@@ -8,7 +8,6 @@ import Details from "../components/ui/details";
 // import IconLogoInlang from "../components/icons/logo-inlang";
 import Footer from "../components/footer";
 import { Link } from 'react-router-dom';
-import React from 'react';
 
 const coreFeatures = [
   {
@@ -170,7 +169,7 @@ export default function HomePage() {
         <div className="flex flex-col items-center">
           <h2 className="text-center">Built apps with the lix SDK</h2>
           <p className="max-w-2xl text-center mt-4 mb-8">
-            The lix SDK can be integrated into existing apps, or used as backend
+            The lix SDK can be intergated into exsiting apps, or used as backend
             for new apps.{" "}
             <a
               href="https://github.com/opral/lix-sdk"
