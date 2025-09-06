@@ -1,0 +1,73 @@
+{
+	"name": "@lix-js/sdk",
+	"type": "module",
+	"version": "0.5.0-preview.1",
+	"description": "SDK for change control. Enable Git-like capabilities like versioning, history, and blame in apps and AI agents.",
+	"keywords": [
+		"change control",
+		"version control",
+		"git",
+		"versioning",
+		"history",
+		"blame",
+		"branching",
+		"ai-agents",
+		"sdk",
+		"browser",
+		"wasm",
+		"json",
+		"csv",
+		"markdown"
+	],
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/opral/lix-sdk"
+	},
+	"homepage": "https://lix.dev/",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": "./dist/index.js",
+		"./zettel-ast": "./dist/zettel-ast/index.js"
+	},
+	"_filesComment": "Shipping src for better debugging experience",
+	"files": [
+		"dist",
+		"src"
+	],
+	"scripts": {
+		"prebuild": "npm run env-variables",
+		"build": "tsc --build",
+		"test": "vitest run --typecheck",
+		"test:watch": "vitest --typecheck",
+		"env-variables": "node ./src/services/env-variables/create-index-file.js",
+		"bench": "vitest bench",
+		"lint": "oxlint --config .oxlintrc.json \"src/**/*.{js,ts}\" --fix",
+		"dev": "tsc --watch",
+		"format": "prettier ./src --write"
+	},
+	"_comment": "Required for tree-shaking https://webpack.js.org/guides/tree-shaking/#mark-the-file-as-side-effect-free",
+	"sideEffects": false,
+	"engines": {
+		"node": ">=22"
+	},
+	"dependencies": {
+		"@codspeed/vitest-plugin": "^4.0.1",
+		"@lix-js/server-protocol-schema": "workspace:*",
+		"@opral/zettel-ast": "workspace:*",
+		"ajv": "^8.17.1",
+		"human-id": "^4.1.1",
+		"kysely": "^0.27.4",
+		"sqlite-wasm-kysely": "workspace:*",
+		"uuid": "^11.1.0"
+	},
+	"devDependencies": {
+		"@opral/tsconfig": "workspace:*",
+		"@vitest/coverage-v8": "4.0.0-beta.10",
+		"oxlint": "^1.14.0",
+		"json-schema-to-ts": "^3.1.1",
+		"prettier": "^3.3.3",
+		"typescript": "^5.5.4",
+		"vitest": "4.0.0-beta.10"
+	}
+}

@@ -1,0 +1,51 @@
+{
+  "name": "@lix-js/docs",
+  "version": "0.1.0",
+  "description": "Technical documentation for the Lix SDK - a browser-native change control system for structured data",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rspress dev",
+    "build": "rspress build",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "preview": "rspress preview",
+    "clean": "rm -rf ./dist ./node_modules"
+  },
+  "devDependencies": {
+    "@braintree/sanitize-url": "^7.0.2",
+    "@lix-js/plugin-json": "workspace:*",
+    "@lix-js/sdk": "workspace:*",
+    "@monaco-editor/react": "^4.7.0",
+    "@rspress/shared": "^1.44.0",
+    "@tailwindcss/postcss": "^4.1.10",
+    "@types/react": "^19.0.12",
+    "@types/react-dom": "^19.0.4",
+    "dayjs": "^1.11.11",
+    "debug": "^4.3.4",
+    "mermaid": "^11.7.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "rspress": "^1.40.2",
+    "rspress-plugin-mermaid": "^0.3.0",
+    "prettier": "^3.6.2",
+    "tailwindcss": "^4.1.11",
+    "typedoc": "0.28.12",
+    "typedoc-plugin-markdown": "4.7.0",
+    "typescript": "5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "keywords": [
+    "lix",
+    "sdk",
+    "documentation",
+    "change control",
+    "version control",
+    "browser"
+  ],
+  "author": "Opral, Inc.",
+  "license": "MIT",
+  "dependencies": {
+    "shiki": "^3.7.0"
+  }
+}

@@ -1,0 +1,10 @@
+# TypeDoc generated files
+docs/api/reference/
+
+docs_build
+
+# api is auto generated
+docs/api/*
+
+# generated from @lix-js/react-utils/README.md
+docs/guide/react-utils.mdx
