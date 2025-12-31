@@ -1,7 +1,11 @@
 {
-	"extends": "@opral/tsconfig/default",
-	"include": ["src/**/*"],
-	"exclude": ["node_modules", "dist"],
+	"include": [
+		"src/**/*"
+	],
+	"exclude": [
+		"node_modules",
+		"dist"
+	],
 	"compilerOptions": {
 		"isolatedDeclarations": false,
 		"allowJs": false,
@@ -9,10 +13,32 @@
 		"allowImportingTsExtensions": false,
 		"emitDeclarationOnly": false,
 		"verbatimModuleSyntax": true,
-		"types": ["vitest/globals"],
+		"types": [
+			"vitest/globals"
+		],
 		"module": "Node16",
-		"lib": ["ESNext", "DOM"],
+		"lib": [
+			"ESNext",
+			"DOM"
+		],
 		"outDir": "./dist",
-		"rootDir": "./src"
+		"rootDir": "./src",
+		"sourceMap": true,
+		"moduleResolution": "Node16",
+		"target": "ES2022",
+		"allowSyntheticDefaultImports": true,
+		"resolveJsonModule": false,
+		"declaration": true,
+		"strict": true,
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
+		"skipDefaultLibCheck": true,
+		"noUncheckedIndexedAccess": true,
+		"declarationMap": true,
+		"noImplicitAny": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"allowUnreachableCode": false
 	}
 }

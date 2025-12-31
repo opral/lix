@@ -1,20 +1,36 @@
 {
-	"extends": "@opral/tsconfig/default",
-	"include": ["src/**/*"],
+	"include": [
+		"src*"
+	],
 	"compilerOptions": {
 		"allowJs": false,
 		"checkJs": false,
-		// isolated declarations lead to substantially faster build times
-		// which is overproportionally useful in a monorepo
-		// https://devblogs.microsoft.com/typescript/announcing-typescript-5-5/#isolated-declarations
 		"isolatedDeclarations": true,
 		"allowImportingTsExtensions": false,
 		"emitDeclarationOnly": false,
-		// recommended by openapi-typescript https://openapi-ts.dev/introduction#setup
 		"noUncheckedIndexedAccess": true,
 		"module": "Node16",
-		"lib": ["ESNext"],
+		"lib": [
+			"ESNext"
+		],
 		"outDir": "./dist",
-		"rootDir": "./src"
+		"rootDir": "./src",
+		"sourceMap": true,
+		"moduleResolution": "Node16",
+		"target": "ES2022",
+		"allowSyntheticDefaultImports": true,
+		"resolveJsonModule": false,
+		"declaration": true,
+		"strict": true,
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
+		"skipDefaultLibCheck": true,
+		"verbatimModuleSyntax": true,
+		"declarationMap": true,
+		"noImplicitAny": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"allowUnreachableCode": false
 	}
 }
