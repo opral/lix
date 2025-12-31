@@ -5,10 +5,21 @@ import {
 	AstSchemas,
 	type Ast,
 	type MarkdownNode,
+	serializeAst,
 } from "@opral/markdown-wc";
-import * as MarkdownWC from "@opral/markdown-wc";
 import type { Change, LixPlugin } from "@lix-js/sdk";
 import { createNodeIdPrefix } from "./node-id-prefix.js";
+
+vi.mock("@opral/markdown-wc", async () => {
+	const actual =
+		await vi.importActual<typeof import("@opral/markdown-wc")>(
+			"@opral/markdown-wc",
+		);
+	return {
+		...actual,
+		serializeAst: vi.fn(actual.serializeAst),
+	};
+});
 
 type ApplyChangesArgs = Parameters<NonNullable<LixPlugin["applyChanges"]>>[0];
 type ApplyChangesFile = ApplyChangesArgs["file"];
@@ -237,17 +248,15 @@ describe("applyChanges", () => {
 			nodeToChange(paragraphNode),
 		];
 
-		const serializeSpy = vi.spyOn(MarkdownWC, "serializeAst");
-
 		applyChanges({
 			file: createMockFile(new TextEncoder().encode("")),
 			changes,
 		} as ApplyChangesArgs);
 
-		const serializedAst = serializeSpy.mock.calls.at(-1)?.[0] as
+		const serializedAst = vi.mocked(serializeAst).mock.calls.at(-1)?.[0] as
 			| Ast
 			| undefined;
-		serializeSpy.mockRestore();
+		vi.mocked(serializeAst).mockClear();
 
 		expect(serializedAst?.children?.[1]?.data?.id).toBe(`${prefix}_1`);
 	});
