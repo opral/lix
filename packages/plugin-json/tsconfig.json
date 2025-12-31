@@ -1,17 +1,38 @@
 {
-	"extends": "@opral/tsconfig/default",
-	"include": ["src/**/*"],
+	"include": [
+		"src/**/*"
+	],
 	"compilerOptions": {
 		"skipDefaultLibCheck": true,
 		"emitDeclarationOnly": false,
 		"experimentalDecorators": true,
 		"emitDecoratorMetadata": true,
 		"useDefineForClassFields": false,
-		"lib": ["ESNext", "DOM"],
+		"lib": [
+			"ESNext",
+			"DOM"
+		],
 		"outDir": "./dist",
 		"rootDir": "./src",
 		"esModuleInterop": true,
 		"skipLibCheck": true,
-		"forceConsistentCasingInFileNames": true
+		"forceConsistentCasingInFileNames": true,
+		"sourceMap": true,
+		"module": "Node16",
+		"moduleResolution": "Node16",
+		"target": "ES2022",
+		"allowSyntheticDefaultImports": true,
+		"resolveJsonModule": false,
+		"declaration": true,
+		"strict": true,
+		"checkJs": true,
+		"verbatimModuleSyntax": true,
+		"noUncheckedIndexedAccess": true,
+		"declarationMap": true,
+		"noImplicitAny": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitOverride": true,
+		"allowUnreachableCode": false
 	}
 }

@@ -1,29 +1,45 @@
 {
-  "extends": "@opral/tsconfig/default",
-  "include": ["src"],
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "react": ["./node_modules/react"]
-    },
-    "target": "ES2022",
-    "useDefineForClassFields": true,
-    "lib": ["ES2023", "DOM", "DOM.Iterable"],
-
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "jsx": "react-jsx",
-
-    /* Linting */
-    "strict": true,
-    "noImplicitAny": false,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "sourceMap": true,
-    "noFallthroughCasesInSwitch": true
-  }
+	"include": [
+		"src"
+	],
+	"compilerOptions": {
+		"baseUrl": ".",
+		"paths": {
+			"react": [
+				"./node_modules/react"
+			]
+		},
+		"target": "ES2022",
+		"useDefineForClassFields": true,
+		"lib": [
+			"ES2023",
+			"DOM",
+			"DOM.Iterable"
+		],
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"noEmit": true,
+		"jsx": "react-jsx",
+		"strict": true,
+		"noImplicitAny": false,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"sourceMap": true,
+		"noFallthroughCasesInSwitch": true,
+		"allowSyntheticDefaultImports": true,
+		"declaration": true,
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
+		"skipDefaultLibCheck": true,
+		"checkJs": true,
+		"verbatimModuleSyntax": true,
+		"noUncheckedIndexedAccess": true,
+		"declarationMap": true,
+		"noImplicitReturns": true,
+		"noImplicitOverride": true,
+		"allowUnreachableCode": false
+	}
 }
