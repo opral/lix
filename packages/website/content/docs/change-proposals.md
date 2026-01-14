@@ -128,13 +128,13 @@ const diff = await lix.db
 
 ## Agent SDK Integration
 
-The [@lix-js/agent-sdk](https://github.com/opral/monorepo/tree/main/packages/lix/agent-sdk) provides higher-level abstractions:
+The [@lix-js/agent-sdk](https://github.com/opral/lix/tree/main/packages/agent-sdk) provides higher-level abstractions:
 
 - **Auto-accept mode** - Skip proposals when user trusts the agent
 - **Proposal rejection errors** - Structured error handling
 - **Proposal lifecycle hooks** - React to proposal events
 
-See the [agent SDK documentation](https://github.com/opral/monorepo/tree/main/packages/lix/agent-sdk) for details.
+See the [agent SDK documentation](https://github.com/opral/lix/tree/main/packages/agent-sdk) for details.
 
 ## Next Steps
 

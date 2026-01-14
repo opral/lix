@@ -81,8 +81,8 @@ Plugins implement the `LixPlugin` interface with two main methods:
 
 For implementation examples, see the official plugin source code:
 
-- **[plugin-json](https://github.com/opral/monorepo/tree/main/packages/lix/plugin-json)** - Simple example using JSON Pointer for entity IDs
-- **[plugin-md](https://github.com/opral/monorepo/tree/main/packages/lix/plugin-md)** - Advanced example with stable ID reconciliation using `querySync`
+- **[plugin-json](https://github.com/opral/lix/tree/main/packages/plugin-json)** - Simple example using JSON Pointer for entity IDs
+- **[plugin-md](https://github.com/opral/lix/tree/main/packages/plugin-md)** - Advanced example with stable ID reconciliation using `querySync`
 
 These implementations demonstrate:
 
