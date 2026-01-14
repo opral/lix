@@ -1272,7 +1272,7 @@ function LandingPage() {
                       </span>
                     </div>
                   </a>
-                ),
+                )
               )}
             </div>
           </div>
@@ -1546,7 +1546,7 @@ function LandingPage() {
                       </p>
                     </div>
                   </div>
-                ),
+                )
               )}
             </div>
           </div>
