@@ -146,7 +146,7 @@ export function MarkdownPage({
   };
 
   return (
-    <article className="markdown-body">
+    <article className="markdown-wc-body">
       {title && (
         <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <h1 className="text-[28px] font-semibold leading-10 tracking-[-0.02em] text-slate-900">

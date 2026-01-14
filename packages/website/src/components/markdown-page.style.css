@@ -53,33 +53,33 @@
 }
 
 /* Base markdown body styles */
-.markdown-body {
+.markdown-wc-body {
   color: var(--vp-c-text-1);
   line-height: 1.7;
   font-size: 16px;
 }
 
 /* Headings */
-.markdown-body h1,
-.markdown-body h2,
-.markdown-body h3,
-.markdown-body h4,
-.markdown-body h5,
-.markdown-body h6 {
+.markdown-wc-body h1,
+.markdown-wc-body h2,
+.markdown-wc-body h3,
+.markdown-wc-body h4,
+.markdown-wc-body h5,
+.markdown-wc-body h6 {
   position: relative;
   font-weight: 600;
   outline: none;
   color: var(--vp-c-text-1);
 }
 
-.markdown-body h1 {
+.markdown-wc-body h1 {
   letter-spacing: -0.02em;
   line-height: 40px;
   font-size: 28px;
-  margin: 0;
+  margin: 0 0 16px 0;
 }
 
-.markdown-body h2 {
+.markdown-wc-body h2 {
   margin: 48px 0 16px;
   border-top: 1px solid var(--vp-c-divider);
   padding-top: 24px;
@@ -88,14 +88,14 @@
   font-size: 24px;
 }
 
-.markdown-body h3 {
+.markdown-wc-body h3 {
   margin: 32px 0 0;
   letter-spacing: -0.01em;
   line-height: 28px;
   font-size: 20px;
 }
 
-.markdown-body h4 {
+.markdown-wc-body h4 {
   margin: 24px 0 0;
   letter-spacing: -0.01em;
   line-height: 24px;
@@ -103,32 +103,28 @@
 }
 
 /* Anchor scroll offset so hash links don't stick to viewport top */
-.markdown-body h2[id],
-.markdown-body h3[id],
-.markdown-body h4[id],
-.markdown-body h5[id],
-.markdown-body h6[id] {
-  scroll-margin-top: 96px;
+.markdown-wc-body h2[id],
+.markdown-wc-body h3[id],
+.markdown-wc-body h4[id],
+.markdown-wc-body h5[id],
+.markdown-wc-body h6[id] {
+  scroll-margin-top: 180px;
 }
 
-/* Heading anchor hash on hover (VitePress-style)
- * rehypeAutolinkHeadings wraps heading text in <a>, but markdown-wc also adds
- * inline styles to anchors. To avoid layout quirks, render the hash on the
- * heading itself when it has a direct anchor child.
- */
-.markdown-body h2:has(> a),
-.markdown-body h3:has(> a),
-.markdown-body h4:has(> a),
-.markdown-body h5:has(> a),
-.markdown-body h6:has(> a) {
+/* Heading anchor hash on hover (VitePress-style) */
+.markdown-wc-body h2:has(> a),
+.markdown-wc-body h3:has(> a),
+.markdown-wc-body h4:has(> a),
+.markdown-wc-body h5:has(> a),
+.markdown-wc-body h6:has(> a) {
   position: relative;
 }
 
-.markdown-body h2:has(> a)::before,
-.markdown-body h3:has(> a)::before,
-.markdown-body h4:has(> a)::before,
-.markdown-body h5:has(> a)::before,
-.markdown-body h6:has(> a)::before {
+.markdown-wc-body h2:has(> a)::before,
+.markdown-wc-body h3:has(> a)::before,
+.markdown-wc-body h4:has(> a)::before,
+.markdown-wc-body h5:has(> a)::before,
+.markdown-wc-body h6:has(> a)::before {
   content: "#";
   position: absolute;
   left: 0;
@@ -142,205 +138,206 @@
 }
 
 /* h2 has extra padding-top for the divider; align hash with text */
-.markdown-body h2:has(> a)::before {
+.markdown-wc-body h2:has(> a)::before {
   top: 24px;
 }
 
 /* First h2 after h1 has no divider/padding */
-.markdown-body h1 + h2:has(> a)::before {
+.markdown-wc-body h1 + h2:has(> a)::before {
   top: 0;
 }
 
-.markdown-body h2:has(> a):hover::before,
-.markdown-body h3:has(> a):hover::before,
-.markdown-body h4:has(> a):hover::before,
-.markdown-body h5:has(> a):hover::before,
-.markdown-body h6:has(> a):hover::before,
-.markdown-body h2:has(> a):focus-within::before,
-.markdown-body h3:has(> a):focus-within::before,
-.markdown-body h4:has(> a):focus-within::before,
-.markdown-body h5:has(> a):focus-within::before,
-.markdown-body h6:has(> a):focus-within::before {
+.markdown-wc-body h2:has(> a):hover::before,
+.markdown-wc-body h3:has(> a):hover::before,
+.markdown-wc-body h4:has(> a):hover::before,
+.markdown-wc-body h5:has(> a):hover::before,
+.markdown-wc-body h6:has(> a):hover::before,
+.markdown-wc-body h2:has(> a):focus-within::before,
+.markdown-wc-body h3:has(> a):focus-within::before,
+.markdown-wc-body h4:has(> a):focus-within::before,
+.markdown-wc-body h5:has(> a):focus-within::before,
+.markdown-wc-body h6:has(> a):focus-within::before {
   opacity: 1;
 }
 
 /* First h2 should not have border-top */
-.markdown-body h1 + h2 {
+.markdown-wc-body h1 + h2 {
   margin-top: 24px;
   border-top: none;
   padding-top: 0;
 }
 
 /* Paragraphs */
-.markdown-body p {
+.markdown-wc-body p {
   margin: 16px 0;
   line-height: 28px;
 }
 
 /* First paragraph after heading */
-.markdown-body h1 + p,
-.markdown-body h2 + p,
-.markdown-body h3 + p,
-.markdown-body h4 + p {
+.markdown-wc-body h1 + p,
+.markdown-wc-body h2 + p,
+.markdown-wc-body h3 + p,
+.markdown-wc-body h4 + p {
   margin-top: 8px;
 }
 
 /* Links */
-.markdown-body a {
+.markdown-wc-body a {
   font-weight: 500;
   color: var(--vp-c-brand-1);
   text-decoration: underline;
   text-underline-offset: 2px;
-  transition: color 0.25s, opacity 0.25s;
+  transition:
+    color 0.25s,
+    opacity 0.25s;
 }
 
-.markdown-body a:hover {
+.markdown-wc-body a:hover {
   color: var(--vp-c-brand-2);
 }
 
 /* Links inside headings should inherit heading styles */
-.markdown-body h1 a,
-.markdown-body h2 a,
-.markdown-body h3 a,
-.markdown-body h4 a,
-.markdown-body h5 a,
-.markdown-body h6 a {
+.markdown-wc-body h1 a,
+.markdown-wc-body h2 a,
+.markdown-wc-body h3 a,
+.markdown-wc-body h4 a,
+.markdown-wc-body h5 a,
+.markdown-wc-body h6 a {
   color: inherit;
   font-weight: inherit;
   text-decoration: none;
 }
 
-.markdown-body h1 a:hover,
-.markdown-body h2 a:hover,
-.markdown-body h3 a:hover,
-.markdown-body h4 a:hover,
-.markdown-body h5 a:hover,
-.markdown-body h6 a:hover {
+.markdown-wc-body h1 a:hover,
+.markdown-wc-body h2 a:hover,
+.markdown-wc-body h3 a:hover,
+.markdown-wc-body h4 a:hover,
+.markdown-wc-body h5 a:hover,
+.markdown-wc-body h6 a:hover {
   color: inherit;
 }
 
 /* Lists */
-.markdown-body ul,
-.markdown-body ol {
+.markdown-wc-body ul,
+.markdown-wc-body ol {
   padding-left: 1.25rem;
   margin: 16px 0;
 }
 
-.markdown-body ul {
+.markdown-wc-body ul {
   list-style: disc;
 }
 
-.markdown-body ol {
+.markdown-wc-body ol {
   list-style: decimal;
 }
 
-.markdown-body li + li {
+.markdown-wc-body li + li {
   margin-top: 8px;
 }
 
-.markdown-body li > ol,
-.markdown-body li > ul {
+.markdown-wc-body li > ol,
+.markdown-wc-body li > ul {
   margin: 8px 0 0;
 }
 
 /* Inline code */
-.markdown-body :not(pre) > code {
+.markdown-wc-body :not(pre) > code {
   font-size: var(--vp-code-font-size);
   color: var(--vp-c-text-1);
   background-color: var(--vp-c-bg-soft);
   border-radius: 4px;
   padding: 2px 6px;
   font-weight: 500;
-  transition: color 0.25s, background-color 0.5s;
+  transition:
+    color 0.25s,
+    background-color 0.5s;
 }
 
 /* Ensure code inside pre doesn't have nested background */
-.markdown-body pre code {
+.markdown-wc-body pre code {
   background: transparent !important;
 }
 
 /* Syntax highlighting color overrides for better contrast */
-.markdown-body pre .hljs {
+.markdown-wc-body pre .hljs {
   color: var(--vp-c-text-1);
 }
 
 /* Keywords (export, default, const, etc.) */
-.markdown-body pre .hljs-keyword,
-.markdown-body pre .hljs-selector-tag,
-.markdown-body pre .hljs-built_in {
+.markdown-wc-body pre .hljs-keyword,
+.markdown-wc-body pre .hljs-selector-tag,
+.markdown-wc-body pre .hljs-built_in {
   color: #d73a49;
 }
 
 /* Strings */
-.markdown-body pre .hljs-string,
-.markdown-body pre .hljs-attr {
+.markdown-wc-body pre .hljs-string,
+.markdown-wc-body pre .hljs-attr {
   color: #032f62;
 }
 
 /* Object property names / attributes */
-.markdown-body pre .hljs-attr {
+.markdown-wc-body pre .hljs-attr {
   color: #005cc5;
 }
 
 /* Comments */
-.markdown-body pre .hljs-comment,
-.markdown-body pre .hljs-quote {
+.markdown-wc-body pre .hljs-comment,
+.markdown-wc-body pre .hljs-quote {
   color: #6a737d;
   font-style: italic;
 }
 
 /* Numbers */
-.markdown-body pre .hljs-number {
+.markdown-wc-body pre .hljs-number {
   color: #005cc5;
 }
 
 /* Functions */
-.markdown-body pre .hljs-title,
-.markdown-body pre .hljs-title.function_ {
+.markdown-wc-body pre .hljs-title,
+.markdown-wc-body pre .hljs-title.function_ {
   color: #6f42c1;
 }
 
 /* Types */
-.markdown-body pre .hljs-type,
-.markdown-body pre .hljs-class {
+.markdown-wc-body pre .hljs-type,
+.markdown-wc-body pre .hljs-class {
   color: #d73a49;
 }
 
 /* Diff styling for code blocks */
-/* Highlight.js uses .hljs-deletion and .hljs-addition for diff syntax */
-.markdown-body pre code .hljs-deletion {
+.markdown-wc-body pre code .hljs-deletion {
   background-color: #ffebee;
   color: #b71c1c;
   padding: 0 2px;
 }
 
-.markdown-body pre code .hljs-addition {
+.markdown-wc-body pre code .hljs-addition {
   background-color: #e8f5e9;
   color: #1b5e20;
   padding: 0 2px;
 }
 
-/* Ensure nested syntax highlighting has good contrast in diff lines */
-.markdown-body pre code .hljs-deletion * {
+.markdown-wc-body pre code .hljs-deletion * {
   color: #b71c1c !important;
 }
 
-.markdown-body pre code .hljs-addition * {
+.markdown-wc-body pre code .hljs-addition * {
   color: #1b5e20 !important;
 }
 
-/* Meta/diff markers (- and +) should be bold and visible */
-.markdown-body pre code .hljs-meta {
+.markdown-wc-body pre code .hljs-meta {
   color: inherit;
   font-weight: 600;
 }
 
-.markdown-body a > code {
+.markdown-wc-body a > code {
   color: var(--vp-c-brand-1);
 }
 
 /* Code blocks */
-.markdown-body pre {
+.markdown-wc-body pre {
   margin: 16px 0;
   padding: 8px 12px;
   background-color: var(--vp-c-bg-soft);
@@ -349,12 +346,12 @@
   position: relative;
 }
 
-/* Copy button for mwc code blocks */
-.markdown-body pre[data-mwc-codeblock] {
+/* Copy button for code blocks */
+.markdown-wc-body pre {
   position: relative;
 }
 
-.markdown-body pre[data-mwc-codeblock] > button[data-mwc-copy-button] {
+.markdown-wc-body pre > button.mwc-copy-button {
   position: absolute;
   top: 8px;
   right: 8px;
@@ -366,19 +363,25 @@
   color: var(--vp-c-text-2);
   border: 1px solid var(--vp-c-divider);
   opacity: 0;
-  transition: opacity 0.2s, color 0.2s, border-color 0.2s;
+  cursor: pointer;
+  transition:
+    opacity 0.2s,
+    color 0.2s,
+    border-color 0.2s,
+    background-color 0.2s;
 }
 
-.markdown-body pre[data-mwc-codeblock]:hover > button[data-mwc-copy-button] {
+.markdown-wc-body pre:hover > button.mwc-copy-button {
   opacity: 1;
 }
 
-.markdown-body pre[data-mwc-codeblock] > button[data-mwc-copy-button]:hover {
+.markdown-wc-body pre > button.mwc-copy-button:hover {
   color: var(--vp-c-text-1);
   border-color: var(--vp-c-border);
+  background: var(--vp-c-bg-soft);
 }
 
-.markdown-body pre code {
+.markdown-wc-body pre code {
   display: block;
   padding: 0;
   width: fit-content;
@@ -393,30 +396,29 @@
 }
 
 /* Blockquotes */
-.markdown-body blockquote {
+.markdown-wc-body blockquote {
   margin: 16px 0;
   border-left: 2px solid var(--vp-c-divider);
   padding-left: 16px;
   color: var(--vp-c-text-2);
-  transition: border-color 0.5s, color 0.5s;
+  transition:
+    border-color 0.5s,
+    color 0.5s;
 }
 
-.markdown-body blockquote > p {
+.markdown-wc-body blockquote > p {
   margin: 0;
   font-size: 16px;
   line-height: 28px;
 }
 
-.markdown-body blockquote[data-mwc-alert] > p {
+.markdown-wc-body blockquote[data-mwc-alert] > p {
   font-size: 0.875rem;
   line-height: 1.5rem;
 }
 
-/* GitHub-style alerts/callouts from markdown-wc
- * Blockquotes with `data-mwc-alert` are styled like VitePress callouts.
- * The marker span is hidden by default.
- */
-.markdown-body blockquote[data-mwc-alert] {
+/* GitHub-style alerts/callouts */
+.markdown-wc-body blockquote[data-mwc-alert] {
   border-left: none;
   border-radius: 8px;
   padding: 16px;
@@ -426,64 +428,64 @@
   line-height: 1.5rem;
 }
 
-.markdown-body blockquote[data-mwc-alert] [data-mwc-alert-marker] {
+.markdown-wc-body blockquote[data-mwc-alert] [data-mwc-alert-marker] {
   display: none;
 }
 
-.markdown-body blockquote[data-mwc-alert]::before {
+.markdown-wc-body blockquote[data-mwc-alert]::before {
   display: block;
   font-weight: 600;
   margin-bottom: 8px;
 }
 
-.markdown-body blockquote[data-mwc-alert="note"] {
+.markdown-wc-body blockquote[data-mwc-alert="note"] {
   background-color: var(--vp-c-note-3);
   border: 1px solid var(--vp-c-note-2);
 }
-.markdown-body blockquote[data-mwc-alert="note"]::before {
+.markdown-wc-body blockquote[data-mwc-alert="note"]::before {
   content: "Note";
   color: var(--vp-c-note-1);
 }
 
-.markdown-body blockquote[data-mwc-alert="tip"] {
+.markdown-wc-body blockquote[data-mwc-alert="tip"] {
   background-color: var(--vp-c-tip-3);
   border: 1px solid var(--vp-c-tip-2);
 }
-.markdown-body blockquote[data-mwc-alert="tip"]::before {
+.markdown-wc-body blockquote[data-mwc-alert="tip"]::before {
   content: "Tip";
   color: var(--vp-c-tip-1);
 }
 
-.markdown-body blockquote[data-mwc-alert="important"] {
+.markdown-wc-body blockquote[data-mwc-alert="important"] {
   background-color: var(--vp-c-important-3);
   border: 1px solid var(--vp-c-important-2);
 }
-.markdown-body blockquote[data-mwc-alert="important"]::before {
+.markdown-wc-body blockquote[data-mwc-alert="important"]::before {
   content: "Important";
   color: var(--vp-c-important-1);
 }
 
-.markdown-body blockquote[data-mwc-alert="warning"] {
+.markdown-wc-body blockquote[data-mwc-alert="warning"] {
   background-color: var(--vp-c-warning-3);
   border: 1px solid var(--vp-c-warning-2);
 }
-.markdown-body blockquote[data-mwc-alert="warning"]::before {
+.markdown-wc-body blockquote[data-mwc-alert="warning"]::before {
   content: "Warning";
   color: var(--vp-c-warning-1);
 }
 
-.markdown-body blockquote[data-mwc-alert="caution"] {
+.markdown-wc-body blockquote[data-mwc-alert="caution"] {
   background-color: var(--vp-c-caution-3);
   border: 1px solid var(--vp-c-caution-2);
 }
-.markdown-body blockquote[data-mwc-alert="caution"]::before {
+.markdown-wc-body blockquote[data-mwc-alert="caution"]::before {
   content: "Caution";
   color: var(--vp-c-caution-1);
 }
 
-/* Custom callout styling via data attributes or content detection */
-.markdown-body .callout,
-.markdown-body .custom-block {
+/* Custom callout styling */
+.markdown-wc-body .callout,
+.markdown-wc-body .custom-block {
   margin: 16px 0;
   border-radius: 8px;
   padding: 16px 16px 8px;
@@ -492,14 +494,14 @@
   color: var(--vp-c-text-1);
 }
 
-.markdown-body .callout p,
-.markdown-body .custom-block p {
+.markdown-wc-body .callout p,
+.markdown-wc-body .custom-block p {
   margin: 8px 0;
   line-height: 24px;
 }
 
-.markdown-body .callout-title,
-.markdown-body .custom-block-title {
+.markdown-wc-body .callout-title,
+.markdown-wc-body .custom-block-title {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -508,133 +510,226 @@
 }
 
 /* TIP callout */
-.markdown-body .callout.tip,
-.markdown-body .custom-block.tip {
+.markdown-wc-body .callout.tip,
+.markdown-wc-body .custom-block.tip {
   background-color: var(--vp-c-tip-3);
   border: 1px solid var(--vp-c-tip-2);
 }
 
-.markdown-body .callout.tip .callout-title,
-.markdown-body .custom-block.tip .custom-block-title {
+.markdown-wc-body .callout.tip .callout-title,
+.markdown-wc-body .custom-block.tip .custom-block-title {
   color: var(--vp-c-tip-1);
 }
 
 /* NOTE/INFO callout */
-.markdown-body .callout.note,
-.markdown-body .callout.info,
-.markdown-body .custom-block.info {
+.markdown-wc-body .callout.note,
+.markdown-wc-body .callout.info,
+.markdown-wc-body .custom-block.info {
   background-color: var(--vp-c-note-3);
   border: 1px solid var(--vp-c-note-2);
 }
 
-.markdown-body .callout.note .callout-title,
-.markdown-body .callout.info .callout-title,
-.markdown-body .custom-block.info .custom-block-title {
+.markdown-wc-body .callout.note .callout-title,
+.markdown-wc-body .callout.info .callout-title,
+.markdown-wc-body .custom-block.info .custom-block-title {
   color: var(--vp-c-note-1);
 }
 
 /* WARNING callout */
-.markdown-body .callout.warning,
-.markdown-body .custom-block.warning {
+.markdown-wc-body .callout.warning,
+.markdown-wc-body .custom-block.warning {
   background-color: var(--vp-c-warning-3);
   border: 1px solid var(--vp-c-warning-2);
 }
 
-.markdown-body .callout.warning .callout-title,
-.markdown-body .custom-block.warning .custom-block-title {
+.markdown-wc-body .callout.warning .callout-title,
+.markdown-wc-body .custom-block.warning .custom-block-title {
   color: var(--vp-c-warning-1);
 }
 
 /* DANGER/CAUTION callout */
-.markdown-body .callout.danger,
-.markdown-body .callout.caution,
-.markdown-body .custom-block.danger {
+.markdown-wc-body .callout.danger,
+.markdown-wc-body .callout.caution,
+.markdown-wc-body .custom-block.danger {
   background-color: var(--vp-c-danger-3);
   border: 1px solid var(--vp-c-danger-2);
 }
 
-.markdown-body .callout.danger .callout-title,
-.markdown-body .callout.caution .callout-title,
-.markdown-body .custom-block.danger .custom-block-title {
+.markdown-wc-body .callout.danger .callout-title,
+.markdown-wc-body .callout.caution .callout-title,
+.markdown-wc-body .custom-block.danger .custom-block-title {
   color: var(--vp-c-danger-1);
 }
 
 /* IMPORTANT callout */
-.markdown-body .callout.important {
+.markdown-wc-body .callout.important {
   background-color: var(--vp-c-important-3);
   border: 1px solid var(--vp-c-important-2);
 }
 
-.markdown-body .callout.important .callout-title {
+.markdown-wc-body .callout.important .callout-title {
   color: var(--vp-c-important-1);
 }
 
 /* Tables */
-.markdown-body table {
+.markdown-wc-body table {
   display: block;
   border-collapse: collapse;
   margin: 20px 0;
   overflow-x: auto;
 }
 
-.markdown-body tr {
+.markdown-wc-body tr {
   background-color: var(--vp-c-bg);
   border-top: 1px solid var(--vp-c-divider);
   transition: background-color 0.5s;
 }
 
-.markdown-body tr:nth-child(2n) {
+.markdown-wc-body tr:nth-child(2n) {
   background-color: var(--vp-c-bg-soft);
 }
 
-.markdown-body th,
-.markdown-body td {
+.markdown-wc-body th,
+.markdown-wc-body td {
   border: 1px solid var(--vp-c-divider);
   padding: 8px 16px;
 }
 
-.markdown-body th {
+.markdown-wc-body th {
   font-size: 14px;
   font-weight: 600;
   color: var(--vp-c-text-1);
   background-color: var(--vp-c-bg-soft);
 }
 
-.markdown-body td {
+.markdown-wc-body td {
   font-size: 14px;
 }
 
 /* Horizontal rule */
-.markdown-body hr {
+.markdown-wc-body hr {
   margin: 16px 0;
   border: none;
   border-top: 1px solid var(--vp-c-divider);
 }
 
-/* Images */
-.markdown-body img {
+/* Images - General */
+.markdown-wc-body img {
   max-width: 100%;
   border-radius: 8px;
 }
 
+/* Respect explicit height/width attributes on images */
+.markdown-wc-body img[height] {
+  height: attr(height px);
+}
+
+.markdown-wc-body img[width] {
+  width: attr(width px);
+}
+
+/* Fallback for browsers that don't support attr() for height/width */
+.markdown-wc-body img[height="14"] {
+  height: 14px;
+}
+.markdown-wc-body img[height="18"] {
+  height: 18px;
+}
+.markdown-wc-body img[height="20"] {
+  height: 20px;
+}
+.markdown-wc-body img[height="24"] {
+  height: 24px;
+}
+.markdown-wc-body img[height="32"] {
+  height: 32px;
+}
+.markdown-wc-body img[width="18"] {
+  width: 18px;
+}
+.markdown-wc-body img[width="20"] {
+  width: 20px;
+}
+.markdown-wc-body img[width="24"] {
+  width: 24px;
+}
+.markdown-wc-body img[width="32"] {
+  width: 32px;
+}
+
+/* Images - Standalone content images */
+.markdown-wc-body p > img:only-child {
+  display: block;
+  margin: 16px auto;
+}
+
+/* Images inside links - Always inline (badges, logos, icons) */
+.markdown-wc-body a > img {
+  display: inline-block;
+  vertical-align: middle;
+  margin: 0;
+  border: none;
+  border-radius: 3px;
+  background-color: transparent;
+}
+
+/* Links containing images - inline with spacing */
+.markdown-wc-body a:has(> img) {
+  display: inline-block;
+  text-decoration: none;
+}
+
+/* Badge-only paragraphs (no br, sub, or other block content) - flex layout */
+.markdown-wc-body
+  p:has(a > img):not(:has(br)):not(:has(sub)):not(:has(sup)) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+/* Paragraphs with mixed content (br, sub, etc.) - keep normal flow */
+.markdown-wc-body p:has(a > img):has(br),
+.markdown-wc-body p:has(a > img):has(sub) {
+  display: block;
+}
+
+.markdown-wc-body p:has(a > img):has(br) a:has(> img),
+.markdown-wc-body p:has(a > img):has(sub) a:has(> img) {
+  margin-right: 8px;
+}
+
+/* Centered content via align attribute */
+.markdown-wc-body [align="center"],
+.markdown-wc-body p[align="center"],
+.markdown-wc-body div[align="center"] {
+  text-align: center;
+}
+
+/* Badge-only centered paragraphs need justify-content */
+.markdown-wc-body
+  p[align="center"]:has(a > img):not(:has(br)):not(:has(sub)):not(:has(sup)) {
+  justify-content: center;
+}
+
 /* Strong/Bold */
-.markdown-body strong {
+.markdown-wc-body strong {
   font-weight: 600;
 }
 
 /* Definition lists */
-.markdown-body dt {
+.markdown-wc-body dt {
   font-weight: 600;
   margin-top: 16px;
 }
 
-.markdown-body dd {
+.markdown-wc-body dd {
   margin-left: 1.25rem;
   margin-top: 4px;
 }
 
 /* Keyboard shortcuts */
-.markdown-body kbd {
+.markdown-wc-body kbd {
   display: inline-block;
   padding: 0 6px;
   font-size: 12px;

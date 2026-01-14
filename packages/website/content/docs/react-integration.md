@@ -1,5 +1,5 @@
 > [!NOTE]
-> This page is mirrored from [packages/lix/react-utils](https://github.com/opral/monorepo/tree/main/packages/lix/react-utils).
+> This page is mirrored from [packages/lix/react-utils](https://github.com/opral/lix/tree/main/packages/react-utils).
 
 # @lix-js/react-utils
 

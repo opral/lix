@@ -13,7 +13,7 @@ type PluginRegistry = {
  * Rewrites relative image links to absolute GitHub raw URLs.
  *
  * @example
- * rewriteRelativeImages("![Alt](./assets/img.png)", "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-md/README.md")
+ * rewriteRelativeImages("![Alt](./assets/img.png)", "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-md/README.md")
  */
 function rewriteRelativeImages(markdown: string, readmeUrl: string) {
   const base = readmeUrl.replace(/\/README\.md$/, "/");
@@ -30,7 +30,7 @@ function rewriteRelativeImages(markdown: string, readmeUrl: string) {
  * Rewrites relative links to GitHub tree URLs.
  *
  * @example
- * rewriteRelativeLinks("[Example](./example)", "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-md/README.md")
+ * rewriteRelativeLinks("[Example](./example)", "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-md/README.md")
  */
 function rewriteRelativeLinks(markdown: string, readmeUrl: string) {
   const repoBase = readmeUrl

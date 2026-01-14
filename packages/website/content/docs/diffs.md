@@ -59,7 +59,7 @@ if (plugin?.renderDiff) {
 
 ### Use a Diff Library
 
-Use a library to visualize changes. Options include [diff](https://www.npmjs.com/package/diff) for text or [@lix-js/html-diff](https://github.com/opral/monorepo/tree/main/packages/lix/html-diff) for comparing rendered HTML output.
+Use a library to visualize changes. Options include [diff](https://www.npmjs.com/package/diff) for text or [@lix-js/html-diff](https://github.com/opral/lix/tree/main/packages/html-diff) for comparing rendered HTML output.
 
 ### Build Your Own UI
 

@@ -880,7 +880,7 @@ function LandingPage() {
         "Collaborative publishing UI with branching proposals, inline reviews, and one-click merges.",
       screenshot: "/prosemirror.png",
       fallback: "ProseMirror Demo",
-      href: "https://github.com/opral/monorepo/tree/main/packages/lix/plugin-prosemirror",
+      href: "https://github.com/opral/lix/tree/main/packages/plugin-prosemirror",
       ctaLabel: "View code →",
       creator: "Studio Alva",
       creatorRole: "Product studio",
@@ -1067,7 +1067,7 @@ function LandingPage() {
               </div>
               <div className="w-px h-14 bg-gray-200" />
               <a
-                href="https://github.com/opral/monorepo/graphs/contributors"
+                href="https://github.com/opral/lix/graphs/contributors"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex flex-col items-center hover:opacity-70 transition-opacity"
