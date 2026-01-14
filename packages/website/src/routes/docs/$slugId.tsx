@@ -6,6 +6,7 @@ import {
 } from "../../components/docs-layout";
 import { MarkdownPage } from "../../components/markdown-page";
 import tableOfContents from "../../../content/docs/table_of_contents.json";
+import { DocsPrevNext } from "../../components/docs-prev-next";
 import {
   buildDocMaps,
   buildTocMap,
@@ -108,6 +109,19 @@ function buildSidebarSections(toc: Toc): SidebarSection[] {
     .filter((section) => section.items.length > 0);
 }
 
+function buildDocsNavRoutes(toc: Toc) {
+  return toc.sidebar.flatMap((section) =>
+    section.items.map((item) => {
+      const relativePath = normalizeRelativePath(item.file);
+      const doc = docsByRelativePath[relativePath];
+      return {
+        slug: doc?.slug ?? "",
+        title: item.label,
+      };
+    }),
+  ).filter((item) => item.slug);
+}
+
 export const Route = createFileRoute("/docs/$slugId")({
   head: ({ loaderData }) => {
     const frontmatter = loaderData?.frontmatter as
@@ -204,7 +218,10 @@ export const Route = createFileRoute("/docs/$slugId")({
     }
 
     const tocEntry = tocMap.get(doc.relativePath);
-    const parsedMarkdown = await parse(doc.content, { externalLinks: true });
+    const parsedMarkdown = await parse(doc.content, {
+      externalLinks: true,
+      assetBaseUrl: `/docs/${doc.slug}/`,
+    });
     const pageToc = buildPageToc(parsedMarkdown.html);
 
     return {
@@ -222,6 +239,11 @@ export const Route = createFileRoute("/docs/$slugId")({
 function DocsPage() {
   const { doc, sidebarSections, html, frontmatter, pageToc } =
     Route.useLoaderData();
+  const navRoutes = buildDocsNavRoutes(tableOfContents as Toc);
+  const editUrl = `https://github.com/opral/lix/blob/main/packages/website/content/docs/${doc.relativePath.replace(
+    /^\.\//,
+    "",
+  )}`;
 
   return (
     <DocsLayout
@@ -235,6 +257,31 @@ function DocsPage() {
         markdown={doc.content}
         imports={(frontmatter.imports as string[] | undefined) ?? undefined}
       />
+      <div className="mt-12">
+        <a
+          href={editUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-2 text-sm text-slate-500 hover:text-slate-700"
+        >
+          <svg
+            className="h-4 w-4"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+            aria-hidden="true"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
+            />
+          </svg>
+          Edit this page on GitHub
+        </a>
+      </div>
+      <DocsPrevNext currentSlug={doc.slug} routes={navRoutes} />
     </DocsLayout>
   );
 }
