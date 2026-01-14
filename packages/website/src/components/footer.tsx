@@ -33,7 +33,11 @@ export function Footer() {
           <a
             href="https://github.com/opral/lix"
             className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
-            title={githubStars ? `${githubStars.toLocaleString()} GitHub stars` : "Star us on GitHub"}
+            title={
+              githubStars
+                ? `${githubStars.toLocaleString()} GitHub stars`
+                : "Star us on GitHub"
+            }
           >
             <span aria-hidden>⭐</span>
             Star on GitHub
