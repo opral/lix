@@ -22,7 +22,7 @@ const pluginIndexMarkdownFiles = import.meta.glob<string>(
     eager: true,
     import: "default",
     query: "?raw",
-  }
+  },
 );
 const pluginIndexMarkdown =
   pluginIndexMarkdownFiles["/content/plugins/index.md"];
@@ -119,10 +119,7 @@ function PluginsIndexPage() {
   const { html, frontmatter, markdown } = Route.useLoaderData();
 
   return (
-    <DocsLayout
-      toc={{ sidebar: [] }}
-      sidebarSections={buildPluginSidebarSections(pluginRegistry)}
-    >
+    <DocsLayout sidebarSections={buildPluginSidebarSections(pluginRegistry)}>
       <MarkdownPage
         html={html}
         markdown={markdown}

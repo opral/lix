@@ -680,8 +680,7 @@
 }
 
 /* Badge-only paragraphs (no br, sub, or other block content) - flex layout */
-.markdown-wc-body
-  p:has(a > img):not(:has(br)):not(:has(sub)):not(:has(sup)) {
+.markdown-wc-body p:has(a > img):not(:has(br)):not(:has(sub)):not(:has(sup)) {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;

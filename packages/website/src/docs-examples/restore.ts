@@ -7,6 +7,7 @@ async function restore(options: any) {
 }
 
 async function selectCheckpoints(options: any) {
+  void options;
   return {
     execute: async () => [
       {
@@ -52,4 +53,3 @@ export default async function runExample(console: any) {
 
 // Uncomment for running in node
 // runExample(console);
-

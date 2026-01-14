@@ -648,6 +648,9 @@ importers:
       jsdom:
         specifier: ^27.0.0
         version: 27.3.0(postcss@8.5.6)
+      prettier:
+        specifier: ^3.6.0
+        version: 3.6.2
       typescript:
         specifier: ^5.7.2
         version: 5.8.3

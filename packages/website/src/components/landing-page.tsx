@@ -1,50 +1,8 @@
 import { useState } from "react";
 import { useRouterState } from "@tanstack/react-router";
 import { getGithubStars } from "../github-stars-cache";
+import { Footer } from "./footer";
 import type { SyntheticEvent } from "react";
-
-/**
- * Copy icon used for the install command interaction.
- *
- * @example
- * <CopyIcon />
- */
-const CopyIcon = () => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    className="h-4 w-4"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
-    <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-  </svg>
-);
-
-/**
- * Check icon shown after the install command is copied.
- *
- * @example
- * <CheckIcon />
- */
-const CheckIcon = () => (
-  <svg
-    xmlns="http://www.w3.org/2000/svg"
-    className="h-4 w-4"
-    viewBox="0 0 20 20"
-    fill="currentColor"
-  >
-    <path
-      fillRule="evenodd"
-      d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
-      clipRule="evenodd"
-    />
-  </svg>
-);
 
 /**
  * Hand-drawn style illustration representing chat-like edits.
@@ -333,39 +291,6 @@ const XIcon = ({ className = "" }) => (
 );
 
 /**
- * Renders the CLI install command with copy interaction.
- *
- * @example
- * <PackageInstaller />
- */
-const PackageInstaller = () => {
-  const [copied, setCopied] = useState(false);
-
-  const copyFullCommand = () => {
-    const command = "npm i @lix-js/sdk";
-    navigator.clipboard.writeText(command);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <div className="inline-flex h-11 items-center justify-center gap-3 px-5 rounded-lg border border-gray-300 bg-white text-sm text-gray-800 transition-colors duration-200 hover:bg-gray-50">
-      <span className="font-mono text-sm leading-none cursor-text select-all">
-        npm i @lix-js/sdk
-      </span>
-      <button
-        onClick={copyFullCommand}
-        className="h-6 w-6 transition-colors duration-200 flex items-center justify-center rounded-md text-gray-500 hover:text-gray-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500"
-        title="Copy full command"
-        aria-label={copied ? "Command copied" : "Copy install command"}
-      >
-        {copied ? <CheckIcon /> : <CopyIcon />}
-      </button>
-    </div>
-  );
-};
-
-/**
  * JavaScript icon for code tabs.
  */
 const JsIcon = ({ className = "" }) => (
@@ -476,72 +401,6 @@ const GoIcon = ({ className = "" }) => (
           fillRule="nonzero"
         />
       </g>
-    </g>
-  </svg>
-);
-
-/**
- * PostgresSQL icon for code tabs.
- */
-const PostgresIcon = ({ className = "" }) => (
-  <svg
-    xmlSpace="preserve"
-    viewBox="0 0 432.071 445.383"
-    className={className}
-    xmlns="http://www.w3.org/2000/svg"
-  >
-    <g
-      style={{
-        fillRule: "nonzero",
-        clipRule: "nonzero",
-        fill: "none",
-        stroke: "#fff",
-        strokeWidth: "12.4651",
-        strokeLinecap: "round",
-        strokeLinejoin: "round",
-        strokeMiterlimit: 4,
-      }}
-    >
-      <path
-        d="M323.205 324.227c2.833-23.601 1.984-27.062 19.563-23.239l4.463.392c13.517.615 31.199-2.174 41.587-7 22.362-10.376 35.622-27.7 13.572-23.148-50.297 10.376-53.755-6.655-53.755-6.655 53.111-78.803 75.313-178.836 56.149-203.322-52.27-66.789-142.748-35.206-144.262-34.386l-.482.089c-9.938-2.062-21.06-3.294-33.554-3.496-22.761-.374-40.032 5.967-53.133 15.904 0 0-161.408-66.498-153.899 83.628 1.597 31.936 45.777 241.655 98.47 178.31 19.259-23.163 37.871-42.748 37.871-42.748 9.242 6.14 20.307 9.272 31.912 8.147l.897-.765c-.281 2.876-.157 5.689.359 9.019-13.572 15.167-9.584 17.83-36.723 23.416-27.457 5.659-11.326 15.734-.797 18.367 12.768 3.193 42.305 7.716 62.268-20.224l-.795 3.188c5.325 4.26 4.965 30.619 5.72 49.452.756 18.834 2.017 36.409 5.856 46.771 3.839 10.36 8.369 37.05 44.036 29.406 29.809-6.388 52.6-15.582 54.677-101.107"
-        style={{
-          fill: "#000",
-          stroke: "#000",
-          strokeWidth: "37.3953",
-          strokeLinecap: "butt",
-          strokeLinejoin: "miter",
-        }}
-      />
-      <path
-        d="M402.395 271.23c-50.302 10.376-53.76-6.655-53.76-6.655 53.111-78.808 75.313-178.843 56.153-203.326-52.27-66.785-142.752-35.2-144.262-34.38l-.486.087c-9.938-2.063-21.06-3.292-33.56-3.496-22.761-.373-40.026 5.967-53.127 15.902 0 0-161.411-66.495-153.904 83.63 1.597 31.938 45.776 241.657 98.471 178.312 19.26-23.163 37.869-42.748 37.869-42.748 9.243 6.14 20.308 9.272 31.908 8.147l.901-.765c-.28 2.876-.152 5.689.361 9.019-13.575 15.167-9.586 17.83-36.723 23.416-27.459 5.659-11.328 15.734-.796 18.367 12.768 3.193 42.307 7.716 62.266-20.224l-.796 3.188c5.319 4.26 9.054 27.711 8.428 48.969-.626 21.259-1.044 35.854 3.147 47.254 4.191 11.4 8.368 37.05 44.042 29.406 29.809-6.388 45.256-22.942 47.405-50.555 1.525-19.631 4.976-16.729 5.194-34.28l2.768-8.309c3.192-26.611.507-35.196 18.872-31.203l4.463.392c13.517.615 31.208-2.174 41.591-7 22.358-10.376 35.618-27.7 13.573-23.148z"
-        style={{ fill: "#336791", stroke: "none" }}
-      />
-      <path d="M215.866 286.484c-1.385 49.516.348 99.377 5.193 111.495 4.848 12.118 15.223 35.688 50.9 28.045 29.806-6.39 40.651-18.756 45.357-46.051 3.466-20.082 10.148-75.854 11.005-87.281M173.104 38.256S11.583-27.76 19.092 122.365c1.597 31.938 45.779 241.664 98.473 178.316 19.256-23.166 36.671-41.335 36.671-41.335M260.349 26.207c-5.591 1.753 89.848-34.889 144.087 34.417 19.159 24.484-3.043 124.519-56.153 203.329" />
-      <path
-        d="M348.282 263.953s3.461 17.036 53.764 6.653c22.04-4.552 8.776 12.774-13.577 23.155-18.345 8.514-59.474 10.696-60.146-1.069-1.729-30.355 21.647-21.133 19.96-28.739-1.525-6.85-11.979-13.573-18.894-30.338-6.037-14.633-82.796-126.849 21.287-110.183 3.813-.789-27.146-99.002-124.553-100.599-97.385-1.597-94.19 119.762-94.19 119.762"
-        style={{ strokeLinejoin: "bevel" }}
-      />
-      <path d="M188.604 274.334c-13.577 15.166-9.584 17.829-36.723 23.417-27.459 5.66-11.326 15.733-.797 18.365 12.768 3.195 42.307 7.718 62.266-20.229 6.078-8.509-.036-22.086-8.385-25.547-4.034-1.671-9.428-3.765-16.361 3.994z" />
-      <path d="M187.715 274.069c-1.368-8.917 2.93-19.528 7.536-31.942 6.922-18.626 22.893-37.255 10.117-96.339-9.523-44.029-73.396-9.163-73.436-3.193-.039 5.968 2.889 30.26-1.067 58.548-5.162 36.913 23.488 68.132 56.479 64.938" />
-      <path
-        d="M172.517 141.7c-.288 2.039 3.733 7.48 8.976 8.207 5.234.73 9.714-3.522 9.998-5.559.284-2.039-3.732-4.285-8.977-5.015-5.237-.731-9.719.333-9.996 2.367z"
-        style={{
-          fill: "#fff",
-          strokeWidth: "4.155",
-          strokeLinecap: "butt",
-          strokeLinejoin: "miter",
-        }}
-      />
-      <path
-        d="M331.941 137.543c.284 2.039-3.732 7.48-8.976 8.207-5.238.73-9.718-3.522-10.005-5.559-.277-2.039 3.74-4.285 8.979-5.015 5.239-.73 9.718.333 10.002 2.368z"
-        style={{
-          fill: "#fff",
-          strokeWidth: "2.0775",
-          strokeLinecap: "butt",
-          strokeLinejoin: "miter",
-        }}
-      />
-      <path d="M350.676 123.432c.863 15.994-3.445 26.888-3.988 43.914-.804 24.748 11.799 53.074-7.191 81.435" />
     </g>
   </svg>
 );
@@ -891,7 +750,9 @@ function LandingPage() {
   ];
 
   const docsPath = "/docs";
-  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const pathname = useRouterState({
+    select: (state) => state.location.pathname,
+  });
   const githubStars = getGithubStars("opral/lix");
 
   const formatStars = (count: number) => {
@@ -949,6 +810,7 @@ function LandingPage() {
   const navLinks = [
     { href: docsPath, label: "Docs" },
     { href: "/plugins/", label: "Plugins" },
+    { href: "/blog/", label: "Blog" },
   ];
 
   const isActive = (href: string) =>
@@ -1002,7 +864,10 @@ function LandingPage() {
                 </a>
               ))}
             </nav>
-            <div className="hidden h-4 w-px bg-gray-200 sm:block" aria-hidden="true" />
+            <div
+              className="hidden h-4 w-px bg-gray-200 sm:block"
+              aria-hidden="true"
+            />
             <div className="flex items-center gap-3">
               {socialLinks.map(({ href, label, Icon, sizeClass }) => (
                 <a
@@ -1021,13 +886,13 @@ function LandingPage() {
                 href="https://github.com/opral/lix"
                 target="_blank"
                 rel="noopener noreferrer"
-              className="group inline-flex items-center gap-1.5 text-sm font-medium text-gray-700 transition-colors hover:text-gray-700"
+                className="group inline-flex items-center gap-1.5 text-sm font-medium text-gray-700 transition-colors hover:text-gray-700"
               >
                 <GitHubIcon className="h-5 w-5" />
                 GitHub
                 {githubStars !== null && (
                   <span
-                  className="inline-flex items-center gap-1 text-gray-500 transition-colors group-hover:text-gray-500"
+                    className="inline-flex items-center gap-1 text-gray-500 transition-colors group-hover:text-gray-500"
                     title={`${githubStars.toLocaleString()} GitHub stars`}
                     aria-label={`${githubStars.toLocaleString()} GitHub stars`}
                   >
@@ -1407,7 +1272,7 @@ function LandingPage() {
                       </span>
                     </div>
                   </a>
-                )
+                ),
               )}
             </div>
           </div>
@@ -1681,45 +1546,13 @@ function LandingPage() {
                       </p>
                     </div>
                   </div>
-                )
+                ),
               )}
             </div>
           </div>
         </section>
 
-        {/* Learn More Section */}
-        <section className="py-14 px-6 sm:px-12 md:px-16 bg-white">
-          <div className="flex flex-col gap-3 sm:flex-row sm:justify-center sm:gap-6">
-            <a
-              href={docsPath}
-              className="inline-flex items-center justify-center gap-2 text-base font-medium text-gray-700 transition-colors hover:text-[#0692B6]"
-            >
-              <span aria-hidden>📘</span>
-              Go to Docs
-            </a>
-            <a
-              href="https://discord.gg/gdMPPWy57R"
-              className="inline-flex items-center justify-center gap-2 text-base font-medium text-gray-700 transition-colors hover:text-[#0692B6]"
-            >
-              <span aria-hidden>💬</span>
-              Join Discord
-            </a>
-            <a
-              href="https://github.com/opral/lix-sdk"
-              className="inline-flex items-center justify-center gap-2 text-base font-medium text-gray-700 transition-colors hover:text-[#0692B6]"
-            >
-              <span aria-hidden>🐙</span>
-              Visit GitHub
-            </a>
-            <a
-              href="https://opral.substack.com/t/lix"
-              className="inline-flex items-center justify-center gap-2 text-base font-medium text-gray-700 transition-colors hover:text-[#0692B6]"
-            >
-              <span aria-hidden>→</span>
-              Read Substack
-            </a>
-          </div>
-        </section>
+        <Footer />
       </main>
     </div>
   );

@@ -185,10 +185,10 @@ Deterministic state is automatically persisted:
 
 The following functions provide deterministic behavior when `lix_deterministic_mode` is enabled:
 
-| Function                      | Purpose                          | Docs                                               |
-| ----------------------------- | -------------------------------- | -------------------------------------------------- |
-| `getTimestamp({ lix })`       | Logical clock timestamps         | API reference                                  |
-| `random({ lix })`             | Reproducible random numbers      | API reference                                  |
-| `uuidV7({ lix })`             | Deterministic UUID v7 generation | API reference                                  |
-| `nanoId({ lix })`             | Deterministic nano ID generation | API reference                                  |
-| `nextSequenceNumber({ lix })` | Monotonic counter (advanced)     | API reference                                  |
+| Function                      | Purpose                          | Docs          |
+| ----------------------------- | -------------------------------- | ------------- |
+| `getTimestamp({ lix })`       | Logical clock timestamps         | API reference |
+| `random({ lix })`             | Reproducible random numbers      | API reference |
+| `uuidV7({ lix })`             | Deterministic UUID v7 generation | API reference |
+| `nanoId({ lix })`             | Deterministic nano ID generation | API reference |
+| `nextSequenceNumber({ lix })` | Monotonic counter (advanced)     | API reference |

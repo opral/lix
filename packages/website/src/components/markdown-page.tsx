@@ -111,6 +111,7 @@ export function MarkdownPage({
   const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
 
   useEffect(() => {
+    // @ts-expect-error - JS-only module
     import("./markdown-page.interactive.js");
   }, [html]);
 
@@ -120,7 +121,7 @@ export function MarkdownPage({
     for (const url of imports) {
       if (!url) continue;
       const existing = document.querySelector(
-        `script[data-mdwc-import="${url}"]`
+        `script[data-mdwc-import="${url}"]`,
       );
       if (existing) continue;
 

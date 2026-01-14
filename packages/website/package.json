@@ -6,7 +6,8 @@
     "dev": "vite dev --port 3000",
     "build": "vite build",
     "preview": "wrangler dev dist/server/server.js",
-    "test": "vitest run"
+    "test": "vitest run && tsc --noEmit",
+    "format": "prettier --write ."
   },
   "dependencies": {
     "@lix-js/plugin-json": "workspace:*",
@@ -33,6 +34,7 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.4",
     "jsdom": "^27.0.0",
+    "prettier": "^3.6.0",
     "typescript": "^5.7.2",
     "vite": "^7.1.7",
     "vitest": "^3.0.5",

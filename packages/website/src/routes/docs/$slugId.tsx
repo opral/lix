@@ -1,4 +1,4 @@
-import { createFileRoute, notFound, redirect } from "@tanstack/react-router";
+import { createFileRoute, notFound } from "@tanstack/react-router";
 import {
   DocsLayout,
   type PageTocItem,
@@ -12,6 +12,7 @@ import {
   buildTocMap,
   normalizeRelativePath,
   type Toc,
+  type TocItem,
 } from "../../lib/build-doc-map";
 import {
   buildCanonicalUrl,
@@ -34,10 +35,13 @@ const docs = import.meta.glob<string>("/content/docs/**/*.md", {
 
 const tocMap = buildTocMap(tableOfContents as Toc);
 const { bySlug: docsBySlug } = buildDocMaps(docs);
-const docsByRelativePath = Object.values(docsBySlug).reduce((acc, doc) => {
-  acc[doc.relativePath] = doc;
-  return acc;
-}, {} as Record<string, (typeof docsBySlug)[string]>);
+const docsByRelativePath = Object.values(docsBySlug).reduce(
+  (acc, doc) => {
+    acc[doc.relativePath] = doc;
+    return acc;
+  },
+  {} as Record<string, (typeof docsBySlug)[string]>,
+);
 
 /**
  * Builds a list of heading links from rendered HTML for the "On this page" TOC.
@@ -110,28 +114,38 @@ function buildSidebarSections(toc: Toc): SidebarSection[] {
 }
 
 function buildDocsNavRoutes(toc: Toc) {
-  return toc.sidebar.flatMap((section) =>
-    section.items.map((item) => {
-      const relativePath = normalizeRelativePath(item.file);
-      const doc = docsByRelativePath[relativePath];
-      return {
-        slug: doc?.slug ?? "",
-        title: item.label,
-      };
-    }),
-  ).filter((item) => item.slug);
+  return toc.sidebar
+    .flatMap((section) =>
+      section.items.map((item) => {
+        const relativePath = normalizeRelativePath(item.file);
+        const doc = docsByRelativePath[relativePath];
+        return {
+          slug: doc?.slug ?? "",
+          title: item.label,
+        };
+      }),
+    )
+    .filter((item) => item.slug);
 }
+
+type DocsLoaderData = {
+  doc: (typeof docsBySlug)[string];
+  tocEntry: TocItem | undefined;
+  sidebarSections: SidebarSection[];
+  html: string;
+  frontmatter: Record<string, unknown> & { imports?: string[] };
+  pageToc: PageTocItem[];
+};
 
 export const Route = createFileRoute("/docs/$slugId")({
   head: ({ loaderData }) => {
-    const frontmatter = loaderData?.frontmatter as
-      | Record<string, unknown>
-      | undefined;
-    const rawMarkdown = loaderData?.doc?.content ?? "";
+    const data = loaderData as DocsLoaderData | undefined;
+    const frontmatter = data?.frontmatter;
+    const rawMarkdown = data?.doc?.content ?? "";
     const title = getMarkdownTitle({ rawMarkdown, frontmatter });
     const description = getMarkdownDescription({ rawMarkdown, frontmatter });
-    const canonicalUrl = loaderData?.doc?.slug
-      ? buildCanonicalUrl(`/docs/${loaderData.doc.slug}`)
+    const canonicalUrl = data?.doc?.slug
+      ? buildCanonicalUrl(`/docs/${data.doc.slug}`)
       : buildCanonicalUrl("/docs");
     const ogImage = resolveOgImage(frontmatter);
     const ogMeta = extractOgMeta(frontmatter);
@@ -210,7 +224,7 @@ export const Route = createFileRoute("/docs/$slugId")({
       ],
     };
   },
-  loader: async ({ params }) => {
+  loader: (async ({ params }: { params: { slugId: string } }) => {
     const doc = docsBySlug[params.slugId];
 
     if (!doc) {
@@ -232,13 +246,13 @@ export const Route = createFileRoute("/docs/$slugId")({
       frontmatter: parsedMarkdown.frontmatter,
       pageToc,
     };
-  },
+  }) as any,
   component: DocsPage,
 });
 
 function DocsPage() {
   const { doc, sidebarSections, html, frontmatter, pageToc } =
-    Route.useLoaderData();
+    Route.useLoaderData() as DocsLoaderData;
   const navRoutes = buildDocsNavRoutes(tableOfContents as Toc);
   const editUrl = `https://github.com/opral/lix/blob/main/packages/website/content/docs/${doc.relativePath.replace(
     /^\.\//,
@@ -247,7 +261,6 @@ function DocsPage() {
 
   return (
     <DocsLayout
-      toc={tableOfContents as Toc}
       sidebarSections={sidebarSections}
       activeRelativePath={doc.relativePath}
       pageToc={pageToc}
