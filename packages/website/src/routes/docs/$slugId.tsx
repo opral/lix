@@ -12,6 +12,16 @@ import {
   normalizeRelativePath,
   type Toc,
 } from "../../lib/build-doc-map";
+import {
+  buildCanonicalUrl,
+  buildBreadcrumbJsonLd,
+  buildWebPageJsonLd,
+  extractOgMeta,
+  extractTwitterMeta,
+  getMarkdownDescription,
+  getMarkdownTitle,
+  resolveOgImage,
+} from "../../lib/seo";
 import { parse } from "@opral/markdown-wc";
 import markdownPageCss from "../../components/markdown-page.style.css?url";
 
@@ -99,14 +109,93 @@ function buildSidebarSections(toc: Toc): SidebarSection[] {
 }
 
 export const Route = createFileRoute("/docs/$slugId")({
-  head: () => ({
-    links: [
+  head: ({ loaderData }) => {
+    const frontmatter = loaderData?.frontmatter as
+      | Record<string, unknown>
+      | undefined;
+    const rawMarkdown = loaderData?.doc?.content ?? "";
+    const title = getMarkdownTitle({ rawMarkdown, frontmatter });
+    const description = getMarkdownDescription({ rawMarkdown, frontmatter });
+    const canonicalUrl = loaderData?.doc?.slug
+      ? buildCanonicalUrl(`/docs/${loaderData.doc.slug}`)
+      : buildCanonicalUrl("/docs");
+    const ogImage = resolveOgImage(frontmatter);
+    const ogMeta = extractOgMeta(frontmatter);
+    const twitterMeta = extractTwitterMeta(frontmatter);
+    const pageTitle = title
+      ? `${title} | Lix Documentation`
+      : "Lix Documentation";
+    const jsonLd = buildWebPageJsonLd({
+      title: pageTitle,
+      description,
+      canonicalUrl,
+      image: ogImage.url,
+    });
+    const breadcrumbJsonLd = buildBreadcrumbJsonLd(
+      [
+        { name: "Lix", item: buildCanonicalUrl("/") },
+        { name: "Documentation", item: buildCanonicalUrl("/docs") },
+        title ? { name: title, item: canonicalUrl } : undefined,
+      ].filter(Boolean) as Array<{ name: string; item: string }>,
+    );
+    const meta: Array<
+      | { title: string }
+      | { name: string; content: string }
+      | { property: string; content: string }
+    > = [
       {
-        rel: "stylesheet",
-        href: markdownPageCss,
+        title: pageTitle,
       },
-    ],
-  }),
+      { property: "og:url", content: canonicalUrl },
+      { property: "og:type", content: "article" },
+      { property: "og:site_name", content: "Lix" },
+      { property: "og:locale", content: "en_US" },
+      { property: "og:image", content: ogImage.url },
+      { property: "og:image:alt", content: ogImage.alt },
+      { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:image", content: ogImage.url },
+      { name: "twitter:image:alt", content: ogImage.alt },
+    ];
+
+    if (description) {
+      meta.push(
+        { name: "description", content: description },
+        { property: "og:description", content: description },
+        { name: "twitter:description", content: description },
+      );
+    }
+
+    if (title) {
+      meta.push(
+        { property: "og:title", content: pageTitle },
+        { name: "twitter:title", content: pageTitle },
+      );
+    }
+
+    return {
+      meta: [...meta, ...ogMeta, ...twitterMeta],
+      links: [
+        {
+          rel: "stylesheet",
+          href: markdownPageCss,
+        },
+        {
+          rel: "canonical",
+          href: canonicalUrl,
+        },
+      ],
+      scripts: [
+        {
+          type: "application/ld+json",
+          children: JSON.stringify(jsonLd),
+        },
+        {
+          type: "application/ld+json",
+          children: JSON.stringify(breadcrumbJsonLd),
+        },
+      ],
+    };
+  },
   loader: async ({ params }) => {
     const doc = docsBySlug[params.slugId];
 

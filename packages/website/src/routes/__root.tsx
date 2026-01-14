@@ -12,13 +12,33 @@ export const Route = createRootRoute({
         content: "width=device-width, initial-scale=1",
       },
       {
-        title: "lix | Documentation",
+        title: "Lix",
+      },
+      {
+        name: "theme-color",
+        content: "#ffffff",
+      },
+      {
+        name: "robots",
+        content: "index, follow",
       },
     ],
     links: [
       {
         rel: "stylesheet",
         href: appCss,
+      },
+      {
+        rel: "icon",
+        href: "/favicon.ico",
+      },
+      {
+        rel: "apple-touch-icon",
+        href: "/logo192.png",
+      },
+      {
+        rel: "manifest",
+        href: "/manifest.json",
       },
     ],
   }),
