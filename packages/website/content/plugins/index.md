@@ -5,7 +5,7 @@ Plugins define how Lix tracks changes in different file formats. Learn more abou
 ## Available plugins
 
 | File type        | Plugin                                            |
-| --------------- | ------------------------------------------------- |
+| ---------------- | ------------------------------------------------- |
 | `*.json`         | [JSON Plugin](/plugins/plugin_json)               |
 | `*.csv`          | [CSV Plugin](/plugins/lix_plugin_csv)             |
 | `*.md`           | [Markdown Plugin](/plugins/plugin_md)             |

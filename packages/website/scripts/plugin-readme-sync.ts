@@ -20,6 +20,7 @@ function rewriteRelativeImages(markdown: string, readmeUrl: string) {
   return markdown.replace(
     /!\[([^\]]*)\]\((?!https?:\/\/)([^)]+)\)/g,
     (match, alt, url) => {
+      void match;
       const normalized = url.replace(/^\.?\//, "");
       return `![${alt}](${base}${normalized})`;
     },
@@ -65,10 +66,7 @@ async function loadRegistry(registryPath: string): Promise<PluginRegistry> {
  * @example
  * await syncPluginReadmes(registry, "/content/plugins");
  */
-async function syncPluginReadmes(
-  registry: PluginRegistry,
-  contentDir: string,
-) {
+async function syncPluginReadmes(registry: PluginRegistry, contentDir: string) {
   const plugins = Array.isArray(registry.plugins) ? registry.plugins : [];
   await mkdir(contentDir, { recursive: true });
 

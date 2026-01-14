@@ -33,7 +33,8 @@ export function DocsPrevNext({
   if (currentIndex === -1 || routes.length <= 1) return null;
 
   const prev = currentIndex > 0 ? routes[currentIndex - 1] : null;
-  const next = currentIndex < routes.length - 1 ? routes[currentIndex + 1] : null;
+  const next =
+    currentIndex < routes.length - 1 ? routes[currentIndex + 1] : null;
 
   if (!prev && !next) return null;
 
@@ -42,7 +43,8 @@ export function DocsPrevNext({
       <div>
         {prev && (
           <Link
-            to={`/docs/${prev.slug}`}
+            to="/docs/$slugId"
+            params={{ slugId: prev.slug }}
             className="group block rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
           >
             <span className="text-sm text-slate-400">Previous</span>
@@ -55,7 +57,8 @@ export function DocsPrevNext({
       <div>
         {next && (
           <Link
-            to={`/docs/${next.slug}`}
+            to="/docs/$slugId"
+            params={{ slugId: next.slug }}
             className="group block rounded-xl border border-slate-200 p-4 text-right transition-colors hover:border-slate-300"
           >
             <span className="text-sm text-slate-400">Next</span>

@@ -51,13 +51,19 @@ function loadPluginMarkdown(pluginKey: string): string | undefined {
   return pluginMarkdown[`/content/plugins/${pluginKey}.md`];
 }
 
+type PluginLoaderData = {
+  html: string;
+  frontmatter: Record<string, unknown> & { imports?: string[] };
+  markdown: string;
+  plugin: PluginEntry;
+};
+
 export const Route = createFileRoute("/plugins/$pluginKey")({
   head: ({ loaderData }) => {
-    const frontmatter = loaderData?.frontmatter as
-      | Record<string, unknown>
-      | undefined;
-    const rawMarkdown = loaderData?.markdown ?? "";
-    const plugin = loaderData?.plugin;
+    const data = loaderData as PluginLoaderData | undefined;
+    const frontmatter = data?.frontmatter;
+    const rawMarkdown = data?.markdown ?? "";
+    const plugin = data?.plugin;
     const fallbackTitle = plugin?.name;
     const fallbackDescription = plugin?.description;
     const title =
@@ -65,8 +71,8 @@ export const Route = createFileRoute("/plugins/$pluginKey")({
     const description =
       getMarkdownDescription({ rawMarkdown, frontmatter }) ??
       fallbackDescription;
-    const canonicalUrl = loaderData?.plugin?.key
-      ? buildCanonicalUrl(`/plugins/${loaderData.plugin.key}`)
+    const canonicalUrl = data?.plugin?.key
+      ? buildCanonicalUrl(`/plugins/${data.plugin.key}`)
       : buildCanonicalUrl("/plugins");
     const ogImage = resolveOgImage(frontmatter);
     const ogMeta = extractOgMeta(frontmatter);
@@ -141,7 +147,7 @@ export const Route = createFileRoute("/plugins/$pluginKey")({
       ],
     };
   },
-  loader: async ({ params }) => {
+  loader: (async ({ params }: { params: { pluginKey: string } }) => {
     const plugin = findPluginEntry(params.pluginKey);
     if (!plugin) {
       throw notFound();
@@ -159,7 +165,7 @@ export const Route = createFileRoute("/plugins/$pluginKey")({
       markdown,
       plugin,
     };
-  },
+  }) as any,
   component: PluginPage,
 });
 
@@ -170,12 +176,12 @@ export const Route = createFileRoute("/plugins/$pluginKey")({
  * <PluginPage />
  */
 function PluginPage() {
-  const { html, frontmatter, markdown } = Route.useLoaderData();
+  const { html, frontmatter, markdown } =
+    Route.useLoaderData() as PluginLoaderData;
   const { pluginKey } = Route.useParams();
 
   return (
     <DocsLayout
-      toc={{ sidebar: [] }}
       sidebarSections={buildPluginSidebarSections(pluginRegistry)}
       activeRelativePath={pluginKey}
     >

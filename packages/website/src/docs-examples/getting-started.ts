@@ -77,4 +77,3 @@ export default async function runExample(console: any) {
 
 // outcomment for running in node
 // runExample(console);
-

@@ -48,7 +48,7 @@ const versionA = await createVersion({ lix, name: "agent-a-campaign" });
 const versionB = await createVersion({ lix, name: "agent-b-campaign" });
 
 // Let agents work autonomously with their own strategies
-agentA.createAdvertisements(versionA), agentB.createAdvertisements(versionB);
+(agentA.createAdvertisements(versionA), agentB.createAdvertisements(versionB));
 
 // Compare performance and merge the winner
 const winner = await determineWinner(versionA, versionB);
@@ -98,9 +98,9 @@ Versions let you work with different states of your data in isolation. Here's a 
 
 ## API reference quick-links
 
-| Function / Type      | Purpose                     | Docs                                        |
-| -------------------- | --------------------------- | ------------------------------------------- |
-| `createVersion()`    | Create a new version branch | API reference                            |
-| `switchVersion()`    | Change active version       | API reference                            |
-| `createCheckpoint()` | Create a labeled commit     | API reference                            |
-| `LixVersion`         | Version type definition     | API reference                            |
+| Function / Type      | Purpose                     | Docs          |
+| -------------------- | --------------------------- | ------------- |
+| `createVersion()`    | Create a new version branch | API reference |
+| `switchVersion()`    | Change active version       | API reference |
+| `createCheckpoint()` | Create a labeled commit     | API reference |
+| `LixVersion`         | Version type definition     | API reference |

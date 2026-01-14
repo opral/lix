@@ -63,7 +63,9 @@ export function getMarkdownDescription(input: MarkdownMetaInput) {
   return extractMarkdownDescription(input.rawMarkdown);
 }
 
-export function extractOgMeta(frontmatter?: Record<string, unknown>): MetaEntry[] {
+export function extractOgMeta(
+  frontmatter?: Record<string, unknown>,
+): MetaEntry[] {
   if (!frontmatter) return [];
   return Object.entries(frontmatter)
     .filter(

@@ -103,7 +103,7 @@ await lix.db
         theme: "light",
         notifications: true,
         language: "en",
-      })
+      }),
     ),
   })
   .execute();
@@ -122,7 +122,7 @@ await lix.db
         theme: "dark",
         notifications: true,
         language: "en",
-      })
+      }),
     ),
   })
   .where("path", "=", "/config.json")
