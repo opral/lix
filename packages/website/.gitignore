@@ -14,3 +14,4 @@ count.txt
 todos.json
 content/plugins/*.md
 !content/plugins/index.md
+*.gen.*
