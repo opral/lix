@@ -14,9 +14,9 @@
     "@lix-js/sdk": "workspace:*",
     "@cloudflare/vite-plugin": "^1.13.8",
     "@tailwindcss/vite": "^4.0.6",
-    "@tanstack/react-router": "^1.132.0",
-    "@tanstack/react-start": "^1.132.0",
-    "@tanstack/router-plugin": "^1.132.0",
+    "@tanstack/react-router": "^1.150.0",
+    "@tanstack/react-start": "^1.150.0",
+    "@tanstack/router-plugin": "^1.150.0",
     "@opral/markdown-wc": "0.8.1",
     "lucide-react": "^0.544.0",
     "react": "^19.2.0",
@@ -26,7 +26,6 @@
     "vite-tsconfig-paths": "^5.1.4"
   },
   "devDependencies": {
-    "@tanstack/devtools-vite": "^0.3.11",
     "@testing-library/dom": "^10.4.0",
     "@testing-library/react": "^16.2.0",
     "@types/node": "^22.10.2",
