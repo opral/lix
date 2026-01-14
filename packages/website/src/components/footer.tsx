@@ -1,32 +1,49 @@
+import { getGithubStars } from "../github-stars-cache";
+
 const footerLinks = [
-  { href: "/docs", label: "Go to Docs", emoji: "📘" },
-  { href: "https://discord.gg/gdMPPWy57R", label: "Join Discord", emoji: "💬" },
-  {
-    href: "https://github.com/opral/lix-sdk",
-    label: "Visit GitHub",
-    emoji: "🐙",
-  },
-  {
-    href: "https://opral.substack.com/t/lix",
-    label: "Read Substack",
-    emoji: "→",
-  },
+  { href: "/docs", label: "Docs", emoji: "📘" },
+  { href: "/blog", label: "Blog", emoji: "📝" },
+  { href: "https://discord.gg/gdMPPWy57R", label: "Discord", emoji: "💬" },
 ];
 
 export function Footer() {
+  const githubStars = getGithubStars("opral/lix");
+
+  const formatStars = (count: number) => {
+    if (count >= 1000) {
+      return `${(count / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+    }
+    return count.toString();
+  };
+
   return (
     <footer className="bg-white">
-      <div className="flex flex-col gap-3 px-6 py-14 sm:flex-row sm:justify-center sm:gap-6">
-        {footerLinks.map((link) => (
+      <div className="border-t border-gray-200">
+        <div className="flex flex-col gap-3 px-6 py-10 sm:flex-row sm:justify-center sm:gap-8">
+          {footerLinks.map((link) => (
+            <a
+              key={link.href}
+              href={link.href}
+              className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
+            >
+              <span aria-hidden>{link.emoji}</span>
+              {link.label}
+            </a>
+          ))}
           <a
-            key={link.href}
-            href={link.href}
-            className="inline-flex items-center justify-center gap-2 text-base font-medium text-gray-700 transition-colors hover:text-[#0692B6]"
+            href="https://github.com/opral/lix"
+            className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
+            title={githubStars ? `${githubStars.toLocaleString()} GitHub stars` : "Star us on GitHub"}
           >
-            <span aria-hidden>{link.emoji}</span>
-            {link.label}
+            <span aria-hidden>⭐</span>
+            Star on GitHub
+            {githubStars !== null && (
+              <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-semibold text-gray-600">
+                {formatStars(githubStars)}
+              </span>
+            )}
           </a>
-        ))}
+        </div>
       </div>
     </footer>
   );

@@ -931,7 +931,7 @@ function LandingPage() {
           <div className="relative max-w-4xl mx-auto text-center">
             {/* Beta Chip */}
             <a
-              href="https://github.com/opral/lix-sdk/issues/374"
+              href="https://github.com/opral/lix/issues/374"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 mb-6 px-3 py-1.5 rounded-full bg-amber-50 border border-amber-200 text-sm text-amber-800 hover:bg-amber-100 transition-colors"
@@ -1045,7 +1045,7 @@ function LandingPage() {
                 </svg>
               </a>
               <a
-                href="https://github.com/opral/lix-sdk"
+                href="https://github.com/opral/lix"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex h-11 items-center justify-center gap-2 px-5 rounded-lg border border-gray-300 bg-white text-sm text-gray-800 transition-colors duration-200 hover:bg-gray-50"
@@ -1071,7 +1071,7 @@ function LandingPage() {
                       JavaScript
                     </button>
                     <a
-                      href="https://github.com/opral/lix-sdk/issues/370"
+                      href="https://github.com/opral/lix/issues/370"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-2 text-gray-400 py-3 px-1 hover:text-gray-600 transition-colors cursor-pointer"
@@ -1080,7 +1080,7 @@ function LandingPage() {
                       Python
                     </a>
                     <a
-                      href="https://github.com/opral/lix-sdk/issues/371"
+                      href="https://github.com/opral/lix/issues/371"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-2 text-gray-400 py-3 px-1 hover:text-gray-600 transition-colors cursor-pointer"
@@ -1089,7 +1089,7 @@ function LandingPage() {
                       Rust
                     </a>
                     <a
-                      href="https://github.com/opral/lix-sdk/issues/373"
+                      href="https://github.com/opral/lix/issues/373"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-2 text-gray-400 py-3 px-1 hover:text-gray-600 transition-colors cursor-pointer"
@@ -1439,7 +1439,7 @@ function LandingPage() {
                       JavaScript
                     </button>
                     <a
-                      href="https://github.com/opral/lix-sdk/issues/370"
+                      href="https://github.com/opral/lix/issues/370"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-2 text-gray-500 py-3 px-1 hover:text-gray-700 transition-colors cursor-pointer"
@@ -1448,7 +1448,7 @@ function LandingPage() {
                       Python
                     </a>
                     <a
-                      href="https://github.com/opral/lix-sdk/issues/371"
+                      href="https://github.com/opral/lix/issues/371"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-2 text-gray-500 py-3 px-1 hover:text-gray-700 transition-colors cursor-pointer"
@@ -1457,7 +1457,7 @@ function LandingPage() {
                       Rust
                     </a>
                     <a
-                      href="https://github.com/opral/lix-sdk/issues/373"
+                      href="https://github.com/opral/lix/issues/373"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="flex items-center gap-2 text-gray-500 py-3 px-1 hover:text-gray-700 transition-colors cursor-pointer"

@@ -7,7 +7,7 @@ npm install @lix-js/sdk @lix-js/plugin-json
 ```
 
 > [!NOTE]
-> Lix is currently **JavaScript/TypeScript only**. Upvote [Python](https://github.com/opral/lix-sdk/issues/370), [Rust](https://github.com/opral/lix-sdk/issues/371), or [Go](https://github.com/opral/lix-sdk/issues/373) to prioritize other languages.
+> Lix is currently **JavaScript/TypeScript only**. Upvote [Python](https://github.com/opral/lix/issues/370), [Rust](https://github.com/opral/lix/issues/371), or [Go](https://github.com/opral/lix/issues/373) to prioritize other languages.
 
 ## Step 1: Open a Lix with plugins
 
@@ -103,7 +103,7 @@ await lix.db
         theme: "light",
         notifications: true,
         language: "en",
-      }),
+      })
     ),
   })
   .execute();
@@ -122,7 +122,7 @@ await lix.db
         theme: "dark",
         notifications: true,
         language: "en",
-      }),
+      })
     ),
   })
   .where("path", "=", "/config.json")
