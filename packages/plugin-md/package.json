@@ -27,9 +27,9 @@
 	"_comment": "Required for tree-shaking https://webpack.js.org/guides/tree-shaking/#mark-the-file-as-side-effect-free",
 	"sideEffects": false,
 	"dependencies": {
-		"@lix-js/html-diff": "workspace:*",
+		"@lix-js/html-diff": "0.1.0",
 		"@lix-js/sdk": "workspace:*",
-		"@opral/markdown-wc": "0.6.0",
+		"@opral/markdown-wc": "0.8.1",
 		"@sanity/diff-match-patch": "^3.1.0",
 		"character-entities": "^2.0.2",
 		"lit": "^3.2.1"

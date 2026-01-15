@@ -111,6 +111,7 @@ export function MarkdownPage({
   const [copyStatus, setCopyStatus] = useState<CopyStatus>("idle");
 
   useEffect(() => {
+    // @ts-expect-error - JS-only module
     import("./markdown-page.interactive.js");
   }, [html]);
 
@@ -120,7 +121,7 @@ export function MarkdownPage({
     for (const url of imports) {
       if (!url) continue;
       const existing = document.querySelector(
-        `script[data-mdwc-import="${url}"]`
+        `script[data-mdwc-import="${url}"]`,
       );
       if (existing) continue;
 
@@ -146,7 +147,7 @@ export function MarkdownPage({
   };
 
   return (
-    <article className="markdown-body">
+    <article className="markdown-wc-body">
       {title && (
         <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <h1 className="text-[28px] font-semibold leading-10 tracking-[-0.02em] text-slate-900">

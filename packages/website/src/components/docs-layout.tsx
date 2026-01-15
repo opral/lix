@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import type { Toc } from "../lib/build-doc-map";
+import { Footer } from "./footer";
 import { Header, MenuIcon } from "./header";
 
 export type SidebarSection = {
@@ -37,13 +37,11 @@ export type PageTocItem = {
  * </DocsLayout>
  */
 export function DocsLayout({
-  toc,
   sidebarSections,
   activeRelativePath,
   pageToc,
   children,
 }: {
-  toc: Toc;
   sidebarSections: SidebarSection[];
   activeRelativePath?: string;
   pageToc?: PageTocItem[];
@@ -232,6 +230,7 @@ export function DocsLayout({
           )}
         </div>
       </div>
+      <Footer />
     </div>
   );
 }

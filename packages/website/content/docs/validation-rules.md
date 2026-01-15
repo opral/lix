@@ -4,8 +4,8 @@
 >
 > Validation rules are a proposed feature. If you're interested in using validation rules:
 >
-> - **Upvote the proposal:** [github.com/opral/lix-sdk/issues/239](https://github.com/opral/lix-sdk/issues/239)
-> - **Watch the demo:** See validation rules in action in the [issue's demo video](https://github.com/opral/lix-sdk/issues/239)
+> - **Upvote the proposal:** [github.com/opral/lix/issues/239](https://github.com/opral/lix/issues/239)
+> - **Watch the demo:** See validation rules in action in the [issue's demo video](https://github.com/opral/lix/issues/239)
 
 Validation rules automatically catch mistakes—enabling agents and humans to self-fix issues.
 

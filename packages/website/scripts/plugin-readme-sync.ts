@@ -13,13 +13,14 @@ type PluginRegistry = {
  * Rewrites relative image links to absolute GitHub raw URLs.
  *
  * @example
- * rewriteRelativeImages("![Alt](./assets/img.png)", "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-md/README.md")
+ * rewriteRelativeImages("![Alt](./assets/img.png)", "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-md/README.md")
  */
 function rewriteRelativeImages(markdown: string, readmeUrl: string) {
   const base = readmeUrl.replace(/\/README\.md$/, "/");
   return markdown.replace(
     /!\[([^\]]*)\]\((?!https?:\/\/)([^)]+)\)/g,
     (match, alt, url) => {
+      void match;
       const normalized = url.replace(/^\.?\//, "");
       return `![${alt}](${base}${normalized})`;
     },
@@ -30,7 +31,7 @@ function rewriteRelativeImages(markdown: string, readmeUrl: string) {
  * Rewrites relative links to GitHub tree URLs.
  *
  * @example
- * rewriteRelativeLinks("[Example](./example)", "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-md/README.md")
+ * rewriteRelativeLinks("[Example](./example)", "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-md/README.md")
  */
 function rewriteRelativeLinks(markdown: string, readmeUrl: string) {
   const repoBase = readmeUrl
@@ -65,10 +66,7 @@ async function loadRegistry(registryPath: string): Promise<PluginRegistry> {
  * @example
  * await syncPluginReadmes(registry, "/content/plugins");
  */
-async function syncPluginReadmes(
-  registry: PluginRegistry,
-  contentDir: string,
-) {
+async function syncPluginReadmes(registry: PluginRegistry, contentDir: string) {
   const plugins = Array.isArray(registry.plugins) ? registry.plugins : [];
   await mkdir(contentDir, { recursive: true });
 
