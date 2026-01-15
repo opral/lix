@@ -7,10 +7,10 @@
       "package": "@lix-js/plugin-json",
       "description": "Tracks JSON files with JSON Pointer entities",
       "file_types": ["*.json"],
-      "readme": "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-json/README.md",
+      "readme": "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-json/README.md",
       "links": {
         "npm": "https://www.npmjs.com/package/@lix-js/plugin-json",
-        "github": "https://github.com/opral/monorepo/tree/main/packages/lix/plugin-json",
+        "github": "https://github.com/opral/lix/tree/main/packages/plugin-json",
         "docs": "/plugins/plugin_json"
       }
     },
@@ -20,10 +20,10 @@
       "package": "@lix-js/plugin-csv",
       "description": "Tracks CSV files with row-level entities",
       "file_types": ["*.csv"],
-      "readme": "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-csv/README.md",
+      "readme": "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-csv/README.md",
       "links": {
         "npm": "https://www.npmjs.com/package/@lix-js/plugin-csv",
-        "github": "https://github.com/opral/monorepo/tree/main/packages/lix/plugin-csv",
+        "github": "https://github.com/opral/lix/tree/main/packages/plugin-csv",
         "docs": "/plugins/lix_plugin_csv"
       }
     },
@@ -33,10 +33,10 @@
       "package": "@lix-js/plugin-md",
       "description": "Tracks Markdown files using markdown-wc AST",
       "file_types": ["*.md"],
-      "readme": "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-md/README.md",
+      "readme": "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-md/README.md",
       "links": {
         "npm": "https://www.npmjs.com/package/@lix-js/plugin-md",
-        "github": "https://github.com/opral/monorepo/tree/main/packages/lix/plugin-md",
+        "github": "https://github.com/opral/lix/tree/main/packages/plugin-md",
         "docs": "/plugins/plugin_md"
       }
     },
@@ -46,10 +46,10 @@
       "package": "@lix-js/plugin-prosemirror",
       "description": "Tracks rich text edits in ProseMirror documents",
       "file_types": ["/prosemirror.json"],
-      "readme": "https://raw.githubusercontent.com/opral/monorepo/main/packages/lix/plugin-prosemirror/README.md",
+      "readme": "https://raw.githubusercontent.com/opral/lix/main/packages/plugin-prosemirror/README.md",
       "links": {
         "npm": "https://www.npmjs.com/package/@lix-js/plugin-prosemirror",
-        "github": "https://github.com/opral/monorepo/tree/main/packages/lix/plugin-prosemirror",
+        "github": "https://github.com/opral/lix/tree/main/packages/plugin-prosemirror",
         "docs": "/plugins/plugin_prosemirror",
         "example": "https://prosemirror-example.onrender.com/"
       }

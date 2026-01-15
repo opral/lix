@@ -15,7 +15,7 @@
 		"@lix-js/plugin-prosemirror": "workspace:*",
 		"@lix-js/react-utils": "workspace:*",
 		"@lix-js/sdk": "workspace:*",
-		"@lix-js/html-diff": "workspace:*",
+		"@lix-js/html-diff": "0.1.0",
 		"@portabletext/editor": "^1.47.7",
 		"@portabletext/react": "^3.2.1",
 		"@portabletext/types": "^2.0.13",

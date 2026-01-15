@@ -26,10 +26,13 @@ const docs = import.meta.glob<string>("/content/docs/**/*.md", {
 });
 
 const { bySlug: docsBySlug } = buildDocMaps(docs);
-const docsByRelativePath = Object.values(docsBySlug).reduce((acc, doc) => {
-  acc[doc.relativePath] = doc;
-  return acc;
-}, {} as Record<string, (typeof docsBySlug)[string]>);
+const docsByRelativePath = Object.values(docsBySlug).reduce(
+  (acc, doc) => {
+    acc[doc.relativePath] = doc;
+    return acc;
+  },
+  {} as Record<string, (typeof docsBySlug)[string]>,
+);
 
 export const Route = createFileRoute("/docs/")({
   loader: () => {

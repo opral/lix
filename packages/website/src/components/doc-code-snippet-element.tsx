@@ -31,7 +31,10 @@ function parseSectionsAttribute(value: string | null): string[] | undefined {
   if (trimmed.startsWith("[")) {
     return JSON.parse(trimmed) as string[];
   }
-  return trimmed.split(",").map((s) => s.trim()).filter(Boolean);
+  return trimmed
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 class DocCodeSnippetElement extends HTMLElement {

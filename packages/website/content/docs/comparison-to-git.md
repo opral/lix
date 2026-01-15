@@ -1,7 +1,5 @@
 # Comparison to Git
 
-**Lix is not a Git replacement.** It's designed for files other than source code and built to be embedded in applications.
-
 The fundamental difference between Git and Lix:
 
 - **Git**: "line 5 changed"
@@ -9,17 +7,12 @@ The fundamental difference between Git and Lix:
 
 Git tracks text line-by-line. Lix is schema-aware - it understands data structure. This means tracking specific fields (price, email, status) instead of arbitrary line numbers.
 
-| Git              | Lix                         |
-| :--------------- | :-------------------------- |
-| Source code      | Any file format             |
-| Line-based diffs | Schema-aware diffs          |
-| CLI tool         | SDK                         |
-
-## When to Use Git vs Lix
-
-**Use Git for source code.** Git is purpose-built for software engineering and developer workflows.
-
-**Use Lix for everything else.** Structured data like JSON, CSV, Excel, or any non-code file format.
+|              | Git                       | Lix             |
+| :----------- | :------------------------ | :-------------- |
+| Diffs        | Line-based                | Schema-aware    |
+| File formats | Text                      | Any via plugins |
+| Metadata     | External (GitHub, GitLab) | In the repo     |
+| Interface    | CLI                       | SDK             |
 
 ## Key Differences
 
@@ -81,6 +74,20 @@ Plugins can handle JSON, CSV, Excel, PDFs, design files, or proprietary formats.
 - **Runs anywhere**: Browsers, Node.js, edge functions, Web Workers
 - **SQL queries**: Query change history programmatically instead of parsing CLI output
 - **Portable storage**: `.lix` files (SQLite) can be stored in OPFS, S3, database columns, or in-memory
+
+### 4. Metadata Lives in the Repo
+
+**Git** stores only file content and commits. Everything else—pull requests, code reviews, discussions, CI rules—lives in external services like GitHub or GitLab.
+
+**Lix** stores all metadata directly in the repo:
+
+- **Change proposals**: The equivalent of pull requests, stored as data in the repo
+- **Discussions**: Conversations and comments attached to changes
+- **Automation rules**: Validation, formatting, and workflow rules travel with the repo
+
+All data is co-located and queryable via SQL—making it directly accessible to agents and automation without requiring API integrations to external services.
+
+### 5. SQL-Queryable History
 
 ```typescript
 // Time-travel: query file history from a specific commit

@@ -1,5 +1,5 @@
 > [!NOTE]
-> This page is mirrored from [packages/lix/react-utils](https://github.com/opral/monorepo/tree/main/packages/lix/react-utils).
+> This page is mirrored from [packages/lix/react-utils](https://github.com/opral/lix/tree/main/packages/react-utils).
 
 # @lix-js/react-utils
 
@@ -30,13 +30,13 @@ import { LixProvider } from "@lix-js/react-utils";
 import { openLix } from "@lix-js/sdk";
 
 async function bootstrap() {
-	const lix = await openLix({});
-	const root = createRoot(document.getElementById("root")!);
-	root.render(
-		<LixProvider lix={lix}>
-			<App />
-		</LixProvider>,
-	);
+  const lix = await openLix({});
+  const root = createRoot(document.getElementById("root")!);
+  root.render(
+    <LixProvider lix={lix}>
+      <App />
+    </LixProvider>,
+  );
 }
 
 bootstrap();
@@ -52,29 +52,29 @@ import { ErrorBoundary } from "react-error-boundary";
 import { useQuery } from "@lix-js/react-utils";
 
 function KeyValueList() {
-	const rows = useQuery(({ lix }) =>
-		lix.db.selectFrom("key_value").where("key", "like", "demo_%").selectAll(),
-	);
+  const rows = useQuery(({ lix }) =>
+    lix.db.selectFrom("key_value").where("key", "like", "demo_%").selectAll(),
+  );
 
-	return (
-		<ul>
-			{rows.map((r) => (
-				<li key={r.key}>
-					{r.key}: {r.value}
-				</li>
-			))}
-		</ul>
-	);
+  return (
+    <ul>
+      {rows.map((r) => (
+        <li key={r.key}>
+          {r.key}: {r.value}
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 export function Page() {
-	return (
-		<Suspense fallback={<div>Loading…</div>}>
-			<ErrorBoundary fallbackRender={() => <div>Failed to load.</div>}>
-				<KeyValueList />
-			</ErrorBoundary>
-		</Suspense>
-	);
+  return (
+    <Suspense fallback={<div>Loading…</div>}>
+      <ErrorBoundary fallbackRender={() => <div>Failed to load.</div>}>
+        <KeyValueList />
+      </ErrorBoundary>
+    </Suspense>
+  );
 }
 ```
 
@@ -83,7 +83,7 @@ Options
 ```tsx
 // One-time execution (no live updates)
 const rows = useQuery(({ lix }) => lix.db.selectFrom("config").selectAll(), {
-	subscribe: false,
+  subscribe: false,
 });
 ```
 
@@ -100,21 +100,21 @@ When you want just one row:
 
 ```tsx
 import {
-	useQueryTakeFirst,
-	useQueryTakeFirstOrThrow,
+  useQueryTakeFirst,
+  useQueryTakeFirstOrThrow,
 } from "@lix-js/react-utils";
 
 // First row or undefined
 const file = useQueryTakeFirst(({ lix }) =>
-	lix.db.selectFrom("file").select(["id", "path"]).where("id", "=", fileId),
+  lix.db.selectFrom("file").select(["id", "path"]).where("id", "=", fileId),
 );
 
 // First row or throw (suspends, then throws to ErrorBoundary if not found)
 const activeVersion = useQueryTakeFirstOrThrow(({ lix }) =>
-	lix.db
-		.selectFrom("active_version")
-		.innerJoin("version", "version.id", "active_version.version_id")
-		.selectAll("version"),
+  lix.db
+    .selectFrom("active_version")
+    .innerJoin("version", "version.id", "active_version.version_id")
+    .selectAll("version"),
 );
 ```
 
@@ -126,9 +126,9 @@ This package aligns with the SDK’s object-arg convention:
 import { selectWorkingDiff } from "@lix-js/sdk";
 
 const rows = useQuery(({ lix }) =>
-	selectWorkingDiff({ lix })
-		.where("diff.status", "!=", "unchanged")
-		.orderBy("diff.entity_id"),
+  selectWorkingDiff({ lix })
+    .where("diff.status", "!=", "unchanged")
+    .orderBy("diff.entity_id"),
 );
 ```
 
@@ -146,8 +146,8 @@ See the guide for the pattern, pitfalls, and a decision matrix:
 import { LixProvider, useLix } from "@lix-js/react-utils";
 
 function NeedsLix() {
-	const lix = useLix(); // same instance passed to LixProvider
-	// …
+  const lix = useLix(); // same instance passed to LixProvider
+  // …
 }
 ```
 

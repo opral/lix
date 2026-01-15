@@ -11,6 +11,7 @@ export default async function runExample(console: any, sharedLix?: any) {
     schema_key: "json_property",
     file_id: "/example.json",
   };
+  void selectedEntity;
 
   // For demonstration, we'll query an actual entity from the database
   const actualEntity = await lix.db
@@ -56,4 +57,3 @@ export default async function runExample(console: any, sharedLix?: any) {
 
 // Uncomment for running in node
 // runExample(console);
-
