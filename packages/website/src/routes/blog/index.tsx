@@ -1,5 +1,4 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { createServerFn } from "@tanstack/react-start";
 import { parse } from "@opral/markdown-wc";
 import { getBlogDescription, getBlogTitle } from "../../blog/blogMetadata";
 import { Footer } from "../../components/footer";
@@ -24,7 +23,7 @@ const blogJsonFiles = import.meta.glob<string>("../../../../../blog/*.json", {
 });
 const blogRootPrefix = "../../../../../blog/";
 
-const loadBlogIndex = createServerFn({ method: "GET" }).handler(async () => {
+async function loadBlogIndex() {
   const authorsContent = await getBlogJson("authors.json");
   const authorsMap = JSON.parse(authorsContent) as Record<
     string,
@@ -86,7 +85,7 @@ const loadBlogIndex = createServerFn({ method: "GET" }).handler(async () => {
   });
 
   return { posts };
-});
+}
 
 export const Route = createFileRoute("/blog/")({
   loader: async () => {
