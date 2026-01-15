@@ -133,7 +133,9 @@ function RootDocument({ children }: { children: React.ReactNode }) {
   }, []);
 
   const appContent =
-    import.meta.env.PROD && isMounted ? (
+    import.meta.env.PROD &&
+    isMounted &&
+    import.meta.env.VITE_PUBLIC_POSTHOG_KEY ? (
       <PostHogProvider
         apiKey={import.meta.env.VITE_PUBLIC_POSTHOG_KEY}
         options={posthogOptions}
