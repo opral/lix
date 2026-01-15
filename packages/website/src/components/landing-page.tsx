@@ -597,7 +597,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Trace every action of agents
+                    Track every action of agents
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
                     See exactly what an agent did and when. Every file edit,
