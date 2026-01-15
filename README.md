@@ -20,11 +20,11 @@ Lix is the version control system for AI agents. Trace file edits, review diffs,
 
 ## Why Lix
 
-AI agents that modify files are a black box. You can't see what they changed, you can't undo their mistakes, and running them unsupervised is a liability. Lix fixes this with three primitives:
+AI agents modifying files need guardrails. Lix gives you visibility and control over what they actually changed:
 
-- **Trace agent actions** - See exactly what an agent did and when.
-- **Meaningful diffs** - See what actually changed, not noisy line-by-line text.
-- **Isolate tasks in branches** - Propose changes for human review and merge only what's approved.
+- **Trace agent actions** – See exactly what an agent did and when.
+- **Meaningful diffs** – See what actually changed, not noisy line-by-line text.
+- **Isolate tasks in branches** – Propose changes for review and merge only what’s approved.
 
 **Under the hood:** Plugins for any file format, SQL-queryable history, stored as a single portable SQLite file.
 
