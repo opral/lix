@@ -7,12 +7,12 @@ The fundamental difference between Git and Lix:
 
 Git tracks text line-by-line. Lix is schema-aware - it understands data structure. This means tracking specific fields (price, email, status) instead of arbitrary line numbers.
 
-|                  | Git                       | Lix                |
-| :--------------- | :------------------------ | :----------------- |
-| Diffs            | Line-based                | Schema-aware       |
-| File formats     | Text                      | Any via plugins    |
-| Metadata         | External (GitHub, GitLab) | In the repo        |
-| Interface        | CLI                       | SDK                |
+|              | Git                       | Lix             |
+| :----------- | :------------------------ | :-------------- |
+| Diffs        | Line-based                | Schema-aware    |
+| File formats | Text                      | Any via plugins |
+| Metadata     | External (GitHub, GitLab) | In the repo     |
+| Interface    | CLI                       | SDK             |
 
 ## Key Differences
 

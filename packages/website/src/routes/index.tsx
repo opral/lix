@@ -10,10 +10,12 @@ import {
 import markdownPageCss from "../components/markdown-page.style.css?url";
 import readmeMarkdown from "../../../../README.md?raw";
 
-const loadReadmeContent = createServerFn({ method: "GET" }).handler(async () => {
-  const parsed = await parse(readmeMarkdown);
-  return { html: parsed.html };
-});
+const loadReadmeContent = createServerFn({ method: "GET" }).handler(
+  async () => {
+    const parsed = await parse(readmeMarkdown);
+    return { html: parsed.html };
+  },
+);
 
 export const Route = createFileRoute("/")({
   loader: async () => {

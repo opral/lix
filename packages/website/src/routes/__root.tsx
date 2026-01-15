@@ -51,6 +51,23 @@ export const Route = createRootRoute({
         href: "/manifest.json",
       },
     ],
+    scripts: [
+      {
+        type: "application/ld+json",
+        children: JSON.stringify({
+          "@context": "https://schema.org",
+          "@type": "Organization",
+          name: "Lix",
+          url: "https://lix.dev",
+          logo: "https://lix.dev/icon.svg",
+          sameAs: [
+            "https://github.com/opral/lix",
+            "https://x.com/lixCCS",
+            "https://discord.gg/gdMPPWy57R",
+          ],
+        }),
+      },
+    ],
   }),
 
   notFoundComponent: NotFoundPage,
