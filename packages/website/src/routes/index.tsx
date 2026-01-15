@@ -1,12 +1,24 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { createServerFn } from "@tanstack/react-start";
+import { parse } from "@opral/markdown-wc";
 import LandingPage from "../components/landing-page";
 import {
   buildCanonicalUrl,
   buildWebSiteJsonLd,
   resolveOgImage,
 } from "../lib/seo";
+import markdownPageCss from "../components/markdown-page.style.css?url";
+import readmeMarkdown from "../../../../README.md?raw";
+
+const loadReadmeContent = createServerFn({ method: "GET" }).handler(async () => {
+  const parsed = await parse(readmeMarkdown);
+  return { html: parsed.html };
+});
 
 export const Route = createFileRoute("/")({
+  loader: async () => {
+    return await loadReadmeContent();
+  },
   head: () => {
     const title = "Lix - The version control system for AI agents";
     const description =
@@ -37,7 +49,10 @@ export const Route = createFileRoute("/")({
         { name: "twitter:image", content: ogImage.url },
         { name: "twitter:image:alt", content: ogImage.alt },
       ],
-      links: [{ rel: "canonical", href: canonicalUrl }],
+      links: [
+        { rel: "canonical", href: canonicalUrl },
+        { rel: "stylesheet", href: markdownPageCss },
+      ],
       scripts: [
         {
           type: "application/ld+json",
@@ -46,5 +61,10 @@ export const Route = createFileRoute("/")({
       ],
     };
   },
-  component: LandingPage,
+  component: LandingPageWrapper,
 });
+
+function LandingPageWrapper() {
+  const { html } = Route.useLoaderData();
+  return <LandingPage readmeHtml={html} />;
+}

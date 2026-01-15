@@ -3,7 +3,6 @@ import { getGithubStars } from "../github-stars-cache";
 const footerLinks = [
   { href: "/docs", label: "Docs", emoji: "📘" },
   { href: "/blog", label: "Blog", emoji: "📝" },
-  { href: "https://discord.gg/gdMPPWy57R", label: "Discord", emoji: "💬" },
 ];
 
 export function Footer() {
@@ -30,6 +29,18 @@ export function Footer() {
               {link.label}
             </a>
           ))}
+          <a
+            href="https://discord.gg/gdMPPWy57R"
+            className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"
+          >
+            <span aria-hidden>💬</span>
+            Discord
+            <img
+              src="https://img.shields.io/discord/897438559458430986?label=%20&color=f3f4f6&style=flat-square"
+              alt="Discord online members"
+              className="h-4"
+            />
+          </a>
           <a
             href="https://github.com/opral/lix"
             className="inline-flex items-center justify-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-900"

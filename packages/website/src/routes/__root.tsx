@@ -5,9 +5,14 @@ import {
   useRouter,
 } from "@tanstack/react-router";
 import React from "react";
+import { PostHogProvider } from "posthog-js/react";
 import appCss from "../styles.css?url";
 
 const GA_MEASUREMENT_ID = "G-3GEP4W5688";
+const posthogOptions = {
+  api_host: import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+  defaults: "2025-11-30",
+} as const;
 
 export const Route = createRootRoute({
   head: () => ({
@@ -101,6 +106,17 @@ function GoogleAnalytics() {
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
+  const appContent = import.meta.env.PROD ? (
+    <PostHogProvider
+      apiKey={import.meta.env.VITE_PUBLIC_POSTHOG_KEY}
+      options={posthogOptions}
+    >
+      {children}
+    </PostHogProvider>
+  ) : (
+    children
+  );
+
   return (
     <html lang="en">
       <head>
@@ -108,7 +124,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
       </head>
       <body>
         <GoogleAnalytics />
-        {children}
+        {appContent}
         <Scripts />
       </body>
     </html>
