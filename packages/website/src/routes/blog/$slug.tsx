@@ -1,5 +1,4 @@
 import { createFileRoute, Link, redirect } from "@tanstack/react-router";
-import { createServerFn } from "@tanstack/react-start";
 import { parse } from "@opral/markdown-wc";
 import { useEffect, useState } from "react";
 import markdownPageCss from "../../components/markdown-page.style.css?url";
@@ -48,9 +47,7 @@ function calculateReadingTime(text: string): number {
   return Math.max(1, Math.ceil(words / wordsPerMinute));
 }
 
-const loadBlogPost = createServerFn({ method: "GET" }).handler(async (ctx) => {
-  const data = ctx.data as { slug?: string } | undefined;
-  const slug = data?.slug;
+async function loadBlogPost(slug: string) {
   if (!slug) {
     throw new Error("Missing blog slug");
   }
@@ -155,13 +152,12 @@ const loadBlogPost = createServerFn({ method: "GET" }).handler(async (ctx) => {
     prevPost,
     nextPost,
   };
-});
+}
 
 export const Route = createFileRoute("/blog/$slug")({
   loader: async ({ params }) => {
     try {
-      // @ts-expect-error - TanStack Start server function type inference
-      return await loadBlogPost({ data: { slug: params.slug } });
+      return await loadBlogPost(params.slug);
     } catch {
       throw redirect({ to: "/blog" });
     }

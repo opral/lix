@@ -1,5 +1,4 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { createServerFn } from "@tanstack/react-start";
 import { parse } from "@opral/markdown-wc";
 import LandingPage from "../components/landing-page";
 import {
@@ -10,12 +9,10 @@ import {
 import markdownPageCss from "../components/markdown-page.style.css?url";
 import readmeMarkdown from "../../../../README.md?raw";
 
-const loadReadmeContent = createServerFn({ method: "GET" }).handler(
-  async () => {
-    const parsed = await parse(readmeMarkdown);
-    return { html: parsed.html };
-  },
-);
+async function loadReadmeContent() {
+  const parsed = await parse(readmeMarkdown);
+  return { html: parsed.html };
+}
 
 export const Route = createFileRoute("/")({
   loader: async () => {

@@ -16,13 +16,15 @@
 
 ---
 
-Lix is the version control system for AI agents. Trace file edits, review diffs, and merge approved changes from branches.
+Lix is the version control system for AI agents. Track file edits, review diffs, and merge approved changes from branches.
 
 ## Why Lix
 
-AI agents that modify files are a black box. You can't see what they changed, you can't undo their mistakes, and running them unsupervised is a liability. Lix fixes this with three primitives:
+AI agents modifying files need guardrails.
 
-- **Trace agent actions** - See exactly what an agent did and when.
+Lix provides visibility and control over changes that AI agents do:
+
+- **Track agent actions** - See exactly what an agent did and when.
 - **Meaningful diffs** - See what actually changed, not noisy line-by-line text.
 - **Isolate tasks in branches** - Propose changes for human review and merge only what's approved.
 
@@ -69,7 +71,7 @@ console.log(diff);
 
 ## How Lix Works
 
-Lix provides version control primitives as an SDK:
+Lix is a version control system that runs on top of an existing SQL(ite) database:
 
 - **Filesystem**: A virtual filesystem for files and directories
 - **Branching**: Isolate work in branches, compare, and merge
