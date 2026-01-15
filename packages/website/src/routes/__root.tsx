@@ -123,16 +123,26 @@ function GoogleAnalytics() {
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
-  const appContent = import.meta.env.PROD ? (
-    <PostHogProvider
-      apiKey={import.meta.env.VITE_PUBLIC_POSTHOG_KEY}
-      options={posthogOptions}
-    >
-      {children}
-    </PostHogProvider>
-  ) : (
-    children
-  );
+  // Only render PostHogProvider on the client side to avoid hydration mismatches.
+  // PostHog is a client-side only library and will cause React error #418 if
+  // rendered during SSR.
+  const [isMounted, setIsMounted] = React.useState(false);
+
+  React.useEffect(() => {
+    setIsMounted(true);
+  }, []);
+
+  const appContent =
+    import.meta.env.PROD && isMounted ? (
+      <PostHogProvider
+        apiKey={import.meta.env.VITE_PUBLIC_POSTHOG_KEY}
+        options={posthogOptions}
+      >
+        {children}
+      </PostHogProvider>
+    ) : (
+      children
+    );
 
   return (
     <html lang="en">
