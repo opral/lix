@@ -1,29 +1,41 @@
-# Lix Change Control System
+<p align="center">
+  <img src="https://raw.githubusercontent.com/opral/lix/main/assets/logo.svg" alt="Lix" height="60">
+</p>
 
-[![NPM Downloads](https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads)](https://www.npmjs.com/package/@lix-js/sdk) [![Discord](https://img.shields.io/discord/897438559458430986?style=flat&logo=discord&labelColor=white)](https://discord.gg/gdMPPWy57R) [![X (Twitter)](https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white)](https://x.com/lixCCS)
+<h3 align="center">The version control system for AI agents</h3>
 
-> [!NOTE] > **Lix is in beta** · [Follow progress to v1.0 →](https://github.com/opral/lix-sdk/issues/374)
+<p align="center">
+  <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="NPM Downloads"></a>
+  <a href="https://discord.gg/gdMPPWy57R"><img src="https://img.shields.io/discord/897438559458430986?style=flat&logo=discord&labelColor=white" alt="Discord"></a>
+  <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
+</p>
 
-Lix is an embeddable change control system that enables Git-like features such as [history](https://lix.dev/docs/history), [versions](https://lix.dev/docs/versions) (branches), [diffs](https://lix.dev/docs/), or [blame](https://lix.dev/docs/attribution) for any file format.
-
-**What makes Lix unique:**
-
-- **Supports any file format** - Track changes in `.xlsx`, `.pdf`, `.json` etc. via plugins.
-- **SQL powered** - History, versions, and diffs are all queryable via SQL.
-- **Embedded** - Runs as a single SQLite file, persistable anywhere (local FS, S3, your database).
-
----
-
-**📖 [Go to lix.dev for more information →](https://lix.dev)**
+> [!NOTE]
+>
+> **Lix is in alpha** · [Follow progress to v1.0 →](https://github.com/opral/lix/issues/374)
 
 ---
 
-## Use Cases
+Lix is the version control system for AI agents. Trace file edits, review diffs, and merge approved changes from branches.
 
-- **AI agent sandboxing** - Agents propose changes, humans review and approve before applying.
-- **Applications with change control** - Branch/merge-style reviews, audit trails, and versioning for structured data.
+## Why Lix
+
+AI agents that modify files are a black box. You can't see what they changed, you can't undo their mistakes, and running them unsupervised is a liability. Lix fixes this with three primitives:
+
+- **Trace agent actions** - See exactly what an agent did and when.
+- **Meaningful diffs** - See what actually changed, not noisy line-by-line text.
+- **Isolate tasks in branches** - Propose changes for human review and merge only what's approved.
+
+**Under the hood:** Plugins for any file format, SQL-queryable history, stored as a single portable SQLite file.
 
 ## Quick Start
+
+<p>
+  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
+  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
+  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+</p>
 
 ```bash
 npm install @lix-js/sdk @lix-js/plugin-json
@@ -53,13 +65,64 @@ const diff = await selectWorkingDiff({ lix }).execute();
 console.log(diff);
 ```
 
+[Full getting started →](https://lix.dev/docs/getting-started)
+
+## How Lix Works
+
+Lix provides version control primitives as an SDK:
+
+- **Filesystem**: A virtual filesystem for files and directories
+- **Branching**: Isolate work in branches, compare, and merge
+- **History**: Full change history with commits and diffs
+- **Change proposals**: Built-in pull request-like workflows
+
+```
+┌─────────────────────────────────────────────────┐
+│                    Lix SDK                      │
+│           (version control system)              │
+│                                                 │
+│ ┌────────────┐ ┌──────────┐ ┌─────────┐ ┌─────┐ │
+│ │ Filesystem │ │ Branching│ │ History │ │ ... │ │
+│ └────────────┘ └──────────┘ └─────────┘ └─────┘ │
+│                                                 │
+└────────────────────────┬────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────┐
+│               SQL(ite) database                 │
+└─────────────────────────────────────────────────┘
+```
+
+Everything lives in a single SQLite database file. Persist anywhere (S3, filesystem, sandbox, etc.).
+
+[Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
+
+## Comparison to Git
+
+Git was built for humans at the terminal. Lix is built to embed where agents operate on files. And while Git stores snapshots and computes diffs, Lix tracks the actual changes, enabling meaningful diffs:
+
+**Example**
+
+- **Git**: "line 5 changed"
+- **Lix**: "price changed from $10 to $12"
+
+|              | Git                       | Lix             |
+| ------------ | ------------------------- | --------------- |
+| Diffs        | Line-based                | Schema-aware    |
+| File formats | Text                      | Any via plugins |
+| Metadata     | External (GitHub, GitLab) | In the repo     |
+| Interface    | CLI                       | SDK             |
+| Queries      | Custom scripts            | SQL             |
+
+[Full comparison to Git →](https://lix.dev/docs/comparison-to-git)
+
 ## Learn More
 
 - **[Getting Started Guide](https://lix.dev/docs/getting-started)** - Build your first app with Lix
 - **[Documentation](https://lix.dev/docs)** - Full API reference and guides
 - **[Discord](https://discord.gg/gdMPPWy57R)** - Get help and join the community
-- **[GitHub](https://github.com/opral/lix-sdk)** - Report issues and contribute
+- **[GitHub](https://github.com/opral/lix)** - Report issues and contribute
 
 ## License
 
-[MIT](https://github.com/opral/monorepo/blob/main/packages/lix/sdk/LICENSE)
+[MIT](https://github.com/opral/lix/blob/main/packages/lix-sdk/LICENSE)

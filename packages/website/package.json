@@ -10,15 +10,16 @@
     "format": "prettier --write ."
   },
   "dependencies": {
+    "@cloudflare/vite-plugin": "^1.13.8",
     "@lix-js/plugin-json": "workspace:*",
     "@lix-js/sdk": "workspace:*",
-    "@cloudflare/vite-plugin": "^1.13.8",
+    "@opral/markdown-wc": "0.8.1",
     "@tailwindcss/vite": "^4.0.6",
     "@tanstack/react-router": "^1.150.0",
     "@tanstack/react-start": "^1.150.0",
     "@tanstack/router-plugin": "^1.150.0",
-    "@opral/markdown-wc": "0.8.1",
     "lucide-react": "^0.544.0",
+    "posthog-js": "^1.321.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "shiki": "^3.2.2",

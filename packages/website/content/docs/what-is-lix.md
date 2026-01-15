@@ -22,7 +22,7 @@ Explore the core capabilities of Lix:
 
 ## Use Cases
 
-- **AI Agent sandboxing:** Agents propose changes, humans review and approve before applying.
+- **Human review of agent changes:** Agents propose edits, humans inspect diffs and approve merges.
 - **Applications with change control:** Branch/merge-style reviews, audit trails, and versioning for structured data.
 
 ![Lix features](/lix-features.svg)
