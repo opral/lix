@@ -1,5 +1,13 @@
-import { HeadContent, Scripts, createRootRoute } from "@tanstack/react-router";
+import {
+  HeadContent,
+  Scripts,
+  createRootRoute,
+  useRouter,
+} from "@tanstack/react-router";
+import React from "react";
 import appCss from "../styles.css?url";
+
+const GA_MEASUREMENT_ID = "G-3GEP4W5688";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -44,6 +52,54 @@ export const Route = createRootRoute({
   shellComponent: RootDocument,
 });
 
+function GoogleAnalytics() {
+  const router = useRouter();
+
+  React.useEffect(() => {
+    if (!import.meta.env.PROD) return;
+    if ((window as any).__gaInitialized) return;
+    (window as any).__gaInitialized = true;
+
+    (window as any).dataLayer = (window as any).dataLayer || [];
+    function gtag(...args: unknown[]) {
+      (window as any).dataLayer.push(args);
+    }
+    (window as any).gtag = gtag;
+
+    const script = document.createElement("script");
+    script.async = true;
+    script.src = `https://www.googletagmanager.com/gtag/js?id=${GA_MEASUREMENT_ID}`;
+    document.head.appendChild(script);
+
+    gtag("js", new Date());
+    gtag("config", GA_MEASUREMENT_ID, { send_page_view: false });
+
+    const sendPageView = (location: {
+      href: string;
+      pathname: string;
+      search: string;
+      hash: string;
+    }) => {
+      gtag("event", "page_view", {
+        page_location: location.href,
+        page_path: `${location.pathname}${location.search}${location.hash}`,
+        page_title: document.title,
+      });
+    };
+
+    sendPageView(router.history.location);
+    const unsubscribe = router.history.subscribe(({ location }) => {
+      sendPageView(location);
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+
+  return null;
+}
+
 function RootDocument({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
@@ -51,6 +107,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <HeadContent />
       </head>
       <body>
+        <GoogleAnalytics />
         {children}
         <Scripts />
       </body>

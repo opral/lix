@@ -956,14 +956,14 @@ function LandingPage() {
               </svg>
             </a>
             <h1 className="text-gray-900 font-bold leading-[1.1] text-4xl sm:text-5xl md:text-6xl tracking-tight">
-              Change control for
+              The version control system
               <br />
-              apps and <span className="text-[#0891b2]">AI agents</span>
+              for <span className="text-[#0891b2]">AI agents</span>
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix is an embeddable change control system that enables Git-like
-              features for any file format.
+              Lix lets you trace what agents do to files, review diffs, and
+              isolate work in branches.
             </p>
 
             {/* Trust signals - Large stat blocks with icons */}
@@ -1161,22 +1161,11 @@ function LandingPage() {
                 </svg>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Any file format
+                    Any file format, human-readable diffs
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Lix can track changes in any file format like{" "}
-                    <code className="text-sm bg-gray-100 px-1.5 py-0.5 rounded text-gray-800 font-medium">
-                      .xlsx
-                    </code>
-                    ,{" "}
-                    <code className="text-sm bg-gray-100 px-1.5 py-0.5 rounded text-gray-800 font-medium">
-                      .pdf
-                    </code>
-                    ,{" "}
-                    <code className="text-sm bg-gray-100 px-1.5 py-0.5 rounded text-gray-800 font-medium">
-                      .json
-                    </code>{" "}
-                    etc. via plugins.
+                    Track changes in JSON, CSV, XLSX, and more via plugins—diffs
+                    at the field/cell level, not just bytes.
                   </p>
                 </div>
               </div>
@@ -1198,10 +1187,11 @@ function LandingPage() {
                 </svg>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Diff, merge & branch
+                    Branch per agent task
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Query history, compare versions, and manage changes via SQL.
+                    Isolate every run in its own branch, compare changes, and
+                    merge only what you approve.
                   </p>
                 </div>
               </div>
@@ -1216,16 +1206,16 @@ function LandingPage() {
                   <path
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    d="M13.5 16.875h3.375m0 0h3.375m-3.375 0V13.5m0 3.375v3.375M6 10.5h2.25a2.25 2.25 0 002.25-2.25V6a2.25 2.25 0 00-2.25-2.25H6A2.25 2.25 0 003.75 6v2.25A2.25 2.25 0 006 10.5zm0 9.75h2.25A2.25 2.25 0 0010.5 18v-2.25a2.25 2.25 0 00-2.25-2.25H6a2.25 2.25 0 00-2.25 2.25V18A2.25 2.25 0 006 20.25zm9.75-9.75H18a2.25 2.25 0 002.25-2.25V6A2.25 2.25 0 0018 3.75h-2.25A2.25 2.25 0 0013.5 6v2.25a2.25 2.25 0 002.25 2.25z"
+                    d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"
                   />
                 </svg>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Integrates with your stack
+                    Embeddable SQLite—runs anywhere
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Lix runs embedded in your app as a single SQLite file,
-                    persistable anywhere e.g. local FS, S3, your database.
+                    A single file you can persist to local disk, S3, or your
+                    DB—no server required.
                   </p>
                 </div>
               </div>

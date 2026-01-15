@@ -8,21 +8,22 @@ import {
 
 export const Route = createFileRoute("/")({
   head: () => {
+    const title = "Lix - The version control system for AI agents";
     const description =
-      "Lix is an embeddable change control system that enables Git-like history, versions, diffs, and blame for any file format.";
+      "Lix lets you branch, track, and review every change an AI agent does on the filesystem.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
-      title: "Lix",
+      title,
       description,
       canonicalUrl,
     });
 
     return {
       meta: [
-        { title: "Lix" },
+        { title },
         { name: "description", content: description },
-        { property: "og:title", content: "Lix" },
+        { property: "og:title", content: title },
         { property: "og:description", content: description },
         { property: "og:url", content: canonicalUrl },
         { property: "og:type", content: "website" },
@@ -31,7 +32,7 @@ export const Route = createFileRoute("/")({
         { property: "og:image", content: ogImage.url },
         { property: "og:image:alt", content: ogImage.alt },
         { name: "twitter:card", content: "summary_large_image" },
-        { name: "twitter:title", content: "Lix" },
+        { name: "twitter:title", content: title },
         { name: "twitter:description", content: description },
         { name: "twitter:image", content: ogImage.url },
         { name: "twitter:image:alt", content: ogImage.alt },

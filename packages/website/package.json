@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "vite dev --port 3000",
     "build": "vite build",
-    "preview": "wrangler dev dist/server/server.js",
+    "preview": "vite preview",
     "test": "vitest run && tsc --noEmit",
     "format": "prettier --write ."
   },
@@ -36,6 +36,7 @@
     "prettier": "^3.6.0",
     "typescript": "^5.7.2",
     "vite": "^7.1.7",
+    "vite-plugin-static-copy": "^2.3.2",
     "vitest": "^3.0.5",
     "web-vitals": "^5.1.0",
     "wrangler": "^4.40.3"
