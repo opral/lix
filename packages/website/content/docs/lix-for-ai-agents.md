@@ -4,7 +4,7 @@
 
 AI agents can generate more changes than a team can review in real time. Those changes still need to be **visible, attributable, and reversible**.
 
-**Lix provides the change-control layer that lets agents move fast while keeping every edit transparent and reviewable.**
+**Lix provides the version control layer that lets agents move fast while keeping every edit transparent and reviewable.**
 
 ## Terminology
 

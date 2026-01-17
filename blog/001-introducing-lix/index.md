@@ -1,41 +1,77 @@
 ---
 date: "2026-01-16"
-og:description: "Lix is a universal version control system for data files. Unlike Git's line-based diffs, Lix understands file structure—showing 'price: 10 → 12' instead of 'line 4 changed'."
+og:description: "Lix is a universal version control system for any file format. Unlike Git's line-based diffs, Lix understands file structure, showing 'price: 10 → 12' instead of 'line 4 changed'."
 ---
 
 # Announcing Lix: A universal version control system
 
 ## Introduction
 
-Lix is a **universal version control system** that works beyond text files.
+Lix is a **universal version control system** that can track changes in any file format.
 
-Instead of tracking lines of text like Git, Lix understands the _structure_ of each file format. A change in a JSON file shows `price: 10 → 12`, not "line 4 changed". A change in a spreadsheet shows `cell B4: pending → shipped`. Git can store files like `.xlsx`, but diffs are effectively opaque because they're binary.
+Unlike Git's line-based diffs, Lix understands file structure. You see `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". This makes Lix an ideal version control layer for AI agents operating on non-code formats.
 
-This makes Lix an ideal version control layer for AI agents that operate on non-code file formats.
+## Example
 
-[Getting started →](https://lix.dev/docs/getting-started)
+### JSON: structure-aware diffs
+
+An agent changes `theme` in `settings.json`.
+
+**Before:**
+```json
+{"theme":"light","notifications":true,"language":"en"}
+```
+
+**After:**
+```json
+{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Git sees:**
+```diff
+-{"theme":"light","notifications":true,"language":"en"}
++{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Lix sees:**
+```
+settings.json
+  property "theme": "light" → "dark"
+```
+
+### Excel: cell-level changes
+
+An agent updates an order status in `orders.xlsx`.
+
+**Git sees:** `Binary files differ`
+
+**Lix sees:**
+```
+orders.xlsx
+  cell (row: order_id=1002, column: status): "pending" → "shipped"
+```
+
+You can review exactly what the agent did, approve it, or roll it back. Just like code review, but for data.
+
+This difference, bytes vs meaning, is exactly the guardrail AI agents need.
 
 ## AI agents need version control
 
-Software engineers trust AI coding assistants because Git provides guardrails: review the diff, reject bad changes, roll back mistakes. The code stays under human control.
-
-AI agents are now modifying files beyond code—spreadsheets, documents, PDFs. These agents need the same guardrails, but Git can't provide them.
-
-**Lix brings the same primitives software engineers rely on (branches, diffs, merges) to any file format.**
-
 ![AI agent changes need to be visible and controllable](./ai-agents.svg)
 
-- **See what changed**: Agent edits to spreadsheets, JSON, or any structured file are reviewable.
+Software engineers trust AI coding assistants because Git provides guardrails: review the diff, reject bad changes, roll back mistakes. Changes made by coding agents stay under control.
+
+Lix brings the same primitives software engineers rely on (branches, diffs, merges) to any file format and agent outside of software engineering:
+
+- **See what changed**: Agent edits to spreadsheets, JSON, or other structured files are reviewable.
 - **Humans stay in control**: Agents propose changes; people decide what ships.
 - **Safe experimentation**: Agents work in isolated branches, not on production data.
 
-[Learn more about using Lix with agents →](https://lix.dev/docs/ai-agents)
+[Learn more about using Lix with agents →](/docs/lix-for-ai-agents/)
 
-## One more thing: Lix is portable
+## Lix is portable
 
-Git is tied to the filesystem. Moving repositories between environments, embedding them in apps, or opening them in browsers requires workarounds.
-
-**Lix fixes that.**
+To work in agent runtimes (browser, sandbox, serverless), version control must be portable by design.
 
 A Lix repository is a single SQLite file that is:
 
@@ -60,11 +96,13 @@ A Lix repository is a single SQLite file that is:
      └─────────┘ └─────────┘ └─────────┘ └────────────┘
 ```
 
-## How does lix work?
+This design is a direct response to Git’s model. Git assumes a local filesystem and exposes a CLI, not an SDK. That model doesn’t embed well in browsers, sandboxes, or as a single portable artifact. We needed a version control system that can run in the browser, locally on a user’s machine, and on the server. SQLite’s embedded design enables Lix to run everywhere.
 
-Lix operates on top of a SQL(ite) database.
+## How does Lix work?
 
-Files, change history, branches, and metadata are stored in tables. Lix adds version control primitives (filesystem, branching, history) as a layer on top of SQLite.
+Under the hood, Lix stores everything in SQLite tables. Most users interact through an SDK; SQL is the underlying interface.
+
+Files, change history, branches, and metadata live in tables. Lix adds version control primitives (filesystem semantics, branching, and history) on top of SQLite.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -78,11 +116,11 @@ Files, change history, branches, and metadata are stored in tables. Lix adds ver
                          │
                          ▼
 ┌─────────────────────────────────────────────────┐
-│               SQL(ite) database                 │
+│               SQLite database                   │
 └─────────────────────────────────────────────────┘
 ```
 
-You interact with Lix through SQL queries: insert a file, query the diff, read the history.
+You can interact with Lix using SQL: insert a file, query a diff, read history.
 
 ```sql
 -- Create a file
@@ -95,13 +133,21 @@ SET data = encode('{"price": 12}')
 WHERE path = '/settings.json';
 ```
 
+The same model can target other SQL backends in the future.  
+
 [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
 
 ### Detecting changes
 
-Every insert or update to a file is passed to plugins. Plugins parse the file and tell lix what changed.
+Every insert or update is passed to plugins. Plugins parse the file and emit structured changes.
 
-**Plugins** make lix structure-aware. A plugin tells lix how to parse a file format and what counts as a change. The JSON plugin tracks properties. A CSV plugin tracks rows. An Excel plugin tracks cells. Without plugins, lix would only see binary blobs.
+**Plugins** make Lix structure-aware. Each plugin defines a *trackable unit* for a file format, called an **entity**: the smallest piece of data that can be independently created, updated, or deleted.
+
+- JSON → property  
+- CSV → row  
+- Excel → cell  
+
+This is what powers entity-aware diffs: Lix answers *what changed* at the level that matters for each format.
 
 ```
 File:                                       Lix:
@@ -112,22 +158,33 @@ File:                                       Lix:
 └────────────────────┘    └──────────┘
 ```
 
-When you insert or update a file, the plugin parses it and emits changes at the entity level. A change to `{ "price": 10 }` → `{ "price": 12 }` becomes `property "price" changed from 10 to 12`, not `line 1 changed`.
-
 ## Background
 
-Lix started as part of [inlang](https://inlang.com), a localization infrastructure. Inlang needed a universal version control system that works for translators, designers, and other non-developers. (Read ["Git-based architecture" →](https://samuelstroschein.com/blog/git-based-architecture))
+This architecture didn't start as a research project. It emerged from shipping real systems.
 
-The first version of lix was built on git, but extending git to support arbitrary file formats didn't work:
+Lix started as part of [inlang](https://inlang.com), open-source localization infrastructure.
 
-- Git only tracks text files line-by-line
-- Making git structure-aware breaks git compatibility
-- At that point, extending git provides no benefit over building from scratch
+To make localization work for translators, designers, and non-developers, we needed version control that worked beyond text files. That led to the idea of a universal, structure-aware version control system, outlined in the RFC for ["Git-based architecture"](https://samuelstroschein.com/blog/git-based-architecture).
 
-This led to a rewrite from scratch on top of SQLite.
+### Git was too limiting
 
-## What's next
+The first version of Lix was built on Git, but extending Git to support arbitrary file formats didn’t work:
 
-- **Faster writes**: Move write handling into the SQL preprocessor to avoid vtable overhead ([RFC 001](https://lix.dev/rfc/001-preprocess-writes)).
-- **More robust engine + multi-language bindings**: Implement the core engine in Rust for better parsing/validation and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
-- **Broader backends**: Preprocessor-first design unlocks future Postgres support ([tracking issue #372](https://github.com/opral/lix/issues/372)).
+- Git can store any file, but it's line-based and treats non-text formats as opaque blobs. You can't ask "what changed in cell C45?"
+- Making Git structure-aware breaks compatibility, at which point Git stops providing its core benefits
+
+### SQLite to the rescue
+
+Those limitations led to a rewrite from scratch on top of SQLite.
+
+SQLite provided transactions, custom data structures, and a query engine out of the box. Early versions relied heavily on [SQLite’s virtual table](https://www.sqlite.org/vtab.html) mechanism to intercept reads and writes. While this worked, we couldn’t achieve the performance and optimizer behavior we needed at scale.
+
+Because virtual tables were only used to intercept reads and writes, the next iteration of Lix became a SQL preprocessor that rewrites incoming queries to native SQLite tables. See [RFC 001](https://lix.dev/rfc/001-preprocess-writes) for details.
+
+## What’s next
+
+- **Faster writes**: Move write handling fully into the SQL preprocessor ([RFC 001](https://lix.dev/rfc/001-preprocess-writes)).
+- **More robust engine + multi-language bindings**: Rewrite the core in Rust for better parsing, validation, and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
+- **Broader backends**: The preprocessor-first design unlocks future Postgres support ([tracking issue #372](https://github.com/opral/lix/issues/372)).
+
+[Get started with Lix →](/docs/getting-started)
