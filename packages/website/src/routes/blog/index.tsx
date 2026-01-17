@@ -15,7 +15,7 @@ const blogMarkdownFiles = import.meta.glob<string>(
   {
     query: "?raw",
     import: "default",
-  },
+  }
 );
 const blogJsonFiles = import.meta.glob<string>("../../../../../blog/*.json", {
   query: "?raw",
@@ -78,7 +78,7 @@ async function loadBlogIndex() {
         authors,
         ogImage,
       };
-    }),
+    })
   );
 
   posts.sort((a, b) => {

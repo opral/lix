@@ -18,7 +18,7 @@ const blogMarkdownFiles = import.meta.glob<string>(
   {
     query: "?raw",
     import: "default",
-  },
+  }
 );
 const blogJsonFiles = import.meta.glob<string>("../../../../../blog/*.json", {
   query: "?raw",
@@ -205,14 +205,14 @@ export const Route = createFileRoute("/blog/$slug")({
       meta.push(
         { name: "description", content: description },
         { property: "og:description", content: description },
-        { name: "twitter:description", content: description },
+        { name: "twitter:description", content: description }
       );
     }
 
     if (title) {
       meta.push(
         { property: "og:title", content: `${title} | Lix Blog` },
-        { name: "twitter:title", content: `${title} | Lix Blog` },
+        { name: "twitter:title", content: `${title} | Lix Blog` }
       );
     }
 
@@ -283,7 +283,7 @@ export const Route = createFileRoute("/blog/$slug")({
                         ...(author.twitter || author.github
                           ? {
                               sameAs: [author.twitter, author.github].filter(
-                                (value): value is string => Boolean(value),
+                                (value): value is string => Boolean(value)
                               ),
                             }
                           : {}),
@@ -307,7 +307,7 @@ export const Route = createFileRoute("/blog/$slug")({
                     ...(author.twitter || author.github
                       ? {
                           sameAs: [author.twitter, author.github].filter(
-                            (value): value is string => Boolean(value),
+                            (value): value is string => Boolean(value)
                           ),
                         }
                       : {}),
