@@ -34,7 +34,6 @@ async function loadBlogIndex() {
   const toc = JSON.parse(tocContent) as Array<{
     path: string;
     slug: string;
-    date?: string;
     authors?: string[];
   }>;
 
@@ -58,19 +57,24 @@ async function loadBlogIndex() {
         ?.map((authorId) => authorsMap[authorId])
         .filter(Boolean) as Author[] | undefined;
 
+      // Extract folder name from path (e.g., "001-introducing-lix" from "001-introducing-lix/index.md")
+      const folderName = relativePath.replace(/\/index\.md$/, "");
       const ogImageRaw =
         typeof parsed.frontmatter?.["og:image"] === "string"
           ? parsed.frontmatter["og:image"]
           : undefined;
       const ogImage = ogImageRaw
-        ? resolveLocalBlogAsset(ogImageRaw, item.slug)
+        ? resolveLocalBlogAsset(ogImageRaw, folderName)
         : undefined;
+
+      // Get date from frontmatter
+      const date = parsed.frontmatter?.date as string | undefined;
 
       return {
         slug: item.slug,
         title,
         description,
-        date: item.date,
+        date,
         authors,
         ogImage,
       };
@@ -272,8 +276,8 @@ function getBlogMarkdown(relativePath: string): Promise<string> {
   return loader();
 }
 
-function resolveLocalBlogAsset(value: string, slug: string): string {
+function resolveLocalBlogAsset(value: string, folderName: string): string {
   if (/^[a-z][a-z0-9+.-]*:/.test(value)) return value;
   const normalized = value.replace(/^\.\//, "");
-  return `/blog/${slug}/${normalized}`;
+  return `/blog/${folderName}/${normalized}`;
 }

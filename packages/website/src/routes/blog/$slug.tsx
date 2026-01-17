@@ -5,6 +5,7 @@ import markdownPageCss from "../../components/markdown-page.style.css?url";
 import { getBlogDescription, getBlogTitle } from "../../blog/blogMetadata";
 import { Footer } from "../../components/footer";
 import { Header } from "../../components/header";
+import { PrevNextNav } from "../../components/prev-next-nav";
 import { resolveOgImageUrl } from "../../blog/og-image";
 import {
   buildCanonicalUrl,
@@ -59,11 +60,26 @@ async function loadBlogPost(slug: string) {
   const toc = JSON.parse(tocContent) as Array<{
     path: string;
     slug: string;
-    date?: string;
     authors?: string[];
   }>;
 
-  const sortedToc = [...toc].sort((a, b) => {
+  // Load all posts to get dates from frontmatter for sorting
+  const postsWithDates = await Promise.all(
+    toc.map(async (item) => {
+      const relPath = item.path.startsWith("./")
+        ? item.path.slice(2)
+        : item.path;
+      const md = await getBlogMarkdown(relPath);
+      const parsedMd = await parse(md);
+      const date = parsedMd.frontmatter?.date as string | undefined;
+      const title =
+        getBlogTitle({ rawMarkdown: md, frontmatter: parsedMd.frontmatter }) ??
+        item.slug;
+      return { ...item, date, title };
+    })
+  );
+
+  const sortedToc = [...postsWithDates].sort((a, b) => {
     if (!a.date && !b.date) return 0;
     if (!a.date) return 1;
     if (!b.date) return -1;
@@ -80,25 +96,11 @@ async function loadBlogPost(slug: string) {
   const nextEntry =
     currentIndex < sortedToc.length - 1 ? sortedToc[currentIndex + 1] : null;
 
-  const getTitleForEntry = async (
-    postEntry: (typeof toc)[0],
-  ): Promise<string> => {
-    const relPath = postEntry.path.startsWith("./")
-      ? postEntry.path.slice(2)
-      : postEntry.path;
-    const md = await getBlogMarkdown(relPath);
-    const parsedMd = await parse(md);
-    return (
-      getBlogTitle({ rawMarkdown: md, frontmatter: parsedMd.frontmatter }) ??
-      postEntry.slug
-    );
-  };
-
   const prevPost: BlogPrevNext = prevEntry
-    ? { slug: prevEntry.slug, title: await getTitleForEntry(prevEntry) }
+    ? { slug: prevEntry.slug, title: prevEntry.title }
     : null;
   const nextPost: BlogPrevNext = nextEntry
-    ? { slug: nextEntry.slug, title: await getTitleForEntry(nextEntry) }
+    ? { slug: nextEntry.slug, title: nextEntry.title }
     : null;
 
   const authors = entry.authors
@@ -108,9 +110,11 @@ async function loadBlogPost(slug: string) {
   const relativePath = entry.path.startsWith("./")
     ? entry.path.slice(2)
     : entry.path;
+  // Extract folder name from path (e.g., "001-introducing-lix" from "001-introducing-lix/index.md")
+  const folderName = relativePath.replace(/\/index\.md$/, "");
   const rawMarkdown = await getBlogMarkdown(relativePath);
   const parsed = await parse(rawMarkdown, {
-    assetBaseUrl: `/blog/${slug}/`,
+    assetBaseUrl: `/blog/${folderName}/`,
   });
   const title = getBlogTitle({
     rawMarkdown,
@@ -120,12 +124,16 @@ async function loadBlogPost(slug: string) {
     rawMarkdown,
     frontmatter: parsed.frontmatter,
   });
+
+  // Get date from frontmatter
+  const date = parsed.frontmatter?.date as string | undefined;
+
   const ogImageOverrideRaw =
     typeof parsed.frontmatter?.["og:image"] === "string"
       ? parsed.frontmatter["og:image"]
       : undefined;
   const ogImageOverride = ogImageOverrideRaw
-    ? resolveOgImageUrl(ogImageOverrideRaw, slug)
+    ? resolveOgImageUrl(ogImageOverrideRaw, folderName)
     : undefined;
   const ogImageAlt =
     typeof parsed.frontmatter?.["og:image:alt"] === "string"
@@ -140,7 +148,7 @@ async function loadBlogPost(slug: string) {
       slug: entry.slug,
       title,
       description,
-      date: entry.date,
+      date,
       authors,
       readingTime,
       ogImage: ogImageOverride,
@@ -345,8 +353,8 @@ function BlogPostPage() {
     <div className="flex min-h-screen flex-col bg-white text-slate-900">
       <Header />
       <main className="flex-1">
-        <header className="border-b border-slate-200 bg-white">
-          <div className="mx-auto max-w-4xl px-6 py-16">
+        <header className="bg-white">
+          <div className="mx-auto max-w-3xl px-6 pt-12 pb-8">
             <nav className="mb-8 flex justify-center">
               <Link
                 to="/blog"
@@ -506,41 +514,14 @@ function BlogPostPage() {
             </div>
           </form>
 
-          {(prevPost || nextPost) && (
-            <nav className="mt-8 grid grid-cols-2 gap-4">
-              <div>
-                {prevPost && (
-                  <Link
-                    to="/blog/$slug"
-                    params={{ slug: prevPost.slug }}
-                    className="group block rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
-                  >
-                    <span className="text-sm text-slate-400">
-                      Previous post
-                    </span>
-                    <span className="mt-1 block font-medium text-[#3451b2] group-hover:text-[#3a5ccc]">
-                      {prevPost.title}
-                    </span>
-                  </Link>
-                )}
-              </div>
-
-              <div>
-                {nextPost && (
-                  <Link
-                    to="/blog/$slug"
-                    params={{ slug: nextPost.slug }}
-                    className="group block rounded-xl border border-slate-200 p-4 text-right transition-colors hover:border-slate-300"
-                  >
-                    <span className="text-sm text-slate-400">Next post</span>
-                    <span className="mt-1 block font-medium text-[#3451b2] group-hover:text-[#3a5ccc]">
-                      {nextPost.title}
-                    </span>
-                  </Link>
-                )}
-              </div>
-            </nav>
-          )}
+          <PrevNextNav
+            prev={prevPost}
+            next={nextPost}
+            basePath="/blog"
+            prevLabel="Previous post"
+            nextLabel="Next post"
+            className="mt-8"
+          />
         </div>
       </main>
       <Footer />

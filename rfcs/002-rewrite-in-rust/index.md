@@ -1,8 +1,12 @@
+---
+date: "2025-11-30"
+---
+
 # Implement the Lix Engine in Rust
 
 ## Summary
 
-[RFC 001](./001-preprocess-writes.md) proposes extending the SQL preprocessor to handle writes. This RFC proposes implementing the **Lix Engine** - the core layer responsible for SQL preprocessing, validation, and rewriting - in Rust.
+[RFC 001](../001-preprocess-writes/index.md) proposes extending the SQL preprocessor to handle writes. This RFC proposes implementing the **Lix Engine** - the core layer responsible for SQL preprocessing, validation, and rewriting - in Rust.
 
 ## Goals
 

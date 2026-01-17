@@ -1,4 +1,4 @@
-import { Link } from "@tanstack/react-router";
+import { PrevNextNav } from "./prev-next-nav";
 
 type DocRoute = {
   slug: string;
@@ -32,42 +32,26 @@ export function DocsPrevNext({
   const currentIndex = routes.findIndex((item) => item.slug === currentSlug);
   if (currentIndex === -1 || routes.length <= 1) return null;
 
-  const prev = currentIndex > 0 ? routes[currentIndex - 1] : null;
-  const next =
+  const prevRoute = currentIndex > 0 ? routes[currentIndex - 1] : null;
+  const nextRoute =
     currentIndex < routes.length - 1 ? routes[currentIndex + 1] : null;
 
-  if (!prev && !next) return null;
+  const prev = prevRoute
+    ? { slug: prevRoute.slug, title: prevRoute.title ?? formatNavTitle(prevRoute.slug) }
+    : null;
+  const next = nextRoute
+    ? { slug: nextRoute.slug, title: nextRoute.title ?? formatNavTitle(nextRoute.slug) }
+    : null;
 
   return (
-    <nav className="mt-8 grid grid-cols-2 gap-4 border-t border-slate-200 pt-8">
-      <div>
-        {prev && (
-          <Link
-            to="/docs/$slugId"
-            params={{ slugId: prev.slug }}
-            className="group block rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
-          >
-            <span className="text-sm text-slate-400">Previous</span>
-            <span className="mt-1 block font-medium text-[#3451b2] group-hover:text-[#3a5ccc]">
-              {prev.title ?? formatNavTitle(prev.slug)}
-            </span>
-          </Link>
-        )}
-      </div>
-      <div>
-        {next && (
-          <Link
-            to="/docs/$slugId"
-            params={{ slugId: next.slug }}
-            className="group block rounded-xl border border-slate-200 p-4 text-right transition-colors hover:border-slate-300"
-          >
-            <span className="text-sm text-slate-400">Next</span>
-            <span className="mt-1 block font-medium text-[#3451b2] group-hover:text-[#3a5ccc]">
-              {next.title ?? formatNavTitle(next.slug)}
-            </span>
-          </Link>
-        )}
-      </div>
-    </nav>
+    <PrevNextNav
+      prev={prev}
+      next={next}
+      basePath="/docs"
+      paramName="slugId"
+      prevLabel="Previous"
+      nextLabel="Next"
+      className="mt-8"
+    />
   );
 }

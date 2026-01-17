@@ -1,3 +1,7 @@
+---
+date: "2025-11-24"
+---
+
 # Preprocess writes to avoid vtable overhead
 
 ## Summary

@@ -1,8 +1,7 @@
 [
   {
-    "path": "./mock-post/index.md",
-    "slug": "hello-lix",
-    "date": "2026-01-15",
-    "authors": ["lix-team"]
+    "path": "./001-introducing-lix/index.md",
+    "slug": "introducing-lix",
+    "authors": ["samuelstroschein"]
   }
 ]

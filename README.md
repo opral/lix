@@ -16,19 +16,17 @@
 
 ---
 
-Lix is the version control system for AI agents. Track file edits, review diffs, and merge approved changes from branches.
+Git works for code. Lix works for any file format: spreadsheets, documents, PDFs, and more. Track file edits, review diffs, and merge approved changes from branches.
 
 ## Why Lix
 
-AI agents modifying files need guardrails.
-
-Lix provides visibility and control over changes that AI agents do:
+Git provides guardrails for AI coding assistants. AI agents working beyond code need the same guardrails. Lix provides them.
 
 - **Track agent actions** - See exactly what an agent did and when.
-- **Meaningful diffs** - See what actually changed, not noisy line-by-line text.
+- **Review meaningful diffs** - See what actually changed, not noisy line-by-line text.
 - **Isolate tasks in branches** - Propose changes for human review and merge only what's approved.
 
-**Under the hood:** Plugins for any file format, SQL-queryable history, stored as a single portable SQLite file.
+Plugins handle any file format. History is SQL-queryable. Everything lives in a single portable SQLite file.
 
 ## Quick Start
 
@@ -101,7 +99,7 @@ Everything lives in a single SQLite database file. Persist anywhere (S3, filesys
 
 ## Comparison to Git
 
-Git was built for humans at the terminal. Lix is built to embed where agents operate on files. And while Git stores snapshots and computes diffs, Lix tracks the actual changes, enabling meaningful diffs:
+Git was built for text files. It can't meaningfully diff spreadsheets, PDFs, or binary formats. Lix can—via plugins that understand file structure.
 
 **Example**
 
@@ -114,7 +112,6 @@ Git was built for humans at the terminal. Lix is built to embed where agents ope
 | File formats | Text                      | Any via plugins |
 | Metadata     | External (GitHub, GitLab) | In the repo     |
 | Interface    | CLI                       | SDK             |
-| Queries      | Custom scripts            | SQL             |
 
 [Full comparison to Git →](https://lix.dev/docs/comparison-to-git)
 
