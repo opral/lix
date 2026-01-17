@@ -5,6 +5,7 @@ import markdownPageCss from "../../components/markdown-page.style.css?url";
 import { Footer } from "../../components/footer";
 import { Header } from "../../components/header";
 import { PrevNextNav } from "../../components/prev-next-nav";
+import { buildCanonicalUrl } from "../../lib/seo";
 
 const rfcMarkdownFiles = import.meta.glob<string>("../../../../../rfcs/**/*.md", {
   query: "?raw",
@@ -129,20 +130,20 @@ export const Route = createFileRoute("/rfc/$slug")({
     ];
 
     if (slug) {
-      links.push({ rel: "canonical", href: `https://lix.opral.com/rfc/${slug}` });
+      links.push({ rel: "canonical", href: buildCanonicalUrl(`/rfc/${slug}`) });
     }
 
     if (loaderData?.prevRfc?.slug) {
       links.push({
         rel: "prev",
-        href: `https://lix.opral.com/rfc/${loaderData.prevRfc.slug}`,
+        href: buildCanonicalUrl(`/rfc/${loaderData.prevRfc.slug}`),
       });
     }
 
     if (loaderData?.nextRfc?.slug) {
       links.push({
         rel: "next",
-        href: `https://lix.opral.com/rfc/${loaderData.nextRfc.slug}`,
+        href: buildCanonicalUrl(`/rfc/${loaderData.nextRfc.slug}`),
       });
     }
 
