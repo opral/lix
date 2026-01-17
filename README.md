@@ -16,17 +16,45 @@
 
 ---
 
-Git works for code. Lix works for any file format: spreadsheets, documents, PDFs, and more. Track file edits, review diffs, and merge approved changes from branches.
+Git works for text files. Lix works for any file format.
+
+Unlike Git's line-based diffs, Lix understands file structure. You see `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". This makes Lix an ideal version control layer for AI agents operating on non-code formats.
 
 ## Why Lix
 
 Git provides guardrails for AI coding assistants. AI agents working beyond code need the same guardrails. Lix provides them.
 
-- **Track agent actions** - See exactly what an agent did and when.
-- **Review meaningful diffs** - See what actually changed, not noisy line-by-line text.
-- **Isolate tasks in branches** - Propose changes for human review and merge only what's approved.
+- **Track agent actions**: See exactly what an agent did and when.
+- **Review meaningful diffs**: See what actually changed, not noisy line-by-line text.
+- **Isolate tasks in branches**: Propose changes for human review and merge only what's approved.
 
 Plugins handle any file format. History is SQL-queryable. Everything lives in a single portable SQLite file.
+
+### Example: JSON
+
+An agent changes `theme` in `settings.json`.
+
+**Before:**
+```json
+{"theme":"light","notifications":true,"language":"en"}
+```
+
+**After:**
+```json
+{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Git sees:**
+```diff
+-{"theme":"light","notifications":true,"language":"en"}
++{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Lix sees:**
+```
+settings.json
+  property "theme": "light" → "dark"
+```
 
 ## Quick Start
 
