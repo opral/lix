@@ -11,6 +11,30 @@ Lix is a **universal version control system** that can track changes in any file
 
 Unlike Git's line-based diffs, Lix understands file structure. You see `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". This makes Lix an ideal version control layer for AI agents operating on non-code formats.
 
+<p>
+  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
+  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
+  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+</p>
+
+```bash
+npm install @lix-js/sdk
+```
+
+> [!NOTE]
+> The API is work in progress. Expect breaking changes before v1.0.
+
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix({});
+
+await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execute();
+
+const diff = selectWorkingDiff({ lix })
+```
+
 ## Example
 
 ### JSON: structure-aware diffs
@@ -120,20 +144,25 @@ Files, change history, branches, and metadata live in tables. Lix adds version c
 └─────────────────────────────────────────────────┘
 ```
 
-You can interact with Lix using SQL: insert a file, query a diff, read history.
+You interact with Lix through the SDK. The current version of lix exposes a SQL interface. Future versions might have a direct `lix.fs.write_file()` API. 
 
-```sql
--- Create a file
-INSERT INTO file (path, data)
-VALUES ('/settings.json', encode('{"price": 10}'));
+> [!NOTE]
+> The API is work in progress. Expect breaking changes before v1.0.
 
--- Update the file
-UPDATE file
-SET data = encode('{"price": 12}')
-WHERE path = '/settings.json';
+```ts
+// Create a file
+await lix.db.insertInto("file")
+  .values({ path: "/settings.json", data: encode('{"price": 10}') })
+  .execute();
+
+// Update the file
+await lix.db.updateTable("file")
+  .set({ data: encode('{"price": 12}') })
+  .where("path", "=", "/settings.json")
+  .execute();
 ```
 
-The same model can target other SQL backends in the future.  
+Under the hood, lix maps incoming SQL queries to native tables of the database.
 
 [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
 
