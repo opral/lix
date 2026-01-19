@@ -7,10 +7,13 @@ import { Header } from "../../components/header";
 import { PrevNextNav } from "../../components/prev-next-nav";
 import { buildCanonicalUrl } from "../../lib/seo";
 
-const rfcMarkdownFiles = import.meta.glob<string>("../../../../../rfcs/**/*.md", {
-  query: "?raw",
-  import: "default",
-});
+const rfcMarkdownFiles = import.meta.glob<string>(
+  "../../../../../rfcs/**/index.md",
+  {
+    query: "?raw",
+    import: "default",
+  }
+);
 
 const rfcRootPrefix = "../../../../../rfcs/";
 

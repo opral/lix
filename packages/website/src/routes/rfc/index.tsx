@@ -3,10 +3,13 @@ import { parse } from "@opral/markdown-wc";
 import { Footer } from "../../components/footer";
 import { Header } from "../../components/header";
 
-const rfcMarkdownFiles = import.meta.glob<string>("../../../../../rfcs/**/*.md", {
+const rfcMarkdownFiles = import.meta.glob<string>(
+  "../../../../../rfcs/**/index.md",
+  {
   query: "?raw",
   import: "default",
-});
+  }
+);
 
 const rfcRootPrefix = "../../../../../rfcs/";
 
