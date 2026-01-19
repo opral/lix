@@ -31,39 +31,55 @@ An agent changes `theme` in `settings.json`.
 +{"theme":"dark","notifications":true,"language":"en"}
 ```
 
-**Lix sees:**
+**Lix sees (illustrative):**
 ```
 settings.json
   property "theme": "light" → "dark"
 ```
 
-### Excel example: cell-level changes
+### Excel example
 
 An agent updates an order status in `orders.xlsx`.
+
+**Before:**
+```
+| order_id | product    | status  |
+|----------|------------|---------|
+| 1001     | Widget A   | shipped |
+| 1002     | Widget B   | pending |
+```
+
+**After:**
+```
+| order_id | product    | status  |
+|----------|------------|---------|
+| 1001     | Widget A   | shipped |
+| 1002     | Widget B   | shipped |
+```
 
 **Git sees:** `Binary files differ`
 
 **Lix sees:**
 ```
 orders.xlsx
-  cell (row: order_id=1002, column: status): "pending" → "shipped"
+  order_id 1002 → status: "pending" → "shipped"
 ```
-
-You can review exactly what the agent did, approve it, or roll it back. Just like code review, but for data.
-
-This difference, bytes vs meaning, is exactly the guardrail AI agents need.
 
 ## AI agents need version control
 
-![AI agent changes need to be visible and controllable](./ai-agents.svg)
+AI agents modifying files need guardrails.
 
-Software engineers trust AI coding assistants because Git provides guardrails: review the diff, reject bad changes, roll back mistakes. Changes made by coding agents stay under control.
+Git provides agents with guardrails for text files: review the diff, reject bad changes, roll back mistakes. Lix brings the same guardrails to any file format and agent outside of software engineering:
 
-Lix brings the same primitives software engineers rely on (branches, diffs, merges) to any file format and agent outside of software engineering:
+
+
 
 - **See what changed**: Agent edits to spreadsheets, JSON, or other structured files are reviewable.
 - **Humans stay in control**: Agents propose changes; people decide what ships.
 - **Safe experimentation**: Agents work in isolated branches, not on production data.
+
+![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
+
 
 [Learn more about using Lix with agents →](/docs/lix-for-ai-agents/)
 
@@ -98,7 +114,7 @@ const diff = selectWorkingDiff({ lix })
 
 Lix adds a version control system on top of SQL databases.
 
-The Lix SDK exposes virtual tables like `file`, `file_history` that are queryable with plain SQL. Under the hood, the SDK rewrites your queries to hit native SQL tables.
+The Lix SDK exposes virtual tables like `file`, `file_history` that are queryable with plain SQL. 
 
 **Why this matters:**
 
@@ -128,15 +144,15 @@ The Lix SDK exposes virtual tables like `file`, `file_history` that are queryabl
 > Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
 
 
-### Detecting changes
+### How does lix detect changes?
 
 Inserts and updates to virtual tables like `file` are forwarded to plugins. Plugins parse the file and emit structured changes.
 
-Each plugin defines an **entity**—the smallest piece of data that can be independently created, updated, or deleted:
+Each plugin defines one or more **entities**, the smallest piece of data that can be independently created, updated, or deleted:
 
 - JSON → property
 - CSV → row
-- Excel → cell
+- Excel → cell, row, columns
 
 ```
 File:                                       Lix:
@@ -151,9 +167,7 @@ File:                                       Lix:
 
 Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
 
-Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). We had to develop a new version control system that addressed these problems.
-
-Through inlang, Lix now has over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk). 
+Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). We had to develop a new version control system that addressed git's limitations inlang ran into. The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk). 
 
 ![90k weekly npm downloads](./npm-downloads.png)
 
@@ -163,4 +177,3 @@ Through inlang, Lix now has over [90k weekly downloads on NPM](https://www.npmjs
 - **More robust engine + multi-language bindings**: Rewrite the core in Rust for better parsing, validation, and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
 - **Broader backends**: The preprocessor-first design unlocks future Postgres support ([tracking issue #372](https://github.com/opral/lix/issues/372)).
 
-[Get started with Lix →](/docs/getting-started)
