@@ -69,10 +69,9 @@ orders.xlsx
 
 AI agents modifying files need guardrails.
 
-Git provides agents with guardrails for text files: review the diff, reject bad changes, roll back mistakes. Lix brings the same guardrails to any file format and agent outside of software engineering:
+Git provides agents with guardrails for text files: review the diff, reject bad changes, roll back mistakes. 
 
-
-
+Lix brings the same guardrails to any file format and agent outside of software engineering:
 
 - **See what changed**: Agent edits to spreadsheets, JSON, or other structured files are reviewable.
 - **Humans stay in control**: Agents propose changes; people decide what ships.
@@ -167,7 +166,9 @@ File:                                       Lix:
 
 Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
 
-Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). We had to develop a new version control system that addressed git's limitations inlang ran into. The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk). 
+Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). We even explored [designing git compatible file formats](https://github.com/opral/inlang/issues/3965) just to make Git's merge work. 
+
+We had to develop a new version control system that addressed git's limitations inlang ran into. The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk). 
 
 ![90k weekly npm downloads](./npm-downloads.png)
 
@@ -177,3 +178,7 @@ Solving localization requires Git's collaboration model (branches, diffs, merges
 - **More robust engine + multi-language bindings**: Rewrite the core in Rust for better parsing, validation, and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
 - **Broader backends**: The preprocessor-first design unlocks future Postgres support ([tracking issue #372](https://github.com/opral/lix/issues/372)).
 
+## Join the community
+
+- ⭐ [Star the lix repo on GitHub](https://github.com/opral/lix)
+- 💬 [Chat on Discord](https://discord.gg/gdMPPWy57R)
