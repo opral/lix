@@ -182,7 +182,7 @@ The next version of Lix will be a refactor to be purely "preprocessor" based. Th
                       └────────────────┘
 ```
 
-[Read the RFC →](https://lix.dev/rfcs/001-preprocess-writes)
+[Read the RFC →](https://lix.dev/rfc/001-preprocess-writes)
 
 
 ## Join the community
