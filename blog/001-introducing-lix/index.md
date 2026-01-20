@@ -81,7 +81,9 @@ property theme:
 
 Changes AI agents make need to be reviewable by humans.
 
-For code, Git solves this: review the diff, reject bad changes, roll back mistakes. Lix brings these primitives to any file format, not just text.
+For code, Git solves this: review the diff, reject bad changes, roll back mistakes. 
+
+Lix brings these primitives to any file format, not just text:
 
 - **Reviewable diffs**: See exactly what an agent changed in any file format.
 - **Human-in-the-loop**: Agents propose, humans approve.
@@ -123,10 +125,6 @@ const diff = selectWorkingDiff({ lix })
 
 Lix adds a version control system on top of SQL databases.
 
-> [!NOTE]
-> Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
-
-
 The Lix SDK exposes virtual tables like `file`, `file_history` that are queryable with plain SQL. 
 
 **Why this matters:**
@@ -152,6 +150,10 @@ The Lix SDK exposes virtual tables like `file`, `file_history` that are queryabl
 │                  SQL database                   │
 └─────────────────────────────────────────────────┘
 ```
+
+> [!NOTE]
+> Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
+
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
 
