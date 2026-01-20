@@ -45,10 +45,10 @@ An AI agent updates an order status in `orders.xlsx`.
 
 **Before:**
 ```diff
-  | order_id | product  | status   |
-  | -------- | -------- | -------- |
-  | 1001     | Widget A | shipped  |
-  | -        | 1002     | Widget B | pending |
+  | order_id | product  | status  |
+  | -------- | -------- | ------- |
+  | 1001     | Widget A | shipped |
+  | 1002     | Widget B | pending |
 ```
 
 **After:**
@@ -56,7 +56,7 @@ An AI agent updates an order status in `orders.xlsx`.
   | order_id | product  | status   |
   | -------- | -------- | -------- |
   | 1001     | Widget A | shipped  |
-  | +        | 1002     | Widget B | shipped |
+  | 1002     | Widget B | shipped |
 ```
 
 **Git sees:**
