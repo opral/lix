@@ -167,10 +167,23 @@ We had to develop a new version control system that addressed git's limitations 
 
 ![90k weekly npm downloads](./npm-downloads.png)
 
-## What’s next
+## What's next
 
-- **Faster writes**: Move write handling fully into the SQL preprocessor ([RFC 001](https://lix.dev/rfc/001-preprocess-writes)).
-- **Multi-language bindings**: Rewrite the core in Rust for better parsing, validation, and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
+The next version of Lix will be a refactor to be purely "preprocessor" based. This enables:
+
+- **Fast writes** ([RFC 001](/rfc/001-preprocess-writes))
+- **Any SQL database** (SQLite, Postgres, Turso, MySQL)
+- **SDKs for Python, Rust, Go** ([RFC 002](/rfc/002-rewrite-in-rust))
+
+```
+                      ┌────────────────┐
+  SELECT * FROM ...   │  Lix Engine    │   SELECT * FROM ...
+ ───────────────────▶ │    (Rust)      │ ───────────────────▶  Database
+                      └────────────────┘
+```
+
+[Read the RFC →](https://lix.dev/rfcs/001-preprocess-writes)
+
 
 ## Join the community
 
