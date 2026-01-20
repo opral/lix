@@ -20,25 +20,6 @@ Lix is a **universal version control system** that can diff any file format (`.x
 
 Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". This makes Lix the ideal version control layer for AI agents operating on non-code formats.
 
-| File format | Git | Lix |
-| ----------- | --- | --- |
-| Text        | ✓   | ✓   |
-| JSON        | ~   | ✓   |
-| Excel       | ✗   | ✓   |
-| PDF         | ✗   | ✓   |
-| Word        | ✗   | ✓   |
-| ...         | ✗   | ✓   |
-
-## Why Lix
-
-Changes AI agents make need to be reviewable by humans.
-
-For code, Git solves this: review the diff, reject bad changes, roll back mistakes. Lix brings these primitives to any file format, not just text.
-
-- **Reviewable diffs**: See exactly what an agent changed in any file format.
-- **Human-in-the-loop**: Agents propose, humans approve.
-- **Safe rollback**: Undo mistakes instantly.
-
 ### Example: Excel
 
 An AI agent updates an order status in `orders.xlsx`.
