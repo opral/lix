@@ -16,19 +16,87 @@
 
 ---
 
-Lix is the version control system for AI agents. Track file edits, review diffs, and merge approved changes from branches.
+Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc).
+
+Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". This makes Lix the ideal version control layer for AI agents operating on non-code formats.
+
+| File format | Git | Lix |
+| ----------- | --- | --- |
+| Text        | ✓   | ✓   |
+| JSON        | ~   | ✓   |
+| Excel       | ✗   | ✓   |
+| PDF         | ✗   | ✓   |
+| Word        | ✗   | ✓   |
+| ...         | ✗   | ✓   |
 
 ## Why Lix
 
-AI agents modifying files need guardrails.
+Changes AI agents make need to be reviewable by humans.
 
-Lix provides visibility and control over changes that AI agents do:
+For code, Git solves this: review the diff, reject bad changes, roll back mistakes. Lix brings these primitives to any file format, not just text.
 
-- **Track agent actions** - See exactly what an agent did and when.
-- **Meaningful diffs** - See what actually changed, not noisy line-by-line text.
-- **Isolate tasks in branches** - Propose changes for human review and merge only what's approved.
+- **Reviewable diffs**: See exactly what an agent changed in any file format.
+- **Human-in-the-loop**: Agents propose, humans approve.
+- **Safe rollback**: Undo mistakes instantly.
 
-**Under the hood:** Plugins for any file format, SQL-queryable history, stored as a single portable SQLite file.
+### Example: Excel
+
+An AI agent updates an order status in `orders.xlsx`.
+
+**Before:**
+```diff
+  | order_id | product  | status  |
+  | -------- | -------- | ------- |
+  | 1001     | Widget A | shipped |
+  | 1002     | Widget B | pending |
+```
+
+**After:**
+```diff
+  | order_id | product  | status   |
+  | -------- | -------- | -------- |
+  | 1001     | Widget A | shipped  |
+  | 1002     | Widget B | shipped |
+```
+
+**Git sees:**
+```diff
+-Binary files differ
+```
+
+**Lix sees:**
+```diff
+order_id 1002 status:
+- pending
++ shipped
+```
+
+### Example: JSON
+
+Even for structured text file formats like `.json`, Lix tracks semantics rather than line-by-line diffs.
+
+**Before:**
+```json
+{"theme":"light","notifications":true,"language":"en"}
+```
+
+**After:**
+```json
+{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Git sees:**
+```diff
+-{"theme":"light","notifications":true,"language":"en"}
++{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Lix sees:**
+```diff
+property theme:
+- light
++ dark
+```
 
 ## Quick Start
 
@@ -71,7 +139,7 @@ console.log(diff);
 
 ## How Lix Works
 
-Lix is a version control system that runs on top of an existing SQL(ite) database:
+Lix is a version control system that runs on top of SQL databases:
 
 - **Filesystem**: A virtual filesystem for files and directories
 - **Branching**: Isolate work in branches, compare, and merge
@@ -80,43 +148,25 @@ Lix is a version control system that runs on top of an existing SQL(ite) databas
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                    Lix SDK                      │
+│                      Lix                        │
 │           (version control system)              │
 │                                                 │
 │ ┌────────────┐ ┌──────────┐ ┌─────────┐ ┌─────┐ │
-│ │ Filesystem │ │ Branching│ │ History │ │ ... │ │
+│ │ Filesystem │ │ Branches │ │ History │ │ ... │ │
 │ └────────────┘ └──────────┘ └─────────┘ └─────┘ │
-│                                                 │
 └────────────────────────┬────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────┐
-│               SQL(ite) database                 │
+│                  SQL database                   │
 └─────────────────────────────────────────────────┘
 ```
 
-Everything lives in a single SQLite database file. Persist anywhere (S3, filesystem, sandbox, etc.).
 
-[Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
+> [!NOTE]
+> Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
 
-## Comparison to Git
-
-Git was built for humans at the terminal. Lix is built to embed where agents operate on files. And while Git stores snapshots and computes diffs, Lix tracks the actual changes, enabling meaningful diffs:
-
-**Example**
-
-- **Git**: "line 5 changed"
-- **Lix**: "price changed from $10 to $12"
-
-|              | Git                       | Lix             |
-| ------------ | ------------------------- | --------------- |
-| Diffs        | Line-based                | Schema-aware    |
-| File formats | Text                      | Any via plugins |
-| Metadata     | External (GitHub, GitLab) | In the repo     |
-| Interface    | CLI                       | SDK             |
-| Queries      | Custom scripts            | SQL             |
-
-[Full comparison to Git →](https://lix.dev/docs/comparison-to-git)
+[Read more about Lix architecture →](https://lix.dev/docs/architecture)
 
 ## Learn More
 

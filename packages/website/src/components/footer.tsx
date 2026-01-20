@@ -3,6 +3,7 @@ import { getGithubStars } from "../github-stars-cache";
 const footerLinks = [
   { href: "/docs", label: "Docs", emoji: "📘" },
   { href: "/blog", label: "Blog", emoji: "📝" },
+  { href: "/rfc", label: "RFCs", emoji: "📄" },
 ];
 
 export function Footer() {

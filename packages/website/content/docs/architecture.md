@@ -194,6 +194,25 @@ Versions are isolated by design:
 - Deletions in a version are cheap—no cascade across versions needed
 - Enables safe parallel development without conflicts
 
+## Change Detection
+
+Inserts and updates to virtual tables like `file` are forwarded to plugins. Plugins parse the file and emit structured changes.
+
+Each plugin defines one or more **entities**, the smallest piece of data that can be independently created, updated, or deleted:
+
+- JSON → property
+- CSV → row
+- Excel → cell, row, columns
+
+```
+File:                                       Lix:
+┌────────────────────┐                      ┌────────────────────┐
+│ { "price": 10 }    │    ┌──────────┐      │ property "price"   │
+│        ↓           │───▶│   JSON   │───▶  │ changed: 10 → 12   │
+│ { "price": 12 }    │    │  Plugin  │      └────────────────────┘
+└────────────────────┘    └──────────┘
+```
+
 ## Integration Points
 
 ### How Plugins Integrate
