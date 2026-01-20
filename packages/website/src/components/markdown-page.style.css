@@ -108,7 +108,7 @@
 .markdown-wc-body h4[id],
 .markdown-wc-body h5[id],
 .markdown-wc-body h6[id] {
-  scroll-margin-top: 180px;
+  scroll-margin-top: 64px;
 }
 
 /* Heading anchor hash on hover (VitePress-style) */

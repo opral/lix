@@ -1,11 +1,9 @@
 # Comparison to Git
 
-The fundamental difference between Git and Lix:
+Git was built for text files. It can't meaningfully diff spreadsheets, PDFs, or binary formats. Lix can—via plugins that understand file structure.
 
 - **Git**: "line 5 changed"
 - **Lix**: "price changed from $10 to $12"
-
-Git tracks text line-by-line. Lix is schema-aware - it understands data structure. This means tracking specific fields (price, email, status) instead of arbitrary line numbers.
 
 |              | Git                       | Lix             |
 | :----------- | :------------------------ | :-------------- |
