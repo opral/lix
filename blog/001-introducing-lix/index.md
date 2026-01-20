@@ -7,13 +7,51 @@ og:description: "Lix is a universal version control system for any file format. 
 
 ## Introduction
 
-Lix is a **universal version control system** that can track changes in any file format.
+Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc).
 
-Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". This makes Lix an ideal version control layer for AI agents operating on non-code formats.
+Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". 
 
-### JSON example
+This makes Lix the ideal version control layer for AI agents operating on non-code formats.
 
-An agent changes `theme` in `settings.json`.
+### Excel file example
+
+An AI agent updates an order status in `orders.xlsx`.
+
+
+**Before:**
+```diff
+  | order_id | product  | status   |
+  | -------- | -------- | -------- |
+  | 1001     | Widget A | shipped  |
+  | -        | 1002     | Widget B | pending |
+```
+
+**After:**
+```diff
+  | order_id | product  | status   |
+  | -------- | -------- | -------- |
+  | 1001     | Widget A | shipped  |
+  | +        | 1002     | Widget B | shipped |
+```
+
+**Git sees:**
+
+```diff
+-Binary files differ
+```
+
+**Lix sees:**
+
+```diff
+order_id 1002 status: 
+
+- pending
++ shipped
+```
+
+### JSON file example
+
+Even for structured text file formats like `.json` lix is tracking semantics rather than line by line diffs. 
 
 **Before:**
 ```json
@@ -31,54 +69,26 @@ An agent changes `theme` in `settings.json`.
 +{"theme":"dark","notifications":true,"language":"en"}
 ```
 
-**Lix sees (illustrative):**
-```
-settings.json
-  property "theme": "light" → "dark"
-```
-
-### Excel example
-
-An agent updates an order status in `orders.xlsx`.
-
-**Before:**
-```
-| order_id | product    | status  |
-|----------|------------|---------|
-| 1001     | Widget A   | shipped |
-| 1002     | Widget B   | pending |
-```
-
-**After:**
-```
-| order_id | product    | status  |
-|----------|------------|---------|
-| 1001     | Widget A   | shipped |
-| 1002     | Widget B   | shipped |
-```
-
-**Git sees:** `Binary files differ`
-
 **Lix sees:**
-```
-orders.xlsx
-  order_id 1002 → status: "pending" → "shipped"
+
+```diff
+property theme: 
+- light
++ dark
 ```
 
 ## AI agents need version control
 
-AI agents modifying files need guardrails.
+Changes AI agents make need to be reviewable by humans.
 
-Git provides agents with guardrails for text files: review the diff, reject bad changes, roll back mistakes. 
+For code, Git solves this: review the diff, reject bad changes, roll back mistakes. Lix brings these primitives to any file format, not just text.
 
-Lix brings the same guardrails to any file format and agent outside of software engineering:
+- **Reviewable diffs**: See exactly what an agent changed in any file format.
+- **Human-in-the-loop**: Agents propose, humans approve.
+- **Safe rollback**: Undo mistakes instantly.
 
-- **See what changed**: Agent edits to spreadsheets, JSON, or other structured files are reviewable.
-- **Humans stay in control**: Agents propose changes; people decide what ships.
-- **Safe experimentation**: Agents work in isolated branches, not on production data.
 
 ![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
-
 
 [Learn more about using Lix with agents →](/docs/lix-for-ai-agents/)
 
@@ -113,6 +123,10 @@ const diff = selectWorkingDiff({ lix })
 
 Lix adds a version control system on top of SQL databases.
 
+> [!NOTE]
+> Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
+
+
 The Lix SDK exposes virtual tables like `file`, `file_history` that are queryable with plain SQL. 
 
 **Why this matters:**
@@ -139,34 +153,13 @@ The Lix SDK exposes virtual tables like `file`, `file_history` that are queryabl
 └─────────────────────────────────────────────────┘
 ```
 
-> [!NOTE]
-> Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
+[Read more about Lix architecture →](https://lix.dev/docs/architecture)
 
-
-### How does lix detect changes?
-
-Inserts and updates to virtual tables like `file` are forwarded to plugins. Plugins parse the file and emit structured changes.
-
-Each plugin defines one or more **entities**, the smallest piece of data that can be independently created, updated, or deleted:
-
-- JSON → property
-- CSV → row
-- Excel → cell, row, columns
-
-```
-File:                                       Lix:
-┌────────────────────┐                      ┌────────────────────┐
-│ { "price": 10 }    │    ┌──────────┐      │ property "price"   │
-│        ↓           │───▶│   JSON   │───▶  │ changed: 10 → 12   │
-│ { "price": 12 }    │    │  Plugin  │      └────────────────────┘
-└────────────────────┘    └──────────┘
-```
-
-## Background
+## Why did we built lix? 
 
 Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
 
-Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). We even explored [designing git compatible file formats](https://github.com/opral/inlang/issues/3965) just to make Git's merge work. 
+Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). 
 
 We had to develop a new version control system that addressed git's limitations inlang ran into. The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk). 
 
@@ -175,8 +168,7 @@ We had to develop a new version control system that addressed git's limitations 
 ## What’s next
 
 - **Faster writes**: Move write handling fully into the SQL preprocessor ([RFC 001](https://lix.dev/rfc/001-preprocess-writes)).
-- **More robust engine + multi-language bindings**: Rewrite the core in Rust for better parsing, validation, and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
-- **Broader backends**: The preprocessor-first design unlocks future Postgres support ([tracking issue #372](https://github.com/opral/lix/issues/372)).
+- **Multi-language bindings**: Rewrite the core in Rust for better parsing, validation, and bindings beyond JS ([RFC 002](https://lix.dev/rfc/002-rewrite-in-rust)).
 
 ## Join the community
 
