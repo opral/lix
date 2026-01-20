@@ -23,7 +23,7 @@ An AI agent updates an order status in `orders.xlsx`.
   | order_id | product  | status   |
   | -------- | -------- | -------- |
   | 1001     | Widget A | shipped  |
-  | -        | 1002     | Widget B | pending |
+  | 1002     | Widget B | pending |
 ```
 
 **After:**
@@ -31,7 +31,7 @@ An AI agent updates an order status in `orders.xlsx`.
   | order_id | product  | status   |
   | -------- | -------- | -------- |
   | 1001     | Widget A | shipped  |
-  | +        | 1002     | Widget B | shipped |
+  | 1002     | Widget B | shipped |
 ```
 
 **Git sees:**
@@ -161,7 +161,7 @@ Lix was developed alongside [inlang](https://inlang.com), open-source localizati
 
 Solving localization requires Git's collaboration model (branches, diffs, merges) but Git only handles text files, in addition to other issues (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). 
 
-We had to develop a new version control system that addressed git's limitations inlang ran into. The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk). 
+We had to develop a new version control system that addressed git's limitations inlang ran into. The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
 
 ![90k weekly npm downloads](./npm-downloads.png)
 
