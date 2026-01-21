@@ -145,6 +145,13 @@ Lix is a version control system that runs on top of SQL databases:
 - **[Discord](https://discord.gg/gdMPPWy57R)** - Get help and join the community
 - **[GitHub](https://github.com/opral/lix)** - Report issues and contribute
 
+## Blog posts
+
+- [Introducing Lix: A universal version control system](https://lix.dev/blog/introducing-lix)
+- [What if a Git SDK to build apps exists?](https://samuelstroschein.com/blog/what-if-a-git-sdk-exists)
+- [Git is unsuited for applications](https://samuelstroschein.com/blog/git-limitations)
+- [Does a git-based architecture make sense?](https://samuelstroschein.com/blog/git-based-architecture)
+
 ## License
 
 [MIT](https://github.com/opral/lix/blob/main/packages/lix-sdk/LICENSE)
