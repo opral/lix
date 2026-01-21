@@ -13,7 +13,7 @@ This makes Lix the ideal version control layer for AI agents operating on non-co
 
 ![Git only works for text files. Lix can handle any binary file](./lix-universal-2.png)
 
-## AI agents need version control beyond text
+## AI agents need version control
 
 Changes AI agents make need to be reviewable by humans.
 
