@@ -354,7 +354,7 @@ function BlogPostPage() {
       <Header />
       <main className="flex-1">
         <header className="bg-white">
-          <div className="mx-auto max-w-3xl px-6 pt-12 pb-8">
+          <div className="mx-auto max-w-4xl px-6 pt-12 pb-8">
             <nav className="mb-8 flex justify-center">
               <Link
                 to="/blog"
@@ -479,7 +479,7 @@ function BlogPostPage() {
           </div>
         </header>
 
-        <div className="mx-auto max-w-3xl px-6 py-12">
+        <div className="mx-auto max-w-4xl px-6 py-12">
           <article
             className="markdown-wc-body [&>h1:first-child]:hidden"
             dangerouslySetInnerHTML={{ __html: html }}
