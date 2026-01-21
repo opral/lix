@@ -5,21 +5,26 @@ og:description: "Lix is a universal version control system for any file format. 
 
 # Introducing Lix: A universal version control system
 
+## AI agents need version control beyond text
+
+Changes AI agents make need to be reviewable by humans.
+
+For code, Git solves this:
+
+- **Reviewable diffs**: What exactly did the agent change?
+- **Human-in-the-loop**: Review, then merge or reject.
+- **Rollback changes**: Undo mistakes instantly.
+
+But agents modify binary files too. And Git can't diff them.
+
+![Git supports text files but not binary formats like PDF, DOCX, XLSX](./git-limits.png)
+
+## Introducing Lix
+
 Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc).
 
 Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". 
 
-This makes Lix the ideal version control layer for AI agents operating on non-code formats.
-
-![Git only works for text files. Lix can handle any binary file](./lix-universal-2.png)
-
-## AI agents need version control
-
-Changes AI agents make need to be reviewable by humans.
-
-For code, Git solves this: review the diff, reject bad changes, roll back mistakes.
-
-Lix brings these primitives to any file format, not just text:
 
 - **Reviewable diffs**: See exactly what an agent changed in any file format.
 - **Human-in-the-loop**: Agents propose, humans approve.
