@@ -5,8 +5,9 @@
 <h3 align="center">The version control system for AI agents</h3>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="NPM Downloads"></a>
+  <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="97k weekly downloads on NPM"></a>
   <a href="https://discord.gg/gdMPPWy57R"><img src="https://img.shields.io/discord/897438559458430986?style=flat&logo=discord&labelColor=white" alt="Discord"></a>
+  <a href="https://github.com/opral/lix"><img src="https://img.shields.io/github/stars/opral/lix?style=flat&logo=github&color=brightgreen" alt="GitHub Stars"></a>
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
@@ -16,11 +17,13 @@
 
 ---
 
-Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc).
+Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc) on top of existing SQL databases.
 
 Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". 
 
 This makes Lix the ideal version control layer for AI agents operating on non-code formats.
+
+![Lix features: diff any file format, human-in-the-loop review, and branch isolation for agents](https://raw.githubusercontent.com/opral/lix/main/assets/value-prop.png)
 
 ## Getting started
 
