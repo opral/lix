@@ -11,49 +11,6 @@ Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 
 
 This makes Lix the ideal version control layer for AI agents operating on non-code formats.
 
-## Getting started
-
-<p>
-  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
-  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
-  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
-  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
-</p>
-
-```bash
-npm install @lix-js/sdk
-```
-
-```ts
-import { openLix } from "@lix-js/sdk";
-
-const lix = await openLix({
-  environment: new InMemorySQLite()
-});
-
-await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execute();
-
-const diff = selectWorkingDiff({ lix })
-```
-
-
-## AI agents need version control
-
-Changes AI agents make need to be reviewable by humans.
-
-For code, Git solves this: review the diff, reject bad changes, roll back mistakes. 
-
-Lix brings these primitives to any file format, not just text:
-
-- **Reviewable diffs**: See exactly what an agent changed in any file format.
-- **Human-in-the-loop**: Agents propose, humans approve.
-- **Safe rollback**: Undo mistakes instantly.
-
-
-![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
-
-[Learn more about using Lix with agents →](/docs/lix-for-ai-agents/)
-
 ## Excel file example
 
 An AI agent updates an order status in `orders.xlsx`.
@@ -90,35 +47,30 @@ order_id 1002 status:
 + shipped
 ```
 
-## JSON file example
+## AI agents need version control beyond text
 
-Even for structured text file formats like `.json` lix is tracking semantics rather than line by line diffs.
+Changes AI agents make need to be reviewable by humans.
 
-**Before:**
-```json
-{"theme":"light","notifications":true,"language":"en"}
-```
+For code, Git solves this: review the diff, reject bad changes, roll back mistakes.
 
-**After:**
-```json
-{"theme":"dark","notifications":true,"language":"en"}
-```
+Lix brings these primitives to any file format, not just text:
 
-**Git sees:**
-```diff
--{"theme":"light","notifications":true,"language":"en"}
-+{"theme":"dark","notifications":true,"language":"en"}
-```
-
-**Lix sees:**
-
-```diff
-property theme: 
-- light
-+ dark
-```
+- **Reviewable diffs**: See exactly what an agent changed in any file format.
+- **Human-in-the-loop**: Agents propose, humans approve.
+- **Safe rollback**: Undo mistakes instantly.
 
 
+![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
+
+[Learn more about using Lix with agents →](/docs/lix-for-ai-agents/)
+
+## Why did we build lix?
+
+Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
+
+We had to develop a new version control system that addressed git's limitations inlang ran into, see (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
+
+![90k weekly npm downloads](./npm-downloads.png)
 
 ## How does Lix work?
 
@@ -151,13 +103,30 @@ Lix adds a version control system on top of SQL databases that let's you query v
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
 
-## Why did we built lix? 
+## Getting started
 
-Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
+<p>
+  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
+  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
+  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+</p>
 
-We had to develop a new version control system that addressed git's limitations inlang ran into, see (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
+```bash
+npm install @lix-js/sdk
+```
 
-![90k weekly npm downloads](./npm-downloads.png)
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  environment: new InMemorySQLite()
+});
+
+await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execute();
+
+const diff = selectWorkingDiff({ lix })
+```
 
 ## What's next
 
