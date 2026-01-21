@@ -22,15 +22,41 @@ Unlike Git's line-based diffs, Lix understands file structure through plugins. L
 
 This makes Lix the ideal version control layer for AI agents operating on non-code formats.
 
-### Example: Excel
+## Getting started
+
+<p>
+  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
+  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
+  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+</p>
+
+```bash
+npm install @lix-js/sdk
+```
+
+```ts
+import { openLix } from "@lix-js/sdk";
+
+const lix = await openLix({
+  environment: new InMemorySQLite()
+});
+
+await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execute();
+
+const diff = selectWorkingDiff({ lix })
+```
+
+## Excel file example
 
 An AI agent updates an order status in `orders.xlsx`.
 
+
 **Before:**
 ```diff
-  | order_id | product  | status  |
-  | -------- | -------- | ------- |
-  | 1001     | Widget A | shipped |
+  | order_id | product  | status   |
+  | -------- | -------- | -------- |
+  | 1001     | Widget A | shipped  |
   | 1002     | Widget B | pending |
 ```
 
@@ -43,20 +69,23 @@ An AI agent updates an order status in `orders.xlsx`.
 ```
 
 **Git sees:**
+
 ```diff
 -Binary files differ
 ```
 
 **Lix sees:**
+
 ```diff
-order_id 1002 status:
+order_id 1002 status: 
+
 - pending
 + shipped
 ```
 
-### Example: JSON
+## JSON file example
 
-Even for structured text file formats like `.json`, Lix tracks semantics rather than line-by-line diffs.
+Even for structured text file formats like `.json` lix is tracking semantics rather than line by line diffs.
 
 **Before:**
 ```json
@@ -75,50 +104,12 @@ Even for structured text file formats like `.json`, Lix tracks semantics rather 
 ```
 
 **Lix sees:**
+
 ```diff
-property theme:
+property theme: 
 - light
 + dark
 ```
-
-## Quick Start
-
-<p>
-  <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
-  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
-  <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
-  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
-</p>
-
-```bash
-npm install @lix-js/sdk @lix-js/plugin-json
-```
-
-```ts
-import { openLix, selectWorkingDiff, InMemoryEnvironment } from "@lix-js/sdk";
-import { plugin as json } from "@lix-js/plugin-json";
-
-// 1) Open a lix with plugins
-const lix = await openLix({
-  environment: new InMemoryEnvironment(),
-  providePlugins: [json],
-});
-
-// 2) Write a file via SQL
-await lix.db
-  .insertInto("file")
-  .values({
-    path: "/settings.json",
-    data: new TextEncoder().encode(JSON.stringify({ theme: "light" })),
-  })
-  .execute();
-
-// 3) Query the changes
-const diff = await selectWorkingDiff({ lix }).execute();
-console.log(diff);
-```
-
-[Full getting started →](https://lix.dev/docs/getting-started)
 
 ## How Lix Works
 
@@ -144,10 +135,6 @@ Lix is a version control system that runs on top of SQL databases:
 │                  SQL database                   │
 └─────────────────────────────────────────────────┘
 ```
-
-
-> [!NOTE]
-> Lix targets SQLite at the moment. [Upvote issue #372 for Postgres support →](https://github.com/opral/lix/issues/372)
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
 
