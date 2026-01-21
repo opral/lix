@@ -173,7 +173,7 @@ function RfcPage() {
     <div className="flex min-h-screen flex-col bg-white text-slate-900">
       <Header />
       <main className="flex-1">
-        <div className="mx-auto max-w-3xl px-6 py-12">
+        <div className="mx-auto max-w-4xl px-6 py-12">
           <nav className="mb-8">
             <Link
               to="/rfc"

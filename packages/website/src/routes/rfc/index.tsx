@@ -88,7 +88,7 @@ function RfcIndexPage() {
     <div className="flex min-h-screen flex-col bg-white text-slate-900">
       <Header />
       <main className="flex-1">
-        <div className="mx-auto max-w-3xl px-6 py-16">
+        <div className="mx-auto max-w-4xl px-6 py-16">
           <h1 className="mb-12 text-4xl font-bold tracking-tight text-slate-900">
             RFCs
           </h1>
