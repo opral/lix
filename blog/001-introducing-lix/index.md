@@ -3,7 +3,7 @@ date: "2026-01-20"
 og:description: "Lix is a universal version control system for any file format. Unlike Git's line-based diffs, Lix understands file structure, showing 'price: 10 → 12' instead of 'line 4 changed'."
 ---
 
-# Announcing Lix: A universal version control system
+# Introducing Lix: A universal version control system
 
 ## Introduction
 
