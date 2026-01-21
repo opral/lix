@@ -385,8 +385,10 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix lets you trace what agents do to files, review diffs, and
-              isolate work in branches.
+              Lix is a version control system that can diff any file format like{" "}
+              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.xlsx</code>,{" "}
+              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.pdf</code>,{" "}
+              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.docx</code> on top of existing SQL databases.
             </p>
 
             {/* Trust signals */}
@@ -560,9 +562,50 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         </section>
 
         {/* Value Props - Lightweight */}
+        {false && (
         <section className="py-12 px-6 sm:px-12 md:px-16 bg-white">
           <div className="max-w-6xl mx-auto">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-8 sm:gap-12">
+              <div className="flex flex-col items-center sm:items-start gap-4">
+                {/* Diff illustration - semantic/field-level */}
+                <div className="w-full max-w-[220px] h-32 rounded-lg border border-gray-200 bg-white p-4">
+                  <div className="text-xs text-gray-400 mb-3">config.json</div>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-gray-600">title</span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="bg-red-50 text-red-700 px-1 rounded line-through">
+                          Draft
+                        </span>
+                        <span className="text-gray-300">→</span>
+                        <span className="bg-green-50 text-green-700 px-1 rounded">
+                          Final
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-gray-600">price</span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="bg-red-50 text-red-700 px-1 rounded line-through">
+                          10
+                        </span>
+                        <span className="text-gray-300">→</span>
+                        <span className="bg-green-50 text-green-700 px-1 rounded">
+                          12
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="text-center sm:text-left">
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    Diff any file
+                  </h3>
+                  <p className="text-gray-600 text-base mt-2">
+                    Lix can diff any file format via plugins without line-by-line diff noise.
+                  </p>
+                </div>
+              </div>
               <div className="flex flex-col items-center sm:items-start gap-4">
                 {/* Trace illustration */}
                 <div className="w-full max-w-[220px] h-32 rounded-lg border border-gray-200 bg-white p-4 font-mono text-xs">
@@ -632,52 +675,10 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Track every action of agents
+                    Human in the loop
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    See exactly what an agent did and when. Every file edit,
-                    conversation, and change proposal is tracked.
-                  </p>
-                </div>
-              </div>
-              <div className="flex flex-col items-center sm:items-start gap-4">
-                {/* Diff illustration - semantic/field-level */}
-                <div className="w-full max-w-[220px] h-32 rounded-lg border border-gray-200 bg-white p-4">
-                  <div className="text-xs text-gray-400 mb-3">config.json</div>
-                  <div className="space-y-3 text-sm">
-                    <div className="flex items-center justify-between">
-                      <span className="text-gray-600">title</span>
-                      <div className="flex items-center gap-1.5">
-                        <span className="bg-red-50 text-red-700 px-1 rounded line-through">
-                          Draft
-                        </span>
-                        <span className="text-gray-300">→</span>
-                        <span className="bg-green-50 text-green-700 px-1 rounded">
-                          Final
-                        </span>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-gray-600">price</span>
-                      <div className="flex items-center gap-1.5">
-                        <span className="bg-red-50 text-red-700 px-1 rounded line-through">
-                          10
-                        </span>
-                        <span className="text-gray-300">→</span>
-                        <span className="bg-green-50 text-green-700 px-1 rounded">
-                          12
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-                <div className="text-center sm:text-left">
-                  <h3 className="text-lg font-semibold text-gray-900">
-                    Display meaningful diffs
-                  </h3>
-                  <p className="text-gray-600 text-base mt-2">
-                    See what actually changed in PDFs, spreadsheets, configs,
-                    and more. Not noisy line-by-line text diffs.
+                    Review and approve changes AI agents make.
                   </p>
                 </div>
               </div>
@@ -814,14 +815,14 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                     Isolate tasks in branches
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Isolate each agent task in its own branch. Compare diffs and
-                    merge only what is approved.
+                    Run multiple agents without conflicts. Merge only what passes review.
                   </p>
                 </div>
               </div>
             </div>
           </div>
         </section>
+        )}
 
         {/* README Content */}
         {readmeHtml && (

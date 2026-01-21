@@ -5,11 +5,32 @@ og:description: "Lix is a universal version control system for any file format. 
 
 # Introducing Lix: A universal version control system
 
+## Changes AI agents make need to be reviewable
+
+For code, git solves this:
+
+- **See diffs** — What exactly did the agent change?
+- **Approve/reject** — Human reviews, then merges or rejects
+- **Task isolation** — Agents work in branches without affecting main
+
+But agents modify binary files too. And git can't diff them.
+
+![Git supports text files but not binary formats like PDF, DOCX, XLSX](./git-file-support.png)
+
+## Introducing Lix
+
 Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc).
 
-Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". 
+Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
 
-This makes Lix the ideal version control layer for AI agents operating on non-code formats.
+Lix brings these primitives to any file format, not just text:
+
+- **Reviewable diffs**: See exactly what an agent changed in any file format.
+- **Human-in-the-loop**: Agents propose, humans approve.
+- **Task isolation**: Isolate tasks of agents in branches.
+
+![AI agent changes need to be visible and controllable](./value-prop.png)
+![](./lix-universal-2.png)
 
 ## Excel file example
 
@@ -47,30 +68,34 @@ order_id 1002 status:
 + shipped
 ```
 
-## AI agents need version control beyond text
 
-Changes AI agents make need to be reviewable by humans.
+## JSON file example
 
-For code, Git solves this: review the diff, reject bad changes, roll back mistakes.
+Even for structured text file formats like `.json` lix is tracking semantics rather than line by line diffs.
 
-Lix brings these primitives to any file format, not just text:
+**Before:**
+```json
+{"theme":"light","notifications":true,"language":"en"}
+```
 
-- **Reviewable diffs**: See exactly what an agent changed in any file format.
-- **Human-in-the-loop**: Agents propose, humans approve.
-- **Safe rollback**: Undo mistakes instantly.
+**After:**
+```json
+{"theme":"dark","notifications":true,"language":"en"}
+```
 
+**Git sees:**
+```diff
+-{"theme":"light","notifications":true,"language":"en"}
++{"theme":"dark","notifications":true,"language":"en"}
+```
 
-![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
+**Lix sees:**
 
-[Learn more about using Lix with agents →](/docs/lix-for-ai-agents/)
-
-## Why did we build lix?
-
-Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
-
-We had to develop a new version control system that addressed git's limitations inlang ran into, see (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
-
-![90k weekly npm downloads](./npm-downloads.png)
+```diff
+property theme: 
+- light
++ dark
+```
 
 ## How does Lix work?
 
@@ -102,6 +127,14 @@ Lix adds a version control system on top of SQL databases that let's you query v
 
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
+
+## Why did we build lix?
+
+Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
+
+We had to develop a new version control system that addressed git's limitations inlang ran into, see (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
+
+![90k weekly npm downloads](./npm-downloads.png)
 
 ## Getting started
 
