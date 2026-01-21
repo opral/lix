@@ -11,7 +11,7 @@ Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 
 
 This makes Lix the ideal version control layer for AI agents operating on non-code formats.
 
-![](./lix-universal-2.png)
+![Git only works for text files. Lix can handle any binary file](./lix-universal-2.png)
 
 ## AI agents need version control beyond text
 
@@ -24,7 +24,6 @@ Lix brings these primitives to any file format, not just text:
 - **Reviewable diffs**: See exactly what an agent changed in any file format.
 - **Human-in-the-loop**: Agents propose, humans approve.
 - **Safe rollback**: Undo mistakes instantly.
-
 
 ![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
 
