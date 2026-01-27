@@ -200,11 +200,8 @@ export function selectWorkingDiff(args: {
 		]);
 
 	// CTEs for constants used across both UNION arms
-	const union = sql<DiffRow>`(
-        select * from (${base}) as w
-        union all
-        select * from (${unchanged}) as u
-    )`.as("diff");
+	const unionQuery = base.unionAll(unchanged);
+	const aliased = sql`(${unionQuery})`.as("diff");
 
 	return db
 		.with("wc", () => workingCommitIdQ as any)
@@ -225,7 +222,7 @@ export function selectWorkingDiff(args: {
 					.where("id", "=", sql`(select id from cc)` as any)
 					.select(["change_set_id"]) as any
 		)
-		.selectFrom(union) as unknown as SelectQueryBuilder<
+		.selectFrom(aliased) as unknown as SelectQueryBuilder<
 		LixDatabaseSchema & DiffDB,
 		"diff",
 		DiffRow

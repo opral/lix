@@ -146,9 +146,9 @@ Query the file's history using the `file_history` view. The `lixcol_root_commit_
 
 ```ts
 const activeVersion = await lix.db
-  .selectFrom("version")
-  .where("is_active", "=", true)
-  .select("commit_id")
+  .selectFrom("active_version")
+  .innerJoin("version", "active_version.version_id", "version.id")
+  .select("version.commit_id")
   .executeTakeFirstOrThrow();
 
 const history = await lix.db
