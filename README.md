@@ -39,7 +39,7 @@ npm install @lix-js/sdk
 ```
 
 ```ts
-import { openLix } from "@lix-js/sdk";
+import { openLix, selectWorkingDiff } from "@lix-js/sdk";
 
 const lix = await openLix({
   environment: new InMemorySQLite()
@@ -47,7 +47,7 @@ const lix = await openLix({
 
 await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execute();
 
-const diff = selectWorkingDiff({ lix })
+const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 ```
 
 ## Excel file example

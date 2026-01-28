@@ -124,6 +124,7 @@ import { selectWorkingDiff } from "@lix-js/sdk";
 
 const rows = useQuery(({ lix }) =>
 	selectWorkingDiff({ lix })
+		.selectAll()
 		.where("diff.status", "!=", "unchanged")
 		.orderBy("diff.entity_id"),
 );
