@@ -42,7 +42,7 @@ await lix.db
 Lix tracks changes on the entity level. You can query the history of a specific entity, or the diff between two versions.
 
 ```ts
-const diff = await selectWorkingDiff({ lix }).execute();
+const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 console.log(diff);
 ```
 
@@ -146,9 +146,9 @@ Query the file's history using the `file_history` view. The `lixcol_root_commit_
 
 ```ts
 const activeVersion = await lix.db
-  .selectFrom("version")
-  .where("is_active", "=", true)
-  .select("commit_id")
+  .selectFrom("active_version")
+  .innerJoin("version", "version.id", "active_version.version_id")
+  .select("version.commit_id as commit_id")
   .executeTakeFirstOrThrow();
 
 const history = await lix.db
