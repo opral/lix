@@ -51,7 +51,7 @@ await lix.db
 	.execute();
 
 // 3) Query the changes
-const diff = await selectWorkingDiff({ lix }).execute();
+const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 console.log(diff);
 ```
 

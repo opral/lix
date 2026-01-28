@@ -34,6 +34,7 @@ import type { LixDatabaseSchema } from "../database/schema.js";
  * @example
  * // Get all changes since the last checkpoint
  * const changes = await selectWorkingDiff({ lix })
+ *   .selectAll()
  *   .where('status', '!=', 'unchanged')
  *   .execute();
  *
@@ -42,6 +43,7 @@ import type { LixDatabaseSchema } from "../database/schema.js";
  * @example
  * // Monitor changes to a specific file
  * const fileChanges = await selectWorkingDiff({ lix })
+ *   .selectAll()
  *   .where('file_id', '=', 'config.json')
  *   .where('status', '!=', 'unchanged')
  *   .orderBy('entity_id')
@@ -51,6 +53,7 @@ import type { LixDatabaseSchema } from "../database/schema.js";
  * // Check if specific entities have changed since checkpoint
  * const entityIds = ['user-1', 'user-2', 'user-3'];
  * const entityChanges = await selectWorkingDiff({ lix })
+ *   .selectAll()
  *   .where('entity_id', 'in', entityIds)
  *   .where('status', '!=', 'unchanged')
  *   .execute();
@@ -58,6 +61,7 @@ import type { LixDatabaseSchema } from "../database/schema.js";
  * @example
  * // Count changes by status
  * const allChanges = await selectWorkingDiff({ lix })
+ *   .selectAll()
  *   .where('status', '!=', 'unchanged')
  *   .execute();
  *
