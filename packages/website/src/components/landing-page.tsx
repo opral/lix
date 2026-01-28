@@ -562,7 +562,6 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
         </section>
 
         {/* Value Props - Lightweight */}
-        {false && (
         <section className="py-12 px-6 sm:px-12 md:px-16 bg-white">
           <div className="max-w-6xl mx-auto">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-8 sm:gap-12">
@@ -822,7 +821,6 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             </div>
           </div>
         </section>
-        )}
 
         {/* README Content */}
         {readmeHtml && (

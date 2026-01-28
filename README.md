@@ -23,8 +23,6 @@ Unlike Git's line-based diffs, Lix understands file structure through plugins. L
 
 This makes Lix the ideal version control layer for AI agents operating on non-code formats.
 
-![Lix features: diff any file format, human-in-the-loop review, and branch isolation for agents](https://raw.githubusercontent.com/opral/lix/main/assets/value-prop.png)
-
 ## Getting started
 
 <p>
