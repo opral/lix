@@ -1,39 +1,20 @@
 ---
 date: "2026-01-20"
-og:description: "Lix is an embeddable version control system. It records semantic changes to enable diffs, reviews, rollback, and querying of edits, directly inside your application."
+og:description: "Lix is a version control system you import as a library. It records semantic changes to enable diffs, reviews, rollback, and querying of edits."
 ---
 
 # Introducing Lix: An embeddable version control system
 
-Changes AI agents make need to be reviewable by humans. 
+Lix is an **embeddable version control system** that can be imported as a library. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
 
-For code, Git solves this: 
-
-- **Reviewable diffs**: What exactly did the agent change?
-- **Human-in-the-loop**: Review, then merge or reject.
-- **Rollback changes**: Undo mistakes instantly.
-
-Git is the right tool for source code repos. Git is optimized for developer workflows around repositories and files. But, embedding Git into applications (with semantic diffs, approvals, and queryable history) is complicated. We ran into these limitations building [inlang](https://inlang.com): ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations).
-
-![Git can store any file but it cannot show meaningful diffs for most binary and structured formats](./git-limits.png)
-
-## Introducing Lix
-
-Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback.
-
-It records semantic changes (via plugins) to enable diffs, reviews, rollback, and querying of edits — **as part of your product**:
-
-- **Track every action of agents** — see exactly what an agent did and when (edits, proposals, and approvals).
-- **Display meaningful diffs** — show what actually changed in structured data and documents, without noisy line-by-line churn.
-- **Rollback changes** — discard proposals, roll back state, and isolate experiments safely.
-
-Typical flow: an agent opens a task branch → proposes changes → your UI shows a semantic diff → user approves → you merge into the main state → rollback is one action.
+- **It's just a library** — Lix is a library you import. Get branching, diff, rollback in your existing stack
+- **Tracks semantic changes** — diffs, blame, and history are queryable via SQL
+- **Approval workflows for agents** — agents propose changes in isolated versions, humans review and merge
 
 ![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
 
-> [!NOTE]
-> Lix does not replace Git for source code. Lix brings Git-like review and rollback into applications for agent-driven changes to app state and non-code artifacts.
-
+> [!TIP]
+> Lix does not replace Git. [Read how Lix compares to Git →](https://lix.dev/docs/comparison-to-git)
 
 ## Semantic change tracking
 
@@ -155,9 +136,12 @@ Lix’s format support depends on plugins. Here’s the current status:
 
 Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
 
-We needed version control **embedded in the application**, not as an external tool. Git's architecture didn't fit: we needed database semantics (transactions, ACID), queryable history, and semantic diffing. [Read more →](https://samuelstroschein.com/blog/git-limitations)
+We needed version control **as a library**, not as an external tool. Git's architecture didn't fit: we needed database semantics (transactions, ACID), queryable history, and semantic diffing. [Read more →](https://samuelstroschein.com/blog/git-limitations)
 
 The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
+
+![Weekly npm downloads](./npm-downloads.png)
+
 
 ## Getting started
 
