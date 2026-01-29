@@ -15,13 +15,15 @@ For code, Git solves this. But Git is hard to embed into applications. It's a CL
 
 ## Introducing Lix
 
+
 Lix is an **embeddable version control system** that runs inside your application.
 
-Unlike Git, Lix understands file structure and stores changes directly. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
+It records schema-aware changes (via plugins) to enable diffs, reviews, rollback, and querying of edits — **as part of your product**:
 
-- **Reviewable diffs**: See exactly what an agent changed in any file format.
-- **Human-in-the-loop**: Agents propose, humans approve.
-- **Safe rollback**: Undo mistakes instantly.
+- **Track every action of agents** — see exactly what an agent did and when (edits, proposals, and approvals).
+- **Display meaningful diffs** — show what actually changed in structured data and documents, without noisy line-by-line churn.
+- **Rollback changes** — discard proposals, roll back state, and isolate experiments safely.
+
 
 ![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
 
