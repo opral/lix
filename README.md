@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/assets/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Embeddable version control system for apps & AI agents</h3>
+<h3 align="center">Embeddable version control system</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="97k weekly downloads on NPM"></a>
@@ -17,16 +17,13 @@
 
 ---
 
-Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback.
+Lix is an **embeddable version control system** that can be imported as a library. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
 
-- **Track agent actions** — see exactly what an agent changed and when
-- **Reviewable diffs** — show semantic changes, not line-by-line noise
-- **Human-in-the-loop** — review, approve, or reject before merging
-- **Instant rollback** — undo mistakes with one action
+- **It's just a library** — Lix is a library you import. Get branching, diff, rollback in your existing stack
+- **Tracks semantic changes** — diffs, blame, and history are queryable via SQL
+- **Approval workflows for agents** — agents propose changes in isolated versions, humans review and merge
 
-> [!NOTE]
->
-> Lix does not replace Git for source code. Lix brings Git-like review and rollback **into applications** for agent-driven changes.
+[How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
 ## Getting started
 

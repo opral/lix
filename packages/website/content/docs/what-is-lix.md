@@ -1,6 +1,6 @@
 # What is Lix?
 
-Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback.
+Lix is an **embeddable version control system** that you import as a library. Agents can propose changes and users can review, approve, and rollback.
 
 What makes Lix unique:
 

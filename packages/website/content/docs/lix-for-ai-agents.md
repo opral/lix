@@ -2,11 +2,11 @@
 
 ![AI agent changes need to be visible and controllable](/blame-what-did-you-change.svg)
 
-AI agents edit your product's **state** (files, documents, configs, database-backed content). Those edits need the same guarantees teams expect from Git—**diff, review, rollback**—but **inside the product**, not in a separate developer toolchain.
+AI agents edit your product's **state** (files, documents, configs, database-backed content). Those edits need the same guarantees teams expect from Git—**diff, review, rollback**—as a library you can import.
 
-**Lix is the embeddable version control layer for your app.**
+**Lix is a version control library.**
 
-Embed Lix once, route agent writes through it, and your UI can show **semantic diffs**, **attribution**, **proposals**, and **rollback**—all as queryable data.
+Import Lix, route agent writes through it, and your UI can show **semantic diffs**, **attribution**, **proposals**, and **rollback**—all as queryable data.
 
 ## Key concepts
 
