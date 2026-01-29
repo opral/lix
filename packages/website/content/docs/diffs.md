@@ -6,7 +6,7 @@ Unlike traditional version control that treats files as opaque blobs of text, Li
 - **Tables/CSV**: A row or an individual cell.
 - **Prose/Markdown**: A paragraph, heading, or list item.
 
-[Schema-aware](/docs/schemas) state enables semantic diffs: "price changed from $10 to $12" instead of "line 5 changed."
+[Semantic](/docs/schemas) state enables semantic diffs: "price changed from $10 to $12" instead of "line 5 changed."
 
 ![Diff](/diff.svg)
 

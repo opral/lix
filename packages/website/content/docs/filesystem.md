@@ -185,7 +185,7 @@ The `file.data` column is not stored directly. It's materialized from [plugin](/
 4. **Caching**: Results are cached for performance
 5. **Fallback**: If no plugin matches, the built-in `lix_unknown_file_fallback_plugin` stores the raw bytes
 
-This design enables schema-aware change tracking while still providing direct file access.
+This design enables semantic change tracking while still providing direct file access.
 
 ## Path Requirements
 

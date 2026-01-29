@@ -379,16 +379,13 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               </svg>
             </a>
             <h1 className="text-gray-900 font-bold leading-[1.1] text-4xl sm:text-5xl md:text-6xl tracking-tight">
-              The version control system
+              The embeddable version control system
               <br />
               for AI agents
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix is a version control system that can diff any file format like{" "}
-              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.xlsx</code>,{" "}
-              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.pdf</code>,{" "}
-              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.docx</code> on top of existing SQL databases.
+              Lix is an embeddable version control system that runs inside your application so agents can propose changes and users can review, approve, and rollback.
             </p>
 
             {/* Trust signals */}

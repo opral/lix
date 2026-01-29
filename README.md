@@ -17,7 +17,7 @@
 
 ---
 
-Lix is an **embeddable version control system** that runs inside your application. AI agents propose changes, users review and approve in-product, and mistakes roll back instantly — all backed by your existing SQL database.
+Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback.
 
 - **Track agent actions** — see exactly what an agent changed and when
 - **Reviewable diffs** — show semantic changes, not line-by-line noise
@@ -53,7 +53,7 @@ await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execut
 const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 ```
 
-## Schema-aware diffs
+## Semantic diffs
 
 Lix tracks **semantic changes** via plugins, not line-by-line text diffs.
 
@@ -120,7 +120,7 @@ order_id 1002 status:
 
 ## How Lix Works
 
-Lix turns changes into **queryable data** on top of your existing SQL database.
+Lix is **change-first**: it stores semantic changes as queryable data, not snapshots.
 
 Plugins parse files and app state into structured entities. Lix stores **what changed** semantically — not just which bytes differ. Audit trails, rollbacks, and history become simple SQL queries:
 
@@ -130,7 +130,7 @@ WHERE entity_id = 'order.1002.status'
 ORDER BY created_at DESC;
 ```
 
-- **No new infrastructure** — uses your existing SQL database (SQLite, Postgres, etc.)
+- **Doesn't reinvent databases** — uses SQLite, Postgres, etc.
 - **SQL API for changes** — query diffs, history, and audit trails directly
 - **Branching & merging** — isolate agent work, compare, and merge
 

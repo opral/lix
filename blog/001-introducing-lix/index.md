@@ -19,9 +19,9 @@ Git is the right tool for source code repos. Git is optimized for developer work
 
 ## Introducing Lix
 
-Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback in-product.
+Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback.
 
-It records schema-aware changes (via plugins) to enable diffs, reviews, rollback, and querying of edits — **as part of your product**:
+It records semantic changes (via plugins) to enable diffs, reviews, rollback, and querying of edits — **as part of your product**:
 
 - **Track every action of agents** — see exactly what an agent did and when (edits, proposals, and approvals).
 - **Display meaningful diffs** — show what actually changed in structured data and documents, without noisy line-by-line churn.
@@ -35,7 +35,7 @@ Typical flow: an agent opens a task branch → proposes changes → your UI show
 > Lix does not replace Git for source code. Lix brings Git-like review and rollback into applications for agent-driven changes to app state and non-code artifacts.
 
 
-## Schema-aware change tracking
+## Semantic change tracking
 
 Lix doesn't track line-by-line text changes. It tracks **semantic changes** at the entity level via plugins.
 
@@ -99,7 +99,7 @@ The same approach extends to any other format your product cares about — **as 
 
 ## How does Lix work?
 
-Lix turns changes into queryable data.
+Lix is **change-first**: it stores semantic changes as queryable data, not snapshots.
 
 That means audit trails, rollbacks, and “blame” become simple queries:
 
@@ -116,9 +116,9 @@ Plugins parse files (including binary formats) into "meaningful changes" e.g. ce
 
 Why this matters:
 
-- **Doesn’t reinvent databases** — durability, ACID, and recovery come from proven SQL engines.
-- **SQL API for changes** — complex queries for diffs, history, and audit trails are possible.
-- **Runs in existing databases** — Lix can use your existing database as a persistence layer.
+- **Doesn't reinvent databases** — durability, ACID, and recovery come from proven SQL engines.
+- **SQL API for changes** — query diffs, history, and audit trails directly.
+- **Portable** — runs on SQLite, Postgres, or other SQL databases.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -155,7 +155,7 @@ Lix’s format support depends on plugins. Here’s the current status:
 
 Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
 
-We needed version control **embedded in the application**, not as an external tool. Git's architecture didn't fit: we needed database semantics (transactions, ACID), queryable history, and schema-aware diffing. [Read more →](https://samuelstroschein.com/blog/git-limitations)
+We needed version control **embedded in the application**, not as an external tool. Git's architecture didn't fit: we needed database semantics (transactions, ACID), queryable history, and semantic diffing. [Read more →](https://samuelstroschein.com/blog/git-limitations)
 
 The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
 

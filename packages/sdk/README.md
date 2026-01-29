@@ -5,7 +5,7 @@
 > [!NOTE]
 > **Lix is in beta** · [Follow progress to v1.0 →](https://github.com/opral/lix-sdk/issues/374)
 
-Lix is an embeddable change control system that enables Git-like features such as [history](https://lix.dev/docs/history), [versions](https://lix.dev/docs/versions) (branches), [diffs](https://lix.dev/docs/), or [blame](https://lix.dev/docs/attribution) for any file format.
+Lix is an embeddable version control system that enables Git-like features such as [history](https://lix.dev/docs/history), [versions](https://lix.dev/docs/versions) (branches), [diffs](https://lix.dev/docs/), or [blame](https://lix.dev/docs/attribution) for any file format.
 
 **What makes Lix unique:**
 
