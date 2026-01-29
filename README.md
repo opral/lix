@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/assets/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">The version control system for AI agents</h3>
+<h3 align="center">Embeddable version control system</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="97k weekly downloads on NPM"></a>
@@ -17,11 +17,13 @@
 
 ---
 
-Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc) on top of existing SQL databases.
+Lix is an **embeddable version control system** that can be imported as a library. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
 
-Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". 
+- **It's just a library** — Lix is a library you import. Get branching, diff, rollback in your existing stack
+- **Tracks semantic changes** — diffs, blame, and history are queryable via SQL
+- **Approval workflows for agents** — agents propose changes in isolated versions, humans review and merge
 
-This makes Lix the ideal version control layer for AI agents operating on non-code formats.
+[How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
 ## Getting started
 
@@ -48,10 +50,39 @@ await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execut
 const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 ```
 
-## Excel file example
+## Semantic change (delta) tracking
 
-An AI agent updates an order status in `orders.xlsx`.
+Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
 
+### JSON file example
+
+**Before:**
+```json
+{"theme":"light","notifications":true,"language":"en"}
+```
+
+**After:**
+```json
+{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Git sees:**
+```diff
+-{"theme":"light","notifications":true,"language":"en"}
++{"theme":"dark","notifications":true,"language":"en"}
+```
+
+**Lix sees:**
+
+```diff
+property theme:
+- light
++ dark
+```
+
+### Excel file example
+
+The same approach works for binary formats. With an XLSX plugin, Lix shows cell-level changes:
 
 **Before:**
 ```diff
@@ -78,53 +109,31 @@ An AI agent updates an order status in `orders.xlsx`.
 **Lix sees:**
 
 ```diff
-order_id 1002 status: 
+order_id 1002 status:
 
 - pending
 + shipped
 ```
 
-## JSON file example
-
-Even for structured text file formats like `.json` lix is tracking semantics rather than line by line diffs.
-
-**Before:**
-```json
-{"theme":"light","notifications":true,"language":"en"}
-```
-
-**After:**
-```json
-{"theme":"dark","notifications":true,"language":"en"}
-```
-
-**Git sees:**
-```diff
--{"theme":"light","notifications":true,"language":"en"}
-+{"theme":"dark","notifications":true,"language":"en"}
-```
-
-**Lix sees:**
-
-```diff
-property theme: 
-- light
-+ dark
-```
-
 ## How Lix Works
 
-Lix is a version control system that runs on top of SQL databases:
+Lix is **change-first**: it stores semantic changes as queryable data, not snapshots.
 
-- **Filesystem**: A virtual filesystem for files and directories
-- **Branching**: Isolate work in branches, compare, and merge
-- **History**: Full change history with commits and diffs
-- **Change proposals**: Built-in pull request-like workflows
+Plugins parse files and app state into structured entities. Lix stores **what changed** semantically — not just which bytes differ. Audit trails, rollbacks, and history become simple SQL queries:
+
+```sql
+SELECT * FROM change_history
+WHERE entity_id = 'order.1002.status'
+ORDER BY created_at DESC;
+```
+
+- **Doesn't reinvent databases** — uses SQLite, Postgres, etc.
+- **SQL API for changes** — query diffs, history, and audit trails directly
+- **Branching & merging** — isolate agent work, compare, and merge
 
 ```
 ┌─────────────────────────────────────────────────┐
 │                      Lix                        │
-│           (version control system)              │
 │                                                 │
 │ ┌────────────┐ ┌──────────┐ ┌─────────┐ ┌─────┐ │
 │ │ Filesystem │ │ Branches │ │ History │ │ ... │ │
@@ -134,6 +143,7 @@ Lix is a version control system that runs on top of SQL databases:
                          ▼
 ┌─────────────────────────────────────────────────┐
 │                  SQL database                   │
+│            (SQLite, Postgres, etc.)             │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -148,7 +158,7 @@ Lix is a version control system that runs on top of SQL databases:
 
 ## Blog posts
 
-- [Introducing Lix: A universal version control system](https://lix.dev/blog/introducing-lix)
+- [Introducing Lix: An embeddable version control system](https://lix.dev/blog/introducing-lix)
 - [What if a Git SDK to build apps exists?](https://samuelstroschein.com/blog/what-if-a-git-sdk-exists)
 - [Git is unsuited for applications](https://samuelstroschein.com/blog/git-limitations)
 - [Does a git-based architecture make sense?](https://samuelstroschein.com/blog/git-based-architecture)

@@ -1,6 +1,6 @@
 # Schemas
 
-Schemas define the structure of data that Lix tracks. They enable schema-aware change tracking by telling Lix what constitutes a meaningful unit of change (an entity) and how to validate it.
+Schemas define the structure of data that Lix tracks. They enable semantic change tracking by telling Lix what constitutes a meaningful unit of change (an entity) and how to validate it.
 
 ## What is a Schema?
 

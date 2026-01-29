@@ -1,12 +1,11 @@
 # What is Lix?
 
-Lix is a **universal version control system** that works beyond text files.
-
-Instead of tracking lines of text like Git, Lix understands the _structure_ of each file format via plugins. A change in a JSON file shows `price: 10 → 12`, not "line 4 changed". A change in a spreadsheet shows `cell B4: pending → shipped`.
+Lix is an **embeddable version control system** that you import as a library. Agents can propose changes and users can review, approve, and rollback.
 
 What makes Lix unique:
 
-- **Supports any file format** - Track changes in `.xlsx`, `.pdf`, `.json` etc. via plugins.
+- **Change-first** - Stores semantic changes as data, not snapshots. Diffs, history, and rollback are native.
+- **Supports any file format** - Track changes in `.xlsx`, `.json`, `.csv` etc. via plugins.
 - **SQL powered** - History, versions, and diffs are all queryable via SQL.
 - **Portable** - Runs as a single SQLite file, persistable anywhere (local FS, S3, your database).
 

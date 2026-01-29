@@ -379,16 +379,11 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               </svg>
             </a>
             <h1 className="text-gray-900 font-bold leading-[1.1] text-4xl sm:text-5xl md:text-6xl tracking-tight">
-              The version control system
-              <br />
-              for AI agents
+              Embeddable version control system for AI agents
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix is a version control system that can diff any file format like{" "}
-              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.xlsx</code>,{" "}
-              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.pdf</code>,{" "}
-              <code className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 text-base">.docx</code> on top of existing SQL databases.
+              Lix is a version control system that can be imported as a library. Use it to, for example, enable human-in-the-loop workflows for AI agents like diffs and reviews.
             </p>
 
             {/* Trust signals */}
@@ -566,6 +561,43 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
           <div className="max-w-6xl mx-auto">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-8 sm:gap-12">
               <div className="flex flex-col items-center sm:items-start gap-4">
+                {/* Library/dependency illustration */}
+                <div className="w-full max-w-[220px] h-32 rounded-lg border border-gray-200 bg-white p-4">
+                  <div className="text-xs text-gray-400 mb-3">dependencies</div>
+                  <div className="space-y-2 font-mono text-xs">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2.5 h-2.5 rounded bg-gray-200"></div>
+                        <span className="text-gray-400">http</span>
+                      </div>
+                      <span className="text-gray-300">2.1</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2.5 h-2.5 rounded bg-gray-200"></div>
+                        <span className="text-gray-400">db</span>
+                      </div>
+                      <span className="text-gray-300">3.0</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2.5 h-2.5 rounded bg-cyan-200 border border-cyan-400"></div>
+                        <span className="text-gray-700 font-medium">lix</span>
+                      </div>
+                      <span className="text-gray-400">1.0</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="text-center sm:text-left">
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    It's just a library
+                  </h3>
+                  <p className="text-gray-600 text-base mt-2">
+                    Lix is a library you import. Get branching, diff, rollback in your existing stack.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-col items-center sm:items-start gap-4">
                 {/* Diff illustration - semantic/field-level */}
                 <div className="w-full max-w-[220px] h-32 rounded-lg border border-gray-200 bg-white p-4">
                   <div className="text-xs text-gray-400 mb-3">config.json</div>
@@ -598,10 +630,10 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Diff any file
+                    Tracks semantic changes
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Lix can diff any file format via plugins without line-by-line diff noise.
+                    Lix stores semantic changes via plugins. Diffs, blame, and history are queryable via SQL.
                   </p>
                 </div>
               </div>
@@ -674,147 +706,10 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Human in the loop
+                    Approval workflows for agents
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Review and approve changes AI agents make.
-                  </p>
-                </div>
-              </div>
-              <div className="flex flex-col items-center sm:items-start gap-4">
-                {/* Branch illustration */}
-                <div className="w-full max-w-[220px] rounded-lg border border-gray-200 bg-white p-4 h-32">
-                  <svg
-                    viewBox="0 0 188 100"
-                    className="w-full h-full"
-                    fill="none"
-                    xmlns="http://www.w3.org/2000/svg"
-                  >
-                    <g strokeLinecap="round">
-                      {/* Main branch line */}
-                      <path
-                        d="M20 10 L20 90"
-                        stroke="#9ca3af"
-                        strokeWidth="2"
-                      />
-                      {/* Branch out - diagonal from merge point */}
-                      <path
-                        d="M20 22 L45 42"
-                        stroke="#9ca3af"
-                        strokeWidth="2"
-                      />
-                      {/* Branch back - diagonal returning to main */}
-                      <path
-                        d="M45 42 L20 70"
-                        stroke="#9ca3af"
-                        strokeWidth="2"
-                      />
-                    </g>
-                    {/* Merge point - purple circle (GitHub style) */}
-                    <circle cx="20" cy="14" r="10" fill="#d8b4fe" />
-                    {/* Merge icon inside */}
-                    <g transform="translate(12, 6)">
-                      <circle
-                        cx="12"
-                        cy="12"
-                        r="2"
-                        fill="none"
-                        stroke="#7c3aed"
-                        strokeWidth="1.5"
-                      />
-                      <circle
-                        cx="4"
-                        cy="4"
-                        r="2"
-                        fill="none"
-                        stroke="#7c3aed"
-                        strokeWidth="1.5"
-                      />
-                      <path
-                        d="M4 6 L4 9 Q4 12 7 12 L10 12"
-                        fill="none"
-                        stroke="#7c3aed"
-                        strokeWidth="1.5"
-                        strokeLinecap="round"
-                      />
-                    </g>
-                    {/* Merged label */}
-                    <text
-                      x="38"
-                      y="18"
-                      fontSize="12"
-                      fill="#374151"
-                      fontFamily="system-ui"
-                    >
-                      merged
-                    </text>
-                    {/* Branch point indicator */}
-                    <circle cx="45" cy="42" r="5" fill="#f3f4f6" />
-                    {/* Agent on branch - robot icon with highlight */}
-                    <g transform="translate(50, 32)">
-                      {/* Background circle for emphasis */}
-                      <circle cx="8" cy="10" r="12" fill="#f9fafb" />
-                      {/* Robot head */}
-                      <rect
-                        x="2"
-                        y="5"
-                        width="12"
-                        height="11"
-                        rx="2"
-                        fill="#e5e7eb"
-                        stroke="#6b7280"
-                        strokeWidth="1.5"
-                      />
-                      {/* Antenna */}
-                      <line
-                        x1="8"
-                        y1="5"
-                        x2="8"
-                        y2="1"
-                        stroke="#6b7280"
-                        strokeWidth="1.5"
-                      />
-                      <circle cx="8" cy="0" r="2" fill="#6b7280" />
-                      {/* Eyes - glowing */}
-                      <circle cx="5.5" cy="9" r="2" fill="#3b82f6" />
-                      <circle cx="10.5" cy="9" r="2" fill="#3b82f6" />
-                      {/* Mouth grid */}
-                      <rect
-                        x="4"
-                        y="12"
-                        width="8"
-                        height="2"
-                        rx="0.5"
-                        fill="#6b7280"
-                      />
-                    </g>
-                    <text
-                      x="76"
-                      y="48"
-                      fontSize="12"
-                      fill="#6b7280"
-                      fontFamily="system-ui"
-                    >
-                      fix spelling
-                    </text>
-                    {/* Main branch label */}
-                    <text
-                      x="38"
-                      y="88"
-                      fontSize="12"
-                      fill="#6b7280"
-                      fontFamily="system-ui"
-                    >
-                      add document
-                    </text>
-                  </svg>
-                </div>
-                <div className="text-center sm:text-left">
-                  <h3 className="text-lg font-semibold text-gray-900">
-                    Isolate tasks in branches
-                  </h3>
-                  <p className="text-gray-600 text-base mt-2">
-                    Run multiple agents without conflicts. Merge only what passes review.
+                    Agents propose changes in isolated versions. Humans review, approve, and merge.
                   </p>
                 </div>
               </div>

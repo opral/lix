@@ -2,54 +2,56 @@
 
 ![AI agent changes need to be visible and controllable](/blame-what-did-you-change.svg)
 
-AI agents can generate more changes than a team can review in real time. Those changes still need to be **visible, attributable, and reversible**.
+AI agents edit your product's **state** (files, documents, configs, database-backed content). Those edits need the same guarantees teams expect from Git—**diff, review, rollback**—as a library you can import.
 
-**Lix provides the version control layer that lets agents move fast while keeping every edit transparent and reviewable.**
+**Lix is a version control library.**
 
-## Terminology
+Import Lix, route agent writes through it, and your UI can show **semantic diffs**, **attribution**, **proposals**, and **rollback**—all as queryable data.
 
-- A **version** is an **isolated branch of state**. Use versions to run agents without touching production data.
-- A **change proposal** is a review unit (diff + discussion + approval) for deciding what ships.
+## Key concepts
 
-## Every change is reviewable
+- **Version**: an isolated branch of your application state. Run agents safely without touching production.
+- **Change proposal**: a review unit (diff + discussion + approval). Humans decide what ships.
 
-- Use [attribution](/docs/attribution) to see which agent (or human) made each edit.
-- Use [diffs](/docs/diffs) to review what changed before you merge or publish it.
-- Query history to answer questions like: "Which agent changed this configuration last?"
+## Review every agent edit
 
-## Humans stay in control
+- **Attribution**: see which agent (or human) changed what. → [/docs/attribution](/docs/attribution)
+- **Diffs**: review what changed before it's merged or published. → [/docs/diffs](/docs/diffs)
+- **Queryable history**: answer "Which agent changed this setting last week?" via SQL.
 
-Agents can draft changes, but humans decide what ships.
+## Keep humans in control
 
-- Use [change proposals](/docs/change-proposals) to review, discuss, and approve a set of changes.
-- Use [conversations](/docs/conversations) to leave comments, request revisions, and loop in stakeholders.
-- Merge a proposal when it meets your requirements, or request another iteration.
+Agents draft. Humans approve.
 
-## Isolated branches for AI agents
+- Use **change proposals** to bundle edits into a reviewable unit. → [/docs/change-proposals](/docs/change-proposals)
+- Use **conversations** to comment, request revisions, loop in stakeholders. → [/docs/conversations](/docs/conversations)
+- Merge when ready—or reject and iterate.
 
-Use [versions](/docs/versions) to give each agent an isolated branch of state.
+## Run agents in isolated versions
 
-- If you run agents in parallel, create one version per agent task.
-- Compare outcomes, merge the best result, or discard versions you don't want.
-- If something goes wrong, use [restore](/docs/restore) to roll back to a known-good state.
+Use **versions** to give each agent task its own branch of state. → [/docs/versions](/docs/versions)
+
+- Run agents in parallel: one version per task.
+- Compare outcomes, merge the best, discard the rest.
+- Something went wrong? **Restore** a known-good state. → [/docs/restore](/docs/restore)
 
 ## Typical workflow
 
-1. Open a fresh version for an agent task.
-2. Run the agent; Lix records changes and attribution.
-3. Review the diff and open a change proposal.
-4. Comment, request revisions, and approve when ready.
-5. Merge the proposal or discard it; restore a previous state if needed.
+1. Create a new **version** for an agent task.
+2. Run the agent—Lix records semantic changes + attribution.
+3. Open a **change proposal** from the version diff.
+4. Review, comment, request revisions, approve.
+5. Merge the proposal (or discard it). Restore if needed.
 
 ## Coming soon: automated guardrails
 
 > [!NOTE]
-> [Validation rules](/docs/validation-rules) are an upcoming feature. Define automated checks agents can run before opening a proposal (for example: schema constraints, required fields, invariants). Follow the issue for progress and demos.
+> [Validation rules](/docs/validation-rules) are upcoming. Define checks agents can run before opening a proposal—schema constraints, required fields, invariants. Follow the issue for progress.
 
 ![Validation rules for AI agents](/validation-rules-agent.svg)
 
 ## Next steps
 
-- Walk through the [Getting Started guide](/docs/getting-started) to wire Lix into your agent pipeline.
-- Learn how to diff, merge, and experiment with [versions](/docs/versions).
-- See change proposals in action in the [live example](https://prosemirror-example.onrender.com/).
+- Wire Lix into your agent pipeline: [/docs/getting-started](/docs/getting-started)
+- Learn diff, merge, and experimentation with versions: [/docs/versions](/docs/versions)
+- See proposals in action: [prosemirror-example.onrender.com](https://prosemirror-example.onrender.com/)
