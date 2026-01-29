@@ -383,7 +383,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix is an importable version control library. For example, enable human-in-the-loop workflows for AI agents like diffs and reviews.
+              Lix is a version control system that can be imported as a library. Use it to, for example, enable human-in-the-loop workflows for AI agents like diffs and reviews.
             </p>
 
             {/* Trust signals */}
