@@ -1,30 +1,23 @@
 ---
 date: "2026-01-20"
-og:description: "Lix is a universal version control system for any file format. Unlike Git's line-based diffs, Lix understands file structure, showing 'price: 10 → 12' instead of 'line 4 changed'."
+og:description: "Lix is an embeddable version control system for AI agents. It records schema-aware changes to enable diffs, reviews, rollback, and querying of edits, directly inside your product."
 ---
 
-# Introducing Lix: A universal version control system
+# Introducing Lix: Embeddable version control for AI agents
 
-## AI agents need version control beyond text
+## AI agents need version control
 
 Changes AI agents make need to be reviewable by humans.
 
-For code, Git solves this:
-
-- **Reviewable diffs**: What exactly did the agent change?
-- **Human-in-the-loop**: Review, then merge or reject.
-- **Rollback changes**: Undo mistakes instantly.
-
-But agents modify binary files too. And Git can't diff them.
+For code, Git solves this. But Git is hard to embed into applications. It's a CLI tool, not a library. And Git does not store "changes" (deltas). To see what changed, you have to compare two snapshots of a file.
 
 ![Git supports text files but not binary formats like PDF, DOCX, XLSX](./git-limits.png)
 
 ## Introducing Lix
 
-Lix is a **universal version control system** that can diff any file format (`.xlsx`, `.pdf`, `.docx`, etc).
+Lix is an **embeddable version control system** that runs inside your application.
 
-Unlike Git's line-based diffs, Lix understands file structure. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ". 
-
+Unlike Git, Lix understands file structure and stores changes directly. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
 
 - **Reviewable diffs**: See exactly what an agent changed in any file format.
 - **Human-in-the-loop**: Agents propose, humans approve.
