@@ -1,22 +1,25 @@
 ---
 date: "2026-01-20"
-og:description: "Lix is an embeddable version control system for AI agents. It records schema-aware changes to enable diffs, reviews, rollback, and querying of edits, directly inside your product."
+og:description: "Lix is an embeddable version control system. It records semantic changes to enable diffs, reviews, rollback, and querying of edits, directly inside your application."
 ---
 
-# Introducing Lix: Embeddable version control for AI agents
+# Introducing Lix: An embeddable version control system
 
-## AI agents need version control
+Changes AI agents make need to be reviewable by humans. 
 
-Changes AI agents make need to be reviewable by humans.
+For code, Git solves this: 
 
-For code, Git solves this. But Git is hard to embed into applications. It's a CLI tool, not a library. And Git does not store "changes" (deltas). To see what changed, you have to compare two snapshots of a file.
+- **Reviewable diffs**: What exactly did the agent change?
+- **Human-in-the-loop**: Review, then merge or reject.
+- **Rollback changes**: Undo mistakes instantly.
 
-![Git supports text files but not binary formats like PDF, DOCX, XLSX](./git-limits.png)
+Git is the right tool for source code repos. Git is optimized for developer workflows around repositories and files. But, embedding Git into applications (with semantic diffs, approvals, and queryable history) is complicated. We ran into these limitations building [inlang](https://inlang.com): ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations).
+
+![Git can store any file but it cannot show meaningful diffs for most binary and structured formats](./git-limits.png)
 
 ## Introducing Lix
 
-
-Lix is an **embeddable version control system** that runs inside your application.
+Lix is an **embeddable version control system** that runs inside your application so agents can propose changes and users can review, approve, and rollback in-product.
 
 It records schema-aware changes (via plugins) to enable diffs, reviews, rollback, and querying of edits — **as part of your product**:
 
@@ -24,50 +27,19 @@ It records schema-aware changes (via plugins) to enable diffs, reviews, rollback
 - **Display meaningful diffs** — show what actually changed in structured data and documents, without noisy line-by-line churn.
 - **Rollback changes** — discard proposals, roll back state, and isolate experiments safely.
 
+Typical flow: an agent opens a task branch → proposes changes → your UI shows a semantic diff → user approves → you merge into the main state → rollback is one action.
 
 ![AI agent changes need to be visible and controllable](./ai-agents-guardrails.png)
 
-
-## Excel file example
-
-An AI agent updates an order status in `orders.xlsx`.
+> [!NOTE]
+> Lix does not replace Git for source code. Lix brings Git-like review and rollback into applications for agent-driven changes to app state and non-code artifacts.
 
 
-**Before:**
-```diff
-  | order_id | product  | status   |
-  | -------- | -------- | -------- |
-  | 1001     | Widget A | shipped  |
-  | 1002     | Widget B | pending |
-```
+## Schema-aware change tracking
 
-**After:**
-```diff
-  | order_id | product  | status   |
-  | -------- | -------- | -------- |
-  | 1001     | Widget A | shipped  |
-  | 1002     | Widget B | shipped |
-```
+Lix doesn't track line-by-line text changes. It tracks **semantic changes** at the entity level via plugins.
 
-**Git sees:**
-
-```diff
--Binary files differ
-```
-
-**Lix sees:**
-
-```diff
-order_id 1002 status: 
-
-- pending
-+ shipped
-```
-
-
-## JSON file example
-
-Even for structured text file formats like `.json` lix is tracking semantics rather than line by line diffs.
+A plugin parses a format (or a piece of app state) into structured entities. Then Lix stores **what changed** — not just which bytes differ.
 
 **Before:**
 ```json
@@ -79,36 +51,78 @@ Even for structured text file formats like `.json` lix is tracking semantics rat
 {"theme":"dark","notifications":true,"language":"en"}
 ```
 
-**Git sees:**
+**Git tracks:**
 ```diff
 -{"theme":"light","notifications":true,"language":"en"}
 +{"theme":"dark","notifications":true,"language":"en"}
 ```
 
-**Lix sees:**
-
+**Lix tracks:**
 ```diff
-property theme: 
+property theme:
 - light
 + dark
 ```
 
+### Excel file example
+
+With an XLSX plugin (not shipped yet), Lix can show a cell-level diff like:
+This is exactly the kind of semantic surface plugins define: cells vs formulas vs styling.
+
+**Before:**
+
+| order_id | product  | status  |
+| -------- | -------- | ------- |
+| 1001     | Widget A | shipped |
+| 1002     | Widget B | pending |
+
+**After:**
+
+| order_id | product  | status  |
+| -------- | -------- | ------- |
+| 1001     | Widget A | shipped |
+| 1002     | Widget B | shipped |
+
+**Git tracks:**
+```diff
+-Binary files differ
+```
+
+**Lix tracks:**
+```diff
+order_id 1002 status:
+- pending
++ shipped
+```
+
+The same approach extends to any other format your product cares about — **as long as there’s a plugin** that can interpret it.
+
 ## How does Lix work?
 
-Lix adds a version control system on top of SQL databases that let's you query virtual tables like `file`, `file_history`, etc. via plain SQL. These table's are version controlled.
+Lix turns changes into queryable data.
 
-**Why this matters:**
+That means audit trails, rollbacks, and “blame” become simple queries:
 
-- **Lix doesn't reinvent databases** — durability, ACID, and corruption recovery are handled by battle-tested SQL databases.
-- **Full SQL support** — query your version control system with the same SQL.
-- **Can runs in your existing database** — no separate storage layer to manage. 
+```sql
+SELECT *
+FROM state_history
+WHERE entity_id = 'settings.theme'
+ORDER BY depth ASC;
+```
 
+Lix uses existing SQL databases as both **query engine** and **persistence layer**.
 
+Plugins parse files (including binary formats) into "meaningful changes" e.g. cells, properties, whitespace, etc. Lix stores those changes as rows in virtual tables like `file`, `file_history`, and `state_history`.
+
+Why this matters:
+
+- **Doesn’t reinvent databases** — durability, ACID, and recovery come from proven SQL engines.
+- **SQL API for changes** — complex queries for diffs, history, and audit trails are possible.
+- **Runs in existing databases** — Lix can use your existing database as a persistence layer.
 
 ```
 ┌─────────────────────────────────────────────────┐
 │                      Lix                        │
-│           (version control system)              │
 │                                                 │
 │ ┌────────────┐ ┌──────────┐ ┌─────────┐ ┌─────┐ │
 │ │ Filesystem │ │ Branches │ │ History │ │ ... │ │
@@ -117,20 +131,33 @@ Lix adds a version control system on top of SQL databases that let's you query v
                          │
                          ▼
 ┌─────────────────────────────────────────────────┐
-│                  SQL database                   │
+│                  SQL database                   │ 
+│            (SQLite, Postgres, etc.)             │
 └─────────────────────────────────────────────────┘
 ```
 
+This means: no separate infrastructure to manage, and no “special” datastore just for version control.
 
-[Read more about Lix architecture →](https://lix.dev/docs/architecture)
+## Plugins (format support)
 
-## Why did we build lix?
+Lix’s format support depends on plugins. Here’s the current status:
+
+| Format | Plugin | Status |
+| ------ | ------ | ------ |
+| JSON | `@lix-js/plugin-json` | Stable |
+| CSV | `@lix-js/plugin-csv` | Stable |
+| Markdown | `@lix-js/plugin-md` | Beta |
+| ProseMirror | `@lix-js/plugin-prosemirror` | Stable |
+
+**Building your own plugin:** take an off-the-shelf parser for your format, map it to Lix’s entity/change schema, and you get semantic diffs + history for that format. [Plugin documentation →](https://lix.dev/docs/plugins)
+
+## Why did we build Lix?
 
 Lix was developed alongside [inlang](https://inlang.com), open-source localization infrastructure.
 
-We had to develop a new version control system that addressed git's limitations inlang ran into, see (see ["Git is unsuited for applications"](https://samuelstroschein.com/blog/git-limitations)). The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
+We needed version control **embedded in the application**, not as an external tool. Git's architecture didn't fit: we needed database semantics (transactions, ACID), queryable history, and schema-aware diffing. [Read more →](https://samuelstroschein.com/blog/git-limitations)
 
-![90k weekly npm downloads](./npm-downloads.png)
+The result is Lix, now at over [90k weekly downloads on NPM](https://www.npmjs.com/package/@lix-js/sdk).
 
 ## Getting started
 
@@ -159,7 +186,7 @@ const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 
 ## What's next
 
-The next version of Lix will be a refactor to be purely "preprocessor" based. This enables:
+The next version of Lix will be a refactor to be purely "preprocessor" based. This makes Lix easier to embed anywhere and enables:
 
 - **Fast writes** ([RFC 001](/rfc/001-preprocess-writes))
 - **Any SQL database** (SQLite, Postgres, Turso, MySQL)
@@ -173,5 +200,6 @@ The next version of Lix will be a refactor to be purely "preprocessor" based. Th
 ```
 
 ### Join the community
+
 - ⭐ [Star the lix repo on GitHub](https://github.com/opral/lix)
 - 💬 [Chat on Discord](https://discord.gg/gdMPPWy57R)
