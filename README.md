@@ -50,9 +50,9 @@ await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execut
 const diff = await selectWorkingDiff({ lix }).selectAll().execute();
 ```
 
-## Semantic diffs
+## Semantic change (delta) tracking
 
-Lix tracks **semantic changes** via plugins, not line-by-line text diffs.
+Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
 
 ### JSON file example
 
