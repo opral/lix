@@ -117,19 +117,15 @@ order_id 1002 status:
 
 ## How Lix Works
 
-Lix is **change-first**: it stores semantic changes as queryable data, not snapshots.
-
-Plugins parse files and app state into structured entities. Lix stores **what changed** semantically — not just which bytes differ. Audit trails, rollbacks, and history become simple SQL queries:
+Lix uses SQL databases as query engine and persistence layer. Virtual tables like `file` and `file_history` are exposed on top:
 
 ```sql
-SELECT * FROM change_history
-WHERE entity_id = 'order.1002.status'
+SELECT * FROM file_history
+WHERE path = '/orders.xlsx'
 ORDER BY created_at DESC;
 ```
 
-- **Doesn't reinvent databases** — uses SQLite, Postgres, etc.
-- **SQL API for changes** — query diffs, history, and audit trails directly
-- **Branching & merging** — isolate agent work, compare, and merge
+When a file is written, a plugin parses it and detects entity-level changes. These changes (deltas) are stored in the database, enabling branching, merging, and audit trails.
 
 ```
 ┌─────────────────────────────────────────────────┐
