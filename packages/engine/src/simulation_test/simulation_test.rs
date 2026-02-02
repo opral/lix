@@ -1,21 +1,30 @@
 use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crate::{open_lix, Lix, LixBackend, LixError, OpenLixConfig, SqliteBackend, SqliteConfig};
 
+use super::postgres::postgres_simulation;
+
 pub struct Simulation {
     pub name: &'static str,
     pub backend_factory: Box<dyn Fn() -> Box<dyn LixBackend + Send + Sync> + Send + Sync>,
+    pub setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
 }
 
 pub struct SimulationArgs {
     pub name: &'static str,
     backend_factory: Box<dyn Fn() -> Box<dyn LixBackend + Send + Sync> + Send + Sync>,
+    setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
     expect: ExpectDeterministic,
 }
 
 impl SimulationArgs {
     pub async fn open_simulated_lix(&self) -> Result<Lix, LixError> {
+        if let Some(setup) = &self.setup {
+            setup().await?;
+        }
         open_lix(OpenLixConfig {
             backend: (self.backend_factory)(),
         })
@@ -115,21 +124,27 @@ impl ExpectDeterministic {
     }
 }
 
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub fn default_simulations() -> Vec<Simulation> {
-    vec![Simulation {
-        name: "sqlite",
-        backend_factory: Box::new(|| {
-            Box::new(SqliteBackend::new(SqliteConfig {
-                filename: ":memory:".to_string(),
-            })) as Box<dyn LixBackend + Send + Sync>
-        }),
-    }]
+    vec![
+        Simulation {
+            name: "sqlite",
+            backend_factory: Box::new(|| {
+                Box::new(SqliteBackend::new(SqliteConfig {
+                    filename: ":memory:".to_string(),
+                })) as Box<dyn LixBackend + Send + Sync>
+            }),
+            setup: None,
+        },
+        postgres_simulation(),
+    ]
 }
 
-pub async fn simulation_test<F, Fut>(simulations: Vec<Simulation>, test_fn: F)
+pub async fn run_simulation_test<F, Fut>(simulations: Vec<Simulation>, test_fn: F)
 where
     F: Fn(SimulationArgs) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: Future<Output = ()>,
 {
     let deterministic = ExpectDeterministic::new();
 
@@ -138,6 +153,7 @@ where
         let args = SimulationArgs {
             name: simulation.name,
             backend_factory: simulation.backend_factory,
+            setup: simulation.setup,
             expect: deterministic.clone(),
         };
         test_fn(args).await;
@@ -146,7 +162,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{simulation_test, Simulation};
+    use super::{run_simulation_test, Simulation};
     use crate::{LixBackend, QueryResult, Value};
     use async_trait::async_trait;
 
@@ -173,12 +189,13 @@ mod tests {
             backend_factory: Box::new(move || {
                 Box::new(StaticBackend { value }) as Box<dyn LixBackend + Send + Sync>
             }),
+            setup: None,
         }
     }
 
     #[tokio::test]
     async fn expect_deterministic_passes_with_same_values() {
-        simulation_test(
+        run_simulation_test(
             vec![
                 simulation_with_value("sim-a", 1),
                 simulation_with_value("sim-b", 1),
@@ -198,7 +215,7 @@ mod tests {
     #[tokio::test]
     #[should_panic]
     async fn expect_deterministic_fails_on_mismatch() {
-        simulation_test(
+        run_simulation_test(
             vec![
                 simulation_with_value("sim-a", 1),
                 simulation_with_value("sim-b", 2),
