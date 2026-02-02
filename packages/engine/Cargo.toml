@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
+sqlx = { version = "0.8", features = ["sqlite", "postgres", "runtime-tokio-rustls"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+# Keep test runtime available
