@@ -126,15 +126,14 @@ pub fn default_simulations() -> Vec<Simulation> {
     }]
 }
 
-pub async fn simulation_test<F, Fut>(_name: &str, simulations: Option<Vec<Simulation>>, test_fn: F)
+pub async fn simulation_test<F, Fut>(simulations: Vec<Simulation>, test_fn: F)
 where
     F: Fn(SimulationArgs) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let sims = simulations.unwrap_or_else(default_simulations);
     let deterministic = ExpectDeterministic::new();
 
-    for (index, simulation) in sims.into_iter().enumerate() {
+    for (index, simulation) in simulations.into_iter().enumerate() {
         deterministic.start_simulation(index == 0);
         let args = SimulationArgs {
             name: simulation.name,
@@ -180,11 +179,10 @@ mod tests {
     #[tokio::test]
     async fn expect_deterministic_passes_with_same_values() {
         simulation_test(
-            "deterministic-ok",
-            Some(vec![
+            vec![
                 simulation_with_value("sim-a", 1),
                 simulation_with_value("sim-b", 1),
-            ]),
+            ],
             |sim| async move {
                 let lix = sim
                     .open_simulated_lix()
@@ -201,11 +199,10 @@ mod tests {
     #[should_panic]
     async fn expect_deterministic_fails_on_mismatch() {
         simulation_test(
-            "deterministic-fail",
-            Some(vec![
+            vec![
                 simulation_with_value("sim-a", 1),
                 simulation_with_value("sim-b", 2),
-            ]),
+            ],
             |sim| async move {
                 let lix = sim
                     .open_simulated_lix()
