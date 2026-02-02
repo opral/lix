@@ -12,9 +12,13 @@ type MetaEntry =
   | { property: string; content: string };
 
 export function buildCanonicalUrl(pathname: string): string {
-  if (!pathname) return SITE_URL;
+  if (!pathname || pathname === "/") return SITE_URL;
   const normalized = pathname.startsWith("/") ? pathname : `/${pathname}`;
-  return `${SITE_URL}${normalized}`;
+  const withoutTrailingSlash =
+    normalized.endsWith("/") && normalized.length > 1
+      ? normalized.slice(0, -1)
+      : normalized;
+  return `${SITE_URL}${withoutTrailingSlash}`;
 }
 
 export function resolveOgImage(frontmatter?: Record<string, unknown>) {
