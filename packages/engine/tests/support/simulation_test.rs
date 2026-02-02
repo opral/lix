@@ -3,9 +3,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::{open_lix, Lix, LixBackend, LixError, OpenLixConfig, SqliteBackend, SqliteConfig};
+use lix_engine::{open_lix, Lix, LixBackend, LixError, OpenLixConfig};
 
-use super::postgres::postgres_simulation;
+use super::simulations::default_simulations as default_simulations_impl;
 
 pub struct Simulation {
     pub name: &'static str,
@@ -14,7 +14,6 @@ pub struct Simulation {
 }
 
 pub struct SimulationArgs {
-    pub name: &'static str,
     backend_factory: Box<dyn Fn() -> Box<dyn LixBackend + Send + Sync> + Send + Sync>,
     setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
     expect: ExpectDeterministic,
@@ -36,14 +35,6 @@ impl SimulationArgs {
         T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
     {
         self.expect.expect_deterministic(actual);
-    }
-
-    pub fn expect<T, F>(&self, actual: T, diff: Option<F>)
-    where
-        T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
-        F: FnOnce(&T, &T),
-    {
-        self.expect.expect(actual, diff);
     }
 }
 
@@ -78,10 +69,9 @@ impl ExpectDeterministic {
         state.call_index = 0;
     }
 
-    fn expect<T, F>(&self, actual: T, diff: Option<F>)
+    fn expect_deterministic<T>(&self, actual: T)
     where
         T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
-        F: FnOnce(&T, &T),
     {
         let mut state = self
             .inner
@@ -104,9 +94,6 @@ impl ExpectDeterministic {
             .expect("expect_deterministic type mismatch across simulations");
 
         if &actual != expected {
-            if let Some(diff_fn) = diff {
-                diff_fn(&actual, expected);
-            }
             panic!(
 				"SIMULATION DETERMINISM VIOLATION\n\nCall #{}: values differ across simulations\nactual: {:?}\nexpected: {:?}",
 				idx,
@@ -115,31 +102,9 @@ impl ExpectDeterministic {
 			);
         }
     }
-
-    fn expect_deterministic<T>(&self, actual: T)
-    where
-        T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
-    {
-        self.expect(actual, Option::<fn(&T, &T)>::None);
-    }
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
-
-pub fn default_simulations() -> Vec<Simulation> {
-    vec![
-        Simulation {
-            name: "sqlite",
-            backend_factory: Box::new(|| {
-                Box::new(SqliteBackend::new(SqliteConfig {
-                    filename: ":memory:".to_string(),
-                })) as Box<dyn LixBackend + Send + Sync>
-            }),
-            setup: None,
-        },
-        postgres_simulation(),
-    ]
-}
 
 pub async fn run_simulation_test<F, Fut>(simulations: Vec<Simulation>, test_fn: F)
 where
@@ -151,7 +116,6 @@ where
     for (index, simulation) in simulations.into_iter().enumerate() {
         deterministic.start_simulation(index == 0);
         let args = SimulationArgs {
-            name: simulation.name,
             backend_factory: simulation.backend_factory,
             setup: simulation.setup,
             expect: deterministic.clone(),
@@ -160,75 +124,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{run_simulation_test, Simulation};
-    use crate::{LixBackend, QueryResult, Value};
-    use async_trait::async_trait;
-
-    struct StaticBackend {
-        value: i64,
-    }
-
-    #[async_trait]
-    impl LixBackend for StaticBackend {
-        async fn execute(
-            &self,
-            _sql: &str,
-            _params: &[Value],
-        ) -> Result<QueryResult, crate::LixError> {
-            Ok(QueryResult {
-                rows: vec![vec![Value::Integer(self.value)]],
-            })
-        }
-    }
-
-    fn simulation_with_value(name: &'static str, value: i64) -> Simulation {
-        Simulation {
-            name,
-            backend_factory: Box::new(move || {
-                Box::new(StaticBackend { value }) as Box<dyn LixBackend + Send + Sync>
-            }),
-            setup: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn expect_deterministic_passes_with_same_values() {
-        run_simulation_test(
-            vec![
-                simulation_with_value("sim-a", 1),
-                simulation_with_value("sim-b", 1),
-            ],
-            |sim| async move {
-                let lix = sim
-                    .open_simulated_lix()
-                    .await
-                    .expect("open_lix should succeed");
-                let result = lix.execute("SELECT 1", &[]).await.unwrap();
-                sim.expect_deterministic(result.rows.clone());
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    #[should_panic]
-    async fn expect_deterministic_fails_on_mismatch() {
-        run_simulation_test(
-            vec![
-                simulation_with_value("sim-a", 1),
-                simulation_with_value("sim-b", 2),
-            ],
-            |sim| async move {
-                let lix = sim
-                    .open_simulated_lix()
-                    .await
-                    .expect("open_lix should succeed");
-                let result = lix.execute("SELECT 1", &[]).await.unwrap();
-                sim.expect_deterministic(result.rows.clone());
-            },
-        )
-        .await;
-    }
+pub fn default_simulations() -> Vec<Simulation> {
+    default_simulations_impl()
 }

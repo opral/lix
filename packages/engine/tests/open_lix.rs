@@ -1,4 +1,5 @@
-use lix_engine::simulation_test;
+mod support;
+
 use lix_engine::Value;
 
 simulation_test!(select_works, |sim| async move {

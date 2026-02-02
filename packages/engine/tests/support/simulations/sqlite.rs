@@ -1,21 +1,33 @@
-use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 use tokio::sync::OnceCell;
 
-use crate::{LixBackend, LixError, QueryResult, Value};
+use lix_engine::{LixBackend, LixError, QueryResult, Value};
 
-#[derive(Debug, Clone)]
-pub struct SqliteConfig {
-    pub filename: String,
+use crate::support::simulation_test::Simulation;
+
+pub fn sqlite_simulation() -> Simulation {
+    Simulation {
+        name: "sqlite",
+        setup: None,
+        backend_factory: Box::new(|| {
+            Box::new(SqliteBackend::new(SqliteConfig {
+                filename: ":memory:".to_string(),
+            })) as Box<dyn LixBackend + Send + Sync>
+        }),
+    }
 }
 
-pub struct SqliteBackend {
+struct SqliteBackend {
     config: SqliteConfig,
     pool: OnceCell<SqlitePool>,
 }
 
+struct SqliteConfig {
+    filename: String,
+}
+
 impl SqliteBackend {
-    pub fn new(config: SqliteConfig) -> Self {
+    fn new(config: SqliteConfig) -> Self {
         Self {
             config,
             pool: OnceCell::const_new(),
@@ -41,14 +53,14 @@ impl SqliteBackend {
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl LixBackend for SqliteBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;
         let mut query = sqlx::query(sql);
 
         for param in params {
-            query = bind_param(query, param);
+            query = bind_param_sqlite(query, param);
         }
 
         let rows = query.fetch_all(pool).await.map_err(|err| LixError {
@@ -68,7 +80,7 @@ impl LixBackend for SqliteBackend {
     }
 }
 
-fn bind_param<'q>(
+fn bind_param_sqlite<'q>(
     query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     param: &'q Value,
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
