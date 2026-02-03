@@ -11,3 +11,9 @@ pub enum Value {
 pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
