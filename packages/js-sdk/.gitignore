@@ -1,1 +1,5 @@
 /src/backend/wasm-sqlite.wasm.ts
+/src/backend/wasm-sqlite.wasm.ts.d.ts
+/src/engine-wasm/engine-wasm-binary.js
+/src/engine-wasm/engine-wasm-binary.d.ts
+/src/engine-wasm/wasm

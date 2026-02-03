@@ -1,7 +1,12 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import type { Database, Sqlite3Static } from "@sqlite.org/sqlite-wasm";
+import type {
+  Database,
+  Sqlite3Static,
+  SqlValue,
+} from "@sqlite.org/sqlite-wasm";
 import { wasmBinary } from "./wasm-sqlite.wasm.js";
-import type { LixBackend, QueryResult, Value } from "../open-lix.js";
+import type { LixBackend } from "../types.js";
+import { Value } from "../engine-wasm/index.js";
 
 type SqliteWasmDatabase = Database & {
   sqlite3: Sqlite3Static;
@@ -38,9 +43,9 @@ async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
 export async function createWasmSqliteBackend(): Promise<LixBackend> {
   const db = await createInMemoryDatabase();
   return {
-    async execute(sql: string, params: Value[]): Promise<QueryResult> {
-      const boundParams = params.map(toSqlParam);
-      const rows: unknown[][] = [];
+    async execute(sql: string, params: Value[]): Promise<any> {
+      const boundParams: SqlValue[] = params.map(toSqlParam);
+      const rows: SqlValue[][] = [];
       db.exec({
         sql,
         bind: boundParams,
@@ -54,22 +59,34 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
   };
 }
 
-function toSqlParam(value: Value): unknown {
-  if ("Null" in value) return null;
-  if ("Integer" in value) return value.Integer;
-  if ("Real" in value) return value.Real;
-  if ("Text" in value) return value.Text;
-  if ("Blob" in value) return value.Blob;
+function toSqlParam(value: Value): SqlValue {
+  switch (value.kind) {
+    case "Null":
+      return null;
+    case "Integer":
+      return value.asInteger() ?? null;
+    case "Real":
+      return value.asReal() ?? null;
+    case "Text":
+      return value.asText() ?? null;
+    case "Blob":
+      return value.asBlob() ?? null;
+    default:
+      return null;
+  }
   return null;
 }
 
-function fromSqlValue(value: unknown): Value {
-  if (value === null || value === undefined) return { Null: null };
+function fromSqlValue(value: SqlValue): Value {
+  if (value === null || value === undefined) return Value.null();
   if (typeof value === "number") {
-    if (Number.isInteger(value)) return { Integer: value };
-    return { Real: value };
+    if (Number.isInteger(value)) return Value.integer(value);
+    return Value.real(value);
   }
-  if (typeof value === "string") return { Text: value };
-  if (value instanceof Uint8Array) return { Blob: value };
-  return { Text: String(value) };
+  if (typeof value === "string") return Value.text(value);
+  if (value instanceof Uint8Array) return Value.blob(value);
+  if (value instanceof ArrayBuffer) return Value.blob(new Uint8Array(value));
+  if (value instanceof Int8Array) return Value.blob(new Uint8Array(value));
+  if (typeof value === "bigint") return Value.integer(Number(value));
+  return Value.text(String(value));
 }

@@ -5,12 +5,12 @@
   "private": true,
   "description": "WASM-backed JS SDK wrapper for Lix",
   "scripts": {
-    "build": "node ./scripts/embed-sqlite-wasm.js",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "build": "node ./scripts/build.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node ./scripts/build.js && vitest run",
+    "test:watch": "node ./scripts/build.js && vitest"
   },
   "dependencies": {
-    "@lix-js/engine-wasm": "workspace:*",
     "@sqlite.org/sqlite-wasm": "^3.50.4-build1"
   },
   "devDependencies": {
