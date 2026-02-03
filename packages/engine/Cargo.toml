@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 postgresql_embedded = { version = "0.20", features = ["tokio"] }

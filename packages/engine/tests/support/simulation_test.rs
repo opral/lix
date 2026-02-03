@@ -19,28 +19,23 @@ pub struct SimulationArgs {
     expect: ExpectDeterministic,
 }
 
-pub struct SimulationLix {
+pub struct SimulationEngine {
     engine: Engine,
-    backend: Box<dyn LixBackend + Send + Sync>,
 }
 
-impl SimulationLix {
+impl SimulationEngine {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let plan = self.engine.preprocess(sql, params)?;
-        let result = self.backend.execute(&plan.sql, &plan.params).await?;
-        self.engine.postprocess(&plan, &result)?;
-        Ok(result)
+        self.engine.execute(sql, params).await
     }
 }
 
 impl SimulationArgs {
-    pub async fn open_simulated_lix(&self) -> Result<SimulationLix, LixError> {
+    pub async fn boot_simulated_engine(&self) -> Result<SimulationEngine, LixError> {
         if let Some(setup) = &self.setup {
             setup().await?;
         }
-        Ok(SimulationLix {
-            engine: boot(),
-            backend: (self.backend_factory)(),
+        Ok(SimulationEngine {
+            engine: boot((self.backend_factory)()),
         })
     }
 

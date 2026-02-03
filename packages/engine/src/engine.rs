@@ -1,20 +1,15 @@
-use crate::{LixError, Plan, QueryResult, Value};
+use crate::{LixBackend, LixError, QueryResult, Value};
 
-pub struct Engine;
+pub struct Engine {
+    backend: Box<dyn LixBackend + Send + Sync>,
+}
 
-pub fn boot() -> Engine {
-    Engine
+pub fn boot(backend: Box<dyn LixBackend + Send + Sync>) -> Engine {
+    Engine { backend }
 }
 
 impl Engine {
-    pub fn preprocess(&self, sql: &str, params: &[Value]) -> Result<Plan, LixError> {
-        Ok(Plan {
-            sql: sql.to_string(),
-            params: params.to_vec(),
-        })
-    }
-
-    pub fn postprocess(&self, _plan: &Plan, _result: &QueryResult) -> Result<(), LixError> {
-        Ok(())
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.backend.execute(sql, params).await
     }
 }
