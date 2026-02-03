@@ -2,6 +2,6 @@
 resolver = "2"
 members = [
   "packages/engine",
-  "packages/engine-wasm",
+  "packages/js-sdk",
   "packages/rs-sdk",
 ]

@@ -1,13 +1,14 @@
 import init, {
   openLix as openLixWasm,
   wasmBinary,
-  type LixBackend,
-  type QueryResult,
-  type Value,
-} from "@lix-js/engine-wasm";
+  QueryResult,
+  Value,
+} from "./engine-wasm/index.js";
 import { createWasmSqliteBackend } from "./backend/wasm-sqlite.js";
+import type { LixBackend } from "./types.js";
 
-export type { LixBackend, QueryResult, Value } from "@lix-js/engine-wasm";
+export type { LixBackend } from "./types.js";
+export { QueryResult, Value } from "./engine-wasm/index.js";
 
 export type Lix = {
   execute(sql: string, params: Value[]): Promise<QueryResult>;

@@ -1,16 +1,15 @@
 [package]
-name = "lix_engine_wasm"
+name = "lix_engine_wasm_bindgen"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
+path = "wasm-bindgen.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
 lix_engine = { path = "../engine" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 async-trait = "0.1"
