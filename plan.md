@@ -2,12 +2,12 @@
 
 ```
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        entity         │ │   entity_by_version   │ │    entity_history     │
+│      lix_entity       │ │ lix_entity_by_version │ │  lix_entity_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             ▼                         ▼                         ▼
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        state          │ │   state_by_version    │ │     state_history     │
+│       lix_state       │ │  lix_state_by_version │ │   lix_state_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             └─────────────────────────┼─────────────────────────┘
@@ -60,15 +60,18 @@
 - materialized state is authoritive for constraints
   - untracked state does NOT participate in constraints
 - drop transaction table - rely on SQLite transactions for isolation
+- prefix every virtual table with `lix_` to avoid name collisions (e.g. `state` -> `lix_state`)
+  - entity views that are already for lix itself do NOT get double-prefixed (e.g. `lix_conversation`, not `lix_lix_conversation`)
+  - future: offer an alias option so users can query `state` while the real table is `lix_state`
 
 ```
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        entity         │ │   entity_by_version   │ │    entity_history     │
+│      lix_entity       │ │ lix_entity_by_version │ │  lix_entity_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             ▼                         ▼                         ▼
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        state          │ │   state_by_version    │ │     state_history     │
+│       lix_state       │ │  lix_state_by_version │ │   lix_state_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             └─────────────────────────┼─────────────────────────┘
@@ -116,7 +119,7 @@ The `file` view reads from both the state vtable and specialized file cache tabl
 
 ```
                          ┌───────────────────────┐
-                         │         file          │
+                         │        lix_file       │
                          └───────────┬───────────┘
                                      │
                   ┌──────────────────┼──────────────────┐
@@ -142,7 +145,7 @@ The `version` view reads from state cache with special handling for inheritance:
 
 ```
                          ┌───────────────────────┐
-                         │        version        │
+                         │       lix_version     │
                          └───────────┬───────────┘
                                      │
                   ┌──────────────────┴──────────────────┐
@@ -253,6 +256,8 @@ Bindings consume the **WASM build of `packages/engine`**.
   - `new PostgresBackend(...)` optional.
 
 ## Milestone 0.2: Python bindings
+
+> Cancelled for now. We didn't go with a WIT based engine because WIT doesn't support async yet.
 
 Expose `openLix()` and `lix.execute()` via PyO3:
 
