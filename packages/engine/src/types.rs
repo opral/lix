@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
     Integer(i64),
@@ -7,13 +7,7 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Plan {
-    pub sql: String,
-    pub params: Vec<Value>,
 }
