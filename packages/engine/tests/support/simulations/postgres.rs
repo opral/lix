@@ -110,7 +110,7 @@ impl PostgresBackend {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl LixBackend for PostgresBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;

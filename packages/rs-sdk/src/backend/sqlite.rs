@@ -21,12 +21,9 @@ impl SqliteBackend {
 #[async_trait(?Send)]
 impl LixBackend for SqliteBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| LixError {
-                message: "sqlite mutex poisoned".to_string(),
-            })?;
+        let conn = self.conn.lock().map_err(|_| LixError {
+            message: "sqlite mutex poisoned".to_string(),
+        })?;
         let mut stmt = conn.prepare(sql).map_err(|err| LixError {
             message: err.to_string(),
         })?;
