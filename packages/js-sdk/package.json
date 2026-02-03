@@ -5,7 +5,7 @@
   "private": true,
   "description": "WASM-backed JS SDK wrapper for Lix",
   "scripts": {
-    "pretest": "node ./scripts/embed-sqlite-wasm.js && pnpm --filter @lix-js/engine-wasm build",
+    "build": "node ./scripts/embed-sqlite-wasm.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
