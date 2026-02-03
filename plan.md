@@ -223,7 +223,9 @@ sync at the WASM boundary.
 - **Browser**: WASM host + browser SQLite backend (WASM SQLite or OPFS).
 - SDK `execute()` does `preprocess → backend.execute → postprocess`.
 
-## Milestone 0.2: Python bindings
+## ~Milestone 0.2: Python bindings~
+
+> Cancelled because WIT 0.3 is not released yet. A python SDK would require a native binding via 
 
 Expose `openLix()` and `lix.execute()` via WASM host:
 
