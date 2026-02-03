@@ -225,7 +225,7 @@ sync at the WASM boundary.
 
 ## ~Milestone 0.2: Python bindings~
 
-> Cancelled because WIT 0.3 is not released yet. A python SDK would require a native binding via 
+> Cancelled because WIT 0.3 is not released yet. A python SDK would require a native binding via
 
 Expose `openLix()` and `lix.execute()` via WASM host:
 
