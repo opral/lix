@@ -162,38 +162,51 @@ The `version` view reads from state cache with special handling for inheritance:
 
 ## Milestone 0: Rust engine core + SQLite/Postgres backends
 
-Goal: a Rust-native Lix core that preprocesses SQL and can drive either SQLite or
-Postgres via a backend. The engine stays sync at the boundary; async happens in
-SDKs and backends.
+Goal: a Rust-native Lix core that can open either SQLite or Postgres and execute SQL
+through the engine pipeline (passthrough first, rewriting later).
 
-### API Surface (Rust, engine)
+### API Surface (Rust)
 
 ```rust
-let engine = boot();
-let plan = engine.preprocess("SELECT 1 + 1", &[])?;
+let lix = open_lix(OpenLixConfig {
+    backend: Box::new(SqliteBackend::new(SqliteConfig {
+        filename: ":memory:".into(),
+    })),
+})?;
+
+let _ = lix.execute("SELECT 1 + 1", &[])?;
+```
+
+```rust
+let lix = open_lix(OpenLixConfig {
+    backend: Box::new(PostgresBackend::new(PostgresConfig {
+        connection_string: "postgres://user:pass@localhost:5432/lix".into(),
+    })),
+})?;
+
+let _ = lix.execute("SELECT 1 + 1", &[])?;
 ```
 
 ### Engine Contract (Rust)
 
-- `boot()` returns an engine handle with sync methods.
-- `engine.preprocess(sql, params)`:
+- `openLix(config)` returns a `Lix` handle bound to a backend.
+- `lix.execute(sql, params)`:
   - Parses SQL with `sqlparser-rs` (SQLite dialect).
-  - For Milestone 0: passthrough (no rewriting).
-  - Returns a `Plan` (rewritten SQL + metadata for postprocess).
-- `engine.postprocess(plan, result)`:
-  - Updates engine state, hooks, caches as needed.
-  - For Milestone 0: no-op.
+  - For Milestone 0: passthrough (no rewriting) and forwards to backend.
+  - Returns rows (for SELECT) and metadata (for mutations).
 
 ### Backend Strategy (mirrors JS Environment API)
 
-The backend is host-provided and async-capable. SDKs orchestrate:
-`preprocess → backend.execute → postprocess`.
+The JS SDK already routes all SQL through a `LixEnvironment` abstraction
+(`environment.call(...)`), keeping execution pluggable. Keep Rust aligned by
+requiring a backend object that implements a minimal contract, rather than an
+enum `kind` switch.
 
-Define a minimal backend trait that SDKs depend on:
+Define a minimal backend trait that the Rust engine depends on:
 
 ```rust
 pub trait LixBackend {
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult>;
+    fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult>;
 }
 ```
 
@@ -207,48 +220,46 @@ Implementations:
 
 ### Success Criteria
 
-1. `boot()` can preprocess `SELECT 1 + 1` (passthrough).
-2. SDK `execute()` runs `SELECT 1 + 1` on both backends via preprocess→execute→postprocess.
+1. `openLix()` works for SQLite and Postgres backends.
+2. `lix.execute()` runs `SELECT 1 + 1` on both backends.
 3. Parameter binding works for both backends (positional params).
 4. Transactions can be used via SQL (`BEGIN`, `COMMIT`, `ROLLBACK`) if needed.
+
+## Milestone 0.05: DataFusion SQL parse passthrough
+
+Hook in DataFusion’s SQL parser inside the Rust engine `execute()` pipeline to
+parse incoming SQL, serialize it back to SQL, and forward the normalized SQL
+string to the backend. This keeps the execution path the same but validates and
+normalizes SQL early, and sets up a stable AST pipeline for later rewrites.
+
+### Tasks
+
+1. Parse SQL with DataFusion SQL parser in the Rust engine
+2. Serialize AST back to SQL string (no rewrite yet)
+3. Forward serialized SQL to `LixBackend.execute`
+4. Add parity tests that compare raw passthrough vs. parse/serialize for
+   SQLite and Postgres
 
 ## Milestone 0.1: JS bindings (Node + WASM)
 
 Expose `openLix()` and `lix.execute()` to JS:
 
-Bindings consume the **WASM build of `packages/engine`** and keep the engine
-sync at the WASM boundary.
+Bindings consume the **WASM build of `packages/engine`**.
 
 - **Node**: WASM host + native JS backend (e.g. BetterSQLite3, node-postgres).
 - **Browser**: WASM host + browser SQLite backend (WASM SQLite or OPFS).
-- SDK `execute()` does `preprocess → backend.execute → postprocess`.
+- Same API shape as Milestone 0, with `backend` as a class instance.
+  - `new SqliteBackend(...)` first.
+  - `new PostgresBackend(...)` optional.
 
-## ~Milestone 0.2: Python bindings~
+## Milestone 0.2: Python bindings
 
-> Cancelled because WIT 0.3 is not released yet. A python SDK would require a native binding via
+Expose `openLix()` and `lix.execute()` via PyO3:
 
-Expose `openLix()` and `lix.execute()` via WASM host:
-
-Bindings consume the **WASM build of `packages/engine`** and keep the engine
-sync at the WASM boundary.
+Bindings consume the **WASM build of `packages/engine`**.
 
 - Python wrapper matches the same API shape (backend objects).
 - Host uses native Python DB drivers (sqlite3 / psycopg) to implement `execute`.
-- SDK `execute()` does `preprocess → backend.execute → postprocess`.
-
-## Milestone 0.3: DataFusion SQL parse passthrough
-
-Hook in DataFusion’s SQL parser to parse incoming SQL, serialize it back to SQL,
-and forward the normalized SQL string to the backend. This keeps the execution
-path the same but validates/normalizes SQL early, and sets up a stable AST
-pipeline for later rewrites.
-
-### Tasks
-
-1. Parse SQL with DataFusion SQL parser
-2. Serialize AST back to SQL string (no rewrite yet)
-3. Forward serialized SQL to `LixBackend.execute`
-4. Add parity tests against raw passthrough for SQLite/Postgres
 
 ## Milestone 1: Untracked State
 
