@@ -24,6 +24,11 @@ pub struct SimulationEngine {
 }
 
 impl SimulationEngine {
+    #[allow(dead_code)]
+    pub async fn init(&self) -> Result<(), LixError> {
+        self.engine.init().await
+    }
+
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.engine.execute(sql, params).await
     }
