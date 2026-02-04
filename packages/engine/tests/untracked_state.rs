@@ -12,19 +12,16 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
-        engine
-            .execute(
-                "CREATE TABLE lix_internal_state_materialized_v1_test_schema (\
-             entity_id TEXT NOT NULL,\
-             schema_key TEXT NOT NULL,\
-             file_id TEXT NOT NULL,\
-             version_id TEXT NOT NULL,\
-             snapshot_content TEXT\
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}'\
              )",
-                &[],
-            )
-            .await
-            .unwrap();
+            &[],
+        )
+        .await
+        .unwrap();
 
         engine
             .execute(
@@ -75,17 +72,17 @@ simulation_test!(
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
 
-        engine
-            .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, file_id, version_id, snapshot_content\
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', '{\"key\":\"tracked\"}'\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
-                &[],
-            )
-            .await
-            .unwrap();
+            &[],
+        )
+        .await
+        .unwrap();
 
         let read = engine
             .execute(

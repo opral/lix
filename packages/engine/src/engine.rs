@@ -1,4 +1,5 @@
 use crate::init::init_backend;
+use crate::schema_registry::register_schema;
 use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -16,7 +17,10 @@ impl Engine {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let normalized_sql = preprocess_sql(sql)?;
-        self.backend.execute(&normalized_sql, params).await
+        let output = preprocess_sql(sql)?;
+        for registration in output.registrations {
+            register_schema(self.backend.as_ref(), &registration.schema_key).await?;
+        }
+        self.backend.execute(&output.sql, params).await
     }
 }
