@@ -21,9 +21,9 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         Some(backend) => backend,
         None => Box::new(backend::sqlite::SqliteBackend::in_memory()?),
     };
-    Ok(Lix {
-        engine: boot(backend),
-    })
+    let engine = boot(backend);
+    engine.init().await?;
+    Ok(Lix { engine })
 }
 
 impl Lix {
