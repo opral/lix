@@ -12,16 +12,16 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
-    engine
-        .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
-             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}'\
-             )",
-            &[],
-        )
-        .await
-        .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+                 'lix_stored_schema',\
+                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
 
         engine
             .execute(
@@ -36,12 +36,12 @@ simulation_test!(
             .unwrap();
 
         let initial = engine
-        .execute(
-            "SELECT snapshot_content FROM lix_internal_state_untracked WHERE entity_id = 'entity-1'",
-            &[],
-        )
-        .await
-        .unwrap();
+            .execute(
+                "SELECT snapshot_content FROM lix_internal_state_untracked WHERE entity_id = 'entity-1'",
+                &[],
+            )
+            .await
+            .unwrap();
 
         sim.expect_deterministic(initial.rows.clone());
         assert_eq!(initial.rows.len(), 1);
@@ -72,17 +72,17 @@ simulation_test!(
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
 
-    engine
-        .execute(
-            "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
-             ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
-             )",
-            &[],
-        )
-        .await
-        .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                 ) VALUES (\
+                 'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
 
         let read = engine
             .execute(
@@ -102,12 +102,12 @@ simulation_test!(
         assert_eq!(read.rows[0][1], Value::Integer(1));
 
         engine
-        .execute(
-            "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = 1",
-            &[],
-        )
-        .await
-        .unwrap();
+            .execute(
+                "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = 1",
+                &[],
+            )
+            .await
+            .unwrap();
 
         let remaining = engine
             .execute(

@@ -376,12 +376,12 @@ Identity:
 
 Immutability:
 
-- `x-lix-immutable: true` is enforced for stored schemas.
+- `x-lix-immutable: true` enforcement is deferred to Milestone 13 (JSON Schema Validation).
 
 Semver:
 
-- `x-lix-version` must be `major.minor.patch` and comparisons must be semantic.
-- The engine should order versions by semver (not lexicographic string order).
+- `x-lix-version` must be `major.minor.patch` (format validation in this milestone).
+- Semver-aware ordering/comparisons are deferred to Milestone 13 (JSON Schema Validation) when schema loading/caching is implemented.
 
 ```sql
 -- Until entity views exist, insert directly into the vtable and set lixcols explicitly.
@@ -407,8 +407,8 @@ Lookup logic (current JS behavior):
 - **All schemas**: `SELECT snapshot_content, updated_at` where `schema_key = 'lix_stored_schema'`,
   `version_id = 'global'`, `snapshot_content IS NOT NULL`; parse `snapshot_content.value`.
 - **Single schema**: filter by `json_extract(snapshot_content, '$.value.\"x-lix-key\"') = <key>`
-  and pick the highest `x-lix-version` (should be semver-aware).
-- Cache per-engine; invalidate when a state commit touches `schema_key = 'lix_stored_schema'`.
+  and pick the highest `x-lix-version` (semver-aware selection is deferred to Milestone 13).
+- Schema cache/invalidation is deferred to Milestone 13.
 
 ### Schema Registration
 
@@ -442,10 +442,10 @@ fn register_schema(schema: &Schema, host: &impl HostBindings) -> Result<()> {
 
 1. Define materialized table schema with required columns
 2. Persist schema definitions into `lix_internal_state_vtable` via the `stored_schema` view (`schema_key = 'lix_stored_schema'`, `version_id = 'global'`)
-3. Enforce immutability and semver ordering for `x-lix-version`
-4. Implement `register_schema()` to create materialized tables dynamically
-5. Handle schema key sanitization for table names
-6. Create indexes for common query patterns (version_id, file_id)
+3. Implement `register_schema()` to create materialized tables dynamically
+
+Note: immutability enforcement and schema cache/invalidation are handled in Milestone 13.
+Semver ordering, schema key sanitization beyond identifier quoting, and indexes are handled in Milestone 14.
 
 ## Milestone 3: Rewriting `lix_internal_state_vtable` SELECT Queries
 

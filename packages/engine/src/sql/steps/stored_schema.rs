@@ -102,7 +102,8 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
             .all(|row| is_literal_equal(row.get(entity_index), &entity_id))
         {
             return Err(LixError {
-                message: "stored schema insert entity_id must match schema key + version".to_string(),
+                message: "stored schema insert entity_id must match schema key + version"
+                    .to_string(),
             });
         }
     } else {
@@ -267,7 +268,10 @@ fn ensure_semver(version: &str) -> Result<(), LixError> {
             message: "stored schema x-lix-version must be semver (major.minor.patch)".to_string(),
         });
     }
-    if parts.iter().all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())) {
+    if parts
+        .iter()
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    {
         return Ok(());
     }
     Err(LixError {
@@ -286,9 +290,9 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::SetExpr;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-    use sqlparser::ast::SetExpr;
 
     fn parse_insert(sql: &str) -> Insert {
         let dialect = GenericDialect {};
@@ -333,7 +337,9 @@ mod tests {
     fn rewrite_stored_schema_insert_adds_overrides() {
         let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1.0.0"}}')"#;
         let insert = parse_insert(sql);
-        let rewritten = rewrite_insert(insert).expect("rewrite ok").expect("rewritten");
+        let rewritten = rewrite_insert(insert)
+            .expect("rewrite ok")
+            .expect("rewritten");
         let insert = match rewritten.statement {
             Statement::Insert(insert) => insert,
             _ => panic!("expected insert"),
