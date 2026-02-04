@@ -52,8 +52,11 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
         rowMode: "array",
         resultRows: rows,
       });
+      const normalizedRows = rows.map((row) =>
+        row.map((value) => fromSqlValue(value)),
+      );
       return {
-        rows: rows.map((row) => row.map((value) => fromSqlValue(value))),
+        rows: normalizedRows,
       };
     },
   };

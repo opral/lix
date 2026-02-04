@@ -1,5 +1,5 @@
-export { default } from "./wasm/lix_engine_wasm.js";
-export * from "./wasm/lix_engine_wasm.js";
+export { default } from "./wasm/lix_engine_wasm_bindgen.js";
+export * from "./wasm/lix_engine_wasm_bindgen.js";
 export { wasmBinary } from "./engine-wasm-binary.js";
 
 export type ValueKind = "Null" | "Integer" | "Real" | "Text" | "Blob";

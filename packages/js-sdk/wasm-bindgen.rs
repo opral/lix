@@ -9,6 +9,7 @@ mod wasm {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
+
     #[wasm_bindgen]
     pub struct Lix {
         engine: lix_engine::Engine,
