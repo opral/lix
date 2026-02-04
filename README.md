@@ -17,7 +17,7 @@
 
 ---
 
-Lix is an **embeddable version control system** that can be imported as a library. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
+Lix is an **embeddable version control system**. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
 
 - **It's just a library** — Lix is a library you import. Get branching, diff, rollback in your existing stack
 - **Tracks semantic changes** — diffs, blame, and history are queryable via SQL
