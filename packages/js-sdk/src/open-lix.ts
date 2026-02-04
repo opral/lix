@@ -18,7 +18,7 @@ let wasmReady: Promise<void> | null = null;
 
 async function ensureWasmReady(): Promise<void> {
   if (!wasmReady) {
-    wasmReady = init(wasmBinary).then(() => undefined);
+    wasmReady = init({ module_or_path: wasmBinary }).then(() => undefined);
   }
   await wasmReady;
 }

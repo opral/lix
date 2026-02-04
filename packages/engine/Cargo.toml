@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
+sqlparser = "0.60.0"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
