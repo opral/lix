@@ -947,6 +947,7 @@ dependencies = [
  "paste",
  "postgresql_embedded",
  "serde",
+ "serde_json",
  "sqlparser",
  "sqlx",
  "tokio",

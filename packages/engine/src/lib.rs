@@ -3,6 +3,7 @@ mod engine;
 mod error;
 mod init;
 mod sql;
+mod schema_registry;
 mod types;
 
 pub use backend::LixBackend;
