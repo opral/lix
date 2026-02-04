@@ -1,0 +1,20 @@
+{
+  "name": "js-sdk",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WASM-backed JS SDK wrapper for Lix",
+  "scripts": {
+    "build": "node ./scripts/build.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node ./scripts/build.js && vitest run",
+    "test:watch": "node ./scripts/build.js && vitest"
+  },
+  "dependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.50.4-build1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vitest": "^3.1.1"
+  }
+}

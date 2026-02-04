@@ -2,12 +2,12 @@
 
 ```
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        entity         │ │   entity_by_version   │ │    entity_history     │
+│      lix_entity       │ │ lix_entity_by_version │ │  lix_entity_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             ▼                         ▼                         ▼
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        state          │ │   state_by_version    │ │     state_history     │
+│       lix_state       │ │  lix_state_by_version │ │   lix_state_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             └─────────────────────────┼─────────────────────────┘
@@ -60,15 +60,18 @@
 - materialized state is authoritive for constraints
   - untracked state does NOT participate in constraints
 - drop transaction table - rely on SQLite transactions for isolation
+- prefix every virtual table with `lix_` to avoid name collisions (e.g. `state` -> `lix_state`)
+  - entity views that are already for lix itself do NOT get double-prefixed (e.g. `lix_conversation`, not `lix_lix_conversation`)
+  - future: offer an alias option so users can query `state` while the real table is `lix_state`
 
 ```
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        entity         │ │   entity_by_version   │ │    entity_history     │
+│      lix_entity       │ │ lix_entity_by_version │ │  lix_entity_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             ▼                         ▼                         ▼
 ┌───────────────────────┐ ┌───────────────────────┐ ┌───────────────────────┐
-│        state          │ │   state_by_version    │ │     state_history     │
+│       lix_state       │ │  lix_state_by_version │ │   lix_state_history   │
 └───────────┬───────────┘ └───────────┬───────────┘ └───────────┬───────────┘
             │                         │                         │
             └─────────────────────────┼─────────────────────────┘
@@ -116,7 +119,7 @@ The `file` view reads from both the state vtable and specialized file cache tabl
 
 ```
                          ┌───────────────────────┐
-                         │         file          │
+                         │        lix_file       │
                          └───────────┬───────────┘
                                      │
                   ┌──────────────────┼──────────────────┐
@@ -142,7 +145,7 @@ The `version` view reads from state cache with special handling for inheritance:
 
 ```
                          ┌───────────────────────┐
-                         │        version        │
+                         │       lix_version     │
                          └───────────┬───────────┘
                                      │
                   ┌──────────────────┴──────────────────┐
@@ -227,17 +230,18 @@ Implementations:
 
 ## Milestone 0.05: DataFusion SQL parse passthrough
 
-Hook in DataFusion’s SQL parser to parse incoming SQL, serialize it back to SQL,
-and forward the normalized SQL string to the backend. This keeps the execution
-path the same but validates/normalizes SQL early, and sets up a stable AST
-pipeline for later rewrites.
+Hook in DataFusion’s SQL parser inside the Rust engine `execute()` pipeline to
+parse incoming SQL, serialize it back to SQL, and forward the normalized SQL
+string to the backend. This keeps the execution path the same but validates and
+normalizes SQL early, and sets up a stable AST pipeline for later rewrites.
 
 ### Tasks
 
-1. Parse SQL with DataFusion SQL parser
+1. Parse SQL with DataFusion SQL parser in the Rust engine
 2. Serialize AST back to SQL string (no rewrite yet)
 3. Forward serialized SQL to `LixBackend.execute`
-4. Add parity tests against raw passthrough for SQLite/Postgres
+4. Add parity tests that compare raw passthrough vs. parse/serialize for
+   SQLite and Postgres
 
 ## Milestone 0.1: JS bindings (Node + WASM)
 
@@ -252,6 +256,8 @@ Bindings consume the **WASM build of `packages/engine`**.
   - `new PostgresBackend(...)` optional.
 
 ## Milestone 0.2: Python bindings
+
+> Cancelled for now. We didn't go with a WIT based engine because WIT doesn't support async yet.
 
 Expose `openLix()` and `lix.execute()` via PyO3:
 
@@ -354,6 +360,56 @@ CREATE TABLE lix_internal_state_materialized_v1_{schema_key} (
 );
 ```
 
+### Stored Schema Registry (lix_stored_schema)
+
+Schemas are not stored in a separate table. They are stored as **state rows** in
+
+Row shape:
+
+- `snapshot_content` stores `{ "value": <schema-definition> }`.
+- Lookups read `$.value` as the schema definition.
+
+Identity:
+
+- `x-lix-primary-key` is `["/value/x-lix-key", "/value/x-lix-version"]`.
+- Schema identity is **derived from JSON**, not from `entity_id` alone.
+
+Immutability:
+
+- `x-lix-immutable: true` is enforced for stored schemas.
+
+Semver:
+
+- `x-lix-version` must be `major.minor.patch` and comparisons must be semantic.
+- The engine should order versions by semver (not lexicographic string order).
+
+```sql
+-- Until entity views exist, insert directly into the vtable and set lixcols explicitly.
+INSERT INTO lix_internal_state_vtable (
+  entity_id,
+  schema_key,
+  version_id,
+  file_id,
+  plugin_key,
+  snapshot_content
+) VALUES (
+  'mock_schema~1.0.0',               -- entity_id derived from x-lix-primary-key pointers
+  'lix_stored_schema',
+  'global',
+  'lix',
+  'lix',
+  '{"value": { "x-lix-key": "mock_schema", "x-lix-version": "1.0.0", ... }}'
+);
+```
+
+Lookup logic (current JS behavior):
+
+- **All schemas**: `SELECT snapshot_content, updated_at` where `schema_key = 'lix_stored_schema'`,
+  `version_id = 'global'`, `snapshot_content IS NOT NULL`; parse `snapshot_content.value`.
+- **Single schema**: filter by `json_extract(snapshot_content, '$.value.\"x-lix-key\"') = <key>`
+  and pick the highest `x-lix-version` (should be semver-aware).
+- Cache per-engine; invalidate when a state commit touches `schema_key = 'lix_stored_schema'`.
+
 ### Schema Registration
 
 When a schema is registered, the engine creates a corresponding materialized table:
@@ -385,9 +441,11 @@ fn register_schema(schema: &Schema, host: &impl HostBindings) -> Result<()> {
 ### Tasks
 
 1. Define materialized table schema with required columns
-2. Implement `register_schema()` to create materialized tables dynamically
-3. Handle schema key sanitization for table names
-4. Create indexes for common query patterns (version_id, file_id)
+2. Persist schema definitions into `lix_internal_state_vtable` via the `stored_schema` view (`schema_key = 'lix_stored_schema'`, `version_id = 'global'`)
+3. Enforce immutability and semver ordering for `x-lix-version`
+4. Implement `register_schema()` to create materialized tables dynamically
+5. Handle schema key sanitization for table names
+6. Create indexes for common query patterns (version_id, file_id)
 
 ## Milestone 3: Rewriting `lix_internal_state_vtable` SELECT Queries
 
@@ -1020,6 +1078,7 @@ The engine should cache compiled schemas in memory for performance.
 3. Compile JSON Schemas once and reuse
 4. Validate `snapshot_content` before commit generation
 5. Return clear error messages with path to invalid field
+6. Enforce `x-lix-immutable: true` (reject UPDATEs that modify immutable rows; require new version/row instead)
 
 ## Milestone 14: Constraint Validation on Materialized Tables
 
@@ -1032,6 +1091,7 @@ After JSON Schema validation, enforce relational constraints by encoding them as
 | `x-lix-primary-key` | Primary key on projected columns (plus `version_id`/scope)                                       |
 | `x-lix-unique`      | UNIQUE index on projected columns (plus `version_id`/scope)                                      |
 | `x-lix-foreign-key` | FOREIGN KEY on projected columns pointing to referenced materialized table (immediate mode only) |
+| `x-lix-immutable`   | Reject UPDATEs for immutable rows (require new version/row instead)                               |
 
 ### Example Materialized Table (projected fields + constraints)
 
@@ -1074,6 +1134,7 @@ CREATE INDEX lix_message_unique_active
 3. Emit `PRIMARY KEY`/`UNIQUE` constraints and indexes over the projected columns plus scope columns.
 4. Emit `FOREIGN KEY` constraints only for immediate-mode FKs; for materialized-mode FKs, rely on materializer and delete-time reverse checks.
 5. Ensure rewritten INSERT/UPDATE/DELETE target materialized tables with these constraints in place; constraint violations bubble up from SQLite.
+6. Ensure immutable schemas (e.g. `x-lix-immutable: true`) are never updated in materialized tables; enforce via rewrite rules or constraint checks.
 
 ---
 

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use postgresql_embedded::PostgreSQL;
+use postgresql_embedded::{PostgreSQL, Status};
 use sqlx::{PgPool, Row};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
@@ -20,7 +20,32 @@ struct PostgresInstance {
 async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
     POSTGRES
         .get_or_try_init(|| async {
-            let mut pg = PostgreSQL::default();
+            let mut settings = postgresql_embedded::Settings::new();
+            settings.data_dir = std::env::temp_dir().join("lix-embedded-postgres");
+            settings.password_file = std::env::temp_dir().join("lix-embedded-postgres.pgpass");
+            settings.password = "lix_test_password".to_string();
+            settings.temporary = false;
+            settings
+                .configuration
+                .insert("dynamic_shared_memory_type".to_string(), "mmap".to_string());
+            settings
+                .configuration
+                .insert("shared_buffers".to_string(), "8MB".to_string());
+            settings
+                .configuration
+                .insert("max_connections".to_string(), "10".to_string());
+            let mut pg = PostgreSQL::new(settings);
+            if pg.settings().data_dir.exists() {
+                if pg.settings().data_dir.join("postmaster.pid").exists()
+                    && pg.status() == Status::Started
+                {
+                    let _ = pg.stop().await;
+                }
+                let _ = std::fs::remove_dir_all(pg.settings().data_dir.clone());
+            }
+            std::fs::create_dir_all(pg.settings().data_dir.clone()).map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
             pg.setup().await.map_err(|err| LixError {
                 message: err.to_string(),
             })?;
@@ -110,7 +135,7 @@ impl PostgresBackend {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl LixBackend for PostgresBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;

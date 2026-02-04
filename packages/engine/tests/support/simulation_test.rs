@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use lix_engine::{open_lix, Lix, LixBackend, LixError, OpenLixConfig};
+use lix_engine::{boot, Engine, LixBackend, LixError, QueryResult, Value};
 
 use super::simulations::default_simulations as default_simulations_impl;
 
@@ -19,15 +19,29 @@ pub struct SimulationArgs {
     expect: ExpectDeterministic,
 }
 
+pub struct SimulationEngine {
+    engine: Engine,
+}
+
+impl SimulationEngine {
+    #[allow(dead_code)]
+    pub async fn init(&self) -> Result<(), LixError> {
+        self.engine.init().await
+    }
+
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.engine.execute(sql, params).await
+    }
+}
+
 impl SimulationArgs {
-    pub async fn open_simulated_lix(&self) -> Result<Lix, LixError> {
+    pub async fn boot_simulated_engine(&self) -> Result<SimulationEngine, LixError> {
         if let Some(setup) = &self.setup {
             setup().await?;
         }
-        open_lix(OpenLixConfig {
-            backend: (self.backend_factory)(),
+        Ok(SimulationEngine {
+            engine: boot((self.backend_factory)()),
         })
-        .await
     }
 
     pub fn expect_deterministic<T>(&self, actual: T)
