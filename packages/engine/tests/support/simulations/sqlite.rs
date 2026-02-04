@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
 use lix_engine::{LixBackend, LixError, QueryResult, Value};
@@ -94,6 +94,16 @@ fn bind_param_sqlite<'q>(
 }
 
 fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value, LixError> {
+    if row
+        .try_get_raw(index)
+        .map_err(|err| LixError {
+            message: err.to_string(),
+        })?
+        .is_null()
+    {
+        return Ok(Value::Null);
+    }
+
     if let Ok(value) = row.try_get::<i64, _>(index) {
         return Ok(Value::Integer(value));
     }
