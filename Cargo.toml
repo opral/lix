@@ -2,5 +2,6 @@
 resolver = "2"
 members = [
   "packages/engine",
+  "packages/js-sdk",
   "packages/rs-sdk",
 ]

@@ -53,7 +53,7 @@ impl SqliteBackend {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl LixBackend for SqliteBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;

@@ -1,9 +1,12 @@
 mod backend;
+mod engine;
 mod error;
-mod lix;
+mod init;
+mod sql;
+mod schema_registry;
 mod types;
 
 pub use backend::LixBackend;
+pub use engine::{boot, Engine};
 pub use error::LixError;
-pub use lix::{open_lix, Lix, OpenLixConfig};
 pub use types::{QueryResult, Value};
