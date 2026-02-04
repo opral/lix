@@ -512,11 +512,14 @@ SELECT * FROM (
 
 ## Milestone 4: Rewriting `lix_internal_state_vtable` INSERT Queries
 
-INSERT operations to the vtable need to be rewritten to:
+INSERT operations to the vtable need to be rewritten to direct, multi-table writes
+inside the user's SQL transaction (no transaction staging table):
 
 1. Insert the snapshot content into `lix_internal_snapshot`
+   - If `snapshot_content` is `NULL`, use the sentinel `no-content` snapshot (ensure it exists)
 2. Create a change record in `lix_internal_change`
 3. Update the materialized table for the schema
+4. If `untracked = 1`, skip change history and write only to `lix_internal_state_untracked`
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -531,7 +534,7 @@ INSERT operations to the vtable need to be rewritten to:
         ▼                            ▼                            ▼
 ┌─────────────────┐    ┌───────────────────────┐    ┌─────────────────────────┐
 │ lix_internal_   │    │ lix_internal_change   │    │ lix_internal_state_     │
-│ snapshot        │    │                       │    │ cache_v1_{schema_key}   │
+│ snapshot        │    │                       │    │ materialized_v1_{schema_key}│
 │                 │    │ (references snapshot) │    │                         │
 │ (content blob)  │    │                       │    │ (materialized state)    │
 └─────────────────┘    └───────────────────────┘    └─────────────────────────┘
@@ -571,8 +574,10 @@ ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET
 
 1. Parse incoming INSERT statements targeting `lix_internal_state_vtable`
 2. Extract row values from VALUES clause
-3. Generate snapshot ID (content-addressed hash or UUID)
-4. Build multi-statement SQL: snapshot insert → change insert → cache upsert
+3. Generate snapshot ID (UUID)
+4. Build multi-statement SQL: snapshot insert → change insert → materialized upsert
+5. Ensure the `no-content` snapshot exists for null rows and use it as `snapshot_id`
+6. Handle untracked inserts by routing to `lix_internal_state_untracked` only
 
 ## Milestone 5: Rewriting `lix_internal_state_vtable` UPDATE Queries
 
@@ -1091,7 +1096,7 @@ After JSON Schema validation, enforce relational constraints by encoding them as
 | `x-lix-primary-key` | Primary key on projected columns (plus `version_id`/scope)                                       |
 | `x-lix-unique`      | UNIQUE index on projected columns (plus `version_id`/scope)                                      |
 | `x-lix-foreign-key` | FOREIGN KEY on projected columns pointing to referenced materialized table (immediate mode only) |
-| `x-lix-immutable`   | Reject UPDATEs for immutable rows (require new version/row instead)                               |
+| `x-lix-immutable`   | Reject UPDATEs for immutable rows (require new version/row instead)                              |
 
 ### Example Materialized Table (projected fields + constraints)
 
