@@ -5,6 +5,7 @@ mod engine;
 mod error;
 mod functions;
 mod init;
+mod key_value;
 mod schema;
 mod schema_registry;
 mod sql;
