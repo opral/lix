@@ -3,8 +3,10 @@ use sqlparser::ast::{
     Expr, Ident, Insert, ObjectName, ObjectNamePart, Statement, TableObject, Value, ValueWithSpan,
 };
 
-use crate::sql::{MutationOperation, MutationRow, SchemaRegistration};
-use crate::LixError;
+use crate::sql::{
+    MutationOperation, MutationRow, ResolvedCell, RowSourceResolver, SchemaRegistration,
+};
+use crate::{LixError, Value as EngineValue};
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 const GLOBAL_VERSION: &str = "global";
@@ -18,7 +20,10 @@ pub struct StoredSchemaRewrite {
     pub mutation: MutationRow,
 }
 
-pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, LixError> {
+pub fn rewrite_insert(
+    insert: Insert,
+    params: &[EngineValue],
+) -> Result<Option<StoredSchemaRewrite>, LixError> {
     if !table_object_is_vtable(&insert.table) {
         return Ok(None);
     }
@@ -30,25 +35,27 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
         None => return Ok(None),
     };
 
-    let values = match source.body.as_ref() {
-        sqlparser::ast::SetExpr::Values(values) => values,
-        _ => return Ok(None),
+    let resolver = RowSourceResolver::new(params);
+    let Some(row_source) = resolver.resolve_insert(&insert)? else {
+        return Ok(None);
     };
-
-    if values.rows.is_empty() {
+    if row_source.rows.is_empty() {
         return Ok(None);
     }
 
-    let mut rows = values.rows.clone();
+    let mut rows = row_source.rows;
+    let resolved_rows = row_source.resolved_rows;
+    let values_layout = row_source.values_layout;
+    resolve_row_literals(&mut rows, &resolved_rows)?;
 
     let schema_key_index = match schema_key_index {
         Some(index) => index,
         None => return Ok(None),
     };
 
-    if !rows
+    if !resolved_rows
         .iter()
-        .all(|row| is_literal_equal(row.get(schema_key_index), STORED_SCHEMA_KEY))
+        .all(|row| resolved_value_equals(row.get(schema_key_index), STORED_SCHEMA_KEY))
     {
         return Ok(None);
     }
@@ -72,11 +79,16 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
     let mut schema_key_value: Option<String> = None;
     let mut schema_version_value: Option<String> = None;
     let mut snapshot_literal_value: Option<String> = None;
-    for row in &rows {
+    for (row_idx, row) in rows.iter().enumerate() {
         let snapshot_expr = row.get(snapshot_index).ok_or_else(|| LixError {
             message: "stored schema insert missing snapshot_content value".to_string(),
         })?;
-        let literal = snapshot_literal(snapshot_expr)?;
+        let literal = snapshot_literal(
+            snapshot_expr,
+            resolved_rows
+                .get(row_idx)
+                .and_then(|r| r.get(snapshot_index)),
+        )?;
         if snapshot_literal_value.is_none() {
             snapshot_literal_value = Some(literal.clone());
         }
@@ -114,9 +126,9 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
         })?;
 
     if let Some(entity_index) = find_column_index(&columns, "entity_id") {
-        if !rows
+        if !resolved_rows
             .iter()
-            .all(|row| is_literal_equal(row.get(entity_index), &entity_id))
+            .all(|row| resolved_value_equals(row.get(entity_index), &entity_id))
         {
             return Err(LixError {
                 message: "stored schema insert entity_id must match schema key + version"
@@ -130,30 +142,57 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
     ensure_literal_column(
         &mut columns,
         &mut rows,
+        &resolved_rows,
         "schema_version",
         &schema_version_value,
     )?;
-    ensure_literal_column(&mut columns, &mut rows, "version_id", GLOBAL_VERSION)?;
-    ensure_literal_column(&mut columns, &mut rows, "file_id", ENGINE_FILE_ID)?;
-    ensure_literal_column(&mut columns, &mut rows, "plugin_key", ENGINE_PLUGIN_KEY)?;
-    ensure_literal_column(&mut columns, &mut rows, "change_id", "schema")?;
-    ensure_literal_column(&mut columns, &mut rows, "is_tombstone", "0")?;
     ensure_literal_column(
         &mut columns,
         &mut rows,
+        &resolved_rows,
+        "version_id",
+        GLOBAL_VERSION,
+    )?;
+    ensure_literal_column(
+        &mut columns,
+        &mut rows,
+        &resolved_rows,
+        "file_id",
+        ENGINE_FILE_ID,
+    )?;
+    ensure_literal_column(
+        &mut columns,
+        &mut rows,
+        &resolved_rows,
+        "plugin_key",
+        ENGINE_PLUGIN_KEY,
+    )?;
+    ensure_literal_column(
+        &mut columns,
+        &mut rows,
+        &resolved_rows,
+        "change_id",
+        "schema",
+    )?;
+    ensure_literal_column(&mut columns, &mut rows, &resolved_rows, "is_tombstone", "0")?;
+    ensure_literal_column(
+        &mut columns,
+        &mut rows,
+        &resolved_rows,
         "created_at",
         "1970-01-01T00:00:00Z",
     )?;
     ensure_literal_column(
         &mut columns,
         &mut rows,
+        &resolved_rows,
         "updated_at",
         "1970-01-01T00:00:00Z",
     )?;
 
     source.body = Box::new(sqlparser::ast::SetExpr::Values(sqlparser::ast::Values {
-        explicit_row: values.explicit_row,
-        value_keyword: values.value_keyword,
+        explicit_row: values_layout.explicit_row,
+        value_keyword: values_layout.value_keyword,
         rows,
     }));
 
@@ -218,16 +257,49 @@ fn append_column_with_literal(
     columns.len() - 1
 }
 
+fn resolve_row_literals(
+    rows: &mut [Vec<Expr>],
+    resolved_rows: &[Vec<ResolvedCell>],
+) -> Result<(), LixError> {
+    for (row, resolved_row) in rows.iter_mut().zip(resolved_rows.iter()) {
+        for (expr, cell) in row.iter_mut().zip(resolved_row.iter()) {
+            if let Some(value) = &cell.value {
+                *expr = engine_value_to_expr(value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn engine_value_to_expr(value: &EngineValue) -> Expr {
+    match value {
+        EngineValue::Null => Expr::Value(ValueWithSpan::from(Value::Null)),
+        EngineValue::Text(value) => Expr::Value(ValueWithSpan::from(Value::SingleQuotedString(
+            value.clone(),
+        ))),
+        EngineValue::Integer(value) => {
+            Expr::Value(ValueWithSpan::from(Value::Number(value.to_string(), false)))
+        }
+        EngineValue::Real(value) => {
+            Expr::Value(ValueWithSpan::from(Value::Number(value.to_string(), false)))
+        }
+        EngineValue::Blob(value) => Expr::Value(ValueWithSpan::from(
+            Value::SingleQuotedByteStringLiteral(String::from_utf8_lossy(value).to_string()),
+        )),
+    }
+}
+
 fn ensure_literal_column(
     columns: &mut Vec<Ident>,
     rows: &mut Vec<Vec<Expr>>,
+    resolved_rows: &[Vec<ResolvedCell>],
     name: &str,
     value: &str,
 ) -> Result<(), LixError> {
     if let Some(index) = find_column_index(columns, name) {
-        let ok = rows
+        let ok = resolved_rows
             .iter()
-            .all(|row| is_literal_equal(row.get(index), value));
+            .all(|row| resolved_value_equals(row.get(index), value));
         if !ok {
             return Err(LixError {
                 message: format!("stored schema insert requires {name} = '{value}'"),
@@ -239,21 +311,23 @@ fn ensure_literal_column(
     Ok(())
 }
 
-fn is_literal_equal(expr: Option<&Expr>, expected: &str) -> bool {
-    match expr {
-        Some(Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(value),
-            ..
-        })) => value == expected,
-        Some(Expr::Value(ValueWithSpan {
-            value: Value::Number(value, _),
-            ..
-        })) => value == expected,
+fn resolved_value_equals(cell: Option<&ResolvedCell>, expected: &str) -> bool {
+    match cell.and_then(|cell| cell.value.as_ref()) {
+        Some(EngineValue::Text(value)) => value == expected,
+        Some(EngineValue::Integer(value)) => value.to_string() == expected,
         _ => false,
     }
 }
 
-fn snapshot_literal(expr: &Expr) -> Result<String, LixError> {
+fn snapshot_literal(expr: &Expr, cell: Option<&ResolvedCell>) -> Result<String, LixError> {
+    if let Some(ResolvedCell {
+        value: Some(EngineValue::Text(value)),
+        ..
+    }) = cell
+    {
+        return Ok(value.clone());
+    }
+
     match expr {
         Expr::Value(ValueWithSpan {
             value: Value::SingleQuotedString(value),
@@ -377,7 +451,7 @@ mod tests {
     fn rewrite_stored_schema_insert_adds_overrides() {
         let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}')"#;
         let insert = parse_insert(sql);
-        let rewritten = rewrite_insert(insert)
+        let rewritten = rewrite_insert(insert, &[])
             .expect("rewrite ok")
             .expect("rewritten");
         let insert = match rewritten.statement {
@@ -415,7 +489,7 @@ mod tests {
     fn rewrite_stored_schema_requires_monotonic_version() {
         let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"v1"}}')"#;
         let insert = parse_insert(sql);
-        let err = rewrite_insert(insert).expect_err("expected error");
+        let err = rewrite_insert(insert, &[]).expect_err("expected error");
         assert!(err.message.contains("monotonic"), "{:#?}", err);
     }
 
@@ -423,7 +497,7 @@ mod tests {
     fn rewrite_ignores_other_schema_keys() {
         let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('other_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}')"#;
         let insert = parse_insert(sql);
-        let rewritten = rewrite_insert(insert).expect("rewrite ok");
+        let rewritten = rewrite_insert(insert, &[]).expect("rewrite ok");
         assert!(rewritten.is_none());
     }
 }

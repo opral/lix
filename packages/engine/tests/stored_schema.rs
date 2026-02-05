@@ -66,6 +66,46 @@ simulation_test!(
 );
 
 simulation_test!(
+    stored_schema_insert_accepts_parameterized_snapshot,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ($1, $2)",
+            &[
+                Value::Text("lix_stored_schema".to_string()),
+                Value::Text(
+                    "{\"value\":{\"x-lix-key\":\"param_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}"
+                        .to_string(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let stored = engine
+        .execute(
+            "SELECT entity_id, schema_key, schema_version FROM lix_internal_state_materialized_v1_lix_stored_schema WHERE entity_id = 'param_schema~1'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stored.rows.len(), 1);
+        let row = &stored.rows[0];
+        assert_eq!(row[0], Value::Text("param_schema~1".to_string()));
+        assert_eq!(row[1], Value::Text("lix_stored_schema".to_string()));
+        assert_eq!(row[2], Value::Text("1".to_string()));
+    }
+);
+
+simulation_test!(
     stored_schema_requires_foreign_key_targets_are_unique_or_primary,
     |sim| async move {
         let engine = sim

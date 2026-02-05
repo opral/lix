@@ -1,3 +1,4 @@
+use crate::cel::CelEvaluator;
 use crate::init::init_backend;
 use crate::schema_registry::register_schema;
 use crate::sql::{
@@ -8,12 +9,14 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 
 pub struct Engine {
     backend: Box<dyn LixBackend + Send + Sync>,
+    cel_evaluator: CelEvaluator,
     schema_cache: SchemaCache,
 }
 
 pub fn boot(backend: Box<dyn LixBackend + Send + Sync>) -> Engine {
     Engine {
         backend,
+        cel_evaluator: CelEvaluator::new(),
         schema_cache: SchemaCache::new(),
     }
 }
@@ -24,7 +27,8 @@ impl Engine {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let output = preprocess_sql(sql)?;
+        let output =
+            preprocess_sql(self.backend.as_ref(), &self.cel_evaluator, sql, params).await?;
         if !output.mutations.is_empty() {
             validate_inserts(self.backend.as_ref(), &self.schema_cache, &output.mutations).await?;
         }
@@ -40,9 +44,9 @@ impl Engine {
             register_schema(self.backend.as_ref(), &registration.schema_key).await?;
         }
         match output.postprocess {
-            None => self.backend.execute(&output.sql, params).await,
+            None => self.backend.execute(&output.sql, &output.params).await,
             Some(PostprocessPlan::VtableUpdate(plan)) => {
-                let result = self.backend.execute(&output.sql, params).await?;
+                let result = self.backend.execute(&output.sql, &output.params).await?;
                 let followup_sql = build_update_followup_sql(&plan, &result.rows)?;
                 if !followup_sql.is_empty() {
                     self.backend.execute(&followup_sql, &[]).await?;
@@ -50,7 +54,7 @@ impl Engine {
                 Ok(result)
             }
             Some(PostprocessPlan::VtableDelete(plan)) => {
-                let result = self.backend.execute(&output.sql, params).await?;
+                let result = self.backend.execute(&output.sql, &output.params).await?;
                 let followup_sql = build_delete_followup_sql(&plan, &result.rows)?;
                 if !followup_sql.is_empty() {
                     self.backend.execute(&followup_sql, &[]).await?;
