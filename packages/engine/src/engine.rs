@@ -1,5 +1,6 @@
 use crate::cel::CelEvaluator;
 use crate::init::init_backend;
+use crate::key_value::{key_value_schema_entity_id, key_value_schema_seed_insert_sql};
 use crate::schema_registry::register_schema;
 use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, preprocess_sql, PostprocessPlan,
@@ -23,7 +24,8 @@ pub fn boot(backend: Box<dyn LixBackend + Send + Sync>) -> Engine {
 
 impl Engine {
     pub async fn init(&self) -> Result<(), LixError> {
-        init_backend(self.backend.as_ref()).await
+        init_backend(self.backend.as_ref()).await?;
+        self.ensure_key_value_schema_installed().await
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
@@ -62,5 +64,25 @@ impl Engine {
                 Ok(result)
             }
         }
+    }
+
+    async fn ensure_key_value_schema_installed(&self) -> Result<(), LixError> {
+        let entity_id = key_value_schema_entity_id();
+        let exists_sql = format!(
+            "SELECT 1 FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_stored_schema' \
+               AND entity_id = '{entity_id}' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1"
+        );
+
+        let existing = self.execute(&exists_sql, &[]).await?;
+        if existing.rows.is_empty() {
+            let insert_sql = key_value_schema_seed_insert_sql()?;
+            self.execute(&insert_sql, &[]).await?;
+        }
+
+        Ok(())
     }
 }
