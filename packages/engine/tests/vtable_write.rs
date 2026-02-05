@@ -253,6 +253,52 @@ simulation_test!(
 );
 
 simulation_test!(
+    tracked_insert_accepts_parameterized_values,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                Value::Text("entity-1".to_string()),
+                Value::Text("test_schema".to_string()),
+                Value::Text("file-1".to_string()),
+                Value::Text("version-1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("{\"key\":\"tracked-param\"}".to_string()),
+                Value::Text("1".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let materialized = engine
+            .execute(
+                "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
+             WHERE entity_id = 'entity-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(materialized.rows.len(), 1);
+        assert_eq!(
+            materialized.rows[0][0],
+            Value::Text("{\"key\":\"tracked-param\"}".to_string())
+        );
+    }
+);
+
+simulation_test!(
     tracked_insert_updates_schema_version_on_conflict,
     |sim| async move {
         let engine = sim
@@ -326,6 +372,103 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine()
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.init().await.unwrap();
+    register_test_schema(&engine).await;
+
+    engine
+        .execute(
+            "CREATE TABLE source_rows (entity_id TEXT, payload TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    engine
+        .execute(
+            "INSERT INTO source_rows (entity_id, payload) VALUES ('entity-1', '{\"key\":\"from-select\"}')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT entity_id, $1, $2, $3, $4, payload, $5 FROM source_rows",
+            &[
+                Value::Text("test_schema".to_string()),
+                Value::Text("file-1".to_string()),
+                Value::Text("version-1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("1".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let materialized = engine
+        .execute(
+            "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
+             WHERE entity_id = 'entity-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(materialized.rows.len(), 1);
+    assert_eq!(
+        materialized.rows[0][0],
+        Value::Text("{\"key\":\"from-select\"}".to_string())
+    );
+});
+
+simulation_test!(tracked_insert_select_zero_rows_is_noop, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine()
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.init().await.unwrap();
+    register_test_schema(&engine).await;
+
+    engine
+        .execute(
+            "CREATE TABLE source_rows (entity_id TEXT, payload TEXT)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let result = engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT entity_id, $1, $2, $3, $4, payload, $5 FROM source_rows",
+            &[
+                Value::Text("test_schema".to_string()),
+                Value::Text("file-1".to_string()),
+                Value::Text("version-1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("1".to_string()),
+            ],
+        )
+        .await;
+
+    assert!(result.is_ok(), "{result:?}");
+
+    let count = engine
+        .execute(
+            "SELECT COUNT(*) FROM lix_internal_state_materialized_v1_test_schema",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(count.rows[0][0], Value::Integer(0));
+});
 
 simulation_test!(
     tracked_state_uses_no_content_snapshot_for_nulls,

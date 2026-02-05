@@ -4,9 +4,12 @@ use crate::sql::steps::{stored_schema, vtable_read, vtable_write};
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
-use crate::LixError;
+use crate::{LixError, Value};
 
-pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError> {
+pub fn rewrite_statement(
+    statement: Statement,
+    params: &[Value],
+) -> Result<RewriteOutput, LixError> {
     match statement {
         Statement::Insert(insert) => {
             let mut current = Statement::Insert(insert);
@@ -16,14 +19,14 @@ pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError
             let update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
             if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) = stored_schema::rewrite_insert(inner.clone())? {
+                if let Some(rewritten) = stored_schema::rewrite_insert(inner.clone(), params)? {
                     registrations.push(rewritten.registration);
                     mutations.push(rewritten.mutation);
                     current = rewritten.statement;
                 }
             }
             if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) = vtable_write::rewrite_insert(inner.clone())? {
+                if let Some(rewritten) = vtable_write::rewrite_insert(inner.clone(), params)? {
                     registrations.extend(rewritten.registrations);
                     statements = rewritten.statements;
                     mutations = rewritten.mutations;
@@ -43,7 +46,7 @@ pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError
             })
         }
         Statement::Update(update) => {
-            let rewritten = vtable_write::rewrite_update(update.clone())?;
+            let rewritten = vtable_write::rewrite_update(update.clone(), params)?;
             match rewritten {
                 Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
                     statements: vec![rewrite.statement],

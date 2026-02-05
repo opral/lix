@@ -9,7 +9,6 @@ mod wasm {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
-
     #[wasm_bindgen]
     pub struct Lix {
         engine: lix_engine::Engine,
@@ -195,7 +194,11 @@ mod wasm {
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::NULL);
             }
             EngineValue::Integer(value) => {
-                let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Integer"));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("kind"),
+                    &JsValue::from_str("Integer"),
+                );
                 let _ = Reflect::set(
                     &obj,
                     &JsValue::from_str("value"),
@@ -208,7 +211,11 @@ mod wasm {
             }
             EngineValue::Text(value) => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Text"));
-                let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from_str(&value));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("value"),
+                    &JsValue::from_str(&value),
+                );
             }
             EngineValue::Blob(value) => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Blob"));

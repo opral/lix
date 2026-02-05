@@ -536,7 +536,7 @@ fn quote_ident(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::preprocess_sql;
+    use crate::sql::preprocess_sql_rewrite_only as preprocess_sql;
 
     fn compact_sql(sql: &str) -> String {
         sql.chars().filter(|c| !c.is_whitespace()).collect()
