@@ -161,6 +161,16 @@ pub fn rewrite_update(update: Update) -> Result<Option<UpdateRewrite>, LixError>
         return Ok(None);
     }
 
+    if update
+        .assignments
+        .iter()
+        .any(|assignment| assignment_target_is_column(&assignment.target, "schema_key"))
+    {
+        return Err(LixError {
+            message: "vtable update cannot change schema_key".to_string(),
+        });
+    }
+
     let selection = update.selection.as_ref().ok_or_else(|| LixError {
         message: "vtable update requires a WHERE clause".to_string(),
     })?;
@@ -432,6 +442,24 @@ fn build_materialized_on_conflict() -> OnInsert {
                     value: Expr::CompoundIdentifier(vec![
                         Ident::new("excluded"),
                         Ident::new("snapshot_content"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("schema_version")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("schema_version"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("plugin_key")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("plugin_key"),
                     ]),
                 },
                 Assignment {
@@ -1920,6 +1948,27 @@ mod tests {
 
         let err = rewrite_update(update).expect_err("expected error");
         assert!(err.message.contains("single schema_key"), "{:#?}", err);
+    }
+
+    #[test]
+    fn rewrite_update_rejects_schema_key_assignment() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET schema_key = 'other'
+            WHERE schema_key = 'a' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update).expect_err("expected error");
+        assert!(
+            err.message.contains("cannot change schema_key"),
+            "{:#?}",
+            err
+        );
     }
 
     #[test]
