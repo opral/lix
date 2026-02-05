@@ -9,6 +9,7 @@ pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError
         Statement::Insert(insert) => {
             let mut current = Statement::Insert(insert);
             let mut registrations: Vec<SchemaRegistration> = Vec::new();
+            let mut statements: Vec<Statement> = Vec::new();
 
             if let Statement::Insert(inner) = &current {
                 if let Some(rewritten) = stored_schema::rewrite_insert(inner.clone())? {
@@ -18,33 +19,40 @@ pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError
             }
             if let Statement::Insert(inner) = &current {
                 if let Some(rewritten) = vtable_write::rewrite_insert(inner.clone())? {
-                    current = rewritten;
+                    registrations.extend(rewritten.registrations);
+                    statements = rewritten.statements;
                 }
             }
 
+            if statements.is_empty() {
+                statements.push(current);
+            }
+
             Ok(RewriteOutput {
-                statement: current,
+                statements,
                 registrations,
             })
         }
         Statement::Update(update) => Ok(RewriteOutput {
-            statement: vtable_write::rewrite_update(update.clone())?
-                .unwrap_or(Statement::Update(update)),
+            statements: vec![
+                vtable_write::rewrite_update(update.clone())?.unwrap_or(Statement::Update(update))
+            ],
             registrations: Vec::new(),
         }),
         Statement::Delete(delete) => Ok(RewriteOutput {
-            statement: vtable_write::rewrite_delete(delete.clone())?
-                .unwrap_or(Statement::Delete(delete)),
+            statements: vec![
+                vtable_write::rewrite_delete(delete.clone())?.unwrap_or(Statement::Delete(delete))
+            ],
             registrations: Vec::new(),
         }),
         Statement::Query(query) => Ok(RewriteOutput {
-            statement: vtable_read::rewrite_query(*query.clone())?
+            statements: vec![vtable_read::rewrite_query(*query.clone())?
                 .map(|rewritten| Statement::Query(Box::new(rewritten)))
-                .unwrap_or_else(|| Statement::Query(query)),
+                .unwrap_or_else(|| Statement::Query(query))],
             registrations: Vec::new(),
         }),
         other => Ok(RewriteOutput {
-            statement: other,
+            statements: vec![other],
             registrations: Vec::new(),
         }),
     }

@@ -1,6 +1,7 @@
 mod backend;
 mod engine;
 mod error;
+mod functions;
 mod init;
 mod schema_registry;
 mod sql;

@@ -7,7 +7,7 @@ pub struct SchemaRegistration {
 
 #[derive(Debug, Clone)]
 pub struct RewriteOutput {
-    pub statement: Statement,
+    pub statements: Vec<Statement>,
     pub registrations: Vec<SchemaRegistration>,
 }
 
