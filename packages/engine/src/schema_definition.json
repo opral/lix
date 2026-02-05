@@ -1,0 +1,177 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Lix Schema Definition",
+  "description": "A JSON schema document that defines Lix schema documents, including custom x-lix-* metadata for identification and versioning.",
+  "allOf": [
+    {
+      "$ref": "http://json-schema.org/draft-07/schema#"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "x-lix-unique": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "format": "json-pointer",
+              "description": "JSON Pointer referencing a property"
+            }
+          }
+        },
+        "additionalProperties": {
+          "type": "boolean",
+          "const": false,
+          "description": "Objects describing Lix schemas must not allow arbitrary additional properties; set this explicitly to false."
+        },
+        "x-lix-primary-key": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "format": "json-pointer",
+            "description": "JSON Pointer referencing a property that participates in the primary key."
+          }
+        },
+        "x-lix-foreign-keys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "properties",
+              "references"
+            ],
+            "properties": {
+              "properties": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "format": "json-pointer",
+                  "description": "JSON Pointer referencing the local field."
+                },
+                "uniqueItems": true,
+                "description": "Local JSON-schema property names that participate in the FK"
+              },
+              "references": {
+                "type": "object",
+                "required": [
+                  "schemaKey",
+                  "properties"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "schemaKey": {
+                    "type": "string",
+                    "description": "The x-lix-key of the referenced schema"
+                  },
+                  "properties": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "format": "json-pointer",
+                      "description": "JSON Pointer referencing the remote field."
+                    },
+                    "uniqueItems": true,
+                    "description": "Remote property names (same length as local properties)"
+                  }
+                }
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "immediate",
+                  "materialized"
+                ],
+                "description": "Validation mode: immediate (default) or materialized (defer insert/update existence checks)"
+              },
+              "scope": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "version_id",
+                    "file_id"
+                  ]
+                },
+                "uniqueItems": true,
+                "description": "Implicit columns (version_id and/or file_id) used to scope the foreign key relationship"
+              }
+            }
+          }
+        },
+        "x-lix-key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "The schema identifier. Must be snake_case (lowercase, underscores) to safely embed in SQL identifiers.",
+          "examples": [
+            "csv_plugin_cell"
+          ]
+        },
+        "x-lix-immutable": {
+          "type": "boolean",
+          "description": "When true, entities for this schema cannot be updated after creation."
+        },
+        "x-lix-override-lixcols": {
+          "type": "object",
+          "description": "Default metadata column values (such as lixcol_file_id). Does not affect JSON property defaults.",
+          "additionalProperties": {
+            "type": "string",
+            "format": "cel"
+          }
+        },
+        "x-lix-entity-views": {
+          "type": "array",
+          "description": "Restricts which SQL entity views (state/state_by_version/state_history) are generated. When omitted, all views are created.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "state",
+              "state_by_version",
+              "state_history"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "x-lix-version": {
+          "type": "string",
+          "pattern": "^[1-9]\\d*$",
+          "description": "Schema version identifier. Deliberately constrained to a monotonic integer (as a string) without leading zeros to keep translation rules open while avoiding future breaking changes.",
+          "examples": [
+            "1"
+          ]
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "allOf": [
+              {
+                "$ref": "http://json-schema.org/draft-07/schema#"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "x-lix-default": {
+                    "type": "string",
+                    "format": "cel",
+                    "description": "CEL expression evaluated to produce the default value when the property is omitted."
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "x-lix-key",
+        "x-lix-version",
+        "additionalProperties"
+      ]
+    }
+  ]
+}

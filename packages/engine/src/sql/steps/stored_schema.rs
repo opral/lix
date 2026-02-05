@@ -3,7 +3,7 @@ use sqlparser::ast::{
     Expr, Ident, Insert, ObjectName, ObjectNamePart, Statement, TableObject, Value, ValueWithSpan,
 };
 
-use crate::sql::SchemaRegistration;
+use crate::sql::{MutationOperation, MutationRow, SchemaRegistration};
 use crate::LixError;
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
@@ -15,6 +15,7 @@ const ENGINE_PLUGIN_KEY: &str = "lix";
 pub struct StoredSchemaRewrite {
     pub statement: Statement,
     pub registration: SchemaRegistration,
+    pub mutation: MutationRow,
 }
 
 pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, LixError> {
@@ -70,11 +71,15 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
     let mut entity_id_value: Option<String> = None;
     let mut schema_key_value: Option<String> = None;
     let mut schema_version_value: Option<String> = None;
+    let mut snapshot_literal_value: Option<String> = None;
     for row in &rows {
         let snapshot_expr = row.get(snapshot_index).ok_or_else(|| LixError {
             message: "stored schema insert missing snapshot_content value".to_string(),
         })?;
         let literal = snapshot_literal(snapshot_expr)?;
+        if snapshot_literal_value.is_none() {
+            snapshot_literal_value = Some(literal.clone());
+        }
         let (schema_key, schema_version) = parse_schema_identity(&literal)?;
         let derived_id = format!("{}~{}", schema_key, schema_version);
         schema_key_value = Some(schema_key.clone());
@@ -100,6 +105,13 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
     let schema_version_value = schema_version_value.ok_or_else(|| LixError {
         message: "stored schema insert requires schema version".to_string(),
     })?;
+    let snapshot_literal_value = snapshot_literal_value.ok_or_else(|| LixError {
+        message: "stored schema insert requires snapshot_content".to_string(),
+    })?;
+    let snapshot_value: JsonValue =
+        serde_json::from_str(&snapshot_literal_value).map_err(|err| LixError {
+            message: format!("stored schema snapshot_content must be valid JSON: {err}"),
+        })?;
 
     if let Some(entity_index) = find_column_index(&columns, "entity_id") {
         if !rows
@@ -158,6 +170,17 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
         statement: Statement::Insert(rewritten),
         registration: SchemaRegistration {
             schema_key: schema_key_value,
+        },
+        mutation: MutationRow {
+            operation: MutationOperation::Insert,
+            entity_id,
+            schema_key: STORED_SCHEMA_KEY.to_string(),
+            schema_version: schema_version_value,
+            file_id: ENGINE_FILE_ID.to_string(),
+            version_id: GLOBAL_VERSION.to_string(),
+            plugin_key: ENGINE_PLUGIN_KEY.to_string(),
+            snapshot_content: Some(snapshot_value),
+            untracked: false,
         },
     }))
 }
@@ -267,27 +290,33 @@ fn parse_schema_identity(snapshot: &str) -> Result<(String, String), LixError> {
             message: "stored schema value.x-lix-version must be string".to_string(),
         })?;
 
-    ensure_semver(schema_version)?;
+    // Deliberately keep x-lix-version as a monotonic integer (string) so we can evolve
+    // translation rules later without locking into semver semantics.
+    ensure_monotonic_version(schema_version)?;
 
     Ok((schema_key.to_string(), schema_version.to_string()))
 }
 
-fn ensure_semver(version: &str) -> Result<(), LixError> {
-    let parts: Vec<&str> = version.split('.').collect();
-    if parts.len() != 3 {
+fn ensure_monotonic_version(version: &str) -> Result<(), LixError> {
+    if version.is_empty() {
         return Err(LixError {
-            message: "stored schema x-lix-version must be semver (major.minor.patch)".to_string(),
+            message: "stored schema x-lix-version must be a monotonic integer".to_string(),
         });
     }
-    if parts
-        .iter()
-        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-    {
-        return Ok(());
+    let mut chars = version.chars();
+    let Some(first) = chars.next() else {
+        return Err(LixError {
+            message: "stored schema x-lix-version must be a monotonic integer".to_string(),
+        });
+    };
+    if first == '0' || !first.is_ascii_digit() || !chars.all(|c| c.is_ascii_digit()) {
+        return Err(LixError {
+            message:
+                "stored schema x-lix-version must be a monotonic integer without leading zeros"
+                    .to_string(),
+        });
     }
-    Err(LixError {
-        message: "stored schema x-lix-version must be semver (major.minor.patch)".to_string(),
-    })
+    Ok(())
 }
 
 fn object_name_matches(name: &ObjectName, target: &str) -> bool {
@@ -346,7 +375,7 @@ mod tests {
 
     #[test]
     fn rewrite_stored_schema_insert_adds_overrides() {
-        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1.0.0"}}')"#;
+        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}')"#;
         let insert = parse_insert(sql);
         let rewritten = rewrite_insert(insert)
             .expect("rewrite ok")
@@ -367,9 +396,9 @@ mod tests {
         let created_idx = column_index(&insert.columns, "created_at");
         let updated_idx = column_index(&insert.columns, "updated_at");
 
-        assert_eq!(expr_string(&row[entity_idx]), "mock_schema~1.0.0");
+        assert_eq!(expr_string(&row[entity_idx]), "mock_schema~1");
         assert_eq!(expr_string(&row[version_idx]), "global");
-        assert_eq!(expr_string(&row[schema_version_idx]), "1.0.0");
+        assert_eq!(expr_string(&row[schema_version_idx]), "1");
         assert_eq!(expr_string(&row[file_idx]), "lix");
         assert_eq!(expr_string(&row[plugin_idx]), "lix");
         assert_eq!(expr_string(&row[change_idx]), "schema");
@@ -383,16 +412,16 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_stored_schema_requires_semver() {
-        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1.0"}}')"#;
+    fn rewrite_stored_schema_requires_monotonic_version() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"v1"}}')"#;
         let insert = parse_insert(sql);
         let err = rewrite_insert(insert).expect_err("expected error");
-        assert!(err.message.contains("semver"), "{:#?}", err);
+        assert!(err.message.contains("monotonic"), "{:#?}", err);
     }
 
     #[test]
     fn rewrite_ignores_other_schema_keys() {
-        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('other_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1.0.0"}}')"#;
+        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('other_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}')"#;
         let insert = parse_insert(sql);
         let rewritten = rewrite_insert(insert).expect("rewrite ok");
         assert!(rewritten.is_none());

@@ -756,13 +756,14 @@ for row in &resolved_rows {
 
 ### Schema Storage
 
-Schemas are stored in `lix_internal_state_vtable` with `schema_key = 'lix_schema'`:
+Schemas are stored in `lix_internal_state_vtable` with `schema_key = 'lix_stored_schema'`:
 
 ```sql
 SELECT snapshot_content
 FROM lix_internal_state_vtable
-WHERE schema_key = 'lix_schema'
-  AND entity_id = 'lix_key_value'  -- the schema_key to validate against
+WHERE schema_key = 'lix_stored_schema'
+  AND json_extract(snapshot_content, '$.value."x-lix-key"') = 'lix_key_value'
+  AND version_id = 'global'
 ```
 
 The engine should cache compiled schemas in memory for performance.

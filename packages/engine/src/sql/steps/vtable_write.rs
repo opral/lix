@@ -1,3 +1,4 @@
+use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, CaseWhen, ConflictTarget, Delete, DoUpdate, Expr,
@@ -8,7 +9,9 @@ use sqlparser::ast::{
 
 use crate::functions::timestamp::timestamp;
 use crate::functions::uuid_v7::uuid_v7;
-use crate::sql::types::{VtableDeletePlan, VtableUpdatePlan};
+use crate::sql::types::{
+    MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
+};
 use crate::sql::SchemaRegistration;
 use crate::LixError;
 use crate::Value as EngineValue;
@@ -31,18 +34,26 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
 pub struct VtableWriteRewrite {
     pub statements: Vec<Statement>,
     pub registrations: Vec<SchemaRegistration>,
+    pub mutations: Vec<MutationRow>,
 }
 
 #[derive(Debug)]
 pub enum UpdateRewrite {
-    Statement(Statement),
+    Statement(VtableUpdateStatement),
     Planned(VtableUpdateRewrite),
+}
+
+#[derive(Debug)]
+pub struct VtableUpdateStatement {
+    pub statement: Statement,
+    pub validation: Option<UpdateValidationPlan>,
 }
 
 #[derive(Debug)]
 pub struct VtableUpdateRewrite {
     pub statement: Statement,
     pub plan: VtableUpdatePlan,
+    pub validation: Option<UpdateValidationPlan>,
 }
 
 #[derive(Debug)]
@@ -125,20 +136,23 @@ pub fn rewrite_insert(
 
     let mut statements: Vec<Statement> = Vec::new();
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut mutations: Vec<MutationRow> = Vec::new();
 
     if !tracked_rows.is_empty() {
-        let tracked = rewrite_tracked_rows(&insert, tracked_rows, &mut registrations)?;
+        let tracked =
+            rewrite_tracked_rows(&insert, tracked_rows, &mut registrations, &mut mutations)?;
         statements.extend(tracked);
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(&insert, untracked_rows)?;
+        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations)?;
         statements.push(untracked);
     }
 
     Ok(Some(VtableWriteRewrite {
         statements,
         registrations,
+        mutations,
     }))
 }
 
@@ -170,9 +184,12 @@ pub fn rewrite_update(update: Update) -> Result<Option<UpdateRewrite>, LixError>
         new_update.assignments = filter_update_assignments(update.assignments);
         ensure_updated_at_assignment(&mut new_update.assignments);
         new_update.selection = try_strip_untracked_predicate(selection).unwrap_or(None);
-        return Ok(Some(UpdateRewrite::Statement(Statement::Update(
-            new_update,
-        ))));
+        let validation =
+            build_update_validation_plan(&new_update, Some(UNTRACKED_TABLE.to_string()))?;
+        return Ok(Some(UpdateRewrite::Statement(VtableUpdateStatement {
+            statement: Statement::Update(new_update),
+            validation,
+        })));
     }
 
     if update.from.is_some() {
@@ -211,9 +228,15 @@ pub fn rewrite_update(update: Update) -> Result<Option<UpdateRewrite>, LixError>
     new_update.selection = Some(stripped_selection);
     new_update.returning = Some(build_update_returning());
 
+    let validation = build_update_validation_plan(
+        &new_update,
+        Some(format!("{}{}", MATERIALIZED_PREFIX, schema_key)),
+    )?;
+
     Ok(Some(UpdateRewrite::Planned(VtableUpdateRewrite {
         statement: Statement::Update(new_update),
         plan: VtableUpdatePlan { schema_key },
+        validation,
     })))
 }
 
@@ -439,6 +462,7 @@ fn rewrite_tracked_rows(
     insert: &sqlparser::ast::Insert,
     rows: Vec<Vec<Expr>>,
     registrations: &mut Vec<SchemaRegistration>,
+    mutations: &mut Vec<MutationRow>,
 ) -> Result<Vec<Statement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
@@ -517,9 +541,21 @@ fn rewrite_tracked_rows(
         ];
 
         materialized_by_schema
-            .entry(schema_key)
+            .entry(schema_key.clone())
             .or_default()
             .push(materialized_row);
+
+        mutations.push(MutationRow {
+            operation: MutationOperation::Insert,
+            entity_id: literal_string_required(row.get(entity_idx), "entity_id")?,
+            schema_key,
+            schema_version: literal_string_required(row.get(schema_version_idx), "schema_version")?,
+            file_id: literal_string_required(row.get(file_idx), "file_id")?,
+            version_id: literal_string_required(row.get(version_idx), "version_id")?,
+            plugin_key: literal_string_required(row.get(plugin_idx), "plugin_key")?,
+            snapshot_content: literal_snapshot_json(row.get(snapshot_idx))?,
+            untracked: false,
+        });
     }
 
     let mut statements = Vec::new();
@@ -596,6 +632,7 @@ fn build_snapshot_on_conflict() -> OnInsert {
 fn build_untracked_insert(
     insert: &sqlparser::ast::Insert,
     rows: Vec<Vec<Expr>>,
+    mutations: &mut Vec<MutationRow>,
 ) -> Result<Statement, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
@@ -621,6 +658,18 @@ fn build_untracked_insert(
             string_expr(&now),
             string_expr(&now),
         ]);
+
+        mutations.push(MutationRow {
+            operation: MutationOperation::Insert,
+            entity_id: literal_string_required(row.get(entity_idx), "entity_id")?,
+            schema_key: literal_string_required(row.get(schema_idx), "schema_key")?,
+            schema_version: literal_string_required(row.get(schema_version_idx), "schema_version")?,
+            file_id: literal_string_required(row.get(file_idx), "file_id")?,
+            version_id: literal_string_required(row.get(version_idx), "version_id")?,
+            plugin_key: literal_string_required(row.get(plugin_idx), "plugin_key")?,
+            snapshot_content: literal_snapshot_json(row.get(snapshot_idx))?,
+            untracked: true,
+        });
     }
 
     Ok(make_insert_statement(
@@ -1067,6 +1116,43 @@ fn literal_string(expr: &Expr) -> Result<String, LixError> {
     }
 }
 
+fn literal_string_required(expr: Option<&Expr>, name: &str) -> Result<String, LixError> {
+    let expr = expr.ok_or_else(|| LixError {
+        message: format!("vtable insert missing {name}"),
+    })?;
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(value),
+            ..
+        }) => Ok(value.clone()),
+        _ => Err(LixError {
+            message: format!("vtable insert requires literal {name}"),
+        }),
+    }
+}
+
+fn literal_snapshot_json(expr: Option<&Expr>) -> Result<Option<JsonValue>, LixError> {
+    let expr = expr.ok_or_else(|| LixError {
+        message: "vtable insert missing snapshot_content".to_string(),
+    })?;
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(value),
+            ..
+        }) => serde_json::from_str::<JsonValue>(value)
+            .map(Some)
+            .map_err(|err| LixError {
+                message: format!("vtable insert snapshot_content invalid JSON: {err}"),
+            }),
+        _ => Err(LixError {
+            message: "vtable insert requires literal snapshot_content".to_string(),
+        }),
+    }
+}
+
 fn string_expr(value: &str) -> Expr {
     Expr::Value(Value::SingleQuotedString(value.to_string()).into())
 }
@@ -1320,6 +1406,57 @@ fn is_untracked_false_literal(expr: &Expr) -> bool {
             ..
         }) => !*value,
         _ => false,
+    }
+}
+
+fn build_update_validation_plan(
+    update: &Update,
+    table_name: Option<String>,
+) -> Result<Option<UpdateValidationPlan>, LixError> {
+    let snapshot_expr = find_assignment_value(&update.assignments, "snapshot_content");
+    let snapshot_content = match snapshot_expr {
+        Some(expr) => Some(literal_snapshot_json_value(expr)?),
+        None => None,
+    }
+    .flatten();
+    let where_clause = update.selection.as_ref().map(|expr| expr.to_string());
+    let table = table_name.ok_or_else(|| LixError {
+        message: "update validation requires target table".to_string(),
+    })?;
+
+    Ok(Some(UpdateValidationPlan {
+        table,
+        where_clause,
+        snapshot_content,
+    }))
+}
+
+fn find_assignment_value<'a>(assignments: &'a [Assignment], column: &str) -> Option<&'a Expr> {
+    assignments.iter().find_map(|assignment| {
+        if assignment_target_is_column(&assignment.target, column) {
+            Some(&assignment.value)
+        } else {
+            None
+        }
+    })
+}
+
+fn literal_snapshot_json_value(expr: &Expr) -> Result<Option<JsonValue>, LixError> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(value),
+            ..
+        }) => serde_json::from_str::<JsonValue>(value)
+            .map(Some)
+            .map_err(|err| LixError {
+                message: format!("vtable update snapshot_content invalid JSON: {err}"),
+            }),
+        _ => Err(LixError {
+            message: "vtable update requires literal snapshot_content".to_string(),
+        }),
     }
 }
 
