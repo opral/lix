@@ -667,7 +667,7 @@ WHERE entity_id = 'entity-1' AND version_id = 'version-1';
 
 ## Milestone 7: In-Memory Row Representation
 
-Before rewriting queries, we need an in-memory representation of the rows being mutated. This enables validation, plugin callbacks, and correct SQL generation.
+We need an in-memory representation of the rows being mutated. This enables validation, plugin callbacks, and correct SQL generation.
 
 > **Note:** The row representation below is illustrative, not fixed. Flexibility is expected as implementation details emerge.
 

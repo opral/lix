@@ -1,6 +1,8 @@
 use crate::init::init_backend;
 use crate::schema_registry::register_schema;
-use crate::sql::preprocess_sql;
+use crate::sql::{
+    build_delete_followup_sql, build_update_followup_sql, preprocess_sql, PostprocessPlan,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 pub struct Engine {
@@ -21,6 +23,24 @@ impl Engine {
         for registration in output.registrations {
             register_schema(self.backend.as_ref(), &registration.schema_key).await?;
         }
-        self.backend.execute(&output.sql, params).await
+        match output.postprocess {
+            None => self.backend.execute(&output.sql, params).await,
+            Some(PostprocessPlan::VtableUpdate(plan)) => {
+                let result = self.backend.execute(&output.sql, params).await?;
+                let followup_sql = build_update_followup_sql(&plan, &result.rows)?;
+                if !followup_sql.is_empty() {
+                    self.backend.execute(&followup_sql, &[]).await?;
+                }
+                Ok(result)
+            }
+            Some(PostprocessPlan::VtableDelete(plan)) => {
+                let result = self.backend.execute(&output.sql, params).await?;
+                let followup_sql = build_delete_followup_sql(&plan, &result.rows)?;
+                if !followup_sql.is_empty() {
+                    self.backend.execute(&followup_sql, &[]).await?;
+                }
+                Ok(result)
+            }
+        }
     }
 }

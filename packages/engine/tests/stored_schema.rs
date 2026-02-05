@@ -25,7 +25,7 @@ simulation_test!(
 
         let stored = engine
         .execute(
-            "SELECT entity_id, schema_key, version_id, file_id, plugin_key, change_id, is_tombstone, created_at, updated_at, snapshot_content \
+            "SELECT entity_id, schema_key, schema_version, version_id, file_id, plugin_key, change_id, is_tombstone, created_at, updated_at, snapshot_content \
              FROM lix_internal_state_materialized_v1_lix_stored_schema \
              WHERE entity_id = 'test_schema~1.0.0'",
             &[],
@@ -38,15 +38,16 @@ simulation_test!(
         let row = &stored.rows[0];
         assert_eq!(row[0], Value::Text("test_schema~1.0.0".to_string()));
         assert_eq!(row[1], Value::Text("lix_stored_schema".to_string()));
-        assert_eq!(row[2], Value::Text("global".to_string()));
-        assert_eq!(row[3], Value::Text("lix".to_string()));
+        assert_eq!(row[2], Value::Text("1.0.0".to_string()));
+        assert_eq!(row[3], Value::Text("global".to_string()));
         assert_eq!(row[4], Value::Text("lix".to_string()));
-        assert_eq!(row[5], Value::Text("schema".to_string()));
-        assert_eq!(row[6], Value::Integer(0));
-        assert_eq!(row[7], Value::Text("1970-01-01T00:00:00Z".to_string()));
+        assert_eq!(row[5], Value::Text("lix".to_string()));
+        assert_eq!(row[6], Value::Text("schema".to_string()));
+        assert_eq!(row[7], Value::Integer(0));
         assert_eq!(row[8], Value::Text("1970-01-01T00:00:00Z".to_string()));
+        assert_eq!(row[9], Value::Text("1970-01-01T00:00:00Z".to_string()));
         assert_eq!(
-            row[9],
+            row[10],
             Value::Text(
                 "{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}"
                     .to_string()

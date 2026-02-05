@@ -69,6 +69,7 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
 
     let mut entity_id_value: Option<String> = None;
     let mut schema_key_value: Option<String> = None;
+    let mut schema_version_value: Option<String> = None;
     for row in &rows {
         let snapshot_expr = row.get(snapshot_index).ok_or_else(|| LixError {
             message: "stored schema insert missing snapshot_content value".to_string(),
@@ -77,6 +78,7 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
         let (schema_key, schema_version) = parse_schema_identity(&literal)?;
         let derived_id = format!("{}~{}", schema_key, schema_version);
         schema_key_value = Some(schema_key.clone());
+        schema_version_value = Some(schema_version.clone());
 
         if let Some(existing) = &entity_id_value {
             if existing != &derived_id {
@@ -95,6 +97,9 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
     let schema_key_value = schema_key_value.ok_or_else(|| LixError {
         message: "stored schema insert requires schema key".to_string(),
     })?;
+    let schema_version_value = schema_version_value.ok_or_else(|| LixError {
+        message: "stored schema insert requires schema version".to_string(),
+    })?;
 
     if let Some(entity_index) = find_column_index(&columns, "entity_id") {
         if !rows
@@ -110,6 +115,12 @@ pub fn rewrite_insert(insert: Insert) -> Result<Option<StoredSchemaRewrite>, Lix
         append_column_with_literal(&mut columns, &mut rows, "entity_id", &entity_id);
     }
 
+    ensure_literal_column(
+        &mut columns,
+        &mut rows,
+        "schema_version",
+        &schema_version_value,
+    )?;
     ensure_literal_column(&mut columns, &mut rows, "version_id", GLOBAL_VERSION)?;
     ensure_literal_column(&mut columns, &mut rows, "file_id", ENGINE_FILE_ID)?;
     ensure_literal_column(&mut columns, &mut rows, "plugin_key", ENGINE_PLUGIN_KEY)?;
@@ -348,6 +359,7 @@ mod tests {
         let row = extract_row(&insert);
         let entity_idx = column_index(&insert.columns, "entity_id");
         let version_idx = column_index(&insert.columns, "version_id");
+        let schema_version_idx = column_index(&insert.columns, "schema_version");
         let file_idx = column_index(&insert.columns, "file_id");
         let plugin_idx = column_index(&insert.columns, "plugin_key");
         let change_idx = column_index(&insert.columns, "change_id");
@@ -357,6 +369,7 @@ mod tests {
 
         assert_eq!(expr_string(&row[entity_idx]), "mock_schema~1.0.0");
         assert_eq!(expr_string(&row[version_idx]), "global");
+        assert_eq!(expr_string(&row[schema_version_idx]), "1.0.0");
         assert_eq!(expr_string(&row[file_idx]), "lix");
         assert_eq!(expr_string(&row[plugin_idx]), "lix");
         assert_eq!(expr_string(&row[change_idx]), "schema");

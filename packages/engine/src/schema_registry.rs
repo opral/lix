@@ -8,6 +8,7 @@ pub async fn register_schema(backend: &dyn LixBackend, schema_key: &str) -> Resu
         "CREATE TABLE IF NOT EXISTS {table} (\
          entity_id TEXT NOT NULL,\
          schema_key TEXT NOT NULL,\
+         schema_version TEXT NOT NULL,\
          file_id TEXT NOT NULL,\
          version_id TEXT NOT NULL,\
          plugin_key TEXT NOT NULL,\

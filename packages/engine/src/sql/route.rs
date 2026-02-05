@@ -1,7 +1,7 @@
 use sqlparser::ast::Statement;
 
 use crate::sql::steps::{stored_schema, vtable_read, vtable_write};
-use crate::sql::types::{RewriteOutput, SchemaRegistration};
+use crate::sql::types::{PostprocessPlan, RewriteOutput, SchemaRegistration};
 use crate::LixError;
 
 pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError> {
@@ -31,29 +31,60 @@ pub fn rewrite_statement(statement: Statement) -> Result<RewriteOutput, LixError
             Ok(RewriteOutput {
                 statements,
                 registrations,
+                postprocess: None,
             })
         }
-        Statement::Update(update) => Ok(RewriteOutput {
-            statements: vec![
-                vtable_write::rewrite_update(update.clone())?.unwrap_or(Statement::Update(update))
-            ],
-            registrations: Vec::new(),
-        }),
-        Statement::Delete(delete) => Ok(RewriteOutput {
-            statements: vec![
-                vtable_write::rewrite_delete(delete.clone())?.unwrap_or(Statement::Delete(delete))
-            ],
-            registrations: Vec::new(),
-        }),
+        Statement::Update(update) => {
+            let rewritten = vtable_write::rewrite_update(update.clone())?;
+            match rewritten {
+                Some(vtable_write::UpdateRewrite::Statement(statement)) => Ok(RewriteOutput {
+                    statements: vec![statement],
+                    registrations: Vec::new(),
+                    postprocess: None,
+                }),
+                Some(vtable_write::UpdateRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+                    statements: vec![rewrite.statement],
+                    registrations: Vec::new(),
+                    postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
+                }),
+                None => Ok(RewriteOutput {
+                    statements: vec![Statement::Update(update)],
+                    registrations: Vec::new(),
+                    postprocess: None,
+                }),
+            }
+        }
+        Statement::Delete(delete) => {
+            let rewritten = vtable_write::rewrite_delete(delete.clone())?;
+            match rewritten {
+                Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
+                    statements: vec![statement],
+                    registrations: Vec::new(),
+                    postprocess: None,
+                }),
+                Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+                    statements: vec![rewrite.statement],
+                    registrations: Vec::new(),
+                    postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
+                }),
+                None => Ok(RewriteOutput {
+                    statements: vec![Statement::Delete(delete)],
+                    registrations: Vec::new(),
+                    postprocess: None,
+                }),
+            }
+        }
         Statement::Query(query) => Ok(RewriteOutput {
             statements: vec![vtable_read::rewrite_query(*query.clone())?
                 .map(|rewritten| Statement::Query(Box::new(rewritten)))
                 .unwrap_or_else(|| Statement::Query(query))],
             registrations: Vec::new(),
+            postprocess: None,
         }),
         other => Ok(RewriteOutput {
             statements: vec![other],
             registrations: Vec::new(),
+            postprocess: None,
         }),
     }
 }
