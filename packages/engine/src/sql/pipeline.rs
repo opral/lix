@@ -2,7 +2,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::sql::route::rewrite_statement;
-use crate::sql::types::{PreprocessOutput, SchemaRegistration};
+use crate::sql::steps::inline_lix_functions::inline_lix_functions;
+use crate::sql::types::{PostprocessPlan, PreprocessOutput, SchemaRegistration};
 use crate::LixError;
 
 pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
@@ -12,11 +13,32 @@ pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
     })?;
 
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
+    let mut mutations = Vec::new();
+    let mut update_validations = Vec::new();
     for statement in statements {
         let output = rewrite_statement(statement)?;
         registrations.extend(output.registrations);
-        rewritten.push(output.statement);
+        if let Some(plan) = output.postprocess {
+            if postprocess.is_some() {
+                return Err(LixError {
+                    message: "only one postprocess rewrite is supported per query".to_string(),
+                });
+            }
+            postprocess = Some(plan);
+        }
+        mutations.extend(output.mutations);
+        update_validations.extend(output.update_validations);
+        for rewritten_statement in output.statements {
+            rewritten.push(inline_lix_functions(rewritten_statement));
+        }
+    }
+
+    if postprocess.is_some() && rewritten.len() != 1 {
+        return Err(LixError {
+            message: "postprocess rewrites require a single statement".to_string(),
+        });
     }
 
     let normalized_sql = rewritten
@@ -28,5 +50,8 @@ pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
     Ok(PreprocessOutput {
         sql: normalized_sql,
         registrations,
+        postprocess,
+        mutations,
+        update_validations,
     })
 }

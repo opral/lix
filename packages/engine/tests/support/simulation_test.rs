@@ -16,6 +16,7 @@ pub struct Simulation {
 pub struct SimulationArgs {
     backend_factory: Box<dyn Fn() -> Box<dyn LixBackend + Send + Sync> + Send + Sync>,
     setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
+    #[allow(dead_code)]
     expect: ExpectDeterministic,
 }
 
@@ -44,6 +45,7 @@ impl SimulationArgs {
         })
     }
 
+    #[allow(dead_code)]
     pub fn expect_deterministic<T>(&self, actual: T)
     where
         T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
@@ -58,6 +60,7 @@ struct ExpectDeterministic {
 }
 
 struct ExpectDeterministicState {
+    #[allow(dead_code)]
     expected_values: Vec<Box<dyn Any + Send + Sync>>,
     is_first: bool,
     call_index: usize,
@@ -83,6 +86,7 @@ impl ExpectDeterministic {
         state.call_index = 0;
     }
 
+    #[allow(dead_code)]
     fn expect_deterministic<T>(&self, actual: T)
     where
         T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
