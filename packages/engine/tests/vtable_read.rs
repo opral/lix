@@ -40,10 +40,10 @@ simulation_test!(
         // Insert untracked row via vtable (should take priority).
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, snapshot_content, untracked\
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', '{\"key\":\"untracked\"}', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
              )",
                 &[],
             )
@@ -630,10 +630,10 @@ simulation_test!(
         // Insert untracked row via vtable.
         engine
             .execute(
-                "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, snapshot_content, untracked\
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', '{\"key\":\"untracked\"}', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
              )",
                 &[],
             )

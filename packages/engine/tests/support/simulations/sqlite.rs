@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool, ValueRef};
+use sqlx::{Executor, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
 use lix_engine::{LixBackend, LixError, QueryResult, Value};
@@ -57,6 +57,14 @@ impl SqliteBackend {
 impl LixBackend for SqliteBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;
+
+        if params.is_empty() && sql.contains(';') {
+            pool.execute(sql).await.map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            return Ok(QueryResult { rows: Vec::new() });
+        }
+
         let mut query = sqlx::query(sql);
 
         for param in params {

@@ -37,7 +37,11 @@ const INIT_STATEMENTS: &[&str] = &[
      schema_key TEXT NOT NULL,\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
+     plugin_key TEXT NOT NULL,\
      snapshot_content TEXT,\
+     schema_version TEXT NOT NULL,\
+     created_at TEXT NOT NULL,\
+     updated_at TEXT NOT NULL,\
      PRIMARY KEY (entity_id, schema_key, file_id, version_id)\
      )",
 ];

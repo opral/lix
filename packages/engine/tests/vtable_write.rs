@@ -26,9 +26,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, snapshot_content, untracked\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', '{\"key\":\"untracked\"}', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
              )",
                 &[],
             )
@@ -120,3 +120,200 @@ simulation_test!(
         assert_eq!(remaining.rows[0][0], Value::Integer(0));
     }
 );
+
+simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine()
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.init().await.unwrap();
+
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+                 'lix_stored_schema',\
+                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}'\
+                 )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES (\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+    let vtable = engine
+        .execute(
+            "SELECT change_id FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(vtable.rows.len(), 1);
+    assert_eq!(vtable.rows[0][0], Value::Text("untracked".to_string()));
+});
+
+simulation_test!(
+    tracked_state_creates_change_and_materialized_rows,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let changes = engine
+            .execute(
+                "SELECT snapshot_id FROM lix_internal_change WHERE entity_id = 'entity-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(changes.rows.len(), 1);
+
+        let snapshot_id = match &changes.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            _ => panic!("expected snapshot id"),
+        };
+
+        let snapshots = engine
+            .execute(
+                &format!(
+                    "SELECT content FROM lix_internal_snapshot WHERE id = '{}'",
+                    snapshot_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snapshots.rows.len(), 1);
+        assert_eq!(
+            snapshots.rows[0][0],
+            Value::Text("{\"key\":\"tracked\"}".to_string())
+        );
+
+        let materialized = engine
+            .execute(
+                "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
+                 WHERE entity_id = 'entity-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(materialized.rows.len(), 1);
+        assert_eq!(
+            materialized.rows[0][0],
+            Value::Text("{\"key\":\"tracked\"}".to_string())
+        );
+    }
+);
+
+simulation_test!(
+    tracked_state_uses_no_content_snapshot_for_nulls,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-2', 'test_schema', 'file-1', 'version-1', 'lix', NULL, '1'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let changes = engine
+            .execute(
+                "SELECT snapshot_id FROM lix_internal_change WHERE entity_id = 'entity-2'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(changes.rows.len(), 1);
+        assert_eq!(changes.rows[0][0], Value::Text("no-content".to_string()));
+    }
+);
+
+simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine()
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.init().await.unwrap();
+
+    engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+    let change = engine
+        .execute(
+            "SELECT id FROM lix_internal_change WHERE entity_id = 'entity-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(change.rows.len(), 1);
+    let change_id = match &change.rows[0][0] {
+        Value::Text(value) => value.clone(),
+        _ => panic!("expected change id"),
+    };
+
+    let vtable = engine
+        .execute(
+            "SELECT change_id FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(vtable.rows.len(), 1);
+    assert_eq!(vtable.rows[0][0], Value::Text(change_id));
+});

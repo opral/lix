@@ -2,6 +2,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::sql::route::rewrite_statement;
+use crate::sql::steps::inline_lix_functions::inline_lix_functions;
 use crate::sql::types::{PreprocessOutput, SchemaRegistration};
 use crate::LixError;
 
@@ -16,7 +17,9 @@ pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
     for statement in statements {
         let output = rewrite_statement(statement)?;
         registrations.extend(output.registrations);
-        rewritten.push(output.statement);
+        for rewritten_statement in output.statements {
+            rewritten.push(inline_lix_functions(rewritten_statement));
+        }
     }
 
     let normalized_sql = rewritten

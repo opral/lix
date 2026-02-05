@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use postgresql_embedded::{PostgreSQL, Status};
-use sqlx::{PgPool, Row, ValueRef};
+use sqlx::{Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use lix_engine::{LixBackend, LixError, QueryResult, Value};
@@ -139,6 +139,14 @@ impl PostgresBackend {
 impl LixBackend for PostgresBackend {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;
+
+        if params.is_empty() && sql.contains(';') {
+            pool.execute(sql).await.map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            return Ok(QueryResult { rows: Vec::new() });
+        }
+
         let mut query = sqlx::query(sql);
 
         for param in params {

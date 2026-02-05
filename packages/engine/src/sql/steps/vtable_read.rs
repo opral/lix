@@ -154,7 +154,7 @@ fn build_untracked_union_query(
     let mut union_parts = Vec::new();
     union_parts.push(format!(
         "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, \
-                1 AS untracked, 1 AS priority \
+                'untracked' AS change_id, 1 AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
         untracked = UNTRACKED_TABLE
@@ -168,7 +168,7 @@ fn build_untracked_union_query(
             .map(|predicate| format!(" WHERE ({predicate})"))
             .unwrap_or_default();
         union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, \
+            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, change_id, \
                     0 AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
@@ -179,9 +179,9 @@ fn build_untracked_union_query(
     let union_sql = union_parts.join(" UNION ALL ");
 
     let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, untracked \
+        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, change_id, untracked \
          FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, untracked, \
+             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, change_id, untracked, \
                     ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
              FROM ({union_sql}) AS lix_state_union\
          ) AS lix_state_ranked \
