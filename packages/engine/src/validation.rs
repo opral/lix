@@ -70,52 +70,6 @@ pub async fn validate_updates(
     let mut definition_cache: HashMap<SchemaCacheKey, JsonValue> = HashMap::new();
 
     for plan in plans {
-        let Some(snapshot) = plan.snapshot_content.as_ref() else {
-            // Even without snapshot_content changes we still enforce immutability.
-            let mut sql = format!(
-                "SELECT entity_id, file_id, version_id, plugin_key, schema_key, schema_version FROM {}",
-                plan.table
-            );
-            if let Some(where_clause) = &plan.where_clause {
-                sql.push_str(" WHERE ");
-                sql.push_str(where_clause);
-            }
-
-            let result = backend.execute(&sql, &[]).await?;
-            if result.rows.is_empty() {
-                continue;
-            }
-
-            for row in result.rows {
-                let schema_key = value_to_string(&row[4], "schema_key")?;
-                let schema_version = value_to_string(&row[5], "schema_version")?;
-
-                let key = SchemaCacheKey {
-                    schema_key: schema_key.clone(),
-                    schema_version: schema_version.clone(),
-                };
-                let schema = if let Some(schema) = definition_cache.get(&key) {
-                    schema.clone()
-                } else {
-                    let schema =
-                        load_schema_definition(backend, &schema_key, &schema_version).await?;
-                    definition_cache.insert(key.clone(), schema.clone());
-                    schema
-                };
-
-                if schema.get("x-lix-immutable").and_then(|v| v.as_bool()) == Some(true) {
-                    return Err(LixError {
-                        message: format!(
-                            "Schema '{}' is immutable and cannot be updated.",
-                            schema_key
-                        ),
-                    });
-                }
-            }
-
-            continue;
-        };
-
         let mut sql = format!(
             "SELECT entity_id, file_id, version_id, plugin_key, schema_key, schema_version FROM {}",
             plan.table
@@ -130,9 +84,18 @@ pub async fn validate_updates(
             continue;
         }
 
+        let snapshot = plan.snapshot_content.as_ref();
+
         for row in result.rows {
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
+
+            if schema_key == STORED_SCHEMA_KEY {
+                if let Some(snapshot) = snapshot {
+                    validate_stored_schema_snapshot(backend, snapshot).await?;
+                }
+                continue;
+            }
 
             let key = SchemaCacheKey {
                 schema_key: schema_key.clone(),
@@ -155,12 +118,10 @@ pub async fn validate_updates(
                 });
             }
 
-            if schema_key == STORED_SCHEMA_KEY {
-                continue;
+            if let Some(snapshot) = snapshot {
+                validate_snapshot_content(backend, cache, &schema_key, &schema_version, snapshot)
+                    .await?;
             }
-
-            validate_snapshot_content(backend, cache, &schema_key, &schema_version, snapshot)
-                .await?;
         }
     }
 
@@ -204,6 +165,22 @@ async fn validate_snapshot_content(
     Ok(())
 }
 
+fn extract_stored_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, LixError> {
+    snapshot.get("value").ok_or_else(|| LixError {
+        message: "stored schema snapshot_content missing value".to_string(),
+    })
+}
+
+async fn validate_stored_schema_snapshot(
+    backend: &dyn LixBackend,
+    snapshot: &JsonValue,
+) -> Result<(), LixError> {
+    let schema_value = extract_stored_schema_value(snapshot)?;
+    validate_lix_schema_definition(schema_value)?;
+    validate_foreign_key_reference_targets(backend, schema_value).await?;
+    Ok(())
+}
+
 async fn validate_stored_schema_insert(
     backend: &dyn LixBackend,
     row: &MutationRow,
@@ -211,12 +188,7 @@ async fn validate_stored_schema_insert(
     let snapshot = row.snapshot_content.as_ref().ok_or_else(|| LixError {
         message: "stored schema insert requires snapshot_content".to_string(),
     })?;
-    let schema_value = snapshot.get("value").ok_or_else(|| LixError {
-        message: "stored schema snapshot_content missing value".to_string(),
-    })?;
-
-    validate_lix_schema_definition(schema_value)?;
-    validate_foreign_key_reference_targets(backend, schema_value).await?;
+    validate_stored_schema_snapshot(backend, snapshot).await?;
 
     Ok(())
 }

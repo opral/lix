@@ -253,6 +253,81 @@ simulation_test!(
 );
 
 simulation_test!(
+    tracked_insert_updates_schema_version_on_conflict,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"2\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"initial\"}', '1'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'other', '{\"key\":\"updated\"}', '2'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let stored = engine
+            .execute(
+                "SELECT schema_version, plugin_key, snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
+             WHERE entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stored.rows.len(), 1);
+        assert_eq!(stored.rows[0][0], Value::Text("2".to_string()));
+        assert_eq!(stored.rows[0][1], Value::Text("other".to_string()));
+        assert_eq!(
+            stored.rows[0][2],
+            Value::Text("{\"key\":\"updated\"}".to_string())
+        );
+    }
+);
+
+simulation_test!(
     tracked_state_uses_no_content_snapshot_for_nulls,
     |sim| async move {
         let engine = sim

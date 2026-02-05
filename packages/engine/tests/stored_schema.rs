@@ -115,3 +115,40 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    stored_schema_updates_validate_schema_definition,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute(
+                "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"value\":{\"x-lix-version\":\"1\"}}' \
+             WHERE schema_key = 'lix_stored_schema' AND entity_id = 'test_schema~1' AND file_id = 'lix' AND version_id = 'global'",
+                &[],
+            )
+            .await;
+
+        let err = result.expect_err("expected stored schema validation error");
+        assert!(
+            err.to_string().contains("Invalid Lix schema definition"),
+            "unexpected error: {err}"
+        );
+    }
+);
