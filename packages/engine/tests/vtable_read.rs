@@ -28,9 +28,9 @@ simulation_test!(
         engine
         .execute(
             "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
             &[],
         )
@@ -95,9 +95,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -159,11 +159,11 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'schema_a', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              ), (\
-             'entity-3', 'schema_a', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -172,9 +172,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-2', 'schema_b', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -239,11 +239,11 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'schema_a', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              ), (\
-             'entity-3', 'schema_a', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -252,9 +252,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-2', 'schema_b', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -326,11 +326,11 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'schema_a', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              ), (\
-             'entity-3', 'schema_a', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -339,9 +339,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-2', 'schema_b', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -401,11 +401,11 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'schema_a', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              ), (\
-             'entity-3', 'schema_a', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -414,9 +414,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-2', 'schema_b', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -480,11 +480,11 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'schema_a', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              ), (\
-             'entity-3', 'schema_a', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -493,9 +493,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-2', 'schema_b', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -553,11 +553,11 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'schema_a', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              ), (\
-             'entity-3', 'schema_a', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -566,9 +566,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-2', 'schema_b', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
                 &[],
             )
@@ -618,9 +618,9 @@ simulation_test!(
         engine
         .execute(
             "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
             &[],
         )
