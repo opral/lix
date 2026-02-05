@@ -1,6 +1,20 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::SimulationEngine;
+
+async fn register_test_schema(engine: &SimulationEngine) {
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+}
 
 simulation_test!(
     untracked_state_routes_to_untracked_table,
@@ -16,7 +30,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema',\
-                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}'\
+                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
                  )",
                 &[],
             )
@@ -133,7 +147,7 @@ simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema',\
-                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1.0.0\"}}'\
+                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
                  )",
             &[],
         )
@@ -174,6 +188,8 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
 
         engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
 
         engine
             .execute(
@@ -246,6 +262,8 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
+        register_test_schema(&engine).await;
+
         engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (\
@@ -278,6 +296,8 @@ simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
         .expect("boot_simulated_engine should succeed");
 
     engine.init().await.unwrap();
+
+    register_test_schema(&engine).await;
 
     engine
             .execute(
@@ -325,6 +345,8 @@ simulation_test!(tracked_update_creates_change_row, |sim| async move {
         .expect("boot_simulated_engine should succeed");
 
     engine.init().await.unwrap();
+
+    register_test_schema(&engine).await;
 
     engine
         .execute(
@@ -412,6 +434,8 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
+        register_test_schema(&engine).await;
+
         engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (\
@@ -475,6 +499,8 @@ simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
         .expect("boot_simulated_engine should succeed");
 
     engine.init().await.unwrap();
+
+    register_test_schema(&engine).await;
 
     engine
         .execute(
@@ -585,6 +611,8 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
+        register_test_schema(&engine).await;
+
         engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (\
@@ -648,6 +676,8 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
 
         engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
 
         engine
         .execute(

@@ -153,7 +153,7 @@ fn build_untracked_union_query(
 
     let mut union_parts = Vec::new();
     union_parts.push(format!(
-        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, \
+        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
                 'untracked' AS change_id, 1 AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
@@ -168,7 +168,7 @@ fn build_untracked_union_query(
             .map(|predicate| format!(" WHERE ({predicate})"))
             .unwrap_or_default();
         union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, change_id, \
+            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, change_id, \
                     0 AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
@@ -179,9 +179,9 @@ fn build_untracked_union_query(
     let union_sql = union_parts.join(" UNION ALL ");
 
     let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, change_id, untracked \
+        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, change_id, untracked \
          FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, change_id, untracked, \
+             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, change_id, untracked, \
                     ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
              FROM ({union_sql}) AS lix_state_union\
          ) AS lix_state_ranked \
@@ -464,7 +464,12 @@ fn is_pushdown_column(ident: &Ident) -> bool {
     let value = ident.value.to_ascii_lowercase();
     matches!(
         value.as_str(),
-        "entity_id" | "schema_key" | "file_id" | "version_id" | "snapshot_content"
+        "entity_id"
+            | "schema_key"
+            | "schema_version"
+            | "file_id"
+            | "version_id"
+            | "snapshot_content"
     )
 }
 

@@ -15,6 +15,8 @@ pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
+    let mut mutations = Vec::new();
+    let mut update_validations = Vec::new();
     for statement in statements {
         let output = rewrite_statement(statement)?;
         registrations.extend(output.registrations);
@@ -26,6 +28,8 @@ pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
             }
             postprocess = Some(plan);
         }
+        mutations.extend(output.mutations);
+        update_validations.extend(output.update_validations);
         for rewritten_statement in output.statements {
             rewritten.push(inline_lix_functions(rewritten_statement));
         }
@@ -47,5 +51,7 @@ pub fn preprocess_sql(sql: &str) -> Result<PreprocessOutput, LixError> {
         sql: normalized_sql,
         registrations,
         postprocess,
+        mutations,
+        update_validations,
     })
 }
