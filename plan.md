@@ -161,7 +161,7 @@ The `version` view reads from state cache with special handling for inheritance:
 
 ---
 
-# Foundation
+# Foundation: CRUD on vtable
 
 ## Milestone 0: Rust engine core + SQLite/Postgres backends
 
@@ -376,12 +376,12 @@ Identity:
 
 Immutability:
 
-- `x-lix-immutable: true` enforcement is deferred to Milestone 13 (JSON Schema Validation).
+- `x-lix-immutable: true` enforcement is deferred to Milestone 8 (JSON Schema Validation).
 
 Semver:
 
 - `x-lix-version` must be `major.minor.patch` (format validation in this milestone).
-- Semver-aware ordering/comparisons are deferred to Milestone 13 (JSON Schema Validation) when schema loading/caching is implemented.
+- Semver-aware ordering/comparisons are deferred to Milestone 8 (JSON Schema Validation) when schema loading/caching is implemented.
 
 ```sql
 -- Until entity views exist, insert directly into the vtable and set lixcols explicitly.
@@ -407,8 +407,8 @@ Lookup logic (current JS behavior):
 - **All schemas**: `SELECT snapshot_content, updated_at` where `schema_key = 'lix_stored_schema'`,
   `version_id = 'global'`, `snapshot_content IS NOT NULL`; parse `snapshot_content.value`.
 - **Single schema**: filter by `json_extract(snapshot_content, '$.value.\"x-lix-key\"') = <key>`
-  and pick the highest `x-lix-version` (semver-aware selection is deferred to Milestone 13).
-- Schema cache/invalidation is deferred to Milestone 13.
+  and pick the highest `x-lix-version` (semver-aware selection is deferred to Milestone 8).
+- Schema cache/invalidation is deferred to Milestone 8.
 
 ### Schema Registration
 
@@ -444,8 +444,8 @@ fn register_schema(schema: &Schema, host: &impl HostBindings) -> Result<()> {
 2. Persist schema definitions into `lix_internal_state_vtable` via the `stored_schema` view (`schema_key = 'lix_stored_schema'`, `version_id = 'global'`)
 3. Implement `register_schema()` to create materialized tables dynamically
 
-Note: immutability enforcement and schema cache/invalidation are handled in Milestone 13.
-Semver ordering, schema key sanitization beyond identifier quoting, and indexes are handled in Milestone 14.
+Note: immutability enforcement and schema cache/invalidation are handled in Milestone 8.
+Semver ordering, schema key sanitization beyond identifier quoting, and indexes are handled in Milestone 10.
 
 ## Milestone 3: Rewriting `lix_internal_state_vtable` SELECT Queries
 
@@ -663,7 +663,7 @@ WHERE entity_id = 'entity-1' AND version_id = 'version-1';
 
 ---
 
-# Processing
+# Validation
 
 ## Milestone 7: In-Memory Row Representation
 
@@ -725,16 +725,187 @@ let resolved_rows = resolve_row_values(&mutation, &host)?;
 4. Apply default values for missing columns
 5. Generate required values (id, created_at, etc.)
 
-## Milestone 8: Generate Commit and Materialized State
+## Milestone 8: JSON Schema Validation
+
+After applying CEL default values, the engine must validate `snapshot_content` against the JSON Schema defined for the `schema_key`. Validation happens in-memory before any SQL is executed.
+
+See RFC 002 for the Rust library: [`jsonschema`](https://github.com/Stranger6667/jsonschema-rs)
+
+### Pipeline (continued)
+
+```rust
+// ... after applying CEL defaults (Milestone 9)
+
+// 5. Validate against JSON Schema
+for row in &resolved_rows {
+    let schema = get_schema(&row.schema_key)?;
+
+    let compiled = JSONSchema::compile(&schema)?;
+
+    if let Err(errors) = compiled.validate(&row.snapshot_content) {
+        return Err(ValidationError {
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            errors: errors.collect(),
+        });
+    }
+}
+
+// Continue to Milestone 11: Generate commit...
+```
+
+### Schema Storage
+
+Schemas are stored in `lix_internal_state_vtable` with `schema_key = 'lix_schema'`:
+
+```sql
+SELECT snapshot_content
+FROM lix_internal_state_vtable
+WHERE schema_key = 'lix_schema'
+  AND entity_id = 'lix_key_value'  -- the schema_key to validate against
+```
+
+The engine should cache compiled schemas in memory for performance.
+
+### Tasks
+
+1. Integrate `jsonschema` crate
+2. Load and cache schemas from state on engine init
+3. Compile JSON Schemas once and reuse
+4. Validate `snapshot_content` before commit generation
+5. Return clear error messages with path to invalid field
+6. Enforce `x-lix-immutable: true` (reject UPDATEs that modify immutable rows; require new version/row instead)
+
+
+## Milestone 9: CEL Default Values
+
+Schemas can define default values using CEL (Common Expression Language) expressions. When a row is inserted without a value for a field that has a CEL default, the engine must evaluate the expression.
+
+See RFC 002 for the Rust library: [`cel-rust`](https://github.com/clarkmcc/cel-rust)
+
+### Example Schema
+
+```json
+{
+  "x-lix-key": "lix_message",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()"
+    },
+    "created_at": {
+      "type": "string",
+      "x-lix-default": "lix_get_timestamp()"
+    }
+  }
+}
+```
+
+### Pipeline (continued)
+
+```rust
+// ... after resolving row values (Milestone 7)
+
+// 4. Apply CEL default values
+for row in &mut resolved_rows {
+    let schema = get_schema(&row.schema_key)?;
+
+    for (field, field_schema) in schema.properties {
+        if row.snapshot_content.get(&field).is_none() {
+            if let Some(cel_default) = field_schema.x_lix_default {
+                let value = evaluate_cel(cel_default, &cel_context)?;
+                row.snapshot_content.insert(field, value);
+            }
+        }
+    }
+}
+
+// CEL context provides built-in functions:
+// - lix_uuid_v7() -> deterministic or real UUID based on mode
+// - lix_get_timestamp() -> deterministic or real timestamp based on mode
+```
+
+### Tasks
+
+1. Integrate `cel-rust` library
+2. Define CEL context with built-in functions (`lix_uuid_v7`, `lix_get_timestamp`)
+3. Wire CEL functions to deterministic mode (use seeded values when enabled)
+4. Parse `x-lix-default` from schema definitions
+5. Evaluate CEL expressions for missing fields before validation
+
+
+## Milestone 10: SQL Constraints on Materialized Tables
+
+After JSON Schema validation, enforce relational constraints by encoding them as SQLite constraints on the materialized tables themselves. Avoid preflight `SELECT … RAISE`; instead, project the constrained fields into indexed/generated columns and let SQLite enforce `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY` directly.
+
+### Constraint Types
+
+| Extension           | Enforcement                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------------ |
+| `x-lix-primary-key` | Primary key on projected columns (plus `version_id`/scope)                                       |
+| `x-lix-unique`      | UNIQUE index on projected columns (plus `version_id`/scope)                                      |
+| `x-lix-foreign-key` | FOREIGN KEY on projected columns pointing to referenced materialized table (immediate mode only) |
+| `x-lix-immutable`   | Reject UPDATEs for immutable rows (require new version/row instead)                              |
+
+### Example Materialized Table (projected fields + constraints)
+
+```sql
+CREATE TABLE lix_internal_state_materialized_v1_lix_message (
+  entity_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  snapshot_content BLOB,
+  is_tombstone INTEGER NOT NULL DEFAULT 0,
+  -- generated projections for constraint fields
+  x_msg_id TEXT GENERATED ALWAYS AS (json_extract(snapshot_content, '$.id')) STORED,
+  x_thread_id TEXT GENERATED ALWAYS AS (json_extract(snapshot_content, '$.thread_id')) STORED,
+  x_seq_num INTEGER GENERATED ALWAYS AS (json_extract(snapshot_content, '$.sequence_number')) STORED,
+  PRIMARY KEY (version_id, x_msg_id),
+  UNIQUE (version_id, x_thread_id, x_seq_num)
+  -- FK: immediate mode only; materialized mode skips this and relies on materializer/deletion checks
+  , FOREIGN KEY (version_id, x_thread_id) REFERENCES lix_internal_state_materialized_v1_lix_thread(version_id, x_thread_id)
+    ON UPDATE CASCADE ON DELETE RESTRICT
+) WITHOUT ROWID;
+
+-- Optional partial index to ignore tombstones
+CREATE INDEX lix_message_unique_active
+  ON lix_internal_state_materialized_v1_lix_message(x_thread_id, x_seq_num)
+  WHERE is_tombstone = 0;
+```
+
+### Notes
+
+- Generated columns (or expression indexes) must match the JSON paths exactly so the indexes are usable.
+- Prefix generated/projection columns (e.g., `x_*`) to avoid colliding with user field names.
+- Scope columns (`version_id`, `file_id`, etc.) should be included in the constraint definition to mirror the engine’s scoping rules.
+- Prefer projecting top-level properties into `x_*` generated columns so filters and joins can hit indexes without `json_extract` calls.
+- For `materialized` foreign keys, consider whether the mode is still needed; if constraints fire after materialization, immediate FKs on projected columns may suffice.
+- Untracked state is not part of constraint enforcement in this design; it lives in a separate table and is resolved at read time, so native PK/UNIQUE/FK only apply to committed/materialized rows.
+
+### Tasks
+
+1. Parse `x-lix-primary-key`, `x-lix-foreign-key`, `x-lix-unique` from schemas.
+2. Project referenced JSON fields into generated columns (or expression indexes) on materialized tables.
+3. Emit `PRIMARY KEY`/`UNIQUE` constraints and indexes over the projected columns plus scope columns.
+4. Emit `FOREIGN KEY` constraints only for immediate-mode FKs; for materialized-mode FKs, rely on materializer and delete-time reverse checks.
+5. Ensure rewritten INSERT/UPDATE/DELETE target materialized tables with these constraints in place; constraint violations bubble up from SQLite.
+6. Ensure immutable schemas (e.g. `x-lix-immutable: true`) are never updated in materialized tables; enforce via rewrite rules or constraint checks.
+
+---
+
+
+
+# Commit graph + history
+
+## Milestone 11: Generate Commit and Materialized State
 
 After extracting in-memory rows, we need to generate commit records and materialized state for the materialized tables.
 
 See the current JS implementation: [generate-commit.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/vtable/generate-commit.ts)
 
-### Pipeline (continued from Milestone 5)
+### Pipeline (continued from Milestone 10)
 
 ```rust
-// ... continued from Milestone 5
+// ... continued from Milestone 10
 
 // 6. Generate commit and materialized state
 let commit_result = generate_commit(GenerateCommitArgs {
@@ -765,7 +936,7 @@ host.execute(&sql)?;
 4. Generate `lix_change_set_element` rows for domain changes
 5. Return both raw changes and materialized state for cache insertion
 
-## Milestone 9: State Materialization
+## Milestone 12: State Materialization
 
 The materialization logic computes the correct state from the commit graph and change history. This is critical for ensuring reads return the correct data based on version inheritance and commit ancestry.
 
@@ -804,7 +975,7 @@ version_ancestry                      (final output)
 
 ### Correctness Assurance
 
-After Milestone 5, we should have tests that verify:
+After Milestone 11, we should have tests that verify:
 
 1. State reads match the JS implementation for the same change history
 2. Version inheritance correctly resolves parent → child state visibility
@@ -812,7 +983,7 @@ After Milestone 5, we should have tests that verify:
 4. Commit graph traversal handles merge commits (multiple parents)
 5. Cache tables are populated correctly from materialized state
 
-## Milestone 10: Deterministic Mode and Simulation Testing
+## Milestone 13: Deterministic Mode and Simulation Testing
 
 To ensure correctness, we need deterministic execution and simulation testing that verifies the engine produces identical results under different conditions.
 
@@ -890,7 +1061,7 @@ If materialization simulation produces different results than normal:
 4. Implement materialization simulation (clear cache, repopulate from materializer)
 5. Add `expectDeterministic` assertion helper
 
-## Milestone 11: Engine Functions
+## Milestone 14: Engine Functions
 
 The engine provides built-in functions that can be called from CEL expressions and SQL. These functions must respect deterministic mode.
 
@@ -977,171 +1148,6 @@ VALUES (lix_uuid_v7(), 'my_schema', '{"seq": ' || lix_next_sequence_number('my_s
 4. Expose functions to CEL evaluation context
 5. Implement sequence number persistence (survives engine restart)
 6. Add `lix_human_id` word lists (adjectives, nouns)
-
-## Milestone 12: CEL Default Values
-
-Schemas can define default values using CEL (Common Expression Language) expressions. When a row is inserted without a value for a field that has a CEL default, the engine must evaluate the expression.
-
-See RFC 002 for the Rust library: [`cel-rust`](https://github.com/clarkmcc/cel-rust)
-
-### Example Schema
-
-```json
-{
-  "x-lix-key": "lix_message",
-  "properties": {
-    "id": {
-      "type": "string",
-      "x-lix-default": "lix_uuid_v7()"
-    },
-    "created_at": {
-      "type": "string",
-      "x-lix-default": "lix_get_timestamp()"
-    }
-  }
-}
-```
-
-### Pipeline (continued)
-
-```rust
-// ... after resolving row values (Milestone 5)
-
-// 4. Apply CEL default values
-for row in &mut resolved_rows {
-    let schema = get_schema(&row.schema_key)?;
-
-    for (field, field_schema) in schema.properties {
-        if row.snapshot_content.get(&field).is_none() {
-            if let Some(cel_default) = field_schema.x_lix_default {
-                let value = evaluate_cel(cel_default, &cel_context)?;
-                row.snapshot_content.insert(field, value);
-            }
-        }
-    }
-}
-
-// CEL context provides built-in functions:
-// - lix_uuid_v7() -> deterministic or real UUID based on mode
-// - lix_get_timestamp() -> deterministic or real timestamp based on mode
-```
-
-### Tasks
-
-1. Integrate `cel-rust` library
-2. Define CEL context with built-in functions (`lix_uuid_v7`, `lix_get_timestamp`)
-3. Wire CEL functions to deterministic mode (use seeded values when enabled)
-4. Parse `x-lix-default` from schema definitions
-5. Evaluate CEL expressions for missing fields before validation
-
-## Milestone 13: JSON Schema Validation
-
-After applying CEL default values, the engine must validate `snapshot_content` against the JSON Schema defined for the `schema_key`. Validation happens in-memory before any SQL is executed.
-
-See RFC 002 for the Rust library: [`jsonschema`](https://github.com/Stranger6667/jsonschema-rs)
-
-### Pipeline (continued)
-
-```rust
-// ... after applying CEL defaults (Milestone 9)
-
-// 5. Validate against JSON Schema
-for row in &resolved_rows {
-    let schema = get_schema(&row.schema_key)?;
-
-    let compiled = JSONSchema::compile(&schema)?;
-
-    if let Err(errors) = compiled.validate(&row.snapshot_content) {
-        return Err(ValidationError {
-            entity_id: row.entity_id,
-            schema_key: row.schema_key,
-            errors: errors.collect(),
-        });
-    }
-}
-
-// Continue to Milestone 6: Generate commit...
-```
-
-### Schema Storage
-
-Schemas are stored in `lix_internal_state_vtable` with `schema_key = 'lix_schema'`:
-
-```sql
-SELECT snapshot_content
-FROM lix_internal_state_vtable
-WHERE schema_key = 'lix_schema'
-  AND entity_id = 'lix_key_value'  -- the schema_key to validate against
-```
-
-The engine should cache compiled schemas in memory for performance.
-
-### Tasks
-
-1. Integrate `jsonschema` crate
-2. Load and cache schemas from state on engine init
-3. Compile JSON Schemas once and reuse
-4. Validate `snapshot_content` before commit generation
-5. Return clear error messages with path to invalid field
-6. Enforce `x-lix-immutable: true` (reject UPDATEs that modify immutable rows; require new version/row instead)
-
-## Milestone 14: Constraint Validation on Materialized Tables
-
-After JSON Schema validation, enforce relational constraints by encoding them as SQLite constraints on the materialized tables themselves. Avoid preflight `SELECT … RAISE`; instead, project the constrained fields into indexed/generated columns and let SQLite enforce `PRIMARY KEY`, `UNIQUE`, and `FOREIGN KEY` directly.
-
-### Constraint Types
-
-| Extension           | Enforcement                                                                                      |
-| ------------------- | ------------------------------------------------------------------------------------------------ |
-| `x-lix-primary-key` | Primary key on projected columns (plus `version_id`/scope)                                       |
-| `x-lix-unique`      | UNIQUE index on projected columns (plus `version_id`/scope)                                      |
-| `x-lix-foreign-key` | FOREIGN KEY on projected columns pointing to referenced materialized table (immediate mode only) |
-| `x-lix-immutable`   | Reject UPDATEs for immutable rows (require new version/row instead)                              |
-
-### Example Materialized Table (projected fields + constraints)
-
-```sql
-CREATE TABLE lix_internal_state_materialized_v1_lix_message (
-  entity_id TEXT NOT NULL,
-  version_id TEXT NOT NULL,
-  snapshot_content BLOB,
-  is_tombstone INTEGER NOT NULL DEFAULT 0,
-  -- generated projections for constraint fields
-  x_msg_id TEXT GENERATED ALWAYS AS (json_extract(snapshot_content, '$.id')) STORED,
-  x_thread_id TEXT GENERATED ALWAYS AS (json_extract(snapshot_content, '$.thread_id')) STORED,
-  x_seq_num INTEGER GENERATED ALWAYS AS (json_extract(snapshot_content, '$.sequence_number')) STORED,
-  PRIMARY KEY (version_id, x_msg_id),
-  UNIQUE (version_id, x_thread_id, x_seq_num)
-  -- FK: immediate mode only; materialized mode skips this and relies on materializer/deletion checks
-  , FOREIGN KEY (version_id, x_thread_id) REFERENCES lix_internal_state_materialized_v1_lix_thread(version_id, x_thread_id)
-    ON UPDATE CASCADE ON DELETE RESTRICT
-) WITHOUT ROWID;
-
--- Optional partial index to ignore tombstones
-CREATE INDEX lix_message_unique_active
-  ON lix_internal_state_materialized_v1_lix_message(x_thread_id, x_seq_num)
-  WHERE is_tombstone = 0;
-```
-
-### Notes
-
-- Generated columns (or expression indexes) must match the JSON paths exactly so the indexes are usable.
-- Prefix generated/projection columns (e.g., `x_*`) to avoid colliding with user field names.
-- Scope columns (`version_id`, `file_id`, etc.) should be included in the constraint definition to mirror the engine’s scoping rules.
-- Prefer projecting top-level properties into `x_*` generated columns so filters and joins can hit indexes without `json_extract` calls.
-- For `materialized` foreign keys, consider whether the mode is still needed; if constraints fire after materialization, immediate FKs on projected columns may suffice.
-- Untracked state is not part of constraint enforcement in this design; it lives in a separate table and is resolved at read time, so native PK/UNIQUE/FK only apply to committed/materialized rows.
-
-### Tasks
-
-1. Parse `x-lix-primary-key`, `x-lix-foreign-key`, `x-lix-unique` from schemas.
-2. Project referenced JSON fields into generated columns (or expression indexes) on materialized tables.
-3. Emit `PRIMARY KEY`/`UNIQUE` constraints and indexes over the projected columns plus scope columns.
-4. Emit `FOREIGN KEY` constraints only for immediate-mode FKs; for materialized-mode FKs, rely on materializer and delete-time reverse checks.
-5. Ensure rewritten INSERT/UPDATE/DELETE target materialized tables with these constraints in place; constraint violations bubble up from SQLite.
-6. Ensure immutable schemas (e.g. `x-lix-immutable: true`) are never updated in materialized tables; enforce via rewrite rules or constraint checks.
-
----
 
 # Versions
 
@@ -1679,7 +1685,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version SELECT rewriting (Milestone 14)
+-- Delegates to state_by_version SELECT rewriting (Milestone 19)
 -- with entity_id filter applied
 SELECT * FROM (
   -- state_by_version rewriting...
@@ -1708,7 +1714,7 @@ VALUES ('entity-1', 'lix_key_value', 'version-1', '{"key": "foo"}')
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version INSERT rewriting (Milestone 15)
+-- Delegates to state_by_version INSERT rewriting (Milestone 20)
 ```
 
 ### Tasks
@@ -1734,7 +1740,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version UPDATE rewriting (Milestone 16)
+-- Delegates to state_by_version UPDATE rewriting (Milestone 21)
 ```
 
 ### Tasks
@@ -1759,7 +1765,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version DELETE rewriting (Milestone 17)
+-- Delegates to state_by_version DELETE rewriting (Milestone 22)
 ```
 
 ### Tasks
@@ -1784,7 +1790,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state SELECT rewriting (Milestone 18)
+-- Delegates to state SELECT rewriting (Milestone 23)
 -- with entity_id filter applied
 SELECT * FROM (
   -- state rewriting...
@@ -1813,7 +1819,7 @@ VALUES ('entity-1', 'lix_key_value', '{"key": "foo"}')
 **Rewritten query:**
 
 ```sql
--- Delegates to state INSERT rewriting (Milestone 19)
+-- Delegates to state INSERT rewriting (Milestone 24)
 ```
 
 ### Tasks
@@ -1839,7 +1845,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state UPDATE rewriting (Milestone 20)
+-- Delegates to state UPDATE rewriting (Milestone 25)
 ```
 
 ### Tasks
@@ -1864,7 +1870,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state DELETE rewriting (Milestone 21)
+-- Delegates to state DELETE rewriting (Milestone 26)
 ```
 
 ### Tasks
@@ -1891,7 +1897,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state_history SELECT rewriting (Milestone 22)
+-- Delegates to state_history SELECT rewriting (Milestone 27)
 -- with entity_id filter applied
 SELECT * FROM (
   -- state_history rewriting...
