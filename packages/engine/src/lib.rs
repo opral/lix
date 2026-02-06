@@ -1,4 +1,5 @@
 mod backend;
+mod builtin_schema;
 mod cel;
 mod default_values;
 mod deterministic_mode;
