@@ -109,7 +109,7 @@
                                                          ▼
                                           ┌──────────────────────────────┐
                                           │      lix_internal_snapshot   │
-                                          │    (content-addressed blobs) │
+                                          │                              │
                                           └──────────────────────────────┘
 ```
 
@@ -751,7 +751,7 @@ for row in &resolved_rows {
     }
 }
 
-// Continue to Milestone 11: Generate commit...
+// Continue to Milestone 13: Generate commit...
 ```
 
 ### Schema Storage
@@ -776,7 +776,6 @@ The engine should cache compiled schemas in memory for performance.
 4. Validate `snapshot_content` before commit generation
 5. Return clear error messages with path to invalid field
 6. Enforce `x-lix-immutable: true` (reject UPDATEs that modify immutable rows; require new version/row instead)
-
 
 ## Milestone 9: CEL Default Values
 
@@ -833,7 +832,6 @@ for row in &mut resolved_rows {
 3. Wire CEL functions to deterministic mode (use seeded values when enabled)
 4. Parse `x-lix-default` from schema definitions
 5. Evaluate CEL expressions for missing fields before validation
-
 
 ## Milestone 10: SQL Constraints on Materialized Tables
 
@@ -893,98 +891,27 @@ CREATE INDEX lix_message_unique_active
 
 ---
 
-
-
 # Commit graph + history
 
-## Milestone 11: Generate Commit and Materialized State
+## Milestone 11: Key-Value Schema and Runtime Access
 
-After extracting in-memory rows, we need to generate commit records and materialized state for the materialized tables.
+Before deterministic mode, the Rust engine must support the key-value schema contract used by the JS SDK.
 
-See the current JS implementation: [generate-commit.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/vtable/generate-commit.ts)
+Reference implementation directory: `packages/sdk/src/key-value`
 
-### Pipeline (continued from Milestone 10)
+### Scope
 
-```rust
-// ... continued from Milestone 10
-
-// 6. Generate commit and materialized state
-let commit_result = generate_commit(GenerateCommitArgs {
-    timestamp: now(),
-    changes: resolved_rows,
-    versions: get_affected_versions(&resolved_rows, &host)?,
-    generate_uuid: || uuid_v7(),
-    active_accounts: get_active_accounts(&host)?,
-});
-
-// commit_result.changes = domain changes + meta changes (commit, version_tip, etc.)
-// commit_result.materialized_state = rows ready for cache insertion
-
-// 7. Build final SQL
-let sql = build_insert_sql(
-    &commit_result.changes,          // -> lix_internal_change + lix_internal_snapshot
-    &commit_result.materialized_state // -> lix_internal_state_materialized_v1_*
-);
-
-host.execute(&sql)?;
-```
+- Read/write `lix_key_value` rows through the same state pathway used by other schemas.
+- Ensure the engine can read deterministic config keys from key-value state.
+- Define a stable Rust accessor layer for engine-level settings stored in key-value.
 
 ### Tasks
 
-1. Port `generateCommit()` logic to Rust
-2. Generate commit snapshot with `change_ids`, `parent_commit_ids`
-3. Generate `lix_version_tip` updates per version
-4. Generate `lix_change_set_element` rows for domain changes
-5. Return both raw changes and materialized state for cache insertion
+1. Port key-value schema behavior from `packages/sdk/src/key-value`
+2. Implement typed accessors for engine settings (including deterministic mode config)
+3. Add unit/integration tests for key-value reads/writes through `lix_internal_state_vtable`
 
-## Milestone 12: State Materialization
-
-The materialization logic computes the correct state from the commit graph and change history. This is critical for ensuring reads return the correct data based on version inheritance and commit ancestry.
-
-See the current JS implementation: [materialize-state.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/materialize-state.ts)
-
-### Materialization Views
-
-The JS implementation creates a chain of SQL views:
-
-```
-lix_internal_materialization_all_commit_edges
-    │
-    ▼
-lix_internal_materialization_version_tips
-    │
-    ▼
-lix_internal_materialization_commit_graph
-    │
-    ▼
-lix_internal_materialization_latest_visible_state
-    │
-    ├─────────────────────────────────┐
-    ▼                                 ▼
-lix_internal_materialization_     lix_internal_state_materializer
-version_ancestry                      (final output)
-```
-
-| View                   | Purpose                                                                                              |
-| ---------------------- | ---------------------------------------------------------------------------------------------------- |
-| `all_commit_edges`     | Union of edges from commit.parent_commit_ids and lix_commit_edge rows                                |
-| `version_tips`         | Current tip commit per version                                                                       |
-| `commit_graph`         | Recursive DAG traversal with depth from tips                                                         |
-| `latest_visible_state` | Explodes commit.change_ids, joins with change table, deduplicates by (version, entity, schema, file) |
-| `version_ancestry`     | Recursive inheritance chain per version                                                              |
-| `state_materializer`   | Final state with inheritance resolution                                                              |
-
-### Correctness Assurance
-
-After Milestone 11, we should have tests that verify:
-
-1. State reads match the JS implementation for the same change history
-2. Version inheritance correctly resolves parent → child state visibility
-3. Tombstones (deletions) are correctly handled
-4. Commit graph traversal handles merge commits (multiple parents)
-5. Cache tables are populated correctly from materialized state
-
-## Milestone 13: Deterministic Mode and Simulation Testing
+## Milestone 12: Deterministic Mode and Simulation Testing
 
 To ensure correctness, we need deterministic execution and simulation testing that verifies the engine produces identical results under different conditions.
 
@@ -998,7 +925,7 @@ The engine should support deterministic mode where:
 - Timestamps are controlled/fixed
 - Results are reproducible given the same inputs
 
-The engine queries `lix_deterministic_mode` from the key-value store on initialization and caches it in memory:
+This milestone depends on Milestone 11 (`packages/sdk/src/key-value` parity). The engine queries `lix_deterministic_mode` from key-value state on initialization and caches it in memory:
 
 ```rust
 // Engine internally checks on init:
@@ -1062,93 +989,92 @@ If materialization simulation produces different results than normal:
 4. Implement materialization simulation (clear cache, repopulate from materializer)
 5. Add `expectDeterministic` assertion helper
 
-## Milestone 14: Engine Functions
+## Milestone 13: Generate Commit and Materialized State
 
-The engine provides built-in functions that can be called from CEL expressions and SQL. These functions must respect deterministic mode.
+After extracting resolved rows, we need to generate commit records and materialized state for the materialized tables.
 
-### Function Registry
+See the current JS implementation: [generate-commit.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/vtable/generate-commit.ts)
 
-| Function                              | Purpose                      | Deterministic Behavior |
-| ------------------------------------- | ---------------------------- | ---------------------- |
-| `lix_uuid_v7()`                       | UUID v7 generation           | Seeded sequence        |
-| `lix_nano_id(length?)`                | Short IDs (default 21 chars) | Seeded sequence        |
-| `lix_human_id()`                      | Human-readable IDs           | Seeded sequence        |
-| `lix_timestamp()`                     | Current timestamp            | Fixed timestamp        |
-| `lix_random()`                        | Random float 0-1             | Seeded RNG             |
-| `lix_next_sequence_number(namespace)` | Auto-incrementing sequence   | Deterministic counter  |
-
-### Implementation
+### Pipeline (continued from Milestone 10)
 
 ```rust
-pub struct FunctionRegistry {
-    deterministic_mode: Option<DeterministicConfig>,
-    sequence_counters: HashMap<String, u64>,
-}
+// ... continued from Milestone 10
 
-impl FunctionRegistry {
-    pub fn lix_uuid_v7(&mut self) -> String {
-        match &mut self.deterministic_mode {
-            Some(config) => config.next_uuid(),
-            None => uuid::Uuid::now_v7().to_string(),
-        }
-    }
+// 6. Generate commit and materialized state
+let commit_result = generate_commit(GenerateCommitArgs {
+    timestamp: now(),
+    changes: resolved_rows,
+    versions: get_affected_versions(&resolved_rows, &host)?,
+    generate_uuid: || uuid_v7(),
+    active_accounts: get_active_accounts(&host)?,
+});
 
-    pub fn lix_nano_id(&mut self, length: Option<usize>) -> String {
-        let len = length.unwrap_or(21);
-        match &mut self.deterministic_mode {
-            Some(config) => config.next_nano_id(len),
-            None => nanoid::nanoid!(len),
-        }
-    }
+// commit_result.changes = domain changes + meta changes (commit, version_tip, etc.)
+// commit_result.materialized_state = rows ready for cache insertion
 
-    pub fn lix_human_id(&mut self) -> String {
-        // Format: adjective-noun-number (e.g., "happy-tiger-42")
-        match &mut self.deterministic_mode {
-            Some(config) => config.next_human_id(),
-            None => generate_human_id(),
-        }
-    }
+// 7. Build final SQL
+let sql = build_insert_sql(
+    &commit_result.changes,           // -> lix_internal_change + lix_internal_snapshot
+    &commit_result.materialized_state // -> lix_internal_state_materialized_v1_*
+);
 
-    pub fn lix_timestamp(&self) -> String {
-        match &self.deterministic_mode {
-            Some(config) => config.fixed_timestamp.clone(),
-            None => chrono::Utc::now().to_rfc3339(),
-        }
-    }
-
-    pub fn lix_random(&mut self) -> f64 {
-        match &mut self.deterministic_mode {
-            Some(config) => config.rng.gen(),
-            None => rand::random(),
-        }
-    }
-
-    pub fn lix_next_sequence_number(&mut self, namespace: &str) -> u64 {
-        let counter = self.sequence_counters.entry(namespace.to_string()).or_insert(0);
-        *counter += 1;
-        *counter
-    }
-}
-```
-
-### SQL Function Registration
-
-Functions are registered with SQLite so they can be called directly in SQL:
-
-```sql
--- Can be used in INSERT statements
-INSERT INTO state (entity_id, schema_key, snapshot_content)
-VALUES (lix_uuid_v7(), 'my_schema', '{"seq": ' || lix_next_sequence_number('my_seq') || '}')
+host.execute(&sql)?;
 ```
 
 ### Tasks
 
-1. Implement `FunctionRegistry` with all built-in functions
-2. Wire functions to deterministic mode (seeded values when enabled)
-3. Register functions with SQLite connection
-4. Expose functions to CEL evaluation context
-5. Implement sequence number persistence (survives engine restart)
-6. Add `lix_human_id` word lists (adjectives, nouns)
+1. Port `generateCommit()` logic to Rust
+2. Generate commit snapshot with `change_ids`, `parent_commit_ids`
+3. Generate `lix_version_tip` updates per version
+4. Generate `lix_change_set_element` rows for domain changes
+5. Return both raw changes and materialized state for cache insertion
+
+## Milestone 14: State Materialization
+
+The materialization logic computes the correct state from the commit graph and change history. This is critical for ensuring reads return the correct data based on version inheritance and commit ancestry.
+
+See the current JS implementation: [materialize-state.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/materialize-state.ts)
+
+### Materialization Views
+
+The JS implementation creates a chain of SQL views:
+
+```
+lix_internal_materialization_all_commit_edges
+    │
+    ▼
+lix_internal_materialization_version_tips
+    │
+    ▼
+lix_internal_materialization_commit_graph
+    │
+    ▼
+lix_internal_materialization_latest_visible_state
+    │
+    ├─────────────────────────────────┐
+    ▼                                 ▼
+lix_internal_materialization_     lix_internal_state_materializer
+version_ancestry                      (final output)
+```
+
+| View                   | Purpose                                                                                              |
+| ---------------------- | ---------------------------------------------------------------------------------------------------- |
+| `all_commit_edges`     | Union of edges from commit.parent_commit_ids and lix_commit_edge rows                                |
+| `version_tips`         | Current tip commit per version                                                                       |
+| `commit_graph`         | Recursive DAG traversal with depth from tips                                                         |
+| `latest_visible_state` | Explodes commit.change_ids, joins with change table, deduplicates by (version, entity, schema, file) |
+| `version_ancestry`     | Recursive inheritance chain per version                                                              |
+| `state_materializer`   | Final state with inheritance resolution                                                              |
+
+### Correctness Assurance
+
+After Milestone 13, we should have tests that verify:
+
+1. State reads match the JS implementation for the same change history
+2. Version inheritance correctly resolves parent → child state visibility
+3. Tombstones (deletions) are correctly handled
+4. Commit graph traversal handles merge commits (multiple parents)
+5. Cache tables are populated correctly from materialized state
 
 # Versions
 
@@ -1972,7 +1898,7 @@ INSERT INTO lix_internal_change (...) VALUES (...);
 2. Map virtual view columns to underlying schema fields
 3. Generate snapshot_content JSON from insert values
 4. Rewrite to INSERT on materialized tables + change/snapshot records
-5. Apply schema defaults and validation (Milestones 12-14)
+5. Apply schema defaults and validation (Milestones 8-10)
 
 ## Milestone 38: Filesystem SELECT (file, directory)
 

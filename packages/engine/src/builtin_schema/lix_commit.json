@@ -1,0 +1,77 @@
+{
+  "x-lix-key": "lix_commit",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\"",
+    "lixcol_version_id": "\"global\""
+  },
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/change_set_id"
+      ],
+      "references": {
+        "schemaKey": "lix_change_set",
+        "properties": [
+          "/id"
+        ]
+      },
+      "mode": "materialized"
+    }
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()"
+    },
+    "change_set_id": {
+      "type": "string"
+    },
+    "change_ids": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "author_account_ids": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "parent_commit_ids": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "meta_change_ids": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "change_set_id"
+  ],
+  "additionalProperties": false
+}

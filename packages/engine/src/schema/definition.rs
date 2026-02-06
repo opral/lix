@@ -1,3 +1,4 @@
+use cel::Program;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
@@ -12,13 +13,13 @@ pub fn lix_schema_definition() -> &'static JsonValue {
         // NOTE: x-lix-version is intentionally constrained to a monotonic integer (as a string).
         // This keeps translation rules open while avoiding a future breaking change when versioning
         // semantics become concrete.
-        let raw = include_str!("schema_definition.json");
-        serde_json::from_str(raw).expect("schema_definition.json must be valid JSON")
+        let raw = include_str!("definition.json");
+        serde_json::from_str(raw).expect("definition.json must be valid JSON")
     })
 }
 
 pub fn lix_schema_definition_json() -> &'static str {
-    include_str!("schema_definition.json")
+    include_str!("definition.json")
 }
 
 pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError> {
@@ -64,7 +65,7 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
     let mut options = JSONSchema::options();
     options.with_meta_schemas();
     options.with_format("json-pointer", is_json_pointer);
-    options.with_format("cel", |_value| true);
+    options.with_format("cel", is_cel_expression);
 
     options.compile(schema).map_err(|err| LixError {
         message: format!("Failed to compile Lix schema definition: {err}"),
@@ -73,6 +74,10 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
 
 fn is_json_pointer(value: &str) -> bool {
     parse_json_pointer(value).is_ok()
+}
+
+fn is_cel_expression(value: &str) -> bool {
+    Program::compile(value).is_ok()
 }
 
 fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
