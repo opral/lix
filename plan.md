@@ -109,7 +109,7 @@
                                                          ▼
                                           ┌──────────────────────────────┐
                                           │      lix_internal_snapshot   │
-                                          │    (content-addressed blobs) │
+                                          │                              │
                                           └──────────────────────────────┘
 ```
 
@@ -777,7 +777,6 @@ The engine should cache compiled schemas in memory for performance.
 5. Return clear error messages with path to invalid field
 6. Enforce `x-lix-immutable: true` (reject UPDATEs that modify immutable rows; require new version/row instead)
 
-
 ## Milestone 9: CEL Default Values
 
 Schemas can define default values using CEL (Common Expression Language) expressions. When a row is inserted without a value for a field that has a CEL default, the engine must evaluate the expression.
@@ -833,7 +832,6 @@ for row in &mut resolved_rows {
 3. Wire CEL functions to deterministic mode (use seeded values when enabled)
 4. Parse `x-lix-default` from schema definitions
 5. Evaluate CEL expressions for missing fields before validation
-
 
 ## Milestone 10: SQL Constraints on Materialized Tables
 
@@ -892,8 +890,6 @@ CREATE INDEX lix_message_unique_active
 6. Ensure immutable schemas (e.g. `x-lix-immutable: true`) are never updated in materialized tables; enforce via rewrite rules or constraint checks.
 
 ---
-
-
 
 # Commit graph + history
 

@@ -1,4 +1,4 @@
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Query, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -6,7 +6,7 @@ use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::sql::materialize_vtable_insert_select_sources;
-use crate::sql::route::rewrite_statement;
+use crate::sql::route::{rewrite_statement, rewrite_statement_with_backend};
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreprocessOutput, SchemaRegistration};
 use crate::{LixBackend, LixError, Value};
@@ -85,6 +85,66 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
     })
 }
 
+async fn preprocess_statements_with_provider_and_backend<P: LixFunctionProvider>(
+    backend: &dyn LixBackend,
+    statements: Vec<Statement>,
+    params: &[Value],
+    provider: &mut P,
+) -> Result<PreprocessOutput, LixError> {
+    let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut postprocess: Option<PostprocessPlan> = None;
+    let mut rewritten = Vec::with_capacity(statements.len());
+    let mut mutations = Vec::new();
+    let mut update_validations = Vec::new();
+    for statement in statements {
+        let output = rewrite_statement_with_backend(backend, statement, params, provider).await?;
+        registrations.extend(output.registrations);
+        if let Some(plan) = output.postprocess {
+            if postprocess.is_some() {
+                return Err(LixError {
+                    message: "only one postprocess rewrite is supported per query".to_string(),
+                });
+            }
+            postprocess = Some(plan);
+        }
+        mutations.extend(output.mutations);
+        update_validations.extend(output.update_validations);
+        for rewritten_statement in output.statements {
+            rewritten.push(inline_lix_functions_with_provider(
+                rewritten_statement,
+                provider,
+            ));
+        }
+    }
+
+    if postprocess.is_some() && rewritten.len() != 1 {
+        return Err(LixError {
+            message: "postprocess rewrites require a single statement".to_string(),
+        });
+    }
+
+    let normalized_sql = rewritten
+        .iter()
+        .map(|statement| statement.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let params = if sql_contains_placeholders(&normalized_sql) {
+        params.to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(PreprocessOutput {
+        sql: normalized_sql,
+        params,
+        registrations,
+        postprocess,
+        mutations,
+        update_validations,
+    })
+}
+
 #[allow(dead_code)]
 pub async fn preprocess_sql(
     backend: &dyn LixBackend,
@@ -107,7 +167,7 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     let params = params.to_vec();
-    let mut statements = parse_sql_statements(sql)?;
+    let mut statements = coalesce_vtable_inserts_in_transactions(parse_sql_statements(sql)?)?;
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
     apply_vtable_insert_defaults(
         backend,
@@ -118,7 +178,8 @@ where
     )
     .await?;
     let mut provider = functions.clone();
-    preprocess_statements_with_provider(statements, &params, &mut provider)
+    preprocess_statements_with_provider_and_backend(backend, statements, &params, &mut provider)
+        .await
 }
 
 #[allow(dead_code)]
@@ -169,4 +230,169 @@ fn sql_contains_placeholders(sql: &str) -> bool {
     }
 
     false
+}
+
+fn coalesce_vtable_inserts_in_transactions(
+    statements: Vec<Statement>,
+) -> Result<Vec<Statement>, LixError> {
+    let mut result = Vec::with_capacity(statements.len());
+    let mut in_transaction = false;
+    let mut pending_insert: Option<Insert> = None;
+
+    for statement in statements {
+        match statement {
+            Statement::StartTransaction { .. } => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                in_transaction = true;
+                result.push(statement);
+            }
+            Statement::Commit { .. } | Statement::Rollback { .. } => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                in_transaction = false;
+                result.push(statement);
+            }
+            Statement::Insert(insert) if in_transaction => {
+                if let Some(existing) = pending_insert.as_mut() {
+                    if can_merge_vtable_insert(existing, &insert) {
+                        append_insert_rows(existing, &insert)?;
+                    } else {
+                        flush_pending_insert(&mut result, &mut pending_insert);
+                        pending_insert = Some(insert);
+                    }
+                } else {
+                    pending_insert = Some(insert);
+                }
+            }
+            other => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                result.push(other);
+            }
+        }
+    }
+
+    flush_pending_insert(&mut result, &mut pending_insert);
+    Ok(result)
+}
+
+fn flush_pending_insert(result: &mut Vec<Statement>, pending_insert: &mut Option<Insert>) {
+    if let Some(insert) = pending_insert.take() {
+        result.push(Statement::Insert(insert));
+    }
+}
+
+fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
+    if !insert_targets_vtable(left) || !insert_targets_vtable(right) {
+        return false;
+    }
+    if left.columns != right.columns {
+        return false;
+    }
+
+    // Conservative merge policy: only plain VALUES inserts with no dialect-specific modifiers.
+    if left.or.is_some()
+        || right.or.is_some()
+        || left.ignore
+        || right.ignore
+        || left.overwrite
+        || right.overwrite
+        || !left.assignments.is_empty()
+        || !right.assignments.is_empty()
+        || left.partitioned.is_some()
+        || right.partitioned.is_some()
+        || !left.after_columns.is_empty()
+        || !right.after_columns.is_empty()
+        || left.on.is_some()
+        || right.on.is_some()
+        || left.returning.is_some()
+        || right.returning.is_some()
+        || left.replace_into
+        || right.replace_into
+        || left.priority.is_some()
+        || right.priority.is_some()
+        || left.insert_alias.is_some()
+        || right.insert_alias.is_some()
+        || left.settings.is_some()
+        || right.settings.is_some()
+        || left.format_clause.is_some()
+        || right.format_clause.is_some()
+    {
+        return false;
+    }
+
+    if left.table.to_string() != right.table.to_string() {
+        return false;
+    }
+    if left.table_alias != right.table_alias {
+        return false;
+    }
+    if left.into != right.into || left.has_table_keyword != right.has_table_keyword {
+        return false;
+    }
+
+    plain_values_rows(left).is_some() && plain_values_rows(right).is_some()
+}
+
+fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixError> {
+    let incoming_rows = plain_values_rows(incoming)
+        .ok_or_else(|| LixError {
+            message: "transaction insert coalescing expected VALUES rows".to_string(),
+        })?
+        .to_vec();
+
+    let target_rows = plain_values_rows_mut(target).ok_or_else(|| LixError {
+        message: "transaction insert coalescing expected mutable VALUES rows".to_string(),
+    })?;
+    target_rows.extend(incoming_rows);
+    Ok(())
+}
+
+fn insert_targets_vtable(insert: &Insert) -> bool {
+    match &insert.table {
+        sqlparser::ast::TableObject::TableName(name) => {
+            object_name_matches(name, "lix_internal_state_vtable")
+        }
+        _ => false,
+    }
+}
+
+fn object_name_matches(name: &ObjectName, target: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(target))
+        .unwrap_or(false)
+}
+
+fn plain_values_rows(insert: &Insert) -> Option<&Vec<Vec<Expr>>> {
+    let source = insert.source.as_ref()?;
+    if !query_is_plain_values(source) {
+        return None;
+    }
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return None;
+    };
+    Some(&values.rows)
+}
+
+fn plain_values_rows_mut(insert: &mut Insert) -> Option<&mut Vec<Vec<Expr>>> {
+    let source = insert.source.as_mut()?;
+    if !query_is_plain_values(source) {
+        return None;
+    }
+    let SetExpr::Values(values) = source.body.as_mut() else {
+        return None;
+    };
+    Some(&mut values.rows)
+}
+
+fn query_is_plain_values(query: &Query) -> bool {
+    query.with.is_none()
+        && query.order_by.is_none()
+        && query.limit_clause.is_none()
+        && query.fetch.is_none()
+        && query.locks.is_empty()
+        && query.for_clause.is_none()
+        && query.settings.is_none()
+        && query.format_clause.is_none()
+        && query.pipe_operators.is_empty()
 }

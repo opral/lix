@@ -6,21 +6,29 @@ use sqlparser::ast::{
     OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor,
     TableObject, TableWithJoins, Update, Value, ValueWithSpan, Values,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::commit::{
+    generate_commit, DomainChangeInput, GenerateCommitArgs, MaterializedStateRow, VersionInfo,
+    VersionSnapshot,
+};
 use crate::functions::LixFunctionProvider;
 use crate::sql::types::{
     MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{resolve_expr_cell, ResolvedCell, RowSourceResolver};
-use crate::LixError;
 use crate::Value as EngineValue;
+use crate::{LixBackend, LixError};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
+const VERSION_TIP_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_tip";
+const VERSION_TIP_SCHEMA_KEY: &str = "lix_version_tip";
+const GLOBAL_VERSION: &str = "global";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -89,40 +97,9 @@ pub fn rewrite_insert(
         });
     }
 
-    let resolver = RowSourceResolver::new(params);
-    let row_source = resolver.resolve_insert_required(&insert, "vtable insert")?;
-    let rows = row_source.rows;
-
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let resolved_rows = row_source.resolved_rows;
-
-    let untracked_index = find_column_index(&insert.columns, "untracked");
-    let mut tracked_rows = Vec::new();
-    let mut untracked_rows = Vec::new();
-
-    for (row, resolved_row) in rows.iter().zip(resolved_rows.iter()) {
-        let untracked_value = untracked_index.and_then(|idx| resolved_row.get(idx));
-
-        let untracked = match untracked_value {
-            None => false,
-            Some(cell) if is_untracked_true_value(cell) => true,
-            Some(cell) if is_untracked_false_value(cell) => false,
-            Some(_) => {
-                return Err(LixError {
-                    message: "vtable insert requires literal or parameter untracked values"
-                        .to_string(),
-                })
-            }
-        };
-
-        if untracked {
-            untracked_rows.push((row.clone(), resolved_row.clone()));
-        } else {
-            tracked_rows.push((row.clone(), resolved_row.clone()));
-        }
-    }
+    let split_rows = split_insert_rows(&insert, params)?;
+    let tracked_rows = split_rows.tracked;
+    let untracked_rows = split_rows.untracked;
 
     let mut statements: Vec<Statement> = Vec::new();
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
@@ -136,6 +113,61 @@ pub fn rewrite_insert(
             &mut mutations,
             functions,
         )?;
+        statements.extend(tracked);
+    }
+
+    if !untracked_rows.is_empty() {
+        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations, functions)?;
+        statements.push(untracked);
+    }
+
+    Ok(Some(VtableWriteRewrite {
+        statements,
+        registrations,
+        mutations,
+    }))
+}
+
+pub async fn rewrite_insert_with_backend(
+    backend: &dyn LixBackend,
+    insert: sqlparser::ast::Insert,
+    params: &[EngineValue],
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Option<VtableWriteRewrite>, LixError> {
+    if !table_object_is_vtable(&insert.table) {
+        return Ok(None);
+    }
+
+    if insert.on.is_some() {
+        return Err(LixError {
+            message: "vtable insert does not support ON CONFLICT".to_string(),
+        });
+    }
+
+    if insert.columns.is_empty() {
+        return Err(LixError {
+            message: "vtable insert requires explicit columns".to_string(),
+        });
+    }
+
+    let split_rows = split_insert_rows(&insert, params)?;
+    let tracked_rows = split_rows.tracked;
+    let untracked_rows = split_rows.untracked;
+
+    let mut statements: Vec<Statement> = Vec::new();
+    let mut registrations: Vec<SchemaRegistration> = Vec::new();
+    let mut mutations: Vec<MutationRow> = Vec::new();
+
+    if !tracked_rows.is_empty() {
+        let tracked = rewrite_tracked_rows_with_backend(
+            backend,
+            &insert,
+            tracked_rows,
+            &mut registrations,
+            &mut mutations,
+            functions,
+        )
+        .await?;
         statements.extend(tracked);
     }
 
@@ -487,6 +519,59 @@ fn build_materialized_on_conflict() -> OnInsert {
     })
 }
 
+struct SplitInsertRows {
+    tracked: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
+    untracked: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
+}
+
+fn split_insert_rows(
+    insert: &sqlparser::ast::Insert,
+    params: &[EngineValue],
+) -> Result<SplitInsertRows, LixError> {
+    let resolver = RowSourceResolver::new(params);
+    let row_source = resolver.resolve_insert_required(insert, "vtable insert")?;
+    let rows = row_source.rows;
+    let resolved_rows = row_source.resolved_rows;
+
+    if rows.is_empty() {
+        return Ok(SplitInsertRows {
+            tracked: Vec::new(),
+            untracked: Vec::new(),
+        });
+    }
+
+    let untracked_index = find_column_index(&insert.columns, "untracked");
+    let mut tracked_rows = Vec::new();
+    let mut untracked_rows = Vec::new();
+
+    for (row, resolved_row) in rows.iter().zip(resolved_rows.iter()) {
+        let untracked_value = untracked_index.and_then(|idx| resolved_row.get(idx));
+
+        let untracked = match untracked_value {
+            None => false,
+            Some(cell) if is_untracked_true_value(cell) => true,
+            Some(cell) if is_untracked_false_value(cell) => false,
+            Some(_) => {
+                return Err(LixError {
+                    message: "vtable insert requires literal or parameter untracked values"
+                        .to_string(),
+                })
+            }
+        };
+
+        if untracked {
+            untracked_rows.push((row.clone(), resolved_row.clone()));
+        } else {
+            tracked_rows.push((row.clone(), resolved_row.clone()));
+        }
+    }
+
+    Ok(SplitInsertRows {
+        tracked: tracked_rows,
+        untracked: untracked_rows,
+    })
+}
+
 fn rewrite_tracked_rows(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
@@ -680,6 +765,344 @@ fn rewrite_tracked_rows(
     }
 
     Ok(statements)
+}
+
+async fn rewrite_tracked_rows_with_backend(
+    backend: &dyn LixBackend,
+    insert: &sqlparser::ast::Insert,
+    rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
+    registrations: &mut Vec<SchemaRegistration>,
+    mutations: &mut Vec<MutationRow>,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Vec<Statement>, LixError> {
+    let entity_idx = required_column_index(&insert.columns, "entity_id")?;
+    let schema_idx = required_column_index(&insert.columns, "schema_key")?;
+    let file_idx = required_column_index(&insert.columns, "file_id")?;
+    let version_idx = required_column_index(&insert.columns, "version_id")?;
+    let plugin_idx = required_column_index(&insert.columns, "plugin_key")?;
+    let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
+    let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
+    let metadata_idx = find_column_index(&insert.columns, "metadata");
+
+    let timestamp = functions.timestamp();
+    let mut domain_changes = Vec::new();
+    let mut affected_versions = BTreeSet::new();
+
+    for (row, materialized) in rows {
+        let entity_id = resolved_string_required(
+            materialized.get(entity_idx),
+            row.get(entity_idx),
+            "entity_id",
+        )?;
+        let schema_key = resolved_string_required(
+            materialized.get(schema_idx),
+            row.get(schema_idx),
+            "schema_key",
+        )?;
+        let file_id =
+            resolved_string_required(materialized.get(file_idx), row.get(file_idx), "file_id")?;
+        let version_id = resolved_string_required(
+            materialized.get(version_idx),
+            row.get(version_idx),
+            "version_id",
+        )?;
+        let plugin_key = resolved_string_required(
+            materialized.get(plugin_idx),
+            row.get(plugin_idx),
+            "plugin_key",
+        )?;
+        let schema_version = resolved_string_required(
+            materialized.get(schema_version_idx),
+            row.get(schema_version_idx),
+            "schema_version",
+        )?;
+
+        let snapshot_json =
+            resolved_snapshot_json(materialized.get(snapshot_idx), row.get(snapshot_idx))?;
+        let metadata_json = match metadata_idx {
+            Some(index) => {
+                resolved_optional_json(materialized.get(index), row.get(index), "metadata")?
+            }
+            None => None,
+        };
+
+        ensure_registration(registrations, &schema_key);
+
+        let change_id = functions.uuid_v7();
+        affected_versions.insert(version_id.clone());
+        domain_changes.push(DomainChangeInput {
+            id: change_id.clone(),
+            entity_id: entity_id.clone(),
+            schema_key: schema_key.clone(),
+            schema_version: schema_version.clone(),
+            file_id: file_id.clone(),
+            plugin_key: plugin_key.clone(),
+            snapshot_content: snapshot_json.as_ref().map(JsonValue::to_string),
+            metadata: metadata_json.as_ref().map(JsonValue::to_string),
+            created_at: timestamp.clone(),
+            version_id: version_id.clone(),
+            writer_key: None,
+        });
+
+        mutations.push(MutationRow {
+            operation: MutationOperation::Insert,
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            snapshot_content: snapshot_json,
+            untracked: false,
+        });
+    }
+
+    if domain_changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let versions = load_version_info_for_versions(backend, &affected_versions).await?;
+    let commit_result = generate_commit(
+        GenerateCommitArgs {
+            timestamp: timestamp.clone(),
+            active_accounts: Vec::new(),
+            changes: domain_changes,
+            versions,
+        },
+        || functions.uuid_v7(),
+    )?;
+
+    let mut ensure_no_content = false;
+    let mut snapshot_rows = Vec::new();
+    let mut change_rows = Vec::new();
+    let mut materialized_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
+
+    for change in &commit_result.changes {
+        let snapshot_id = match &change.snapshot_content {
+            Some(content) => {
+                let id = functions.uuid_v7();
+                snapshot_rows.push(vec![string_expr(&id), string_expr(content)]);
+                id
+            }
+            None => {
+                ensure_no_content = true;
+                "no-content".to_string()
+            }
+        };
+
+        let metadata_expr = change
+            .metadata
+            .as_ref()
+            .map(|value| string_expr(value))
+            .unwrap_or_else(null_expr);
+
+        change_rows.push(vec![
+            string_expr(&change.id),
+            string_expr(&change.entity_id),
+            string_expr(&change.schema_key),
+            string_expr(&change.schema_version),
+            string_expr(&change.file_id),
+            string_expr(&change.plugin_key),
+            string_expr(&snapshot_id),
+            metadata_expr,
+            string_expr(&change.created_at),
+        ]);
+    }
+
+    for row in commit_result.materialized_state {
+        ensure_registration(registrations, &row.schema_key);
+        materialized_by_schema
+            .entry(row.schema_key.clone())
+            .or_default()
+            .push(materialized_row_values(&row));
+    }
+
+    let mut statements = Vec::new();
+    if ensure_no_content {
+        statements.push(make_insert_statement(
+            SNAPSHOT_TABLE,
+            vec![Ident::new("id"), Ident::new("content")],
+            vec![vec![string_expr("no-content"), null_expr()]],
+            Some(build_snapshot_on_conflict()),
+        ));
+    }
+
+    if !snapshot_rows.is_empty() {
+        statements.push(make_insert_statement(
+            SNAPSHOT_TABLE,
+            vec![Ident::new("id"), Ident::new("content")],
+            snapshot_rows,
+            Some(build_snapshot_on_conflict()),
+        ));
+    }
+
+    if !change_rows.is_empty() {
+        statements.push(make_insert_statement(
+            CHANGE_TABLE,
+            vec![
+                Ident::new("id"),
+                Ident::new("entity_id"),
+                Ident::new("schema_key"),
+                Ident::new("schema_version"),
+                Ident::new("file_id"),
+                Ident::new("plugin_key"),
+                Ident::new("snapshot_id"),
+                Ident::new("metadata"),
+                Ident::new("created_at"),
+            ],
+            change_rows,
+            None,
+        ));
+    }
+
+    for (schema_key, rows) in materialized_by_schema {
+        let table_name = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
+        statements.push(make_insert_statement(
+            &table_name,
+            vec![
+                Ident::new("entity_id"),
+                Ident::new("schema_key"),
+                Ident::new("schema_version"),
+                Ident::new("file_id"),
+                Ident::new("version_id"),
+                Ident::new("plugin_key"),
+                Ident::new("snapshot_content"),
+                Ident::new("change_id"),
+                Ident::new("is_tombstone"),
+                Ident::new("created_at"),
+                Ident::new("updated_at"),
+            ],
+            rows,
+            Some(build_materialized_on_conflict()),
+        ));
+    }
+
+    Ok(statements)
+}
+
+fn ensure_registration(registrations: &mut Vec<SchemaRegistration>, schema_key: &str) {
+    if registrations
+        .iter()
+        .any(|registration| registration.schema_key == schema_key)
+    {
+        return;
+    }
+    registrations.push(SchemaRegistration {
+        schema_key: schema_key.to_string(),
+    });
+}
+
+fn materialized_row_values(row: &MaterializedStateRow) -> Vec<Expr> {
+    vec![
+        string_expr(&row.entity_id),
+        string_expr(&row.schema_key),
+        string_expr(&row.schema_version),
+        string_expr(&row.file_id),
+        string_expr(&row.lixcol_version_id),
+        string_expr(&row.plugin_key),
+        row.snapshot_content
+            .as_ref()
+            .map(|value| string_expr(value))
+            .unwrap_or_else(null_expr),
+        string_expr(&row.id),
+        number_expr("0"),
+        string_expr(&row.created_at),
+        string_expr(&row.created_at),
+    ]
+}
+
+async fn load_version_info_for_versions(
+    backend: &dyn LixBackend,
+    version_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, VersionInfo>, LixError> {
+    let mut versions = BTreeMap::new();
+
+    for version_id in version_ids {
+        let sql = format!(
+            "SELECT snapshot_content \
+             FROM {table_name} \
+             WHERE schema_key = '{schema_key}' \
+               AND entity_id = '{entity_id}' \
+               AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            table_name = VERSION_TIP_TABLE,
+            schema_key = VERSION_TIP_SCHEMA_KEY,
+            entity_id = escape_sql_string(version_id),
+            global_version = GLOBAL_VERSION,
+        );
+
+        let mut info = VersionInfo {
+            parent_commit_ids: Vec::new(),
+            snapshot: VersionSnapshot {
+                id: version_id.clone(),
+                working_commit_id: version_id.clone(),
+            },
+        };
+
+        match backend.execute(&sql, &[]).await {
+            Ok(result) => {
+                if let Some(row) = result.rows.first() {
+                    if let Some(parsed) = parse_version_info_from_tip_snapshot(row, version_id)? {
+                        info = parsed;
+                    }
+                }
+            }
+            Err(err) if is_missing_relation_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+
+        versions.insert(version_id.clone(), info);
+    }
+
+    Ok(versions)
+}
+
+fn parse_version_info_from_tip_snapshot(
+    row: &[EngineValue],
+    fallback_version_id: &str,
+) -> Result<Option<VersionInfo>, LixError> {
+    let Some(first_value) = row.first() else {
+        return Ok(None);
+    };
+    let raw_snapshot = match first_value {
+        EngineValue::Text(value) => value,
+        EngineValue::Null => return Ok(None),
+        _ => {
+            return Err(LixError {
+                message: "version tip snapshot_content must be text".to_string(),
+            })
+        }
+    };
+
+    let snapshot: JsonValue = serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+        message: format!("version tip snapshot_content invalid JSON: {error}"),
+    })?;
+    let version_id = snapshot
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(fallback_version_id)
+        .to_string();
+    let working_commit_id = snapshot
+        .get("working_commit_id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(fallback_version_id)
+        .to_string();
+    let parent_commit_ids = snapshot
+        .get("commit_id")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+
+    Ok(Some(VersionInfo {
+        parent_commit_ids,
+        snapshot: VersionSnapshot {
+            id: version_id,
+            working_commit_id,
+        },
+    }))
 }
 
 fn build_snapshot_on_conflict() -> OnInsert {
@@ -1139,6 +1562,19 @@ fn value_to_string(value: &EngineValue, name: &str) -> Result<String, LixError> 
     }
 }
 
+fn escape_sql_string(input: &str) -> String {
+    input.replace('\'', "''")
+}
+
+fn is_missing_relation_error(err: &LixError) -> bool {
+    let lower = err.message.to_lowercase();
+    lower.contains("no such table")
+        || lower.contains("relation")
+            && (lower.contains("does not exist")
+                || lower.contains("undefined table")
+                || lower.contains("unknown"))
+}
+
 fn make_insert_statement(
     table: &str,
     columns: Vec<Ident>,
@@ -1267,6 +1703,54 @@ fn resolved_snapshot_json(
     }
 
     literal_snapshot_json(expr)
+}
+
+fn literal_optional_json(
+    expr: Option<&Expr>,
+    field_name: &str,
+) -> Result<Option<JsonValue>, LixError> {
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(value),
+            ..
+        }) => serde_json::from_str::<JsonValue>(value)
+            .map(Some)
+            .map_err(|err| LixError {
+                message: format!("vtable insert {field_name} invalid JSON: {err}"),
+            }),
+        _ => Err(LixError {
+            message: format!("vtable insert requires literal {field_name}"),
+        }),
+    }
+}
+
+fn resolved_optional_json(
+    cell: Option<&ResolvedCell>,
+    expr: Option<&Expr>,
+    field_name: &str,
+) -> Result<Option<JsonValue>, LixError> {
+    if let Some(cell) = cell {
+        match &cell.value {
+            Some(EngineValue::Null) => return Ok(None),
+            Some(EngineValue::Text(value)) => {
+                return serde_json::from_str::<JsonValue>(value)
+                    .map(Some)
+                    .map_err(|err| LixError {
+                        message: format!("vtable insert {field_name} invalid JSON: {err}"),
+                    })
+            }
+            _ => {}
+        }
+    }
+
+    literal_optional_json(expr, field_name)
 }
 
 fn resolved_expr_or_original(

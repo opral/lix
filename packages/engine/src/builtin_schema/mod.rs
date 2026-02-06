@@ -6,6 +6,7 @@ use crate::schema::lix_schema_definition;
 const LIX_STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_CHANGE_SCHEMA_KEY: &str = "lix_change";
+const LIX_CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const LIX_CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
 const LIX_COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const LIX_VERSION_TIP_SCHEMA_KEY: &str = "lix_version_tip";
@@ -15,6 +16,7 @@ const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_STORED_SCHEMA_JSON: &str = include_str!("lix_stored_schema.json");
 const LIX_KEY_VALUE_SCHEMA_JSON: &str = include_str!("lix_key_value.json");
 const LIX_CHANGE_SCHEMA_JSON: &str = include_str!("lix_change.json");
+const LIX_CHANGE_AUTHOR_SCHEMA_JSON: &str = include_str!("lix_change_author.json");
 const LIX_CHANGE_SET_SCHEMA_JSON: &str = include_str!("lix_change_set.json");
 const LIX_COMMIT_SCHEMA_JSON: &str = include_str!("lix_commit.json");
 const LIX_VERSION_TIP_SCHEMA_JSON: &str = include_str!("lix_version_tip.json");
@@ -24,6 +26,7 @@ const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
 static LIX_STORED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_KEY_VALUE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_CHANGE_AUTHOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SET_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_VERSION_TIP_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -34,6 +37,7 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_STORED_SCHEMA_KEY,
     LIX_KEY_VALUE_SCHEMA_KEY,
     LIX_CHANGE_SCHEMA_KEY,
+    LIX_CHANGE_AUTHOR_SCHEMA_KEY,
     LIX_CHANGE_SET_SCHEMA_KEY,
     LIX_COMMIT_SCHEMA_KEY,
     LIX_VERSION_TIP_SCHEMA_KEY,
@@ -59,6 +63,9 @@ pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static Jso
             LIX_CHANGE_SCHEMA
                 .get_or_init(|| parse_builtin_schema("lix_change.json", LIX_CHANGE_SCHEMA_JSON)),
         ),
+        LIX_CHANGE_AUTHOR_SCHEMA_KEY => Some(LIX_CHANGE_AUTHOR_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_change_author.json", LIX_CHANGE_AUTHOR_SCHEMA_JSON)
+        })),
         LIX_CHANGE_SET_SCHEMA_KEY => Some(LIX_CHANGE_SET_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_change_set.json", LIX_CHANGE_SET_SCHEMA_JSON)
         })),
@@ -90,6 +97,7 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
         LIX_STORED_SCHEMA_KEY => Some(LIX_STORED_SCHEMA_JSON),
         LIX_KEY_VALUE_SCHEMA_KEY => Some(LIX_KEY_VALUE_SCHEMA_JSON),
         LIX_CHANGE_SCHEMA_KEY => Some(LIX_CHANGE_SCHEMA_JSON),
+        LIX_CHANGE_AUTHOR_SCHEMA_KEY => Some(LIX_CHANGE_AUTHOR_SCHEMA_JSON),
         LIX_CHANGE_SET_SCHEMA_KEY => Some(LIX_CHANGE_SET_SCHEMA_JSON),
         LIX_COMMIT_SCHEMA_KEY => Some(LIX_COMMIT_SCHEMA_JSON),
         LIX_VERSION_TIP_SCHEMA_KEY => Some(LIX_VERSION_TIP_SCHEMA_JSON),
