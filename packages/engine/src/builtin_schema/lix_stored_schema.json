@@ -1,0 +1,37 @@
+{
+  "x-lix-key": "lix_stored_schema",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/value/x-lix-key",
+    "/value/x-lix-version"
+  ],
+  "x-lix-immutable": true,
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\"",
+    "lixcol_version_id": "\"global\""
+  },
+  "type": "object",
+  "properties": {
+    "value": {
+      "type": "object",
+      "properties": {
+        "x-lix-key": {
+          "type": "string"
+        },
+        "x-lix-version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "x-lix-key",
+        "x-lix-version"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "value"
+  ],
+  "additionalProperties": false
+}

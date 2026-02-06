@@ -1,0 +1,71 @@
+{
+  "x-lix-key": "lix_change_set_element",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/change_set_id",
+    "/change_id"
+  ],
+  "x-lix-unique": [
+    [
+      "/change_set_id",
+      "/entity_id",
+      "/schema_key",
+      "/file_id"
+    ]
+  ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/change_set_id"
+      ],
+      "references": {
+        "schemaKey": "lix_change_set",
+        "properties": [
+          "/id"
+        ]
+      }
+    },
+    {
+      "properties": [
+        "/change_id"
+      ],
+      "references": {
+        "schemaKey": "lix_change",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\"",
+    "lixcol_version_id": "\"global\""
+  },
+  "type": "object",
+  "properties": {
+    "change_set_id": {
+      "type": "string"
+    },
+    "change_id": {
+      "type": "string"
+    },
+    "entity_id": {
+      "type": "string"
+    },
+    "schema_key": {
+      "type": "string"
+    },
+    "file_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "change_set_id",
+    "change_id",
+    "entity_id",
+    "schema_key",
+    "file_id"
+  ],
+  "additionalProperties": false
+}

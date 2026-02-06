@@ -1,0 +1,50 @@
+{
+  "x-lix-key": "lix_commit_edge",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/parent_id",
+    "/child_id"
+  ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/parent_id"
+      ],
+      "references": {
+        "schemaKey": "lix_commit",
+        "properties": [
+          "/id"
+        ]
+      }
+    },
+    {
+      "properties": [
+        "/child_id"
+      ],
+      "references": {
+        "schemaKey": "lix_commit",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\""
+  },
+  "type": "object",
+  "properties": {
+    "parent_id": {
+      "type": "string"
+    },
+    "child_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "parent_id",
+    "child_id"
+  ],
+  "additionalProperties": false
+}

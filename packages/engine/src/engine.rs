@@ -1,3 +1,4 @@
+use crate::builtin_schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{
     load_persisted_sequence_next, load_settings, persist_sequence_highest, DeterministicSettings,
@@ -6,8 +7,8 @@ use crate::deterministic_mode::{
 use crate::functions::SharedFunctionProvider;
 use crate::init::init_backend;
 use crate::key_value::{
-    key_value_file_id, key_value_plugin_key, key_value_schema_entity_id, key_value_schema_key,
-    key_value_schema_seed_insert_sql, key_value_schema_version, KEY_VALUE_GLOBAL_VERSION,
+    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+    KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::schema_registry::register_schema;
 use crate::sql::{
@@ -69,7 +70,7 @@ impl Engine {
         let clear_boot_pending = self.deterministic_boot_pending.load(Ordering::SeqCst);
         let result = async {
             init_backend(self.backend.as_ref()).await?;
-            self.ensure_key_value_schema_installed().await?;
+            self.ensure_builtin_schemas_installed().await?;
             self.seed_boot_key_values().await
         }
         .await;
@@ -153,21 +154,38 @@ impl Engine {
         Ok(result)
     }
 
-    async fn ensure_key_value_schema_installed(&self) -> Result<(), LixError> {
-        let entity_id = key_value_schema_entity_id();
-        let exists_sql = format!(
-            "SELECT 1 FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_stored_schema' \
-               AND entity_id = '{entity_id}' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL \
-             LIMIT 1"
-        );
+    async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
+        for schema_key in builtin_schema_keys() {
+            let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
+                message: format!("builtin schema '{schema_key}' is not available"),
+            })?;
+            let entity_id = builtin_schema_entity_id(schema)?;
 
-        let existing = self.execute(&exists_sql, &[]).await?;
-        if existing.rows.is_empty() {
-            let insert_sql = key_value_schema_seed_insert_sql()?;
-            self.execute(&insert_sql, &[]).await?;
+            let existing = self
+                .execute(
+                    "SELECT 1 FROM lix_internal_state_vtable \
+                     WHERE schema_key = 'lix_stored_schema' \
+                       AND entity_id = $1 \
+                       AND version_id = 'global' \
+                       AND snapshot_content IS NOT NULL \
+                     LIMIT 1",
+                    &[Value::Text(entity_id.clone())],
+                )
+                .await?;
+            if !existing.rows.is_empty() {
+                continue;
+            }
+
+            let snapshot_content = serde_json::json!({
+                "value": schema
+            })
+            .to_string();
+            self.execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) \
+                 VALUES ('lix_stored_schema', $1)",
+                &[Value::Text(snapshot_content)],
+            )
+            .await?;
         }
 
         Ok(())
@@ -204,6 +222,23 @@ impl Engine {
 
         Ok(())
     }
+}
+
+fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
+    let schema_key = schema
+        .get("x-lix-key")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            message: "builtin schema must define string x-lix-key".to_string(),
+        })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            message: "builtin schema must define string x-lix-version".to_string(),
+        })?;
+
+    Ok(format!("{schema_key}~{schema_version}"))
 }
 
 fn infer_boot_deterministic_settings(key_values: &[BootKeyValue]) -> Option<DeterministicSettings> {
