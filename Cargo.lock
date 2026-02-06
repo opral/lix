@@ -1370,6 +1370,7 @@ dependencies = [
  "async-trait",
  "lix_engine",
  "rusqlite",
+ "serde_json",
  "tokio",
 ]
 

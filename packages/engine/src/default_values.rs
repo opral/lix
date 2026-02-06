@@ -3,6 +3,7 @@ use sqlparser::ast::Value as AstValue;
 use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Statement, TableObject};
 
 use crate::cel::CelEvaluator;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::{OverlaySchemaProvider, SchemaKey, SchemaProvider};
 use crate::sql::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
 use crate::{LixBackend, LixError, Value};
@@ -10,12 +11,16 @@ use crate::{LixBackend, LixError, Value};
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 
-pub async fn apply_vtable_insert_defaults(
+pub async fn apply_vtable_insert_defaults<P>(
     backend: &dyn LixBackend,
     evaluator: &CelEvaluator,
     statements: &mut [Statement],
     params: &[Value],
-) -> Result<(), LixError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<(), LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
 
     for statement in statements {
@@ -27,18 +32,29 @@ pub async fn apply_vtable_insert_defaults(
             continue;
         }
 
-        apply_statement_defaults(evaluator, insert, &mut schema_provider, params).await?;
+        apply_statement_defaults(
+            evaluator,
+            insert,
+            &mut schema_provider,
+            params,
+            functions.clone(),
+        )
+        .await?;
     }
 
     Ok(())
 }
 
-async fn apply_statement_defaults(
+async fn apply_statement_defaults<P>(
     evaluator: &CelEvaluator,
     insert: &mut Insert,
     schema_provider: &mut OverlaySchemaProvider<'_>,
     params: &[Value],
-) -> Result<(), LixError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<(), LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let schema_idx = match find_column_index(&insert.columns, "schema_key") {
         Some(index) => index,
         None => return Ok(()),
@@ -96,6 +112,7 @@ async fn apply_statement_defaults(
             &schema,
             &context,
             evaluator,
+            functions.clone(),
             &schema_key,
             &schema_version,
         )? {
@@ -136,20 +153,26 @@ async fn apply_statement_defaults(
     Ok(())
 }
 
-fn apply_defaults_to_snapshot(
+fn apply_defaults_to_snapshot<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,
     context: &JsonMap<String, JsonValue>,
     evaluator: &CelEvaluator,
+    functions: SharedFunctionProvider<P>,
     schema_key: &str,
     schema_version: &str,
-) -> Result<bool, LixError> {
+) -> Result<bool, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let Some(properties) = schema.get("properties").and_then(|value| value.as_object()) else {
         return Ok(false);
     };
+    let mut ordered_properties: Vec<(&String, &JsonValue)> = properties.iter().collect();
+    ordered_properties.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
 
     let mut changed = false;
-    for (field_name, field_schema) in properties {
+    for (field_name, field_schema) in ordered_properties {
         if snapshot.contains_key(field_name) {
             continue;
         }
@@ -159,7 +182,7 @@ fn apply_defaults_to_snapshot(
             .and_then(|value| value.as_str())
         {
             let value = evaluator
-                .evaluate(expression, context)
+                .evaluate_with_functions(expression, context, functions.clone())
                 .map_err(|err| LixError {
                     message: format!(
                         "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
@@ -228,6 +251,7 @@ mod tests {
     use sqlparser::ast::{Expr, SetExpr, Statement};
 
     use crate::cel::CelEvaluator;
+    use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
     use crate::sql::parse_sql_statements;
     use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -240,6 +264,10 @@ mod tests {
         async fn execute(&self, _: &str, _: &[Value]) -> Result<QueryResult, LixError> {
             panic!("defaulting should resolve schema from pending in-request inserts")
         }
+    }
+
+    fn system_functions() -> SharedFunctionProvider<SystemFunctionProvider> {
+        SharedFunctionProvider::new(SystemFunctionProvider)
     }
 
     #[test]
@@ -262,6 +290,7 @@ mod tests {
             &schema,
             &context,
             &evaluator,
+            system_functions(),
             "test_schema",
             "1",
         )
@@ -294,6 +323,7 @@ mod tests {
             &schema,
             &context,
             &evaluator,
+            system_functions(),
             "test_schema",
             "1",
         )
@@ -326,6 +356,7 @@ mod tests {
             &schema,
             &context,
             &evaluator,
+            system_functions(),
             "test_schema",
             "1",
         )
@@ -333,6 +364,64 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(snapshot.get("status"), Some(&JsonValue::Null));
+    }
+
+    #[test]
+    fn applies_cel_defaults_in_stable_sorted_field_order() {
+        struct CountingFunctions {
+            next: i64,
+        }
+
+        impl LixFunctionProvider for CountingFunctions {
+            fn uuid_v7(&mut self) -> String {
+                let current = self.next;
+                self.next += 1;
+                format!("uuid-{current}")
+            }
+
+            fn timestamp(&mut self) -> String {
+                let current = self.next;
+                self.next += 1;
+                format!("ts-{current}")
+            }
+        }
+
+        let evaluator = CelEvaluator::new();
+        let schema = json!({
+            "properties": {
+                "z_uuid": {
+                    "type": "string",
+                    "x-lix-default": "lix_uuid_v7()"
+                },
+                "a_timestamp": {
+                    "type": "string",
+                    "x-lix-default": "lix_timestamp()"
+                }
+            }
+        });
+        let mut snapshot = JsonMap::new();
+        let context = snapshot.clone();
+
+        let changed = apply_defaults_to_snapshot(
+            &mut snapshot,
+            &schema,
+            &context,
+            &evaluator,
+            SharedFunctionProvider::new(CountingFunctions { next: 0 }),
+            "test_schema",
+            "1",
+        )
+        .expect("apply defaults");
+
+        assert!(changed);
+        assert_eq!(
+            snapshot.get("a_timestamp"),
+            Some(&JsonValue::String("ts-0".to_string()))
+        );
+        assert_eq!(
+            snapshot.get("z_uuid"),
+            Some(&JsonValue::String("uuid-1".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -347,9 +436,15 @@ mod tests {
         )
         .expect("parse SQL");
 
-        apply_vtable_insert_defaults(&backend, &evaluator, &mut statements, &Vec::new())
-            .await
-            .expect("apply defaults");
+        apply_vtable_insert_defaults(
+            &backend,
+            &evaluator,
+            &mut statements,
+            &Vec::new(),
+            system_functions(),
+        )
+        .await
+        .expect("apply defaults");
 
         let Statement::Insert(insert) = &statements[1] else {
             panic!("expected second statement to be insert");

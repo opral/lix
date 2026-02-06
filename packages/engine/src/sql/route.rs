@@ -1,14 +1,16 @@
 use sqlparser::ast::Statement;
 
+use crate::functions::LixFunctionProvider;
 use crate::sql::steps::{stored_schema, vtable_read, vtable_write};
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
 use crate::{LixError, Value};
 
-pub fn rewrite_statement(
+pub fn rewrite_statement<P: LixFunctionProvider>(
     statement: Statement,
     params: &[Value],
+    functions: &mut P,
 ) -> Result<RewriteOutput, LixError> {
     match statement {
         Statement::Insert(insert) => {
@@ -26,7 +28,9 @@ pub fn rewrite_statement(
                 }
             }
             if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) = vtable_write::rewrite_insert(inner.clone(), params)? {
+                if let Some(rewritten) =
+                    vtable_write::rewrite_insert(inner.clone(), params, functions)?
+                {
                     registrations.extend(rewritten.registrations);
                     statements = rewritten.statements;
                     mutations = rewritten.mutations;

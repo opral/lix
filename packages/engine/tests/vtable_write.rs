@@ -20,7 +20,7 @@ simulation_test!(
     untracked_state_routes_to_untracked_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -137,7 +137,7 @@ simulation_test!(
 
 simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -183,7 +183,7 @@ simulation_test!(
     tracked_state_creates_change_and_materialized_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -256,7 +256,7 @@ simulation_test!(
     tracked_insert_accepts_parameterized_values,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -302,7 +302,7 @@ simulation_test!(
     tracked_insert_updates_schema_version_on_conflict,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -375,7 +375,7 @@ simulation_test!(
 
 simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -430,7 +430,7 @@ simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
 
 simulation_test!(tracked_insert_select_zero_rows_is_noop, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -474,7 +474,7 @@ simulation_test!(
     tracked_state_uses_no_content_snapshot_for_nulls,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -509,7 +509,7 @@ simulation_test!(
 
 simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -558,7 +558,7 @@ simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
 
 simulation_test!(tracked_update_creates_change_row, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -646,7 +646,7 @@ simulation_test!(
     tracked_delete_creates_change_and_tombstone,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -712,7 +712,7 @@ simulation_test!(
 
 simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -823,7 +823,7 @@ simulation_test!(
     tracked_update_null_uses_no_content_snapshot,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -889,7 +889,7 @@ simulation_test!(
     mixed_tracked_and_untracked_insert_splits_writes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 

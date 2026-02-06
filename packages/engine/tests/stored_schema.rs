@@ -6,7 +6,7 @@ simulation_test!(
     stored_schema_registers_materialized_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -69,7 +69,7 @@ simulation_test!(
     stored_schema_insert_accepts_parameterized_snapshot,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -109,7 +109,7 @@ simulation_test!(
     stored_schema_requires_foreign_key_targets_are_unique_or_primary,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -160,7 +160,7 @@ simulation_test!(
     stored_schema_updates_validate_schema_definition,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 

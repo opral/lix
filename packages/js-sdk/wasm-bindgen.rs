@@ -3,7 +3,8 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, LixBackend, LixError, QueryResult as EngineQueryResult, Value as EngineValue,
+        boot, BootArgs, LixBackend, LixError, QueryResult as EngineQueryResult,
+        Value as EngineValue,
     };
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -32,7 +33,7 @@ mod wasm {
     pub fn open_lix(backend: JsValue) -> Result<Lix, JsValue> {
         let backend = Box::new(JsBackend { backend });
         Ok(Lix {
-            engine: boot(backend),
+            engine: boot(BootArgs::new(backend)),
         })
     }
 

@@ -5,26 +5,36 @@ use sqlparser::ast::{
 };
 use sqlparser::ast::{VisitMut, VisitorMut};
 
-use crate::functions::timestamp::timestamp;
-use crate::functions::uuid_v7::uuid_v7;
+use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
 
-pub fn inline_lix_functions(mut statement: Statement) -> Statement {
-    let mut inliner = LixFunctionInliner;
+#[allow(dead_code)]
+pub fn inline_lix_functions(statement: Statement) -> Statement {
+    let mut provider = SystemFunctionProvider;
+    inline_lix_functions_with_provider(statement, &mut provider)
+}
+
+pub fn inline_lix_functions_with_provider<P: LixFunctionProvider>(
+    mut statement: Statement,
+    provider: &mut P,
+) -> Statement {
+    let mut inliner = LixFunctionInliner { provider };
     let _ = statement.visit(&mut inliner);
     statement
 }
 
-struct LixFunctionInliner;
+struct LixFunctionInliner<'a, P: LixFunctionProvider> {
+    provider: &'a mut P,
+}
 
-impl VisitorMut for LixFunctionInliner {
+impl<P: LixFunctionProvider> VisitorMut for LixFunctionInliner<'_, P> {
     type Break = ();
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::Function(function) = expr {
             if function_is(function, "lix_uuid_v7") && function_args_empty(function) {
-                *expr = Expr::Value(Value::SingleQuotedString(uuid_v7()).into());
+                *expr = Expr::Value(Value::SingleQuotedString(self.provider.uuid_v7()).into());
             } else if function_is(function, "lix_timestamp") && function_args_empty(function) {
-                *expr = Expr::Value(Value::SingleQuotedString(timestamp()).into());
+                *expr = Expr::Value(Value::SingleQuotedString(self.provider.timestamp()).into());
             }
         }
         ControlFlow::Continue(())
@@ -54,8 +64,29 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::inline_lix_functions;
+    use crate::functions::LixFunctionProvider;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    #[derive(Default)]
+    struct TestProvider {
+        uuid_calls: usize,
+        timestamp_calls: usize,
+    }
+
+    impl LixFunctionProvider for TestProvider {
+        fn uuid_v7(&mut self) -> String {
+            let value = format!("uuid-{}", self.uuid_calls);
+            self.uuid_calls += 1;
+            value
+        }
+
+        fn timestamp(&mut self) -> String {
+            let value = format!("ts-{}", self.timestamp_calls);
+            self.timestamp_calls += 1;
+            value
+        }
+    }
 
     #[test]
     fn inlines_uuid_and_timestamp_calls() {
@@ -71,5 +102,21 @@ mod tests {
         assert!(rewritten.contains("'"));
         assert!(rewritten.contains("T"));
         assert!(rewritten.contains("Z"));
+    }
+
+    #[test]
+    fn inlines_with_custom_provider() {
+        let sql = "SELECT lix_uuid_v7(), lix_timestamp(), lix_uuid_v7()";
+        let dialect = GenericDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
+        let statement = statements.remove(0);
+        let mut provider = TestProvider::default();
+
+        let rewritten = super::inline_lix_functions_with_provider(statement, &mut provider);
+        let rewritten_sql = rewritten.to_string();
+
+        assert!(rewritten_sql.contains("'uuid-0'"));
+        assert!(rewritten_sql.contains("'ts-0'"));
+        assert!(rewritten_sql.contains("'uuid-1'"));
     }
 }

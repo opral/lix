@@ -4,9 +4,10 @@ use std::sync::{Arc, RwLock};
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::LixError;
 
-use super::context::build_context;
+use super::context::build_context_with_functions;
 use super::value::cel_to_json;
 
 #[derive(Debug)]
@@ -24,13 +25,27 @@ impl CelEvaluator {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn evaluate(
         &self,
         expression: &str,
         variables: &JsonMap<String, JsonValue>,
     ) -> Result<JsonValue, LixError> {
+        let functions = SharedFunctionProvider::new(SystemFunctionProvider);
+        self.evaluate_with_functions(expression, variables, functions)
+    }
+
+    pub fn evaluate_with_functions<P>(
+        &self,
+        expression: &str,
+        variables: &JsonMap<String, JsonValue>,
+        functions: SharedFunctionProvider<P>,
+    ) -> Result<JsonValue, LixError>
+    where
+        P: LixFunctionProvider + Send + 'static,
+    {
         let compiled = self.compile(expression)?;
-        let context = build_context(variables)?;
+        let context = build_context_with_functions(variables, functions)?;
         let value = compiled.program.execute(&context).map_err(|err| LixError {
             message: format!("failed to evaluate CEL expression '{expression}': {err}"),
         })?;

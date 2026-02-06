@@ -3,6 +3,7 @@ mod support;
 use chrono::DateTime;
 use lix_engine::Value;
 use serde_json::Value as JsonValue;
+use support::simulation_test::{default_simulations, run_simulation_test, SimulationArgs};
 use uuid::Uuid;
 
 async fn insert_schema(engine: &support::simulation_test::SimulationEngine, schema: &str) {
@@ -25,9 +26,27 @@ fn text_to_json(value: &Value) -> JsonValue {
     }
 }
 
+async fn enable_deterministic_mode(engine: &support::simulation_test::SimulationEngine) {
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'lix_deterministic_mode', 'lix_key_value', 'lix', 'global', 'lix', '{\"key\":\"lix_deterministic_mode\",\"value\":{\"enabled\":true}}', '1'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+fn deterministic_uuid(counter: i64) -> String {
+    format!("01920000-0000-7000-8000-0000{counter:08x}")
+}
+
 simulation_test!(insert_applies_cel_default, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -67,7 +86,7 @@ simulation_test!(
     insert_applies_cel_default_with_parameterized_snapshot_content,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -116,7 +135,7 @@ simulation_test!(
     insert_select_applies_cel_default_with_parameterized_source,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -163,7 +182,7 @@ simulation_test!(
 
 simulation_test!(insert_uses_json_default_fallback, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -197,7 +216,7 @@ simulation_test!(insert_uses_json_default_fallback, |sim| async move {
 
 simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -234,7 +253,7 @@ simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
 
 simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -268,7 +287,7 @@ simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
 
 simulation_test!(update_does_not_backfill_defaults, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -309,13 +328,14 @@ simulation_test!(update_does_not_backfill_defaults, |sim| async move {
     assert!(snapshot.get("slug").is_none());
 });
 
-simulation_test!(insert_applies_uuid_function_default, |sim| async move {
+async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
     engine.init().await.unwrap();
+    enable_deterministic_mode(&engine).await;
 
     insert_schema(
         &engine,
@@ -341,26 +361,36 @@ simulation_test!(insert_applies_uuid_function_default, |sim| async move {
 
     let snapshot = text_to_json(&row.rows[0][0]);
     let token = snapshot["token"].as_str().expect("token to be string");
+    sim.expect_deterministic(token.to_string());
+    assert_eq!(token, deterministic_uuid(0));
     Uuid::parse_str(token).expect("token to be valid UUID");
-});
+}
 
-simulation_test!(
-    insert_applies_timestamp_function_default,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine()
-            .await
-            .expect("boot_simulated_engine should succeed");
+#[tokio::test]
+async fn insert_applies_uuid_function_default() {
+    run_simulation_test(
+        default_simulations(),
+        run_insert_applies_uuid_function_default,
+    )
+    .await;
+}
 
-        engine.init().await.unwrap();
+async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
 
-        insert_schema(
+    engine.init().await.unwrap();
+    enable_deterministic_mode(&engine).await;
+
+    insert_schema(
         &engine,
         r#"{"value":{"x-lix-key":"timestamp_fn_default_schema","x-lix-version":"1","type":"object","properties":{"name":{"type":"string"},"created_at":{"type":"string","x-lix-default":"lix_timestamp()"}},"required":["name"],"additionalProperties":false}}"#,
     )
     .await;
 
-        engine
+    engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'timestamp_fn_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1')",
             &[],
@@ -368,7 +398,7 @@ simulation_test!(
         .await
         .unwrap();
 
-        let row = engine
+    let row = engine
         .execute(
             "SELECT snapshot_content FROM lix_internal_state_vtable WHERE schema_key = 'timestamp_fn_default_schema' AND entity_id = 'entity-1'",
             &[],
@@ -376,23 +406,33 @@ simulation_test!(
         .await
         .unwrap();
 
-        let snapshot = text_to_json(&row.rows[0][0]);
-        let created_at = snapshot["created_at"]
-            .as_str()
-            .expect("created_at to be string");
-        DateTime::parse_from_rfc3339(created_at).expect("created_at to be strict RFC3339");
-        assert!(created_at.ends_with('Z'));
-        let fraction = created_at
-            .split('.')
-            .nth(1)
-            .expect("created_at has millisecond fraction");
-        assert_eq!(fraction.len(), 4);
-    }
-);
+    let snapshot = text_to_json(&row.rows[0][0]);
+    let created_at = snapshot["created_at"]
+        .as_str()
+        .expect("created_at to be string");
+    sim.expect_deterministic(created_at.to_string());
+    assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
+    DateTime::parse_from_rfc3339(created_at).expect("created_at to be strict RFC3339");
+    assert!(created_at.ends_with('Z'));
+    let fraction = created_at
+        .split('.')
+        .nth(1)
+        .expect("created_at has millisecond fraction");
+    assert_eq!(fraction.len(), 4);
+}
+
+#[tokio::test]
+async fn insert_applies_timestamp_function_default() {
+    run_simulation_test(
+        default_simulations(),
+        run_insert_applies_timestamp_function_default,
+    )
+    .await;
+}
 
 simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 

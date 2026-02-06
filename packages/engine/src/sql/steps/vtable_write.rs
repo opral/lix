@@ -7,8 +7,7 @@ use sqlparser::ast::{
     TableObject, TableWithJoins, Update, Value, ValueWithSpan, Values,
 };
 
-use crate::functions::timestamp::timestamp;
-use crate::functions::uuid_v7::uuid_v7;
+use crate::functions::LixFunctionProvider;
 use crate::sql::types::{
     MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
@@ -72,6 +71,7 @@ pub struct VtableDeleteRewrite {
 pub fn rewrite_insert(
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<Option<VtableWriteRewrite>, LixError> {
     if !table_object_is_vtable(&insert.table) {
         return Ok(None);
@@ -129,13 +129,18 @@ pub fn rewrite_insert(
     let mut mutations: Vec<MutationRow> = Vec::new();
 
     if !tracked_rows.is_empty() {
-        let tracked =
-            rewrite_tracked_rows(&insert, tracked_rows, &mut registrations, &mut mutations)?;
+        let tracked = rewrite_tracked_rows(
+            &insert,
+            tracked_rows,
+            &mut registrations,
+            &mut mutations,
+            functions,
+        )?;
         statements.extend(tracked);
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations)?;
+        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations, functions)?;
         statements.push(untracked);
     }
 
@@ -347,8 +352,9 @@ pub fn rewrite_delete(delete: Delete) -> Result<Option<DeleteRewrite>, LixError>
 pub fn build_update_followup_sql(
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
-    let statements = build_update_followup_statements(plan, rows)?;
+    let statements = build_update_followup_statements(plan, rows, functions)?;
     Ok(statements
         .into_iter()
         .map(|statement| statement.to_string())
@@ -359,8 +365,9 @@ pub fn build_update_followup_sql(
 pub fn build_delete_followup_sql(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
-    let statements = build_delete_followup_statements(plan, rows)?;
+    let statements = build_delete_followup_statements(plan, rows, functions)?;
     Ok(statements
         .into_iter()
         .map(|statement| statement.to_string())
@@ -485,6 +492,7 @@ fn rewrite_tracked_rows(
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     registrations: &mut Vec<SchemaRegistration>,
     mutations: &mut Vec<MutationRow>,
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
@@ -523,13 +531,13 @@ fn rewrite_tracked_rows(
             ensure_no_content = true;
             "no-content".to_string()
         } else {
-            let id = uuid_v7();
+            let id = functions.uuid_v7();
             snapshot_rows.push(vec![string_expr(&id), snapshot_content.clone()]);
             id
         };
 
-        let change_id = uuid_v7();
-        let created_at = timestamp();
+        let change_id = functions.uuid_v7();
+        let created_at = functions.timestamp();
         let updated_at = created_at.clone();
 
         let metadata_expr = match metadata_idx {
@@ -685,6 +693,7 @@ fn build_untracked_insert(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     mutations: &mut Vec<MutationRow>,
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<Statement, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
@@ -696,7 +705,7 @@ fn build_untracked_insert(
 
     let mut mapped_rows = Vec::new();
     for (row, materialized) in rows {
-        let now = timestamp();
+        let now = functions.timestamp();
         mapped_rows.push(vec![
             resolved_expr_or_original(materialized.get(entity_idx), row.get(entity_idx))?,
             resolved_expr_or_original(materialized.get(schema_idx), row.get(schema_idx))?,
@@ -773,6 +782,7 @@ fn build_untracked_insert(
 fn build_update_followup_statements(
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -802,7 +812,7 @@ fn build_update_followup_statements(
             ensure_no_content = true;
             "no-content".to_string()
         } else {
-            let id = uuid_v7();
+            let id = functions.uuid_v7();
             snapshot_rows.push(vec![
                 string_expr(&id),
                 value_to_expr(snapshot_content_value)?,
@@ -810,7 +820,7 @@ fn build_update_followup_statements(
             id
         };
 
-        let change_id = uuid_v7();
+        let change_id = functions.uuid_v7();
 
         change_rows.push(vec![
             string_expr(&change_id),
@@ -882,6 +892,7 @@ fn build_update_followup_statements(
 fn build_delete_followup_statements(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
+    functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -904,7 +915,7 @@ fn build_delete_followup_statements(
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let updated_at = value_to_string(&row[6], "updated_at")?;
 
-        let change_id = uuid_v7();
+        let change_id = functions.uuid_v7();
 
         change_rows.push(vec![
             string_expr(&change_id),
@@ -1739,6 +1750,7 @@ mod tests {
         rewrite_delete, rewrite_insert, rewrite_update, DeleteRewrite, UpdateRewrite,
         UPDATE_RETURNING_COLUMNS,
     };
+    use crate::functions::SystemFunctionProvider;
     use crate::Value as EngineValue;
     use serde_json::json;
     use sqlparser::ast::{
@@ -1760,7 +1772,8 @@ mod tests {
             _ => panic!("expected insert"),
         };
 
-        let rewrite = rewrite_insert(insert, &[])
+        let mut provider = SystemFunctionProvider;
+        let rewrite = rewrite_insert(insert, &[], &mut provider)
             .expect("rewrite ok")
             .expect("rewrite applied");
 
@@ -1795,7 +1808,8 @@ mod tests {
             _ => panic!("expected insert"),
         };
 
-        let rewrite = rewrite_insert(insert, &[])
+        let mut provider = SystemFunctionProvider;
+        let rewrite = rewrite_insert(insert, &[], &mut provider)
             .expect("rewrite ok")
             .expect("rewrite applied");
 
@@ -1823,7 +1837,8 @@ mod tests {
             _ => panic!("expected insert"),
         };
 
-        let rewrite = rewrite_insert(insert, &[])
+        let mut provider = SystemFunctionProvider;
+        let rewrite = rewrite_insert(insert, &[], &mut provider)
             .expect("rewrite ok")
             .expect("rewrite applied");
 
@@ -1915,7 +1930,8 @@ mod tests {
             _ => panic!("expected insert"),
         };
 
-        let rewrite = rewrite_insert(insert, &[])
+        let mut provider = SystemFunctionProvider;
+        let rewrite = rewrite_insert(insert, &[], &mut provider)
             .expect("rewrite ok")
             .expect("rewrite applied");
 
