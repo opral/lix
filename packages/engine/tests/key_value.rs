@@ -37,7 +37,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(after_insert.rows.clone());
+    sim.assert_deterministic(after_insert.rows.clone());
     assert_eq!(after_insert.rows.len(), 1);
     assert_eq!(
         after_insert.rows[0][0],
@@ -65,7 +65,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(after_update.rows.clone());
+    sim.assert_deterministic(after_update.rows.clone());
     assert_eq!(after_update.rows.len(), 1);
     assert_eq!(
         after_update.rows[0][0],
@@ -93,7 +93,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(after_delete.rows.clone());
+    sim.assert_deterministic(after_delete.rows.clone());
     assert_eq!(after_delete.rows.len(), 0);
 });
 
@@ -133,7 +133,7 @@ simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(rows.rows.clone());
+    sim.assert_deterministic(rows.rows.clone());
     assert_eq!(rows.rows.len(), 6);
 
     let actual_by_id: HashMap<String, String> = rows
@@ -209,7 +209,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(rows.rows.clone());
+        sim.assert_deterministic(rows.rows.clone());
         assert_eq!(rows.rows.len(), 2);
 
         let number_row = &rows.rows[0];

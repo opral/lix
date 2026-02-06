@@ -17,7 +17,7 @@ use crate::sql::types::{
     MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::sql::SchemaRegistration;
-use crate::sql::{resolve_expr_cell, ResolvedCell, RowSourceResolver};
+use crate::sql::{resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver};
 use crate::Value as EngineValue;
 use crate::{LixBackend, LixError};
 
@@ -2042,12 +2042,7 @@ fn build_update_validation_plan(
     table_name: Option<String>,
     params: &[EngineValue],
 ) -> Result<Option<UpdateValidationPlan>, LixError> {
-    let snapshot_expr = find_assignment_value(&update.assignments, "snapshot_content");
-    let snapshot_content = match snapshot_expr {
-        Some(expr) => Some(literal_snapshot_json_value(expr, params)?),
-        None => None,
-    }
-    .flatten();
+    let snapshot_content = snapshot_content_from_assignments(&update.assignments, params)?;
     let where_clause = update.selection.as_ref().map(|expr| expr.to_string());
     let table = table_name.ok_or_else(|| LixError {
         message: "update validation requires target table".to_string(),
@@ -2060,22 +2055,22 @@ fn build_update_validation_plan(
     }))
 }
 
-fn find_assignment_value<'a>(assignments: &'a [Assignment], column: &str) -> Option<&'a Expr> {
-    assignments.iter().find_map(|assignment| {
-        if assignment_target_is_column(&assignment.target, column) {
-            Some(&assignment.value)
-        } else {
-            None
-        }
-    })
-}
-
-fn literal_snapshot_json_value(
-    expr: &Expr,
+fn snapshot_content_from_assignments(
+    assignments: &[Assignment],
     params: &[EngineValue],
 ) -> Result<Option<JsonValue>, LixError> {
-    let cell = resolve_expr_cell(expr, params)?;
-    match cell.value {
+    let mut state = PlaceholderState::new();
+    for assignment in assignments {
+        let value = resolve_expr_cell_with_state(&assignment.value, params, &mut state)?;
+        if assignment_target_is_column(&assignment.target, "snapshot_content") {
+            return resolved_snapshot_json_value(value.value);
+        }
+    }
+    Ok(None)
+}
+
+fn resolved_snapshot_json_value(value: Option<EngineValue>) -> Result<Option<JsonValue>, LixError> {
+    match value {
         Some(EngineValue::Null) => Ok(None),
         Some(EngineValue::Text(value)) => serde_json::from_str::<JsonValue>(&value)
             .map(Some)

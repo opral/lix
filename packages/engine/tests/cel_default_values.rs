@@ -362,7 +362,7 @@ async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
 
     let snapshot = text_to_json(&row.rows[0][0]);
     let token = snapshot["token"].as_str().expect("token to be string");
-    sim.expect_deterministic(token.to_string());
+    sim.assert_deterministic(token.to_string());
     assert_eq!(token, deterministic_uuid(0));
     Uuid::parse_str(token).expect("token to be valid UUID");
 }
@@ -411,7 +411,7 @@ async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
     let created_at = snapshot["created_at"]
         .as_str()
         .expect("created_at to be string");
-    sim.expect_deterministic(created_at.to_string());
+    sim.assert_deterministic(created_at.to_string());
     assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
     DateTime::parse_from_rfc3339(created_at).expect("created_at to be strict RFC3339");
     assert!(created_at.ends_with('Z'));

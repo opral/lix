@@ -57,7 +57,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(initial.rows.clone());
+        sim.assert_deterministic(initial.rows.clone());
         assert_eq!(initial.rows.len(), 1);
         assert_eq!(
             initial.rows[0][0],
@@ -107,7 +107,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],

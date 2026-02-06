@@ -1,0 +1,27 @@
+{
+  "x-lix-key": "lix_active_version",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\"",
+    "lixcol_untracked": "1",
+    "lixcol_version_id": "\"global\""
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "version_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "version_id"
+  ],
+  "additionalProperties": false
+}
