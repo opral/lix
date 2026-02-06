@@ -2,6 +2,7 @@ use serde_json::Value as JsonValue;
 
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
+use crate::json_truthiness::{loosely_false, loosely_true};
 use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
@@ -13,6 +14,7 @@ use crate::{LixError, Value};
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 const EPOCH_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeterministicSettings {
@@ -60,8 +62,8 @@ impl LixFunctionProvider for RuntimeFunctionProvider {
     fn uuid_v7(&mut self) -> String {
         if self.settings.enabled && self.settings.uuid_v7_enabled {
             let counter = self.take_sequence();
-            let hex = format!("{counter:08x}");
-            return format!("01920000-0000-7000-8000-0000{hex}");
+            let counter_bits = (counter as u64) & DETERMINISTIC_UUID_COUNTER_MASK;
+            return format!("01920000-0000-7000-8000-{counter_bits:012x}");
         }
         uuid_v7()
     }
@@ -185,29 +187,6 @@ fn parse_integer_value(value: &JsonValue) -> Option<i64> {
         JsonValue::Number(number) => number.as_i64(),
         JsonValue::String(text) => text.parse::<i64>().ok(),
         _ => None,
-    }
-}
-
-fn loosely_true(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Bool(boolean) => *boolean,
-        JsonValue::Number(number) => {
-            number.as_i64() == Some(1) || number.as_u64() == Some(1) || number.as_f64() == Some(1.0)
-        }
-        JsonValue::String(text) => text == "1",
-        _ => false,
-    }
-}
-
-fn loosely_false(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Bool(boolean) => !boolean,
-        JsonValue::Number(number) => {
-            number.as_i64() == Some(0) || number.as_u64() == Some(0) || number.as_f64() == Some(0.0)
-        }
-        JsonValue::String(text) => text.is_empty() || text == "0",
-        JsonValue::Array(values) => values.is_empty(),
-        _ => false,
     }
 }
 

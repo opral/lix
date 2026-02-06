@@ -41,7 +41,8 @@ async fn enable_deterministic_mode(engine: &support::simulation_test::Simulation
 }
 
 fn deterministic_uuid(counter: i64) -> String {
-    format!("01920000-0000-7000-8000-0000{counter:08x}")
+    let counter_bits = (counter as u64) & 0x0000_FFFF_FFFF_FFFF;
+    format!("01920000-0000-7000-8000-{counter_bits:012x}")
 }
 
 simulation_test!(insert_applies_cel_default, |sim| async move {

@@ -327,8 +327,47 @@ where
         commit_row.snapshot_content = Some(snapshot.to_string());
     }
 
+    let mut commit_snapshot_by_version: BTreeMap<String, String> = BTreeMap::new();
+    for version_id in meta_by_version.keys() {
+        let commit_row_idx =
+            *commit_row_index_by_version
+                .get(version_id)
+                .ok_or_else(|| LixError {
+                    message: format!(
+                        "generate_commit: missing commit row index for version '{}'",
+                        version_id
+                    ),
+                })?;
+        let commit_row = meta_changes.get(commit_row_idx).ok_or_else(|| LixError {
+            message: format!(
+                "generate_commit: missing commit row for version '{}'",
+                version_id
+            ),
+        })?;
+        let commit_snapshot = commit_row
+            .snapshot_content
+            .as_ref()
+            .ok_or_else(|| LixError {
+                message: format!(
+                    "generate_commit: commit row for version '{}' is missing snapshot_content",
+                    version_id
+                ),
+            })?
+            .clone();
+        commit_snapshot_by_version.insert(version_id.clone(), commit_snapshot);
+    }
+
     // Materialize commit rows and version_tip rows so commit views can resolve immediately.
     for (version_id, meta) in &meta_by_version {
+        let commit_snapshot = commit_snapshot_by_version
+            .get(version_id)
+            .cloned()
+            .ok_or_else(|| LixError {
+                message: format!(
+                    "generate_commit: missing finalized commit snapshot for version '{}'",
+                    version_id
+                ),
+            })?;
         materialized_state.push(MaterializedStateRow {
             id: generate_uuid(),
             entity_id: meta.commit_id.clone(),
@@ -336,13 +375,7 @@ where
             schema_version: commit_schema.schema_version.clone(),
             file_id: commit_schema.file_id.clone(),
             plugin_key: commit_schema.plugin_key.clone(),
-            snapshot_content: Some(
-                json!({
-                    "id": meta.commit_id,
-                    "change_set_id": meta.change_set_id,
-                })
-                .to_string(),
-            ),
+            snapshot_content: Some(commit_snapshot),
             metadata: None,
             created_at: args.timestamp.clone(),
             lixcol_version_id: GLOBAL_VERSION.to_string(),
@@ -618,6 +651,16 @@ mod tests {
             commit_snapshot["author_account_ids"],
             serde_json::json!(["acct-1"])
         );
+
+        let materialized_commit_row = result
+            .materialized_state
+            .iter()
+            .find(|row| row.schema_key == "lix_commit")
+            .expect("expected materialized commit row");
+        let materialized_commit_snapshot: serde_json::Value =
+            serde_json::from_str(materialized_commit_row.snapshot_content.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(materialized_commit_snapshot, commit_snapshot);
 
         let materialized_counts = counts_by_schema(&result.materialized_state);
         assert_eq!(materialized_counts.get("lix_key_value"), Some(&1));

@@ -8,6 +8,7 @@ mod engine;
 mod error;
 mod functions;
 mod init;
+mod json_truthiness;
 mod key_value;
 mod schema;
 mod schema_registry;
