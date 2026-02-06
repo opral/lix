@@ -6,7 +6,7 @@ simulation_test!(
     vtable_read_prioritizes_untracked_over_tracked,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -27,10 +27,10 @@ simulation_test!(
         // Insert tracked row directly into materialized table.
         engine
         .execute(
-            "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}'\
              )",
             &[],
         )
@@ -73,7 +73,7 @@ simulation_test!(
     vtable_read_returns_tracked_when_no_untracked_exists,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -94,10 +94,10 @@ simulation_test!(
         // Insert tracked row directly into materialized table.
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}'\
              )",
                 &[],
             )
@@ -127,7 +127,7 @@ simulation_test!(
     vtable_read_schema_key_in_selects_multiple_materialized_tables,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -158,12 +158,12 @@ simulation_test!(
         // Insert tracked rows into both materialized tables.
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
-             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
              )",
                 &[],
             )
@@ -171,10 +171,10 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
              )",
                 &[],
             )
@@ -209,7 +209,7 @@ simulation_test!(
     vtable_read_schema_key_in_single_filters_out_other,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -238,12 +238,12 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
-             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
              )",
                 &[],
             )
@@ -251,10 +251,10 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
              )",
                 &[],
             )
@@ -296,7 +296,7 @@ simulation_test!(
     vtable_read_schema_key_equals_selects_single_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -325,12 +325,12 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
-             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
              )",
                 &[],
             )
@@ -338,10 +338,10 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
              )",
                 &[],
             )
@@ -371,7 +371,7 @@ simulation_test!(
     vtable_read_filters_by_entity_id_with_schema_key,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -400,12 +400,12 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
-             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
              )",
                 &[],
             )
@@ -413,10 +413,10 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
              )",
                 &[],
             )
@@ -450,7 +450,7 @@ simulation_test!(
     vtable_read_filters_by_file_id_with_schema_key,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -479,12 +479,12 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
-             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
              )",
                 &[],
             )
@@ -492,10 +492,10 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
              )",
                 &[],
             )
@@ -523,7 +523,7 @@ simulation_test!(
     vtable_read_filters_by_multiple_predicates,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -552,12 +552,12 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_a (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
-             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}', 'change-3', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
              )",
                 &[],
             )
@@ -565,10 +565,10 @@ simulation_test!(
             .unwrap();
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_schema_b (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}', 'change-2', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
              )",
                 &[],
             )
@@ -596,7 +596,7 @@ simulation_test!(
     vtable_read_falls_back_to_tracked_after_untracked_deleted,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -617,10 +617,10 @@ simulation_test!(
         // Insert tracked row directly into materialized table.
         engine
         .execute(
-            "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
-             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}'\
              )",
             &[],
         )

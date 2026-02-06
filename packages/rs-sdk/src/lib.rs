@@ -1,15 +1,27 @@
 mod backend;
 
-use lix_engine::boot;
+use lix_engine::{boot, BootArgs, BootKeyValue};
+use serde_json::Value as JsonValue;
 
 pub struct OpenLixConfig {
     pub backend: Option<Box<dyn LixBackend + Send + Sync>>,
+    pub key_values: Vec<BootKeyValueConfig>,
 }
 
 impl Default for OpenLixConfig {
     fn default() -> Self {
-        Self { backend: None }
+        Self {
+            backend: None,
+            key_values: Vec::new(),
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct BootKeyValueConfig {
+    pub key: String,
+    pub value: JsonValue,
+    pub version_id: Option<String>,
 }
 
 pub struct Lix {
@@ -21,7 +33,19 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         Some(backend) => backend,
         None => Box::new(backend::sqlite::SqliteBackend::in_memory()?),
     };
-    let engine = boot(backend);
+    let key_values = config
+        .key_values
+        .into_iter()
+        .map(|item| BootKeyValue {
+            key: item.key,
+            value: item.value,
+            version_id: item.version_id,
+        })
+        .collect();
+    let engine = boot(BootArgs {
+        backend,
+        key_values,
+    });
     engine.init().await?;
     Ok(Lix { engine })
 }

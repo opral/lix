@@ -154,7 +154,7 @@ fn build_untracked_union_query(
     let mut union_parts = Vec::new();
     union_parts.push(format!(
         "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
-                'untracked' AS change_id, 1 AS untracked, 1 AS priority \
+                created_at, updated_at, 'untracked' AS change_id, 1 AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
         untracked = UNTRACKED_TABLE
@@ -168,8 +168,8 @@ fn build_untracked_union_query(
             .map(|predicate| format!(" WHERE ({predicate})"))
             .unwrap_or_default();
         union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, change_id, \
-                    0 AS untracked, 2 AS priority \
+            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
+                    created_at, updated_at, change_id, 0 AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
             materialized_where = materialized_where
@@ -179,9 +179,11 @@ fn build_untracked_union_query(
     let union_sql = union_parts.join(" UNION ALL ");
 
     let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, change_id, untracked \
+        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
+                created_at, updated_at, change_id, untracked \
          FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, change_id, untracked, \
+             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
+                    created_at, updated_at, change_id, untracked, \
                     ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
              FROM ({union_sql}) AS lix_state_union\
          ) AS lix_state_ranked \
@@ -536,7 +538,7 @@ fn quote_ident(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::preprocess_sql;
+    use crate::sql::preprocess_sql_rewrite_only as preprocess_sql;
 
     fn compact_sql(sql: &str) -> String {
         sql.chars().filter(|c| !c.is_whitespace()).collect()

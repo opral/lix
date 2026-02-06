@@ -1,6 +1,8 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
 
+use crate::Value;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaRegistration {
     pub schema_key: String,
@@ -62,6 +64,7 @@ pub struct RewriteOutput {
 #[derive(Debug, Clone)]
 pub struct PreprocessOutput {
     pub sql: String,
+    pub params: Vec<Value>,
     pub registrations: Vec<SchemaRegistration>,
     pub postprocess: Option<PostprocessPlan>,
     pub mutations: Vec<MutationRow>,

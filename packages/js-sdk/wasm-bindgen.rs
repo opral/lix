@@ -3,12 +3,12 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, LixBackend, LixError, QueryResult as EngineQueryResult, Value as EngineValue,
+        boot, BootArgs, LixBackend, LixError, QueryResult as EngineQueryResult,
+        Value as EngineValue,
     };
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-
 
     #[wasm_bindgen]
     pub struct Lix {
@@ -33,7 +33,7 @@ mod wasm {
     pub fn open_lix(backend: JsValue) -> Result<Lix, JsValue> {
         let backend = Box::new(JsBackend { backend });
         Ok(Lix {
-            engine: boot(backend),
+            engine: boot(BootArgs::new(backend)),
         })
     }
 
@@ -195,7 +195,11 @@ mod wasm {
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::NULL);
             }
             EngineValue::Integer(value) => {
-                let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Integer"));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("kind"),
+                    &JsValue::from_str("Integer"),
+                );
                 let _ = Reflect::set(
                     &obj,
                     &JsValue::from_str("value"),
@@ -208,7 +212,11 @@ mod wasm {
             }
             EngineValue::Text(value) => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Text"));
-                let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from_str(&value));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("value"),
+                    &JsValue::from_str(&value),
+                );
             }
             EngineValue::Blob(value) => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Blob"));

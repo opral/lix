@@ -795,3 +795,93 @@ fn x_lix_unique_fails_with_invalid_structure_duplicate() {
 
     assert!(validate_lix_schema_definition(&schema).is_err());
 }
+
+#[test]
+fn x_lix_default_accepts_valid_cel_expression() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "properties": {
+            "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" }
+        },
+        "additionalProperties": false
+    });
+
+    assert!(validate_lix_schema_definition(&schema).is_ok());
+}
+
+#[test]
+fn x_lix_default_rejects_invalid_cel_expression() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "properties": {
+            "id": { "type": "string", "x-lix-default": "lix_uuid_v7(" }
+        },
+        "additionalProperties": false
+    });
+
+    assert!(validate_lix_schema_definition(&schema).is_err());
+}
+
+#[test]
+fn x_lix_override_lixcols_accepts_valid_cel_expression() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_file_id": "'lix'",
+            "lixcol_version_id": "lix_timestamp()"
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    assert!(validate_lix_schema_definition(&schema).is_ok());
+}
+
+#[test]
+fn x_lix_override_lixcols_accepts_cel_literals() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "attempts": "3",
+            "enabled": "true",
+            "nullable": "null"
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    assert!(validate_lix_schema_definition(&schema).is_ok());
+}
+
+#[test]
+fn x_lix_override_lixcols_rejects_invalid_cel_expression() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_file_id": "lix_uuid_v7("
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    assert!(validate_lix_schema_definition(&schema).is_err());
+}
