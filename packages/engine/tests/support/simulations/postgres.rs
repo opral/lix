@@ -5,7 +5,7 @@ use postgresql_embedded::{PostgreSQL, Status};
 use sqlx::{Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
-use lix_engine::{LixBackend, LixError, QueryResult, Value};
+use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
 use crate::support::simulation_test::Simulation;
 
@@ -137,6 +137,10 @@ impl PostgresBackend {
 
 #[async_trait::async_trait(?Send)]
 impl LixBackend for PostgresBackend {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Postgres
+    }
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;
 

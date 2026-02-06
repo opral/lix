@@ -15,6 +15,7 @@ mod schema_registry;
 mod sql;
 mod types;
 mod validation;
+mod version;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
@@ -22,6 +23,7 @@ pub use schema::{
 };
 
 pub use backend::LixBackend;
+pub use backend::SqlDialect;
 pub use commit::{
     generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
     MaterializedStateRow, VersionInfo, VersionSnapshot,

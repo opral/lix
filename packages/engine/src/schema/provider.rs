@@ -153,7 +153,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{json, Value as JsonValue};
 
-    use crate::{LixBackend, LixError, QueryResult, Value};
+    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
     use super::{SchemaKey, SchemaProvider, SqlStoredSchemaProvider};
 
@@ -196,6 +196,10 @@ mod tests {
 
     #[async_trait(?Send)]
     impl LixBackend for FakeBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
         async fn execute(&self, sql: &str, _: &[Value]) -> Result<QueryResult, LixError> {
             self.calls
                 .lock()

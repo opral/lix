@@ -12,11 +12,12 @@ const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    let schema_keys = match extract_schema_keys_from_query(&query) {
-        Some(keys) => keys,
-        None => return Ok(None),
+    let schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
+    let pushdown_predicate = if schema_keys.is_empty() {
+        None
+    } else {
+        extract_pushdown_predicate(&query)
     };
-    let pushdown_predicate = extract_pushdown_predicate(&query);
 
     let mut changed = false;
     let mut new_query = query.clone();
@@ -118,7 +119,9 @@ fn rewrite_table_factor(
     changed: &mut bool,
 ) -> Result<(), LixError> {
     match relation {
-        TableFactor::Table { name, alias, .. } if object_name_matches(name, VTABLE_NAME) => {
+        TableFactor::Table { name, alias, .. }
+            if !schema_keys.is_empty() && object_name_matches(name, VTABLE_NAME) =>
+        {
             let derived_query = build_untracked_union_query(schema_keys, pushdown_predicate)?;
             let derived_alias = alias.clone().or_else(|| Some(default_vtable_alias()));
             *relation = TableFactor::Derived {
@@ -127,6 +130,17 @@ fn rewrite_table_factor(
                 alias: derived_alias,
             };
             *changed = true;
+        }
+        TableFactor::Derived { subquery, .. } => {
+            if let Some(rewritten) = rewrite_query((**subquery).clone())? {
+                *subquery = Box::new(rewritten);
+                *changed = true;
+            }
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            rewrite_table_with_joins(table_with_joins, schema_keys, pushdown_predicate, changed)?;
         }
         _ => {}
     }

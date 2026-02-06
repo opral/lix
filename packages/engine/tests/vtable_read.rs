@@ -59,7 +59,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
@@ -113,7 +113,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
@@ -191,7 +191,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 3);
         assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
         assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
@@ -271,7 +271,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(schema_a_only.rows.clone());
+        sim.assert_deterministic(schema_a_only.rows.clone());
         assert_eq!(schema_a_only.rows.len(), 2);
         assert_eq!(
             schema_a_only.rows[0][0],
@@ -358,7 +358,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(schema_a_eq.rows.clone());
+        sim.assert_deterministic(schema_a_eq.rows.clone());
         assert_eq!(schema_a_eq.rows.len(), 2);
         assert_eq!(schema_a_eq.rows[0][0], Value::Text("entity-1".to_string()));
         assert_eq!(schema_a_eq.rows[0][1], Value::Text("schema_a".to_string()));
@@ -432,7 +432,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(entity_filter.rows.clone());
+        sim.assert_deterministic(entity_filter.rows.clone());
         assert_eq!(entity_filter.rows.len(), 1);
         assert_eq!(
             entity_filter.rows[0][0],
@@ -511,7 +511,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(file_filter.rows.clone());
+        sim.assert_deterministic(file_filter.rows.clone());
         assert_eq!(file_filter.rows.len(), 1);
         assert_eq!(file_filter.rows[0][0], Value::Text("entity-3".to_string()));
         assert_eq!(file_filter.rows[0][1], Value::Text("schema_a".to_string()));
@@ -584,7 +584,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(multi_filter.rows.clone());
+        sim.assert_deterministic(multi_filter.rows.clone());
         assert_eq!(multi_filter.rows.len(), 1);
         assert_eq!(multi_filter.rows[0][0], Value::Text("entity-3".to_string()));
         assert_eq!(multi_filter.rows[0][1], Value::Text("schema_a".to_string()));
@@ -658,7 +658,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
