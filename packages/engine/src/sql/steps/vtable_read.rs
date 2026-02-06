@@ -5,7 +5,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::LixError;
+use crate::backend::SqlDialect;
+use crate::{LixBackend, LixError, Value as LixValue};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
@@ -18,6 +19,32 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     } else {
         extract_pushdown_predicate(&query)
     };
+
+    let mut changed = false;
+    let mut new_query = query.clone();
+    new_query.body = Box::new(rewrite_set_expr(
+        *query.body,
+        &schema_keys,
+        pushdown_predicate.as_ref(),
+        &mut changed,
+    )?);
+
+    if changed {
+        Ok(Some(new_query))
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn rewrite_query_with_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+) -> Result<Option<Query>, LixError> {
+    let mut schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
+    if schema_keys.is_empty() {
+        schema_keys = fetch_materialized_schema_keys(backend).await?;
+    }
+    let pushdown_predicate = extract_pushdown_predicate(&query);
 
     let mut changed = false;
     let mut new_query = query.clone();
@@ -160,9 +187,18 @@ fn build_untracked_union_query(
     let predicate_sql = pushdown_predicate
         .and_then(|expr| strip_qualifiers(expr.clone()))
         .map(|expr| expr.to_string());
-    let untracked_where = match &predicate_sql {
-        Some(predicate) => format!("schema_key IN ({schema_list}) AND ({predicate})"),
-        None => format!("schema_key IN ({schema_list})"),
+    let schema_filter = if schema_keys.is_empty() {
+        None
+    } else {
+        Some(format!("schema_key IN ({schema_list})"))
+    };
+    let untracked_where = match (schema_filter.as_ref(), predicate_sql.as_ref()) {
+        (Some(schema_filter), Some(predicate)) => {
+            format!("{schema_filter} AND ({predicate})")
+        }
+        (Some(schema_filter), None) => schema_filter.clone(),
+        (None, Some(predicate)) => format!("({predicate})"),
+        (None, None) => "1=1".to_string(),
     };
 
     let mut union_parts = Vec::new();
@@ -548,6 +584,40 @@ fn escape_string_literal(value: &str) -> String {
 fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{}\"", escaped)
+}
+
+async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {
+    let sql = match backend.dialect() {
+        SqlDialect::Sqlite => {
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'lix_internal_state_materialized_v1_%'"
+        }
+        SqlDialect::Postgres => {
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = current_schema() \
+               AND table_type = 'BASE TABLE' \
+               AND table_name LIKE 'lix_internal_state_materialized_v1_%'"
+        }
+    };
+    let result = backend.execute(sql, &[]).await?;
+
+    let mut keys = Vec::new();
+    for row in &result.rows {
+        let Some(LixValue::Text(name)) = row.first() else {
+            continue;
+        };
+        let Some(schema_key) = name.strip_prefix(MATERIALIZED_PREFIX) else {
+            continue;
+        };
+        if schema_key.is_empty() {
+            continue;
+        }
+        if !keys.iter().any(|existing| existing == schema_key) {
+            keys.push(schema_key.to_string());
+        }
+    }
+
+    keys.sort();
+    Ok(keys)
 }
 
 #[cfg(test)]

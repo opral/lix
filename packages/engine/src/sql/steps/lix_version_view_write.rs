@@ -191,13 +191,17 @@ pub async fn rewrite_update_with_backend(
                     message: "lix_version update cannot set empty commit_id".to_string(),
                 });
             }
-            let next_working_commit_id = assignment_values.working_commit_id.clone().ok_or_else(
-                || LixError {
+            let next_working_commit_id =
+                assignment_values
+                    .working_commit_id
+                    .clone()
+                    .ok_or_else(|| {
+                        LixError {
                     message:
                         "lix_version update must set both commit_id and working_commit_id together"
                             .to_string(),
-                },
-            )?;
+                }
+                    })?;
             if next_working_commit_id.is_empty() {
                 return Err(LixError {
                     message: "lix_version update cannot set empty working_commit_id".to_string(),
