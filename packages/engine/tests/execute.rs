@@ -4,7 +4,7 @@ use lix_engine::Value;
 
 simulation_test!(select_works, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
     let result = engine.execute("SELECT 1 + 1", &[]).await.unwrap();

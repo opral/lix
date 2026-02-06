@@ -1,6 +1,7 @@
 mod backend;
 mod cel;
 mod default_values;
+mod deterministic_mode;
 mod engine;
 mod error;
 mod functions;
@@ -18,6 +19,6 @@ pub use schema::{
 };
 
 pub use backend::LixBackend;
-pub use engine::{boot, Engine};
+pub use engine::{boot, BootArgs, BootKeyValue, Engine};
 pub use error::LixError;
 pub use types::{QueryResult, Value};

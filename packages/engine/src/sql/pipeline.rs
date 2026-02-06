@@ -4,9 +4,10 @@ use sqlparser::parser::Parser;
 
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::route::rewrite_statement;
-use crate::sql::steps::inline_lix_functions::inline_lix_functions;
+use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreprocessOutput, SchemaRegistration};
 use crate::{LixBackend, LixError, Value};
 
@@ -21,13 +22,22 @@ pub fn preprocess_statements(
     statements: Vec<Statement>,
     params: &[Value],
 ) -> Result<PreprocessOutput, LixError> {
+    let mut provider = SystemFunctionProvider;
+    preprocess_statements_with_provider(statements, params, &mut provider)
+}
+
+pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
+    statements: Vec<Statement>,
+    params: &[Value],
+    provider: &mut P,
+) -> Result<PreprocessOutput, LixError> {
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut mutations = Vec::new();
     let mut update_validations = Vec::new();
     for statement in statements {
-        let output = rewrite_statement(statement, params)?;
+        let output = rewrite_statement(statement, params, provider)?;
         registrations.extend(output.registrations);
         if let Some(plan) = output.postprocess {
             if postprocess.is_some() {
@@ -40,7 +50,10 @@ pub fn preprocess_statements(
         mutations.extend(output.mutations);
         update_validations.extend(output.update_validations);
         for rewritten_statement in output.statements {
-            rewritten.push(inline_lix_functions(rewritten_statement));
+            rewritten.push(inline_lix_functions_with_provider(
+                rewritten_statement,
+                provider,
+            ));
         }
     }
 
@@ -72,17 +85,40 @@ pub fn preprocess_statements(
     })
 }
 
+#[allow(dead_code)]
 pub async fn preprocess_sql(
     backend: &dyn LixBackend,
     evaluator: &CelEvaluator,
     sql: &str,
     params: &[Value],
 ) -> Result<PreprocessOutput, LixError> {
+    let functions = SharedFunctionProvider::new(SystemFunctionProvider);
+    preprocess_sql_with_provider(backend, evaluator, sql, params, functions).await
+}
+
+pub async fn preprocess_sql_with_provider<P: LixFunctionProvider>(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    sql: &str,
+    params: &[Value],
+    functions: SharedFunctionProvider<P>,
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let params = params.to_vec();
     let mut statements = parse_sql_statements(sql)?;
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
-    apply_vtable_insert_defaults(backend, evaluator, &mut statements, &params).await?;
-    preprocess_statements(statements, &params)
+    apply_vtable_insert_defaults(
+        backend,
+        evaluator,
+        &mut statements,
+        &params,
+        functions.clone(),
+    )
+    .await?;
+    let mut provider = functions.clone();
+    preprocess_statements_with_provider(statements, &params, &mut provider)
 }
 
 #[allow(dead_code)]

@@ -16,7 +16,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
 
 simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -99,7 +99,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
 
 simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -182,7 +182,7 @@ simulation_test!(
     key_value_distinguishes_string_and_number_literals,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 

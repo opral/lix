@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use lix_engine::{boot, Engine, LixBackend, LixError, QueryResult, Value};
+use lix_engine::{boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, QueryResult, Value};
 
 use super::simulations::default_simulations as default_simulations_impl;
 
@@ -18,6 +18,11 @@ pub struct SimulationArgs {
     setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
     #[allow(dead_code)]
     expect: ExpectDeterministic,
+}
+
+#[derive(Default)]
+pub struct SimulationBootArgs {
+    pub key_values: Vec<BootKeyValue>,
 }
 
 pub struct SimulationEngine {
@@ -36,12 +41,19 @@ impl SimulationEngine {
 }
 
 impl SimulationArgs {
-    pub async fn boot_simulated_engine(&self) -> Result<SimulationEngine, LixError> {
+    pub async fn boot_simulated_engine(
+        &self,
+        args: Option<SimulationBootArgs>,
+    ) -> Result<SimulationEngine, LixError> {
         if let Some(setup) = &self.setup {
             setup().await?;
         }
+        let args = args.unwrap_or_default();
         Ok(SimulationEngine {
-            engine: boot((self.backend_factory)()),
+            engine: boot(BootArgs {
+                backend: (self.backend_factory)(),
+                key_values: args.key_values,
+            }),
         })
     }
 

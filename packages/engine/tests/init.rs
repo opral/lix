@@ -2,7 +2,7 @@ mod support;
 
 simulation_test!(init_creates_untracked_table, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -18,7 +18,7 @@ simulation_test!(init_creates_untracked_table, |sim| async move {
 
 simulation_test!(init_creates_snapshot_table, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -34,7 +34,7 @@ simulation_test!(init_creates_snapshot_table, |sim| async move {
 
 simulation_test!(init_creates_change_table, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -50,7 +50,7 @@ simulation_test!(init_creates_change_table, |sim| async move {
 
 simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 
@@ -73,7 +73,7 @@ simulation_test!(
     init_creates_key_value_materialized_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -93,7 +93,7 @@ simulation_test!(
 
 simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
     let engine = sim
-        .boot_simulated_engine()
+        .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
 

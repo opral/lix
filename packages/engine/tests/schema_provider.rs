@@ -14,7 +14,7 @@ simulation_test!(
     same_request_schema_insert_allows_snapshot_validation,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -55,7 +55,7 @@ simulation_test!(
     same_request_stored_schema_foreign_key_uses_pending_target,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -94,7 +94,7 @@ simulation_test!(
     same_request_schema_insert_applies_defaults,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 

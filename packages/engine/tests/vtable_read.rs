@@ -6,7 +6,7 @@ simulation_test!(
     vtable_read_prioritizes_untracked_over_tracked,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -73,7 +73,7 @@ simulation_test!(
     vtable_read_returns_tracked_when_no_untracked_exists,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -127,7 +127,7 @@ simulation_test!(
     vtable_read_schema_key_in_selects_multiple_materialized_tables,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -209,7 +209,7 @@ simulation_test!(
     vtable_read_schema_key_in_single_filters_out_other,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -296,7 +296,7 @@ simulation_test!(
     vtable_read_schema_key_equals_selects_single_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -371,7 +371,7 @@ simulation_test!(
     vtable_read_filters_by_entity_id_with_schema_key,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -450,7 +450,7 @@ simulation_test!(
     vtable_read_filters_by_file_id_with_schema_key,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -523,7 +523,7 @@ simulation_test!(
     vtable_read_filters_by_multiple_predicates,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -596,7 +596,7 @@ simulation_test!(
     vtable_read_falls_back_to_tracked_after_untracked_deleted,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine()
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
