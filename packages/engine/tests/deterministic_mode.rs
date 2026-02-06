@@ -214,17 +214,18 @@ simulation_test!(
 
         assert_eq!(changes.rows.len(), 1);
         assert_eq!(changes.rows[0][0], Value::Text(deterministic_uuid(1)));
-        assert_eq!(changes.rows[0][1], Value::Text(deterministic_uuid(0)));
+        assert_eq!(changes.rows[0][1], Value::Text(deterministic_uuid(8)));
         assert_eq!(
             changes.rows[0][2],
-            Value::Text("1970-01-01T00:00:00.002Z".to_string())
+            Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
         let materialized = engine
             .execute(
                 "SELECT change_id, created_at, updated_at \
-                 FROM lix_internal_state_materialized_v1_test_schema \
-                 WHERE entity_id = 'entity-1' \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-1' \
                  LIMIT 1",
                 &[],
             )
@@ -235,14 +236,14 @@ simulation_test!(
         assert_eq!(materialized.rows[0][0], Value::Text(deterministic_uuid(1)));
         assert_eq!(
             materialized.rows[0][1],
-            Value::Text("1970-01-01T00:00:00.002Z".to_string())
+            Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
         assert_eq!(
             materialized.rows[0][2],
-            Value::Text("1970-01-01T00:00:00.002Z".to_string())
+            Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
-        assert_eq!(read_sequence_value(&engine).await, 2);
+        assert_eq!(read_sequence_value(&engine).await, 10);
     }
 );
 
@@ -346,7 +347,7 @@ simulation_test!(
         assert_eq!(id, deterministic_uuid(1));
         assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
 
-        // 2 calls from CEL defaults + 3 calls from tracked write internals.
-        assert_eq!(read_sequence_value(&engine).await, 4);
+        // 2 calls from CEL defaults + commit/materialization sequence consumption.
+        assert_eq!(read_sequence_value(&engine).await, 12);
     }
 );

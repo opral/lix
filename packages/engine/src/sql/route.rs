@@ -5,7 +5,7 @@ use crate::sql::steps::{stored_schema, vtable_read, vtable_write};
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
-use crate::{LixError, Value};
+use crate::{LixBackend, LixError, Value};
 
 pub fn rewrite_statement<P: LixFunctionProvider>(
     statement: Statement,
@@ -117,5 +117,57 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
             mutations: Vec::new(),
             update_validations: Vec::new(),
         }),
+    }
+}
+
+pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
+    backend: &dyn LixBackend,
+    statement: Statement,
+    params: &[Value],
+    functions: &mut P,
+) -> Result<RewriteOutput, LixError> {
+    match statement {
+        Statement::Insert(insert) => {
+            let mut current = Statement::Insert(insert);
+            let mut registrations: Vec<SchemaRegistration> = Vec::new();
+            let mut statements: Vec<Statement> = Vec::new();
+            let mut mutations: Vec<MutationRow> = Vec::new();
+            let update_validations: Vec<UpdateValidationPlan> = Vec::new();
+
+            if let Statement::Insert(inner) = &current {
+                if let Some(rewritten) = stored_schema::rewrite_insert(inner.clone(), params)? {
+                    registrations.push(rewritten.registration);
+                    mutations.push(rewritten.mutation);
+                    current = rewritten.statement;
+                }
+            }
+            if let Statement::Insert(inner) = &current {
+                if let Some(rewritten) = vtable_write::rewrite_insert_with_backend(
+                    backend,
+                    inner.clone(),
+                    params,
+                    functions,
+                )
+                .await?
+                {
+                    registrations.extend(rewritten.registrations);
+                    statements = rewritten.statements;
+                    mutations = rewritten.mutations;
+                }
+            }
+
+            if statements.is_empty() {
+                statements.push(current);
+            }
+
+            Ok(RewriteOutput {
+                statements,
+                registrations,
+                postprocess: None,
+                mutations,
+                update_validations,
+            })
+        }
+        other => rewrite_statement(other, params, functions),
     }
 }

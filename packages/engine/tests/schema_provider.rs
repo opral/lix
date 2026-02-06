@@ -79,8 +79,9 @@ simulation_test!(
 
         let count = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_internal_state_materialized_v1_lix_stored_schema \
-             WHERE entity_id IN ('same_request_parent~1', 'same_request_child~1')",
+                "SELECT COUNT(*) FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_stored_schema' \
+               AND entity_id IN ('same_request_parent~1', 'same_request_child~1')",
                 &[],
             )
             .await

@@ -88,10 +88,10 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_internal_state_materialized_v1_test_schema (\
-                 entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, created_at, updated_at\
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', 'change-1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+                 'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
                  )",
                 &[],
             )
@@ -237,8 +237,9 @@ simulation_test!(
 
         let materialized = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
-                 WHERE entity_id = 'entity-1'",
+                "SELECT snapshot_content FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-1'",
                 &[],
             )
             .await
@@ -283,8 +284,9 @@ simulation_test!(
 
         let materialized = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
-             WHERE entity_id = 'entity-1'",
+                "SELECT snapshot_content FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema' \
+               AND entity_id = 'entity-1'",
                 &[],
             )
             .await
@@ -356,8 +358,11 @@ simulation_test!(
 
         let stored = engine
             .execute(
-                "SELECT schema_version, plugin_key, snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
-             WHERE entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = 'version-1'",
+                "SELECT schema_version, snapshot_content, change_id FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema' \
+               AND entity_id = 'entity-1' \
+               AND file_id = 'file-1' \
+               AND version_id = 'version-1'",
                 &[],
             )
             .await
@@ -365,11 +370,27 @@ simulation_test!(
 
         assert_eq!(stored.rows.len(), 1);
         assert_eq!(stored.rows[0][0], Value::Text("2".to_string()));
-        assert_eq!(stored.rows[0][1], Value::Text("other".to_string()));
         assert_eq!(
-            stored.rows[0][2],
+            stored.rows[0][1],
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
+
+        let change_id = match &stored.rows[0][2] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected change_id text, got {other:?}"),
+        };
+        let change = engine
+            .execute(
+                &format!(
+                    "SELECT plugin_key FROM lix_internal_change WHERE id = '{}'",
+                    change_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(change.rows.len(), 1);
+        assert_eq!(change.rows[0][0], Value::Text("other".to_string()));
     }
 );
 
@@ -414,8 +435,9 @@ simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
 
     let materialized = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
-             WHERE entity_id = 'entity-1'",
+            "SELECT snapshot_content FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema' \
+               AND entity_id = 'entity-1'",
             &[],
         )
         .await
@@ -462,7 +484,8 @@ simulation_test!(tracked_insert_select_zero_rows_is_noop, |sim| async move {
 
     let count = engine
         .execute(
-            "SELECT COUNT(*) FROM lix_internal_state_materialized_v1_test_schema",
+            "SELECT COUNT(*) FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema'",
             &[],
         )
         .await
@@ -677,19 +700,19 @@ simulation_test!(
 
         let materialized = engine
             .execute(
-                "SELECT is_tombstone, snapshot_content, change_id \
-             FROM lix_internal_state_materialized_v1_test_schema \
-             WHERE entity_id = 'entity-1'",
+                "SELECT snapshot_content, change_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema' \
+               AND entity_id = 'entity-1'",
                 &[],
             )
             .await
             .unwrap();
 
         assert_eq!(materialized.rows.len(), 1);
-        assert_eq!(materialized.rows[0][0], Value::Integer(1));
-        assert_eq!(materialized.rows[0][1], Value::Null);
+        assert_eq!(materialized.rows[0][0], Value::Null);
 
-        let change_id = match &materialized.rows[0][2] {
+        let change_id = match &materialized.rows[0][1] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected change id"),
         };
@@ -787,8 +810,9 @@ simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
     let materialized = engine
         .execute(
             "SELECT entity_id, snapshot_content, change_id \
-             FROM lix_internal_state_materialized_v1_test_schema \
-             WHERE entity_id IN ('entity-1', 'entity-2')",
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema' \
+               AND entity_id IN ('entity-1', 'entity-2')",
             &[],
         )
         .await
@@ -951,8 +975,9 @@ simulation_test!(
 
         let tracked_materialized = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_materialized_v1_test_schema \
-             WHERE entity_id = 'entity-1'",
+                "SELECT snapshot_content FROM lix_internal_state_vtable \
+             WHERE schema_key = 'test_schema' \
+               AND entity_id = 'entity-1'",
                 &[],
             )
             .await

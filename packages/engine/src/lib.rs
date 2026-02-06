@@ -1,6 +1,7 @@
 mod backend;
 mod builtin_schema;
 mod cel;
+mod commit;
 mod default_values;
 mod deterministic_mode;
 mod engine;
@@ -20,6 +21,10 @@ pub use schema::{
 };
 
 pub use backend::LixBackend;
+pub use commit::{
+    generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
+    MaterializedStateRow, VersionInfo, VersionSnapshot,
+};
 pub use engine::{boot, BootArgs, BootKeyValue, Engine};
 pub use error::LixError;
 pub use types::{QueryResult, Value};

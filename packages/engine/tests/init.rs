@@ -82,7 +82,9 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "SELECT 1 FROM lix_internal_state_materialized_v1_lix_key_value LIMIT 1",
+                "SELECT 1 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' \
+                 LIMIT 1",
                 &[],
             )
             .await
@@ -103,11 +105,11 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
     let result = engine
         .execute(
             "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_materialized_v1_lix_stored_schema \
+             FROM lix_internal_state_vtable \
              WHERE entity_id = 'lix_key_value~1' \
+               AND schema_key = 'lix_stored_schema' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
-               AND is_tombstone = 0 \
              LIMIT 1",
             &[],
         )
@@ -141,20 +143,21 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
     let result = engine
         .execute(
             "SELECT entity_id, snapshot_content \
-             FROM lix_internal_state_materialized_v1_lix_stored_schema \
+             FROM lix_internal_state_vtable \
              WHERE entity_id IN (\
                'lix_stored_schema~1', \
                'lix_key_value~1', \
                'lix_change~1', \
+               'lix_change_author~1', \
                'lix_change_set~1', \
                'lix_commit~1', \
                'lix_version_tip~1', \
                'lix_change_set_element~1', \
                'lix_commit_edge~1'\
              ) \
+               AND schema_key = 'lix_stored_schema' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
-               AND is_tombstone = 0 \
              ORDER BY entity_id",
             &[],
         )
@@ -162,7 +165,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         .unwrap();
 
     sim.expect_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 8);
+    assert_eq!(result.rows.len(), 9);
 
     let mut seen_schema_keys = BTreeSet::new();
     for row in result.rows {
@@ -203,6 +206,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         seen_schema_keys,
         BTreeSet::from([
             "lix_change".to_string(),
+            "lix_change_author".to_string(),
             "lix_change_set".to_string(),
             "lix_change_set_element".to_string(),
             "lix_commit".to_string(),
