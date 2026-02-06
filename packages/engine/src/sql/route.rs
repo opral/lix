@@ -2,8 +2,9 @@ use sqlparser::ast::{Insert, Statement};
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::steps::{
-    lix_active_version_view_read, lix_active_version_view_write, lix_version_view_read,
-    lix_version_view_write, stored_schema, vtable_read, vtable_write,
+    lix_active_version_view_read, lix_active_version_view_write, lix_state_view_read,
+    lix_state_view_write, lix_version_view_read, lix_version_view_write, stored_schema,
+    vtable_read, vtable_write,
 };
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
@@ -115,6 +116,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
             let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query =
                 lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
             Ok(RewriteOutput {
                 statements: vec![Statement::Query(Box::new(query))],
@@ -156,6 +158,14 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
             }
 
             let mut current = Statement::Insert(insert);
+            if let Statement::Insert(inner) = &current {
+                if let Some(rewritten) =
+                    lix_state_view_write::rewrite_insert_with_backend(backend, inner.clone())
+                        .await?
+                {
+                    current = Statement::Insert(rewritten);
+                }
+            }
             let mut registrations: Vec<SchemaRegistration> = Vec::new();
             let mut statements: Vec<Statement> = Vec::new();
             let mut mutations: Vec<MutationRow> = Vec::new();
@@ -213,6 +223,13 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
                 .await;
             }
 
+            if let Some(rewritten) =
+                lix_state_view_write::rewrite_update_with_backend(backend, update.clone(), params)
+                    .await?
+            {
+                return rewrite_statement(Statement::Update(rewritten), params, functions);
+            }
+
             if let Some(version_inserts) =
                 lix_version_view_write::rewrite_update_with_backend(backend, update.clone(), params)
                     .await?
@@ -229,6 +246,12 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
             rewrite_statement(Statement::Update(update), params, functions)
         }
         Statement::Delete(delete) => {
+            if let Some(rewritten) =
+                lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
+            {
+                return rewrite_statement(Statement::Delete(rewritten), params, functions);
+            }
+
             if let Some(version_inserts) =
                 lix_version_view_write::rewrite_delete_with_backend(backend, delete.clone(), params)
                     .await?
@@ -243,6 +266,23 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
             }
 
             rewrite_statement(Statement::Delete(delete), params, functions)
+        }
+        Statement::Query(query) => {
+            let query = *query;
+            let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query =
+                lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query = vtable_read::rewrite_query_with_backend(backend, query.clone())
+                .await?
+                .unwrap_or(query);
+            Ok(RewriteOutput {
+                statements: vec![Statement::Query(Box::new(query))],
+                registrations: Vec::new(),
+                postprocess: None,
+                mutations: Vec::new(),
+                update_validations: Vec::new(),
+            })
         }
         other => rewrite_statement(other, params, functions),
     }
