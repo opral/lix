@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::{BootKeyValue, Value};
+use uuid::Uuid;
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
@@ -27,7 +28,8 @@ fn register_defaults_schema_sql() -> &'static str {
 }
 
 fn deterministic_uuid(counter: i64) -> String {
-    format!("01920000-0000-7000-8000-0000{counter:08x}")
+    let counter_bits = (counter as u64) & 0x0000_FFFF_FFFF_FFFF;
+    format!("01920000-0000-7000-8000-{counter_bits:012x}")
 }
 
 async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine) -> i64 {
@@ -349,5 +351,44 @@ simulation_test!(
 
         // 2 calls from CEL defaults + commit/materialization sequence consumption.
         assert_eq!(read_sequence_value(&engine).await, 12);
+    }
+);
+
+simulation_test!(
+    deterministic_uuid_stays_valid_after_u32_sequence_boundary,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                &insert_key_value_sql("lix_deterministic_sequence_number", "4294967295"),
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &insert_key_value_sql("lix_deterministic_mode", "{\"enabled\":true}"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let result = engine.execute("SELECT lix_uuid_v7()", &[]).await.unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        let uuid = match &result.rows[0][0] {
+            Value::Text(value) => value,
+            other => panic!("expected text uuid, got {other:?}"),
+        };
+        assert_eq!(uuid, &deterministic_uuid(4_294_967_296));
+        assert_eq!(uuid.len(), 36);
+        Uuid::parse_str(uuid).expect("deterministic uuid to remain parseable after u32 overflow");
+
+        assert_eq!(read_sequence_value(&engine).await, 4_294_967_296);
     }
 );

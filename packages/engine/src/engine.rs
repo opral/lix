@@ -6,6 +6,7 @@ use crate::deterministic_mode::{
 };
 use crate::functions::SharedFunctionProvider;
 use crate::init::init_backend;
+use crate::json_truthiness::{loosely_false, loosely_true};
 use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
@@ -266,27 +267,4 @@ fn infer_boot_deterministic_settings(key_values: &[BootKeyValue]) -> Option<Dete
             timestamp_enabled,
         })
     })
-}
-
-fn loosely_true(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Bool(boolean) => *boolean,
-        JsonValue::Number(number) => {
-            number.as_i64() == Some(1) || number.as_u64() == Some(1) || number.as_f64() == Some(1.0)
-        }
-        JsonValue::String(text) => text == "1",
-        _ => false,
-    }
-}
-
-fn loosely_false(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Bool(boolean) => !boolean,
-        JsonValue::Number(number) => {
-            number.as_i64() == Some(0) || number.as_u64() == Some(0) || number.as_f64() == Some(0.0)
-        }
-        JsonValue::String(text) => text.is_empty() || text == "0",
-        JsonValue::Array(values) => values.is_empty(),
-        _ => false,
-    }
 }
