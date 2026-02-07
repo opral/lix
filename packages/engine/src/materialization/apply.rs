@@ -34,17 +34,23 @@ pub(crate) async fn apply_materialization_plan_internal(
             .as_ref()
             .map(|value| format!("'{}'", escape_sql_string(value)))
             .unwrap_or_else(|| "NULL".to_string());
+        let inherited_from_version_sql = write
+            .inherited_from_version_id
+            .as_ref()
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, change_id, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, inherited_from_version_id, change_id, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', {snapshot_content}, '{change_id}', {is_tombstone}, '{created_at}', '{updated_at}'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', {snapshot_content}, {inherited_from_version_id}, '{change_id}', {is_tombstone}, '{created_at}', '{updated_at}'\
              ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
              plugin_key = excluded.plugin_key, \
              snapshot_content = excluded.snapshot_content, \
+             inherited_from_version_id = excluded.inherited_from_version_id, \
              change_id = excluded.change_id, \
              is_tombstone = excluded.is_tombstone, \
              created_at = excluded.created_at, \
@@ -57,6 +63,7 @@ pub(crate) async fn apply_materialization_plan_internal(
             version_id = escape_sql_string(&write.version_id),
             plugin_key = escape_sql_string(&write.plugin_key),
             snapshot_content = snapshot_sql,
+            inherited_from_version_id = inherited_from_version_sql,
             change_id = escape_sql_string(&write.change_id),
             is_tombstone = is_tombstone,
             created_at = escape_sql_string(&write.created_at),

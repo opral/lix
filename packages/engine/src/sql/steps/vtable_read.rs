@@ -234,7 +234,7 @@ fn build_untracked_union_query(
             .unwrap_or_default();
         union_parts.push(format!(
             "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
-                    created_at, updated_at, NULL AS inherited_from_version_id, change_id, 0 AS untracked, 2 AS priority \
+                    created_at, updated_at, inherited_from_version_id, change_id, 0 AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
             materialized_where = materialized_where

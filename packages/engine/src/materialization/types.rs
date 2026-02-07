@@ -42,6 +42,7 @@ pub struct MaterializationWrite {
     pub entity_id: String,
     pub file_id: String,
     pub version_id: String,
+    pub inherited_from_version_id: Option<String>,
     pub op: MaterializationWriteOp,
     pub snapshot_content: Option<String>,
     pub schema_version: String,

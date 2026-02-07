@@ -151,8 +151,13 @@ impl Engine {
             Some(PostprocessPlan::VtableUpdate(plan)) => {
                 let result = self.backend.execute(&output.sql, &output.params).await?;
                 let mut followup_functions = functions.clone();
-                let followup_sql =
-                    build_update_followup_sql(&plan, &result.rows, &mut followup_functions)?;
+                let followup_sql = build_update_followup_sql(
+                    self.backend.as_ref(),
+                    &plan,
+                    &result.rows,
+                    &mut followup_functions,
+                )
+                .await?;
                 if !followup_sql.is_empty() {
                     self.backend.execute(&followup_sql, &[]).await?;
                 }
@@ -161,8 +166,13 @@ impl Engine {
             Some(PostprocessPlan::VtableDelete(plan)) => {
                 let result = self.backend.execute(&output.sql, &output.params).await?;
                 let mut followup_functions = functions.clone();
-                let followup_sql =
-                    build_delete_followup_sql(&plan, &result.rows, &mut followup_functions)?;
+                let followup_sql = build_delete_followup_sql(
+                    self.backend.as_ref(),
+                    &plan,
+                    &result.rows,
+                    &mut followup_functions,
+                )
+                .await?;
                 if !followup_sql.is_empty() {
                     self.backend.execute(&followup_sql, &[]).await?;
                 }
