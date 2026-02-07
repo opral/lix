@@ -26,6 +26,7 @@ struct VisibleRow {
     file_id: String,
     plugin_key: String,
     snapshot_content: Option<String>,
+    metadata: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -361,6 +362,7 @@ fn build_latest_visible_state(
             file_id: winner.change.file_id.clone(),
             plugin_key: winner.change.plugin_key.clone(),
             snapshot_content: winner.change.snapshot_content.clone(),
+            metadata: winner.change.metadata.clone(),
             created_at,
             updated_at: winner.change.created_at.clone(),
         });
@@ -465,6 +467,7 @@ fn build_global_projection_rows(
             file_id: change.file_id.clone(),
             plugin_key: change.plugin_key.clone(),
             snapshot_content,
+            metadata: change.metadata.clone(),
             created_at: change.created_at.clone(),
             updated_at: change.created_at.clone(),
         };
@@ -515,6 +518,7 @@ fn build_global_projection_rows(
                     })
                     .to_string(),
                 ),
+                metadata: None,
                 created_at: fallback_created_at.clone(),
                 updated_at: fallback_created_at,
             };
@@ -566,6 +570,7 @@ fn build_global_projection_rows(
             file_id: commit_change.file_id.clone(),
             plugin_key: commit_change.plugin_key.clone(),
             snapshot_content: commit_change.snapshot_content.clone(),
+            metadata: commit_change.metadata.clone(),
             created_at: commit_change.created_at.clone(),
             updated_at: commit_change.created_at.clone(),
         };
@@ -620,6 +625,7 @@ fn build_global_projection_rows(
                         })
                         .to_string(),
                     ),
+                    metadata: change.metadata.clone(),
                     created_at: change.created_at.clone(),
                     updated_at: change.created_at.clone(),
                 };
@@ -657,6 +663,7 @@ fn build_global_projection_rows(
                             })
                             .to_string(),
                         ),
+                        metadata: commit_change.metadata.clone(),
                         created_at: commit_change.created_at.clone(),
                         updated_at: commit_change.created_at.clone(),
                     };
@@ -697,6 +704,7 @@ fn build_global_projection_rows(
                     })
                     .to_string(),
                 ),
+                metadata: commit_change.metadata.clone(),
                 created_at: commit_change.created_at.clone(),
                 updated_at: commit_change.created_at.clone(),
             };
@@ -1018,6 +1026,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<MaterializationWrite> {
             inherited_from_version_id: row.inherited_from_version_id.clone(),
             op,
             snapshot_content: row.source.snapshot_content.clone(),
+            metadata: row.source.metadata.clone(),
             schema_version: row.source.schema_version.clone(),
             plugin_key: row.source.plugin_key.clone(),
             change_id: row.source.change_id.clone(),

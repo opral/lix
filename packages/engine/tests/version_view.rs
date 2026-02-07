@@ -1,7 +1,7 @@
 mod support;
 
 use lix_engine::Value;
-use support::simulation_test::{default_simulations, run_simulation_test, SimulationArgs};
+use support::simulation_test::SimulationArgs;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -79,14 +79,12 @@ async fn run_lix_version_seeded_main_id_deterministic(sim: SimulationArgs) {
     assert_text(&row[2], "global");
 }
 
-#[tokio::test]
-async fn lix_version_seeded_main_id_is_deterministic_across_backends() {
-    run_simulation_test(
-        default_simulations(),
-        run_lix_version_seeded_main_id_deterministic,
-    )
-    .await;
-}
+simulation_test!(
+    lix_version_seeded_main_id_is_deterministic_across_backends,
+    |sim| async move {
+        run_lix_version_seeded_main_id_deterministic(sim).await;
+    }
+);
 
 simulation_test!(
     lix_version_select_reads_seeded_global_version,

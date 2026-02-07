@@ -180,6 +180,109 @@ simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
 });
 
 simulation_test!(
+    untracked_state_metadata_is_visible_in_vtable_and_state_by_version,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, untracked\
+                 ) VALUES (\
+                 'entity-meta-untracked', 'test_schema', 'file-1', 'main', 'lix', '{\"key\":\"untracked-meta\"}', '1', '{\"source\":\"local\"}', 1\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let vtable_before = engine
+            .execute(
+                "SELECT metadata FROM lix_internal_state_vtable \
+                 WHERE entity_id = 'entity-meta-untracked' \
+                   AND schema_key = 'test_schema' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(vtable_before.rows.len(), 1);
+        assert_eq!(
+            vtable_before.rows[0][0],
+            Value::Text("{\"source\":\"local\"}".to_string())
+        );
+
+        let by_version_before = engine
+            .execute(
+                "SELECT metadata FROM lix_state_by_version \
+                 WHERE entity_id = 'entity-meta-untracked' \
+                   AND schema_key = 'test_schema' \
+                   AND version_id = 'main' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_version_before.rows.len(), 1);
+        assert_eq!(
+            by_version_before.rows[0][0],
+            Value::Text("{\"source\":\"local\"}".to_string())
+        );
+
+        engine
+            .execute(
+                "UPDATE lix_internal_state_vtable \
+                 SET metadata = '{\"source\":\"updated\",\"retries\":1}' \
+                 WHERE entity_id = 'entity-meta-untracked' \
+                   AND schema_key = 'test_schema' \
+                   AND untracked = 1",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let vtable_after = engine
+            .execute(
+                "SELECT metadata FROM lix_internal_state_vtable \
+                 WHERE entity_id = 'entity-meta-untracked' \
+                   AND schema_key = 'test_schema' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(vtable_after.rows.len(), 1);
+        assert_eq!(
+            vtable_after.rows[0][0],
+            Value::Text("{\"source\":\"updated\",\"retries\":1}".to_string())
+        );
+
+        let by_version_after = engine
+            .execute(
+                "SELECT metadata FROM lix_state_by_version \
+                 WHERE entity_id = 'entity-meta-untracked' \
+                   AND schema_key = 'test_schema' \
+                   AND version_id = 'main' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_version_after.rows.len(), 1);
+        assert_eq!(
+            by_version_after.rows[0][0],
+            Value::Text("{\"source\":\"updated\",\"retries\":1}".to_string())
+        );
+    }
+);
+
+simulation_test!(
     tracked_state_creates_change_and_materialized_rows,
     |sim| async move {
         let engine = sim
@@ -249,6 +352,61 @@ simulation_test!(
         assert_eq!(
             materialized.rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
+        );
+    }
+);
+
+simulation_test!(
+    tracked_state_propagates_metadata_to_change_and_vtable,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata\
+                 ) VALUES (\
+                 'entity-meta', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1', '{\"source\":\"import\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let vtable = engine
+            .execute(
+                "SELECT metadata FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-meta'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(vtable.rows.len(), 1);
+        assert_eq!(
+            vtable.rows[0][0],
+            Value::Text("{\"source\":\"import\"}".to_string())
+        );
+
+        let changes = engine
+            .execute(
+                "SELECT metadata FROM lix_internal_change \
+                 WHERE entity_id = 'entity-meta' \
+                 ORDER BY created_at DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changes.rows.len(), 1);
+        assert_eq!(
+            changes.rows[0][0],
+            Value::Text("{\"source\":\"import\"}".to_string())
         );
     }
 );

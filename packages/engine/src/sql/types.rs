@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
@@ -23,6 +25,7 @@ pub struct UpdateValidationPlan {
     pub table: String,
     pub where_clause: Option<Expr>,
     pub snapshot_content: Option<JsonValue>,
+    pub snapshot_patch: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[allow(dead_code)]

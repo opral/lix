@@ -15,6 +15,7 @@ pub(crate) struct ChangeRecord {
     pub file_id: String,
     pub plugin_key: String,
     pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
     pub created_at: String,
 }
 
@@ -66,7 +67,7 @@ pub(crate) struct LoadedData {
 }
 
 pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.created_at \
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
     let result = backend.execute(sql, &[]).await?;
@@ -87,7 +88,8 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         let file_id = text_required(&row, 4, "file_id")?;
         let plugin_key = text_required(&row, 5, "plugin_key")?;
         let snapshot_content = text_optional(&row, 6, "snapshot_content")?;
-        let created_at = text_required(&row, 7, "created_at")?;
+        let metadata = text_optional(&row, 7, "metadata")?;
+        let created_at = text_required(&row, 8, "created_at")?;
 
         let change = ChangeRecord {
             id: id.clone(),
@@ -97,6 +99,7 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
             file_id: file_id.clone(),
             plugin_key: plugin_key.clone(),
             snapshot_content: snapshot_content.clone(),
+            metadata: metadata.clone(),
             created_at: created_at.clone(),
         };
 

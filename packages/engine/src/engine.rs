@@ -979,6 +979,7 @@ mod tests {
                 "id": "main",
                 "version_id": version_id
             })),
+            snapshot_patch: None,
         }
     }
 }

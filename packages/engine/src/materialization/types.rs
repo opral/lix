@@ -45,6 +45,7 @@ pub struct MaterializationWrite {
     pub inherited_from_version_id: Option<String>,
     pub op: MaterializationWriteOp,
     pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
     pub schema_version: String,
     pub plugin_key: String,
     pub change_id: String,

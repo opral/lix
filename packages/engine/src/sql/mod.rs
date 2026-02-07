@@ -1,3 +1,4 @@
+mod entity_views;
 mod escaping;
 mod lowering;
 mod params;
