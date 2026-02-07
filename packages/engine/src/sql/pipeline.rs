@@ -2,9 +2,12 @@ use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Query, SetExpr, S
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+use crate::sql::bind_sql;
+use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::route::{rewrite_statement, rewrite_statement_with_backend};
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
@@ -50,10 +53,8 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
         mutations.extend(output.mutations);
         update_validations.extend(output.update_validations);
         for rewritten_statement in output.statements {
-            rewritten.push(inline_lix_functions_with_provider(
-                rewritten_statement,
-                provider,
-            ));
+            let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
+            rewritten.push(lower_statement(inlined, SqlDialect::Sqlite)?);
         }
     }
 
@@ -63,17 +64,8 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
         });
     }
 
-    let normalized_sql = rewritten
-        .iter()
-        .map(|statement| statement.to_string())
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    let params = if sql_contains_placeholders(&normalized_sql) {
-        params.to_vec()
-    } else {
-        Vec::new()
-    };
+    let (normalized_sql, params) =
+        render_statements_with_params(&rewritten, params, SqlDialect::Sqlite)?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
@@ -110,10 +102,8 @@ async fn preprocess_statements_with_provider_and_backend<P: LixFunctionProvider>
         mutations.extend(output.mutations);
         update_validations.extend(output.update_validations);
         for rewritten_statement in output.statements {
-            rewritten.push(inline_lix_functions_with_provider(
-                rewritten_statement,
-                provider,
-            ));
+            let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
+            rewritten.push(lower_statement(inlined, backend.dialect())?);
         }
     }
 
@@ -123,17 +113,8 @@ async fn preprocess_statements_with_provider_and_backend<P: LixFunctionProvider>
         });
     }
 
-    let normalized_sql = rewritten
-        .iter()
-        .map(|statement| statement.to_string())
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    let params = if sql_contains_placeholders(&normalized_sql) {
-        params.to_vec()
-    } else {
-        Vec::new()
-    };
+    let (normalized_sql, params) =
+        render_statements_with_params(&rewritten, params, backend.dialect())?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
@@ -187,49 +168,33 @@ pub fn preprocess_sql_rewrite_only(sql: &str) -> Result<PreprocessOutput, LixErr
     preprocess_statements(parse_sql_statements(sql)?, &[])
 }
 
-fn sql_contains_placeholders(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut in_single_quoted = false;
+fn render_statements_with_params(
+    statements: &[Statement],
+    params: &[Value],
+    dialect: SqlDialect,
+) -> Result<(String, Vec<Value>), LixError> {
+    let mut rendered = Vec::with_capacity(statements.len());
+    let mut bound_params = Vec::new();
+    let mut statement_with_params_count = 0usize;
 
-    while i < bytes.len() {
-        let byte = bytes[i];
-        if in_single_quoted {
-            if byte == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    i += 2;
-                    continue;
-                }
-                in_single_quoted = false;
-            }
-            i += 1;
-            continue;
+    for statement in statements {
+        let bound = bind_sql(&statement.to_string(), params, dialect)?;
+        let _placeholder_state = bound.state;
+        if !bound.params.is_empty() {
+            statement_with_params_count += 1;
+            bound_params = bound.params;
         }
-
-        if byte == b'\'' {
-            in_single_quoted = true;
-            i += 1;
-            continue;
-        }
-
-        if byte == b'?' {
-            return true;
-        }
-
-        if byte == b'$' {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > i + 1 {
-                return true;
-            }
-        }
-
-        i += 1;
+        rendered.push(bound.sql);
     }
 
-    false
+    if statement_with_params_count > 1 || (statement_with_params_count == 1 && statements.len() > 1)
+    {
+        return Err(LixError {
+            message: "multiple statements with placeholders are not supported".to_string(),
+        });
+    }
+
+    Ok((rendered.join("; "), bound_params))
 }
 
 fn coalesce_vtable_inserts_in_transactions(
@@ -395,4 +360,24 @@ fn query_is_plain_values(query: &Query) -> bool {
         && query.settings.is_none()
         && query.format_clause.is_none()
         && query.pipe_operators.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preprocess_sql_rewrite_only;
+
+    #[test]
+    fn rewrite_only_path_lowers_lix_json_text_functions() {
+        let rewritten = preprocess_sql_rewrite_only("SELECT version_id FROM lix_active_version")
+            .expect("rewrite should succeed");
+
+        assert!(
+            !rewritten.sql.contains("lix_json_text("),
+            "rewrite-only path must lower logical lix_json_text() calls"
+        );
+        assert!(
+            rewritten.sql.contains("json_extract("),
+            "rewrite-only sqlite lowering should emit json_extract()"
+        );
+    }
 }

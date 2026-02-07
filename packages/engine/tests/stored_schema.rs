@@ -34,7 +34,7 @@ simulation_test!(
         .await
         .unwrap();
 
-        sim.expect_deterministic(stored.rows.clone());
+        sim.assert_deterministic(stored.rows.clone());
         assert_eq!(stored.rows.len(), 1);
         let row = &stored.rows[0];
         assert_eq!(row[0], Value::Text("test_schema~1".to_string()));

@@ -27,6 +27,7 @@ const INIT_STATEMENTS: &[&str] = &[
      version_id TEXT NOT NULL,\
      plugin_key TEXT NOT NULL,\
      snapshot_content TEXT,\
+     inherited_from_version_id TEXT,\
      change_id TEXT NOT NULL,\
      is_tombstone INTEGER NOT NULL DEFAULT 0,\
      created_at TEXT NOT NULL,\

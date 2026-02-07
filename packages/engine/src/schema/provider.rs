@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use crate::sql::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 use super::key::SchemaKey;
@@ -132,10 +133,6 @@ fn schema_from_snapshot_content(raw: &str) -> Result<JsonValue, LixError> {
     })
 }
 
-fn escape_sql_string(input: &str) -> String {
-    input.replace('\'', "''")
-}
-
 fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
     match value {
         Value::Text(text) => Ok(text.clone()),
@@ -153,7 +150,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{json, Value as JsonValue};
 
-    use crate::{LixBackend, LixError, QueryResult, Value};
+    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
     use super::{SchemaKey, SchemaProvider, SqlStoredSchemaProvider};
 
@@ -196,6 +193,10 @@ mod tests {
 
     #[async_trait(?Send)]
     impl LixBackend for FakeBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
         async fn execute(&self, sql: &str, _: &[Value]) -> Result<QueryResult, LixError> {
             self.calls
                 .lock()

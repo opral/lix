@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
-use crate::builtin_schema::builtin_schema_definition;
+use crate::builtin_schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::commit::types::{
     ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, MaterializedStateRow,
 };
@@ -10,7 +10,7 @@ use crate::LixError;
 
 const GLOBAL_VERSION: &str = "global";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const VERSION_TIP_SCHEMA_KEY: &str = "lix_version_tip";
+const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
@@ -64,7 +64,7 @@ where
     }
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
-    let version_tip_schema = builtin_schema_meta(VERSION_TIP_SCHEMA_KEY)?;
+    let version_pointer_schema = builtin_schema_meta(VERSION_POINTER_SCHEMA_KEY)?;
     let change_set_element_schema = builtin_schema_meta(CHANGE_SET_ELEMENT_SCHEMA_KEY)?;
     let commit_edge_schema = builtin_schema_meta(COMMIT_EDGE_SCHEMA_KEY)?;
     let change_author_schema = builtin_schema_meta(CHANGE_AUTHOR_SCHEMA_KEY)?;
@@ -114,16 +114,16 @@ where
             ),
         })?;
 
-        let version_tip_change_id = generate_uuid();
-        tip_change_id_by_version.insert(version_id.clone(), version_tip_change_id.clone());
+        let version_pointer_change_id = generate_uuid();
+        tip_change_id_by_version.insert(version_id.clone(), version_pointer_change_id.clone());
 
         meta_changes.push(ChangeRow {
-            id: version_tip_change_id,
+            id: version_pointer_change_id,
             entity_id: version_id.clone(),
-            schema_key: VERSION_TIP_SCHEMA_KEY.to_string(),
-            schema_version: version_tip_schema.schema_version.clone(),
-            file_id: version_tip_schema.file_id.clone(),
-            plugin_key: version_tip_schema.plugin_key.clone(),
+            schema_key: VERSION_POINTER_SCHEMA_KEY.to_string(),
+            schema_version: version_pointer_schema.schema_version.clone(),
+            file_id: version_pointer_schema.file_id.clone(),
+            plugin_key: version_pointer_schema.plugin_key.clone(),
             snapshot_content: Some(
                 json!({
                     "id": version_id,
@@ -357,7 +357,7 @@ where
         commit_snapshot_by_version.insert(version_id.clone(), commit_snapshot);
     }
 
-    // Materialize commit rows and version_tip rows so commit views can resolve immediately.
+    // Materialize commit rows and version_pointer rows so commit views can resolve immediately.
     for (version_id, meta) in &meta_by_version {
         let commit_snapshot = commit_snapshot_by_version
             .get(version_id)
@@ -396,10 +396,10 @@ where
         materialized_state.push(MaterializedStateRow {
             id: tip_id,
             entity_id: version_id.clone(),
-            schema_key: VERSION_TIP_SCHEMA_KEY.to_string(),
-            schema_version: version_tip_schema.schema_version.clone(),
-            file_id: version_tip_schema.file_id.clone(),
-            plugin_key: version_tip_schema.plugin_key.clone(),
+            schema_key: VERSION_POINTER_SCHEMA_KEY.to_string(),
+            schema_version: version_pointer_schema.schema_version.clone(),
+            file_id: version_pointer_schema.file_id.clone(),
+            plugin_key: version_pointer_schema.plugin_key.clone(),
             snapshot_content: Some(
                 json!({
                     "id": version_id,
@@ -516,10 +516,6 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
     })
 }
 
-fn decode_lixcol_literal(raw: &str) -> String {
-    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim_matches('\"').to_string())
-}
-
 fn dedupe_ordered(values: &[String]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut deduped = Vec::new();
@@ -622,7 +618,7 @@ mod tests {
             result
                 .changes
                 .iter()
-                .filter(|row| row.schema_key == "lix_version_tip")
+                .filter(|row| row.schema_key == "lix_version_pointer")
                 .count(),
             1
         );
@@ -667,7 +663,7 @@ mod tests {
         assert_eq!(materialized_counts.get("lix_change_author"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
-        assert_eq!(materialized_counts.get("lix_version_tip"), Some(&1));
+        assert_eq!(materialized_counts.get("lix_version_pointer"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
         assert_eq!(result.materialized_state.len(), 6);
 
@@ -825,7 +821,7 @@ mod tests {
             result
                 .changes
                 .iter()
-                .filter(|row| row.schema_key == "lix_version_tip")
+                .filter(|row| row.schema_key == "lix_version_pointer")
                 .count(),
             2
         );
@@ -878,8 +874,8 @@ mod tests {
         let global_tip = result
             .materialized_state
             .iter()
-            .find(|row| row.schema_key == "lix_version_tip" && row.entity_id == "global")
-            .expect("global version_tip should exist");
+            .find(|row| row.schema_key == "lix_version_pointer" && row.entity_id == "global")
+            .expect("global version_pointer should exist");
         let global_tip_snapshot: serde_json::Value =
             serde_json::from_str(global_tip.snapshot_content.as_ref().unwrap()).unwrap();
         let global_commit_id = global_tip_snapshot["commit_id"]

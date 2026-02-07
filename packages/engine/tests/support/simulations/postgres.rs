@@ -5,9 +5,9 @@ use postgresql_embedded::{PostgreSQL, Status};
 use sqlx::{Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
-use lix_engine::{LixBackend, LixError, QueryResult, Value};
+use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-use crate::support::simulation_test::Simulation;
+use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
 static POSTGRES: OnceCell<Arc<PostgresInstance>> = OnceCell::const_new();
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -92,6 +92,7 @@ pub fn postgres_simulation() -> Simulation {
                 Ok(())
             })
         })),
+        behavior: SimulationBehavior::Base,
         backend_factory: Box::new(move || {
             let url = connection_string
                 .lock()
@@ -137,6 +138,10 @@ impl PostgresBackend {
 
 #[async_trait::async_trait(?Send)]
 impl LixBackend for PostgresBackend {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Postgres
+    }
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;
 

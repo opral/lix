@@ -253,7 +253,7 @@ mod tests {
     use crate::cel::CelEvaluator;
     use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
     use crate::sql::parse_sql_statements;
-    use crate::{LixBackend, LixError, QueryResult, Value};
+    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
     use super::{apply_defaults_to_snapshot, apply_vtable_insert_defaults};
 
@@ -261,6 +261,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl LixBackend for UnexpectedBackendCall {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
         async fn execute(&self, _: &str, _: &[Value]) -> Result<QueryResult, LixError> {
             panic!("defaulting should resolve schema from pending in-request inserts")
         }

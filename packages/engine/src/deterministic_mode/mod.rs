@@ -7,7 +7,7 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::sql::{parse_sql_statements, preprocess_statements_with_provider};
+use crate::sql::{escape_sql_string, parse_sql_statements, preprocess_statements_with_provider};
 use crate::LixBackend;
 use crate::{LixError, Value};
 
@@ -197,10 +197,6 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             message: format!("expected text value for {name}"),
         }),
     }
-}
-
-fn escape_sql_string(input: &str) -> String {
-    input.replace('\'', "''")
 }
 
 fn is_missing_relation_error(err: &LixError) -> bool {
