@@ -1,17 +1,17 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CaseWhen, ConflictTarget, Delete, DoUpdate, Expr,
-    Function, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-    OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor,
-    TableObject, TableWithJoins, Update, Value, ValueWithSpan, Values,
+    Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, DoUpdate, Expr, Function,
+    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, OnConflict,
+    OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
+    TableWithJoins, Update, Value, ValueWithSpan, Values,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::builtin_schema::types::LixVersionPointer;
 use crate::commit::{
-    generate_commit, DomainChangeInput, GenerateCommitArgs, MaterializedStateRow, VersionInfo,
-    VersionSnapshot,
+    generate_commit, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
+    MaterializedStateRow, VersionInfo, VersionSnapshot,
 };
 use crate::functions::LixFunctionProvider;
 use crate::sql::types::{
@@ -382,12 +382,13 @@ pub fn rewrite_delete(delete: Delete) -> Result<Option<DeleteRewrite>, LixError>
     })))
 }
 
-pub fn build_update_followup_sql(
+pub async fn build_update_followup_sql(
+    backend: &dyn LixBackend,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
-    let statements = build_update_followup_statements(plan, rows, functions)?;
+    let statements = build_update_followup_statements(backend, plan, rows, functions).await?;
     Ok(statements
         .into_iter()
         .map(|statement| statement.to_string())
@@ -395,12 +396,13 @@ pub fn build_update_followup_sql(
         .join("; "))
 }
 
-pub fn build_delete_followup_sql(
+pub async fn build_delete_followup_sql(
+    backend: &dyn LixBackend,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
-    let statements = build_delete_followup_statements(plan, rows, functions)?;
+    let statements = build_delete_followup_statements(backend, plan, rows, functions).await?;
     Ok(statements
         .into_iter()
         .map(|statement| statement.to_string())
@@ -873,112 +875,11 @@ async fn rewrite_tracked_rows_with_backend(
         || functions.uuid_v7(),
     )?;
 
-    let mut ensure_no_content = false;
-    let mut snapshot_rows = Vec::new();
-    let mut change_rows = Vec::new();
-    let mut materialized_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
-
-    for change in &commit_result.changes {
-        let snapshot_id = match &change.snapshot_content {
-            Some(content) => {
-                let id = functions.uuid_v7();
-                snapshot_rows.push(vec![string_expr(&id), string_expr(content)]);
-                id
-            }
-            None => {
-                ensure_no_content = true;
-                "no-content".to_string()
-            }
-        };
-
-        let metadata_expr = change
-            .metadata
-            .as_ref()
-            .map(|value| string_expr(value))
-            .unwrap_or_else(null_expr);
-
-        change_rows.push(vec![
-            string_expr(&change.id),
-            string_expr(&change.entity_id),
-            string_expr(&change.schema_key),
-            string_expr(&change.schema_version),
-            string_expr(&change.file_id),
-            string_expr(&change.plugin_key),
-            string_expr(&snapshot_id),
-            metadata_expr,
-            string_expr(&change.created_at),
-        ]);
-    }
-
-    for row in commit_result.materialized_state {
+    for row in &commit_result.materialized_state {
         ensure_registration(registrations, &row.schema_key);
-        materialized_by_schema
-            .entry(row.schema_key.clone())
-            .or_default()
-            .push(materialized_row_values(&row));
     }
 
-    let mut statements = Vec::new();
-    if ensure_no_content {
-        statements.push(make_insert_statement(
-            SNAPSHOT_TABLE,
-            vec![Ident::new("id"), Ident::new("content")],
-            vec![vec![string_expr("no-content"), null_expr()]],
-            Some(build_snapshot_on_conflict()),
-        ));
-    }
-
-    if !snapshot_rows.is_empty() {
-        statements.push(make_insert_statement(
-            SNAPSHOT_TABLE,
-            vec![Ident::new("id"), Ident::new("content")],
-            snapshot_rows,
-            Some(build_snapshot_on_conflict()),
-        ));
-    }
-
-    if !change_rows.is_empty() {
-        statements.push(make_insert_statement(
-            CHANGE_TABLE,
-            vec![
-                Ident::new("id"),
-                Ident::new("entity_id"),
-                Ident::new("schema_key"),
-                Ident::new("schema_version"),
-                Ident::new("file_id"),
-                Ident::new("plugin_key"),
-                Ident::new("snapshot_id"),
-                Ident::new("metadata"),
-                Ident::new("created_at"),
-            ],
-            change_rows,
-            None,
-        ));
-    }
-
-    for (schema_key, rows) in materialized_by_schema {
-        let table_name = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
-        statements.push(make_insert_statement(
-            &table_name,
-            vec![
-                Ident::new("entity_id"),
-                Ident::new("schema_key"),
-                Ident::new("schema_version"),
-                Ident::new("file_id"),
-                Ident::new("version_id"),
-                Ident::new("plugin_key"),
-                Ident::new("snapshot_content"),
-                Ident::new("change_id"),
-                Ident::new("is_tombstone"),
-                Ident::new("created_at"),
-                Ident::new("updated_at"),
-            ],
-            rows,
-            Some(build_materialized_on_conflict()),
-        ));
-    }
-
-    Ok(statements)
+    build_statements_from_generate_commit_result(commit_result, functions)
 }
 
 fn ensure_registration(registrations: &mut Vec<SchemaRegistration>, schema_key: &str) {
@@ -1202,7 +1103,8 @@ fn build_untracked_insert(
     ))
 }
 
-fn build_update_followup_statements(
+async fn build_update_followup_statements(
+    backend: &dyn LixBackend,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     functions: &mut dyn LixFunctionProvider,
@@ -1211,10 +1113,9 @@ fn build_update_followup_statements(
         return Ok(Vec::new());
     }
 
-    let mut ensure_no_content = false;
-    let mut snapshot_rows = Vec::new();
-    let mut change_rows = Vec::new();
-    let mut change_updates = Vec::new();
+    let timestamp = functions.timestamp();
+    let mut domain_changes = Vec::new();
+    let mut affected_versions = BTreeSet::new();
 
     for row in rows {
         if row.len() < UPDATE_RETURNING_COLUMNS.len() {
@@ -1228,91 +1129,39 @@ fn build_update_followup_statements(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
-        let snapshot_content_value = &row[5];
-        let updated_at = value_to_string(&row[6], "updated_at")?;
+        let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
 
-        let snapshot_id = if matches!(snapshot_content_value, EngineValue::Null) {
-            ensure_no_content = true;
-            "no-content".to_string()
-        } else {
-            let id = functions.uuid_v7();
-            snapshot_rows.push(vec![
-                string_expr(&id),
-                value_to_expr(snapshot_content_value)?,
-            ]);
-            id
-        };
-
-        let change_id = functions.uuid_v7();
-
-        change_rows.push(vec![
-            string_expr(&change_id),
-            string_expr(&entity_id),
-            string_expr(&plan.schema_key),
-            string_expr(&schema_version),
-            string_expr(&file_id),
-            string_expr(&plugin_key),
-            string_expr(&snapshot_id),
-            null_expr(),
-            string_expr(&updated_at),
-        ]);
-
-        change_updates.push(ChangeUpdateRow {
+        affected_versions.insert(version_id.clone());
+        domain_changes.push(DomainChangeInput {
+            id: functions.uuid_v7(),
             entity_id,
+            schema_key: plan.schema_key.clone(),
+            schema_version,
             file_id,
             version_id,
-            change_id,
+            plugin_key,
+            snapshot_content,
+            metadata: None,
+            created_at: timestamp.clone(),
+            writer_key: None,
         });
     }
 
-    let mut statements = Vec::new();
-
-    if ensure_no_content {
-        statements.push(make_insert_statement(
-            SNAPSHOT_TABLE,
-            vec![Ident::new("id"), Ident::new("content")],
-            vec![vec![string_expr("no-content"), null_expr()]],
-            Some(build_snapshot_on_conflict()),
-        ));
-    }
-
-    if !snapshot_rows.is_empty() {
-        statements.push(make_insert_statement(
-            SNAPSHOT_TABLE,
-            vec![Ident::new("id"), Ident::new("content")],
-            snapshot_rows,
-            Some(build_snapshot_on_conflict()),
-        ));
-    }
-
-    if !change_rows.is_empty() {
-        statements.push(make_insert_statement(
-            CHANGE_TABLE,
-            vec![
-                Ident::new("id"),
-                Ident::new("entity_id"),
-                Ident::new("schema_key"),
-                Ident::new("schema_version"),
-                Ident::new("file_id"),
-                Ident::new("plugin_key"),
-                Ident::new("snapshot_id"),
-                Ident::new("metadata"),
-                Ident::new("created_at"),
-            ],
-            change_rows,
-            None,
-        ));
-    }
-
-    if !change_updates.is_empty() {
-        let table_name = format!("{}{}", MATERIALIZED_PREFIX, plan.schema_key);
-        statements.push(build_change_id_update(&table_name, &change_updates));
-    }
-
-    Ok(statements)
+    let versions = load_version_info_for_versions(backend, &affected_versions).await?;
+    let commit_result = generate_commit(
+        GenerateCommitArgs {
+            timestamp,
+            active_accounts: Vec::new(),
+            changes: domain_changes,
+            versions,
+        },
+        || functions.uuid_v7(),
+    )?;
+    build_statements_from_generate_commit_result(commit_result, functions)
 }
 
-fn build_delete_followup_statements(
+async fn build_delete_followup_statements(
+    backend: &dyn LixBackend,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     functions: &mut dyn LixFunctionProvider,
@@ -1321,8 +1170,9 @@ fn build_delete_followup_statements(
         return Ok(Vec::new());
     }
 
-    let mut change_rows = Vec::new();
-    let mut change_updates = Vec::new();
+    let timestamp = functions.timestamp();
+    let mut domain_changes = Vec::new();
+    let mut affected_versions = BTreeSet::new();
 
     for row in rows {
         if row.len() < UPDATE_RETURNING_COLUMNS.len() {
@@ -1336,63 +1186,33 @@ fn build_delete_followup_statements(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
-        let updated_at = value_to_string(&row[6], "updated_at")?;
-
-        let change_id = functions.uuid_v7();
-
-        change_rows.push(vec![
-            string_expr(&change_id),
-            string_expr(&entity_id),
-            string_expr(&plan.schema_key),
-            string_expr(&schema_version),
-            string_expr(&file_id),
-            string_expr(&plugin_key),
-            string_expr("no-content"),
-            null_expr(),
-            string_expr(&updated_at),
-        ]);
-
-        change_updates.push(ChangeUpdateRow {
+        affected_versions.insert(version_id.clone());
+        domain_changes.push(DomainChangeInput {
+            id: functions.uuid_v7(),
             entity_id,
+            schema_key: plan.schema_key.clone(),
+            schema_version,
             file_id,
             version_id,
-            change_id,
+            plugin_key,
+            snapshot_content: None,
+            metadata: None,
+            created_at: timestamp.clone(),
+            writer_key: None,
         });
     }
 
-    let mut statements = Vec::new();
-    statements.push(make_insert_statement(
-        SNAPSHOT_TABLE,
-        vec![Ident::new("id"), Ident::new("content")],
-        vec![vec![string_expr("no-content"), null_expr()]],
-        Some(build_snapshot_on_conflict()),
-    ));
-
-    if !change_rows.is_empty() {
-        statements.push(make_insert_statement(
-            CHANGE_TABLE,
-            vec![
-                Ident::new("id"),
-                Ident::new("entity_id"),
-                Ident::new("schema_key"),
-                Ident::new("schema_version"),
-                Ident::new("file_id"),
-                Ident::new("plugin_key"),
-                Ident::new("snapshot_id"),
-                Ident::new("metadata"),
-                Ident::new("created_at"),
-            ],
-            change_rows,
-            None,
-        ));
-    }
-
-    if !change_updates.is_empty() {
-        let table_name = format!("{}{}", MATERIALIZED_PREFIX, plan.schema_key);
-        statements.push(build_change_id_update(&table_name, &change_updates));
-    }
-
-    Ok(statements)
+    let versions = load_version_info_for_versions(backend, &affected_versions).await?;
+    let commit_result = generate_commit(
+        GenerateCommitArgs {
+            timestamp,
+            active_accounts: Vec::new(),
+            changes: domain_changes,
+            versions,
+        },
+        || functions.uuid_v7(),
+    )?;
+    build_statements_from_generate_commit_result(commit_result, functions)
 }
 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
@@ -1439,86 +1259,115 @@ fn lix_timestamp_expr() -> Expr {
     })
 }
 
-fn build_change_id_update(table_name: &str, rows: &[ChangeUpdateRow]) -> Statement {
-    let case_expr = Expr::Case {
-        case_token: AttachedToken::empty(),
-        end_token: AttachedToken::empty(),
-        operand: None,
-        conditions: rows
-            .iter()
-            .map(|row| CaseWhen {
-                condition: match_key_expr(row),
-                result: string_expr(&row.change_id),
-            })
-            .collect(),
-        else_result: Some(Box::new(Expr::Identifier(Ident::new("change_id")))),
-    };
+fn build_statements_from_generate_commit_result(
+    commit_result: GenerateCommitResult,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Vec<Statement>, LixError> {
+    let mut ensure_no_content = false;
+    let mut snapshot_rows = Vec::new();
+    let mut change_rows = Vec::new();
+    let mut materialized_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
 
-    let selection = or_exprs(rows.iter().map(match_key_expr).collect());
+    for change in &commit_result.changes {
+        let snapshot_id = match &change.snapshot_content {
+            Some(content) => {
+                let id = functions.uuid_v7();
+                snapshot_rows.push(vec![string_expr(&id), string_expr(content)]);
+                id
+            }
+            None => {
+                ensure_no_content = true;
+                "no-content".to_string()
+            }
+        };
 
-    Statement::Update(Update {
-        update_token: AttachedToken::empty(),
-        table: table_with_joins_for(table_name),
-        assignments: vec![Assignment {
-            target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
-                Ident::new("change_id"),
-            )])),
-            value: case_expr,
-        }],
-        from: None,
-        selection: Some(selection),
-        returning: None,
-        or: None,
-        limit: None,
-    })
-}
+        let metadata_expr = change
+            .metadata
+            .as_ref()
+            .map(|value| string_expr(value))
+            .unwrap_or_else(null_expr);
 
-#[derive(Debug, Clone)]
-struct ChangeUpdateRow {
-    entity_id: String,
-    file_id: String,
-    version_id: String,
-    change_id: String,
-}
-
-fn match_key_expr(row: &ChangeUpdateRow) -> Expr {
-    and_exprs(vec![
-        eq_expr("entity_id", &row.entity_id),
-        eq_expr("file_id", &row.file_id),
-        eq_expr("version_id", &row.version_id),
-    ])
-}
-
-fn eq_expr(column: &str, value: &str) -> Expr {
-    Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(Ident::new(column))),
-        op: BinaryOperator::Eq,
-        right: Box::new(string_expr(value)),
+        change_rows.push(vec![
+            string_expr(&change.id),
+            string_expr(&change.entity_id),
+            string_expr(&change.schema_key),
+            string_expr(&change.schema_version),
+            string_expr(&change.file_id),
+            string_expr(&change.plugin_key),
+            string_expr(&snapshot_id),
+            metadata_expr,
+            string_expr(&change.created_at),
+        ]);
     }
-}
 
-fn and_exprs(mut exprs: Vec<Expr>) -> Expr {
-    let mut iter = exprs.drain(..);
-    let first = iter
-        .next()
-        .unwrap_or_else(|| Expr::Value(Value::Boolean(true).into()));
-    iter.fold(first, |left, right| Expr::BinaryOp {
-        left: Box::new(left),
-        op: BinaryOperator::And,
-        right: Box::new(right),
-    })
-}
+    for row in &commit_result.materialized_state {
+        materialized_by_schema
+            .entry(row.schema_key.clone())
+            .or_default()
+            .push(materialized_row_values(row));
+    }
 
-fn or_exprs(mut exprs: Vec<Expr>) -> Expr {
-    let mut iter = exprs.drain(..);
-    let first = iter
-        .next()
-        .unwrap_or_else(|| Expr::Value(Value::Boolean(false).into()));
-    iter.fold(first, |left, right| Expr::BinaryOp {
-        left: Box::new(left),
-        op: BinaryOperator::Or,
-        right: Box::new(right),
-    })
+    let mut statements = Vec::new();
+    if ensure_no_content {
+        statements.push(make_insert_statement(
+            SNAPSHOT_TABLE,
+            vec![Ident::new("id"), Ident::new("content")],
+            vec![vec![string_expr("no-content"), null_expr()]],
+            Some(build_snapshot_on_conflict()),
+        ));
+    }
+
+    if !snapshot_rows.is_empty() {
+        statements.push(make_insert_statement(
+            SNAPSHOT_TABLE,
+            vec![Ident::new("id"), Ident::new("content")],
+            snapshot_rows,
+            Some(build_snapshot_on_conflict()),
+        ));
+    }
+
+    if !change_rows.is_empty() {
+        statements.push(make_insert_statement(
+            CHANGE_TABLE,
+            vec![
+                Ident::new("id"),
+                Ident::new("entity_id"),
+                Ident::new("schema_key"),
+                Ident::new("schema_version"),
+                Ident::new("file_id"),
+                Ident::new("plugin_key"),
+                Ident::new("snapshot_id"),
+                Ident::new("metadata"),
+                Ident::new("created_at"),
+            ],
+            change_rows,
+            None,
+        ));
+    }
+
+    for (schema_key, rows) in materialized_by_schema {
+        let table_name = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
+        statements.push(make_insert_statement(
+            &table_name,
+            vec![
+                Ident::new("entity_id"),
+                Ident::new("schema_key"),
+                Ident::new("schema_version"),
+                Ident::new("file_id"),
+                Ident::new("version_id"),
+                Ident::new("plugin_key"),
+                Ident::new("snapshot_content"),
+                Ident::new("change_id"),
+                Ident::new("is_tombstone"),
+                Ident::new("created_at"),
+                Ident::new("updated_at"),
+            ],
+            rows,
+            Some(build_materialized_on_conflict()),
+        ));
+    }
+
+    Ok(statements)
 }
 
 fn table_with_joins_for(table: &str) -> TableWithJoins {
@@ -1549,6 +1398,16 @@ fn value_to_expr(value: &EngineValue) -> Result<Expr, LixError> {
         EngineValue::Real(value) => Ok(Expr::Value(Value::Number(value.to_string(), false).into())),
         EngineValue::Blob(_) => Err(LixError {
             message: "vtable update does not support blob snapshot_content".to_string(),
+        }),
+    }
+}
+
+fn value_to_optional_text(value: &EngineValue, name: &str) -> Result<Option<String>, LixError> {
+    match value {
+        EngineValue::Null => Ok(None),
+        EngineValue::Text(text) => Ok(Some(text.clone())),
+        _ => Err(LixError {
+            message: format!("vtable update expected text or null for {name}"),
         }),
     }
 }

@@ -186,6 +186,7 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
              s.created_at AS created_at, \
              s.updated_at AS updated_at, \
              CASE \
+               WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
                WHEN vc.depth = 0 THEN NULL \
                ELSE s.version_id \
              END AS inherited_from_version_id, \

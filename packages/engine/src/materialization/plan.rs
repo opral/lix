@@ -59,16 +59,6 @@ struct BuiltinProjectionSchemaMeta {
     plugin_key: String,
 }
 
-#[derive(Debug, Clone)]
-struct VersionPointerSource {
-    change_id: String,
-    schema_version: String,
-    file_id: String,
-    plugin_key: String,
-    created_at: String,
-    working_commit_id: Option<String>,
-}
-
 pub(crate) async fn materialization_plan_internal(
     backend: &dyn LixBackend,
     req: &MaterializationRequest,
@@ -413,14 +403,91 @@ fn build_global_projection_rows(
     let commit_edge_schema = builtin_projection_schema_meta("lix_commit_edge");
     let change_author_schema = builtin_projection_schema_meta("lix_change_author");
     let commit_depths = min_depth_by_commit(commit_graph);
+    let change_commit_by_change_id = build_change_commit_index(data);
+    let latest_pointer_changes = latest_version_pointer_changes(data);
 
     let mut candidates: BTreeMap<(String, String, String, String), Vec<ProjectionCandidate>> =
         BTreeMap::new();
 
+    for change in &latest_pointer_changes {
+        let pointer_snapshot = change.snapshot_content.as_ref().and_then(|raw| {
+            match serde_json::from_str::<LixVersionPointer>(raw) {
+                Ok(parsed) => Some(parsed),
+                Err(error) => {
+                    warnings.push(MaterializationWarning {
+                        code: "invalid_version_pointer_snapshot".to_string(),
+                        message: format!(
+                            "lix_version_pointer change '{}' has invalid snapshot JSON: {}",
+                            change.id, error
+                        ),
+                    });
+                    None
+                }
+            }
+        });
+
+        let effective_commit_id = pointer_snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.commit_id.is_empty())
+            .map(|snapshot| snapshot.commit_id.clone())
+            .or_else(|| change_commit_by_change_id.get(&change.id).cloned())
+            .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
+        let depth = commit_depths
+            .get(&effective_commit_id)
+            .copied()
+            .unwrap_or(usize::MAX / 4);
+
+        let snapshot_content = pointer_snapshot
+            .as_ref()
+            .filter(|snapshot| !snapshot.id.is_empty() && !snapshot.commit_id.is_empty())
+            .map(|snapshot| {
+                let working_commit_id = snapshot
+                    .working_commit_id
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| snapshot.commit_id.clone());
+                json!({
+                    "id": snapshot.id,
+                    "commit_id": snapshot.commit_id,
+                    "working_commit_id": working_commit_id,
+                })
+                .to_string()
+            });
+
+        let row = VisibleRow {
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            commit_id: effective_commit_id,
+            change_id: change.id.clone(),
+            entity_id: change.entity_id.clone(),
+            schema_key: version_pointer_schema.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content,
+            created_at: change.created_at.clone(),
+            updated_at: change.created_at.clone(),
+        };
+        let key = (
+            row.version_id.clone(),
+            row.entity_id.clone(),
+            row.schema_key.clone(),
+            row.file_id.clone(),
+        );
+        candidates
+            .entry(key)
+            .or_default()
+            .push(ProjectionCandidate { depth, row });
+    }
+
     for (version_id, tip_commit_ids) in version_pointers {
+        if latest_pointer_changes
+            .iter()
+            .any(|change| change.entity_id == *version_id)
+        {
+            continue;
+        }
         for tip_commit_id in tip_commit_ids {
-            let source =
-                latest_version_pointer_source_for_tip(data, version_id, tip_commit_id, warnings);
             let tip_depth = commit_depths
                 .get(tip_commit_id)
                 .copied()
@@ -431,54 +498,31 @@ fn build_global_projection_rows(
                 .map(|commit| commit.created_at.clone())
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
-            let (change_id, schema_version, file_id, plugin_key, created_at, working_commit_id) =
-                match source {
-                    Some(source) => (
-                        source.change_id,
-                        source.schema_version,
-                        source.file_id,
-                        source.plugin_key,
-                        source.created_at,
-                        source
-                            .working_commit_id
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or_else(|| tip_commit_id.clone()),
-                    ),
-                    None => (
-                        format!("syn~lix_version_pointer~{}~{}", version_id, tip_commit_id),
-                        version_pointer_schema.schema_version.clone(),
-                        version_pointer_schema.file_id.clone(),
-                        version_pointer_schema.plugin_key.clone(),
-                        fallback_created_at.clone(),
-                        tip_commit_id.clone(),
-                    ),
-                };
-
             let row = VisibleRow {
                 version_id: GLOBAL_VERSION_ID.to_string(),
                 commit_id: tip_commit_id.clone(),
-                change_id,
+                change_id: format!("syn~lix_version_pointer~{}~{}", version_id, tip_commit_id),
                 entity_id: version_id.clone(),
                 schema_key: version_pointer_schema.schema_key.clone(),
-                schema_version,
-                file_id: file_id.clone(),
-                plugin_key,
+                schema_version: version_pointer_schema.schema_version.clone(),
+                file_id: version_pointer_schema.file_id.clone(),
+                plugin_key: version_pointer_schema.plugin_key.clone(),
                 snapshot_content: Some(
                     json!({
                         "id": version_id,
                         "commit_id": tip_commit_id,
-                        "working_commit_id": working_commit_id,
+                        "working_commit_id": tip_commit_id,
                     })
                     .to_string(),
                 ),
-                created_at: created_at.clone(),
-                updated_at: created_at,
+                created_at: fallback_created_at.clone(),
+                updated_at: fallback_created_at,
             };
             let key = (
                 row.version_id.clone(),
                 row.entity_id.clone(),
                 row.schema_key.clone(),
-                file_id,
+                row.file_id.clone(),
             );
             candidates
                 .entry(key)
@@ -710,57 +754,34 @@ fn min_depth_by_commit(
     min_depth
 }
 
-fn latest_version_pointer_source_for_tip(
-    data: &LoadedData,
-    version_id: &str,
-    tip_commit_id: &str,
-    warnings: &mut Vec<MaterializationWarning>,
-) -> Option<VersionPointerSource> {
-    let mut best: Option<VersionPointerSource> = None;
-
+fn latest_version_pointer_changes(data: &LoadedData) -> Vec<ChangeRecord> {
+    let mut latest_by_entity: BTreeMap<String, ChangeRecord> = BTreeMap::new();
     for change in data.changes.values() {
-        if change.schema_key != "lix_version_pointer" || change.entity_id != version_id {
+        if change.schema_key != "lix_version_pointer" {
             continue;
         }
-        let Some(snapshot_content) = change.snapshot_content.as_deref() else {
-            continue;
-        };
-        let parsed: LixVersionPointer = match serde_json::from_str(snapshot_content) {
-            Ok(value) => value,
-            Err(error) => {
-                warnings.push(MaterializationWarning {
-                    code: "invalid_version_pointer_snapshot".to_string(),
-                    message: format!(
-                        "lix_version_pointer change '{}' has invalid snapshot JSON: {}",
-                        change.id, error
-                    ),
-                });
-                continue;
-            }
-        };
-        if parsed.commit_id != tip_commit_id {
-            continue;
-        }
-
-        let candidate = VersionPointerSource {
-            change_id: change.id.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            created_at: change.created_at.clone(),
-            working_commit_id: parsed.working_commit_id,
-        };
-
-        match &best {
+        match latest_by_entity.get(&change.entity_id) {
             Some(existing)
-                if existing.created_at > candidate.created_at
-                    || (existing.created_at == candidate.created_at
-                        && existing.change_id >= candidate.change_id) => {}
-            _ => best = Some(candidate),
+                if existing.created_at > change.created_at
+                    || (existing.created_at == change.created_at && existing.id >= change.id) => {}
+            _ => {
+                latest_by_entity.insert(change.entity_id.clone(), change.clone());
+            }
         }
     }
+    latest_by_entity.into_values().collect()
+}
 
-    best
+fn build_change_commit_index(data: &LoadedData) -> BTreeMap<String, String> {
+    let mut index = BTreeMap::new();
+    for commit in data.commits.values() {
+        for change_id in &commit.snapshot.change_ids {
+            index
+                .entry(change_id.clone())
+                .or_insert_with(|| commit.entity_id.clone());
+        }
+    }
+    index
 }
 
 fn builtin_projection_schema_meta(schema_key: &str) -> BuiltinProjectionSchemaMeta {
@@ -998,6 +1019,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<MaterializationWrite> {
             entity_id: row.source.entity_id.clone(),
             file_id: row.source.file_id.clone(),
             version_id: row.version_id.clone(),
+            inherited_from_version_id: row.inherited_from_version_id.clone(),
             op,
             snapshot_content: row.source.snapshot_content.clone(),
             schema_version: row.source.schema_version.clone(),

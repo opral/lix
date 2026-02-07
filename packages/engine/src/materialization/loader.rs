@@ -34,6 +34,14 @@ pub(crate) struct VersionPointerRecord {
 }
 
 #[derive(Debug, Clone)]
+struct VersionPointerLatestChange {
+    id: String,
+    entity_id: String,
+    snapshot_content: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct VersionDescriptorRecord {
     pub id: String,
     pub entity_id: String,
@@ -66,6 +74,8 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
     let mut changes = BTreeMap::new();
     let mut commits = BTreeMap::new();
     let mut version_pointers = Vec::new();
+    let mut latest_version_pointer_by_entity: BTreeMap<String, VersionPointerLatestChange> =
+        BTreeMap::new();
     let mut version_descriptors = BTreeMap::new();
     let mut commit_edges = Vec::new();
 
@@ -110,15 +120,13 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         }
 
         if schema_key == "lix_version_pointer" {
-            if let Some(snapshot_raw) = snapshot_content {
-                if let Some(snapshot) = parse_version_pointer_snapshot(&snapshot_raw)? {
-                    version_pointers.push(VersionPointerRecord {
-                        id,
-                        snapshot,
-                        created_at,
-                    });
-                }
-            }
+            let candidate = VersionPointerLatestChange {
+                id: id.clone(),
+                entity_id: entity_id.clone(),
+                snapshot_content: snapshot_content.clone(),
+                created_at: created_at.clone(),
+            };
+            upsert_latest_version_pointer_change(&mut latest_version_pointer_by_entity, candidate);
             continue;
         }
 
@@ -152,6 +160,20 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         }
     }
 
+    for latest in latest_version_pointer_by_entity.into_values() {
+        let Some(snapshot_raw) = latest.snapshot_content.as_deref() else {
+            // Tombstone (NULL snapshot): this version pointer is currently deleted.
+            continue;
+        };
+        if let Some(snapshot) = parse_version_pointer_snapshot(snapshot_raw)? {
+            version_pointers.push(VersionPointerRecord {
+                id: latest.id,
+                snapshot,
+                created_at: latest.created_at,
+            });
+        }
+    }
+
     version_pointers.sort_by(|a, b| {
         a.snapshot
             .id
@@ -177,6 +199,21 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         version_descriptors,
         commit_edges,
     })
+}
+
+fn upsert_latest_version_pointer_change(
+    target: &mut BTreeMap<String, VersionPointerLatestChange>,
+    candidate: VersionPointerLatestChange,
+) {
+    match target.get(&candidate.entity_id) {
+        Some(existing)
+            if existing.created_at > candidate.created_at
+                || (existing.created_at == candidate.created_at && existing.id >= candidate.id) => {
+        }
+        _ => {
+            target.insert(candidate.entity_id.clone(), candidate);
+        }
+    }
 }
 
 fn upsert_latest_by_entity<T, F>(target: &mut BTreeMap<String, T>, candidate: T, key: F)
