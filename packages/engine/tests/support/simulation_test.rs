@@ -9,9 +9,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, MaterializationApplyReport,
-    MaterializationDebugMode, MaterializationPlan, MaterializationReport, MaterializationRequest,
-    MaterializationScope, QueryResult, Value,
+    boot, BootAccount, BootArgs, BootKeyValue, Engine, LixBackend, LixError,
+    MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
+    MaterializationReport, MaterializationRequest, MaterializationScope, QueryResult, Value,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -40,6 +40,7 @@ pub struct SimulationArgs {
 #[derive(Default)]
 pub struct SimulationBootArgs {
     pub key_values: Vec<BootKeyValue>,
+    pub active_account: Option<BootAccount>,
 }
 
 pub struct SimulationEngine {
@@ -144,6 +145,7 @@ impl SimulationArgs {
             engine: boot(BootArgs {
                 backend: (self.backend_factory)(),
                 key_values: args.key_values,
+                active_account: args.active_account,
             }),
             behavior: self.behavior,
             rematerialization_pending: AtomicBool::new(false),

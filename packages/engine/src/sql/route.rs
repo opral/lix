@@ -2,9 +2,10 @@ use sqlparser::ast::{Insert, Statement};
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::steps::{
-    lix_active_version_view_read, lix_active_version_view_write, lix_state_by_version_view_read,
-    lix_state_by_version_view_write, lix_state_view_read, lix_state_view_write,
-    lix_version_view_read, lix_version_view_write, stored_schema, vtable_read, vtable_write,
+    lix_active_account_view_read, lix_active_account_view_write, lix_active_version_view_read,
+    lix_active_version_view_write, lix_state_by_version_view_read, lix_state_by_version_view_write,
+    lix_state_view_read, lix_state_view_write, lix_version_view_read, lix_version_view_write,
+    stored_schema, vtable_read, vtable_write,
 };
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
@@ -22,6 +23,11 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
                 lix_version_view_write::rewrite_insert(insert.clone(), params)?
             {
                 return rewrite_vtable_inserts(version_inserts, params, functions);
+            }
+            if let Some(active_account_inserts) =
+                lix_active_account_view_write::rewrite_insert(insert.clone(), params)?
+            {
+                return rewrite_vtable_inserts(active_account_inserts, params, functions);
             }
 
             let mut current = Statement::Insert(insert);
@@ -136,6 +142,8 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
             let query = *query;
             let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query =
+                lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query =
                 lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query =
                 lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
@@ -174,6 +182,17 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
                 return rewrite_vtable_inserts_with_backend(
                     backend,
                     version_inserts,
+                    params,
+                    functions,
+                )
+                .await;
+            }
+            if let Some(active_account_inserts) =
+                lix_active_account_view_write::rewrite_insert(insert.clone(), params)?
+            {
+                return rewrite_vtable_inserts_with_backend(
+                    backend,
+                    active_account_inserts,
                     params,
                     functions,
                 )
@@ -288,6 +307,16 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
                 return rewrite_statement(Statement::Delete(rewritten), params, functions);
             }
 
+            if let Some(rewritten) = lix_active_account_view_write::rewrite_delete_with_backend(
+                backend,
+                delete.clone(),
+                params,
+            )
+            .await?
+            {
+                return rewrite_statement(rewritten, params, functions);
+            }
+
             if let Some(rewritten) =
                 lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
             {
@@ -312,6 +341,8 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
         Statement::Query(query) => {
             let query = *query;
             let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query =
+                lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query =
                 lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query =

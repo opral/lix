@@ -8,6 +8,10 @@ use sqlparser::ast::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::account::{
+    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
+    parse_active_account_snapshot,
+};
 use crate::builtin_schema::types::LixVersionPointer;
 use crate::commit::{
     generate_commit, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
@@ -29,6 +33,7 @@ const CHANGE_TABLE: &str = "lix_internal_change";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
+const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const GLOBAL_VERSION: &str = "global";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
@@ -865,10 +870,11 @@ async fn rewrite_tracked_rows_with_backend(
     }
 
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
-            active_accounts: Vec::new(),
+            active_accounts,
             changes: domain_changes,
             versions,
         },
@@ -911,6 +917,57 @@ fn materialized_row_values(row: &MaterializedStateRow) -> Vec<Expr> {
         string_expr(&row.created_at),
         string_expr(&row.created_at),
     ]
+}
+
+async fn load_commit_active_accounts(
+    backend: &dyn LixBackend,
+    domain_changes: &[DomainChangeInput],
+) -> Result<Vec<String>, LixError> {
+    if domain_changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Explicit change_author writes should not recursively derive change_author rows.
+    if domain_changes
+        .iter()
+        .all(|change| change.schema_key == CHANGE_AUTHOR_SCHEMA_KEY)
+    {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "SELECT snapshot_content \
+         FROM {table_name} \
+         WHERE schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{version_id}' \
+           AND snapshot_content IS NOT NULL",
+        table_name = UNTRACKED_TABLE,
+        schema_key = escape_sql_string(active_account_schema_key()),
+        file_id = escape_sql_string(active_account_file_id()),
+        version_id = escape_sql_string(active_account_storage_version_id()),
+    );
+    let result = backend.execute(&sql, &[]).await?;
+
+    let mut deduped = BTreeSet::new();
+    for row in result.rows {
+        let Some(value) = row.first() else {
+            continue;
+        };
+        let snapshot = match value {
+            EngineValue::Text(text) => text,
+            EngineValue::Null => continue,
+            _ => {
+                return Err(LixError {
+                    message: "active account snapshot_content must be text".to_string(),
+                })
+            }
+        };
+        let account_id = parse_active_account_snapshot(snapshot)?;
+        deduped.insert(account_id);
+    }
+
+    Ok(deduped.into_iter().collect())
 }
 
 async fn load_version_info_for_versions(
@@ -1148,10 +1205,11 @@ async fn build_update_followup_statements(
     }
 
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
-            active_accounts: Vec::new(),
+            active_accounts,
             changes: domain_changes,
             versions,
         },
@@ -1203,10 +1261,11 @@ async fn build_delete_followup_statements(
     }
 
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
-            active_accounts: Vec::new(),
+            active_accounts,
             changes: domain_changes,
             versions,
         },

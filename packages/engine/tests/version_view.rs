@@ -45,6 +45,7 @@ fn deterministic_boot_args() -> SimulationBootArgs {
             value: serde_json::json!({ "enabled": true }),
             version_id: None,
         }],
+        active_account: None,
     }
 }
 

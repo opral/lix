@@ -1,27 +1,16 @@
 {
-  "x-lix-key": "lix_change_author",
+  "x-lix-key": "lix_active_account",
   "x-lix-version": "1",
   "x-lix-primary-key": [
-    "/change_id",
     "/account_id"
   ],
   "x-lix-override-lixcols": {
     "lixcol_file_id": "\"lix\"",
     "lixcol_plugin_key": "\"lix\"",
+    "lixcol_untracked": "1",
     "lixcol_version_id": "\"global\""
   },
   "x-lix-foreign-keys": [
-    {
-      "properties": [
-        "/change_id"
-      ],
-      "references": {
-        "schemaKey": "lix_change",
-        "properties": [
-          "/id"
-        ]
-      }
-    },
     {
       "properties": [
         "/account_id"
@@ -36,15 +25,11 @@
   ],
   "type": "object",
   "properties": {
-    "change_id": {
-      "type": "string"
-    },
     "account_id": {
       "type": "string"
     }
   },
   "required": [
-    "change_id",
     "account_id"
   ],
   "additionalProperties": false
