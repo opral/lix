@@ -92,13 +92,18 @@ pub async fn rewrite_update_with_backend(
     }
 
     let active_version_id = load_active_version_id(backend).await?;
-    let has_untracked_predicate = update
+    let stripped_selection = update
         .selection
+        .take()
+        .map(strip_inherited_from_version_predicate)
+        .transpose()?
+        .flatten();
+    let has_untracked_predicate = stripped_selection
         .as_ref()
         .map(|selection| contains_column_reference(selection, "untracked"))
         .unwrap_or(false);
     replace_table_with_vtable(&mut update.table)?;
-    let mut selection = match update.selection.take() {
+    let mut selection = match stripped_selection {
         Some(existing) => Expr::BinaryOp {
             left: Box::new(existing),
             op: BinaryOperator::And,
@@ -189,7 +194,13 @@ pub async fn rewrite_delete_with_backend(
 
     let active_version_id = load_active_version_id(backend).await?;
     replace_delete_from_vtable(&mut delete)?;
-    delete.selection = Some(match delete.selection.take() {
+    let stripped_selection = delete
+        .selection
+        .take()
+        .map(strip_inherited_from_version_predicate)
+        .transpose()?
+        .flatten();
+    delete.selection = Some(match stripped_selection {
         Some(existing) => Expr::BinaryOp {
             left: Box::new(existing),
             op: BinaryOperator::And,
@@ -299,6 +310,63 @@ fn version_predicate_expr(version_id: &str) -> Expr {
         right: Box::new(Expr::Value(
             Value::SingleQuotedString(version_id.to_string()).into(),
         )),
+    }
+}
+
+fn strip_inherited_from_version_predicate(expr: Expr) -> Result<Option<Expr>, LixError> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let left = strip_inherited_from_version_predicate(*left)?;
+            let right = strip_inherited_from_version_predicate(*right)?;
+            match (left, right) {
+                (Some(left), Some(right)) => Ok(Some(Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOperator::And,
+                    right: Box::new(right),
+                })),
+                (Some(expr), None) | (None, Some(expr)) => Ok(Some(expr)),
+                (None, None) => Ok(None),
+            }
+        }
+        Expr::IsNull(inner) if expr_is_inherited_from_version_column(&inner) => Ok(None),
+        Expr::IsNotNull(inner) if expr_is_inherited_from_version_column(&inner) => {
+            Ok(Some(false_predicate_expr()))
+        }
+        other if contains_column_reference(&other, "inherited_from_version_id") => Err(LixError {
+            message:
+                "lix_state mutation only supports inherited_from_version_id filters via IS NULL/IS NOT NULL"
+                    .to_string(),
+        }),
+        other => Ok(Some(other)),
+    }
+}
+
+fn expr_is_inherited_from_version_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident
+            .value
+            .eq_ignore_ascii_case("inherited_from_version_id"),
+        Expr::CompoundIdentifier(idents) => idents
+            .last()
+            .map(|ident| {
+                ident
+                    .value
+                    .eq_ignore_ascii_case("inherited_from_version_id")
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn false_predicate_expr() -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(Expr::Value(Value::Number("1".to_string(), false).into())),
+        op: BinaryOperator::Eq,
+        right: Box::new(Expr::Value(Value::Number("0".to_string(), false).into())),
     }
 }
 
