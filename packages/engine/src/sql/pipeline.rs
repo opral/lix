@@ -24,15 +24,17 @@ pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
 pub fn preprocess_statements(
     statements: Vec<Statement>,
     params: &[Value],
+    dialect: SqlDialect,
 ) -> Result<PreprocessOutput, LixError> {
     let mut provider = SystemFunctionProvider;
-    preprocess_statements_with_provider(statements, params, &mut provider)
+    preprocess_statements_with_provider(statements, params, &mut provider, dialect)
 }
 
 pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
+    dialect: SqlDialect,
 ) -> Result<PreprocessOutput, LixError> {
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
@@ -54,7 +56,7 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
         update_validations.extend(output.update_validations);
         for rewritten_statement in output.statements {
             let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
-            rewritten.push(lower_statement(inlined, SqlDialect::Sqlite)?);
+            rewritten.push(lower_statement(inlined, dialect)?);
         }
     }
 
@@ -64,8 +66,7 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
         });
     }
 
-    let (normalized_sql, params) =
-        render_statements_with_params(&rewritten, params, SqlDialect::Sqlite)?;
+    let (normalized_sql, params) = render_statements_with_params(&rewritten, params, dialect)?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
@@ -165,7 +166,7 @@ where
 
 #[allow(dead_code)]
 pub fn preprocess_sql_rewrite_only(sql: &str) -> Result<PreprocessOutput, LixError> {
-    preprocess_statements(parse_sql_statements(sql)?, &[])
+    preprocess_statements(parse_sql_statements(sql)?, &[], SqlDialect::Sqlite)
 }
 
 fn render_statements_with_params(
@@ -364,7 +365,8 @@ fn query_is_plain_values(query: &Query) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::preprocess_sql_rewrite_only;
+    use super::{parse_sql_statements, preprocess_sql_rewrite_only, preprocess_statements};
+    use crate::backend::SqlDialect;
 
     #[test]
     fn rewrite_only_path_lowers_lix_json_text_functions() {
@@ -378,6 +380,23 @@ mod tests {
         assert!(
             rewritten.sql.contains("json_extract("),
             "rewrite-only sqlite lowering should emit json_extract()"
+        );
+    }
+
+    #[test]
+    fn preprocess_statements_uses_requested_dialect() {
+        let statements = parse_sql_statements("SELECT version_id FROM lix_active_version")
+            .expect("parse should succeed");
+        let rewritten = preprocess_statements(statements, &[], SqlDialect::Postgres)
+            .expect("rewrite should succeed");
+
+        assert!(
+            !rewritten.sql.contains("lix_json_text("),
+            "preprocess path must lower logical lix_json_text() calls"
+        );
+        assert!(
+            rewritten.sql.contains("jsonb_extract_path_text("),
+            "postgres lowering should emit jsonb_extract_path_text()"
         );
     }
 }
