@@ -142,7 +142,7 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    lix_json_text(snapshot_content, 'commit_id') AS commit_id, \
                    lix_json_text(snapshot_content, 'working_commit_id') AS working_commit_id \
                  FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_version_tip' \
+                 WHERE schema_key = 'lix_version_pointer' \
                    AND version_id = 'global' \
                    AND snapshot_content IS NOT NULL \
                ) AS t \

@@ -15,15 +15,15 @@ use crate::sql::{
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_tip_file_id, version_tip_plugin_key,
-    version_tip_schema_key, version_tip_schema_version, version_tip_snapshot_content,
-    version_tip_storage_version_id,
+    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
+    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
+    version_pointer_storage_version_id,
 };
 use crate::{LixBackend, LixError, Value as EngineValue};
 
 const LIX_VERSION_VIEW_NAME: &str = "lix_version";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const VERSION_TIP_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_tip";
+const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 
 pub fn rewrite_insert(
     insert: Insert,
@@ -207,7 +207,7 @@ pub async fn rewrite_update_with_backend(
                     message: "lix_version update cannot set empty working_commit_id".to_string(),
                 });
             }
-            let snapshot = serde_json::from_str::<JsonValue>(&version_tip_snapshot_content(
+            let snapshot = serde_json::from_str::<JsonValue>(&version_pointer_snapshot_content(
                 &existing.id,
                 &next_commit_id,
                 &next_working_commit_id,
@@ -429,7 +429,7 @@ fn parse_insert_rows(
             .map_err(|error| LixError {
                 message: format!("failed to encode version descriptor snapshot: {error}"),
             })?;
-        let tip_snapshot = serde_json::from_str::<JsonValue>(&version_tip_snapshot_content(
+        let tip_snapshot = serde_json::from_str::<JsonValue>(&version_pointer_snapshot_content(
             &id,
             &commit_id,
             &working_commit_id,
@@ -487,11 +487,11 @@ async fn validate_tip_working_commit_uniqueness(
                    AND version_id = $2 \
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL",
-                table_name = VERSION_TIP_TABLE
+                table_name = VERSION_POINTER_TABLE
             ),
             &[
-                EngineValue::Text(version_tip_schema_key().to_string()),
-                EngineValue::Text(version_tip_storage_version_id().to_string()),
+                EngineValue::Text(version_pointer_schema_key().to_string()),
+                EngineValue::Text(version_pointer_storage_version_id().to_string()),
             ],
         )
         .await?;
@@ -624,11 +624,11 @@ fn build_vtable_inserts(
     }
     if !tip_rows.is_empty() {
         inserts.push(build_vtable_insert_for_schema(
-            version_tip_schema_key(),
-            version_tip_file_id(),
-            version_tip_storage_version_id(),
-            version_tip_plugin_key(),
-            version_tip_schema_version(),
+            version_pointer_schema_key(),
+            version_pointer_file_id(),
+            version_pointer_storage_version_id(),
+            version_pointer_plugin_key(),
+            version_pointer_schema_version(),
             &tip_rows,
         )?);
     }

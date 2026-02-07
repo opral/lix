@@ -151,7 +151,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
                'lix_change_author~1', \
                'lix_change_set~1', \
                'lix_commit~1', \
-               'lix_version_tip~1', \
+               'lix_version_pointer~1', \
                'lix_change_set_element~1', \
                'lix_commit_edge~1'\
              ) \
@@ -213,7 +213,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             "lix_commit_edge".to_string(),
             "lix_key_value".to_string(),
             "lix_stored_schema".to_string(),
-            "lix_version_tip".to_string(),
+            "lix_version_pointer".to_string(),
         ])
     );
 });

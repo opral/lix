@@ -1,3 +1,4 @@
+use crate::builtin_schema::types::LixVersionDescriptor;
 use crate::builtin_schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{
@@ -11,6 +12,9 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
+use crate::materialization::{
+    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
+};
 use crate::schema_registry::register_schema;
 use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, preprocess_sql_with_provider,
@@ -23,9 +27,9 @@ use crate::version::{
     active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
     version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
-    version_descriptor_storage_version_id, version_tip_file_id, version_tip_plugin_key,
-    version_tip_schema_key, version_tip_schema_version, version_tip_snapshot_content,
-    version_tip_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
+    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
+    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
+    version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -182,6 +186,27 @@ impl Engine {
         Ok(result)
     }
 
+    pub async fn materialization_plan(
+        &self,
+        req: &MaterializationRequest,
+    ) -> Result<MaterializationPlan, LixError> {
+        crate::materialization::materialization_plan(self.backend.as_ref(), req).await
+    }
+
+    pub async fn apply_materialization_plan(
+        &self,
+        plan: &MaterializationPlan,
+    ) -> Result<MaterializationApplyReport, LixError> {
+        crate::materialization::apply_materialization_plan(self.backend.as_ref(), plan).await
+    }
+
+    pub async fn materialize(
+        &self,
+        req: &MaterializationRequest,
+    ) -> Result<MaterializationReport, LixError> {
+        crate::materialization::materialize(self.backend.as_ref(), req).await
+    }
+
     async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
         for schema_key in builtin_schema_keys() {
             let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
@@ -275,9 +300,9 @@ impl Engine {
             .load_latest_commit_id()
             .await?
             .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
-        self.seed_materialized_version_tip(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+        self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
-        self.seed_materialized_version_tip(&main_version_id, &bootstrap_commit_id)
+        self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
             .await?;
 
         Ok(main_version_id)
@@ -370,35 +395,35 @@ impl Engine {
                 Value::Text(value) => value,
                 _ => continue,
             };
-            let snapshot: JsonValue =
+            let snapshot: LixVersionDescriptor =
                 serde_json::from_str(snapshot_content).map_err(|error| LixError {
                     message: format!("version descriptor snapshot_content invalid JSON: {error}"),
                 })?;
-            let Some(snapshot_name) = snapshot.get("name").and_then(JsonValue::as_str) else {
+            let Some(snapshot_name) = snapshot.name.as_deref() else {
                 continue;
             };
             if snapshot_name != name {
                 continue;
             }
-            let snapshot_id = snapshot
-                .get("id")
-                .and_then(JsonValue::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(entity_id.as_str());
+            let snapshot_id = if snapshot.id.is_empty() {
+                entity_id.as_str()
+            } else {
+                snapshot.id.as_str()
+            };
             return Ok(Some(snapshot_id.to_string()));
         }
 
         Ok(None)
     }
 
-    async fn seed_materialized_version_tip(
+    async fn seed_materialized_version_pointer(
         &self,
         entity_id: &str,
         commit_id: &str,
     ) -> Result<(), LixError> {
         let table = format!(
             "lix_internal_state_materialized_v1_{}",
-            version_tip_schema_key()
+            version_pointer_schema_key()
         );
         let check_sql = format!(
             "SELECT 1 FROM {table} \
@@ -410,17 +435,17 @@ impl Engine {
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
             table = table,
-            schema_key = escape_sql_string(version_tip_schema_key()),
+            schema_key = escape_sql_string(version_pointer_schema_key()),
             entity_id = escape_sql_string(entity_id),
-            file_id = escape_sql_string(version_tip_file_id()),
-            version_id = escape_sql_string(version_tip_storage_version_id()),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            version_id = escape_sql_string(version_pointer_storage_version_id()),
         );
         let existing = self.backend.execute(&check_sql, &[]).await?;
         if !existing.rows.is_empty() {
             return Ok(());
         }
 
-        let snapshot_content = version_tip_snapshot_content(entity_id, commit_id, commit_id);
+        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id, commit_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, \
@@ -432,11 +457,11 @@ impl Engine {
              ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
             table = table,
             entity_id = escape_sql_string(entity_id),
-            schema_key = escape_sql_string(version_tip_schema_key()),
-            schema_version = escape_sql_string(version_tip_schema_version()),
-            file_id = escape_sql_string(version_tip_file_id()),
-            version_id = escape_sql_string(version_tip_storage_version_id()),
-            plugin_key = escape_sql_string(version_tip_plugin_key()),
+            schema_key = escape_sql_string(version_pointer_schema_key()),
+            schema_version = escape_sql_string(version_pointer_schema_version()),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            version_id = escape_sql_string(version_pointer_storage_version_id()),
+            plugin_key = escape_sql_string(version_pointer_plugin_key()),
             snapshot_content = escape_sql_string(&snapshot_content),
         );
         self.backend.execute(&insert_sql, &[]).await?;

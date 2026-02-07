@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
+use crate::builtin_schema::types::{LixActiveVersion, LixVersionDescriptor, LixVersionPointer};
 use crate::builtin_schema::{builtin_schema_definition, builtin_schema_json};
 use crate::LixError;
 
@@ -9,7 +10,7 @@ pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
 
 static ACTIVE_VERSION_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
-static VERSION_TIP_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
+static VERSION_POINTER_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 
 struct SchemaMetadata {
     schema_key: String,
@@ -52,32 +53,26 @@ pub(crate) fn active_version_storage_version_id() -> &'static str {
 }
 
 pub(crate) fn active_version_snapshot_content(entity_id: &str, version_id: &str) -> String {
-    serde_json::json!({
-        "id": entity_id,
-        "version_id": version_id,
+    serde_json::to_string(&LixActiveVersion {
+        id: entity_id.to_string(),
+        version_id: version_id.to_string(),
     })
-    .to_string()
+    .expect("lix_active_version snapshot serialization must succeed")
 }
 
 pub(crate) fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
-    let parsed: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| LixError {
-        message: format!("active version snapshot_content invalid JSON: {error}"),
-    })?;
-
-    let value = parsed
-        .get("version_id")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| LixError {
-            message: "active version snapshot_content must contain string version_id".to_string(),
+    let parsed: LixActiveVersion =
+        serde_json::from_str(snapshot_content).map_err(|error| LixError {
+            message: format!("active version snapshot_content invalid JSON: {error}"),
         })?;
 
-    if value.is_empty() {
+    if parsed.version_id.is_empty() {
         return Err(LixError {
             message: "active version must not be empty".to_string(),
         });
     }
 
-    Ok(value.to_string())
+    Ok(parsed.version_id)
 }
 
 pub(crate) fn version_descriptor_schema_key() -> &'static str {
@@ -106,46 +101,46 @@ pub(crate) fn version_descriptor_snapshot_content(
     inherits_from_version_id: Option<&str>,
     hidden: bool,
 ) -> String {
-    serde_json::json!({
-        "id": id,
-        "name": name,
-        "inherits_from_version_id": inherits_from_version_id,
-        "hidden": hidden,
+    serde_json::to_string(&LixVersionDescriptor {
+        id: id.to_string(),
+        name: Some(name.to_string()),
+        inherits_from_version_id: inherits_from_version_id.map(ToString::to_string),
+        hidden,
     })
-    .to_string()
+    .expect("lix_version_descriptor snapshot serialization must succeed")
 }
 
-pub(crate) fn version_tip_schema_key() -> &'static str {
-    &version_tip_schema_metadata().schema_key
+pub(crate) fn version_pointer_schema_key() -> &'static str {
+    &version_pointer_schema_metadata().schema_key
 }
 
-pub(crate) fn version_tip_schema_version() -> &'static str {
-    &version_tip_schema_metadata().schema_version
+pub(crate) fn version_pointer_schema_version() -> &'static str {
+    &version_pointer_schema_metadata().schema_version
 }
 
-pub(crate) fn version_tip_file_id() -> &'static str {
-    &version_tip_schema_metadata().file_id
+pub(crate) fn version_pointer_file_id() -> &'static str {
+    &version_pointer_schema_metadata().file_id
 }
 
-pub(crate) fn version_tip_plugin_key() -> &'static str {
-    &version_tip_schema_metadata().plugin_key
+pub(crate) fn version_pointer_plugin_key() -> &'static str {
+    &version_pointer_schema_metadata().plugin_key
 }
 
-pub(crate) fn version_tip_storage_version_id() -> &'static str {
-    &version_tip_schema_metadata().storage_version_id
+pub(crate) fn version_pointer_storage_version_id() -> &'static str {
+    &version_pointer_schema_metadata().storage_version_id
 }
 
-pub(crate) fn version_tip_snapshot_content(
+pub(crate) fn version_pointer_snapshot_content(
     id: &str,
     commit_id: &str,
     working_commit_id: &str,
 ) -> String {
-    serde_json::json!({
-        "id": id,
-        "commit_id": commit_id,
-        "working_commit_id": working_commit_id,
+    serde_json::to_string(&LixVersionPointer {
+        id: id.to_string(),
+        commit_id: commit_id.to_string(),
+        working_commit_id: Some(working_commit_id.to_string()),
     })
-    .to_string()
+    .expect("lix_version_pointer snapshot serialization must succeed")
 }
 
 fn active_version_schema_metadata() -> &'static SchemaMetadata {
@@ -157,8 +152,8 @@ fn version_descriptor_schema_metadata() -> &'static SchemaMetadata {
         .get_or_init(|| parse_schema_metadata("lix_version_descriptor"))
 }
 
-fn version_tip_schema_metadata() -> &'static SchemaMetadata {
-    VERSION_TIP_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_version_tip"))
+fn version_pointer_schema_metadata() -> &'static SchemaMetadata {
+    VERSION_POINTER_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_version_pointer"))
 }
 
 fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {
