@@ -1,3 +1,9 @@
+use crate::account::{
+    account_file_id, account_plugin_key, account_schema_key, account_schema_version,
+    account_snapshot_content, account_storage_version_id, active_account_file_id,
+    active_account_plugin_key, active_account_schema_key, active_account_schema_version,
+    active_account_snapshot_content, active_account_storage_version_id,
+};
 use crate::builtin_schema::types::LixVersionDescriptor;
 use crate::builtin_schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::cel::CelEvaluator;
@@ -45,9 +51,16 @@ pub struct BootKeyValue {
     pub version_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BootAccount {
+    pub id: String,
+    pub name: String,
+}
+
 pub struct BootArgs {
     pub backend: Box<dyn LixBackend + Send + Sync>,
     pub key_values: Vec<BootKeyValue>,
+    pub active_account: Option<BootAccount>,
 }
 
 impl BootArgs {
@@ -55,6 +68,7 @@ impl BootArgs {
         Self {
             backend,
             key_values: Vec::new(),
+            active_account: None,
         }
     }
 }
@@ -64,6 +78,7 @@ pub struct Engine {
     cel_evaluator: CelEvaluator,
     schema_cache: SchemaCache,
     boot_key_values: Vec<BootKeyValue>,
+    boot_active_account: Option<BootAccount>,
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
@@ -77,6 +92,7 @@ pub fn boot(args: BootArgs) -> Engine {
         cel_evaluator: CelEvaluator::new(),
         schema_cache: SchemaCache::new(),
         boot_key_values: args.key_values,
+        boot_active_account: args.active_account,
         boot_deterministic_settings,
         deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
         active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
@@ -93,6 +109,7 @@ impl Engine {
             self.seed_default_active_version(&default_active_version_id)
                 .await?;
             self.seed_boot_key_values().await?;
+            self.seed_boot_account().await?;
             self.load_and_cache_active_version().await
         }
         .await;
@@ -316,6 +333,80 @@ impl Engine {
             .await?;
 
         Ok(main_version_id)
+    }
+
+    async fn seed_boot_account(&self) -> Result<(), LixError> {
+        let Some(account) = &self.boot_active_account else {
+            return Ok(());
+        };
+
+        let exists = self
+            .execute(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = $1 \
+                   AND entity_id = $2 \
+                   AND file_id = $3 \
+                   AND version_id = $4 \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[
+                    Value::Text(account_schema_key().to_string()),
+                    Value::Text(account.id.clone()),
+                    Value::Text(account_file_id().to_string()),
+                    Value::Text(account_storage_version_id().to_string()),
+                ],
+            )
+            .await?;
+        if exists.rows.is_empty() {
+            self.execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    Value::Text(account.id.clone()),
+                    Value::Text(account_schema_key().to_string()),
+                    Value::Text(account_file_id().to_string()),
+                    Value::Text(account_storage_version_id().to_string()),
+                    Value::Text(account_plugin_key().to_string()),
+                    Value::Text(account_snapshot_content(&account.id, &account.name)),
+                    Value::Text(account_schema_version().to_string()),
+                ],
+            )
+            .await?;
+        }
+
+        self.execute(
+            "DELETE FROM lix_internal_state_vtable \
+             WHERE untracked = 1 \
+               AND schema_key = $1 \
+               AND file_id = $2 \
+               AND version_id = $3",
+            &[
+                Value::Text(active_account_schema_key().to_string()),
+                Value::Text(active_account_file_id().to_string()),
+                Value::Text(active_account_storage_version_id().to_string()),
+            ],
+        )
+        .await?;
+
+        self.execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+            &[
+                Value::Text(account.id.clone()),
+                Value::Text(active_account_schema_key().to_string()),
+                Value::Text(active_account_file_id().to_string()),
+                Value::Text(active_account_storage_version_id().to_string()),
+                Value::Text(active_account_plugin_key().to_string()),
+                Value::Text(active_account_snapshot_content(&account.id)),
+                Value::Text(active_account_schema_version().to_string()),
+            ],
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn seed_materialized_version_descriptor(

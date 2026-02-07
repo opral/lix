@@ -44,6 +44,7 @@ simulation_test!(
                     value: serde_json::json!({ "enabled": true }),
                     version_id: None,
                 }],
+                active_account: None,
             }))
             .await
             .expect("boot_simulated_engine should succeed");
@@ -107,6 +108,7 @@ simulation_test!(apply_materialization_plan_upserts_rows, |sim| async move {
                 value: serde_json::json!({ "enabled": true }),
                 version_id: None,
             }],
+            active_account: None,
         }))
         .await
         .expect("boot_simulated_engine should succeed");
