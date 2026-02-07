@@ -159,9 +159,24 @@ fn rewrite_table_factor(
             *changed = true;
         }
         TableFactor::Derived { subquery, .. } => {
-            if let Some(rewritten) = rewrite_query((**subquery).clone())? {
-                *subquery = Box::new(rewritten);
-                *changed = true;
+            if schema_keys.is_empty() {
+                if let Some(rewritten) = rewrite_query((**subquery).clone())? {
+                    *subquery = Box::new(rewritten);
+                    *changed = true;
+                }
+            } else {
+                let mut subquery_changed = false;
+                let mut rewritten_subquery = (**subquery).clone();
+                rewritten_subquery.body = Box::new(rewrite_set_expr(
+                    *rewritten_subquery.body,
+                    schema_keys,
+                    pushdown_predicate,
+                    &mut subquery_changed,
+                )?);
+                if subquery_changed {
+                    *subquery = Box::new(rewritten_subquery);
+                    *changed = true;
+                }
             }
         }
         TableFactor::NestedJoin {
@@ -203,8 +218,8 @@ fn build_untracked_union_query(
 
     let mut union_parts = Vec::new();
     union_parts.push(format!(
-        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
-                created_at, updated_at, 'untracked' AS change_id, 1 AS untracked, 1 AS priority \
+        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, 1 AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
         untracked = UNTRACKED_TABLE
@@ -218,8 +233,8 @@ fn build_untracked_union_query(
             .map(|predicate| format!(" WHERE ({predicate})"))
             .unwrap_or_default();
         union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
-                    created_at, updated_at, change_id, 0 AS untracked, 2 AS priority \
+            "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+                    created_at, updated_at, NULL AS inherited_from_version_id, change_id, 0 AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
             materialized_where = materialized_where
@@ -229,11 +244,11 @@ fn build_untracked_union_query(
     let union_sql = union_parts.join(" UNION ALL ");
 
     let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
-                created_at, updated_at, change_id, untracked \
+        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+                created_at, updated_at, inherited_from_version_id, change_id, untracked \
          FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, snapshot_content, schema_version, \
-                    created_at, updated_at, change_id, untracked, \
+             SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+                    created_at, updated_at, inherited_from_version_id, change_id, untracked, \
                     ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
              FROM ({union_sql}) AS lix_state_union\
          ) AS lix_state_ranked \
@@ -521,6 +536,7 @@ fn is_pushdown_column(ident: &Ident) -> bool {
             | "schema_version"
             | "file_id"
             | "version_id"
+            | "plugin_key"
             | "snapshot_content"
     )
 }
