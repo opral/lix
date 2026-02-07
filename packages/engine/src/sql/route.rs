@@ -4,8 +4,9 @@ use crate::functions::LixFunctionProvider;
 use crate::sql::steps::{
     lix_active_account_view_read, lix_active_account_view_write, lix_active_version_view_read,
     lix_active_version_view_write, lix_state_by_version_view_read, lix_state_by_version_view_write,
-    lix_state_view_read, lix_state_view_write, lix_version_view_read, lix_version_view_write,
-    stored_schema, vtable_read, vtable_write,
+    lix_state_history_view_read, lix_state_history_view_write, lix_state_view_read,
+    lix_state_view_write, lix_version_view_read, lix_version_view_write, stored_schema,
+    vtable_read, vtable_write,
 };
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
@@ -19,6 +20,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
 ) -> Result<RewriteOutput, LixError> {
     match statement {
         Statement::Insert(insert) => {
+            lix_state_history_view_write::reject_insert(&insert)?;
             if let Some(version_inserts) =
                 lix_version_view_write::rewrite_insert(insert.clone(), params)?
             {
@@ -73,6 +75,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
             })
         }
         Statement::Update(update) => {
+            lix_state_history_view_write::reject_update(&update)?;
             let update = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_update(update.clone())?
             {
@@ -106,6 +109,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
             }
         }
         Statement::Delete(delete) => {
+            lix_state_history_view_write::reject_delete(&delete)?;
             let delete = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
@@ -148,6 +152,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
             let query =
                 lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
             Ok(RewriteOutput {
                 statements: vec![Statement::Query(Box::new(query))],
@@ -175,6 +180,7 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
 ) -> Result<RewriteOutput, LixError> {
     match statement {
         Statement::Insert(insert) => {
+            lix_state_history_view_write::reject_insert(&insert)?;
             if let Some(version_inserts) =
                 lix_version_view_write::rewrite_insert_with_backend(backend, insert.clone(), params)
                     .await?
@@ -255,6 +261,7 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
             })
         }
         Statement::Update(update) => {
+            lix_state_history_view_write::reject_update(&update)?;
             if let Some(active_version_inserts) =
                 lix_active_version_view_write::rewrite_update_with_backend(
                     backend,
@@ -301,6 +308,7 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
             rewrite_statement(Statement::Update(update), params, functions)
         }
         Statement::Delete(delete) => {
+            lix_state_history_view_write::reject_delete(&delete)?;
             if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
@@ -348,6 +356,7 @@ pub async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
             let query =
                 lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+            let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
             let query = vtable_read::rewrite_query_with_backend(backend, query.clone())
                 .await?
                 .unwrap_or(query);

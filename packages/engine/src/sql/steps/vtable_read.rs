@@ -13,21 +13,26 @@ const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    let schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
-    let pushdown_predicate = if schema_keys.is_empty() {
-        None
+    let top_level_targets_vtable = query_targets_vtable(&query);
+    let schema_keys = if top_level_targets_vtable {
+        extract_schema_keys_from_query(&query).unwrap_or_default()
     } else {
+        Vec::new()
+    };
+    let pushdown_predicate = if top_level_targets_vtable && !schema_keys.is_empty() {
         extract_pushdown_predicate(&query)
+    } else {
+        None
     };
 
     let mut changed = false;
     let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(
-        *query.body,
+    rewrite_query_inner(
+        &mut new_query,
         &schema_keys,
         pushdown_predicate.as_ref(),
         &mut changed,
-    )?);
+    )?;
 
     if changed {
         Ok(Some(new_query))
@@ -40,26 +45,55 @@ pub async fn rewrite_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
 ) -> Result<Option<Query>, LixError> {
-    let mut schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
+    let top_level_targets_vtable = query_targets_vtable(&query);
+    let mut schema_keys = if top_level_targets_vtable {
+        extract_schema_keys_from_query(&query).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if schema_keys.is_empty() {
         schema_keys = fetch_materialized_schema_keys(backend).await?;
     }
-    let pushdown_predicate = extract_pushdown_predicate(&query);
+    let pushdown_predicate = if top_level_targets_vtable {
+        extract_pushdown_predicate(&query)
+    } else {
+        None
+    };
 
     let mut changed = false;
     let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(
-        *query.body,
+    rewrite_query_inner(
+        &mut new_query,
         &schema_keys,
         pushdown_predicate.as_ref(),
         &mut changed,
-    )?);
+    )?;
 
     if changed {
         Ok(Some(new_query))
     } else {
         Ok(None)
     }
+}
+
+fn rewrite_query_inner(
+    query: &mut Query,
+    schema_keys: &[String],
+    pushdown_predicate: Option<&Expr>,
+    changed: &mut bool,
+) -> Result<(), LixError> {
+    if let Some(with) = query.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            rewrite_query_inner(&mut cte.query, schema_keys, None, changed)?;
+        }
+    }
+    query.body = Box::new(rewrite_set_expr(
+        (*query.body).clone(),
+        schema_keys,
+        pushdown_predicate,
+        changed,
+    )?);
+    Ok(())
 }
 
 fn rewrite_set_expr(
@@ -76,12 +110,7 @@ fn rewrite_set_expr(
         }
         SetExpr::Query(query) => {
             let mut query = *query;
-            query.body = Box::new(rewrite_set_expr(
-                *query.body,
-                schema_keys,
-                pushdown_predicate,
-                changed,
-            )?);
+            rewrite_query_inner(&mut query, schema_keys, pushdown_predicate, changed)?;
             SetExpr::Query(Box::new(query))
         }
         SetExpr::SetOperation {
@@ -167,12 +196,12 @@ fn rewrite_table_factor(
             } else {
                 let mut subquery_changed = false;
                 let mut rewritten_subquery = (**subquery).clone();
-                rewritten_subquery.body = Box::new(rewrite_set_expr(
-                    *rewritten_subquery.body,
+                rewrite_query_inner(
+                    &mut rewritten_subquery,
                     schema_keys,
                     pushdown_predicate,
                     &mut subquery_changed,
-                )?);
+                )?;
                 if subquery_changed {
                     *subquery = Box::new(rewritten_subquery);
                     *changed = true;
@@ -279,6 +308,28 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(|part| part.as_ident())
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
+}
+
+fn query_targets_vtable(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.from.iter().any(table_with_joins_targets_vtable)
+}
+
+fn table_with_joins_targets_vtable(table: &TableWithJoins) -> bool {
+    table_factor_is_vtable(&table.relation)
+        || table
+            .joins
+            .iter()
+            .any(|join| table_factor_is_vtable(&join.relation))
+}
+
+fn table_factor_is_vtable(relation: &TableFactor) -> bool {
+    matches!(
+        relation,
+        TableFactor::Table { name, .. } if object_name_matches(name, VTABLE_NAME)
+    )
 }
 
 fn extract_schema_keys_from_query(query: &Query) -> Option<Vec<String>> {
