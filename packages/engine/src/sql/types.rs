@@ -1,5 +1,5 @@
 use serde_json::Value as JsonValue;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, Statement};
 
 use crate::Value;
 
@@ -21,7 +21,7 @@ pub struct VtableDeletePlan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateValidationPlan {
     pub table: String,
-    pub where_clause: Option<String>,
+    pub where_clause: Option<Expr>,
     pub snapshot_content: Option<JsonValue>,
 }
 
