@@ -53,10 +53,8 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
         mutations.extend(output.mutations);
         update_validations.extend(output.update_validations);
         for rewritten_statement in output.statements {
-            rewritten.push(inline_lix_functions_with_provider(
-                rewritten_statement,
-                provider,
-            ));
+            let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
+            rewritten.push(lower_statement(inlined, SqlDialect::Sqlite)?);
         }
     }
 
@@ -362,4 +360,24 @@ fn query_is_plain_values(query: &Query) -> bool {
         && query.settings.is_none()
         && query.format_clause.is_none()
         && query.pipe_operators.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preprocess_sql_rewrite_only;
+
+    #[test]
+    fn rewrite_only_path_lowers_lix_json_text_functions() {
+        let rewritten = preprocess_sql_rewrite_only("SELECT version_id FROM lix_active_version")
+            .expect("rewrite should succeed");
+
+        assert!(
+            !rewritten.sql.contains("lix_json_text("),
+            "rewrite-only path must lower logical lix_json_text() calls"
+        );
+        assert!(
+            rewritten.sql.contains("json_extract("),
+            "rewrite-only sqlite lowering should emit json_extract()"
+        );
+    }
 }

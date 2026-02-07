@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::sql::lowering::lower_statement;
 use crate::sql::steps::{lix_version_view_read, vtable_read};
 use crate::sql::{
-    bind_sql_with_state, resolve_expr_cell_with_state, PlaceholderState, RowSourceResolver,
+    bind_sql_with_state, escape_sql_string, resolve_expr_cell_with_state, PlaceholderState,
+    RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -871,8 +872,4 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
-}
-
-fn escape_sql_string(input: &str) -> String {
-    input.replace('\'', "''")
 }

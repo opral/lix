@@ -22,7 +22,10 @@ use crate::sql::types::{
     MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::sql::SchemaRegistration;
-use crate::sql::{resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver};
+use crate::sql::{
+    escape_sql_string, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
+    RowSourceResolver,
+};
 use crate::Value as EngineValue;
 use crate::{LixBackend, LixError};
 
@@ -1478,10 +1481,6 @@ fn value_to_string(value: &EngineValue, name: &str) -> Result<String, LixError> 
             message: format!("vtable update expected text for {name}"),
         }),
     }
-}
-
-fn escape_sql_string(input: &str) -> String {
-    input.replace('\'', "''")
 }
 
 fn is_missing_relation_error(err: &LixError) -> bool {

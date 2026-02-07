@@ -48,30 +48,38 @@ pub(crate) fn bind_sql_with_state(
         let byte = bytes[index];
 
         if in_single_quote {
-            output.push(byte as char);
             if byte == b'\'' {
+                output.push('\'');
                 if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
                     output.push('\'');
                     index += 2;
                     continue;
                 }
                 in_single_quote = false;
+                index += 1;
+                continue;
             }
-            index += 1;
+            let (ch, next_index) = next_char(sql, index);
+            output.push(ch);
+            index = next_index;
             continue;
         }
 
         if in_double_quote {
-            output.push(byte as char);
             if byte == b'"' {
+                output.push('"');
                 if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
                     output.push('"');
                     index += 2;
                     continue;
                 }
                 in_double_quote = false;
+                index += 1;
+                continue;
             }
-            index += 1;
+            let (ch, next_index) = next_char(sql, index);
+            output.push(ch);
+            index = next_index;
             continue;
         }
 
@@ -122,8 +130,9 @@ pub(crate) fn bind_sql_with_state(
             continue;
         }
 
-        output.push(byte as char);
-        index += 1;
+        let (ch, next_index) = next_char(sql, index);
+        output.push(ch);
+        index = next_index;
     }
 
     let bound_params = used_source_indices
@@ -209,6 +218,14 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     Ok(parsed)
 }
 
+fn next_char(input: &str, index: usize) -> (char, usize) {
+    let ch = input[index..]
+        .chars()
+        .next()
+        .expect("bind_sql_with_state index must remain on char boundaries");
+    (ch, index + ch.len_utf8())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::backend::SqlDialect;
@@ -291,5 +308,34 @@ mod tests {
 
         assert_eq!(bound.sql, "SELECT '$1', \"?\", $1 FROM t WHERE x = '$2'");
         assert_eq!(bound.params, vec![Value::Integer(5)]);
+    }
+
+    #[test]
+    fn preserves_utf8_characters_while_binding() {
+        let bound = bind_sql(
+            "SELECT 'é🙂', \"名字\", ? FROM t WHERE note = 'München'",
+            &[Value::Text("ok".to_string())],
+            SqlDialect::Postgres,
+        )
+        .expect("bind should succeed");
+
+        assert_eq!(
+            bound.sql,
+            "SELECT 'é🙂', \"名字\", $1 FROM t WHERE note = 'München'"
+        );
+        assert_eq!(bound.params, vec![Value::Text("ok".to_string())]);
+    }
+
+    #[test]
+    fn preserves_utf8_characters_inside_escaped_quotes() {
+        let bound = bind_sql(
+            "SELECT 'L''été', \"Schrödinger\"\"猫\", ?",
+            &[Value::Integer(1)],
+            SqlDialect::Sqlite,
+        )
+        .expect("bind should succeed");
+
+        assert_eq!(bound.sql, "SELECT 'L''été', \"Schrödinger\"\"猫\", ?1");
+        assert_eq!(bound.params, vec![Value::Integer(1)]);
     }
 }

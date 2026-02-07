@@ -1,3 +1,4 @@
+mod escaping;
 mod lowering;
 mod params;
 mod pipeline;
@@ -6,6 +7,7 @@ mod row_resolution;
 mod steps;
 mod types;
 
+pub(crate) use escaping::escape_sql_string;
 pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};
 #[allow(unused_imports)]
 pub use pipeline::{

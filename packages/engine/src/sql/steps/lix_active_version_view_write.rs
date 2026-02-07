@@ -8,7 +8,9 @@ use sqlparser::parser::Parser;
 
 use crate::sql::lowering::lower_statement;
 use crate::sql::steps::{lix_active_version_view_read, vtable_read};
-use crate::sql::{bind_sql_with_state, resolve_expr_cell_with_state, PlaceholderState};
+use crate::sql::{
+    bind_sql_with_state, escape_sql_string, resolve_expr_cell_with_state, PlaceholderState,
+};
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -307,8 +309,4 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
