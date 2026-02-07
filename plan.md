@@ -1218,7 +1218,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 
 ## Milestone 20: `lix_state_by_version` SELECT Rewriting
 
-The `lix_state_by_version` view provides state scoped to a specific version. It builds on the vtable rewriting by adding version-specific filtering.
+The `lix_state_by_version` view provides state scoped to explicit version(s) and includes inheritance fallback from ancestor versions.
 
 ### Query Rewriting Example
 
@@ -1263,7 +1263,8 @@ FROM (
 1. Parse SELECT statements targeting `lix_state_by_version`
 2. Extract `version_id` from WHERE clause
 3. Apply version filtering to both untracked and materialized tables
-4. Filter out tombstones by default
+4. Resolve inheritance chain for requested version(s) and select nearest visible row
+5. Filter out tombstones by default (child tombstones hide parent rows)
 
 ## Milestone 21: `lix_state_by_version` INSERT Rewriting
 
@@ -1346,7 +1347,7 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 
 ## Milestone 24: Version Inheritance in SELECT Rewriting
 
-State queries must respect version inheritance. When querying state for a version, if an entity doesn't exist in that version, the query should fall back to parent versions.
+State queries must respect version inheritance. This applies to both `lix_state_by_version` (explicit version scope) and `lix_state` (active-version scope). If an entity doesn't exist in the requested version, the query should fall back to parent versions.
 
 ### Inheritance Chain
 
@@ -1356,7 +1357,7 @@ version-child (active)
             └── version-grandparent
 ```
 
-When querying `lix_state` for `version-child`, if an entity exists in `version-parent` but not `version-child`, it should be visible.
+When querying `lix_state_by_version` for `version-child`, if an entity exists in `version-parent` but not `version-child`, it should be visible. `lix_state` should follow the same behavior after resolving active version.
 
 ### Query Rewriting Example
 
@@ -1410,8 +1411,8 @@ SELECT * FROM (
 - Version inheritance is resolved via recursive CTE
 - Closer versions (lower depth) take priority
 - Tombstones in child versions hide parent state
-- `lix_state_by_version` does NOT use inheritance (explicit version only)
-- `lix_state` uses inheritance based on active version
+- `lix_state_by_version` uses inheritance within each requested version scope
+- `lix_state` resolves active version, then uses the same inheritance logic
 
 ### Tasks
 
@@ -1419,7 +1420,7 @@ SELECT * FROM (
 2. Join state queries with version chain
 3. Prioritize by inheritance depth (closer = higher priority)
 4. Handle tombstones correctly (child tombstone hides parent state)
-5. Apply inheritance only to `lix_state` view, not `lix_state_by_version`
+5. Apply inheritance to both `lix_state_by_version` and `lix_state` (shared core logic)
 
 ## Milestone 25: State Materialization
 

@@ -247,7 +247,7 @@ fn build_untracked_union_query(
 
     let mut union_parts = Vec::new();
     union_parts.push(format!(
-        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                 created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, 1 AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
@@ -262,7 +262,7 @@ fn build_untracked_union_query(
             .map(|predicate| format!(" WHERE ({predicate})"))
             .unwrap_or_default();
         union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+            "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                     created_at, updated_at, inherited_from_version_id, change_id, 0 AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
@@ -273,10 +273,10 @@ fn build_untracked_union_query(
     let union_sql = union_parts.join(" UNION ALL ");
 
     let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                 created_at, updated_at, inherited_from_version_id, change_id, untracked \
          FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, \
+             SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                     created_at, updated_at, inherited_from_version_id, change_id, untracked, \
                     ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
              FROM ({union_sql}) AS lix_state_union\
@@ -589,6 +589,7 @@ fn is_pushdown_column(ident: &Ident) -> bool {
             | "version_id"
             | "plugin_key"
             | "snapshot_content"
+            | "metadata"
     )
 }
 

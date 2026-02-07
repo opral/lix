@@ -1,7 +1,7 @@
 mod support;
 
 use lix_engine::Value;
-use support::simulation_test::{default_simulations, run_simulation_test, SimulationArgs};
+use support::simulation_test::SimulationArgs;
 
 fn parse_snapshot(value: &Value) -> serde_json::Value {
     let text = match value {
@@ -104,14 +104,13 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
     assert_eq!(version.rows[0][0], Value::Text("main".to_string()));
 }
 
-#[tokio::test]
-async fn init_seeds_default_active_version_is_deterministic_across_backends() {
-    run_simulation_test(
-        default_simulations(),
-        run_init_seeds_default_active_version_deterministic,
-    )
-    .await;
-}
+simulation_test!(
+    init_seeds_default_active_version_is_deterministic_across_backends,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        run_init_seeds_default_active_version_deterministic(sim).await;
+    }
+);
 
 simulation_test!(init_seeds_default_active_version, |sim| async move {
     let engine = sim

@@ -11,10 +11,6 @@ use crate::LixError;
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    if !top_level_select_targets_lix_state_history(&query) {
-        return Ok(None);
-    }
-
     let mut changed = false;
     let mut new_query = query.clone();
     new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
@@ -24,31 +20,6 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     } else {
         Ok(None)
     }
-}
-
-fn top_level_select_targets_lix_state_history(query: &Query) -> bool {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    select
-        .from
-        .iter()
-        .any(table_with_joins_targets_lix_state_history)
-}
-
-fn table_with_joins_targets_lix_state_history(table: &TableWithJoins) -> bool {
-    table_factor_is_lix_state_history(&table.relation)
-        || table
-            .joins
-            .iter()
-            .any(|join| table_factor_is_lix_state_history(&join.relation))
-}
-
-fn table_factor_is_lix_state_history(relation: &TableFactor) -> bool {
-    matches!(
-        relation,
-        TableFactor::Table { name, .. } if object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME)
-    )
 }
 
 fn rewrite_set_expr(expr: SetExpr, changed: &mut bool) -> Result<SetExpr, LixError> {

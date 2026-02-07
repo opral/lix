@@ -78,12 +78,15 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
     })
 }
 
-async fn preprocess_statements_with_provider_and_backend<P: LixFunctionProvider>(
+async fn preprocess_statements_with_provider_and_backend<P>(
     backend: &dyn LixBackend,
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
-) -> Result<PreprocessOutput, LixError> {
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Clone + Send + 'static,
+{
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());

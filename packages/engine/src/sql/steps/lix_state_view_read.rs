@@ -16,10 +16,9 @@ use crate::LixError;
 const LIX_STATE_VIEW_NAME: &str = "lix_state";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    if !top_level_select_targets_lix_state(&query) {
+    if !query_targets_lix_state(&query) {
         return Ok(None);
     }
-
     let mut changed = false;
     let mut new_query = query.clone();
     new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
@@ -31,7 +30,7 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     }
 }
 
-fn top_level_select_targets_lix_state(query: &Query) -> bool {
+fn query_targets_lix_state(query: &Query) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
@@ -146,7 +145,8 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
              ranked.updated_at AS updated_at, \
              ranked.inherited_from_version_id AS inherited_from_version_id, \
              ranked.change_id AS change_id, \
-             ranked.untracked AS untracked \
+             ranked.untracked AS untracked, \
+             ranked.metadata AS metadata \
          FROM ( \
            WITH RECURSIVE active_version AS ( \
              SELECT lix_json_text(snapshot_content, 'version_id') AS version_id \
@@ -193,6 +193,7 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
              END AS inherited_from_version_id, \
              s.change_id AS change_id, \
              s.untracked AS untracked, \
+             s.metadata AS metadata, \
              ROW_NUMBER() OVER ( \
                PARTITION BY s.entity_id, s.schema_key, s.file_id \
                ORDER BY vc.depth ASC \
