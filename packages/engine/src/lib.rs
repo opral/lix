@@ -10,6 +10,7 @@ mod functions;
 mod init;
 mod json_truthiness;
 mod key_value;
+mod materialization;
 mod schema;
 mod schema_registry;
 mod sql;
@@ -30,4 +31,12 @@ pub use commit::{
 };
 pub use engine::{boot, BootArgs, BootKeyValue, Engine};
 pub use error::LixError;
+pub use materialization::{
+    apply_materialization_plan, materialization_plan, materialize, InheritanceWinnerDebugRow,
+    LatestVisibleWinnerDebugRow, MaterializationApplyReport, MaterializationDebugMode,
+    MaterializationDebugTrace, MaterializationPlan, MaterializationReport, MaterializationRequest,
+    MaterializationScope, MaterializationWarning, MaterializationWrite, MaterializationWriteOp,
+    StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
+    VersionPointerDebugRow,
+};
 pub use types::{QueryResult, Value};

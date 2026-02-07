@@ -212,7 +212,7 @@ simulation_test!(
                 "SELECT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-a' \
-               AND schema_key IN ('lix_version_descriptor', 'lix_version_tip') \
+               AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer') \
              ORDER BY schema_key",
                 &[],
             )
@@ -221,7 +221,7 @@ simulation_test!(
 
         assert_eq!(vtable_rows.rows.len(), 2);
         assert_text(&vtable_rows.rows[0][0], "lix_version_descriptor");
-        assert_text(&vtable_rows.rows[1][0], "lix_version_tip");
+        assert_text(&vtable_rows.rows[1][0], "lix_version_pointer");
     }
 );
 
@@ -436,7 +436,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
             "SELECT schema_key, snapshot_content \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-c' \
-               AND schema_key IN ('lix_version_descriptor', 'lix_version_tip') \
+               AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer') \
              ORDER BY schema_key",
             &[],
         )
@@ -446,7 +446,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
     assert_eq!(deleted_rows.rows.len(), 2);
     assert_text(&deleted_rows.rows[0][0], "lix_version_descriptor");
     assert_eq!(deleted_rows.rows[0][1], Value::Null);
-    assert_text(&deleted_rows.rows[1][0], "lix_version_tip");
+    assert_text(&deleted_rows.rows[1][0], "lix_version_pointer");
     assert_eq!(deleted_rows.rows[1][1], Value::Null);
 });
 

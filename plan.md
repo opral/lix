@@ -155,7 +155,7 @@ The `version` view reads from state cache with special handling for inheritance:
 │ lix_internal_state_vtable       │   │ lix_internal_state_materialized_v1_    │
 │                                 │   │ lix_version_descriptor          │
 │ (version descriptors,           │   │                                 │
-│  lix_version_tip)               │   │ (indexed inheritance chain)     │
+│  lix_version_pointer)               │   │ (indexed inheritance chain)     │
 └─────────────────────────────────┘   └─────────────────────────────────┘
 ```
 
@@ -1009,7 +1009,7 @@ let commit_result = generate_commit(GenerateCommitArgs {
     active_accounts: get_active_accounts(&host)?,
 });
 
-// commit_result.changes = domain changes + meta changes (commit, version_tip, etc.)
+// commit_result.changes = domain changes + meta changes (commit, version_pointer, etc.)
 // commit_result.materialized_state = rows ready for cache insertion
 
 // 7. Build final SQL
@@ -1025,7 +1025,7 @@ host.execute(&sql)?;
 
 1. Port `generateCommit()` logic to Rust
 2. Generate commit snapshot with `change_ids`, `parent_commit_ids`
-3. Generate `lix_version_tip` updates per version
+3. Generate `lix_version_pointer` updates per version
 4. Generate `lix_change_set_element` rows for domain changes
 5. Return both raw changes and materialized state for cache insertion
 
@@ -1068,9 +1068,9 @@ WHERE entity_id = 'lix_active_version' AND schema_key = 'lix_key_value'
 3. Provide API to switch active version
 4. Update cached value when active version changes
 
-## Milestone 15: Version View (version_descriptor + version_tip)
+## Milestone 15: Version View (version_descriptor + version_pointer)
 
-The `version` view combines `lix_version_descriptor` and `lix_version_tip` to provide a unified view of versions with their current tip commits.
+The `version` view combines `lix_version_descriptor` and `lix_version_pointer` to provide a unified view of versions with their current tip commits.
 
 ### Query Rewriting Example
 
@@ -1095,8 +1095,8 @@ FROM (
   WHERE is_tombstone = 0
 ) vd
 LEFT JOIN (
-  -- version_tip from materialized table
-  SELECT * FROM lix_internal_state_materialized_v1_lix_version_tip
+  -- version_pointer from materialized table
+  SELECT * FROM lix_internal_state_materialized_v1_lix_version_pointer
   WHERE is_tombstone = 0
 ) vt ON json_extract(vd.snapshot_content, '$.id') = json_extract(vt.snapshot_content, '$.version_id')
 WHERE json_extract(vd.snapshot_content, '$.id') = 'version-1'
@@ -1105,7 +1105,7 @@ WHERE json_extract(vd.snapshot_content, '$.id') = 'version-1'
 ### Tasks
 
 1. Parse SELECT statements targeting `version` view
-2. Rewrite to JOIN version_descriptor and version_tip materialized tables
+2. Rewrite to JOIN version_descriptor and version_pointer materialized tables
 3. Project relevant fields from snapshot_content
 4. Handle INSERT/UPDATE/DELETE by routing to appropriate underlying schema
 
@@ -1435,7 +1435,7 @@ The JS implementation creates a chain of SQL views:
 lix_internal_materialization_all_commit_edges
     │
     ▼
-lix_internal_materialization_version_tips
+lix_internal_materialization_version_pointers
     │
     ▼
 lix_internal_materialization_commit_graph
@@ -1452,7 +1452,7 @@ version_ancestry                      (final output)
 | View                   | Purpose                                                                                              |
 | ---------------------- | ---------------------------------------------------------------------------------------------------- |
 | `all_commit_edges`     | Union of edges from commit.parent_commit_ids and lix_commit_edge rows                                |
-| `version_tips`         | Current tip commit per version                                                                       |
+| `version_pointers`         | Current tip commit per version                                                                       |
 | `commit_graph`         | Recursive DAG traversal with depth from tips                                                         |
 | `latest_visible_state` | Explodes commit.change_ids, joins with change table, deduplicates by (version, entity, schema, file) |
 | `version_ancestry`     | Recursive inheritance chain per version                                                              |

@@ -7,7 +7,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use lix_engine::{boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, QueryResult, Value};
+use lix_engine::{
+    boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, MaterializationApplyReport,
+    MaterializationPlan, MaterializationReport, MaterializationRequest, QueryResult, Value,
+};
 
 use super::simulations::default_simulations as default_simulations_impl;
 
@@ -40,6 +43,27 @@ impl SimulationEngine {
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.engine.execute(sql, params).await
+    }
+
+    pub async fn materialization_plan(
+        &self,
+        req: &MaterializationRequest,
+    ) -> Result<MaterializationPlan, LixError> {
+        self.engine.materialization_plan(req).await
+    }
+
+    pub async fn apply_materialization_plan(
+        &self,
+        plan: &MaterializationPlan,
+    ) -> Result<MaterializationApplyReport, LixError> {
+        self.engine.apply_materialization_plan(plan).await
+    }
+
+    pub async fn materialize(
+        &self,
+        req: &MaterializationRequest,
+    ) -> Result<MaterializationReport, LixError> {
+        self.engine.materialize(req).await
     }
 }
 

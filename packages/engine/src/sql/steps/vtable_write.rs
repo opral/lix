@@ -8,6 +8,7 @@ use sqlparser::ast::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::builtin_schema::types::LixVersionPointer;
 use crate::commit::{
     generate_commit, DomainChangeInput, GenerateCommitArgs, MaterializedStateRow, VersionInfo,
     VersionSnapshot,
@@ -26,8 +27,8 @@ const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
-const VERSION_TIP_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_tip";
-const VERSION_TIP_SCHEMA_KEY: &str = "lix_version_tip";
+const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
+const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const GLOBAL_VERSION: &str = "global";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
@@ -1027,8 +1028,8 @@ async fn load_version_info_for_versions(
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
-            table_name = VERSION_TIP_TABLE,
-            schema_key = VERSION_TIP_SCHEMA_KEY,
+            table_name = VERSION_POINTER_TABLE,
+            schema_key = VERSION_POINTER_SCHEMA_KEY,
             entity_id = escape_sql_string(version_id),
             global_version = GLOBAL_VERSION,
         );
@@ -1076,25 +1077,24 @@ fn parse_version_info_from_tip_snapshot(
         }
     };
 
-    let snapshot: JsonValue = serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-        message: format!("version tip snapshot_content invalid JSON: {error}"),
-    })?;
-    let version_id = snapshot
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .unwrap_or(fallback_version_id)
-        .to_string();
+    let snapshot: LixVersionPointer =
+        serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+            message: format!("version tip snapshot_content invalid JSON: {error}"),
+        })?;
+    let version_id = if snapshot.id.is_empty() {
+        fallback_version_id.to_string()
+    } else {
+        snapshot.id
+    };
     let working_commit_id = snapshot
-        .get("working_commit_id")
-        .and_then(JsonValue::as_str)
-        .unwrap_or(fallback_version_id)
-        .to_string();
-    let parent_commit_ids = snapshot
-        .get("commit_id")
-        .and_then(JsonValue::as_str)
+        .working_commit_id
         .filter(|value| !value.is_empty())
-        .map(|value| vec![value.to_string()])
-        .unwrap_or_default();
+        .unwrap_or_else(|| fallback_version_id.to_string());
+    let parent_commit_ids = if snapshot.commit_id.is_empty() {
+        Vec::new()
+    } else {
+        vec![snapshot.commit_id]
+    };
 
     Ok(Some(VersionInfo {
         parent_commit_ids,
