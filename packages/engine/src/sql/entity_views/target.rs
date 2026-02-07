@@ -1,9 +1,11 @@
 use std::collections::{BTreeSet, HashMap};
 
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 
-use crate::builtin_schema::{builtin_schema_definition, decode_lixcol_literal};
+use crate::builtin_schema::builtin_schema_definition;
+use crate::cel::CelEvaluator;
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
 use crate::{LixBackend, LixError};
 
@@ -145,11 +147,23 @@ fn build_target_from_schema(
         .and_then(JsonValue::as_str)
         .unwrap_or("1")
         .to_string();
+    let evaluator = CelEvaluator::new();
 
-    let file_id_override = extract_lixcol_override(schema, "lixcol_file_id");
-    let plugin_key_override = extract_lixcol_override(schema, "lixcol_plugin_key");
-    let version_id_override = extract_lixcol_override(schema, "lixcol_version_id");
-    let override_predicates = collect_override_predicates(schema, variant);
+    let file_id_override =
+        extract_lixcol_string_override(schema, schema_key, "lixcol_file_id", &evaluator)?;
+    let plugin_key_override = extract_lixcol_string_override(
+        schema,
+        schema_key,
+        "lixcol_plugin_key",
+        &evaluator,
+    )?;
+    let version_id_override = extract_lixcol_string_override(
+        schema,
+        schema_key,
+        "lixcol_version_id",
+        &evaluator,
+    )?;
+    let override_predicates = collect_override_predicates(schema, schema_key, variant, &evaluator)?;
 
     Ok(Some(EntityViewTarget {
         view_name: view_name.to_string(),
@@ -284,39 +298,86 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
     Ok(out)
 }
 
-fn extract_lixcol_override(schema: &JsonValue, key: &str) -> Option<String> {
+fn raw_lixcol_override_expression<'a>(schema: &'a JsonValue, key: &str) -> Option<&'a str> {
     schema
         .get("x-lix-override-lixcols")
         .and_then(JsonValue::as_object)
         .and_then(|overrides| overrides.get(key))
         .and_then(JsonValue::as_str)
-        .map(decode_lixcol_literal)
 }
 
-fn extract_lixcol_literal_override(schema: &JsonValue, key: &str) -> Option<JsonValue> {
-    let raw = schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)
-        .and_then(|overrides| overrides.get(key))
-        .and_then(JsonValue::as_str)?
-        .trim()
-        .to_string();
-    if raw.is_empty() {
-        return None;
+fn evaluate_lixcol_override(
+    schema: &JsonValue,
+    schema_key: &str,
+    key: &str,
+    evaluator: &CelEvaluator,
+) -> Result<Option<JsonValue>, LixError> {
+    let Some(raw_expression) = raw_lixcol_override_expression(schema, key) else {
+        return Ok(None);
+    };
+    let expression = raw_expression.trim();
+    if expression.is_empty() {
+        return Ok(None);
     }
-    let value = serde_json::from_str::<JsonValue>(&raw).ok()?;
+    evaluator
+        .evaluate(expression, &JsonMap::new())
+        .map(Some)
+        .map_err(|err| LixError {
+            message: format!(
+                "invalid x-lix-override-lixcols expression for '{}.{}': {}",
+                schema_key, key, err.message
+            ),
+        })
+}
+
+fn extract_lixcol_string_override(
+    schema: &JsonValue,
+    schema_key: &str,
+    key: &str,
+    evaluator: &CelEvaluator,
+) -> Result<Option<String>, LixError> {
+    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::String(text) => Ok(Some(text)),
+        _ => Err(LixError {
+            message: format!(
+                "x-lix-override-lixcols '{}.{}' must evaluate to a string",
+                schema_key, key
+            ),
+        }),
+    }
+}
+
+fn extract_lixcol_scalar_override(
+    schema: &JsonValue,
+    schema_key: &str,
+    key: &str,
+    evaluator: &CelEvaluator,
+) -> Result<Option<JsonValue>, LixError> {
+    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
+        return Ok(None);
+    };
     match value {
         JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {
-            Some(value)
+            Ok(Some(value))
         }
-        JsonValue::Array(_) | JsonValue::Object(_) => None,
+        JsonValue::Array(_) | JsonValue::Object(_) => Err(LixError {
+            message: format!(
+                "x-lix-override-lixcols '{}.{}' must evaluate to a scalar or null",
+                schema_key, key
+            ),
+        }),
     }
 }
 
 fn collect_override_predicates(
     schema: &JsonValue,
+    schema_key: &str,
     variant: EntityViewVariant,
-) -> Vec<EntityViewOverridePredicate> {
+    evaluator: &CelEvaluator,
+) -> Result<Vec<EntityViewOverridePredicate>, LixError> {
     let keys = [
         "lixcol_entity_id",
         "lixcol_file_id",
@@ -333,7 +394,8 @@ fn collect_override_predicates(
         let Some(column) = override_column_name(key) else {
             continue;
         };
-        let Some(value) = extract_lixcol_literal_override(schema, key) else {
+        let Some(value) = extract_lixcol_scalar_override(schema, schema_key, key, evaluator)?
+        else {
             continue;
         };
         out.push(EntityViewOverridePredicate {
@@ -341,7 +403,7 @@ fn collect_override_predicates(
             value,
         });
     }
-    out
+    Ok(out)
 }
 
 fn override_column_name(key: &str) -> Option<&'static str> {
@@ -374,7 +436,9 @@ fn object_name_terminal(name: &ObjectName) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_target_from_view_name;
+    use serde_json::json;
+
+    use super::{build_target_from_schema, resolve_target_from_view_name, EntityViewVariant};
 
     #[test]
     fn resolves_builtin_by_version_view() {
@@ -382,5 +446,97 @@ mod tests {
             .expect("resolve should succeed")
             .expect("target should resolve");
         assert_eq!(target.schema_key, "lix_key_value");
+    }
+
+    #[test]
+    fn evaluates_cel_override_values_for_target_resolution() {
+        let schema = json!({
+            "x-lix-key": "lix_custom_entity",
+            "x-lix-version": "1",
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "'file-custom'",
+                "lixcol_plugin_key": "'plugin-custom'",
+                "lixcol_version_id": "'version-custom'",
+                "lixcol_untracked": "1"
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+
+        let target = build_target_from_schema(
+            "lix_custom_entity",
+            "lix_custom_entity",
+            EntityViewVariant::Base,
+            &schema,
+        )
+        .expect("target resolution should succeed")
+        .expect("target should resolve");
+
+        assert_eq!(target.file_id_override.as_deref(), Some("file-custom"));
+        assert_eq!(target.plugin_key_override.as_deref(), Some("plugin-custom"));
+        assert_eq!(target.version_id_override.as_deref(), Some("version-custom"));
+        assert_eq!(target.override_predicates.len(), 3);
+        assert!(target
+            .override_predicates
+            .iter()
+            .any(|predicate| predicate.column == "untracked" && predicate.value == json!(1)));
+    }
+
+    #[test]
+    fn rejects_invalid_cel_override_expression() {
+        let schema = json!({
+            "x-lix-key": "lix_custom_entity",
+            "x-lix-version": "1",
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "lix_uuid_v7("
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+
+        let err = build_target_from_schema(
+            "lix_custom_entity",
+            "lix_custom_entity",
+            EntityViewVariant::Base,
+            &schema,
+        )
+        .expect_err("invalid CEL expression should fail target resolution");
+        assert!(err
+            .to_string()
+            .contains("invalid x-lix-override-lixcols expression"));
+    }
+
+    #[test]
+    fn rejects_non_string_file_id_override() {
+        let schema = json!({
+            "x-lix-key": "lix_custom_entity",
+            "x-lix-version": "1",
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "1"
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+
+        let err = build_target_from_schema(
+            "lix_custom_entity",
+            "lix_custom_entity",
+            EntityViewVariant::Base,
+            &schema,
+        )
+        .expect_err("non-string file_id override should fail target resolution");
+        assert!(err.to_string().contains("must evaluate to a string"));
     }
 }

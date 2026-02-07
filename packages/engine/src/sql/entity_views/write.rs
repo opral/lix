@@ -421,6 +421,8 @@ fn rewrite_update_with_target(
     params: &[EngineValue],
 ) -> Result<Update, LixError> {
     let write_variant = mutation_variant(target);
+    let derived_entity_id_predicate =
+        derive_entity_id_predicate_from_where(update.selection.as_ref(), target);
     if !update.table.joins.is_empty() {
         return Err(LixError {
             message: format!("{} update does not support JOIN targets", target.view_name),
@@ -502,7 +504,9 @@ fn rewrite_update_with_target(
         &target.schema_key,
         target,
         write_variant,
-    ));
+        derived_entity_id_predicate,
+        "update",
+    )?);
     Ok(update)
 }
 
@@ -512,6 +516,8 @@ fn rewrite_delete_with_target(
     dialect: SqlDialect,
 ) -> Result<Delete, LixError> {
     let write_variant = mutation_variant(target);
+    let derived_entity_id_predicate =
+        derive_entity_id_predicate_from_where(delete.selection.as_ref(), target);
     replace_delete_target_table(&mut delete, write_variant)?;
     let property_names = property_name_set(target);
     let rewritten_selection = delete
@@ -524,7 +530,9 @@ fn rewrite_delete_with_target(
         &target.schema_key,
         target,
         write_variant,
-    ));
+        derived_entity_id_predicate,
+        "delete",
+    )?);
     Ok(delete)
 }
 
@@ -1133,14 +1141,17 @@ fn append_entity_scope_predicate(
     schema_key: &str,
     target: &EntityViewTarget,
     write_variant: EntityViewVariant,
-) -> Expr {
+    derived_entity_id_predicate: Option<Expr>,
+    operation: &str,
+) -> Result<Expr, LixError> {
     let scoped = append_schema_predicate(selection, schema_key);
+    let scoped = append_optional_and_predicate(scoped, derived_entity_id_predicate);
     let base_override_version_id = (target.variant == EntityViewVariant::Base
         && write_variant == EntityViewVariant::ByVersion)
         .then(|| target.version_id_override.as_deref())
         .flatten();
-    match base_override_version_id {
-        Some(version_id) => Expr::BinaryOp {
+    if let Some(version_id) = base_override_version_id {
+        return Ok(Expr::BinaryOp {
             left: Box::new(scoped),
             op: BinaryOperator::And,
             right: Box::new(Expr::BinaryOp {
@@ -1148,8 +1159,216 @@ fn append_entity_scope_predicate(
                 op: BinaryOperator::Eq,
                 right: Box::new(string_literal_expr(version_id)),
             }),
+        });
+    }
+
+    if write_variant == EntityViewVariant::ByVersion && !contains_column_reference(&scoped, "version_id") {
+        let Some(version_id) = target.version_id_override.as_deref() else {
+            return Err(LixError {
+                message: format!(
+                    "{} {} requires explicit lixcol_version_id or schema default override",
+                    target.view_name, operation
+                ),
+            });
+        };
+        return Ok(Expr::BinaryOp {
+            left: Box::new(scoped),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("version_id"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(string_literal_expr(version_id)),
+            }),
+        });
+    }
+
+    Ok(scoped)
+}
+
+fn append_optional_and_predicate(base: Expr, extra: Option<Expr>) -> Expr {
+    match extra {
+        Some(predicate) => Expr::BinaryOp {
+            left: Box::new(base),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
         },
-        None => scoped,
+        None => base,
+    }
+}
+
+fn derive_entity_id_predicate_from_where(
+    selection: Option<&Expr>,
+    target: &EntityViewTarget,
+) -> Option<Expr> {
+    let parts = collect_primary_key_equality_parts(selection?, target)?;
+    let entity_id_expression = build_entity_id_expression_from_parts(&parts)?;
+    Some(Expr::BinaryOp {
+        left: Box::new(Expr::Identifier(Ident::new("entity_id"))),
+        op: BinaryOperator::Eq,
+        right: Box::new(entity_id_expression),
+    })
+}
+
+fn collect_primary_key_equality_parts(
+    selection: &Expr,
+    target: &EntityViewTarget,
+) -> Option<Vec<Expr>> {
+    if target.primary_key_properties.is_empty() {
+        return None;
+    }
+    let mut matched: HashMap<String, Expr> = HashMap::new();
+    collect_primary_key_equalities_recursive(selection, target, &mut matched);
+
+    let mut ordered = Vec::with_capacity(target.primary_key_properties.len());
+    for property in &target.primary_key_properties {
+        let key = property.to_ascii_lowercase();
+        let value = matched.get(&key)?;
+        ordered.push(value.clone());
+    }
+    Some(ordered)
+}
+
+fn collect_primary_key_equalities_recursive(
+    expr: &Expr,
+    target: &EntityViewTarget,
+    matched: &mut HashMap<String, Expr>,
+) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if *op == BinaryOperator::And {
+                collect_primary_key_equalities_recursive(left, target, matched);
+                collect_primary_key_equalities_recursive(right, target, matched);
+                return;
+            }
+            if *op != BinaryOperator::Eq {
+                return;
+            }
+
+            if let Some(property) = expression_property_name(left) {
+                let key = property.to_ascii_lowercase();
+                if is_primary_key_property(target, &key)
+                    && !matched.contains_key(&key)
+                    && is_supported_entity_id_component_expression(right)
+                {
+                    matched.insert(key, strip_nested_expr((**right).clone()));
+                    return;
+                }
+            }
+            if let Some(property) = expression_property_name(right) {
+                let key = property.to_ascii_lowercase();
+                if is_primary_key_property(target, &key)
+                    && !matched.contains_key(&key)
+                    && is_supported_entity_id_component_expression(left)
+                {
+                    matched.insert(key, strip_nested_expr((**left).clone()));
+                }
+            }
+        }
+        Expr::Nested(inner) => collect_primary_key_equalities_recursive(inner, target, matched),
+        _ => {}
+    }
+}
+
+fn is_primary_key_property(target: &EntityViewTarget, property: &str) -> bool {
+    target
+        .primary_key_properties
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(property))
+}
+
+fn expression_property_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.clone()),
+        Expr::Nested(inner) => expression_property_name(inner),
+        _ => None,
+    }
+}
+
+fn is_supported_entity_id_component_expression(expr: &Expr) -> bool {
+    matches!(strip_nested_expr(expr.clone()), Expr::Value(_))
+}
+
+fn strip_nested_expr(expr: Expr) -> Expr {
+    let mut current = expr;
+    while let Expr::Nested(inner) = current {
+        current = *inner;
+    }
+    current
+}
+
+fn build_entity_id_expression_from_parts(parts: &[Expr]) -> Option<Expr> {
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() == 1 {
+        return Some(parts[0].clone());
+    }
+
+    let mut iter = parts.iter();
+    let mut combined = iter.next()?.clone();
+    for part in iter {
+        combined = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(combined),
+                op: BinaryOperator::StringConcat,
+                right: Box::new(string_literal_expr("~")),
+            }),
+            op: BinaryOperator::StringConcat,
+            right: Box::new(part.clone()),
+        };
+    }
+    Some(combined)
+}
+
+fn contains_column_reference(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column),
+        Expr::CompoundIdentifier(idents) => idents
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case(column))
+            .unwrap_or(false),
+        Expr::BinaryOp { left, right, .. } => {
+            contains_column_reference(left, column) || contains_column_reference(right, column)
+        }
+        Expr::UnaryOp { expr, .. } => contains_column_reference(expr, column),
+        Expr::Nested(inner) => contains_column_reference(inner, column),
+        Expr::InList { expr, list, .. } => {
+            contains_column_reference(expr, column)
+                || list
+                    .iter()
+                    .any(|item| contains_column_reference(item, column))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            contains_column_reference(expr, column)
+                || contains_column_reference(low, column)
+                || contains_column_reference(high, column)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            contains_column_reference(expr, column) || contains_column_reference(pattern, column)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => contains_column_reference(inner, column),
+        Expr::Cast { expr, .. } => contains_column_reference(expr, column),
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    contains_column_reference(expr, column)
+                }
+                sqlparser::ast::FunctionArg::Named { arg, .. }
+                | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                        contains_column_reference(expr, column)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }),
+            _ => false,
+        },
+        Expr::InSubquery { expr, .. } => contains_column_reference(expr, column),
+        _ => false,
     }
 }
 
@@ -1651,7 +1870,7 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use super::rewrite_insert;
+    use super::{rewrite_delete, rewrite_insert, rewrite_update};
 
     #[test]
     fn rewrites_lix_key_value_by_version_insert_target() {
@@ -1665,5 +1884,85 @@ mod tests {
             .expect("rewrite should succeed")
             .expect("insert should rewrite");
         assert_eq!(rewritten.table.to_string(), "lix_state_by_version");
+    }
+
+    #[test]
+    fn rejects_by_version_update_without_version_scope_or_override() {
+        let sql = "UPDATE lix_key_value_by_version SET value = 'x' WHERE key = 'k'";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Update(update) = statement else {
+            panic!("expected update statement");
+        };
+        let err = rewrite_update(update, &[])
+            .expect_err("update rewrite should require by-version scope");
+        assert!(err
+            .to_string()
+            .contains("requires explicit lixcol_version_id or schema default override"));
+    }
+
+    #[test]
+    fn rejects_by_version_delete_without_version_scope_or_override() {
+        let sql = "DELETE FROM lix_key_value_by_version WHERE key = 'k'";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let err = rewrite_delete(delete)
+            .expect_err("delete rewrite should require by-version scope");
+        assert!(err
+            .to_string()
+            .contains("requires explicit lixcol_version_id or schema default override"));
+    }
+
+    #[test]
+    fn by_version_delete_uses_schema_version_override_when_missing_in_where() {
+        let sql = "DELETE FROM lix_change_set_by_version WHERE id = 'cs-1'";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let rewritten = rewrite_delete(delete)
+            .expect("delete rewrite should succeed")
+            .expect("delete should be rewritten");
+        let rendered = rewritten.to_string();
+        assert!(rendered.contains("version_id = 'global'"));
+        assert!(rendered.contains("schema_key = 'lix_change_set'"));
+    }
+
+    #[test]
+    fn by_version_update_pushes_down_derived_entity_id_for_single_primary_key() {
+        let sql = "UPDATE lix_key_value_by_version SET value = 'x' WHERE key = 'k' AND version_id = 'v1'";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Update(update) = statement else {
+            panic!("expected update statement");
+        };
+        let rewritten = rewrite_update(update, &[])
+            .expect("update rewrite should succeed")
+            .expect("update should rewrite");
+        let rendered = rewritten.to_string();
+        assert!(rendered.contains("entity_id = 'k'"));
+    }
+
+    #[test]
+    fn by_version_delete_pushes_down_derived_entity_id_for_composite_primary_key() {
+        let sql = "DELETE FROM lix_change_author_by_version \
+                   WHERE change_id = 'change-1' AND account_id = 'account-1' AND version_id = 'global'";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        let rewritten = rewrite_delete(delete)
+            .expect("delete rewrite should succeed")
+            .expect("delete should rewrite");
+        let rendered = rewritten.to_string();
+        assert!(rendered.contains("entity_id ="));
+        assert!(rendered.contains("change-1"));
+        assert!(rendered.contains("account-1"));
+        assert!(rendered.contains("||"));
     }
 }
