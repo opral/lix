@@ -4,13 +4,16 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
     boot, BootArgs, BootKeyValue, Engine, LixBackend, LixError, MaterializationApplyReport,
-    MaterializationPlan, MaterializationReport, MaterializationRequest, QueryResult, Value,
+    MaterializationDebugMode, MaterializationPlan, MaterializationReport, MaterializationRequest,
+    MaterializationScope, QueryResult, Value,
 };
+use tokio::sync::Mutex as TokioMutex;
 
 use super::simulations::default_simulations as default_simulations_impl;
 
@@ -18,11 +21,19 @@ pub struct Simulation {
     pub name: &'static str,
     pub backend_factory: Box<dyn Fn() -> Box<dyn LixBackend + Send + Sync> + Send + Sync>,
     pub setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
+    pub behavior: SimulationBehavior,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulationBehavior {
+    Base,
+    Rematerialization,
 }
 
 pub struct SimulationArgs {
     backend_factory: Box<dyn Fn() -> Box<dyn LixBackend + Send + Sync> + Send + Sync>,
     setup: Option<Arc<dyn Fn() -> BoxFuture<'static, Result<(), LixError>> + Send + Sync>>,
+    behavior: SimulationBehavior,
     expect: ExpectDeterministic,
 }
 
@@ -33,16 +44,42 @@ pub struct SimulationBootArgs {
 
 pub struct SimulationEngine {
     engine: Engine,
+    behavior: SimulationBehavior,
+    rematerialization_pending: AtomicBool,
+    initialized: AtomicBool,
+    rematerialization_lock: TokioMutex<()>,
 }
 
 impl SimulationEngine {
     #[allow(dead_code)]
     pub async fn init(&self) -> Result<(), LixError> {
-        self.engine.init().await
+        let result = self.engine.init().await;
+        if result.is_ok() {
+            self.initialized.store(true, Ordering::SeqCst);
+            if self.behavior == SimulationBehavior::Rematerialization {
+                // Re-materialize on first read after init, mirroring "cache cleared then repopulated"
+                // simulation semantics from the JS test harness.
+                self.rematerialization_pending.store(true, Ordering::SeqCst);
+            }
+        }
+        result
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.engine.execute(sql, params).await
+        match classify_statement(sql) {
+            StatementKind::Read => {
+                self.rematerialize_before_read_if_needed().await?;
+                self.engine.execute(sql, params).await
+            }
+            StatementKind::Write => {
+                let result = self.engine.execute(sql, params).await;
+                if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
+                    self.rematerialization_pending.store(true, Ordering::SeqCst);
+                }
+                result
+            }
+            StatementKind::Other => self.engine.execute(sql, params).await,
+        }
     }
 
     pub async fn materialization_plan(
@@ -65,6 +102,33 @@ impl SimulationEngine {
     ) -> Result<MaterializationReport, LixError> {
         self.engine.materialize(req).await
     }
+
+    async fn rematerialize_before_read_if_needed(&self) -> Result<(), LixError> {
+        if self.behavior != SimulationBehavior::Rematerialization
+            || !self.initialized.load(Ordering::SeqCst)
+            || !self.rematerialization_pending.load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        let _guard = self.rematerialization_lock.lock().await;
+        if !self.initialized.load(Ordering::SeqCst)
+            || !self.rematerialization_pending.load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        self.engine
+            .materialize(&MaterializationRequest {
+                scope: MaterializationScope::Full,
+                debug: MaterializationDebugMode::Off,
+                debug_row_limit: 1,
+            })
+            .await?;
+        self.rematerialization_pending
+            .store(false, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl SimulationArgs {
@@ -81,6 +145,10 @@ impl SimulationArgs {
                 backend: (self.backend_factory)(),
                 key_values: args.key_values,
             }),
+            behavior: self.behavior,
+            rematerialization_pending: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+            rematerialization_lock: TokioMutex::new(()),
         })
     }
 
@@ -392,7 +460,7 @@ impl SharedExpectDeterministic {
                 .or_insert_with(|| {
                     Arc::new(SharedDeterministicCase {
                         state: Mutex::new(SharedDeterministicCaseState {
-                            baseline_backend: None,
+                            baseline_backend: Some("sqlite".to_string()),
                             baseline_finished: false,
                             baseline_failed: false,
                             baseline_call_count: None,
@@ -412,15 +480,15 @@ impl SharedExpectDeterministic {
                 .expect("shared deterministic mutex poisoned");
             if let Some(existing) = state.role_by_backend.get(backend_name) {
                 *existing
-            } else if state.baseline_backend.is_none() {
-                state.baseline_backend = Some(backend_name.to_string());
-                state.role_by_backend.insert(backend_name.to_string(), true);
-                true
             } else {
+                let is_baseline = state
+                    .baseline_backend
+                    .as_deref()
+                    .is_some_and(|baseline| baseline == backend_name);
                 state
                     .role_by_backend
-                    .insert(backend_name.to_string(), false);
-                false
+                    .insert(backend_name.to_string(), is_baseline);
+                is_baseline
             }
         };
 
@@ -487,6 +555,7 @@ where
         let args = SimulationArgs {
             backend_factory: simulation.backend_factory,
             setup: simulation.setup,
+            behavior: simulation.behavior,
             expect: deterministic.clone(),
         };
         Box::pin(test_fn(args)).await;
@@ -506,6 +575,7 @@ where
     let args = SimulationArgs {
         backend_factory: simulation.backend_factory,
         setup: simulation.setup,
+        behavior: simulation.behavior,
         expect: deterministic,
     };
     Box::pin(test_fn(args)).await;
@@ -513,4 +583,59 @@ where
 
 pub fn default_simulations() -> Vec<Simulation> {
     default_simulations_impl()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementKind {
+    Read,
+    Write,
+    Other,
+}
+
+fn classify_statement(sql: &str) -> StatementKind {
+    let Some(keyword) = first_keyword(sql) else {
+        return StatementKind::Other;
+    };
+    let keyword = keyword.to_ascii_lowercase();
+
+    match keyword.as_str() {
+        "select" | "pragma" | "show" | "describe" | "desc" | "explain" => StatementKind::Read,
+        "insert" | "update" | "delete" | "replace" | "merge" => StatementKind::Write,
+        "with" => classify_with_statement(sql),
+        _ => StatementKind::Other,
+    }
+}
+
+fn classify_with_statement(sql: &str) -> StatementKind {
+    let normalized = sql.to_ascii_lowercase();
+    if normalized.contains(" insert ")
+        || normalized.contains(" update ")
+        || normalized.contains(" delete ")
+        || normalized.contains(" replace ")
+        || normalized.contains(" merge ")
+    {
+        StatementKind::Write
+    } else {
+        StatementKind::Read
+    }
+}
+
+fn first_keyword(sql: &str) -> Option<&str> {
+    let trimmed = sql.trim_start();
+    let end = trimmed
+        .char_indices()
+        .find_map(|(idx, ch)| {
+            if ch.is_whitespace() || ch == '(' {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(trimmed.len());
+    let keyword = &trimmed[..end];
+    if keyword.is_empty() {
+        None
+    } else {
+        Some(keyword)
+    }
 }

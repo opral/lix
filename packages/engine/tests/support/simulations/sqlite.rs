@@ -3,12 +3,13 @@ use tokio::sync::OnceCell;
 
 use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-use crate::support::simulation_test::Simulation;
+use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
 pub fn sqlite_simulation() -> Simulation {
     Simulation {
         name: "sqlite",
         setup: None,
+        behavior: SimulationBehavior::Base,
         backend_factory: Box::new(|| {
             Box::new(SqliteBackend::new(SqliteConfig {
                 filename: ":memory:".to_string(),

@@ -7,7 +7,7 @@ use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-use crate::support::simulation_test::Simulation;
+use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
 static POSTGRES: OnceCell<Arc<PostgresInstance>> = OnceCell::const_new();
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -92,6 +92,7 @@ pub fn postgres_simulation() -> Simulation {
                 Ok(())
             })
         })),
+        behavior: SimulationBehavior::Base,
         backend_factory: Box::new(move || {
             let url = connection_string
                 .lock()
