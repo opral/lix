@@ -3,8 +3,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use lix_engine::{
-    BootKeyValue, MaterializationDebugMode, MaterializationPlan, MaterializationRequest,
-    MaterializationScope, MaterializationWrite, MaterializationWriteOp, Value,
+    MaterializationDebugMode, MaterializationPlan, MaterializationRequest, MaterializationScope,
+    MaterializationWrite, MaterializationWriteOp, Value,
 };
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
@@ -39,16 +39,9 @@ simulation_test!(
     materialization_plan_exposes_debug_trace_and_is_deterministic,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: vec![BootKeyValue {
-                    key: "lix_deterministic_mode".to_string(),
-                    value: serde_json::json!({ "enabled": true }),
-                    version_id: None,
-                }],
-                active_account: None,
-            }))
+            .boot_simulated_engine_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_engine_deterministic should succeed");
         engine.init().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -103,16 +96,9 @@ simulation_test!(
 
 simulation_test!(apply_materialization_plan_upserts_rows, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-            key_values: vec![BootKeyValue {
-                key: "lix_deterministic_mode".to_string(),
-                value: serde_json::json!({ "enabled": true }),
-                version_id: None,
-            }],
-            active_account: None,
-        }))
+        .boot_simulated_engine_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_engine_deterministic should succeed");
     engine.init().await.unwrap();
 
     register_test_schema(&engine).await;

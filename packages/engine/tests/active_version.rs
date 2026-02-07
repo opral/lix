@@ -1,9 +1,7 @@
 mod support;
 
-use lix_engine::{BootKeyValue, Value};
-use support::simulation_test::{
-    default_simulations, run_simulation_test, SimulationArgs, SimulationBootArgs,
-};
+use lix_engine::Value;
+use support::simulation_test::{default_simulations, run_simulation_test, SimulationArgs};
 
 fn parse_snapshot(value: &Value) -> serde_json::Value {
     let text = match value {
@@ -56,22 +54,11 @@ async fn read_active_version_view_row(
     (id, version_id)
 }
 
-fn deterministic_boot_args() -> SimulationBootArgs {
-    SimulationBootArgs {
-        key_values: vec![BootKeyValue {
-            key: "lix_deterministic_mode".to_string(),
-            value: serde_json::json!({ "enabled": true }),
-            version_id: None,
-        }],
-        active_account: None,
-    }
-}
-
 async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs) {
     let engine = sim
-        .boot_simulated_engine(Some(deterministic_boot_args()))
+        .boot_simulated_engine_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_engine_deterministic should succeed");
 
     engine.init().await.unwrap();
 
