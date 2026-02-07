@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde_json::json;
 
-use crate::builtin_schema::builtin_schema_definition;
 use crate::builtin_schema::types::LixVersionPointer;
+use crate::builtin_schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::materialization::loader::{load_data, ChangeRecord, LoadedData};
 use crate::materialization::types::{
     InheritanceWinnerDebugRow, LatestVisibleWinnerDebugRow, MaterializationDebugMode,
@@ -833,10 +833,6 @@ fn builtin_projection_schema_meta(schema_key: &str) -> BuiltinProjectionSchemaMe
         file_id: decode_lixcol_literal(file_id),
         plugin_key: decode_lixcol_literal(plugin_key),
     }
-}
-
-fn decode_lixcol_literal(raw: &str) -> String {
-    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim_matches('"').to_string())
 }
 
 fn resolve_target_versions(

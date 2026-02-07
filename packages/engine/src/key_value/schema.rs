@@ -1,7 +1,9 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::builtin_schema::{builtin_schema_definition, builtin_schema_json};
+use crate::builtin_schema::{
+    builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
+};
 
 pub(crate) const KEY_VALUE_GLOBAL_VERSION: &str = "global";
 
@@ -72,8 +74,4 @@ fn key_value_schema_metadata() -> &'static KeyValueSchemaMetadata {
             plugin_key: decode_lixcol_literal(plugin_key_raw),
         }
     })
-}
-
-fn decode_lixcol_literal(raw: &str) -> String {
-    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim_matches('\"').to_string())
 }

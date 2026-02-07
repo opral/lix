@@ -147,6 +147,10 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn decode_lixcol_literal(raw: &str) -> String {
+    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim_matches('"').to_string())
+}
+
 fn parse_builtin_schema(file_name: &str, raw_json: &str) -> JsonValue {
     serde_json::from_str(raw_json).unwrap_or_else(|error| {
         panic!("builtin schema file '{file_name}' must contain valid JSON: {error}")

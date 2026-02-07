@@ -2,7 +2,9 @@ use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
 use crate::builtin_schema::types::{LixActiveVersion, LixVersionDescriptor, LixVersionPointer};
-use crate::builtin_schema::{builtin_schema_definition, builtin_schema_json};
+use crate::builtin_schema::{
+    builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
+};
 use crate::LixError;
 
 pub(crate) const GLOBAL_VERSION_ID: &str = "global";
@@ -201,8 +203,4 @@ fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {
         plugin_key: decode_lixcol_literal(plugin_key_raw),
         storage_version_id,
     }
-}
-
-fn decode_lixcol_literal(raw: &str) -> String {
-    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim_matches('"').to_string())
 }
