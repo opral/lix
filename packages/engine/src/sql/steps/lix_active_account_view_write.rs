@@ -13,7 +13,7 @@ use crate::account::{
 };
 use crate::sql::lowering::lower_statement;
 use crate::sql::steps::{lix_active_account_view_read, vtable_read};
-use crate::sql::{bind_sql_with_state, resolve_insert_rows, PlaceholderState};
+use crate::sql::{bind_sql_with_state, escape_sql_string, resolve_insert_rows, PlaceholderState};
 use crate::{LixBackend, LixError, Value as EngineValue};
 
 const LIX_ACTIVE_ACCOUNT_VIEW_NAME: &str = "lix_active_account";
@@ -307,8 +307,4 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

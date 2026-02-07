@@ -5,6 +5,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::sql::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
 };
@@ -188,8 +189,4 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

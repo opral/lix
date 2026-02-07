@@ -4,6 +4,7 @@ use crate::materialization::types::{
     MaterializationApplyReport, MaterializationPlan, MaterializationScope, MaterializationWriteOp,
 };
 use crate::schema_registry::register_schema;
+use crate::sql::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn apply_materialization_plan_internal(
@@ -161,8 +162,4 @@ fn materialized_table_name(schema_key: &str) -> String {
 fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{escaped}\"")
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

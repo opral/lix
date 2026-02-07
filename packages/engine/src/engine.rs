@@ -23,8 +23,8 @@ use crate::materialization::{
 };
 use crate::schema_registry::register_schema;
 use crate::sql::{
-    build_delete_followup_sql, build_update_followup_sql, preprocess_sql_with_provider,
-    MutationRow, PostprocessPlan, UpdateValidationPlan,
+    build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
+    preprocess_sql_with_provider, MutationRow, PostprocessPlan, UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -805,8 +805,4 @@ fn where_clause_targets_active_version(where_clause: Option<&str>) -> bool {
         .to_ascii_lowercase();
     let schema_key_filter = format!("schema_key='{}'", active_version_schema_key());
     normalized.contains(&schema_key_filter.to_ascii_lowercase())
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

@@ -8,6 +8,7 @@ use sqlparser::parser::Parser;
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
+use crate::sql::escape_sql_string;
 use crate::LixError;
 
 const LIX_ACTIVE_ACCOUNT_VIEW_NAME: &str = "lix_active_account";
@@ -188,8 +189,4 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(target))
         .unwrap_or(false)
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

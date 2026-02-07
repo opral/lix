@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use crate::sql::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 use super::key::SchemaKey;
@@ -130,10 +131,6 @@ fn schema_from_snapshot_content(raw: &str) -> Result<JsonValue, LixError> {
     parsed.get("value").cloned().ok_or_else(|| LixError {
         message: "stored schema snapshot_content missing value".to_string(),
     })
-}
-
-fn escape_sql_string(input: &str) -> String {
-    input.replace('\'', "''")
 }
 
 fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
