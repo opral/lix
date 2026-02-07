@@ -4,78 +4,46 @@ pub mod simulations;
 #[macro_export]
 macro_rules! simulation_test {
     ($name:ident, |$sim:ident| $body:expr) => {
+        $crate::simulation_test!(
+            $name,
+            simulations = [sqlite, postgres, materialization],
+            |$sim| $body
+        );
+    };
+    ($name:ident, simulations = [$($simulation:ident),+ $(,)?], |$sim:ident| $body:expr) => {
         paste::paste! {
-            #[test]
-            fn [<$name _sqlite>]() {
-                std::thread::Builder::new()
-                    .name(concat!(stringify!($name), "_sqlite").to_string())
-                    .stack_size(8 * 1024 * 1024)
-                    .spawn(|| {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("failed to build tokio runtime");
-                        runtime.block_on(async {
-                            $crate::support::simulation_test::run_single_simulation_test(
-                                "sqlite",
-                                concat!(module_path!(), "::", stringify!($name)),
-                                |$sim| $body,
-                            )
-                            .await;
-                        });
-                    })
-                    .expect("failed to spawn sqlite test thread")
-                    .join()
-                    .expect("sqlite simulation test thread panicked");
-            }
-
-            #[test]
-            fn [<$name _postgres>]() {
-                std::thread::Builder::new()
-                    .name(concat!(stringify!($name), "_postgres").to_string())
-                    .stack_size(8 * 1024 * 1024)
-                    .spawn(|| {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("failed to build tokio runtime");
-                        runtime.block_on(async {
-                            $crate::support::simulation_test::run_single_simulation_test(
-                                "postgres",
-                                concat!(module_path!(), "::", stringify!($name)),
-                                |$sim| $body,
-                            )
-                            .await;
-                        });
-                    })
-                    .expect("failed to spawn postgres test thread")
-                    .join()
-                    .expect("postgres simulation test thread panicked");
-            }
-
-            #[test]
-            fn [<$name _materialization>]() {
-                std::thread::Builder::new()
-                    .name(concat!(stringify!($name), "_materialization").to_string())
-                    .stack_size(8 * 1024 * 1024)
-                    .spawn(|| {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("failed to build tokio runtime");
-                        runtime.block_on(async {
-                            $crate::support::simulation_test::run_single_simulation_test(
-                                "materialization",
-                                concat!(module_path!(), "::", stringify!($name)),
-                                |$sim| $body,
-                            )
-                            .await;
-                        });
-                    })
-                    .expect("failed to spawn materialization test thread")
-                    .join()
-                    .expect("materialization simulation test thread panicked");
-            }
+            $(
+                #[test]
+                fn [<$name _ $simulation>]() {
+                    std::thread::Builder::new()
+                        .name(concat!(stringify!($name), "_", stringify!($simulation)).to_string())
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(|| {
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("failed to build tokio runtime");
+                            runtime.block_on(async {
+                                $crate::support::simulation_test::run_single_simulation_test(
+                                    stringify!($simulation),
+                                    concat!(module_path!(), "::", stringify!($name)),
+                                    |$sim| $body,
+                                )
+                                .await;
+                            });
+                        })
+                        .expect(concat!(
+                            "failed to spawn ",
+                            stringify!($simulation),
+                            " test thread"
+                        ))
+                        .join()
+                        .expect(concat!(
+                            stringify!($simulation),
+                            " simulation test thread panicked"
+                        ));
+                }
+            )+
         }
     };
 }

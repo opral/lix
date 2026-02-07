@@ -3,7 +3,8 @@ mod support;
 use std::collections::BTreeSet;
 
 use lix_engine::{
-    BootKeyValue, MaterializationDebugMode, MaterializationRequest, MaterializationScope, Value,
+    BootKeyValue, MaterializationDebugMode, MaterializationPlan, MaterializationRequest,
+    MaterializationScope, MaterializationWrite, MaterializationWriteOp, Value,
 };
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
@@ -189,3 +190,86 @@ simulation_test!(apply_materialization_plan_upserts_rows, |sim| async move {
 
     sim.assert_deterministic(rows.rows.clone());
 });
+
+simulation_test!(
+    apply_materialization_plan_full_scope_clears_existing_rows_in_schema_tables,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        let main_version_id = main_version_id(&engine).await;
+
+        let scoped_versions = BTreeSet::from([main_version_id.clone()]);
+        let seed_plan = MaterializationPlan {
+            run_id: "seed".to_string(),
+            scope: MaterializationScope::Versions(scoped_versions.clone()),
+            stats: Vec::new(),
+            writes: vec![MaterializationWrite {
+                schema_key: "materialization_test_schema".to_string(),
+                entity_id: "entity-old".to_string(),
+                file_id: "file-1".to_string(),
+                version_id: main_version_id.clone(),
+                inherited_from_version_id: None,
+                op: MaterializationWriteOp::Upsert,
+                snapshot_content: Some("{\"value\":\"old\"}".to_string()),
+                schema_version: "1".to_string(),
+                plugin_key: "lix".to_string(),
+                change_id: "seed-change".to_string(),
+                created_at: "1970-01-01T00:00:00Z".to_string(),
+                updated_at: "1970-01-01T00:00:00Z".to_string(),
+            }],
+            warnings: Vec::new(),
+            debug: None,
+        };
+        engine.apply_materialization_plan(&seed_plan).await.unwrap();
+
+        let full_plan = MaterializationPlan {
+            run_id: "full".to_string(),
+            scope: MaterializationScope::Full,
+            stats: Vec::new(),
+            writes: vec![MaterializationWrite {
+                schema_key: "materialization_test_schema".to_string(),
+                entity_id: "entity-new".to_string(),
+                file_id: "file-1".to_string(),
+                version_id: main_version_id.clone(),
+                inherited_from_version_id: None,
+                op: MaterializationWriteOp::Upsert,
+                snapshot_content: Some("{\"value\":\"new\"}".to_string()),
+                schema_version: "1".to_string(),
+                plugin_key: "lix".to_string(),
+                change_id: "full-change".to_string(),
+                created_at: "1970-01-01T00:00:00Z".to_string(),
+                updated_at: "1970-01-01T00:00:00Z".to_string(),
+            }],
+            warnings: Vec::new(),
+            debug: None,
+        };
+        let report = engine.apply_materialization_plan(&full_plan).await.unwrap();
+
+        assert!(report.rows_deleted > 0);
+        assert_eq!(report.rows_written, 1);
+        sim.assert_deterministic(vec![report.rows_written as i64, report.rows_deleted as i64]);
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, snapshot_content \
+                 FROM lix_internal_state_materialized_v1_materialization_test_schema \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][0], Value::Text("entity-new".to_string()));
+        assert_eq!(
+            rows.rows[0][1],
+            Value::Text("{\"value\":\"new\"}".to_string())
+        );
+        sim.assert_deterministic(rows.rows.clone());
+    }
+);

@@ -12,7 +12,6 @@ pub(crate) async fn apply_materialization_plan_internal(
     plan: &MaterializationPlan,
 ) -> Result<MaterializationApplyReport, LixError> {
     let mut tables_touched = BTreeSet::new();
-    let target_versions = scope_versions(&plan.scope);
 
     let mut schema_keys = BTreeSet::new();
     for write in &plan.writes {
@@ -20,7 +19,7 @@ pub(crate) async fn apply_materialization_plan_internal(
     }
 
     let rows_deleted =
-        clear_scope_rows(backend, &schema_keys, &target_versions, &mut tables_touched).await?;
+        clear_scope_rows(backend, &schema_keys, &plan.scope, &mut tables_touched).await?;
 
     for write in &plan.writes {
         let table_name = materialized_table_name(&write.schema_key);
@@ -85,14 +84,18 @@ pub(crate) async fn apply_materialization_plan_internal(
 async fn clear_scope_rows(
     backend: &dyn LixBackend,
     schema_keys: &BTreeSet<String>,
-    target_versions: &BTreeSet<String>,
+    scope: &MaterializationScope,
     tables_touched: &mut BTreeSet<String>,
 ) -> Result<usize, LixError> {
-    if target_versions.is_empty() || schema_keys.is_empty() {
+    if schema_keys.is_empty() {
         return Ok(0);
     }
 
-    let in_list = in_clause_values(target_versions);
+    let version_filter = match scope {
+        MaterializationScope::Full => None,
+        MaterializationScope::Versions(versions) if versions.is_empty() => return Ok(0),
+        MaterializationScope::Versions(versions) => Some(in_clause_values(versions)),
+    };
     let mut rows_deleted = 0usize;
 
     for schema_key in schema_keys {
@@ -100,19 +103,35 @@ async fn clear_scope_rows(
         let table_name = materialized_table_name(schema_key);
         tables_touched.insert(table_name.clone());
 
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM {table_name} WHERE version_id IN ({in_list})",
-            table_name = quote_ident(&table_name),
-            in_list = in_list,
-        );
+        let (count_sql, delete_sql) = if let Some(in_list) = version_filter.as_ref() {
+            (
+                format!(
+                    "SELECT COUNT(*) FROM {table_name} WHERE version_id IN ({in_list})",
+                    table_name = quote_ident(&table_name),
+                    in_list = in_list,
+                ),
+                format!(
+                    "DELETE FROM {table_name} WHERE version_id IN ({in_list})",
+                    table_name = quote_ident(&table_name),
+                    in_list = in_list,
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "SELECT COUNT(*) FROM {table_name}",
+                    table_name = quote_ident(&table_name),
+                ),
+                format!(
+                    "DELETE FROM {table_name}",
+                    table_name = quote_ident(&table_name),
+                ),
+            )
+        };
+
         let count_result = backend.execute(&count_sql, &[]).await?;
         rows_deleted += parse_count_result(&count_result.rows)?;
 
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE version_id IN ({in_list})",
-            table_name = quote_ident(&table_name),
-            in_list = in_list,
-        );
         backend.execute(&delete_sql, &[]).await?;
     }
 
@@ -137,13 +156,6 @@ fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
         _ => Err(LixError {
             message: "materialization apply: count query returned non-integer value".to_string(),
         }),
-    }
-}
-
-fn scope_versions(scope: &MaterializationScope) -> BTreeSet<String> {
-    match scope {
-        MaterializationScope::Full => BTreeSet::new(),
-        MaterializationScope::Versions(versions) => versions.clone(),
     }
 }
 
