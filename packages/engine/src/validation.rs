@@ -72,7 +72,7 @@ pub async fn validate_updates(
         );
         if let Some(where_clause) = &plan.where_clause {
             sql.push_str(" WHERE ");
-            sql.push_str(where_clause);
+            sql.push_str(&where_clause.to_string());
         }
 
         let result = backend.execute(&sql, &[]).await?;

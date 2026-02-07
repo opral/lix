@@ -1960,7 +1960,7 @@ fn build_update_validation_plan(
     params: &[EngineValue],
 ) -> Result<Option<UpdateValidationPlan>, LixError> {
     let snapshot_content = snapshot_content_from_assignments(&update.assignments, params)?;
-    let where_clause = update.selection.as_ref().map(|expr| expr.to_string());
+    let where_clause = update.selection.clone();
     let table = table_name.ok_or_else(|| LixError {
         message: "update validation requires target table".to_string(),
     })?;

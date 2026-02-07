@@ -39,6 +39,7 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
+use sqlparser::ast::{BinaryOperator, Expr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
@@ -778,7 +779,7 @@ fn active_version_from_update_validations(
         {
             continue;
         }
-        if !where_clause_targets_active_version(plan.where_clause.as_deref()) {
+        if !where_clause_targets_active_version(plan.where_clause.as_ref()) {
             continue;
         }
         let Some(snapshot) = plan.snapshot_content.as_ref() else {
@@ -794,15 +795,190 @@ fn active_version_from_update_validations(
     Ok(None)
 }
 
-fn where_clause_targets_active_version(where_clause: Option<&str>) -> bool {
+fn where_clause_targets_active_version(where_clause: Option<&Expr>) -> bool {
     let Some(where_clause) = where_clause else {
         return false;
     };
-    let normalized: String = where_clause
-        .chars()
-        .filter(|character| !character.is_whitespace() && *character != '"')
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let schema_key_filter = format!("schema_key='{}'", active_version_schema_key());
-    normalized.contains(&schema_key_filter.to_ascii_lowercase())
+    let Some(schema_keys) = schema_keys_from_expr(where_clause) else {
+        return false;
+    };
+    schema_keys
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(active_version_schema_key()))
+}
+
+fn schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if expr_is_schema_key_column(left) {
+                return schema_key_literal_value(right).map(|value| vec![value]);
+            }
+            if expr_is_schema_key_column(right) {
+                return schema_key_literal_value(left).map(|value| vec![value]);
+            }
+            None
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => match (schema_keys_from_expr(left), schema_keys_from_expr(right)) {
+            (Some(left), Some(right)) => {
+                let intersection = intersect_strings(&left, &right);
+                if intersection.is_empty() {
+                    None
+                } else {
+                    Some(intersection)
+                }
+            }
+            (Some(keys), None) | (None, Some(keys)) => Some(keys),
+            (None, None) => None,
+        },
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => match (schema_keys_from_expr(left), schema_keys_from_expr(right)) {
+            (Some(left), Some(right)) => Some(union_strings(&left, &right)),
+            _ => None,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if !expr_is_schema_key_column(expr) {
+                return None;
+            }
+            let mut values = Vec::with_capacity(list.len());
+            for item in list {
+                let value = schema_key_literal_value(item)?;
+                values.push(value);
+            }
+            if values.is_empty() {
+                None
+            } else {
+                Some(dedup_strings(values))
+            }
+        }
+        Expr::Nested(inner) => schema_keys_from_expr(inner),
+        _ => None,
+    }
+}
+
+fn expr_is_schema_key_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("schema_key"),
+        Expr::CompoundIdentifier(idents) => idents
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case("schema_key"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn schema_key_literal_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value) => value.value.clone().into_string(),
+        Expr::Identifier(ident) if ident.quote_style == Some('"') => Some(ident.value.clone()),
+        _ => None,
+    }
+}
+
+fn dedup_strings(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn union_strings(left: &[String], right: &[String]) -> Vec<String> {
+    let mut out = left.to_vec();
+    for value in right {
+        if !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in left {
+        if right.contains(value) && !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{active_version_from_update_validations, active_version_schema_key};
+    use crate::sql::parse_sql_statements;
+    use crate::sql::UpdateValidationPlan;
+    use serde_json::json;
+    use sqlparser::ast::{Expr, Statement};
+
+    #[test]
+    fn detects_active_version_update_with_single_quoted_schema_key() {
+        let where_clause = parse_update_where_clause(&format!(
+            "UPDATE lix_internal_state_untracked SET snapshot_content = 'x' WHERE schema_key = '{}' AND entity_id = 'main'",
+            active_version_schema_key()
+        ));
+        let plan = update_validation_plan(where_clause, "v-single");
+
+        let detected = active_version_from_update_validations(&[plan]).expect("detect version");
+        assert_eq!(detected.as_deref(), Some("v-single"));
+    }
+
+    #[test]
+    fn detects_active_version_update_with_double_quoted_schema_key() {
+        let where_clause = parse_update_where_clause(&format!(
+            "UPDATE lix_internal_state_untracked SET snapshot_content = 'x' WHERE schema_key = \"{}\" AND entity_id = 'main'",
+            active_version_schema_key()
+        ));
+        let plan = update_validation_plan(where_clause, "v-double");
+
+        let detected = active_version_from_update_validations(&[plan]).expect("detect version");
+        assert_eq!(detected.as_deref(), Some("v-double"));
+    }
+
+    #[test]
+    fn ignores_non_active_version_schema_key() {
+        let where_clause = parse_update_where_clause(
+            "UPDATE lix_internal_state_untracked SET snapshot_content = 'x' WHERE schema_key = 'other_schema' AND entity_id = 'main'",
+        );
+        let plan = update_validation_plan(where_clause, "v-other");
+
+        let detected = active_version_from_update_validations(&[plan]).expect("detect version");
+        assert_eq!(detected, None);
+    }
+
+    fn parse_update_where_clause(sql: &str) -> Expr {
+        let mut statements = parse_sql_statements(sql).expect("parse sql");
+        let statement = statements.remove(0);
+        let Statement::Update(update) = statement else {
+            panic!("expected update statement");
+        };
+        update.selection.expect("where clause")
+    }
+
+    fn update_validation_plan(where_clause: Expr, version_id: &str) -> UpdateValidationPlan {
+        UpdateValidationPlan {
+            table: "lix_internal_state_untracked".to_string(),
+            where_clause: Some(where_clause),
+            snapshot_content: Some(json!({
+                "id": "main",
+                "version_id": version_id
+            })),
+        }
+    }
 }
