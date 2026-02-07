@@ -1,0 +1,36 @@
+{
+  "x-lix-key": "lix_active_account",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/account_id"
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\"",
+    "lixcol_untracked": "1",
+    "lixcol_version_id": "\"global\""
+  },
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/account_id"
+      ],
+      "references": {
+        "schemaKey": "lix_account",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
+  "type": "object",
+  "properties": {
+    "account_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_id"
+  ],
+  "additionalProperties": false
+}

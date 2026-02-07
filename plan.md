@@ -155,7 +155,7 @@ The `version` view reads from state cache with special handling for inheritance:
 │ lix_internal_state_vtable       │   │ lix_internal_state_materialized_v1_    │
 │                                 │   │ lix_version_descriptor          │
 │ (version descriptors,           │   │                                 │
-│  lix_version_tip)               │   │ (indexed inheritance chain)     │
+│  lix_version_pointer)               │   │ (indexed inheritance chain)     │
 └─────────────────────────────────┘   └─────────────────────────────────┘
 ```
 
@@ -1009,7 +1009,7 @@ let commit_result = generate_commit(GenerateCommitArgs {
     active_accounts: get_active_accounts(&host)?,
 });
 
-// commit_result.changes = domain changes + meta changes (commit, version_tip, etc.)
+// commit_result.changes = domain changes + meta changes (commit, version_pointer, etc.)
 // commit_result.materialized_state = rows ready for cache insertion
 
 // 7. Build final SQL
@@ -1025,60 +1025,13 @@ host.execute(&sql)?;
 
 1. Port `generateCommit()` logic to Rust
 2. Generate commit snapshot with `change_ids`, `parent_commit_ids`
-3. Generate `lix_version_tip` updates per version
+3. Generate `lix_version_pointer` updates per version
 4. Generate `lix_change_set_element` rows for domain changes
 5. Return both raw changes and materialized state for cache insertion
 
-## Milestone 14: State Materialization
-
-The materialization logic computes the correct state from the commit graph and change history. This is critical for ensuring reads return the correct data based on version inheritance and commit ancestry.
-
-See the current JS implementation: [materialize-state.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/materialize-state.ts)
-
-### Materialization Views
-
-The JS implementation creates a chain of SQL views:
-
-```
-lix_internal_materialization_all_commit_edges
-    │
-    ▼
-lix_internal_materialization_version_tips
-    │
-    ▼
-lix_internal_materialization_commit_graph
-    │
-    ▼
-lix_internal_materialization_latest_visible_state
-    │
-    ├─────────────────────────────────┐
-    ▼                                 ▼
-lix_internal_materialization_     lix_internal_state_materializer
-version_ancestry                      (final output)
-```
-
-| View                   | Purpose                                                                                              |
-| ---------------------- | ---------------------------------------------------------------------------------------------------- |
-| `all_commit_edges`     | Union of edges from commit.parent_commit_ids and lix_commit_edge rows                                |
-| `version_tips`         | Current tip commit per version                                                                       |
-| `commit_graph`         | Recursive DAG traversal with depth from tips                                                         |
-| `latest_visible_state` | Explodes commit.change_ids, joins with change table, deduplicates by (version, entity, schema, file) |
-| `version_ancestry`     | Recursive inheritance chain per version                                                              |
-| `state_materializer`   | Final state with inheritance resolution                                                              |
-
-### Correctness Assurance
-
-After Milestone 13, we should have tests that verify:
-
-1. State reads match the JS implementation for the same change history
-2. Version inheritance correctly resolves parent → child state visibility
-3. Tombstones (deletions) are correctly handled
-4. Commit graph traversal handles merge commits (multiple parents)
-5. Cache tables are populated correctly from materialized state
-
 # Versions
 
-## Milestone 15: Active Version
+## Milestone 14: Active Version
 
 The active version determines which version context is used for state operations. It is stored in the untracked table since it's local-only state that shouldn't be synced.
 
@@ -1115,9 +1068,9 @@ WHERE entity_id = 'lix_active_version' AND schema_key = 'lix_key_value'
 3. Provide API to switch active version
 4. Update cached value when active version changes
 
-## Milestone 16: Version View (version_descriptor + version_tip)
+## Milestone 15: Version View (version_descriptor + version_pointer)
 
-The `version` view combines `lix_version_descriptor` and `lix_version_tip` to provide a unified view of versions with their current tip commits.
+The `version` view combines `lix_version_descriptor` and `lix_version_pointer` to provide a unified view of versions with their current tip commits.
 
 ### Query Rewriting Example
 
@@ -1142,8 +1095,8 @@ FROM (
   WHERE is_tombstone = 0
 ) vd
 LEFT JOIN (
-  -- version_tip from materialized table
-  SELECT * FROM lix_internal_state_materialized_v1_lix_version_tip
+  -- version_pointer from materialized table
+  SELECT * FROM lix_internal_state_materialized_v1_lix_version_pointer
   WHERE is_tombstone = 0
 ) vt ON json_extract(vd.snapshot_content, '$.id') = json_extract(vt.snapshot_content, '$.version_id')
 WHERE json_extract(vd.snapshot_content, '$.id') = 'version-1'
@@ -1152,11 +1105,246 @@ WHERE json_extract(vd.snapshot_content, '$.id') = 'version-1'
 ### Tasks
 
 1. Parse SELECT statements targeting `version` view
-2. Rewrite to JOIN version_descriptor and version_tip materialized tables
+2. Rewrite to JOIN version_descriptor and version_pointer materialized tables
 3. Project relevant fields from snapshot_content
 4. Handle INSERT/UPDATE/DELETE by routing to appropriate underlying schema
 
-## Milestone 17: Version Inheritance in SELECT Rewriting
+## Milestone 16: `lix_state` SELECT Rewriting
+
+The `lix_state` view provides state for the "current" version (typically the active version in the session). It wraps `lix_state_by_version` with implicit version resolution.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+SELECT * FROM lix_state
+WHERE schema_key = 'lix_key_value'
+```
+
+**Rewritten query:**
+
+```sql
+-- First resolve current version from session/context
+-- Then rewrite as lix_state_by_version with that version_id
+SELECT * FROM (
+  -- Same as lix_state_by_version rewriting with version_id = <current_version>
+  ...
+) WHERE rn = 1 AND is_tombstone = 0
+```
+
+### Tasks
+
+1. Parse SELECT statements targeting `lix_state`
+2. Resolve current version from engine context
+3. Delegate to `lix_state_by_version` SELECT rewriting with resolved version
+4. Handle cases where no version is active
+
+## Milestone 17: `lix_state` INSERT Rewriting
+
+INSERT operations on `lix_state` write to the current version.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+INSERT INTO lix_state (entity_id, schema_key, snapshot_content)
+VALUES ('entity-1', 'lix_key_value', '{"key": "foo"}')
+```
+
+**Rewritten query:**
+
+```sql
+-- Resolve current version, then delegate to lix_state_by_version INSERT
+```
+
+### Tasks
+
+1. Parse INSERT statements targeting `lix_state`
+2. Resolve current version from engine context
+3. Delegate to `lix_state_by_version` INSERT rewriting with resolved version
+
+## Milestone 18: `lix_state` UPDATE Rewriting
+
+UPDATE operations on `lix_state` modify state for the current version.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+UPDATE lix_state
+SET snapshot_content = '{"key": "updated"}'
+WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
+```
+
+**Rewritten query:**
+
+```sql
+-- Resolve current version, then delegate to lix_state_by_version UPDATE
+```
+
+### Tasks
+
+1. Parse UPDATE statements targeting `lix_state`
+2. Resolve current version from engine context
+3. Delegate to `lix_state_by_version` UPDATE rewriting with resolved version
+
+## Milestone 19: `lix_state` DELETE Rewriting
+
+DELETE operations on `lix_state` create tombstones for the current version.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+DELETE FROM lix_state
+WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
+```
+
+**Rewritten query:**
+
+```sql
+-- Resolve current version, then delegate to lix_state_by_version DELETE
+```
+
+### Tasks
+
+1. Parse DELETE statements targeting `lix_state`
+2. Resolve current version from engine context
+3. Delegate to `lix_state_by_version` DELETE rewriting (tombstone creation)
+
+## Milestone 20: `lix_state_by_version` SELECT Rewriting
+
+The `lix_state_by_version` view provides state scoped to a specific version. It builds on the vtable rewriting by adding version-specific filtering.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+SELECT * FROM lix_state_by_version
+WHERE schema_key = 'lix_key_value' AND version_id = 'version-1'
+```
+
+**Rewritten query:**
+
+```sql
+SELECT
+  entity_id,
+  schema_key,
+  file_id,
+  version_id,
+  snapshot_content,
+  change_id
+FROM (
+  SELECT *, ROW_NUMBER() OVER (
+    PARTITION BY entity_id, file_id
+    ORDER BY priority
+  ) AS rn
+  FROM (
+    -- Priority 1: Untracked
+    SELECT *, 1 AS priority FROM lix_internal_state_untracked
+    WHERE schema_key = 'lix_key_value' AND version_id = 'version-1'
+
+    UNION ALL
+
+    -- Priority 2: Materialized
+    SELECT *, 2 AS priority FROM lix_internal_state_materialized_v1_lix_key_value
+    WHERE version_id = 'version-1'
+  )
+) WHERE rn = 1 AND is_tombstone = 0
+```
+
+### Tasks
+
+1. Parse SELECT statements targeting `lix_state_by_version`
+2. Extract `version_id` from WHERE clause
+3. Apply version filtering to both untracked and materialized tables
+4. Filter out tombstones by default
+
+## Milestone 21: `lix_state_by_version` INSERT Rewriting
+
+INSERT operations on `lix_state_by_version` write to the underlying vtable with explicit version scoping.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+INSERT INTO lix_state_by_version (entity_id, schema_key, version_id, snapshot_content)
+VALUES ('entity-1', 'lix_key_value', 'version-1', '{"key": "foo"}')
+```
+
+**Rewritten query:**
+
+```sql
+-- Delegates to lix_internal_state_vtable INSERT rewriting (Milestone 4)
+-- with version_id explicitly set
+```
+
+### Tasks
+
+1. Parse INSERT statements targeting `lix_state_by_version`
+2. Validate `version_id` is provided
+3. Delegate to vtable INSERT rewriting with version context
+
+## Milestone 22: `lix_state_by_version` UPDATE Rewriting
+
+UPDATE operations on `lix_state_by_version` modify state for a specific version.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+UPDATE lix_state_by_version
+SET snapshot_content = '{"key": "updated"}'
+WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = 'version-1'
+```
+
+**Rewritten query:**
+
+```sql
+-- Delegates to lix_internal_state_vtable UPDATE rewriting (Milestone 5)
+-- with version_id explicitly set
+```
+
+### Tasks
+
+1. Parse UPDATE statements targeting `lix_state_by_version`
+2. Extract `version_id` from WHERE clause
+3. Delegate to vtable UPDATE rewriting with version context
+
+## Milestone 23: `lix_state_by_version` DELETE Rewriting
+
+DELETE operations on `lix_state_by_version` create tombstones for the specified version.
+
+### Query Rewriting Example
+
+**Input query:**
+
+```sql
+DELETE FROM lix_state_by_version
+WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = 'version-1'
+```
+
+**Rewritten query:**
+
+```sql
+-- Delegates to lix_internal_state_vtable DELETE rewriting (Milestone 6)
+-- Creates tombstone for the specific version
+```
+
+### Tasks
+
+1. Parse DELETE statements targeting `lix_state_by_version`
+2. Extract `version_id` from WHERE clause
+3. Delegate to vtable DELETE rewriting (tombstone creation)
+
+## Milestone 24: Version Inheritance in SELECT Rewriting
 
 State queries must respect version inheritance. When querying state for a version, if an entity doesn't exist in that version, the query should fall back to parent versions.
 
@@ -1168,14 +1356,14 @@ version-child (active)
             └── version-grandparent
 ```
 
-When querying `state` for `version-child`, if an entity exists in `version-parent` but not `version-child`, it should be visible.
+When querying `lix_state` for `version-child`, if an entity exists in `version-parent` but not `version-child`, it should be visible.
 
 ### Query Rewriting Example
 
 **Input query:**
 
 ```sql
-SELECT * FROM state
+SELECT * FROM lix_state
 WHERE schema_key = 'lix_key_value'
 ```
 
@@ -1222,8 +1410,8 @@ SELECT * FROM (
 - Version inheritance is resolved via recursive CTE
 - Closer versions (lower depth) take priority
 - Tombstones in child versions hide parent state
-- `state_by_version` does NOT use inheritance (explicit version only)
-- `state` uses inheritance based on active version
+- `lix_state_by_version` does NOT use inheritance (explicit version only)
+- `lix_state` uses inheritance based on active version
 
 ### Tasks
 
@@ -1231,9 +1419,58 @@ SELECT * FROM (
 2. Join state queries with version chain
 3. Prioritize by inheritance depth (closer = higher priority)
 4. Handle tombstones correctly (child tombstone hides parent state)
-5. Apply inheritance only to `state` view, not `state_by_version`
+5. Apply inheritance only to `lix_state` view, not `lix_state_by_version`
 
-## Milestone 18: Active Account and Change Author
+## Milestone 25: State Materialization
+
+The materialization logic computes the correct state from the commit graph and change history. This is critical for ensuring reads return the correct data based on version inheritance and commit ancestry.
+
+See the current JS implementation: [materialize-state.ts](https://github.com/opral/monorepo/blob/2413bafee26554208ec674e2a52306fcf4b77bc4/packages/lix/sdk/src/state/materialize-state.ts)
+
+### Materialization Views
+
+The JS implementation creates a chain of SQL views:
+
+```
+lix_internal_materialization_all_commit_edges
+    │
+    ▼
+lix_internal_materialization_version_pointers
+    │
+    ▼
+lix_internal_materialization_commit_graph
+    │
+    ▼
+lix_internal_materialization_latest_visible_state
+    │
+    ├─────────────────────────────────┐
+    ▼                                 ▼
+lix_internal_materialization_     lix_internal_state_materializer
+version_ancestry                      (final output)
+```
+
+| View                   | Purpose                                                                                              |
+| ---------------------- | ---------------------------------------------------------------------------------------------------- |
+| `all_commit_edges`     | Union of edges from commit.parent_commit_ids and lix_commit_edge rows                                |
+| `version_pointers`         | Current tip commit per version                                                                       |
+| `commit_graph`         | Recursive DAG traversal with depth from tips                                                         |
+| `latest_visible_state` | Explodes commit.change_ids, joins with change table, deduplicates by (version, entity, schema, file) |
+| `version_ancestry`     | Recursive inheritance chain per version                                                              |
+| `state_materializer`   | Final state with inheritance resolution                                                              |
+
+### Correctness Assurance
+
+After Milestone 13, we should have tests that verify:
+
+1. State reads match the JS implementation for the same change history
+2. Version inheritance correctly resolves parent → child state visibility
+3. Tombstones (deletions) are correctly handled
+4. Commit graph traversal handles merge commits (multiple parents)
+5. Cache tables are populated correctly from materialized state
+
+# Accounts
+
+## Milestone 26: Active Account and Change Author
 
 The active account determines which account context is used for change attribution. Like active version, it is stored in the untracked table. When changes are created, the engine generates change author records linking changes to accounts.
 
@@ -1317,253 +1554,18 @@ VALUES (
 
 # State Views
 
-## Milestone 19: `state_by_version` SELECT Rewriting
+## Milestone 27: `lix_state_history` SELECT Rewriting (Read-Only)
 
-The `state_by_version` view provides state scoped to a specific version. It builds on the vtable rewriting by adding version-specific filtering.
+The `lix_state_history` view provides the full history of state changes across all versions. Unlike `lix_state` and `lix_state_by_version`, it does not deduplicate by entity—it returns all historical records.
 
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-SELECT * FROM state_by_version
-WHERE schema_key = 'lix_key_value' AND version_id = 'version-1'
-```
-
-**Rewritten query:**
-
-```sql
-SELECT
-  entity_id,
-  schema_key,
-  file_id,
-  version_id,
-  snapshot_content,
-  change_id
-FROM (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY entity_id, file_id
-    ORDER BY priority
-  ) AS rn
-  FROM (
-    -- Priority 1: Untracked
-    SELECT *, 1 AS priority FROM lix_internal_state_untracked
-    WHERE schema_key = 'lix_key_value' AND version_id = 'version-1'
-
-    UNION ALL
-
-    -- Priority 2: Materialized
-    SELECT *, 2 AS priority FROM lix_internal_state_materialized_v1_lix_key_value
-    WHERE version_id = 'version-1'
-  )
-) WHERE rn = 1 AND is_tombstone = 0
-```
-
-### Tasks
-
-1. Parse SELECT statements targeting `state_by_version`
-2. Extract `version_id` from WHERE clause
-3. Apply version filtering to both untracked and materialized tables
-4. Filter out tombstones by default
-
-## Milestone 20: `state_by_version` INSERT Rewriting
-
-INSERT operations on `state_by_version` write to the underlying vtable with explicit version scoping.
+> **Note:** `lix_state_history` is read-only. INSERT/UPDATE/DELETE are not supported.
 
 ### Query Rewriting Example
 
 **Input query:**
 
 ```sql
-INSERT INTO state_by_version (entity_id, schema_key, version_id, snapshot_content)
-VALUES ('entity-1', 'lix_key_value', 'version-1', '{"key": "foo"}')
-```
-
-**Rewritten query:**
-
-```sql
--- Delegates to lix_internal_state_vtable INSERT rewriting (Milestone 4)
--- with version_id explicitly set
-```
-
-### Tasks
-
-1. Parse INSERT statements targeting `state_by_version`
-2. Validate `version_id` is provided
-3. Delegate to vtable INSERT rewriting with version context
-
-## Milestone 21: `state_by_version` UPDATE Rewriting
-
-UPDATE operations on `state_by_version` modify state for a specific version.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-UPDATE state_by_version
-SET snapshot_content = '{"key": "updated"}'
-WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = 'version-1'
-```
-
-**Rewritten query:**
-
-```sql
--- Delegates to lix_internal_state_vtable UPDATE rewriting (Milestone 5)
--- with version_id explicitly set
-```
-
-### Tasks
-
-1. Parse UPDATE statements targeting `state_by_version`
-2. Extract `version_id` from WHERE clause
-3. Delegate to vtable UPDATE rewriting with version context
-
-## Milestone 22: `state_by_version` DELETE Rewriting
-
-DELETE operations on `state_by_version` create tombstones for the specified version.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-DELETE FROM state_by_version
-WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = 'version-1'
-```
-
-**Rewritten query:**
-
-```sql
--- Delegates to lix_internal_state_vtable DELETE rewriting (Milestone 6)
--- Creates tombstone for the specific version
-```
-
-### Tasks
-
-1. Parse DELETE statements targeting `state_by_version`
-2. Extract `version_id` from WHERE clause
-3. Delegate to vtable DELETE rewriting (tombstone creation)
-
-## Milestone 23: `state` SELECT Rewriting
-
-The `state` view provides state for the "current" version (typically the active version in the session). It wraps `state_by_version` with implicit version resolution.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-SELECT * FROM state
-WHERE schema_key = 'lix_key_value'
-```
-
-**Rewritten query:**
-
-```sql
--- First resolve current version from session/context
--- Then rewrite as state_by_version with that version_id
-SELECT * FROM (
-  -- Same as state_by_version rewriting with version_id = <current_version>
-  ...
-) WHERE rn = 1 AND is_tombstone = 0
-```
-
-### Tasks
-
-1. Parse SELECT statements targeting `state`
-2. Resolve current version from engine context
-3. Delegate to `state_by_version` SELECT rewriting with resolved version
-4. Handle cases where no version is active
-
-## Milestone 24: `state` INSERT Rewriting
-
-INSERT operations on `state` write to the current version.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-INSERT INTO state (entity_id, schema_key, snapshot_content)
-VALUES ('entity-1', 'lix_key_value', '{"key": "foo"}')
-```
-
-**Rewritten query:**
-
-```sql
--- Resolve current version, then delegate to state_by_version INSERT
-```
-
-### Tasks
-
-1. Parse INSERT statements targeting `state`
-2. Resolve current version from engine context
-3. Delegate to `state_by_version` INSERT rewriting with resolved version
-
-## Milestone 25: `state` UPDATE Rewriting
-
-UPDATE operations on `state` modify state for the current version.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-UPDATE state
-SET snapshot_content = '{"key": "updated"}'
-WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
-```
-
-**Rewritten query:**
-
-```sql
--- Resolve current version, then delegate to state_by_version UPDATE
-```
-
-### Tasks
-
-1. Parse UPDATE statements targeting `state`
-2. Resolve current version from engine context
-3. Delegate to `state_by_version` UPDATE rewriting with resolved version
-
-## Milestone 26: `state` DELETE Rewriting
-
-DELETE operations on `state` create tombstones for the current version.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-DELETE FROM state
-WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
-```
-
-**Rewritten query:**
-
-```sql
--- Resolve current version, then delegate to state_by_version DELETE
-```
-
-### Tasks
-
-1. Parse DELETE statements targeting `state`
-2. Resolve current version from engine context
-3. Delegate to `state_by_version` DELETE rewriting (tombstone creation)
-
-## Milestone 27: `state_history` SELECT Rewriting (Read-Only)
-
-The `state_history` view provides the full history of state changes across all versions. Unlike `state` and `state_by_version`, it does not deduplicate by entity—it returns all historical records.
-
-> **Note:** `state_history` is read-only. INSERT/UPDATE/DELETE are not supported.
-
-### Query Rewriting Example
-
-**Input query:**
-
-```sql
-SELECT * FROM state_history
+SELECT * FROM lix_state_history
 WHERE schema_key = 'lix_key_value' AND entity_id = 'entity-1'
 ```
 
@@ -1586,7 +1588,7 @@ ORDER BY c.created_at DESC
 
 ### Tasks
 
-1. Parse SELECT statements targeting `state_history`
+1. Parse SELECT statements targeting `lix_state_history`
 2. Rewrite to query `lix_internal_change` joined with `lix_internal_snapshot`
 3. Include all historical records (no deduplication)
 4. Order by creation time
@@ -1598,7 +1600,7 @@ ORDER BY c.created_at DESC
 
 ## Milestone 28: `entity_by_version` SELECT Rewriting
 
-The `entity_by_version` view is a layer on top of `state_by_version` that filters by `entity_id`. It returns state for a specific entity in a specific version.
+The `entity_by_version` view is a layer on top of `lix_state_by_version` that filters by `entity_id`. It returns state for a specific entity in a specific version.
 
 ### Query Rewriting Example
 
@@ -1612,10 +1614,10 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version SELECT rewriting (Milestone 19)
+-- Delegates to lix_state_by_version SELECT rewriting (Milestone 20)
 -- with entity_id filter applied
 SELECT * FROM (
-  -- state_by_version rewriting...
+  -- lix_state_by_version rewriting...
 ) WHERE entity_id = 'entity-1'
 ```
 
@@ -1623,11 +1625,11 @@ SELECT * FROM (
 
 1. Parse SELECT statements targeting `entity_by_version`
 2. Extract `entity_id` from WHERE clause (required)
-3. Delegate to `state_by_version` SELECT rewriting with entity_id filter
+3. Delegate to `lix_state_by_version` SELECT rewriting with entity_id filter
 
 ## Milestone 29: `entity_by_version` INSERT Rewriting
 
-INSERT operations on `entity_by_version` delegate to `state_by_version` INSERT.
+INSERT operations on `entity_by_version` delegate to `lix_state_by_version` INSERT.
 
 ### Query Rewriting Example
 
@@ -1641,18 +1643,18 @@ VALUES ('entity-1', 'lix_key_value', 'version-1', '{"key": "foo"}')
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version INSERT rewriting (Milestone 20)
+-- Delegates to lix_state_by_version INSERT rewriting (Milestone 21)
 ```
 
 ### Tasks
 
 1. Parse INSERT statements targeting `entity_by_version`
 2. Validate `entity_id` and `version_id` are provided
-3. Delegate to `state_by_version` INSERT rewriting
+3. Delegate to `lix_state_by_version` INSERT rewriting
 
 ## Milestone 30: `entity_by_version` UPDATE Rewriting
 
-UPDATE operations on `entity_by_version` delegate to `state_by_version` UPDATE.
+UPDATE operations on `entity_by_version` delegate to `lix_state_by_version` UPDATE.
 
 ### Query Rewriting Example
 
@@ -1667,18 +1669,18 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version UPDATE rewriting (Milestone 21)
+-- Delegates to lix_state_by_version UPDATE rewriting (Milestone 22)
 ```
 
 ### Tasks
 
 1. Parse UPDATE statements targeting `entity_by_version`
 2. Extract `entity_id` and `version_id` from WHERE clause
-3. Delegate to `state_by_version` UPDATE rewriting
+3. Delegate to `lix_state_by_version` UPDATE rewriting
 
 ## Milestone 31: `entity_by_version` DELETE Rewriting
 
-DELETE operations on `entity_by_version` delegate to `state_by_version` DELETE.
+DELETE operations on `entity_by_version` delegate to `lix_state_by_version` DELETE.
 
 ### Query Rewriting Example
 
@@ -1692,18 +1694,18 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value' AND version_id = '
 **Rewritten query:**
 
 ```sql
--- Delegates to state_by_version DELETE rewriting (Milestone 22)
+-- Delegates to lix_state_by_version DELETE rewriting (Milestone 23)
 ```
 
 ### Tasks
 
 1. Parse DELETE statements targeting `entity_by_version`
 2. Extract `entity_id` and `version_id` from WHERE clause
-3. Delegate to `state_by_version` DELETE rewriting
+3. Delegate to `lix_state_by_version` DELETE rewriting
 
 ## Milestone 32: `entity` SELECT Rewriting
 
-The `entity` view is a layer on top of `state` that filters by `entity_id`. It returns state for a specific entity in the current version.
+The `entity` view is a layer on top of `lix_state` that filters by `entity_id`. It returns state for a specific entity in the current version.
 
 ### Query Rewriting Example
 
@@ -1717,10 +1719,10 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state SELECT rewriting (Milestone 23)
+-- Delegates to lix_state SELECT rewriting (Milestone 16)
 -- with entity_id filter applied
 SELECT * FROM (
-  -- state rewriting...
+  -- lix_state rewriting...
 ) WHERE entity_id = 'entity-1'
 ```
 
@@ -1728,11 +1730,11 @@ SELECT * FROM (
 
 1. Parse SELECT statements targeting `entity`
 2. Extract `entity_id` from WHERE clause (required)
-3. Delegate to `state` SELECT rewriting with entity_id filter
+3. Delegate to `lix_state` SELECT rewriting with entity_id filter
 
 ## Milestone 33: `entity` INSERT Rewriting
 
-INSERT operations on `entity` delegate to `state` INSERT.
+INSERT operations on `entity` delegate to `lix_state` INSERT.
 
 ### Query Rewriting Example
 
@@ -1746,18 +1748,18 @@ VALUES ('entity-1', 'lix_key_value', '{"key": "foo"}')
 **Rewritten query:**
 
 ```sql
--- Delegates to state INSERT rewriting (Milestone 24)
+-- Delegates to lix_state INSERT rewriting (Milestone 17)
 ```
 
 ### Tasks
 
 1. Parse INSERT statements targeting `entity`
 2. Validate `entity_id` is provided
-3. Delegate to `state` INSERT rewriting
+3. Delegate to `lix_state` INSERT rewriting
 
 ## Milestone 34: `entity` UPDATE Rewriting
 
-UPDATE operations on `entity` delegate to `state` UPDATE.
+UPDATE operations on `entity` delegate to `lix_state` UPDATE.
 
 ### Query Rewriting Example
 
@@ -1772,18 +1774,18 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state UPDATE rewriting (Milestone 25)
+-- Delegates to lix_state UPDATE rewriting (Milestone 18)
 ```
 
 ### Tasks
 
 1. Parse UPDATE statements targeting `entity`
 2. Extract `entity_id` from WHERE clause
-3. Delegate to `state` UPDATE rewriting
+3. Delegate to `lix_state` UPDATE rewriting
 
 ## Milestone 35: `entity` DELETE Rewriting
 
-DELETE operations on `entity` delegate to `state` DELETE.
+DELETE operations on `entity` delegate to `lix_state` DELETE.
 
 ### Query Rewriting Example
 
@@ -1797,18 +1799,18 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state DELETE rewriting (Milestone 26)
+-- Delegates to lix_state DELETE rewriting (Milestone 19)
 ```
 
 ### Tasks
 
 1. Parse DELETE statements targeting `entity`
 2. Extract `entity_id` from WHERE clause
-3. Delegate to `state` DELETE rewriting
+3. Delegate to `lix_state` DELETE rewriting
 
 ## Milestone 36: `entity_history` SELECT Rewriting (Read-Only)
 
-The `entity_history` view is a layer on top of `state_history` that filters by `entity_id`. It returns all historical records for a specific entity.
+The `entity_history` view is a layer on top of `lix_state_history` that filters by `entity_id`. It returns all historical records for a specific entity.
 
 > **Note:** `entity_history` is read-only. INSERT/UPDATE/DELETE are not supported.
 
@@ -1824,10 +1826,10 @@ WHERE entity_id = 'entity-1' AND schema_key = 'lix_key_value'
 **Rewritten query:**
 
 ```sql
--- Delegates to state_history SELECT rewriting (Milestone 27)
+-- Delegates to lix_state_history SELECT rewriting (Milestone 27)
 -- with entity_id filter applied
 SELECT * FROM (
-  -- state_history rewriting...
+  -- lix_state_history rewriting...
 ) WHERE entity_id = 'entity-1'
 ```
 
@@ -1835,7 +1837,7 @@ SELECT * FROM (
 
 1. Parse SELECT statements targeting `entity_history`
 2. Extract `entity_id` from WHERE clause (required)
-3. Delegate to `state_history` SELECT rewriting with entity_id filter
+3. Delegate to `lix_state_history` SELECT rewriting with entity_id filter
 4. Reject INSERT/UPDATE/DELETE with clear error message
 
 ---
@@ -2077,7 +2079,7 @@ fn materialize_file_data(file_id: &str, version_id: &str, host: &impl HostBindin
 
     // 3. Query entities for this file
     let entities = host.execute(
-        "SELECT * FROM state_by_version WHERE plugin_key = ? AND file_id = ? AND version_id = ?",
+        "SELECT * FROM lix_state_by_version WHERE plugin_key = ? AND file_id = ? AND version_id = ?",
         &[&plugin.key, file_id, version_id]
     )?;
 

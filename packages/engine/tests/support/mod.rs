@@ -3,25 +3,47 @@ pub mod simulations;
 
 #[macro_export]
 macro_rules! simulation_test {
-	($name:ident, |$sim:ident| $body:expr) => {
-		paste::paste! {
-			#[tokio::test]
-			async fn [<$name _sqlite>]() {
-				let $sim = $crate::support::simulation_test::default_simulations()
-					.into_iter()
-					.find(|sim| sim.name == "sqlite")
-					.expect("sqlite simulation missing");
-				$crate::support::simulation_test::run_simulation_test(vec![$sim], |$sim| $body).await;
-			}
-
-			#[tokio::test]
-			async fn [<$name _postgres>]() {
-				let $sim = $crate::support::simulation_test::default_simulations()
-					.into_iter()
-					.find(|sim| sim.name == "postgres")
-					.expect("postgres simulation missing");
-				$crate::support::simulation_test::run_simulation_test(vec![$sim], |$sim| $body).await;
-			}
-		}
-	};
+    ($name:ident, |$sim:ident| $body:expr) => {
+        $crate::simulation_test!(
+            $name,
+            simulations = [sqlite, postgres, materialization],
+            |$sim| $body
+        );
+    };
+    ($name:ident, simulations = [$($simulation:ident),+ $(,)?], |$sim:ident| $body:expr) => {
+        paste::paste! {
+            $(
+                #[test]
+                fn [<$name _ $simulation>]() {
+                    std::thread::Builder::new()
+                        .name(concat!(stringify!($name), "_", stringify!($simulation)).to_string())
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(|| {
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("failed to build tokio runtime");
+                            runtime.block_on(async {
+                                $crate::support::simulation_test::run_single_simulation_test(
+                                    stringify!($simulation),
+                                    concat!(module_path!(), "::", stringify!($name)),
+                                    |$sim| $body,
+                                )
+                                .await;
+                            });
+                        })
+                        .expect(concat!(
+                            "failed to spawn ",
+                            stringify!($simulation),
+                            " test thread"
+                        ))
+                        .join()
+                        .expect(concat!(
+                            stringify!($simulation),
+                            " simulation test thread panicked"
+                        ));
+                }
+            )+
+        }
+    };
 }

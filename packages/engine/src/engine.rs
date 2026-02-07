@@ -1,3 +1,10 @@
+use crate::account::{
+    account_file_id, account_plugin_key, account_schema_key, account_schema_version,
+    account_snapshot_content, account_storage_version_id, active_account_file_id,
+    active_account_plugin_key, active_account_schema_key, active_account_schema_version,
+    active_account_snapshot_content, active_account_storage_version_id,
+};
+use crate::builtin_schema::types::LixVersionDescriptor;
 use crate::builtin_schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::cel::CelEvaluator;
 use crate::deterministic_mode::{
@@ -11,15 +18,29 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
+use crate::materialization::{
+    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
+};
 use crate::schema_registry::register_schema;
 use crate::sql::{
-    build_delete_followup_sql, build_update_followup_sql, preprocess_sql_with_provider,
-    PostprocessPlan,
+    build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
+    preprocess_sql_with_provider, MutationRow, PostprocessPlan, UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
+use crate::version::{
+    active_version_file_id, active_version_plugin_key, active_version_schema_key,
+    active_version_schema_version, active_version_snapshot_content,
+    active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
+    version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content,
+    version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
+    version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
+    version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 
@@ -30,9 +51,16 @@ pub struct BootKeyValue {
     pub version_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BootAccount {
+    pub id: String,
+    pub name: String,
+}
+
 pub struct BootArgs {
     pub backend: Box<dyn LixBackend + Send + Sync>,
     pub key_values: Vec<BootKeyValue>,
+    pub active_account: Option<BootAccount>,
 }
 
 impl BootArgs {
@@ -40,6 +68,7 @@ impl BootArgs {
         Self {
             backend,
             key_values: Vec::new(),
+            active_account: None,
         }
     }
 }
@@ -49,8 +78,10 @@ pub struct Engine {
     cel_evaluator: CelEvaluator,
     schema_cache: SchemaCache,
     boot_key_values: Vec<BootKeyValue>,
+    boot_active_account: Option<BootAccount>,
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
+    active_version_id: RwLock<String>,
 }
 
 pub fn boot(args: BootArgs) -> Engine {
@@ -61,8 +92,10 @@ pub fn boot(args: BootArgs) -> Engine {
         cel_evaluator: CelEvaluator::new(),
         schema_cache: SchemaCache::new(),
         boot_key_values: args.key_values,
+        boot_active_account: args.active_account,
         boot_deterministic_settings,
         deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
+        active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
     }
 }
 
@@ -72,11 +105,16 @@ impl Engine {
         let result = async {
             init_backend(self.backend.as_ref()).await?;
             self.ensure_builtin_schemas_installed().await?;
-            self.seed_boot_key_values().await
+            let default_active_version_id = self.seed_default_versions().await?;
+            self.seed_default_active_version(&default_active_version_id)
+                .await?;
+            self.seed_boot_key_values().await?;
+            self.seed_boot_account().await?;
+            self.load_and_cache_active_version().await
         }
         .await;
 
-        if clear_boot_pending {
+        if clear_boot_pending && result.is_ok() {
             self.deterministic_boot_pending
                 .store(false, Ordering::SeqCst);
         }
@@ -107,6 +145,10 @@ impl Engine {
             functions.clone(),
         )
         .await?;
+        let next_active_version_id_from_mutations =
+            active_version_from_mutations(&output.mutations)?;
+        let next_active_version_id_from_updates =
+            active_version_from_update_validations(&output.update_validations)?;
         if !output.mutations.is_empty() {
             validate_inserts(self.backend.as_ref(), &self.schema_cache, &output.mutations).await?;
         }
@@ -126,8 +168,13 @@ impl Engine {
             Some(PostprocessPlan::VtableUpdate(plan)) => {
                 let result = self.backend.execute(&output.sql, &output.params).await?;
                 let mut followup_functions = functions.clone();
-                let followup_sql =
-                    build_update_followup_sql(&plan, &result.rows, &mut followup_functions)?;
+                let followup_sql = build_update_followup_sql(
+                    self.backend.as_ref(),
+                    &plan,
+                    &result.rows,
+                    &mut followup_functions,
+                )
+                .await?;
                 if !followup_sql.is_empty() {
                     self.backend.execute(&followup_sql, &[]).await?;
                 }
@@ -136,8 +183,13 @@ impl Engine {
             Some(PostprocessPlan::VtableDelete(plan)) => {
                 let result = self.backend.execute(&output.sql, &output.params).await?;
                 let mut followup_functions = functions.clone();
-                let followup_sql =
-                    build_delete_followup_sql(&plan, &result.rows, &mut followup_functions)?;
+                let followup_sql = build_delete_followup_sql(
+                    self.backend.as_ref(),
+                    &plan,
+                    &result.rows,
+                    &mut followup_functions,
+                )
+                .await?;
                 if !followup_sql.is_empty() {
                     self.backend.execute(&followup_sql, &[]).await?;
                 }
@@ -152,7 +204,34 @@ impl Engine {
             }
         }
 
+        if let Some(version_id) =
+            next_active_version_id_from_mutations.or(next_active_version_id_from_updates)
+        {
+            self.set_active_version_id(version_id);
+        }
+
         Ok(result)
+    }
+
+    pub async fn materialization_plan(
+        &self,
+        req: &MaterializationRequest,
+    ) -> Result<MaterializationPlan, LixError> {
+        crate::materialization::materialization_plan(self.backend.as_ref(), req).await
+    }
+
+    pub async fn apply_materialization_plan(
+        &self,
+        plan: &MaterializationPlan,
+    ) -> Result<MaterializationApplyReport, LixError> {
+        crate::materialization::apply_materialization_plan(self.backend.as_ref(), plan).await
+    }
+
+    pub async fn materialize(
+        &self,
+        req: &MaterializationRequest,
+    ) -> Result<MaterializationReport, LixError> {
+        crate::materialization::materialize(self.backend.as_ref(), req).await
     }
 
     async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
@@ -223,6 +302,402 @@ impl Engine {
 
         Ok(())
     }
+
+    async fn seed_default_versions(&self) -> Result<String, LixError> {
+        self.seed_materialized_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID, None)
+            .await?;
+        let main_version_id = match self
+            .find_version_id_by_name(DEFAULT_ACTIVE_VERSION_NAME)
+            .await?
+        {
+            Some(version_id) => version_id,
+            None => {
+                let generated_main_id = self.generate_runtime_uuid().await?;
+                self.seed_materialized_version_descriptor(
+                    &generated_main_id,
+                    DEFAULT_ACTIVE_VERSION_NAME,
+                    Some(GLOBAL_VERSION_ID),
+                )
+                .await?;
+                generated_main_id
+            }
+        };
+
+        let bootstrap_commit_id = self
+            .load_latest_commit_id()
+            .await?
+            .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
+        self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+            .await?;
+        self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
+            .await?;
+
+        Ok(main_version_id)
+    }
+
+    async fn seed_boot_account(&self) -> Result<(), LixError> {
+        let Some(account) = &self.boot_active_account else {
+            return Ok(());
+        };
+
+        let exists = self
+            .execute(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = $1 \
+                   AND entity_id = $2 \
+                   AND file_id = $3 \
+                   AND version_id = $4 \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[
+                    Value::Text(account_schema_key().to_string()),
+                    Value::Text(account.id.clone()),
+                    Value::Text(account_file_id().to_string()),
+                    Value::Text(account_storage_version_id().to_string()),
+                ],
+            )
+            .await?;
+        if exists.rows.is_empty() {
+            self.execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[
+                    Value::Text(account.id.clone()),
+                    Value::Text(account_schema_key().to_string()),
+                    Value::Text(account_file_id().to_string()),
+                    Value::Text(account_storage_version_id().to_string()),
+                    Value::Text(account_plugin_key().to_string()),
+                    Value::Text(account_snapshot_content(&account.id, &account.name)),
+                    Value::Text(account_schema_version().to_string()),
+                ],
+            )
+            .await?;
+        }
+
+        self.execute(
+            "DELETE FROM lix_internal_state_vtable \
+             WHERE untracked = 1 \
+               AND schema_key = $1 \
+               AND file_id = $2 \
+               AND version_id = $3",
+            &[
+                Value::Text(active_account_schema_key().to_string()),
+                Value::Text(active_account_file_id().to_string()),
+                Value::Text(active_account_storage_version_id().to_string()),
+            ],
+        )
+        .await?;
+
+        self.execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+            &[
+                Value::Text(account.id.clone()),
+                Value::Text(active_account_schema_key().to_string()),
+                Value::Text(active_account_file_id().to_string()),
+                Value::Text(active_account_storage_version_id().to_string()),
+                Value::Text(active_account_plugin_key().to_string()),
+                Value::Text(active_account_snapshot_content(&account.id)),
+                Value::Text(active_account_schema_version().to_string()),
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn seed_materialized_version_descriptor(
+        &self,
+        entity_id: &str,
+        name: &str,
+        inherits_from_version_id: Option<&str>,
+    ) -> Result<(), LixError> {
+        let table = format!(
+            "lix_internal_state_materialized_v1_{}",
+            version_descriptor_schema_key()
+        );
+        let check_sql = format!(
+            "SELECT 1 FROM {table} \
+             WHERE schema_key = '{schema_key}' \
+               AND entity_id = '{entity_id}' \
+               AND file_id = '{file_id}' \
+               AND version_id = '{version_id}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            table = table,
+            schema_key = escape_sql_string(version_descriptor_schema_key()),
+            entity_id = escape_sql_string(entity_id),
+            file_id = escape_sql_string(version_descriptor_file_id()),
+            version_id = escape_sql_string(version_descriptor_storage_version_id()),
+        );
+        let existing = self.backend.execute(&check_sql, &[]).await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content =
+            version_descriptor_snapshot_content(entity_id, name, inherits_from_version_id, false);
+        let insert_sql = format!(
+            "INSERT INTO {table} (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, \
+             change_id, is_tombstone, created_at, updated_at\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', \
+             'bootstrap', 0, '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\
+             ) \
+             ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
+            table = table,
+            entity_id = escape_sql_string(entity_id),
+            schema_key = escape_sql_string(version_descriptor_schema_key()),
+            schema_version = escape_sql_string(version_descriptor_schema_version()),
+            file_id = escape_sql_string(version_descriptor_file_id()),
+            version_id = escape_sql_string(version_descriptor_storage_version_id()),
+            plugin_key = escape_sql_string(version_descriptor_plugin_key()),
+            snapshot_content = escape_sql_string(&snapshot_content),
+        );
+        self.backend.execute(&insert_sql, &[]).await?;
+
+        Ok(())
+    }
+
+    async fn find_version_id_by_name(&self, name: &str) -> Result<Option<String>, LixError> {
+        let table = format!(
+            "lix_internal_state_materialized_v1_{}",
+            version_descriptor_schema_key()
+        );
+        let sql = format!(
+            "SELECT entity_id, snapshot_content \
+             FROM {table} \
+             WHERE schema_key = '{schema_key}' \
+               AND file_id = '{file_id}' \
+               AND version_id = '{version_id}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL",
+            table = table,
+            schema_key = escape_sql_string(version_descriptor_schema_key()),
+            file_id = escape_sql_string(version_descriptor_file_id()),
+            version_id = escape_sql_string(version_descriptor_storage_version_id()),
+        );
+        let result = self.backend.execute(&sql, &[]).await?;
+
+        for row in result.rows {
+            if row.len() < 2 {
+                continue;
+            }
+            let entity_id = match &row[0] {
+                Value::Text(value) => value,
+                _ => continue,
+            };
+            let snapshot_content = match &row[1] {
+                Value::Text(value) => value,
+                _ => continue,
+            };
+            let snapshot: LixVersionDescriptor =
+                serde_json::from_str(snapshot_content).map_err(|error| LixError {
+                    message: format!("version descriptor snapshot_content invalid JSON: {error}"),
+                })?;
+            let Some(snapshot_name) = snapshot.name.as_deref() else {
+                continue;
+            };
+            if snapshot_name != name {
+                continue;
+            }
+            let snapshot_id = if snapshot.id.is_empty() {
+                entity_id.as_str()
+            } else {
+                snapshot.id.as_str()
+            };
+            return Ok(Some(snapshot_id.to_string()));
+        }
+
+        Ok(None)
+    }
+
+    async fn seed_materialized_version_pointer(
+        &self,
+        entity_id: &str,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let table = format!(
+            "lix_internal_state_materialized_v1_{}",
+            version_pointer_schema_key()
+        );
+        let check_sql = format!(
+            "SELECT 1 FROM {table} \
+             WHERE schema_key = '{schema_key}' \
+               AND entity_id = '{entity_id}' \
+               AND file_id = '{file_id}' \
+               AND version_id = '{version_id}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            table = table,
+            schema_key = escape_sql_string(version_pointer_schema_key()),
+            entity_id = escape_sql_string(entity_id),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            version_id = escape_sql_string(version_pointer_storage_version_id()),
+        );
+        let existing = self.backend.execute(&check_sql, &[]).await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id, commit_id);
+        let insert_sql = format!(
+            "INSERT INTO {table} (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, \
+             change_id, is_tombstone, created_at, updated_at\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', \
+             'bootstrap', 0, '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\
+             ) \
+             ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
+            table = table,
+            entity_id = escape_sql_string(entity_id),
+            schema_key = escape_sql_string(version_pointer_schema_key()),
+            schema_version = escape_sql_string(version_pointer_schema_version()),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            version_id = escape_sql_string(version_pointer_storage_version_id()),
+            plugin_key = escape_sql_string(version_pointer_plugin_key()),
+            snapshot_content = escape_sql_string(&snapshot_content),
+        );
+        self.backend.execute(&insert_sql, &[]).await?;
+
+        Ok(())
+    }
+
+    async fn seed_default_active_version(&self, version_id: &str) -> Result<(), LixError> {
+        let check_sql = format!(
+            "SELECT 1 \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = '{schema_key}' \
+               AND file_id = '{file_id}' \
+               AND version_id = '{storage_version_id}' \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            schema_key = escape_sql_string(active_version_schema_key()),
+            file_id = escape_sql_string(active_version_file_id()),
+            storage_version_id = escape_sql_string(active_version_storage_version_id()),
+        );
+        let existing = self.backend.execute(&check_sql, &[]).await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let entity_id = self.generate_runtime_uuid().await?;
+        let snapshot_content = active_version_snapshot_content(&entity_id, version_id);
+        let insert_sql = format!(
+            "INSERT INTO lix_internal_state_untracked (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, created_at, updated_at\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\
+             )",
+            entity_id = escape_sql_string(&entity_id),
+            schema_key = escape_sql_string(active_version_schema_key()),
+            file_id = escape_sql_string(active_version_file_id()),
+            storage_version_id = escape_sql_string(active_version_storage_version_id()),
+            plugin_key = escape_sql_string(active_version_plugin_key()),
+            snapshot_content = escape_sql_string(&snapshot_content),
+            schema_version = escape_sql_string(active_version_schema_version()),
+        );
+        self.backend.execute(&insert_sql, &[]).await?;
+        Ok(())
+    }
+
+    async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {
+        let result = self
+            .backend
+            .execute(
+                "SELECT entity_id \
+                 FROM lix_internal_change \
+                 WHERE schema_key = 'lix_commit' \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT 1",
+                &[],
+            )
+            .await?;
+        let Some(row) = result.rows.first() else {
+            return Ok(None);
+        };
+        let Some(value) = row.first() else {
+            return Ok(None);
+        };
+        match value {
+            Value::Text(value) if !value.is_empty() => Ok(Some(value.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    async fn generate_runtime_uuid(&self) -> Result<String, LixError> {
+        let result = self.execute("SELECT lix_uuid_v7()", &[]).await?;
+        let row = result.rows.first().ok_or_else(|| LixError {
+            message: "lix_uuid_v7 query returned no rows".to_string(),
+        })?;
+        let value = row.first().ok_or_else(|| LixError {
+            message: "lix_uuid_v7 query returned no columns".to_string(),
+        })?;
+        match value {
+            Value::Text(text) => Ok(text.clone()),
+            other => Err(LixError {
+                message: format!("lix_uuid_v7 query returned non-text value: {other:?}"),
+            }),
+        }
+    }
+
+    async fn load_and_cache_active_version(&self) -> Result<(), LixError> {
+        let result = self
+            .backend
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = $1 \
+                   AND file_id = $2 \
+                   AND version_id = $3 \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY updated_at DESC \
+                 LIMIT 1",
+                &[
+                    Value::Text(active_version_schema_key().to_string()),
+                    Value::Text(active_version_file_id().to_string()),
+                    Value::Text(active_version_storage_version_id().to_string()),
+                ],
+            )
+            .await?;
+
+        if let Some(row) = result.rows.first() {
+            let snapshot_content = row.first().ok_or_else(|| LixError {
+                message: "active version query row is missing snapshot_content".to_string(),
+            })?;
+            let snapshot_content = match snapshot_content {
+                Value::Text(value) => value.as_str(),
+                other => {
+                    return Err(LixError {
+                        message: format!(
+                            "active version snapshot_content must be text, got {other:?}"
+                        ),
+                    })
+                }
+            };
+            let active_version_id = parse_active_version_snapshot(snapshot_content)?;
+            self.set_active_version_id(active_version_id);
+            return Ok(());
+        }
+
+        self.set_active_version_id(GLOBAL_VERSION_ID.to_string());
+        Ok(())
+    }
+
+    fn set_active_version_id(&self, version_id: String) {
+        let mut guard = self.active_version_id.write().unwrap();
+        if *guard == version_id {
+            return;
+        }
+        *guard = version_id;
+    }
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -267,4 +742,67 @@ fn infer_boot_deterministic_settings(key_values: &[BootKeyValue]) -> Option<Dete
             timestamp_enabled,
         })
     })
+}
+
+fn active_version_from_mutations(mutations: &[MutationRow]) -> Result<Option<String>, LixError> {
+    for mutation in mutations.iter().rev() {
+        if !mutation.untracked {
+            continue;
+        }
+        if mutation.schema_key != active_version_schema_key()
+            || mutation.file_id != active_version_file_id()
+            || mutation.version_id != active_version_storage_version_id()
+        {
+            continue;
+        }
+
+        let snapshot = mutation.snapshot_content.as_ref().ok_or_else(|| LixError {
+            message: "active version mutation is missing snapshot_content".to_string(),
+        })?;
+        let snapshot_content = serde_json::to_string(snapshot).map_err(|error| LixError {
+            message: format!("active version mutation snapshot_content invalid JSON: {error}"),
+        })?;
+        return parse_active_version_snapshot(&snapshot_content).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn active_version_from_update_validations(
+    plans: &[UpdateValidationPlan],
+) -> Result<Option<String>, LixError> {
+    for plan in plans.iter().rev() {
+        if !plan
+            .table
+            .eq_ignore_ascii_case("lix_internal_state_untracked")
+        {
+            continue;
+        }
+        if !where_clause_targets_active_version(plan.where_clause.as_deref()) {
+            continue;
+        }
+        let Some(snapshot) = plan.snapshot_content.as_ref() else {
+            continue;
+        };
+
+        let snapshot_content = serde_json::to_string(snapshot).map_err(|error| LixError {
+            message: format!("active version update snapshot_content invalid JSON: {error}"),
+        })?;
+        return parse_active_version_snapshot(&snapshot_content).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn where_clause_targets_active_version(where_clause: Option<&str>) -> bool {
+    let Some(where_clause) = where_clause else {
+        return false;
+    };
+    let normalized: String = where_clause
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '"')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let schema_key_filter = format!("schema_key='{}'", active_version_schema_key());
+    normalized.contains(&schema_key_filter.to_ascii_lowercase())
 }

@@ -1,14 +1,15 @@
 use sqlx::{Executor, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
-use lix_engine::{LixBackend, LixError, QueryResult, Value};
+use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-use crate::support::simulation_test::Simulation;
+use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
 pub fn sqlite_simulation() -> Simulation {
     Simulation {
         name: "sqlite",
         setup: None,
+        behavior: SimulationBehavior::Base,
         backend_factory: Box::new(|| {
             Box::new(SqliteBackend::new(SqliteConfig {
                 filename: ":memory:".to_string(),
@@ -55,6 +56,10 @@ impl SqliteBackend {
 
 #[async_trait::async_trait(?Send)]
 impl LixBackend for SqliteBackend {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Sqlite
+    }
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let pool = self.pool().await?;
 

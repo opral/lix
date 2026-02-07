@@ -21,6 +21,17 @@
           "/id"
         ]
       }
+    },
+    {
+      "properties": [
+        "/account_id"
+      ],
+      "references": {
+        "schemaKey": "lix_account",
+        "properties": [
+          "/id"
+        ]
+      }
     }
   ],
   "type": "object",

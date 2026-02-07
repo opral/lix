@@ -14,7 +14,7 @@ simulation_test!(init_creates_untracked_table, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.rows.clone());
 });
 
 simulation_test!(init_creates_snapshot_table, |sim| async move {
@@ -30,7 +30,7 @@ simulation_test!(init_creates_snapshot_table, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.rows.clone());
 });
 
 simulation_test!(init_creates_change_table, |sim| async move {
@@ -46,7 +46,7 @@ simulation_test!(init_creates_change_table, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.rows.clone());
 });
 
 simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
@@ -65,7 +65,7 @@ simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.rows.clone());
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], lix_engine::Value::Null);
 });
@@ -90,7 +90,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(result.rows.clone());
+        sim.assert_deterministic(result.rows.clone());
     }
 );
 
@@ -116,7 +116,7 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.rows.clone());
     assert_eq!(result.rows.len(), 1);
     assert_eq!(
         result.rows[0][0],
@@ -151,7 +151,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
                'lix_change_author~1', \
                'lix_change_set~1', \
                'lix_commit~1', \
-               'lix_version_tip~1', \
+               'lix_version_pointer~1', \
                'lix_change_set_element~1', \
                'lix_commit_edge~1'\
              ) \
@@ -164,7 +164,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         .await
         .unwrap();
 
-    sim.expect_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.rows.clone());
     assert_eq!(result.rows.len(), 9);
 
     let mut seen_schema_keys = BTreeSet::new();
@@ -213,7 +213,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             "lix_commit_edge".to_string(),
             "lix_key_value".to_string(),
             "lix_stored_schema".to_string(),
-            "lix_version_tip".to_string(),
+            "lix_version_pointer".to_string(),
         ])
     );
 });

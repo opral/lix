@@ -1,3 +1,4 @@
+mod account;
 mod backend;
 mod builtin_schema;
 mod cel;
@@ -10,11 +11,13 @@ mod functions;
 mod init;
 mod json_truthiness;
 mod key_value;
+mod materialization;
 mod schema;
 mod schema_registry;
 mod sql;
 mod types;
 mod validation;
+mod version;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
@@ -22,10 +25,19 @@ pub use schema::{
 };
 
 pub use backend::LixBackend;
+pub use backend::SqlDialect;
 pub use commit::{
     generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
     MaterializedStateRow, VersionInfo, VersionSnapshot,
 };
-pub use engine::{boot, BootArgs, BootKeyValue, Engine};
+pub use engine::{boot, BootAccount, BootArgs, BootKeyValue, Engine};
 pub use error::LixError;
+pub use materialization::{
+    apply_materialization_plan, materialization_plan, materialize, InheritanceWinnerDebugRow,
+    LatestVisibleWinnerDebugRow, MaterializationApplyReport, MaterializationDebugMode,
+    MaterializationDebugTrace, MaterializationPlan, MaterializationReport, MaterializationRequest,
+    MaterializationScope, MaterializationWarning, MaterializationWrite, MaterializationWriteOp,
+    StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
+    VersionPointerDebugRow,
+};
 pub use types::{QueryResult, Value};

@@ -67,6 +67,7 @@ simulation_test!(
                     value: serde_json::json!({ "enabled": true }),
                     version_id: None,
                 }],
+                ..Default::default()
             }))
             .await
             .expect("boot_simulated_engine should succeed");
@@ -94,8 +95,8 @@ simulation_test!(
             Value::Text(value) => value,
             other => panic!("expected text updated_at, got {other:?}"),
         };
-        sim.expect_deterministic(created_at.to_string());
-        sim.expect_deterministic(updated_at.to_string());
+        sim.assert_deterministic(created_at.to_string());
+        sim.assert_deterministic(updated_at.to_string());
         assert!(created_at.starts_with("1970-01-01T00:00:00."));
         assert!(created_at.ends_with('Z'));
         assert_eq!(created_at, updated_at);

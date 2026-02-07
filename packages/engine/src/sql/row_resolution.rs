@@ -5,6 +5,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::sql::params::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::steps::vtable_read;
 use crate::{LixBackend, LixError, Value};
 
@@ -71,11 +72,6 @@ pub struct InsertValuesLayout {
     pub value_keyword: bool,
 }
 
-#[derive(Debug, Default)]
-struct PlaceholderState {
-    next_ordinal: usize,
-}
-
 pub fn resolve_values_rows(
     rows: &[Vec<Expr>],
     params: &[Value],
@@ -103,9 +99,12 @@ pub fn resolve_insert_rows(
         .map(|source| source.resolved_rows))
 }
 
-pub fn resolve_expr_cell(expr: &Expr, params: &[Value]) -> Result<ResolvedCell, LixError> {
-    let mut state = PlaceholderState::default();
-    resolve_expr(expr, params, &mut state)
+pub fn resolve_expr_cell_with_state(
+    expr: &Expr,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<ResolvedCell, LixError> {
+    resolve_expr(expr, params, state)
 }
 
 fn insert_values_rows(insert: &Insert) -> Option<&[Vec<Expr>]> {
@@ -277,56 +276,6 @@ fn resolve_expr(
             placeholder_index: None,
         }),
     }
-}
-
-fn resolve_placeholder_index(
-    token: &str,
-    params_len: usize,
-    state: &mut PlaceholderState,
-) -> Result<usize, LixError> {
-    let trimmed = token.trim();
-
-    let index = if trimmed.is_empty() || trimmed == "?" {
-        let index = state.next_ordinal;
-        state.next_ordinal += 1;
-        index
-    } else if let Some(numeric) = trimmed.strip_prefix('?') {
-        let parsed = parse_1_based_index(trimmed, numeric)?;
-        state.next_ordinal = state.next_ordinal.max(parsed);
-        parsed - 1
-    } else if let Some(numeric) = trimmed.strip_prefix('$') {
-        let parsed = parse_1_based_index(trimmed, numeric)?;
-        state.next_ordinal = state.next_ordinal.max(parsed);
-        parsed - 1
-    } else {
-        return Err(LixError {
-            message: format!("unsupported SQL placeholder format '{trimmed}'"),
-        });
-    };
-
-    if index >= params_len {
-        return Err(LixError {
-            message: format!(
-                "placeholder '{trimmed}' references parameter {} but only {} parameters were provided",
-                index + 1,
-                params_len
-            ),
-        });
-    }
-
-    Ok(index)
-}
-
-fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
-    let parsed = numeric.parse::<usize>().map_err(|_| LixError {
-        message: format!("invalid SQL placeholder '{token}'"),
-    })?;
-    if parsed == 0 {
-        return Err(LixError {
-            message: format!("invalid SQL placeholder '{token}'"),
-        });
-    }
-    Ok(parsed)
 }
 
 fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {

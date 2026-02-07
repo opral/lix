@@ -59,7 +59,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
@@ -113,7 +113,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
@@ -191,7 +191,88 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
+        assert_eq!(read.rows.len(), 3);
+        assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
+        assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
+        assert_eq!(read.rows[0][2], Value::Text("file-1".to_string()));
+        assert_eq!(read.rows[1][0], Value::Text("entity-2".to_string()));
+        assert_eq!(read.rows[1][1], Value::Text("schema_b".to_string()));
+        assert_eq!(read.rows[1][2], Value::Text("file-2".to_string()));
+        assert_eq!(read.rows[2][0], Value::Text("entity-3".to_string()));
+        assert_eq!(read.rows[2][1], Value::Text("schema_a".to_string()));
+        assert_eq!(read.rows[2][2], Value::Text("file-3".to_string()));
+    }
+);
+
+simulation_test!(
+    vtable_read_without_schema_key_selects_multiple_materialized_tables,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        // Register schemas so materialized tables exist.
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
+             ) VALUES (\
+             'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
+             ), (\
+             'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
+             ) VALUES (\
+             'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
+             )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let read = engine
+            .execute(
+                "SELECT entity_id, schema_key, file_id FROM lix_internal_state_vtable \
+             WHERE file_id IN ('file-1', 'file-2', 'file-3') \
+             ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 3);
         assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
         assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
@@ -271,7 +352,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(schema_a_only.rows.clone());
+        sim.assert_deterministic(schema_a_only.rows.clone());
         assert_eq!(schema_a_only.rows.len(), 2);
         assert_eq!(
             schema_a_only.rows[0][0],
@@ -358,7 +439,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(schema_a_eq.rows.clone());
+        sim.assert_deterministic(schema_a_eq.rows.clone());
         assert_eq!(schema_a_eq.rows.len(), 2);
         assert_eq!(schema_a_eq.rows[0][0], Value::Text("entity-1".to_string()));
         assert_eq!(schema_a_eq.rows[0][1], Value::Text("schema_a".to_string()));
@@ -432,7 +513,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(entity_filter.rows.clone());
+        sim.assert_deterministic(entity_filter.rows.clone());
         assert_eq!(entity_filter.rows.len(), 1);
         assert_eq!(
             entity_filter.rows[0][0],
@@ -511,7 +592,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(file_filter.rows.clone());
+        sim.assert_deterministic(file_filter.rows.clone());
         assert_eq!(file_filter.rows.len(), 1);
         assert_eq!(file_filter.rows[0][0], Value::Text("entity-3".to_string()));
         assert_eq!(file_filter.rows[0][1], Value::Text("schema_a".to_string()));
@@ -584,7 +665,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(multi_filter.rows.clone());
+        sim.assert_deterministic(multi_filter.rows.clone());
         assert_eq!(multi_filter.rows.len(), 1);
         assert_eq!(multi_filter.rows[0][0], Value::Text("entity-3".to_string()));
         assert_eq!(multi_filter.rows[0][1], Value::Text("schema_a".to_string()));
@@ -658,7 +739,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.expect_deterministic(read.rows.clone());
+        sim.assert_deterministic(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],

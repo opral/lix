@@ -59,13 +59,13 @@ fn as_i64(value: &Value) -> i64 {
     }
 }
 
-async fn read_version_tip_commit_id(engine: &SimulationEngine, version_id: &str) -> String {
+async fn read_version_pointer_commit_id(engine: &SimulationEngine, version_id: &str) -> String {
     let result = engine
         .execute(
             &format!(
                 "SELECT snapshot_content \
                  FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_version_tip' \
+                 WHERE schema_key = 'lix_version_pointer' \
                    AND entity_id = '{}' \
                  LIMIT 1",
                 version_id
@@ -157,7 +157,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let previous_commit_id = read_version_tip_commit_id(&engine, "global").await;
+        let previous_commit_id = read_version_pointer_commit_id(&engine, "global").await;
 
         engine
             .execute(
@@ -171,7 +171,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let new_commit_id = read_version_tip_commit_id(&engine, "global").await;
+        let new_commit_id = read_version_pointer_commit_id(&engine, "global").await;
         assert_ne!(new_commit_id, previous_commit_id);
 
         let domain_change = engine
@@ -253,7 +253,7 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_id \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_tip')",
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer')",
                 &[],
             )
             .await
@@ -291,7 +291,7 @@ simulation_test!(
             .execute(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_tip', 'lix_change_set_element', 'lix_commit_edge')",
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')",
                 &[],
             )
             .await
@@ -314,7 +314,7 @@ simulation_test!(
             .execute(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_tip', 'lix_change_set_element', 'lix_commit_edge')",
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')",
                 &[],
             )
             .await

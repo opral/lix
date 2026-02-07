@@ -1,0 +1,40 @@
+{
+  "x-lix-key": "lix_version_descriptor",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\""
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()"
+    },
+    "name": {
+      "type": "string"
+    },
+    "inherits_from_version_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "hidden": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "id",
+    "name"
+  ],
+  "additionalProperties": false
+}
