@@ -1,0 +1,58 @@
+{
+  "x-lix-key": "lix_file_descriptor",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-unique": [
+    [
+      "/path"
+    ]
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\""
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()"
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^/.+$"
+    },
+    "metadata": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "hidden": {
+      "type": "boolean",
+      "x-lix-default": "false"
+    }
+  },
+  "required": [
+    "id",
+    "path"
+  ],
+  "additionalProperties": false
+}

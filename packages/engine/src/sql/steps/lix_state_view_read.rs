@@ -9,7 +9,7 @@ use crate::sql::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_file_id, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
+    version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::LixError;
 
@@ -145,6 +145,7 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
              ranked.updated_at AS updated_at, \
              ranked.inherited_from_version_id AS inherited_from_version_id, \
              ranked.change_id AS change_id, \
+             ranked.commit_id AS commit_id, \
              ranked.untracked AS untracked, \
              ranked.metadata AS metadata \
          FROM ( \
@@ -175,6 +176,34 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
                AND vd.snapshot_content IS NOT NULL \
                AND lix_json_text(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
                AND vc.depth < 64 \
+           ), \
+           commit_by_version AS ( \
+             SELECT \
+               COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
+               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_commit' \
+               AND version_id = '{global_version}' \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_set_element_by_version AS ( \
+             SELECT \
+               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_text(snapshot_content, 'change_id') AS change_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_change_set_element' \
+               AND version_id = '{global_version}' \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_commit_by_change_id AS ( \
+             SELECT \
+               cse.change_id AS change_id, \
+               MAX(cbv.commit_id) AS commit_id \
+             FROM change_set_element_by_version cse \
+             JOIN commit_by_version cbv \
+               ON cbv.change_set_id = cse.change_set_id \
+             WHERE cse.change_id IS NOT NULL \
+             GROUP BY cse.change_id \
            ) \
            SELECT \
              s.entity_id AS entity_id, \
@@ -192,6 +221,7 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
                ELSE s.version_id \
              END AS inherited_from_version_id, \
              s.change_id AS change_id, \
+             COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) AS commit_id, \
              s.untracked AS untracked, \
              s.metadata AS metadata, \
              ROW_NUMBER() OVER ( \
@@ -201,6 +231,8 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
            FROM lix_internal_state_vtable s \
            JOIN version_chain vc \
              ON vc.version_id = s.version_id \
+           LEFT JOIN change_commit_by_change_id cc \
+             ON cc.change_id = s.change_id \
            CROSS JOIN active_version av \
          ) AS ranked \
          WHERE ranked.rn = 1 \
@@ -211,6 +243,7 @@ fn build_lix_state_view_query() -> Result<Query, LixError> {
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
     );
     parse_single_query(&sql)
 }

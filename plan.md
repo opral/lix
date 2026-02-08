@@ -1453,7 +1453,7 @@ version_ancestry                      (final output)
 | View                   | Purpose                                                                                              |
 | ---------------------- | ---------------------------------------------------------------------------------------------------- |
 | `all_commit_edges`     | Union of edges from commit.parent_commit_ids and lix_commit_edge rows                                |
-| `version_pointers`         | Current tip commit per version                                                                       |
+| `version_pointers`     | Current tip commit per version                                                                       |
 | `commit_graph`         | Recursive DAG traversal with depth from tips                                                         |
 | `latest_visible_state` | Explodes commit.change_ids, joins with change table, deduplicates by (version, entity, schema, file) |
 | `version_ancestry`     | Recursive inheritance chain per version                                                              |
@@ -1847,7 +1847,7 @@ SELECT * FROM (
 
 ## Milestone 37: Filesystem INSERT (file_descriptor, directory)
 
-INSERT operations on the `file` and `directory` virtual views need to be rewritten to write to the underlying physical tables: `lix_file_descriptor` and `lix_directory`.
+INSERT operations on the `file` and `directory` virtual views need to be rewritten to write to the underlying "views": `lix_file_descriptor` and `lix_directory`.
 
 > **Note:** This milestone handles file/directory metadata only. File content (`file.data`) and change detection are addressed in a later milestone.
 

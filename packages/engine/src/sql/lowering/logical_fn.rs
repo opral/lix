@@ -58,7 +58,32 @@ pub(crate) fn parse_lix_json_text(
     Ok(Some(LixJsonTextCall { json_expr, path }))
 }
 
-fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
+pub(crate) fn parse_lix_empty_blob(function: &Function) -> Result<Option<()>, LixError> {
+    if !function_name_matches(&function.name, "lix_empty_blob") {
+        return Ok(None);
+    }
+    match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: "lix_empty_blob() does not support DISTINCT/ALL/clauses".to_string(),
+                });
+            }
+            if !list.args.is_empty() {
+                return Err(LixError {
+                    message: "lix_empty_blob() does not accept arguments".to_string(),
+                });
+            }
+            Ok(Some(()))
+        }
+        FunctionArguments::None => Ok(Some(())),
+        _ => Err(LixError {
+            message: "lix_empty_blob() requires a regular argument list".to_string(),
+        }),
+    }
+}
+
+pub(crate) fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
     name.0
         .last()
         .and_then(ObjectNamePart::as_ident)
