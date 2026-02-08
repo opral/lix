@@ -88,12 +88,7 @@ pub(crate) fn rewrite_update(
     if target.variant == EntityViewVariant::History {
         return Err(read_only_error(&target.view_name, "UPDATE"));
     }
-    let mut rewritten = rewrite_update_with_target(
-        update,
-        &target,
-        SqlDialect::Sqlite,
-        params,
-    )?;
+    let mut rewritten = rewrite_update_with_target(update, &target, SqlDialect::Sqlite, params)?;
     if let Some(selection) = rewritten.selection.take() {
         rewritten.selection = Some(rewrite_subquery_expressions(selection)?);
     }
@@ -115,16 +110,10 @@ pub(crate) async fn rewrite_update_with_backend(
     if target.variant == EntityViewVariant::History {
         return Err(read_only_error(&target.view_name, "UPDATE"));
     }
-    let mut rewritten = rewrite_update_with_target(
-        update,
-        &target,
-        backend.dialect(),
-        params,
-    )?;
+    let mut rewritten = rewrite_update_with_target(update, &target, backend.dialect(), params)?;
     if let Some(selection) = rewritten.selection.take() {
-        rewritten.selection = Some(
-            rewrite_subquery_expressions_with_backend(selection, backend).await?,
-        );
+        rewritten.selection =
+            Some(rewrite_subquery_expressions_with_backend(selection, backend).await?);
     }
     Ok(Some(rewritten))
 }
@@ -139,11 +128,7 @@ pub(crate) fn rewrite_delete(delete: Delete) -> Result<Option<Delete>, LixError>
     if target.variant == EntityViewVariant::History {
         return Err(read_only_error(&target.view_name, "DELETE"));
     }
-    let mut rewritten = rewrite_delete_with_target(
-        delete,
-        &target,
-        SqlDialect::Sqlite,
-    )?;
+    let mut rewritten = rewrite_delete_with_target(delete, &target, SqlDialect::Sqlite)?;
     if let Some(selection) = rewritten.selection.take() {
         rewritten.selection = Some(rewrite_subquery_expressions(selection)?);
     }
@@ -164,15 +149,10 @@ pub(crate) async fn rewrite_delete_with_backend(
     if target.variant == EntityViewVariant::History {
         return Err(read_only_error(&target.view_name, "DELETE"));
     }
-    let mut rewritten = rewrite_delete_with_target(
-        delete,
-        &target,
-        backend.dialect(),
-    )?;
+    let mut rewritten = rewrite_delete_with_target(delete, &target, backend.dialect())?;
     if let Some(selection) = rewritten.selection.take() {
-        rewritten.selection = Some(
-            rewrite_subquery_expressions_with_backend(selection, backend).await?,
-        );
+        rewritten.selection =
+            Some(rewrite_subquery_expressions_with_backend(selection, backend).await?);
     }
     Ok(Some(rewritten))
 }
@@ -329,9 +309,8 @@ where
             Some(index) => row[index].clone(),
             None => integer_expr(0),
         };
-        let snapshot_content_expr = string_literal_expr(
-            &JsonValue::Object(snapshot_object.clone()).to_string(),
-        );
+        let snapshot_content_expr =
+            string_literal_expr(&JsonValue::Object(snapshot_object.clone()).to_string());
         let schema_key_expr = string_literal_expr(&target.schema_key);
 
         let row_exprs = match write_variant {
@@ -454,6 +433,12 @@ fn rewrite_update_with_target(
             let value = json_value_from_resolved_or_literal(
                 Some(&resolved),
                 Some(&assignment.value),
+                &format!("{} update assignment '{}'", target.view_name, column),
+            )?;
+            let value = coerce_json_value_for_property(
+                value,
+                &column,
+                target,
                 &format!("{} update assignment '{}'", target.view_name, column),
             )?;
             property_assignments.insert(column, value);
@@ -1042,8 +1027,11 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                             backend,
                         )
                         .await?,
-                        result: rewrite_subquery_expressions_with_backend(condition.result, backend)
-                            .await?,
+                        result: rewrite_subquery_expressions_with_backend(
+                            condition.result,
+                            backend,
+                        )
+                        .await?,
                     });
                 }
                 let else_result = match else_result {
@@ -1162,7 +1150,9 @@ fn append_entity_scope_predicate(
         });
     }
 
-    if write_variant == EntityViewVariant::ByVersion && !contains_column_reference(&scoped, "version_id") {
+    if write_variant == EntityViewVariant::ByVersion
+        && !contains_column_reference(&scoped, "version_id")
+    {
         let Some(version_id) = target.version_id_override.as_deref() else {
             return Err(LixError {
                 message: format!(
@@ -1352,19 +1342,21 @@ fn contains_column_reference(expr: &Expr, column: &str) -> bool {
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => contains_column_reference(inner, column),
         Expr::Cast { expr, .. } => contains_column_reference(expr, column),
         Expr::Function(function) => match &function.args {
-            sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
-                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
-                    contains_column_reference(expr, column)
-                }
-                sqlparser::ast::FunctionArg::Named { arg, .. }
-                | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
-                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                        contains_column_reference(expr, column)
-                    }
+            sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.iter().any(|arg| match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) => contains_column_reference(expr, column),
+                    sqlparser::ast::FunctionArg::Named { arg, .. }
+                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                            contains_column_reference(expr, column)
+                        }
+                        _ => false,
+                    },
                     _ => false,
-                },
-                _ => false,
-            }),
+                })
+            }
             _ => false,
         },
         Expr::InSubquery { expr, .. } => contains_column_reference(expr, column),
@@ -1411,6 +1403,12 @@ where
             row.get(*index),
             &format!("{} insert property '{}'", target.view_name, property),
         )?;
+        let value = coerce_json_value_for_property(
+            value,
+            property,
+            target,
+            &format!("{} insert property '{}'", target.view_name, property),
+        )?;
         object.insert(property.clone(), value);
     }
     apply_schema_defaults_to_snapshot(&mut object, target, evaluator, functions)?;
@@ -1426,7 +1424,11 @@ fn apply_schema_defaults_to_snapshot<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let Some(properties) = target.schema.get("properties").and_then(JsonValue::as_object) else {
+    let Some(properties) = target
+        .schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+    else {
         return Ok(());
     };
 
@@ -1445,6 +1447,85 @@ where
         snapshot.insert(property.clone(), value.unwrap_or(JsonValue::Null));
     }
     Ok(())
+}
+
+fn coerce_json_value_for_property(
+    value: JsonValue,
+    property: &str,
+    target: &EntityViewTarget,
+    _context: &str,
+) -> Result<JsonValue, LixError> {
+    if !property_expects_boolean(target, property) {
+        return Ok(value);
+    }
+
+    Ok(match value {
+        JsonValue::Bool(_) => value,
+        JsonValue::Number(number) => match number.as_i64() {
+            Some(0) => JsonValue::Bool(false),
+            Some(1) => JsonValue::Bool(true),
+            _ => JsonValue::Number(number),
+        },
+        JsonValue::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "true" | "1" => JsonValue::Bool(true),
+                "false" | "0" => JsonValue::Bool(false),
+                _ => JsonValue::String(text),
+            }
+        }
+        other => other,
+    })
+}
+
+fn property_expects_boolean(target: &EntityViewTarget, property: &str) -> bool {
+    target
+        .schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .and_then(|properties| properties.get(property))
+        .map(schema_allows_boolean)
+        .unwrap_or(false)
+}
+
+fn schema_allows_boolean(schema: &JsonValue) -> bool {
+    if schema
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .map(|value| value.eq_ignore_ascii_case("boolean"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if schema
+        .get("type")
+        .and_then(JsonValue::as_array)
+        .map(|values| {
+            values.iter().any(|value| {
+                value
+                    .as_str()
+                    .map(|value| value.eq_ignore_ascii_case("boolean"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if schema
+            .get(key)
+            .and_then(JsonValue::as_array)
+            .map(|variants| variants.iter().any(schema_allows_boolean))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn evaluate_default_property_value<P>(
@@ -1638,7 +1719,9 @@ fn derive_entity_id_expr(
                 ),
             });
         };
-        parts.push(entity_id_component_from_json_value(value, property, target)?);
+        parts.push(entity_id_component_from_json_value(
+            value, property, target,
+        )?);
     }
     let entity_id = if parts.len() == 1 {
         parts.remove(0)
@@ -1909,8 +1992,8 @@ mod tests {
         let Statement::Delete(delete) = statement else {
             panic!("expected delete statement");
         };
-        let err = rewrite_delete(delete)
-            .expect_err("delete rewrite should require by-version scope");
+        let err =
+            rewrite_delete(delete).expect_err("delete rewrite should require by-version scope");
         assert!(err
             .to_string()
             .contains("requires explicit lixcol_version_id or schema default override"));
@@ -1934,7 +2017,8 @@ mod tests {
 
     #[test]
     fn by_version_update_pushes_down_derived_entity_id_for_single_primary_key() {
-        let sql = "UPDATE lix_key_value_by_version SET value = 'x' WHERE key = 'k' AND version_id = 'v1'";
+        let sql =
+            "UPDATE lix_key_value_by_version SET value = 'x' WHERE key = 'k' AND version_id = 'v1'";
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
         let statement = statements.remove(0);
         let Statement::Update(update) = statement else {

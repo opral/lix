@@ -6,6 +6,8 @@ use sqlparser::ast::{
     OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, Update, Value, ValueWithSpan, Values,
 };
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::{
@@ -23,8 +25,8 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    escape_sql_string, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
-    RowSourceResolver,
+    escape_sql_string, lowering::lower_statement, resolve_expr_cell_with_state,
+    route::rewrite_read_query_with_backend, PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::Value as EngineValue;
 use crate::{LixBackend, LixError};
@@ -37,6 +39,8 @@ const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const GLOBAL_VERSION: &str = "global";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
@@ -364,12 +368,6 @@ pub fn rewrite_delete(delete: Delete) -> Result<Option<DeleteRewrite>, LixError>
                     Ident::new("is_tombstone"),
                 )])),
                 value: number_expr("1"),
-            },
-            Assignment {
-                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
-                    Ident::new("snapshot_content"),
-                )])),
-                value: null_expr(),
             },
             Assignment {
                 target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
@@ -1266,6 +1264,7 @@ async fn build_delete_followup_statements(
     let timestamp = functions.timestamp();
     let mut domain_changes = Vec::new();
     let mut affected_versions = BTreeSet::new();
+    let mut deleted_directory_scopes: Vec<(String, String)> = Vec::new();
 
     for row in rows {
         if row.len() < UPDATE_RETURNING_COLUMNS.len() {
@@ -1279,7 +1278,15 @@ async fn build_delete_followup_statements(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
+        let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
+        if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+            if let Some(snapshot_content) = snapshot_content {
+                if let Some(path) = directory_path_from_snapshot(&snapshot_content)? {
+                    deleted_directory_scopes.push((version_id.clone(), path));
+                }
+            }
+        }
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
@@ -1296,6 +1303,20 @@ async fn build_delete_followup_statements(
         });
     }
 
+    if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+        let cascaded_file_deletes = load_cascaded_file_delete_changes(
+            backend,
+            &deleted_directory_scopes,
+            &timestamp,
+            functions,
+        )
+        .await?;
+        for change in cascaded_file_deletes {
+            affected_versions.insert(change.version_id.clone());
+            domain_changes.push(change);
+        }
+    }
+
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;
     let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
     let commit_result = generate_commit(
@@ -1308,6 +1329,133 @@ async fn build_delete_followup_statements(
         || functions.uuid_v7(),
     )?;
     build_statements_from_generate_commit_result(commit_result, functions)
+}
+
+fn directory_path_from_snapshot(snapshot_content: &str) -> Result<Option<String>, LixError> {
+    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| LixError {
+        message: format!("vtable delete directory snapshot_content must be JSON: {error}"),
+    })?;
+    Ok(snapshot
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .map(|path| path.to_string()))
+}
+
+async fn load_cascaded_file_delete_changes(
+    backend: &dyn LixBackend,
+    directory_scopes: &[(String, String)],
+    timestamp: &str,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Vec<DomainChangeInput>, LixError> {
+    if directory_scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut grouped_paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (version_id, directory_path) in directory_scopes {
+        grouped_paths
+            .entry(version_id.clone())
+            .or_default()
+            .insert(directory_path.clone());
+    }
+
+    let mut changes = Vec::new();
+    let mut seen_file_versions: BTreeSet<(String, String)> = BTreeSet::new();
+    for (version_id, directory_paths) in grouped_paths {
+        let predicates = directory_paths
+            .iter()
+            .map(|directory_path| file_path_prefix_predicate(directory_path))
+            .collect::<Vec<_>>();
+        if predicates.is_empty() {
+            continue;
+        }
+        let where_clause = predicates.join(" OR ");
+        let sql = format!(
+            "SELECT \
+                id, \
+                lixcol_file_id, \
+                lixcol_version_id, \
+                lixcol_plugin_key, \
+                lixcol_schema_version, \
+                lixcol_metadata \
+             FROM lix_file_descriptor_by_version \
+             WHERE lixcol_version_id = '{version_id}' \
+               AND ({where_clause})",
+            version_id = escape_sql_string(&version_id),
+            where_clause = where_clause,
+        );
+        let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+        let result = backend.execute(&rewritten_sql, &[]).await?;
+        for row in result.rows {
+            if row.len() < 6 {
+                return Err(LixError {
+                    message: "filesystem directory delete cascade expected six file columns"
+                        .to_string(),
+                });
+            }
+            let entity_id = value_to_string(&row[0], "entity_id")?;
+            let file_id = value_to_string(&row[1], "file_id")?;
+            let cascaded_version_id = value_to_string(&row[2], "version_id")?;
+            let plugin_key = value_to_string(&row[3], "plugin_key")?;
+            let schema_version = value_to_string(&row[4], "schema_version")?;
+            let metadata = value_to_optional_text(&row[5], "metadata")?;
+
+            if !seen_file_versions.insert((entity_id.clone(), cascaded_version_id.clone())) {
+                continue;
+            }
+
+            changes.push(DomainChangeInput {
+                id: functions.uuid_v7(),
+                entity_id,
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                schema_version,
+                file_id,
+                version_id: cascaded_version_id,
+                plugin_key,
+                snapshot_content: None,
+                metadata,
+                created_at: timestamp.to_string(),
+                writer_key: None,
+            });
+        }
+    }
+
+    Ok(changes)
+}
+
+fn file_path_prefix_predicate(directory_path: &str) -> String {
+    let trimmed = directory_path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "path LIKE '/%'".to_string();
+    }
+    format!(
+        "(path = '{exact}' OR path LIKE '{prefix}/%')",
+        exact = escape_sql_string(trimmed),
+        prefix = escape_sql_string(trimmed),
+    )
+}
+
+async fn rewrite_single_read_query_for_backend(
+    backend: &dyn LixBackend,
+    sql: &str,
+) -> Result<String, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "expected a single SELECT statement".to_string(),
+        });
+    }
+    let statement = statements.remove(0);
+    let Statement::Query(query) = statement else {
+        return Err(LixError {
+            message: "expected SELECT statement".to_string(),
+        });
+    };
+    let rewritten = rewrite_read_query_with_backend(backend, *query).await?;
+    let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
+    Ok(lowered.to_string())
 }
 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
@@ -2803,7 +2951,7 @@ mod tests {
             .map(|assignment| assignment.target.to_string())
             .collect::<Vec<_>>();
         assert!(assignments.iter().any(|name| name == "is_tombstone"));
-        assert!(assignments.iter().any(|name| name == "snapshot_content"));
+        assert!(!assignments.iter().any(|name| name == "snapshot_content"));
         assert!(assignments.iter().any(|name| name == "updated_at"));
     }
 

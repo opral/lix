@@ -53,6 +53,42 @@ async fn insert_state_row(
 }
 
 simulation_test!(
+    lix_state_by_version_select_exposes_commit_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(&engine, "entity-commit", "version-a", "{\"value\":\"A\"}").await;
+
+        let rows = engine
+            .execute(
+                "SELECT commit_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-commit' \
+                   AND file_id = 'test-file' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.rows.clone());
+        assert_eq!(rows.rows.len(), 1);
+        let commit_id = match &rows.rows[0][0] {
+            Value::Text(value) => value,
+            other => panic!("expected text commit_id in lix_state_by_version, got {other:?}"),
+        };
+        assert!(!commit_id.is_empty(), "expected non-empty commit_id");
+    }
+);
+
+simulation_test!(
     lix_state_by_version_select_scopes_to_version_predicate,
     |sim| async move {
         let engine = sim

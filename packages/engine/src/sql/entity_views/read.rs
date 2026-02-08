@@ -153,7 +153,9 @@ fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError>
             base_state_source_sql(target.version_id_override.as_deref()),
             vec!["1=1".to_string()],
         ),
-        EntityViewVariant::ByVersion => ("lix_state_by_version".to_string(), vec!["1=1".to_string()]),
+        EntityViewVariant::ByVersion => {
+            ("lix_state_by_version".to_string(), vec!["1=1".to_string()])
+        }
         EntityViewVariant::History => ("lix_state_history".to_string(), vec!["1=1".to_string()]),
     };
     let mut select_parts = Vec::new();

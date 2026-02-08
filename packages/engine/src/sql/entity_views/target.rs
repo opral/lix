@@ -151,18 +151,10 @@ fn build_target_from_schema(
 
     let file_id_override =
         extract_lixcol_string_override(schema, schema_key, "lixcol_file_id", &evaluator)?;
-    let plugin_key_override = extract_lixcol_string_override(
-        schema,
-        schema_key,
-        "lixcol_plugin_key",
-        &evaluator,
-    )?;
-    let version_id_override = extract_lixcol_string_override(
-        schema,
-        schema_key,
-        "lixcol_version_id",
-        &evaluator,
-    )?;
+    let plugin_key_override =
+        extract_lixcol_string_override(schema, schema_key, "lixcol_plugin_key", &evaluator)?;
+    let version_id_override =
+        extract_lixcol_string_override(schema, schema_key, "lixcol_version_id", &evaluator)?;
     let override_predicates = collect_override_predicates(schema, schema_key, variant, &evaluator)?;
 
     Ok(Some(EntityViewTarget {
@@ -478,7 +470,10 @@ mod tests {
 
         assert_eq!(target.file_id_override.as_deref(), Some("file-custom"));
         assert_eq!(target.plugin_key_override.as_deref(), Some("plugin-custom"));
-        assert_eq!(target.version_id_override.as_deref(), Some("version-custom"));
+        assert_eq!(
+            target.version_id_override.as_deref(),
+            Some("version-custom")
+        );
         assert_eq!(target.override_predicates.len(), 3);
         assert!(target
             .override_predicates
