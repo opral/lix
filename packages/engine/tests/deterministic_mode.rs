@@ -1,6 +1,6 @@
 mod support;
 
-use lix_engine::{BootKeyValue, Value};
+use lix_engine::Value;
 use uuid::Uuid;
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
@@ -61,16 +61,9 @@ simulation_test!(
     deterministic_boot_key_values_apply_during_init,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: vec![BootKeyValue {
-                    key: "lix_deterministic_mode".to_string(),
-                    value: serde_json::json!({ "enabled": true }),
-                    version_id: None,
-                }],
-                ..Default::default()
-            }))
+            .boot_simulated_engine_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_engine_deterministic should succeed");
         engine.init().await.unwrap();
 
         let mode_metadata = engine

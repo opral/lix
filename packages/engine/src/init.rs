@@ -29,6 +29,7 @@ const INIT_STATEMENTS: &[&str] = &[
      snapshot_content TEXT,\
      inherited_from_version_id TEXT,\
      change_id TEXT NOT NULL,\
+     metadata TEXT,\
      is_tombstone INTEGER NOT NULL DEFAULT 0,\
      created_at TEXT NOT NULL,\
      updated_at TEXT NOT NULL,\
@@ -41,11 +42,45 @@ const INIT_STATEMENTS: &[&str] = &[
      version_id TEXT NOT NULL,\
      plugin_key TEXT NOT NULL,\
      snapshot_content TEXT,\
+     metadata TEXT,\
      schema_version TEXT NOT NULL,\
      created_at TEXT NOT NULL,\
      updated_at TEXT NOT NULL,\
      PRIMARY KEY (entity_id, schema_key, file_id, version_id)\
      )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     data TEXT NOT NULL,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_data_cache_version_id \
+     ON lix_internal_file_data_cache (version_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     directory_id TEXT,\
+     name TEXT NOT NULL,\
+     extension TEXT,\
+     path TEXT NOT NULL,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_path_cache_version_path \
+     ON lix_internal_file_path_cache (version_id, path, file_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_path_cache_version_directory \
+     ON lix_internal_file_path_cache (version_id, directory_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_lixcol_cache (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     latest_change_id TEXT,\
+     latest_commit_id TEXT,\
+     created_at TEXT,\
+     updated_at TEXT,\
+     writer_key TEXT,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_file_lixcol_cache_lookup \
+     ON lix_internal_file_lixcol_cache (file_id, version_id)",
 ];
 
 pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {

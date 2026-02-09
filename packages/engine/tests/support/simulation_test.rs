@@ -154,6 +154,18 @@ impl SimulationArgs {
         })
     }
 
+    pub async fn boot_simulated_engine_deterministic(&self) -> Result<SimulationEngine, LixError> {
+        self.boot_simulated_engine(Some(SimulationBootArgs {
+            key_values: vec![BootKeyValue {
+                key: "lix_deterministic_mode".to_string(),
+                value: serde_json::json!({ "enabled": true }),
+                version_id: None,
+            }],
+            active_account: None,
+        }))
+        .await
+    }
+
     pub fn assert_deterministic<T>(&self, actual: T)
     where
         T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,

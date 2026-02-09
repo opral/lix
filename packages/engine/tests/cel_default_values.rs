@@ -3,7 +3,7 @@ mod support;
 use chrono::DateTime;
 use lix_engine::Value;
 use serde_json::Value as JsonValue;
-use support::simulation_test::{default_simulations, run_simulation_test, SimulationArgs};
+use support::simulation_test::SimulationArgs;
 use uuid::Uuid;
 
 async fn insert_schema(engine: &support::simulation_test::SimulationEngine, schema: &str) {
@@ -367,14 +367,13 @@ async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
     Uuid::parse_str(token).expect("token to be valid UUID");
 }
 
-#[tokio::test]
-async fn insert_applies_uuid_function_default() {
-    run_simulation_test(
-        default_simulations(),
-        run_insert_applies_uuid_function_default,
-    )
-    .await;
-}
+simulation_test!(
+    insert_applies_uuid_function_default,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        run_insert_applies_uuid_function_default(sim).await;
+    }
+);
 
 async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
     let engine = sim
@@ -422,14 +421,13 @@ async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
     assert_eq!(fraction.len(), 4);
 }
 
-#[tokio::test]
-async fn insert_applies_timestamp_function_default() {
-    run_simulation_test(
-        default_simulations(),
-        run_insert_applies_timestamp_function_default,
-    )
-    .await;
-}
+simulation_test!(
+    insert_applies_timestamp_function_default,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        run_insert_applies_timestamp_function_default(sim).await;
+    }
+);
 
 simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
     let engine = sim

@@ -6,6 +6,8 @@ use sqlparser::ast::{
     OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, Update, Value, ValueWithSpan, Values,
 };
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::{
@@ -23,8 +25,8 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    escape_sql_string, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
-    RowSourceResolver,
+    escape_sql_string, lowering::lower_statement, resolve_expr_cell_with_state,
+    route::rewrite_read_query_with_backend, PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::Value as EngineValue;
 use crate::{LixBackend, LixError};
@@ -37,6 +39,8 @@ const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const GLOBAL_VERSION: &str = "global";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
@@ -45,6 +49,7 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "plugin_key",
     "schema_version",
     "snapshot_content",
+    "metadata",
     "updated_at",
 ];
 
@@ -366,12 +371,6 @@ pub fn rewrite_delete(delete: Delete) -> Result<Option<DeleteRewrite>, LixError>
             },
             Assignment {
                 target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
-                    Ident::new("snapshot_content"),
-                )])),
-                value: null_expr(),
-            },
-            Assignment {
-                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
                     Ident::new("updated_at"),
                 )])),
                 value: lix_timestamp_expr(),
@@ -457,6 +456,15 @@ fn build_untracked_on_conflict() -> OnInsert {
                 },
                 Assignment {
                     target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("metadata")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("metadata"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
                         ObjectNamePart::Identifier(Ident::new("updated_at")),
                     ])),
                     value: Expr::CompoundIdentifier(vec![
@@ -513,6 +521,15 @@ fn build_materialized_on_conflict() -> OnInsert {
                     value: Expr::CompoundIdentifier(vec![
                         Ident::new("excluded"),
                         Ident::new("change_id"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("metadata")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("metadata"),
                     ]),
                 },
                 Assignment {
@@ -652,7 +669,7 @@ fn rewrite_tracked_rows(
             resolved_expr_or_original(materialized.get(file_idx), row.get(file_idx))?,
             resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
             string_expr(&snapshot_id),
-            metadata_expr,
+            metadata_expr.clone(),
             string_expr(&created_at),
         ]);
 
@@ -668,6 +685,7 @@ fn rewrite_tracked_rows(
             resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
             snapshot_content,
             string_expr(&change_id),
+            metadata_expr,
             number_expr("0"),
             string_expr(&created_at),
             string_expr(&updated_at),
@@ -766,6 +784,7 @@ fn rewrite_tracked_rows(
                 Ident::new("plugin_key"),
                 Ident::new("snapshot_content"),
                 Ident::new("change_id"),
+                Ident::new("metadata"),
                 Ident::new("is_tombstone"),
                 Ident::new("created_at"),
                 Ident::new("updated_at"),
@@ -916,6 +935,10 @@ fn materialized_row_values(row: &MaterializedStateRow) -> Vec<Expr> {
             .map(|value| string_expr(value))
             .unwrap_or_else(null_expr),
         string_expr(&row.id),
+        row.metadata
+            .as_ref()
+            .map(|value| string_expr(value))
+            .unwrap_or_else(null_expr),
         number_expr("0"),
         string_expr(&row.created_at),
         string_expr(&row.created_at),
@@ -1086,6 +1109,7 @@ fn build_untracked_insert(
     let plugin_idx = required_column_index(&insert.columns, "plugin_key")?;
     let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
     let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
+    let metadata_idx = find_column_index(&insert.columns, "metadata");
 
     let mut mapped_rows = Vec::new();
     for (row, materialized) in rows {
@@ -1097,6 +1121,10 @@ fn build_untracked_insert(
             resolved_expr_or_original(materialized.get(version_idx), row.get(version_idx))?,
             resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
             resolved_expr_or_original(materialized.get(snapshot_idx), row.get(snapshot_idx))?,
+            match metadata_idx {
+                Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
+                None => null_expr(),
+            },
             resolved_expr_or_original(
                 materialized.get(schema_version_idx),
                 row.get(schema_version_idx),
@@ -1154,6 +1182,7 @@ fn build_untracked_insert(
             Ident::new("version_id"),
             Ident::new("plugin_key"),
             Ident::new("snapshot_content"),
+            Ident::new("metadata"),
             Ident::new("schema_version"),
             Ident::new("created_at"),
             Ident::new("updated_at"),
@@ -1190,6 +1219,7 @@ async fn build_update_followup_statements(
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
+        let metadata = value_to_optional_text(&row[6], "metadata")?;
 
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
@@ -1201,7 +1231,7 @@ async fn build_update_followup_statements(
             version_id,
             plugin_key,
             snapshot_content,
-            metadata: None,
+            metadata,
             created_at: timestamp.clone(),
             writer_key: None,
         });
@@ -1234,6 +1264,7 @@ async fn build_delete_followup_statements(
     let timestamp = functions.timestamp();
     let mut domain_changes = Vec::new();
     let mut affected_versions = BTreeSet::new();
+    let mut deleted_directory_scopes: Vec<(String, String)> = Vec::new();
 
     for row in rows {
         if row.len() < UPDATE_RETURNING_COLUMNS.len() {
@@ -1247,6 +1278,11 @@ async fn build_delete_followup_statements(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
+        let _snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
+        let metadata = value_to_optional_text(&row[6], "metadata")?;
+        if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+            deleted_directory_scopes.push((version_id.clone(), entity_id.clone()));
+        }
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
@@ -1257,10 +1293,24 @@ async fn build_delete_followup_statements(
             version_id,
             plugin_key,
             snapshot_content: None,
-            metadata: None,
+            metadata,
             created_at: timestamp.clone(),
             writer_key: None,
         });
+    }
+
+    if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+        let cascaded_file_deletes = load_cascaded_file_delete_changes(
+            backend,
+            &deleted_directory_scopes,
+            &timestamp,
+            functions,
+        )
+        .await?;
+        for change in cascaded_file_deletes {
+            affected_versions.insert(change.version_id.clone());
+            domain_changes.push(change);
+        }
     }
 
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;
@@ -1275,6 +1325,111 @@ async fn build_delete_followup_statements(
         || functions.uuid_v7(),
     )?;
     build_statements_from_generate_commit_result(commit_result, functions)
+}
+
+async fn load_cascaded_file_delete_changes(
+    backend: &dyn LixBackend,
+    directory_scopes: &[(String, String)],
+    timestamp: &str,
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Vec<DomainChangeInput>, LixError> {
+    if directory_scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut grouped_directory_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (version_id, directory_id) in directory_scopes {
+        grouped_directory_ids
+            .entry(version_id.clone())
+            .or_default()
+            .insert(directory_id.clone());
+    }
+
+    let mut changes = Vec::new();
+    let mut seen_file_versions: BTreeSet<(String, String)> = BTreeSet::new();
+    for (version_id, directory_ids) in grouped_directory_ids {
+        if directory_ids.is_empty() {
+            continue;
+        }
+        let in_list = directory_ids
+            .iter()
+            .map(|directory_id| format!("'{}'", escape_sql_string(directory_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT \
+                id, \
+                lixcol_file_id, \
+                lixcol_version_id, \
+                lixcol_plugin_key, \
+                lixcol_schema_version, \
+                lixcol_metadata \
+             FROM lix_file_descriptor_by_version \
+             WHERE lixcol_version_id = '{version_id}' \
+               AND directory_id IN ({in_list})",
+            version_id = escape_sql_string(&version_id),
+            in_list = in_list,
+        );
+        let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+        let result = backend.execute(&rewritten_sql, &[]).await?;
+        for row in result.rows {
+            if row.len() < 6 {
+                return Err(LixError {
+                    message: "filesystem directory delete cascade expected six file columns"
+                        .to_string(),
+                });
+            }
+            let entity_id = value_to_string(&row[0], "entity_id")?;
+            let file_id = value_to_string(&row[1], "file_id")?;
+            let cascaded_version_id = value_to_string(&row[2], "version_id")?;
+            let plugin_key = value_to_string(&row[3], "plugin_key")?;
+            let schema_version = value_to_string(&row[4], "schema_version")?;
+            let metadata = value_to_optional_text(&row[5], "metadata")?;
+
+            if !seen_file_versions.insert((entity_id.clone(), cascaded_version_id.clone())) {
+                continue;
+            }
+
+            changes.push(DomainChangeInput {
+                id: functions.uuid_v7(),
+                entity_id,
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                schema_version,
+                file_id,
+                version_id: cascaded_version_id,
+                plugin_key,
+                snapshot_content: None,
+                metadata,
+                created_at: timestamp.to_string(),
+                writer_key: None,
+            });
+        }
+    }
+
+    Ok(changes)
+}
+
+async fn rewrite_single_read_query_for_backend(
+    backend: &dyn LixBackend,
+    sql: &str,
+) -> Result<String, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "expected a single SELECT statement".to_string(),
+        });
+    }
+    let statement = statements.remove(0);
+    let Statement::Query(query) = statement else {
+        return Err(LixError {
+            message: "expected SELECT statement".to_string(),
+        });
+    };
+    let rewritten = rewrite_read_query_with_backend(backend, *query).await?;
+    let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
+    Ok(lowered.to_string())
 }
 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
@@ -1420,6 +1575,7 @@ fn build_statements_from_generate_commit_result(
                 Ident::new("plugin_key"),
                 Ident::new("snapshot_content"),
                 Ident::new("change_id"),
+                Ident::new("metadata"),
                 Ident::new("is_tombstone"),
                 Ident::new("created_at"),
                 Ident::new("updated_at"),
@@ -1959,8 +2115,9 @@ fn build_update_validation_plan(
     table_name: Option<String>,
     params: &[EngineValue],
 ) -> Result<Option<UpdateValidationPlan>, LixError> {
-    let snapshot_content = snapshot_content_from_assignments(&update.assignments, params)?;
-    let where_clause = update.selection.as_ref().map(|expr| expr.to_string());
+    let (snapshot_content, snapshot_patch) =
+        snapshot_content_from_assignments(&update.assignments, params)?;
+    let where_clause = update.selection.clone();
     let table = table_name.ok_or_else(|| LixError {
         message: "update validation requires target table".to_string(),
     })?;
@@ -1969,25 +2126,32 @@ fn build_update_validation_plan(
         table,
         where_clause,
         snapshot_content,
+        snapshot_patch,
     }))
 }
 
 fn snapshot_content_from_assignments(
     assignments: &[Assignment],
     params: &[EngineValue],
-) -> Result<Option<JsonValue>, LixError> {
+) -> Result<(Option<JsonValue>, Option<BTreeMap<String, JsonValue>>), LixError> {
     let mut state = PlaceholderState::new();
     for assignment in assignments {
         let value = resolve_expr_cell_with_state(&assignment.value, params, &mut state)?;
         if assignment_target_is_column(&assignment.target, "snapshot_content") {
-            return resolved_snapshot_json_value(value.value);
+            if value.value.is_none() {
+                if let Some(patch) = extract_snapshot_patch_from_expr(&assignment.value)? {
+                    return Ok((None, Some(patch)));
+                }
+            }
+            return Ok((resolved_snapshot_json_value(value.value)?, None));
         }
     }
-    Ok(None)
+    Ok((None, None))
 }
 
 fn resolved_snapshot_json_value(value: Option<EngineValue>) -> Result<Option<JsonValue>, LixError> {
     match value {
+        None => Ok(None),
         Some(EngineValue::Null) => Ok(None),
         Some(EngineValue::Text(value)) => serde_json::from_str::<JsonValue>(&value)
             .map(Some)
@@ -1997,6 +2161,278 @@ fn resolved_snapshot_json_value(value: Option<EngineValue>) -> Result<Option<Jso
         _ => Err(LixError {
             message: "vtable update requires literal snapshot_content".to_string(),
         }),
+    }
+}
+
+fn extract_snapshot_patch_from_expr(
+    expr: &Expr,
+) -> Result<Option<BTreeMap<String, JsonValue>>, LixError> {
+    if let Some(patch) = parse_sqlite_json_set_patch(expr)? {
+        return Ok(Some(patch));
+    }
+    if let Some(patch) = parse_postgres_jsonb_set_patch(expr)? {
+        return Ok(Some(patch));
+    }
+    Ok(None)
+}
+
+fn parse_sqlite_json_set_patch(
+    expr: &Expr,
+) -> Result<Option<BTreeMap<String, JsonValue>>, LixError> {
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+    if !function_name_matches(&function.name, "json_set") {
+        return Ok(None);
+    }
+    let Some(args) = function_unnamed_expr_args(function) else {
+        return Ok(None);
+    };
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Ok(None);
+    }
+
+    let mut patch = BTreeMap::new();
+    let mut index = 1usize;
+    while index + 1 < args.len() {
+        let Some(property) = parse_sqlite_json_path_property(args[index]) else {
+            return Ok(None);
+        };
+        let value = parse_sqlite_patch_value(args[index + 1])?;
+        patch.insert(property, value);
+        index += 2;
+    }
+    Ok(Some(patch))
+}
+
+fn parse_postgres_jsonb_set_patch(
+    expr: &Expr,
+) -> Result<Option<BTreeMap<String, JsonValue>>, LixError> {
+    let mut patch = BTreeMap::new();
+    if collect_postgres_jsonb_set_patch(expr, &mut patch)? {
+        return Ok(Some(patch));
+    }
+    Ok(None)
+}
+
+fn collect_postgres_jsonb_set_patch(
+    expr: &Expr,
+    patch: &mut BTreeMap<String, JsonValue>,
+) -> Result<bool, LixError> {
+    let expr = unwrap_cast_expr(expr);
+    let Expr::Function(function) = expr else {
+        return Ok(is_postgres_snapshot_base(expr));
+    };
+    if !function_name_matches(&function.name, "jsonb_set") {
+        return Ok(is_postgres_snapshot_base(expr));
+    }
+    let Some(args) = function_unnamed_expr_args(function) else {
+        return Ok(false);
+    };
+    if args.len() < 3 {
+        return Ok(false);
+    }
+
+    let base_ok = if is_postgres_snapshot_base(args[0]) {
+        true
+    } else {
+        collect_postgres_jsonb_set_patch(args[0], patch)?
+    };
+    if !base_ok {
+        return Ok(false);
+    }
+
+    let Some(property) = parse_postgres_json_path_property(args[1]) else {
+        return Ok(false);
+    };
+    let value = parse_postgres_patch_value(args[2])?;
+    patch.insert(property, value);
+    Ok(true)
+}
+
+fn parse_sqlite_json_path_property(path: &Expr) -> Option<String> {
+    let path = single_quoted_literal(path)?;
+    if !(path.starts_with("$.\"") && path.ends_with('"')) {
+        return None;
+    }
+    let property = &path[3..path.len() - 1];
+    Some(property.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+fn parse_postgres_json_path_property(path: &Expr) -> Option<String> {
+    let path = single_quoted_literal(path)?;
+    if !(path.starts_with('{') && path.ends_with('}')) {
+        return None;
+    }
+    let property = &path[1..path.len() - 1];
+    if property.is_empty() || property.contains(',') {
+        return None;
+    }
+    Some(property.to_string())
+}
+
+fn parse_sqlite_patch_value(value: &Expr) -> Result<JsonValue, LixError> {
+    if let Some(value) = parse_json_function_value(value)? {
+        return Ok(value);
+    }
+    parse_json_literal_value(value)
+}
+
+fn parse_postgres_patch_value(value: &Expr) -> Result<JsonValue, LixError> {
+    let value = unwrap_cast_expr(value);
+    let raw = single_quoted_literal(value).ok_or_else(|| LixError {
+        message: "vtable update requires JSONB patch values to be single-quoted JSON literals"
+            .to_string(),
+    })?;
+    serde_json::from_str(raw).map_err(|err| LixError {
+        message: format!("vtable update JSONB patch value is not valid JSON: {err}"),
+    })
+}
+
+fn parse_json_function_value(expr: &Expr) -> Result<Option<JsonValue>, LixError> {
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+    if !function_name_matches(&function.name, "json") {
+        return Ok(None);
+    }
+    let Some(args) = function_unnamed_expr_args(function) else {
+        return Ok(None);
+    };
+    if args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(raw) = single_quoted_literal(args[0]) else {
+        return Ok(None);
+    };
+    serde_json::from_str(raw).map(Some).map_err(|err| LixError {
+        message: format!("vtable update json(...) patch value is not valid JSON: {err}"),
+    })
+}
+
+fn parse_json_literal_value(expr: &Expr) -> Result<JsonValue, LixError> {
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return Err(LixError {
+            message: "vtable update patch requires literal property values".to_string(),
+        });
+    };
+
+    match value {
+        Value::Null => Ok(JsonValue::Null),
+        Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
+        Value::Number(value, _) => {
+            if let Ok(parsed) = value.parse::<i64>() {
+                Ok(JsonValue::Number(parsed.into()))
+            } else if let Ok(parsed) = value.parse::<f64>() {
+                serde_json::Number::from_f64(parsed)
+                    .map(JsonValue::Number)
+                    .ok_or_else(|| LixError {
+                        message: "vtable update patch contains non-finite number".to_string(),
+                    })
+            } else {
+                Err(LixError {
+                    message: format!(
+                        "vtable update patch contains invalid numeric literal '{value}'"
+                    ),
+                })
+            }
+        }
+        Value::SingleQuotedString(value)
+        | Value::DoubleQuotedString(value)
+        | Value::TripleSingleQuotedString(value)
+        | Value::TripleDoubleQuotedString(value)
+        | Value::EscapedStringLiteral(value)
+        | Value::UnicodeStringLiteral(value)
+        | Value::NationalStringLiteral(value)
+        | Value::HexStringLiteral(value)
+        | Value::SingleQuotedRawStringLiteral(value)
+        | Value::DoubleQuotedRawStringLiteral(value)
+        | Value::TripleSingleQuotedRawStringLiteral(value)
+        | Value::TripleDoubleQuotedRawStringLiteral(value)
+        | Value::SingleQuotedByteStringLiteral(value)
+        | Value::DoubleQuotedByteStringLiteral(value)
+        | Value::TripleSingleQuotedByteStringLiteral(value)
+        | Value::TripleDoubleQuotedByteStringLiteral(value) => Ok(JsonValue::String(value.clone())),
+        Value::DollarQuotedString(value) => Ok(JsonValue::String(value.value.clone())),
+        Value::Placeholder(token) => Err(LixError {
+            message: format!("vtable update patch contains unresolved placeholder '{token}'"),
+        }),
+    }
+}
+
+fn is_postgres_snapshot_base(expr: &Expr) -> bool {
+    let expr = unwrap_cast_expr(expr);
+    let Expr::Function(function) = expr else {
+        return false;
+    };
+    if !function_name_matches(&function.name, "coalesce") {
+        return false;
+    }
+    let Some(args) = function_unnamed_expr_args(function) else {
+        return false;
+    };
+    if args.len() < 2 {
+        return false;
+    }
+    expr_is_snapshot_content_reference(args[0]) && single_quoted_literal(args[1]) == Some("{}")
+}
+
+fn expr_is_snapshot_content_reference(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("snapshot_content"),
+        Expr::CompoundIdentifier(idents) => idents
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case("snapshot_content"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn function_name_matches(name: &ObjectName, target: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(target))
+        .unwrap_or(false)
+}
+
+fn function_unnamed_expr_args<'a>(function: &'a Function) -> Option<Vec<&'a Expr>> {
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) = arg
+        else {
+            return None;
+        };
+        out.push(expr);
+    }
+    Some(out)
+}
+
+fn single_quoted_literal(expr: &Expr) -> Option<&str> {
+    let Expr::Value(ValueWithSpan {
+        value: Value::SingleQuotedString(value),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    Some(value.as_str())
+}
+
+fn unwrap_cast_expr(mut expr: &Expr) -> &Expr {
+    loop {
+        match expr {
+            Expr::Cast { expr: inner, .. } => {
+                expr = inner.as_ref();
+            }
+            Expr::Nested(inner) => {
+                expr = inner.as_ref();
+            }
+            _ => return expr,
+        }
     }
 }
 
@@ -2489,7 +2925,7 @@ mod tests {
             .map(|assignment| assignment.target.to_string())
             .collect::<Vec<_>>();
         assert!(assignments.iter().any(|name| name == "is_tombstone"));
-        assert!(assignments.iter().any(|name| name == "snapshot_content"));
+        assert!(!assignments.iter().any(|name| name == "snapshot_content"));
         assert!(assignments.iter().any(|name| name == "updated_at"));
     }
 

@@ -52,8 +52,8 @@ async fn insert_state_row(
     engine.execute(&sql, &[]).await.unwrap();
 }
 
-// TODO(parity): Legacy SDK also resolves inheritance on state_by_version.
-// Current milestone follows plan.md scope: inheritance is applied on lix_state reads.
+// TODO(m24): Add `_by_version` inheritance coverage here too, mirroring
+// `lix_state` expectations for explicit version scopes.
 
 simulation_test!(
     lix_state_select_inherits_from_parent_version,
