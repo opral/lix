@@ -18,6 +18,14 @@ const VTABLE_NAME: &str = "lix_internal_state_vtable";
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     let mut changed = false;
     let mut new_query = query.clone();
+    if let Some(with) = new_query.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            if let Some(rewritten) = rewrite_query((*cte.query).clone())? {
+                cte.query = Box::new(rewritten);
+                changed = true;
+            }
+        }
+    }
     new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
 
     if changed {

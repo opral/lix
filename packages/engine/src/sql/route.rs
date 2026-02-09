@@ -5,11 +5,11 @@ use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::entity_views::{read as entity_view_read, write as entity_view_write};
 use crate::sql::steps::{
-    filesystem_view_read, filesystem_view_write, lix_active_account_view_read,
-    lix_active_account_view_write, lix_active_version_view_read, lix_active_version_view_write,
-    lix_state_by_version_view_read, lix_state_by_version_view_write, lix_state_history_view_read,
-    lix_state_history_view_write, lix_state_view_read, lix_state_view_write, lix_version_view_read,
-    lix_version_view_write, stored_schema, vtable_read, vtable_write,
+    filesystem_step, lix_active_account_view_read, lix_active_account_view_write,
+    lix_active_version_view_read, lix_active_version_view_write, lix_state_by_version_view_read,
+    lix_state_by_version_view_write, lix_state_history_view_read, lix_state_history_view_write,
+    lix_state_view_read, lix_state_view_write, lix_version_view_read, lix_version_view_write,
+    stored_schema, vtable_read, vtable_write,
 };
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
@@ -24,7 +24,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
     match statement {
         Statement::Insert(insert) => {
             lix_state_history_view_write::reject_insert(&insert)?;
-            if let Some(rewritten) = filesystem_view_write::rewrite_insert(insert.clone())? {
+            if let Some(rewritten) = filesystem_step::rewrite_insert(insert.clone())? {
                 return rewrite_statement(Statement::Insert(rewritten), params, functions);
             }
             if let Some(version_inserts) =
@@ -85,7 +85,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
         }
         Statement::Update(update) => {
             lix_state_history_view_write::reject_update(&update)?;
-            if let Some(rewritten) = filesystem_view_write::rewrite_update(update.clone())? {
+            if let Some(rewritten) = filesystem_step::rewrite_update(update.clone())? {
                 return rewrite_statement(rewritten, params, functions);
             }
             if let Some(rewritten) = entity_view_write::rewrite_update(update.clone(), params)? {
@@ -125,7 +125,7 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
         }
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
-            if let Some(rewritten) = filesystem_view_write::rewrite_delete(delete.clone())? {
+            if let Some(rewritten) = filesystem_step::rewrite_delete(delete.clone())? {
                 return rewrite_statement(Statement::Delete(rewritten), params, functions);
             }
             if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
@@ -196,12 +196,12 @@ where
         Statement::Insert(insert) => {
             lix_state_history_view_write::reject_insert(&insert)?;
             let filesystem_insert_side_effects =
-                filesystem_view_write::insert_side_effect_statements_with_backend(
+                filesystem_step::insert_side_effect_statements_with_backend(
                     backend, &insert, params,
                 )
                 .await?;
             let insert = if let Some(rewritten) =
-                filesystem_view_write::rewrite_insert_with_backend(backend, insert.clone(), params)
+                filesystem_step::rewrite_insert_with_backend(backend, insert.clone(), params)
                     .await?
             {
                 rewritten
@@ -316,7 +316,7 @@ where
         Statement::Update(update) => {
             lix_state_history_view_write::reject_update(&update)?;
             let update = if let Some(rewritten) =
-                filesystem_view_write::rewrite_update_with_backend(backend, update.clone(), params)
+                filesystem_step::rewrite_update_with_backend(backend, update.clone(), params)
                     .await?
             {
                 match rewritten {
@@ -382,7 +382,7 @@ where
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
             let delete = if let Some(rewritten) =
-                filesystem_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
+                filesystem_step::rewrite_delete_with_backend(backend, delete.clone()).await?
             {
                 rewritten
             } else {
@@ -438,7 +438,7 @@ where
 }
 
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
-    let query = filesystem_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+    let query = filesystem_step::rewrite_query(query.clone())?.unwrap_or(query);
     let query = entity_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
@@ -461,7 +461,7 @@ pub(crate) async fn rewrite_read_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
 ) -> Result<Query, LixError> {
-    let query = filesystem_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+    let query = filesystem_step::rewrite_query(query.clone())?.unwrap_or(query);
     let query = entity_view_read::rewrite_query_with_backend(backend, query.clone())
         .await?
         .unwrap_or(query);

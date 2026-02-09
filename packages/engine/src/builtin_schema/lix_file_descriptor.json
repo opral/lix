@@ -6,7 +6,9 @@
   ],
   "x-lix-unique": [
     [
-      "/path"
+      "/directory_id",
+      "/name",
+      "/extension"
     ]
   ],
   "x-lix-override-lixcols": {
@@ -19,9 +21,22 @@
       "type": "string",
       "x-lix-default": "lix_uuid_v7()"
     },
-    "path": {
+    "directory_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
       "type": "string",
-      "pattern": "^/.+$"
+      "pattern": "^[^/\\\\]+$"
+    },
+    "extension": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[^./\\\\]+$"
     },
     "metadata": {
       "anyOf": [
@@ -52,7 +67,9 @@
   },
   "required": [
     "id",
-    "path"
+    "directory_id",
+    "name",
+    "extension"
   ],
   "additionalProperties": false
 }

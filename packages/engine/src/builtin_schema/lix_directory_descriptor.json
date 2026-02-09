@@ -6,7 +6,8 @@
   ],
   "x-lix-unique": [
     [
-      "/path"
+      "/parent_id",
+      "/name"
     ]
   ],
   "x-lix-override-lixcols": {
@@ -19,10 +20,6 @@
       "type": "string",
       "x-lix-default": "lix_uuid_v7()"
     },
-    "path": {
-      "type": "string",
-      "pattern": "^/.*/$"
-    },
     "parent_id": {
       "type": [
         "string",
@@ -30,10 +27,8 @@
       ]
     },
     "name": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string",
+      "pattern": "^(?!\\.{1,2}$)[^/\\\\]+$"
     },
     "hidden": {
       "type": "boolean",
@@ -42,7 +37,8 @@
   },
   "required": [
     "id",
-    "path"
+    "parent_id",
+    "name"
   ],
   "additionalProperties": false
 }
