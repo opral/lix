@@ -46,6 +46,7 @@ pub fn rewrite_delete(delete: Delete) -> Result<Option<Delete>, LixError> {
 pub async fn rewrite_delete_with_backend(
     backend: &dyn LixBackend,
     delete: Delete,
+    params: &[EngineValue],
 ) -> Result<Option<Delete>, LixError> {
-    mutation_rewrite::rewrite_delete_with_backend(backend, delete).await
+    mutation_rewrite::rewrite_delete_with_backend(backend, delete, params).await
 }

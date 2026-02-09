@@ -325,6 +325,7 @@ pub fn rewrite_delete(mut delete: Delete) -> Result<Option<Delete>, LixError> {
 pub async fn rewrite_delete_with_backend(
     backend: &dyn LixBackend,
     mut delete: Delete,
+    params: &[EngineValue],
 ) -> Result<Option<Delete>, LixError> {
     let Some(target) = target_from_delete(&delete) else {
         return Ok(None);
@@ -350,7 +351,7 @@ pub async fn rewrite_delete_with_backend(
     }
 
     if target.is_directory() {
-        let selected = directory_rows_matching_delete(backend, &delete, target).await?;
+        let selected = directory_rows_matching_delete(backend, &delete, target, params).await?;
         let expanded = expand_directory_descendants(backend, &selected).await?;
         if !expanded.is_empty() {
             let predicate = build_directory_delete_selection(&expanded, target)?;
@@ -466,6 +467,10 @@ async fn rewrite_file_insert_columns_with_backend(
     params: &[EngineValue],
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
+    let id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("id"));
     let path_index = insert
         .columns
         .iter()
@@ -523,8 +528,23 @@ async fn rewrite_file_insert_columns_with_backend(
             row_expr,
             resolved_row,
         )?;
+        let explicit_id = id_index
+            .map(|index| resolve_text_expr(row_expr.get(index), resolved_row.get(index), "file id"))
+            .transpose()?
+            .flatten();
 
         assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
+        if let Some(existing_id) =
+            find_file_id_by_path(backend, &version_id, &parsed.normalized_path).await?
+        {
+            let same_id = explicit_id
+                .as_deref()
+                .map(|value| value == existing_id.as_str())
+                .unwrap_or(false);
+            if !same_id {
+                return Err(file_unique_error(&parsed.normalized_path, &version_id));
+            }
+        }
 
         let directory_id = if let Some(directory_path) = &parsed.directory_path {
             if let Some(existing_id) =
@@ -756,6 +776,21 @@ async fn rewrite_file_update_assignments_with_backend(
     let version_id = resolve_update_version_id(backend, update, target).await?;
     let parsed = parse_file_path(&raw_path)?;
     assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
+    let matching_file_ids = file_ids_matching_update(backend, update, target, params).await?;
+    if matching_file_ids.len() > 1 {
+        return Err(file_unique_error(&parsed.normalized_path, &version_id));
+    }
+    if !matching_file_ids.is_empty() {
+        if let Some(existing_id) =
+            find_file_id_by_path(backend, &version_id, &parsed.normalized_path).await?
+        {
+            let touches_existing = matching_file_ids.iter().any(|id| id == &existing_id);
+            let touches_other = matching_file_ids.iter().any(|id| id != &existing_id);
+            if !touches_existing || touches_other {
+                return Err(file_unique_error(&parsed.normalized_path, &version_id));
+            }
+        }
+    }
 
     let directory_id = if let Some(directory_path) = &parsed.directory_path {
         Some(
@@ -1049,6 +1084,15 @@ fn directory_unique_error(path: &str, version_id: &str) -> LixError {
     }
 }
 
+fn file_unique_error(path: &str, version_id: &str) -> LixError {
+    LixError {
+        message: format!(
+            "Unique constraint violation: file path '{}' already exists in version '{}'",
+            path, version_id
+        ),
+    }
+}
+
 async fn find_directory_id_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
@@ -1077,6 +1121,39 @@ async fn find_directory_id_by_path(
     let EngineValue::Text(id) = value else {
         return Err(LixError {
             message: format!("directory lookup expected text id, got {value:?}"),
+        });
+    };
+    Ok(Some(id.clone()))
+}
+
+async fn find_file_id_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<String>, LixError> {
+    let lookup_sql = "SELECT id \
+         FROM lix_file_by_version \
+         WHERE lixcol_version_id = $1 AND path = $2 \
+         LIMIT 1";
+    let rewritten_lookup_sql = rewrite_single_read_query_for_backend(backend, lookup_sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_lookup_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(path.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let Some(value) = row.first() else {
+        return Ok(None);
+    };
+    let EngineValue::Text(id) = value else {
+        return Err(LixError {
+            message: format!("file lookup expected text id, got {value:?}"),
         });
     };
     Ok(Some(id.clone()))
@@ -1478,6 +1555,7 @@ async fn directory_rows_matching_delete(
     backend: &dyn LixBackend,
     delete: &Delete,
     target: FilesystemTarget,
+    params: &[EngineValue],
 ) -> Result<Vec<ScopedDirectoryId>, LixError> {
     let where_clause = delete
         .selection
@@ -1503,7 +1581,7 @@ async fn directory_rows_matching_delete(
         )
     };
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-    let result = backend.execute(&rewritten_sql, &[]).await?;
+    let result = backend.execute(&rewritten_sql, params).await?;
 
     let mut rows: Vec<ScopedDirectoryId> = Vec::new();
     for row in result.rows {
@@ -1549,6 +1627,43 @@ async fn directory_rows_matching_delete(
     rows.sort();
     rows.dedup();
     Ok(rows)
+}
+
+async fn file_ids_matching_update(
+    backend: &dyn LixBackend,
+    update: &Update,
+    target: FilesystemTarget,
+    params: &[EngineValue],
+) -> Result<Vec<String>, LixError> {
+    let where_clause = update
+        .selection
+        .as_ref()
+        .map(|selection| format!(" WHERE {selection}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT id FROM {view_name}{where_clause}",
+        view_name = target.view_name,
+        where_clause = where_clause
+    );
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let result = backend.execute(&rewritten_sql, params).await?;
+
+    let mut out: Vec<String> = Vec::new();
+    for row in result.rows {
+        let Some(value) = row.first() else {
+            continue;
+        };
+        let EngineValue::Text(id) = value else {
+            return Err(LixError {
+                message: format!("file update id lookup expected text, got {value:?}"),
+            });
+        };
+        out.push(id.clone());
+    }
+
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 async fn expand_directory_descendants(
