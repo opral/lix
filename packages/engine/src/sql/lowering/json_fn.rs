@@ -13,6 +13,19 @@ pub(crate) fn lower_lix_json_text(call: &LixJsonTextCall, dialect: SqlDialect) -
     }
 }
 
+pub(crate) fn lower_lix_empty_blob(dialect: SqlDialect) -> Expr {
+    match dialect {
+        SqlDialect::Sqlite => function_expr("zeroblob", vec![integer_literal_expr(0)]),
+        SqlDialect::Postgres => function_expr(
+            "decode",
+            vec![
+                string_literal_expr("".to_string()),
+                string_literal_expr("hex".to_string()),
+            ],
+        ),
+    }
+}
+
 fn lower_sqlite_json_text(call: &LixJsonTextCall) -> Expr {
     let mut json_path = "$".to_string();
     for segment in &call.path {
@@ -66,4 +79,8 @@ fn function_expr(name: &str, args: Vec<Expr>) -> Expr {
 
 fn string_literal_expr(value: String) -> Expr {
     Expr::Value(AstValue::SingleQuotedString(value).into())
+}
+
+fn integer_literal_expr(value: i64) -> Expr {
+    Expr::Value(AstValue::Number(value.to_string(), false).into())
 }

@@ -1,0 +1,44 @@
+{
+  "x-lix-key": "lix_directory_descriptor",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-unique": [
+    [
+      "/parent_id",
+      "/name"
+    ]
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_file_id": "\"lix\"",
+    "lixcol_plugin_key": "\"lix\""
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-lix-default": "lix_uuid_v7()"
+    },
+    "parent_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^(?!\\.{1,2}$)[^/\\\\]+$"
+    },
+    "hidden": {
+      "type": "boolean",
+      "x-lix-default": "false"
+    }
+  },
+  "required": [
+    "id",
+    "parent_id",
+    "name"
+  ],
+  "additionalProperties": false
+}

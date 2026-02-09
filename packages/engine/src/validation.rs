@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use jsonschema::JSONSchema;
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::schema::{
     schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
@@ -67,12 +68,12 @@ pub async fn validate_updates(
 
     for plan in plans {
         let mut sql = format!(
-            "SELECT entity_id, file_id, version_id, plugin_key, schema_key, schema_version FROM {}",
+            "SELECT entity_id, file_id, version_id, plugin_key, schema_key, schema_version, snapshot_content FROM {}",
             plan.table
         );
         if let Some(where_clause) = &plan.where_clause {
             sql.push_str(" WHERE ");
-            sql.push_str(where_clause);
+            sql.push_str(&where_clause.to_string());
         }
 
         let result = backend.execute(&sql, &[]).await?;
@@ -80,14 +81,13 @@ pub async fn validate_updates(
             continue;
         }
 
-        let snapshot = plan.snapshot_content.as_ref();
-
         for row in result.rows {
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
+            let snapshot = resolve_update_snapshot(plan, row.get(6), &schema_key)?;
 
             if schema_key == STORED_SCHEMA_KEY {
-                if let Some(snapshot) = snapshot {
+                if let Some(snapshot) = snapshot.as_ref() {
                     validate_stored_schema_snapshot(&mut schema_provider, snapshot).await?;
                 }
                 continue;
@@ -105,7 +105,7 @@ pub async fn validate_updates(
                 });
             }
 
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = snapshot.as_ref() {
                 validate_snapshot_content(&mut schema_provider, cache, &key, snapshot).await?;
             }
         }
@@ -306,4 +306,58 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             message: format!("expected text value for {name}"),
         }),
     }
+}
+
+fn resolve_update_snapshot(
+    plan: &UpdateValidationPlan,
+    row_snapshot_value: Option<&Value>,
+    schema_key: &str,
+) -> Result<Option<JsonValue>, LixError> {
+    if let Some(snapshot) = plan.snapshot_content.as_ref() {
+        return Ok(Some(snapshot.clone()));
+    }
+    let Some(patch) = plan.snapshot_patch.as_ref() else {
+        return Ok(None);
+    };
+    let mut base = parse_row_snapshot_content(row_snapshot_value, schema_key)?;
+    apply_snapshot_patch(&mut base, patch, schema_key)?;
+    Ok(Some(base))
+}
+
+fn parse_row_snapshot_content(
+    value: Option<&Value>,
+    schema_key: &str,
+) -> Result<JsonValue, LixError> {
+    match value {
+        None | Some(Value::Null) => Ok(JsonValue::Object(JsonMap::new())),
+        Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text).map_err(|err| LixError {
+            message: format!(
+                "snapshot_content for schema '{}' is not valid JSON during update validation: {err}",
+                schema_key
+            ),
+        }),
+        Some(other) => Err(LixError {
+            message: format!(
+                "snapshot_content for schema '{}' must be text or null during update validation, got {other:?}",
+                schema_key
+            ),
+        }),
+    }
+}
+
+fn apply_snapshot_patch(
+    snapshot: &mut JsonValue,
+    patch: &BTreeMap<String, JsonValue>,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    let object = snapshot.as_object_mut().ok_or_else(|| LixError {
+        message: format!(
+            "snapshot_content for schema '{}' must be a JSON object for property update validation",
+            schema_key
+        ),
+    })?;
+    for (property, value) in patch {
+        object.insert(property.clone(), value.clone());
+    }
+    Ok(())
 }
