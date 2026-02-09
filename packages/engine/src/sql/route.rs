@@ -382,7 +382,8 @@ where
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
             let delete = if let Some(rewritten) =
-                filesystem_step::rewrite_delete_with_backend(backend, delete.clone()).await?
+                filesystem_step::rewrite_delete_with_backend(backend, delete.clone(), params)
+                    .await?
             {
                 rewritten
             } else {

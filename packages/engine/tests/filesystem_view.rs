@@ -360,6 +360,64 @@ simulation_test!(
 );
 
 simulation_test!(
+    directory_delete_with_parameterized_path_cascades_descendants,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
+                 VALUES ('dir-docs-param', '/docs/', NULL, 'docs')",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
+                 VALUES ('dir-guides-param', '/docs/guides/', 'dir-docs-param', 'guides')",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-cascade-param', '/docs/guides/intro.md', 'ignored')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "DELETE FROM lix_directory WHERE path = $1",
+                &[Value::Text("/docs/".to_string())],
+            )
+            .await
+            .unwrap();
+
+        let directories = engine
+            .execute("SELECT id FROM lix_directory ORDER BY id", &[])
+            .await
+            .unwrap();
+        let files = engine
+            .execute("SELECT id FROM lix_file ORDER BY id", &[])
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(directories.rows.clone());
+        sim.assert_deterministic(files.rows.clone());
+        assert!(directories.rows.is_empty());
+        assert!(files.rows.is_empty());
+    }
+);
+
+simulation_test!(
     directory_view_crud_rewrites_to_descriptor,
     |sim| async move {
         let engine = sim
@@ -1135,6 +1193,77 @@ simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
         )
         .await
         .expect_err("duplicate directory path should fail");
+    assert!(
+        err.message.contains("Unique constraint violation")
+            || err.message.contains("already exists"),
+        "unexpected error: {}",
+        err.message
+    );
+});
+
+simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine_deterministic()
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
+
+    engine
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-dup-a', '/docs/readme.md', 'ignored')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let err = engine
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-dup-b', '/docs/readme.md', 'ignored')",
+            &[],
+        )
+        .await
+        .expect_err("duplicate file path should fail");
+    assert!(
+        err.message.contains("Unique constraint violation")
+            || err.message.contains("already exists"),
+        "unexpected error: {}",
+        err.message
+    );
+});
+
+simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine_deterministic()
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
+
+    engine
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-path-a', '/docs/a.md', 'ignored')",
+            &[],
+        )
+        .await
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-path-b', '/docs/b.md', 'ignored')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let err = engine
+        .execute(
+            "UPDATE lix_file SET path = '/docs/a.md' WHERE id = 'file-path-b'",
+            &[],
+        )
+        .await
+        .expect_err("path update collision should fail");
     assert!(
         err.message.contains("Unique constraint violation")
             || err.message.contains("already exists"),
