@@ -1,0 +1,1852 @@
+use sqlparser::ast::{
+    Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr, Statement,
+    TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan, Values,
+};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::filesystem::path::{
+    compose_directory_path, directory_ancestor_paths, directory_name_from_path,
+    file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
+    normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
+};
+use crate::sql::escape_sql_string;
+use crate::sql::{
+    lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
+    rewrite_read_query_with_backend, PlaceholderState, ResolvedCell,
+};
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
+use crate::{LixBackend, LixError, Value as EngineValue};
+
+const FILE_VIEW: &str = "lix_file";
+const FILE_BY_VERSION_VIEW: &str = "lix_file_by_version";
+const FILE_HISTORY_VIEW: &str = "lix_file_history";
+const DIRECTORY_VIEW: &str = "lix_directory";
+const DIRECTORY_BY_VERSION_VIEW: &str = "lix_directory_by_version";
+const DIRECTORY_HISTORY_VIEW: &str = "lix_directory_history";
+
+const FILE_DESCRIPTOR_VIEW: &str = "lix_file_descriptor";
+const FILE_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_file_descriptor_by_version";
+const DIRECTORY_DESCRIPTOR_VIEW: &str = "lix_directory_descriptor";
+const DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_directory_descriptor_by_version";
+
+pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
+    let Some(target) = target_from_table_object(&insert.table) else {
+        return Ok(None);
+    };
+    if target.read_only {
+        return Err(LixError {
+            message: format!("{} does not support INSERT", target.view_name),
+        });
+    }
+
+    if target.is_file {
+        strip_file_data_from_insert(&mut insert)?;
+    }
+
+    insert.table = TableObject::TableName(table_name(target.rewrite_view_name));
+    Ok(Some(insert))
+}
+
+pub async fn rewrite_insert_with_backend(
+    backend: &dyn LixBackend,
+    mut insert: Insert,
+    params: &[EngineValue],
+) -> Result<Option<Insert>, LixError> {
+    let Some(target) = target_from_table_object(&insert.table) else {
+        return Ok(None);
+    };
+    if target.read_only {
+        return Err(LixError {
+            message: format!("{} does not support INSERT", target.view_name),
+        });
+    }
+
+    if target.is_file {
+        strip_file_data_from_insert(&mut insert)?;
+        rewrite_file_insert_columns_with_backend(backend, &mut insert, params, target).await?;
+    } else {
+        rewrite_directory_insert_columns_with_backend(backend, &mut insert, params, target).await?;
+    }
+
+    insert.table = TableObject::TableName(table_name(target.rewrite_view_name));
+    Ok(Some(insert))
+}
+
+pub async fn insert_side_effect_statements_with_backend(
+    backend: &dyn LixBackend,
+    insert: &Insert,
+    params: &[EngineValue],
+) -> Result<Vec<Statement>, LixError> {
+    let Some(target) = target_from_table_object(&insert.table) else {
+        return Ok(Vec::new());
+    };
+    if target.read_only {
+        return Ok(Vec::new());
+    }
+
+    let source = match &insert.source {
+        Some(source) => source,
+        None => return Ok(Vec::new()),
+    };
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if values.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let path_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("path"));
+    let Some(path_index) = path_index else {
+        return Ok(Vec::new());
+    };
+
+    let by_version_index = insert.columns.iter().position(|column| {
+        column.value.eq_ignore_ascii_case("lixcol_version_id")
+            || column.value.eq_ignore_ascii_case("version_id")
+    });
+    let active_version_id = if target.uses_active_version_scope() {
+        Some(load_active_version_id(backend).await?)
+    } else {
+        None
+    };
+
+    let resolved_rows = resolve_values_rows(&values.rows, params)?;
+    let mut directory_requests: Vec<(String, String)> = Vec::new();
+
+    for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
+        if row.len() != insert.columns.len() {
+            return Err(LixError {
+                message: "filesystem insert row length does not match column count".to_string(),
+            });
+        }
+
+        let Some(raw_path) =
+            resolve_text_expr(row.get(path_index), resolved_row.get(path_index), "path")?
+        else {
+            continue;
+        };
+        let normalized_path = if target.is_file {
+            normalize_file_path(&raw_path)?
+        } else {
+            normalize_directory_path(&raw_path)?
+        };
+
+        let version_id = if let Some(active_version_id) = &active_version_id {
+            active_version_id.clone()
+        } else if target.requires_explicit_version_scope() {
+            let Some(version_index) = by_version_index else {
+                continue;
+            };
+            let Some(version_id) = resolve_text_expr(
+                row.get(version_index),
+                resolved_row.get(version_index),
+                "version_id",
+            )?
+            else {
+                continue;
+            };
+            version_id
+        } else {
+            continue;
+        };
+
+        if target.is_file {
+            for ancestor in file_ancestor_directory_paths(&normalized_path) {
+                directory_requests.push((version_id.clone(), ancestor));
+            }
+        } else {
+            for ancestor in directory_ancestor_paths(&normalized_path) {
+                directory_requests.push((version_id.clone(), ancestor));
+            }
+        }
+    }
+
+    if directory_requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    directory_requests.sort_by(|left, right| {
+        let version_order = left.0.cmp(&right.0);
+        if version_order != std::cmp::Ordering::Equal {
+            return version_order;
+        }
+        let left_depth = path_depth(&left.1);
+        let right_depth = path_depth(&right.1);
+        left_depth
+            .cmp(&right_depth)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    directory_requests.dedup();
+
+    let mut known_ids: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut statements: Vec<Statement> = Vec::new();
+
+    for (version_id, path) in directory_requests {
+        let key = (version_id.clone(), path.clone());
+        if known_ids.contains_key(&key) {
+            continue;
+        }
+
+        if let Some(existing_id) = find_directory_id_by_path(backend, &version_id, &path).await? {
+            known_ids.insert(key, existing_id);
+            continue;
+        }
+
+        let parent_id = match parent_directory_path(&path) {
+            Some(parent_path) => {
+                let parent_key = (version_id.clone(), parent_path.clone());
+                if let Some(parent_id) = known_ids.get(&parent_key) {
+                    Some(parent_id.clone())
+                } else if let Some(existing_parent_id) =
+                    find_directory_id_by_path(backend, &version_id, &parent_path).await?
+                {
+                    known_ids.insert(parent_key, existing_parent_id.clone());
+                    Some(existing_parent_id)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
+        let id = auto_directory_id(&version_id, &path);
+        let name = directory_name_from_path(&path).unwrap_or_default();
+        let statement_sql = if target.uses_active_version_scope() {
+            format!(
+                "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_untracked) \
+                 VALUES ('{id}', {parent_id}, '{name}', 0, 1)",
+                table = DIRECTORY_DESCRIPTOR_VIEW,
+                id = escape_sql_string(&id),
+                parent_id = parent_id
+                    .map(|value| format!("'{}'", escape_sql_string(&value)))
+                    .unwrap_or_else(|| "NULL".to_string()),
+                name = escape_sql_string(&name),
+            )
+        } else {
+            format!(
+                "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('{id}', {parent_id}, '{name}', 0, '{version_id}', 1)",
+                table = DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
+                id = escape_sql_string(&id),
+                parent_id = parent_id
+                    .map(|value| format!("'{}'", escape_sql_string(&value)))
+                    .unwrap_or_else(|| "NULL".to_string()),
+                name = escape_sql_string(&name),
+                version_id = escape_sql_string(&version_id),
+            )
+        };
+        statements.push(parse_single_statement(&statement_sql)?);
+        known_ids.insert(key, id);
+    }
+
+    Ok(statements)
+}
+
+pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
+    let Some(target) = target_from_update_table(&update.table) else {
+        return Ok(None);
+    };
+    if target.read_only {
+        return Err(LixError {
+            message: format!("{} does not support UPDATE", target.view_name),
+        });
+    }
+
+    if target.is_file {
+        update.assignments.retain(|assignment| {
+            assignment_target_name(assignment)
+                .map(|name| !name.eq_ignore_ascii_case("data"))
+                .unwrap_or(true)
+        });
+        if update.assignments.is_empty() {
+            return Ok(Some(noop_statement()?));
+        }
+    }
+
+    replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
+    Ok(Some(Statement::Update(update)))
+}
+
+pub async fn rewrite_update_with_backend(
+    backend: &dyn LixBackend,
+    mut update: Update,
+    params: &[EngineValue],
+) -> Result<Option<Statement>, LixError> {
+    let Some(target) = target_from_update_table(&update.table) else {
+        return Ok(None);
+    };
+    if target.read_only {
+        return Err(LixError {
+            message: format!("{} does not support UPDATE", target.view_name),
+        });
+    }
+
+    if target.is_file {
+        update.assignments.retain(|assignment| {
+            assignment_target_name(assignment)
+                .map(|name| !name.eq_ignore_ascii_case("data"))
+                .unwrap_or(true)
+        });
+        if update.assignments.is_empty() {
+            return Ok(Some(noop_statement()?));
+        }
+        rewrite_file_update_assignments_with_backend(backend, &mut update, params, target).await?;
+    } else {
+        rewrite_directory_update_assignments_with_backend(backend, &mut update, params, target)
+            .await?;
+    }
+
+    replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
+    Ok(Some(Statement::Update(update)))
+}
+
+pub fn rewrite_delete(mut delete: Delete) -> Result<Option<Delete>, LixError> {
+    let Some(target) = target_from_delete(&delete) else {
+        return Ok(None);
+    };
+    if target.read_only {
+        return Err(LixError {
+            message: format!("{} does not support DELETE", target.view_name),
+        });
+    }
+
+    replace_delete_target_table(&mut delete, target.rewrite_view_name)?;
+    Ok(Some(delete))
+}
+
+pub async fn rewrite_delete_with_backend(
+    backend: &dyn LixBackend,
+    mut delete: Delete,
+) -> Result<Option<Delete>, LixError> {
+    let Some(target) = target_from_delete(&delete) else {
+        return Ok(None);
+    };
+    if target.read_only {
+        return Err(LixError {
+            message: format!("{} does not support DELETE", target.view_name),
+        });
+    }
+    if target.requires_explicit_version_scope()
+        && extract_predicate_string(
+            delete.selection.as_ref(),
+            &["lixcol_version_id", "version_id"],
+        )
+        .is_none()
+    {
+        return Err(LixError {
+            message: format!(
+                "{} delete requires a version_id predicate",
+                target.view_name
+            ),
+        });
+    }
+
+    if target.is_directory() {
+        let selected = directory_rows_matching_delete(backend, &delete, target).await?;
+        let expanded = expand_directory_descendants(backend, &selected).await?;
+        if !expanded.is_empty() {
+            let predicate = build_directory_delete_selection(&expanded, target)?;
+            delete.selection = Some(parse_expression(&predicate)?);
+        }
+    }
+
+    replace_delete_target_table(&mut delete, target.rewrite_view_name)?;
+    Ok(Some(delete))
+}
+
+#[derive(Clone, Copy)]
+struct FilesystemTarget {
+    view_name: &'static str,
+    rewrite_view_name: &'static str,
+    read_only: bool,
+    is_file: bool,
+}
+
+impl FilesystemTarget {
+    fn is_directory(self) -> bool {
+        !self.is_file
+    }
+
+    fn uses_active_version_scope(self) -> bool {
+        self.view_name.eq_ignore_ascii_case(FILE_VIEW)
+            || self.view_name.eq_ignore_ascii_case(DIRECTORY_VIEW)
+    }
+
+    fn requires_explicit_version_scope(self) -> bool {
+        self.view_name.eq_ignore_ascii_case(FILE_BY_VERSION_VIEW)
+            || self
+                .view_name
+                .eq_ignore_ascii_case(DIRECTORY_BY_VERSION_VIEW)
+    }
+}
+
+fn target_from_table_object(table: &TableObject) -> Option<FilesystemTarget> {
+    let name = match table {
+        TableObject::TableName(name) => name,
+        _ => return None,
+    };
+    let view_name = object_name_terminal(name)?;
+    target_from_view_name(&view_name)
+}
+
+fn target_from_update_table(table: &TableWithJoins) -> Option<FilesystemTarget> {
+    if !table.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &table.relation else {
+        return None;
+    };
+    let view_name = object_name_terminal(name)?;
+    target_from_view_name(&view_name)
+}
+
+fn target_from_delete(delete: &Delete) -> Option<FilesystemTarget> {
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    if tables.len() != 1 {
+        return None;
+    }
+    target_from_update_table(&tables[0])
+}
+
+fn target_from_view_name(view_name: &str) -> Option<FilesystemTarget> {
+    match view_name.to_ascii_lowercase().as_str() {
+        FILE_VIEW => Some(FilesystemTarget {
+            view_name: FILE_VIEW,
+            rewrite_view_name: FILE_DESCRIPTOR_VIEW,
+            read_only: false,
+            is_file: true,
+        }),
+        FILE_BY_VERSION_VIEW => Some(FilesystemTarget {
+            view_name: FILE_BY_VERSION_VIEW,
+            rewrite_view_name: FILE_DESCRIPTOR_BY_VERSION_VIEW,
+            read_only: false,
+            is_file: true,
+        }),
+        FILE_HISTORY_VIEW => Some(FilesystemTarget {
+            view_name: FILE_HISTORY_VIEW,
+            rewrite_view_name: FILE_DESCRIPTOR_VIEW,
+            read_only: true,
+            is_file: true,
+        }),
+        DIRECTORY_VIEW => Some(FilesystemTarget {
+            view_name: DIRECTORY_VIEW,
+            rewrite_view_name: DIRECTORY_DESCRIPTOR_VIEW,
+            read_only: false,
+            is_file: false,
+        }),
+        DIRECTORY_BY_VERSION_VIEW => Some(FilesystemTarget {
+            view_name: DIRECTORY_BY_VERSION_VIEW,
+            rewrite_view_name: DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
+            read_only: false,
+            is_file: false,
+        }),
+        DIRECTORY_HISTORY_VIEW => Some(FilesystemTarget {
+            view_name: DIRECTORY_HISTORY_VIEW,
+            rewrite_view_name: DIRECTORY_DESCRIPTOR_VIEW,
+            read_only: true,
+            is_file: false,
+        }),
+        _ => None,
+    }
+}
+
+async fn rewrite_file_insert_columns_with_backend(
+    backend: &dyn LixBackend,
+    insert: &mut Insert,
+    params: &[EngineValue],
+    target: FilesystemTarget,
+) -> Result<(), LixError> {
+    let path_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("path"))
+        .ok_or_else(|| LixError {
+            message: format!("{} insert requires path", target.view_name),
+        })?;
+    let by_version_index = insert.columns.iter().position(|column| {
+        column.value.eq_ignore_ascii_case("lixcol_version_id")
+            || column.value.eq_ignore_ascii_case("version_id")
+    });
+    let active_version_id = if target.uses_active_version_scope() {
+        Some(load_active_version_id(backend).await?)
+    } else {
+        None
+    };
+
+    let source = insert.source.as_ref().ok_or_else(|| LixError {
+        message: "filesystem insert requires VALUES rows".to_string(),
+    })?;
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(LixError {
+            message: "filesystem insert requires VALUES rows".to_string(),
+        });
+    };
+    let row_exprs = values.rows.clone();
+    let resolved_rows = resolve_values_rows(&row_exprs, params)?;
+
+    let directory_id_index = ensure_insert_column(insert, "directory_id")?;
+    let name_index = ensure_insert_column(insert, "name")?;
+    let extension_index = ensure_insert_column(insert, "extension")?;
+    let rows = insert_values_rows_mut(insert)?;
+
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let resolved_row = resolved_rows.get(row_index).ok_or_else(|| LixError {
+            message: "filesystem insert row resolution mismatch".to_string(),
+        })?;
+        let row_expr = row_exprs.get(row_index).ok_or_else(|| LixError {
+            message: "filesystem insert row expression mismatch".to_string(),
+        })?;
+
+        let raw_path = resolve_text_expr(
+            row_expr.get(path_index),
+            resolved_row.get(path_index),
+            "file path",
+        )?
+        .ok_or_else(|| LixError {
+            message: "lix_file insert requires path".to_string(),
+        })?;
+        let parsed = parse_file_path(&raw_path)?;
+        let version_id = resolve_insert_row_version_id(
+            target,
+            &active_version_id,
+            by_version_index,
+            row_expr,
+            resolved_row,
+        )?;
+
+        assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
+
+        let directory_id = if let Some(directory_path) = &parsed.directory_path {
+            if let Some(existing_id) =
+                find_directory_id_by_path(backend, &version_id, directory_path).await?
+            {
+                Some(existing_id)
+            } else {
+                Some(auto_directory_id(&version_id, directory_path))
+            }
+        } else {
+            None
+        };
+
+        row[directory_id_index] = optional_string_literal_expr(directory_id.as_deref());
+        row[name_index] = string_literal_expr(&parsed.name);
+        row[extension_index] = optional_string_literal_expr(parsed.extension.as_deref());
+    }
+
+    remove_insert_column(insert, "path")?;
+    Ok(())
+}
+
+async fn rewrite_directory_insert_columns_with_backend(
+    backend: &dyn LixBackend,
+    insert: &mut Insert,
+    params: &[EngineValue],
+    target: FilesystemTarget,
+) -> Result<(), LixError> {
+    let path_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("path"));
+    let parent_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("parent_id"));
+    let name_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("name"));
+    let id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("id"));
+    let by_version_index = insert.columns.iter().position(|column| {
+        column.value.eq_ignore_ascii_case("lixcol_version_id")
+            || column.value.eq_ignore_ascii_case("version_id")
+    });
+    let active_version_id = if target.uses_active_version_scope() {
+        Some(load_active_version_id(backend).await?)
+    } else {
+        None
+    };
+
+    let source = insert.source.as_ref().ok_or_else(|| LixError {
+        message: "filesystem insert requires VALUES rows".to_string(),
+    })?;
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Err(LixError {
+            message: "filesystem insert requires VALUES rows".to_string(),
+        });
+    };
+    let row_exprs = values.rows.clone();
+    let resolved_rows = resolve_values_rows(&row_exprs, params)?;
+
+    let ensured_parent_index = ensure_insert_column(insert, "parent_id")?;
+    let ensured_name_index = ensure_insert_column(insert, "name")?;
+    let rows = insert_values_rows_mut(insert)?;
+
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let resolved_row = resolved_rows.get(row_index).ok_or_else(|| LixError {
+            message: "filesystem insert row resolution mismatch".to_string(),
+        })?;
+        let row_expr = row_exprs.get(row_index).ok_or_else(|| LixError {
+            message: "filesystem insert row expression mismatch".to_string(),
+        })?;
+        let version_id = resolve_insert_row_version_id(
+            target,
+            &active_version_id,
+            by_version_index,
+            row_expr,
+            resolved_row,
+        )?;
+
+        let explicit_id = id_index
+            .map(|index| {
+                resolve_text_expr(row_expr.get(index), resolved_row.get(index), "directory id")
+            })
+            .transpose()?
+            .flatten();
+        let explicit_parent_id = parent_index
+            .map(|index| {
+                resolve_text_expr(
+                    row_expr.get(index),
+                    resolved_row.get(index),
+                    "directory parent_id",
+                )
+            })
+            .transpose()?
+            .flatten();
+        let explicit_name = name_index
+            .map(|index| {
+                resolve_text_expr(
+                    row_expr.get(index),
+                    resolved_row.get(index),
+                    "directory name",
+                )
+            })
+            .transpose()?
+            .flatten();
+        let explicit_path = path_index
+            .map(|index| {
+                resolve_text_expr(
+                    row_expr.get(index),
+                    resolved_row.get(index),
+                    "directory path",
+                )
+            })
+            .transpose()?
+            .flatten();
+
+        let (computed_parent_id, computed_name, computed_path) =
+            if let Some(raw_path) = explicit_path {
+                let normalized_path = normalize_directory_path(&raw_path)?;
+                let derived_name =
+                    directory_name_from_path(&normalized_path).ok_or_else(|| LixError {
+                        message: "Directory name must be provided".to_string(),
+                    })?;
+                let parent_path = parent_directory_path(&normalized_path);
+                let derived_parent_id = match parent_path {
+                    Some(ref parent_path) => {
+                        if let Some(existing_parent_id) =
+                            find_directory_id_by_path(backend, &version_id, parent_path).await?
+                        {
+                            Some(existing_parent_id)
+                        } else {
+                            Some(auto_directory_id(&version_id, parent_path))
+                        }
+                    }
+                    None => None,
+                };
+
+                if explicit_parent_id.as_deref() != derived_parent_id.as_deref()
+                    && explicit_parent_id.is_some()
+                {
+                    return Err(LixError {
+                        message: format!(
+                            "Provided parent_id does not match parent derived from path {}",
+                            normalized_path
+                        ),
+                    });
+                }
+                if let Some(name) = explicit_name {
+                    if normalize_path_segment(&name)? != derived_name {
+                        return Err(LixError {
+                            message: format!(
+                                "Provided directory name '{}' does not match path '{}'",
+                                name, normalized_path
+                            ),
+                        });
+                    }
+                }
+
+                (derived_parent_id, derived_name, normalized_path)
+            } else {
+                let raw_name = explicit_name.unwrap_or_default();
+                if raw_name.trim().is_empty() {
+                    return Err(LixError {
+                        message: "Directory name must be provided".to_string(),
+                    });
+                }
+                let name = normalize_path_segment(&raw_name)?;
+                let parent_path = match explicit_parent_id.as_deref() {
+                    Some(parent_id) => read_directory_path_by_id(backend, &version_id, parent_id)
+                        .await?
+                        .ok_or_else(|| LixError {
+                            message: format!("Parent directory does not exist for id {parent_id}"),
+                        })?,
+                    None => "/".to_string(),
+                };
+                let computed_path = compose_directory_path(parent_path.as_str(), &name)?;
+                (explicit_parent_id, name, computed_path)
+            };
+
+        if let Some(existing_id) =
+            find_directory_id_by_path(backend, &version_id, &computed_path).await?
+        {
+            let same_id = explicit_id
+                .as_deref()
+                .map(|value| value == existing_id.as_str())
+                .unwrap_or(false);
+            if !same_id {
+                return Err(directory_unique_error(&computed_path, &version_id));
+            }
+        }
+
+        assert_no_file_at_directory_path(backend, &version_id, &computed_path).await?;
+
+        row[ensured_parent_index] = optional_string_literal_expr(computed_parent_id.as_deref());
+        row[ensured_name_index] = string_literal_expr(&computed_name);
+    }
+
+    remove_insert_column(insert, "path")?;
+    Ok(())
+}
+
+async fn rewrite_file_update_assignments_with_backend(
+    backend: &dyn LixBackend,
+    update: &mut Update,
+    params: &[EngineValue],
+    target: FilesystemTarget,
+) -> Result<(), LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    let mut next_path: Option<String> = None;
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            continue;
+        };
+        let resolved =
+            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
+        if column.eq_ignore_ascii_case("path") {
+            next_path = resolve_text_expr(Some(&assignment.value), Some(&resolved), "file path")?;
+        }
+    }
+    let Some(raw_path) = next_path else {
+        return Ok(());
+    };
+
+    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let parsed = parse_file_path(&raw_path)?;
+    assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
+
+    let directory_id = if let Some(directory_path) = &parsed.directory_path {
+        Some(
+            find_directory_id_by_path(backend, &version_id, directory_path)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!(
+                        "Parent directory does not exist for path {}",
+                        directory_path
+                    ),
+                })?,
+        )
+    } else {
+        None
+    };
+
+    update.assignments.retain(|assignment| {
+        assignment_target_name(assignment)
+            .map(|name| !name.eq_ignore_ascii_case("path"))
+            .unwrap_or(true)
+    });
+    set_or_replace_update_assignment(
+        update,
+        "directory_id",
+        optional_string_literal_expr(directory_id.as_deref()),
+    );
+    set_or_replace_update_assignment(update, "name", string_literal_expr(&parsed.name));
+    set_or_replace_update_assignment(
+        update,
+        "extension",
+        optional_string_literal_expr(parsed.extension.as_deref()),
+    );
+
+    Ok(())
+}
+
+async fn rewrite_directory_update_assignments_with_backend(
+    backend: &dyn LixBackend,
+    update: &mut Update,
+    params: &[EngineValue],
+    target: FilesystemTarget,
+) -> Result<(), LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    let mut next_path: Option<String> = None;
+    let mut next_parent_id: Option<Option<String>> = None;
+    let mut next_name: Option<String> = None;
+
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            continue;
+        };
+        let resolved =
+            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
+        if column.eq_ignore_ascii_case("path") {
+            next_path =
+                resolve_text_expr(Some(&assignment.value), Some(&resolved), "directory path")?;
+        } else if column.eq_ignore_ascii_case("parent_id") {
+            next_parent_id = Some(resolve_text_expr(
+                Some(&assignment.value),
+                Some(&resolved),
+                "directory parent_id",
+            )?);
+        } else if column.eq_ignore_ascii_case("name") {
+            next_name =
+                resolve_text_expr(Some(&assignment.value), Some(&resolved), "directory name")?;
+        }
+    }
+
+    if next_path.is_none() && next_parent_id.is_none() && next_name.is_none() {
+        return Ok(());
+    }
+
+    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let current_directory_id =
+        extract_predicate_string(update.selection.as_ref(), &["id", "lixcol_entity_id"]);
+    let Some(current_directory_id) = current_directory_id else {
+        return Err(LixError {
+            message: "lix_directory update requires an id predicate".to_string(),
+        });
+    };
+
+    let existing = read_directory_descriptor_by_id(backend, &version_id, &current_directory_id)
+        .await?
+        .ok_or_else(|| LixError {
+            message: format!("Directory does not exist for id {}", current_directory_id),
+        })?;
+
+    let (resolved_parent_id, resolved_name, resolved_path) = if let Some(raw_path) = next_path {
+        let normalized_path = normalize_directory_path(&raw_path)?;
+        let name = directory_name_from_path(&normalized_path).ok_or_else(|| LixError {
+            message: "Directory name must be provided".to_string(),
+        })?;
+        let parent_id = match parent_directory_path(&normalized_path) {
+            Some(parent_path) => find_directory_id_by_path(backend, &version_id, &parent_path)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!("Parent directory does not exist for path {}", parent_path),
+                })?,
+            None => String::new(),
+        };
+        let parent_id_opt = if parent_id.is_empty() {
+            None
+        } else {
+            Some(parent_id)
+        };
+        (parent_id_opt, name, normalized_path)
+    } else {
+        let parent_id = next_parent_id.unwrap_or(existing.parent_id.clone());
+        let name_raw = next_name.unwrap_or(existing.name.clone());
+        let name = normalize_path_segment(&name_raw)?;
+        if name.is_empty() {
+            return Err(LixError {
+                message: "Directory name must be provided".to_string(),
+            });
+        }
+        let parent_path = if let Some(parent_id) = parent_id.as_deref() {
+            read_directory_path_by_id(backend, &version_id, parent_id)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!("Parent directory does not exist for id {}", parent_id),
+                })?
+        } else {
+            "/".to_string()
+        };
+        let path = compose_directory_path(&parent_path, &name)?;
+        (parent_id, name, path)
+    };
+
+    if resolved_parent_id.as_deref() == Some(current_directory_id.as_str()) {
+        return Err(LixError {
+            message: "Directory cannot be its own parent".to_string(),
+        });
+    }
+    if let Some(parent_id) = resolved_parent_id.as_deref() {
+        assert_no_directory_cycle(
+            backend,
+            &version_id,
+            current_directory_id.as_str(),
+            parent_id,
+        )
+        .await?;
+    }
+    if let Some(existing_id) =
+        find_directory_id_by_path(backend, &version_id, &resolved_path).await?
+    {
+        if existing_id != current_directory_id {
+            return Err(directory_unique_error(&resolved_path, &version_id));
+        }
+    }
+    assert_no_file_at_directory_path(backend, &version_id, &resolved_path).await?;
+
+    update.assignments.retain(|assignment| {
+        assignment_target_name(assignment)
+            .map(|name| !name.eq_ignore_ascii_case("path"))
+            .unwrap_or(true)
+    });
+    set_or_replace_update_assignment(
+        update,
+        "parent_id",
+        optional_string_literal_expr(resolved_parent_id.as_deref()),
+    );
+    set_or_replace_update_assignment(update, "name", string_literal_expr(&resolved_name));
+
+    Ok(())
+}
+
+fn resolve_insert_row_version_id(
+    target: FilesystemTarget,
+    active_version_id: &Option<String>,
+    by_version_index: Option<usize>,
+    row_expr: &[Expr],
+    resolved_row: &[ResolvedCell],
+) -> Result<String, LixError> {
+    if let Some(version_id) = active_version_id {
+        return Ok(version_id.clone());
+    }
+    if target.requires_explicit_version_scope() {
+        let version_index = by_version_index.ok_or_else(|| LixError {
+            message: format!(
+                "{} insert requires lixcol_version_id or version_id",
+                target.view_name
+            ),
+        })?;
+        return resolve_text_expr(
+            row_expr.get(version_index),
+            resolved_row.get(version_index),
+            "version_id",
+        )?
+        .ok_or_else(|| LixError {
+            message: format!(
+                "{} insert requires lixcol_version_id or version_id",
+                target.view_name
+            ),
+        });
+    }
+    Err(LixError {
+        message: "filesystem insert could not resolve version scope".to_string(),
+    })
+}
+
+async fn resolve_update_version_id(
+    backend: &dyn LixBackend,
+    update: &Update,
+    target: FilesystemTarget,
+) -> Result<String, LixError> {
+    if target.uses_active_version_scope() {
+        return load_active_version_id(backend).await;
+    }
+    if target.requires_explicit_version_scope() {
+        return extract_predicate_string(
+            update.selection.as_ref(),
+            &["lixcol_version_id", "version_id"],
+        )
+        .ok_or_else(|| LixError {
+            message: format!(
+                "{} update requires a version_id predicate",
+                target.view_name
+            ),
+        });
+    }
+    Err(LixError {
+        message: "filesystem update could not resolve version scope".to_string(),
+    })
+}
+
+fn set_or_replace_update_assignment(update: &mut Update, column: &str, value: Expr) {
+    if let Some(existing) = update.assignments.iter_mut().find(|assignment| {
+        assignment_target_name(assignment)
+            .map(|name| name.eq_ignore_ascii_case(column))
+            .unwrap_or(false)
+    }) {
+        existing.value = value;
+        return;
+    }
+    update.assignments.push(sqlparser::ast::Assignment {
+        target: sqlparser::ast::AssignmentTarget::ColumnName(table_name(column)),
+        value,
+    });
+}
+
+fn ensure_insert_column(insert: &mut Insert, column: &str) -> Result<usize, LixError> {
+    if let Some(index) = insert
+        .columns
+        .iter()
+        .position(|candidate| candidate.value.eq_ignore_ascii_case(column))
+    {
+        return Ok(index);
+    }
+    insert.columns.push(Ident::new(column));
+    for row in insert_values_rows_mut(insert)? {
+        row.push(Expr::Value(AstValue::Null.into()));
+    }
+    Ok(insert.columns.len() - 1)
+}
+
+fn remove_insert_column(insert: &mut Insert, column: &str) -> Result<(), LixError> {
+    let Some(index) = insert
+        .columns
+        .iter()
+        .position(|candidate| candidate.value.eq_ignore_ascii_case(column))
+    else {
+        return Ok(());
+    };
+    insert.columns.remove(index);
+    for row in insert_values_rows_mut(insert)? {
+        if index < row.len() {
+            row.remove(index);
+        }
+    }
+    Ok(())
+}
+
+fn insert_values_rows_mut(insert: &mut Insert) -> Result<&mut Vec<Vec<Expr>>, LixError> {
+    let source = insert.source.as_mut().ok_or_else(|| LixError {
+        message: "filesystem insert requires VALUES rows".to_string(),
+    })?;
+    let SetExpr::Values(values) = source.body.as_mut() else {
+        return Err(LixError {
+            message: "filesystem insert requires VALUES rows".to_string(),
+        });
+    };
+    Ok(&mut values.rows)
+}
+
+fn directory_unique_error(path: &str, version_id: &str) -> LixError {
+    LixError {
+        message: format!(
+            "Unique constraint violation: directory path '{}' already exists in version '{}'",
+            path, version_id
+        ),
+    }
+}
+
+async fn find_directory_id_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<String>, LixError> {
+    let lookup_sql = "SELECT id \
+         FROM lix_directory_by_version \
+         WHERE lixcol_version_id = $1 AND path = $2 \
+         LIMIT 1";
+    let rewritten_lookup_sql = rewrite_single_read_query_for_backend(backend, lookup_sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_lookup_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(path.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let Some(value) = row.first() else {
+        return Ok(None);
+    };
+    let EngineValue::Text(id) = value else {
+        return Err(LixError {
+            message: format!("directory lookup expected text id, got {value:?}"),
+        });
+    };
+    Ok(Some(id.clone()))
+}
+
+async fn rewrite_single_read_query_for_backend(
+    backend: &dyn LixBackend,
+    sql: &str,
+) -> Result<String, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "expected a single SELECT statement".to_string(),
+        });
+    }
+    let statement = statements.remove(0);
+    let Statement::Query(query) = statement else {
+        return Err(LixError {
+            message: "expected SELECT statement".to_string(),
+        });
+    };
+    let rewritten = rewrite_read_query_with_backend(backend, *query).await?;
+    let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
+    Ok(lowered.to_string())
+}
+
+fn resolve_text_expr(
+    expr: Option<&Expr>,
+    cell: Option<&ResolvedCell>,
+    context: &str,
+) -> Result<Option<String>, LixError> {
+    if let Some(cell) = cell {
+        if let Some(value) = &cell.value {
+            return match value {
+                EngineValue::Null => Ok(None),
+                EngineValue::Text(value) => Ok(Some(value.clone())),
+                EngineValue::Integer(value) => Ok(Some(value.to_string())),
+                EngineValue::Real(value) => Ok(Some(value.to_string())),
+                EngineValue::Blob(_) => Err(LixError {
+                    message: format!("{context} does not support blob values"),
+                }),
+            };
+        }
+    }
+
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return Ok(None);
+    };
+    match value {
+        AstValue::Null => Ok(None),
+        AstValue::SingleQuotedString(value)
+        | AstValue::DoubleQuotedString(value)
+        | AstValue::TripleSingleQuotedString(value)
+        | AstValue::TripleDoubleQuotedString(value)
+        | AstValue::EscapedStringLiteral(value)
+        | AstValue::UnicodeStringLiteral(value)
+        | AstValue::NationalStringLiteral(value)
+        | AstValue::HexStringLiteral(value)
+        | AstValue::SingleQuotedRawStringLiteral(value)
+        | AstValue::DoubleQuotedRawStringLiteral(value)
+        | AstValue::TripleSingleQuotedRawStringLiteral(value)
+        | AstValue::TripleDoubleQuotedRawStringLiteral(value)
+        | AstValue::SingleQuotedByteStringLiteral(value)
+        | AstValue::DoubleQuotedByteStringLiteral(value)
+        | AstValue::TripleSingleQuotedByteStringLiteral(value)
+        | AstValue::TripleDoubleQuotedByteStringLiteral(value) => Ok(Some(value.clone())),
+        AstValue::DollarQuotedString(value) => Ok(Some(value.value.clone())),
+        AstValue::Number(value, _) => Ok(Some(value.clone())),
+        AstValue::Boolean(value) => Ok(Some(if *value {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        })),
+        AstValue::Placeholder(_) => Ok(None),
+    }
+}
+
+fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Option<String> {
+    let selection = selection?;
+    match selection {
+        Expr::BinaryOp { left, op, right } => {
+            if op.to_string().eq_ignore_ascii_case("=") {
+                if let Some(column) = expr_column_name(left) {
+                    if columns
+                        .iter()
+                        .any(|candidate| column.eq_ignore_ascii_case(candidate))
+                    {
+                        if let Some(value) = expr_string_literal(right) {
+                            return Some(value);
+                        }
+                    }
+                }
+                if let Some(column) = expr_column_name(right) {
+                    if columns
+                        .iter()
+                        .any(|candidate| column.eq_ignore_ascii_case(candidate))
+                    {
+                        if let Some(value) = expr_string_literal(left) {
+                            return Some(value);
+                        }
+                    }
+                }
+            }
+            extract_predicate_string(Some(left), columns)
+                .or_else(|| extract_predicate_string(Some(right), columns))
+        }
+        Expr::Nested(inner) => extract_predicate_string(Some(inner), columns),
+        _ => None,
+    }
+}
+
+fn expr_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
+        _ => None,
+    }
+}
+
+fn expr_string_literal(expr: &Expr) -> Option<String> {
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return None;
+    };
+    match value {
+        AstValue::SingleQuotedString(value)
+        | AstValue::DoubleQuotedString(value)
+        | AstValue::TripleSingleQuotedString(value)
+        | AstValue::TripleDoubleQuotedString(value)
+        | AstValue::EscapedStringLiteral(value)
+        | AstValue::UnicodeStringLiteral(value)
+        | AstValue::NationalStringLiteral(value)
+        | AstValue::HexStringLiteral(value)
+        | AstValue::SingleQuotedRawStringLiteral(value)
+        | AstValue::DoubleQuotedRawStringLiteral(value)
+        | AstValue::TripleSingleQuotedRawStringLiteral(value)
+        | AstValue::TripleDoubleQuotedRawStringLiteral(value)
+        | AstValue::SingleQuotedByteStringLiteral(value)
+        | AstValue::DoubleQuotedByteStringLiteral(value)
+        | AstValue::TripleSingleQuotedByteStringLiteral(value)
+        | AstValue::TripleDoubleQuotedByteStringLiteral(value) => Some(value.clone()),
+        AstValue::DollarQuotedString(value) => Some(value.value.clone()),
+        AstValue::Number(value, _) => Some(value.clone()),
+        AstValue::Boolean(value) => Some(if *value {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        }),
+        AstValue::Null | AstValue::Placeholder(_) => None,
+    }
+}
+
+async fn load_active_version_id(backend: &dyn LixBackend) -> Result<String, LixError> {
+    let result = backend
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = $1 \
+               AND file_id = $2 \
+               AND version_id = $3 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+            &[
+                EngineValue::Text(active_version_schema_key().to_string()),
+                EngineValue::Text(active_version_file_id().to_string()),
+                EngineValue::Text(active_version_storage_version_id().to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Err(LixError {
+            message: "filesystem rewrite requires an active version".to_string(),
+        });
+    };
+    let Some(snapshot_content) = row.first() else {
+        return Err(LixError {
+            message: "filesystem active version query row is missing snapshot_content".to_string(),
+        });
+    };
+    let EngineValue::Text(snapshot_content) = snapshot_content else {
+        return Err(LixError {
+            message: format!(
+                "filesystem active version snapshot_content must be text, got {snapshot_content:?}"
+            ),
+        });
+    };
+    parse_active_version_snapshot(snapshot_content)
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryDescriptorSnapshot {
+    parent_id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScopedDirectoryId {
+    id: String,
+    version_id: String,
+}
+
+fn string_literal_expr(value: &str) -> Expr {
+    Expr::Value(AstValue::SingleQuotedString(value.to_string()).into())
+}
+
+fn optional_string_literal_expr(value: Option<&str>) -> Expr {
+    match value {
+        Some(value) => string_literal_expr(value),
+        None => Expr::Value(AstValue::Null.into()),
+    }
+}
+
+fn auto_directory_id(version_id: &str, path: &str) -> String {
+    format!("lix-auto-dir:{}:{}", version_id, path)
+}
+
+async fn assert_no_directory_at_file_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    file_path: &str,
+) -> Result<(), LixError> {
+    let directory_path = format!("{file_path}/");
+    let sql = "SELECT id \
+         FROM lix_directory_by_version \
+         WHERE lixcol_version_id = $1 AND path = $2 \
+         LIMIT 1";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(directory_path.clone()),
+            ],
+        )
+        .await?;
+    if result.rows.is_empty() {
+        return Ok(());
+    }
+    Err(LixError {
+        message: format!("File path collides with existing directory path: {directory_path}"),
+    })
+}
+
+async fn assert_no_file_at_directory_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_path: &str,
+) -> Result<(), LixError> {
+    let file_path = directory_path.trim_end_matches('/').to_string();
+    let sql = "SELECT id \
+         FROM lix_file_by_version \
+         WHERE lixcol_version_id = $1 AND path = $2 \
+         LIMIT 1";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(file_path.clone()),
+            ],
+        )
+        .await?;
+    if result.rows.is_empty() {
+        return Ok(());
+    }
+    Err(LixError {
+        message: format!("Directory path collides with existing file path: {file_path}"),
+    })
+}
+
+async fn read_directory_path_by_id(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: &str,
+) -> Result<Option<String>, LixError> {
+    let sql = "SELECT path \
+         FROM lix_directory_by_version \
+         WHERE lixcol_version_id = $1 AND id = $2 \
+         LIMIT 1";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(directory_id.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let Some(value) = row.first() else {
+        return Ok(None);
+    };
+    match value {
+        EngineValue::Text(path) => Ok(Some(path.clone())),
+        other => Err(LixError {
+            message: format!("directory path lookup expected text path, got {other:?}"),
+        }),
+    }
+}
+
+async fn read_directory_descriptor_by_id(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: &str,
+) -> Result<Option<DirectoryDescriptorSnapshot>, LixError> {
+    let sql = "SELECT \
+         lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
+         lix_json_text(snapshot_content, 'name') AS name \
+         FROM lix_state_by_version \
+         WHERE schema_key = 'lix_directory_descriptor' \
+           AND snapshot_content IS NOT NULL \
+           AND version_id = $1 \
+           AND lix_json_text(snapshot_content, 'id') = $2 \
+         LIMIT 1";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(directory_id.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    if row.len() < 2 {
+        return Err(LixError {
+            message: "directory descriptor lookup expected two columns".to_string(),
+        });
+    }
+    let parent_id = match &row[0] {
+        EngineValue::Null => None,
+        EngineValue::Text(value) => Some(value.clone()),
+        other => {
+            return Err(LixError {
+                message: format!(
+                    "directory descriptor parent_id expected text/null, got {other:?}"
+                ),
+            })
+        }
+    };
+    let name = match &row[1] {
+        EngineValue::Text(value) => value.clone(),
+        other => {
+            return Err(LixError {
+                message: format!("directory descriptor name expected text, got {other:?}"),
+            })
+        }
+    };
+    Ok(Some(DirectoryDescriptorSnapshot { parent_id, name }))
+}
+
+async fn assert_no_directory_cycle(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: &str,
+    parent_id: &str,
+) -> Result<(), LixError> {
+    let mut safety = 0usize;
+    let mut current_parent: Option<String> = Some(parent_id.to_string());
+    while let Some(parent_id) = current_parent {
+        if parent_id == directory_id {
+            return Err(LixError {
+                message: "Directory parent would create a cycle".to_string(),
+            });
+        }
+        if safety > 1024 {
+            return Err(LixError {
+                message: "Directory hierarchy appears to be cyclic".to_string(),
+            });
+        }
+        safety += 1;
+
+        let Some(snapshot) =
+            read_directory_descriptor_by_id(backend, version_id, &parent_id).await?
+        else {
+            return Err(LixError {
+                message: format!("Parent directory does not exist for id {}", parent_id),
+            });
+        };
+        current_parent = snapshot.parent_id;
+    }
+    Ok(())
+}
+
+async fn directory_rows_matching_delete(
+    backend: &dyn LixBackend,
+    delete: &Delete,
+    target: FilesystemTarget,
+) -> Result<Vec<ScopedDirectoryId>, LixError> {
+    let where_clause = delete
+        .selection
+        .as_ref()
+        .map(|selection| format!(" WHERE {selection}"))
+        .unwrap_or_default();
+    let active_version_id = if target.uses_active_version_scope() {
+        Some(load_active_version_id(backend).await?)
+    } else {
+        None
+    };
+    let sql = if target.uses_active_version_scope() {
+        format!(
+            "SELECT id FROM {view_name}{where_clause}",
+            view_name = target.view_name,
+            where_clause = where_clause
+        )
+    } else {
+        format!(
+            "SELECT id, lixcol_version_id FROM {view_name}{where_clause}",
+            view_name = target.view_name,
+            where_clause = where_clause
+        )
+    };
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let result = backend.execute(&rewritten_sql, &[]).await?;
+
+    let mut rows: Vec<ScopedDirectoryId> = Vec::new();
+    for row in result.rows {
+        if target.uses_active_version_scope() {
+            let version_id = active_version_id.clone().ok_or_else(|| LixError {
+                message: "active version id is missing for directory delete".to_string(),
+            })?;
+            let id = match row.first() {
+                Some(EngineValue::Text(value)) => value.clone(),
+                Some(other) => {
+                    return Err(LixError {
+                        message: format!("directory delete id lookup expected text, got {other:?}"),
+                    })
+                }
+                None => continue,
+            };
+            rows.push(ScopedDirectoryId { id, version_id });
+        } else {
+            if row.len() < 2 {
+                continue;
+            }
+            let id = match &row[0] {
+                EngineValue::Text(value) => value.clone(),
+                other => {
+                    return Err(LixError {
+                        message: format!("directory delete id lookup expected text, got {other:?}"),
+                    })
+                }
+            };
+            let version_id = match &row[1] {
+                EngineValue::Text(value) => value.clone(),
+                other => {
+                    return Err(LixError {
+                        message: format!(
+                            "directory delete version lookup expected text, got {other:?}"
+                        ),
+                    })
+                }
+            };
+            rows.push(ScopedDirectoryId { id, version_id });
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    Ok(rows)
+}
+
+async fn expand_directory_descendants(
+    backend: &dyn LixBackend,
+    selected: &[ScopedDirectoryId],
+) -> Result<Vec<ScopedDirectoryId>, LixError> {
+    let mut out: BTreeSet<ScopedDirectoryId> = BTreeSet::new();
+    for scoped in selected {
+        let ids = load_directory_descendants(backend, &scoped.version_id, &scoped.id).await?;
+        for id in ids {
+            out.insert(ScopedDirectoryId {
+                id,
+                version_id: scoped.version_id.clone(),
+            });
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+async fn load_directory_descendants(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    root_id: &str,
+) -> Result<Vec<String>, LixError> {
+    let sql = "WITH RECURSIVE directory_rows AS (\
+         SELECT \
+           lix_json_text(snapshot_content, 'id') AS id, \
+           lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
+           version_id \
+         FROM lix_state_by_version \
+         WHERE schema_key = 'lix_directory_descriptor' \
+           AND snapshot_content IS NOT NULL\
+         ), \
+         descendants(id) AS (\
+           SELECT id FROM directory_rows \
+           WHERE version_id = $1 AND id = $2 \
+           UNION ALL \
+           SELECT child.id \
+           FROM directory_rows child \
+           JOIN descendants parent ON child.parent_id = parent.id \
+           WHERE child.version_id = $1\
+         ) \
+         SELECT id FROM descendants";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(root_id.to_string()),
+            ],
+        )
+        .await?;
+    let mut ids = Vec::new();
+    for row in result.rows {
+        if let Some(EngineValue::Text(id)) = row.first() {
+            ids.push(id.clone());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn build_directory_delete_selection(
+    rows: &[ScopedDirectoryId],
+    target: FilesystemTarget,
+) -> Result<String, LixError> {
+    if rows.is_empty() {
+        return Err(LixError {
+            message: "directory delete selection expansion returned empty result".to_string(),
+        });
+    }
+    if target.uses_active_version_scope() {
+        let ids = rows
+            .iter()
+            .map(|row| format!("'{}'", escape_sql_string(&row.id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(format!("id IN ({ids})"));
+    }
+
+    let clauses = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "(id = '{id}' AND lixcol_version_id = '{version_id}')",
+                id = escape_sql_string(&row.id),
+                version_id = escape_sql_string(&row.version_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(clauses.join(" OR "))
+}
+
+fn parse_expression(sql: &str) -> Result<Expr, LixError> {
+    let wrapped_sql = format!("SELECT 1 WHERE {sql}");
+    let mut statements =
+        Parser::parse_sql(&GenericDialect {}, &wrapped_sql).map_err(|error| LixError {
+            message: error.to_string(),
+        })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "failed to parse expression".to_string(),
+        });
+    }
+    let Statement::Query(query) = statements.remove(0) else {
+        return Err(LixError {
+            message: "failed to parse expression query".to_string(),
+        });
+    };
+    let SetExpr::Select(select) = *query.body else {
+        return Err(LixError {
+            message: "failed to parse expression SELECT".to_string(),
+        });
+    };
+    select.selection.ok_or_else(|| LixError {
+        message: "failed to parse expression selection".to_string(),
+    })
+}
+
+fn parse_single_statement(sql: &str) -> Result<Statement, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "expected a single statement".to_string(),
+        });
+    }
+    Ok(statements.remove(0))
+}
+
+fn strip_file_data_from_insert(insert: &mut Insert) -> Result<(), LixError> {
+    let data_column_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("data"));
+    let Some(data_column_index) = data_column_index else {
+        return Ok(());
+    };
+
+    insert.columns.remove(data_column_index);
+    let source = insert.source.as_mut().ok_or_else(|| LixError {
+        message: "file insert with data requires VALUES rows".to_string(),
+    })?;
+    let SetExpr::Values(Values { rows, .. }) = source.body.as_mut() else {
+        return Err(LixError {
+            message: "file insert with data requires VALUES rows".to_string(),
+        });
+    };
+
+    for row in rows.iter_mut() {
+        if data_column_index >= row.len() {
+            return Err(LixError {
+                message: "file insert row length does not match column count".to_string(),
+            });
+        }
+        row.remove(data_column_index);
+    }
+
+    if insert.columns.is_empty() {
+        return Err(LixError {
+            message: "file insert requires at least one non-data column".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn replace_update_target_table(
+    table: &mut TableWithJoins,
+    rewrite_view_name: &str,
+) -> Result<(), LixError> {
+    if !table.joins.is_empty() {
+        return Err(LixError {
+            message: "filesystem update does not support JOIN targets".to_string(),
+        });
+    }
+    let TableFactor::Table { name, .. } = &mut table.relation else {
+        return Err(LixError {
+            message: "filesystem update requires table target".to_string(),
+        });
+    };
+    *name = table_name(rewrite_view_name);
+    Ok(())
+}
+
+fn replace_delete_target_table(
+    delete: &mut Delete,
+    rewrite_view_name: &str,
+) -> Result<(), LixError> {
+    let tables = match &mut delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    let Some(table) = tables.first_mut() else {
+        return Err(LixError {
+            message: "filesystem delete requires table target".to_string(),
+        });
+    };
+    replace_update_target_table(table, rewrite_view_name)
+}
+
+fn assignment_target_name(assignment: &sqlparser::ast::Assignment) -> Option<String> {
+    let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
+        return None;
+    };
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.clone())
+}
+
+fn object_name_terminal(name: &ObjectName) -> Option<String> {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.clone())
+}
+
+fn table_name(name: &str) -> ObjectName {
+    ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))])
+}
+
+fn noop_statement() -> Result<Statement, LixError> {
+    let mut statements =
+        Parser::parse_sql(&GenericDialect {}, "SELECT 0 WHERE 1 = 0").map_err(|error| {
+            LixError {
+                message: error.to_string(),
+            }
+        })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "failed to build filesystem no-op statement".to_string(),
+        });
+    }
+    Ok(statements.remove(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rewrite_delete, rewrite_insert, rewrite_update};
+    use crate::sql::parse_sql_statements;
+    use sqlparser::ast::Statement;
+
+    #[test]
+    fn rewrites_file_insert_and_drops_data_column() {
+        let sql =
+            "INSERT INTO lix_file (id, path, data, metadata) VALUES ('f1', '/a.txt', X'00', '{}')";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let insert = match statements.into_iter().next().expect("statement") {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+
+        let rewritten = rewrite_insert(insert)
+            .expect("rewrite")
+            .expect("should rewrite");
+        assert_eq!(rewritten.table.to_string(), "lix_file_descriptor");
+        assert_eq!(
+            rewritten
+                .columns
+                .iter()
+                .map(|column| column.value.clone())
+                .collect::<Vec<_>>(),
+            vec!["id", "path", "metadata"]
+        );
+    }
+
+    #[test]
+    fn rewrites_data_only_update_to_noop_statement() {
+        let sql = "UPDATE lix_file SET data = X'01' WHERE id = 'f1'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let update = match statements.into_iter().next().expect("statement") {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewritten = rewrite_update(update)
+            .expect("rewrite")
+            .expect("should rewrite");
+        assert_eq!(rewritten.to_string(), "SELECT 0 WHERE 1 = 0");
+    }
+
+    #[test]
+    fn rewrites_directory_delete_target() {
+        let sql = "DELETE FROM lix_directory WHERE path = '/docs/'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let delete = match statements.into_iter().next().expect("statement") {
+            Statement::Delete(delete) => delete,
+            _ => panic!("expected delete"),
+        };
+
+        let rewritten = rewrite_delete(delete)
+            .expect("rewrite")
+            .expect("should rewrite");
+        assert!(rewritten
+            .to_string()
+            .contains("DELETE FROM lix_directory_descriptor"));
+    }
+}

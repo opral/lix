@@ -1278,14 +1278,10 @@ async fn build_delete_followup_statements(
         let version_id = value_to_string(&row[2], "version_id")?;
         let plugin_key = value_to_string(&row[3], "plugin_key")?;
         let schema_version = value_to_string(&row[4], "schema_version")?;
-        let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
+        let _snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
         if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-            if let Some(snapshot_content) = snapshot_content {
-                if let Some(path) = directory_path_from_snapshot(&snapshot_content)? {
-                    deleted_directory_scopes.push((version_id.clone(), path));
-                }
-            }
+            deleted_directory_scopes.push((version_id.clone(), entity_id.clone()));
         }
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
@@ -1331,16 +1327,6 @@ async fn build_delete_followup_statements(
     build_statements_from_generate_commit_result(commit_result, functions)
 }
 
-fn directory_path_from_snapshot(snapshot_content: &str) -> Result<Option<String>, LixError> {
-    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| LixError {
-        message: format!("vtable delete directory snapshot_content must be JSON: {error}"),
-    })?;
-    Ok(snapshot
-        .get("path")
-        .and_then(JsonValue::as_str)
-        .map(|path| path.to_string()))
-}
-
 async fn load_cascaded_file_delete_changes(
     backend: &dyn LixBackend,
     directory_scopes: &[(String, String)],
@@ -1351,25 +1337,25 @@ async fn load_cascaded_file_delete_changes(
         return Ok(Vec::new());
     }
 
-    let mut grouped_paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (version_id, directory_path) in directory_scopes {
-        grouped_paths
+    let mut grouped_directory_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (version_id, directory_id) in directory_scopes {
+        grouped_directory_ids
             .entry(version_id.clone())
             .or_default()
-            .insert(directory_path.clone());
+            .insert(directory_id.clone());
     }
 
     let mut changes = Vec::new();
     let mut seen_file_versions: BTreeSet<(String, String)> = BTreeSet::new();
-    for (version_id, directory_paths) in grouped_paths {
-        let predicates = directory_paths
-            .iter()
-            .map(|directory_path| file_path_prefix_predicate(directory_path))
-            .collect::<Vec<_>>();
-        if predicates.is_empty() {
+    for (version_id, directory_ids) in grouped_directory_ids {
+        if directory_ids.is_empty() {
             continue;
         }
-        let where_clause = predicates.join(" OR ");
+        let in_list = directory_ids
+            .iter()
+            .map(|directory_id| format!("'{}'", escape_sql_string(directory_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "SELECT \
                 id, \
@@ -1380,9 +1366,9 @@ async fn load_cascaded_file_delete_changes(
                 lixcol_metadata \
              FROM lix_file_descriptor_by_version \
              WHERE lixcol_version_id = '{version_id}' \
-               AND ({where_clause})",
+               AND directory_id IN ({in_list})",
             version_id = escape_sql_string(&version_id),
-            where_clause = where_clause,
+            in_list = in_list,
         );
         let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
         let result = backend.execute(&rewritten_sql, &[]).await?;
@@ -1421,18 +1407,6 @@ async fn load_cascaded_file_delete_changes(
     }
 
     Ok(changes)
-}
-
-fn file_path_prefix_predicate(directory_path: &str) -> String {
-    let trimmed = directory_path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return "path LIKE '/%'".to_string();
-    }
-    format!(
-        "(path = '{exact}' OR path LIKE '{prefix}/%')",
-        exact = escape_sql_string(trimmed),
-        prefix = escape_sql_string(trimmed),
-    )
 }
 
 async fn rewrite_single_read_query_for_backend(
