@@ -127,25 +127,14 @@ pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
 }
 
 pub(crate) fn file_ancestor_directory_paths(path: &str) -> Vec<String> {
-    let segments = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() <= 1 {
-        return Vec::new();
-    }
-
-    let mut ancestors = Vec::with_capacity(segments.len() - 1);
-    let mut prefix_segments: Vec<&str> = Vec::with_capacity(segments.len() - 1);
-    for segment in segments.iter().take(segments.len() - 1) {
-        prefix_segments.push(segment);
-        ancestors.push(format!("/{}/", prefix_segments.join("/")));
-    }
-    ancestors
+    ancestor_directory_paths(path)
 }
 
 pub(crate) fn directory_ancestor_paths(path: &str) -> Vec<String> {
+    ancestor_directory_paths(path)
+}
+
+fn ancestor_directory_paths(path: &str) -> Vec<String> {
     let segments = path
         .trim_matches('/')
         .split('/')
