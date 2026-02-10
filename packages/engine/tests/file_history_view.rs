@@ -950,7 +950,7 @@ simulation_test!(
             serde_json::json!({"name":"test-item","value":105}),
         );
         assert_text(&after.rows[0][1], "lix_file_descriptor");
-        assert_text(&after.rows[0][2], "lix");
+        assert_text(&after.rows[0][2], "history-partial");
         assert_text(&after.rows[0][3], "lix");
         assert_text(&after.rows[0][4], "1");
         assert_text(&after.rows[0][5], &expected_after_content_change_id);
