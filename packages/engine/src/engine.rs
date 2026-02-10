@@ -913,15 +913,34 @@ impl Engine {
         &self,
         targets: &BTreeSet<(String, String)>,
     ) -> Result<(), LixError> {
-        for (file_id, version_id) in targets {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        const PAIRS_PER_CHUNK: usize = 200;
+        let keys = targets.iter().cloned().collect::<Vec<_>>();
+
+        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            let mut predicates = Vec::with_capacity(chunk.len());
+            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
+                let file_param = index * 2 + 1;
+                let version_param = file_param + 1;
+                predicates.push(format!(
+                    "(file_id = ${file_param} AND version_id = ${version_param})"
+                ));
+                params.push(Value::Text(file_id.clone()));
+                params.push(Value::Text(version_id.clone()));
+            }
+
             self.backend
                 .execute(
-                    "DELETE FROM lix_internal_file_data_cache \
-                     WHERE file_id = $1 AND version_id = $2",
-                    &[
-                        Value::Text(file_id.clone()),
-                        Value::Text(version_id.clone()),
-                    ],
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
+                         WHERE {}",
+                        predicates.join(" OR ")
+                    ),
+                    &params,
                 )
                 .await?;
         }
