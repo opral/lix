@@ -19,7 +19,8 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::materialization::{
-    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
+    MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
+    MaterializationReport, MaterializationRequest, MaterializationScope,
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::PluginManifest;
@@ -42,13 +43,18 @@ use crate::version::{
 use crate::WasmRuntime;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{BinaryOperator, Expr, Statement};
-use std::collections::BTreeMap;
+use sqlparser::ast::{
+    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Statement, TableFactor,
+    TableObject, TableWithJoins,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 #[derive(Debug, Clone)]
 pub struct BootKeyValue {
@@ -138,6 +144,7 @@ impl Engine {
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let active_version_id = self.active_version_id.read().unwrap().clone();
+        let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
         let pending_file_writes =
             crate::filesystem::pending_file_writes::collect_pending_file_writes(
                 self.backend.as_ref(),
@@ -197,39 +204,51 @@ impl Engine {
         for registration in output.registrations {
             register_schema(self.backend.as_ref(), &registration.schema_key).await?;
         }
-        let result = match output.postprocess {
-            None => self.backend.execute(&output.sql, &output.params).await,
-            Some(PostprocessPlan::VtableUpdate(plan)) => {
-                let result = self.backend.execute(&output.sql, &output.params).await?;
-                let mut followup_functions = functions.clone();
-                let followup_sql = build_update_followup_sql(
-                    self.backend.as_ref(),
-                    &plan,
-                    &result.rows,
-                    &mut followup_functions,
-                )
-                .await?;
-                if !followup_sql.is_empty() {
-                    self.backend.execute(&followup_sql, &[]).await?;
+        let mut postprocess_file_cache_targets = BTreeSet::new();
+        let result =
+            match output.postprocess {
+                None => self.backend.execute(&output.sql, &output.params).await,
+                Some(PostprocessPlan::VtableUpdate(plan)) => {
+                    let result = self.backend.execute(&output.sql, &output.params).await?;
+                    if should_refresh_file_cache {
+                        postprocess_file_cache_targets.extend(
+                            collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key)?,
+                        );
+                    }
+                    let mut followup_functions = functions.clone();
+                    let followup_sql = build_update_followup_sql(
+                        self.backend.as_ref(),
+                        &plan,
+                        &result.rows,
+                        &mut followup_functions,
+                    )
+                    .await?;
+                    if !followup_sql.is_empty() {
+                        self.backend.execute(&followup_sql, &[]).await?;
+                    }
+                    Ok(result)
                 }
-                Ok(result)
-            }
-            Some(PostprocessPlan::VtableDelete(plan)) => {
-                let result = self.backend.execute(&output.sql, &output.params).await?;
-                let mut followup_functions = functions.clone();
-                let followup_sql = build_delete_followup_sql(
-                    self.backend.as_ref(),
-                    &plan,
-                    &result.rows,
-                    &mut followup_functions,
-                )
-                .await?;
-                if !followup_sql.is_empty() {
-                    self.backend.execute(&followup_sql, &[]).await?;
+                Some(PostprocessPlan::VtableDelete(plan)) => {
+                    let result = self.backend.execute(&output.sql, &output.params).await?;
+                    if should_refresh_file_cache {
+                        postprocess_file_cache_targets.extend(
+                            collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key)?,
+                        );
+                    }
+                    let mut followup_functions = functions.clone();
+                    let followup_sql = build_delete_followup_sql(
+                        self.backend.as_ref(),
+                        &plan,
+                        &result.rows,
+                        &mut followup_functions,
+                    )
+                    .await?;
+                    if !followup_sql.is_empty() {
+                        self.backend.execute(&followup_sql, &[]).await?;
+                    }
+                    Ok(result)
                 }
-                Ok(result)
-            }
-        }?;
+            }?;
 
         if settings.enabled {
             let sequence_end = functions.with_lock(|provider| provider.next_sequence());
@@ -243,6 +262,13 @@ impl Engine {
         {
             self.set_active_version_id(version_id);
         }
+        let file_cache_refresh_targets = if should_refresh_file_cache {
+            let mut targets = direct_state_file_cache_refresh_targets(&output.mutations);
+            targets.extend(postprocess_file_cache_targets);
+            targets
+        } else {
+            BTreeSet::new()
+        };
 
         if let Some(runtime) = self.wasm_runtime.as_ref() {
             if !pending_file_writes.is_empty() {
@@ -271,6 +297,12 @@ impl Engine {
         }
         self.persist_pending_file_data_updates(&pending_file_writes)
             .await?;
+        self.invalidate_file_data_cache_entries(&file_cache_refresh_targets)
+            .await?;
+        if self.wasm_runtime.is_some() {
+            self.refresh_file_data_for_versions(file_cache_refresh_targets)
+                .await?;
+        }
 
         Ok(result)
     }
@@ -877,6 +909,46 @@ impl Engine {
         Ok(())
     }
 
+    async fn invalidate_file_data_cache_entries(
+        &self,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        for (file_id, version_id) in targets {
+            self.backend
+                .execute(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = $1 AND version_id = $2",
+                    &[
+                        Value::Text(file_id.clone()),
+                        Value::Text(version_id.clone()),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_file_data_for_versions(
+        &self,
+        targets: BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        let versions = targets
+            .into_iter()
+            .map(|(_, version_id)| version_id)
+            .collect::<BTreeSet<_>>();
+        if versions.is_empty() {
+            return Ok(());
+        }
+
+        self.materialize(&MaterializationRequest {
+            scope: MaterializationScope::Versions(versions),
+            debug: MaterializationDebugMode::Off,
+            debug_row_limit: 1,
+        })
+        .await?;
+        Ok(())
+    }
+
     fn set_active_version_id(&self, version_id: String) {
         let mut guard = self.active_version_id.write().unwrap();
         if *guard == version_id {
@@ -919,6 +991,114 @@ fn should_sequentialize_postprocess_multi_statement(
                 | Statement::Rollback { .. }
         )
     })
+}
+
+fn direct_state_file_cache_refresh_targets(
+    mutations: &[MutationRow],
+) -> BTreeSet<(String, String)> {
+    mutations
+        .iter()
+        .filter(|mutation| !mutation.untracked)
+        .filter(|mutation| mutation.file_id != "lix")
+        .filter(|mutation| mutation.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY)
+        .filter(|mutation| mutation.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+        .map(|mutation| (mutation.file_id.clone(), mutation.version_id.clone()))
+        .collect()
+}
+
+fn collect_postprocess_file_cache_targets(
+    rows: &[Vec<Value>],
+    schema_key: &str,
+) -> Result<BTreeSet<(String, String)>, LixError> {
+    if schema_key == FILE_DESCRIPTOR_SCHEMA_KEY || schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut targets = BTreeSet::new();
+    for row in rows {
+        let Some(file_id) = row.get(1) else {
+            return Err(LixError {
+                message: "postprocess file cache refresh expected file_id column".to_string(),
+            });
+        };
+        let Some(version_id) = row.get(2) else {
+            return Err(LixError {
+                message: "postprocess file cache refresh expected version_id column".to_string(),
+            });
+        };
+        let Value::Text(file_id) = file_id else {
+            return Err(LixError {
+                message: format!(
+                    "postprocess file cache refresh expected text file_id, got {file_id:?}"
+                ),
+            });
+        };
+        let Value::Text(version_id) = version_id else {
+            return Err(LixError {
+                message: format!(
+                    "postprocess file cache refresh expected text version_id, got {version_id:?}"
+                ),
+            });
+        };
+        if file_id == "lix" {
+            continue;
+        }
+        targets.insert((file_id.clone(), version_id.clone()));
+    }
+
+    Ok(targets)
+}
+
+fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    statements
+        .iter()
+        .any(statement_targets_file_cache_refresh_table)
+}
+
+fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
+    match statement {
+        Statement::Insert(insert) => table_object_targets_file_cache_refresh(&insert.table),
+        Statement::Update(update) => table_with_joins_targets_file_cache_refresh(&update.table),
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            tables
+                .iter()
+                .any(table_with_joins_targets_file_cache_refresh)
+        }
+        _ => false,
+    }
+}
+
+fn table_object_targets_file_cache_refresh(table: &TableObject) -> bool {
+    let TableObject::TableName(name) = table else {
+        return false;
+    };
+    object_name_targets_file_cache_refresh(name)
+}
+
+fn table_with_joins_targets_file_cache_refresh(table: &TableWithJoins) -> bool {
+    let TableFactor::Table { name, .. } = &table.relation else {
+        return false;
+    };
+    object_name_targets_file_cache_refresh(name)
+}
+
+fn object_name_targets_file_cache_refresh(name: &ObjectName) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| table_name_targets_file_cache_refresh(&ident.value))
+        .unwrap_or(false)
+}
+
+fn table_name_targets_file_cache_refresh(table_name: &str) -> bool {
+    table_name.eq_ignore_ascii_case("lix_state")
+        || table_name.eq_ignore_ascii_case("lix_state_by_version")
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -1191,7 +1371,10 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_version_from_update_validations, active_version_schema_key};
+    use super::{
+        active_version_from_update_validations, active_version_schema_key,
+        should_refresh_file_cache_for_sql,
+    };
     use crate::sql::parse_sql_statements;
     use crate::sql::UpdateValidationPlan;
     use serde_json::json;
@@ -1230,6 +1413,32 @@ mod tests {
 
         let detected = active_version_from_update_validations(&[plan]).expect("detect version");
         assert_eq!(detected, None);
+    }
+
+    #[test]
+    fn refresh_cache_detection_matches_lix_state_writes() {
+        assert!(should_refresh_file_cache_for_sql(
+            "UPDATE lix_state SET snapshot_content = '{}' WHERE file_id = 'f'"
+        ));
+        assert!(should_refresh_file_cache_for_sql(
+            "DELETE FROM lix_state_by_version WHERE file_id = 'f'"
+        ));
+        assert!(should_refresh_file_cache_for_sql(
+            "INSERT INTO lix_state (entity_id, schema_key, file_id, version_id, snapshot_content) VALUES ('/x', 'json_pointer', 'f', 'v', '{}')"
+        ));
+    }
+
+    #[test]
+    fn refresh_cache_detection_ignores_non_target_tables() {
+        assert!(!should_refresh_file_cache_for_sql(
+            "SELECT * FROM lix_state WHERE file_id = 'f'"
+        ));
+        assert!(!should_refresh_file_cache_for_sql(
+            "UPDATE lix_state_history SET snapshot_content = '{}' WHERE file_id = 'f'"
+        ));
+        assert!(!should_refresh_file_cache_for_sql(
+            "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
+        ));
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {
