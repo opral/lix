@@ -4,6 +4,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::filesystem::path::{
@@ -13,7 +14,7 @@ use crate::filesystem::path::{
 };
 use crate::sql::escape_sql_string;
 use crate::sql::{
-    lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
+    lower_statement, resolve_expr_cell_with_state, resolve_values_rows, DetectedFileDomainChange,
     rewrite_read_query_with_backend, PlaceholderState, ResolvedCell,
 };
 use crate::version::{
@@ -33,6 +34,16 @@ const FILE_DESCRIPTOR_VIEW: &str = "lix_file_descriptor";
 const FILE_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_file_descriptor_by_version";
 const DIRECTORY_DESCRIPTOR_VIEW: &str = "lix_directory_descriptor";
 const DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_directory_descriptor_by_version";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
+const INTERNAL_DESCRIPTOR_FILE_ID: &str = "lix";
+const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
+
+#[derive(Debug, Default)]
+pub struct FilesystemInsertSideEffects {
+    pub statements: Vec<Statement>,
+    pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
+}
 
 pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
@@ -81,23 +92,23 @@ pub async fn insert_side_effect_statements_with_backend(
     backend: &dyn LixBackend,
     insert: &Insert,
     params: &[EngineValue],
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<FilesystemInsertSideEffects, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     };
     if target.read_only {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     }
 
     let source = match &insert.source {
         Some(source) => source,
-        None => return Ok(Vec::new()),
+        None => return Ok(FilesystemInsertSideEffects::default()),
     };
     let SetExpr::Values(values) = source.body.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     };
     if values.rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     }
 
     let path_index = insert
@@ -105,7 +116,7 @@ pub async fn insert_side_effect_statements_with_backend(
         .iter()
         .position(|column| column.value.eq_ignore_ascii_case("path"));
     let Some(path_index) = path_index else {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     };
 
     let by_version_index = insert.columns.iter().position(|column| {
@@ -119,7 +130,11 @@ pub async fn insert_side_effect_statements_with_backend(
     };
 
     let resolved_rows = resolve_values_rows(&values.rows, params)?;
-    let mut directory_requests: Vec<(String, String)> = Vec::new();
+    let untracked_index = insert.columns.iter().position(|column| {
+        column.value.eq_ignore_ascii_case("lixcol_untracked")
+            || column.value.eq_ignore_ascii_case("untracked")
+    });
+    let mut directory_requests: BTreeMap<(String, String), bool> = BTreeMap::new();
 
     for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
         if row.len() != insert.columns.len() {
@@ -157,39 +172,58 @@ pub async fn insert_side_effect_statements_with_backend(
         } else {
             continue;
         };
+        let untracked = untracked_index
+            .map(|index| {
+                resolve_untracked_expr(
+                    row.get(index),
+                    resolved_row.get(index),
+                    "filesystem insert untracked",
+                )
+            })
+            .transpose()?
+            .flatten()
+            .unwrap_or(false);
 
         if target.is_file {
             for ancestor in file_ancestor_directory_paths(&normalized_path) {
-                directory_requests.push((version_id.clone(), ancestor));
+                let key = (version_id.clone(), ancestor);
+                directory_requests
+                    .entry(key)
+                    .and_modify(|existing| *existing = *existing && untracked)
+                    .or_insert(untracked);
             }
         } else {
             for ancestor in directory_ancestor_paths(&normalized_path) {
-                directory_requests.push((version_id.clone(), ancestor));
+                let key = (version_id.clone(), ancestor);
+                directory_requests
+                    .entry(key)
+                    .and_modify(|existing| *existing = *existing && untracked)
+                    .or_insert(untracked);
             }
         }
     }
 
     if directory_requests.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     }
 
-    directory_requests.sort_by(|left, right| {
-        let version_order = left.0.cmp(&right.0);
+    let mut ordered_requests = directory_requests.into_iter().collect::<Vec<_>>();
+    ordered_requests.sort_by(|left, right| {
+        let version_order = left.0 .0.cmp(&right.0 .0);
         if version_order != std::cmp::Ordering::Equal {
             return version_order;
         }
-        let left_depth = path_depth(&left.1);
-        let right_depth = path_depth(&right.1);
+        let left_depth = path_depth(&left.0 .1);
+        let right_depth = path_depth(&right.0 .1);
         left_depth
             .cmp(&right_depth)
-            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.0 .1.cmp(&right.0 .1))
     });
-    directory_requests.dedup();
 
     let mut known_ids: BTreeMap<(String, String), String> = BTreeMap::new();
-    let mut statements: Vec<Statement> = Vec::new();
+    let mut side_effects = FilesystemInsertSideEffects::default();
 
-    for (version_id, path) in directory_requests {
+    for ((version_id, path), untracked) in ordered_requests {
         let key = (version_id.clone(), path.clone());
         if known_ids.contains_key(&key) {
             continue;
@@ -219,35 +253,62 @@ pub async fn insert_side_effect_statements_with_backend(
 
         let id = auto_directory_id(&version_id, &path);
         let name = directory_name_from_path(&path).unwrap_or_default();
-        let statement_sql = if target.uses_active_version_scope() {
-            format!(
-                "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_untracked) \
-                 VALUES ('{id}', {parent_id}, '{name}', 0, 1)",
-                table = DIRECTORY_DESCRIPTOR_VIEW,
-                id = escape_sql_string(&id),
-                parent_id = parent_id
-                    .map(|value| format!("'{}'", escape_sql_string(&value)))
-                    .unwrap_or_else(|| "NULL".to_string()),
-                name = escape_sql_string(&name),
-            )
+        if untracked {
+            let statement_sql = if target.uses_active_version_scope() {
+                format!(
+                    "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_untracked) \
+                     VALUES ('{id}', {parent_id}, '{name}', 0, 1)",
+                    table = DIRECTORY_DESCRIPTOR_VIEW,
+                    id = escape_sql_string(&id),
+                    parent_id = parent_id
+                        .as_ref()
+                        .map(|value| format!("'{}'", escape_sql_string(value)))
+                        .unwrap_or_else(|| "NULL".to_string()),
+                    name = escape_sql_string(&name),
+                )
+            } else {
+                format!(
+                    "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_version_id, lixcol_untracked) \
+                     VALUES ('{id}', {parent_id}, '{name}', 0, '{version_id}', 1)",
+                    table = DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
+                    id = escape_sql_string(&id),
+                    parent_id = parent_id
+                        .as_ref()
+                        .map(|value| format!("'{}'", escape_sql_string(value)))
+                        .unwrap_or_else(|| "NULL".to_string()),
+                    name = escape_sql_string(&name),
+                    version_id = escape_sql_string(&version_id),
+                )
+            };
+            side_effects
+                .statements
+                .push(parse_single_statement(&statement_sql)?);
         } else {
-            format!(
-                "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_version_id, lixcol_untracked) \
-                 VALUES ('{id}', {parent_id}, '{name}', 0, '{version_id}', 1)",
-                table = DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
-                id = escape_sql_string(&id),
-                parent_id = parent_id
-                    .map(|value| format!("'{}'", escape_sql_string(&value)))
-                    .unwrap_or_else(|| "NULL".to_string()),
-                name = escape_sql_string(&name),
-                version_id = escape_sql_string(&version_id),
-            )
-        };
-        statements.push(parse_single_statement(&statement_sql)?);
+            let snapshot_content = json!({
+                "id": id,
+                "parent_id": parent_id,
+                "name": name,
+                "hidden": false,
+            })
+            .to_string();
+            side_effects
+                .tracked_directory_changes
+                .push(DetectedFileDomainChange {
+                    entity_id: id.clone(),
+                    schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                    schema_version: DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
+                    file_id: INTERNAL_DESCRIPTOR_FILE_ID.to_string(),
+                    version_id: version_id.clone(),
+                    plugin_key: INTERNAL_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                    snapshot_content: Some(snapshot_content),
+                    metadata: None,
+                    writer_key: None,
+                });
+        }
         known_ids.insert(key, id);
     }
 
-    Ok(statements)
+    Ok(side_effects)
 }
 
 pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
@@ -1232,6 +1293,92 @@ fn resolve_text_expr(
         } else {
             "0".to_string()
         })),
+        AstValue::Placeholder(_) => Ok(None),
+    }
+}
+
+fn resolve_untracked_expr(
+    expr: Option<&Expr>,
+    cell: Option<&ResolvedCell>,
+    context: &str,
+) -> Result<Option<bool>, LixError> {
+    if let Some(cell) = cell {
+        if let Some(value) = &cell.value {
+            return match value {
+                EngineValue::Null => Ok(None),
+                EngineValue::Integer(value) => Ok(Some(*value != 0)),
+                EngineValue::Real(value) => Ok(Some(*value != 0.0)),
+                EngineValue::Text(value) => {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    match normalized.as_str() {
+                        "1" | "true" => Ok(Some(true)),
+                        "0" | "false" | "" => Ok(Some(false)),
+                        _ => Err(LixError {
+                            message: format!(
+                                "{context} expects a boolean-like value, got '{}'",
+                                value
+                            ),
+                        }),
+                    }
+                }
+                EngineValue::Blob(_) => Err(LixError {
+                    message: format!("{context} does not support blob values"),
+                }),
+            };
+        }
+    }
+
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return Ok(None);
+    };
+    match value {
+        AstValue::Null => Ok(None),
+        AstValue::Boolean(value) => Ok(Some(*value)),
+        AstValue::Number(value, _) => match value.trim() {
+            "1" => Ok(Some(true)),
+            "0" => Ok(Some(false)),
+            _ => Err(LixError {
+                message: format!("{context} expects 0/1, got '{}'", value),
+            }),
+        },
+        AstValue::SingleQuotedString(value)
+        | AstValue::DoubleQuotedString(value)
+        | AstValue::TripleSingleQuotedString(value)
+        | AstValue::TripleDoubleQuotedString(value)
+        | AstValue::EscapedStringLiteral(value)
+        | AstValue::UnicodeStringLiteral(value)
+        | AstValue::NationalStringLiteral(value)
+        | AstValue::HexStringLiteral(value)
+        | AstValue::SingleQuotedRawStringLiteral(value)
+        | AstValue::DoubleQuotedRawStringLiteral(value)
+        | AstValue::TripleSingleQuotedRawStringLiteral(value)
+        | AstValue::TripleDoubleQuotedRawStringLiteral(value)
+        | AstValue::SingleQuotedByteStringLiteral(value)
+        | AstValue::DoubleQuotedByteStringLiteral(value)
+        | AstValue::TripleSingleQuotedByteStringLiteral(value)
+        | AstValue::TripleDoubleQuotedByteStringLiteral(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" => Ok(Some(true)),
+                "0" | "false" | "" => Ok(Some(false)),
+                _ => Err(LixError {
+                    message: format!("{context} expects boolean-like text, got '{}'", value),
+                }),
+            }
+        }
+        AstValue::DollarQuotedString(value) => {
+            let normalized = value.value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" => Ok(Some(true)),
+                "0" | "false" | "" => Ok(Some(false)),
+                _ => Err(LixError {
+                    message: format!("{context} expects boolean-like text, got '{}'", value.value),
+                }),
+            }
+        }
         AstValue::Placeholder(_) => Ok(None),
     }
 }

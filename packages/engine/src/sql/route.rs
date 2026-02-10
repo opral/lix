@@ -202,6 +202,10 @@ where
                     backend, &insert, params,
                 )
                 .await?;
+            let mut insert_detected_file_domain_changes =
+                detected_file_domain_changes.to_vec();
+            insert_detected_file_domain_changes
+                .extend(filesystem_insert_side_effects.tracked_directory_changes.clone());
             let insert = if let Some(rewritten) =
                 filesystem_step::rewrite_insert_with_backend(backend, insert.clone(), params)
                     .await?
@@ -219,7 +223,7 @@ where
                     version_inserts,
                     params,
                     functions,
-                    detected_file_domain_changes,
+                    &insert_detected_file_domain_changes,
                 )
                 .await;
             }
@@ -231,7 +235,7 @@ where
                     active_account_inserts,
                     params,
                     functions,
-                    detected_file_domain_changes,
+                    &insert_detected_file_domain_changes,
                 )
                 .await;
             }
@@ -282,7 +286,7 @@ where
                     backend,
                     inner.clone(),
                     params,
-                    detected_file_domain_changes,
+                    &insert_detected_file_domain_changes,
                     functions,
                 )
                 .await?
@@ -305,10 +309,10 @@ where
                 update_validations,
             };
 
-            if !filesystem_insert_side_effects.is_empty() {
+            if !filesystem_insert_side_effects.statements.is_empty() {
                 output = prepend_statements_with_backend(
                     backend,
-                    filesystem_insert_side_effects,
+                    filesystem_insert_side_effects.statements,
                     output,
                     params,
                     functions,
