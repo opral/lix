@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{LixError, LoadWasmComponentRequest, WasmInstance, WasmRuntime};
@@ -52,6 +54,7 @@ struct WirePluginEntityChangeOutput {
 
 pub struct TestWasmtimeRuntime {
     engine: Engine,
+    component_cache: Mutex<HashMap<ComponentCacheKey, Arc<Component>>>,
 }
 
 impl TestWasmtimeRuntime {
@@ -65,13 +68,35 @@ impl TestWasmtimeRuntime {
             message: format!("Failed to initialize wasmtime engine: {error}"),
         })?;
 
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            component_cache: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ComponentCacheKey {
+    plugin_key: String,
+    world: String,
+    wasm_fingerprint: u64,
+    wasm_len: usize,
+}
+
+impl ComponentCacheKey {
+    fn from_request(request: &LoadWasmComponentRequest) -> Self {
+        Self {
+            plugin_key: request.key.clone(),
+            world: request.world.clone(),
+            wasm_fingerprint: wasm_fingerprint(&request.bytes),
+            wasm_len: request.bytes.len(),
+        }
     }
 }
 
 struct TestWasmtimeInstance {
     engine: Engine,
-    component: Component,
+    component: Arc<Component>,
 }
 
 struct WasiState {
@@ -97,12 +122,40 @@ impl WasmRuntime for TestWasmtimeRuntime {
         &self,
         request: LoadWasmComponentRequest,
     ) -> Result<Arc<dyn WasmInstance>, LixError> {
-        let component = Component::new(&self.engine, request.bytes).map_err(|error| LixError {
-            message: format!(
-                "Failed to compile wasm component for plugin '{}': {error}",
-                request.key
-            ),
-        })?;
+        let cache_key = ComponentCacheKey::from_request(&request);
+
+        if let Some(component) = self
+            .component_cache
+            .lock()
+            .expect("component cache mutex poisoned")
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(Arc::new(TestWasmtimeInstance {
+                engine: self.engine.clone(),
+                component,
+            }));
+        }
+
+        let compiled = Arc::new(
+            Component::new(&self.engine, &request.bytes).map_err(|error| LixError {
+                message: format!(
+                    "Failed to compile wasm component for plugin '{}': {error}",
+                    request.key
+                ),
+            })?,
+        );
+
+        let component = {
+            let mut cache = self
+                .component_cache
+                .lock()
+                .expect("component cache mutex poisoned");
+            cache
+                .entry(cache_key)
+                .or_insert_with(|| compiled.clone())
+                .clone()
+        };
 
         Ok(Arc::new(TestWasmtimeInstance {
             engine: self.engine.clone(),
@@ -130,10 +183,11 @@ impl WasmInstance for TestWasmtimeInstance {
             message: format!("Failed to add wasi imports to linker: {error}"),
         })?;
 
-        let bindings = plugin_bindings::Plugin::instantiate(&mut store, &self.component, &linker)
-            .map_err(|error| LixError {
-            message: format!("Failed to instantiate wasm component: {error}"),
-        })?;
+        let bindings =
+            plugin_bindings::Plugin::instantiate(&mut store, self.component.as_ref(), &linker)
+                .map_err(|error| LixError {
+                    message: format!("Failed to instantiate wasm component: {error}"),
+                })?;
 
         match export {
             "detect-changes" | "api#detect-changes" => {
@@ -204,6 +258,12 @@ impl WasmInstance for TestWasmtimeInstance {
             }),
         }
     }
+}
+
+fn wasm_fingerprint(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn wire_file_to_binding(file: WirePluginFile) -> plugin_bindings::exports::lix::plugin::api::File {
