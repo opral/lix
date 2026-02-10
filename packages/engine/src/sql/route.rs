@@ -14,6 +14,7 @@ use crate::sql::steps::{
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
+use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
 pub fn rewrite_statement<P: LixFunctionProvider>(
@@ -188,6 +189,7 @@ pub async fn rewrite_statement_with_backend<P>(
     statement: Statement,
     params: &[Value],
     functions: &mut P,
+    detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<RewriteOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -217,6 +219,7 @@ where
                     version_inserts,
                     params,
                     functions,
+                    detected_file_domain_changes,
                 )
                 .await;
             }
@@ -228,6 +231,7 @@ where
                     active_account_inserts,
                     params,
                     functions,
+                    detected_file_domain_changes,
                 )
                 .await;
             }
@@ -278,6 +282,7 @@ where
                     backend,
                     inner.clone(),
                     params,
+                    detected_file_domain_changes,
                     functions,
                 )
                 .await?
@@ -307,6 +312,7 @@ where
                     output,
                     params,
                     functions,
+                    detected_file_domain_changes,
                 )
                 .await?;
             }
@@ -347,6 +353,7 @@ where
                     active_version_inserts,
                     params,
                     functions,
+                    detected_file_domain_changes,
                 )
                 .await;
             }
@@ -373,6 +380,7 @@ where
                     version_inserts,
                     params,
                     functions,
+                    detected_file_domain_changes,
                 )
                 .await;
             }
@@ -417,8 +425,14 @@ where
                 lix_version_view_write::rewrite_delete_with_backend(backend, delete.clone(), params)
                     .await?
             {
-                rewrite_vtable_inserts_with_backend(backend, version_inserts, params, functions)
-                    .await?
+                rewrite_vtable_inserts_with_backend(
+                    backend,
+                    version_inserts,
+                    params,
+                    functions,
+                    detected_file_domain_changes,
+                )
+                .await?
             } else {
                 rewrite_statement(Statement::Delete(delete), params, functions)?
             };
@@ -500,6 +514,7 @@ async fn prepend_statements_with_backend<P>(
     mut output: RewriteOutput,
     params: &[Value],
     functions: &mut P,
+    detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<RewriteOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -518,7 +533,11 @@ where
 
     for statement in side_effects {
         let rewritten = Box::pin(rewrite_statement_with_backend(
-            backend, statement, params, functions,
+            backend,
+            statement,
+            params,
+            functions,
+            detected_file_domain_changes,
         ))
         .await?;
         merge_rewrite_output(&mut prefixed, rewritten)?;
@@ -591,14 +610,21 @@ async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
     inserts: Vec<Insert>,
     params: &[Value],
     functions: &mut P,
+    detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<RewriteOutput, LixError> {
     let mut statements = Vec::new();
     let mut registrations = Vec::new();
     let mut mutations = Vec::new();
 
     for insert in inserts {
-        let Some(rewritten) =
-            vtable_write::rewrite_insert_with_backend(backend, insert, params, functions).await?
+        let Some(rewritten) = vtable_write::rewrite_insert_with_backend(
+            backend,
+            insert,
+            params,
+            detected_file_domain_changes,
+            functions,
+        )
+        .await?
         else {
             return Err(LixError {
                 message: "lix_version rewrite expected backend vtable insert rewrite".to_string(),

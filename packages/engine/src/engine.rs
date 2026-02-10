@@ -27,8 +27,8 @@ use crate::plugin::types::PluginManifest;
 use crate::schema_registry::register_schema;
 use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, escape_sql_string, parse_sql_statements,
-    preprocess_sql_with_provider, MutationOperation, MutationRow, PostprocessPlan,
-    UpdateValidationPlan,
+    preprocess_sql_with_provider_and_detected_file_domain_changes, DetectedFileDomainChange,
+    MutationOperation, MutationRow, PostprocessPlan, UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -45,8 +45,8 @@ use crate::WasmRuntime;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr,
-    Statement, TableFactor, TableObject, TableWithJoins,
+    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
+    TableFactor, TableObject, TableWithJoins,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -193,6 +193,11 @@ impl Engine {
             .map_err(|error| LixError {
                 message: format!("pending file delete collection failed: {}", error.message),
             })?;
+        let detected_file_changes = self
+            .detect_file_changes_for_pending_writes(&pending_file_writes)
+            .await?;
+        let detected_file_domain_changes =
+            detected_file_domain_changes_from_detected_file_changes(&detected_file_changes);
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
         if self.deterministic_boot_pending.load(Ordering::SeqCst) {
@@ -208,12 +213,13 @@ impl Engine {
         let functions =
             SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, sequence_start));
 
-        let output = match preprocess_sql_with_provider(
+        let output = match preprocess_sql_with_provider_and_detected_file_domain_changes(
             self.backend.as_ref(),
             &self.cel_evaluator,
             sql,
             params,
             functions.clone(),
+            &detected_file_domain_changes,
         )
         .await
         {
@@ -242,9 +248,19 @@ impl Engine {
             register_schema(self.backend.as_ref(), &registration.schema_key).await?;
         }
         let mut postprocess_file_cache_targets = BTreeSet::new();
+        let mut plugin_changes_committed = false;
         let result =
             match output.postprocess {
-                None => self.backend.execute(&output.sql, &output.params).await,
+                None => {
+                    let result = self.backend.execute(&output.sql, &output.params).await?;
+                    let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
+                        mutation.operation == MutationOperation::Insert && !mutation.untracked
+                    });
+                    if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
+                        plugin_changes_committed = true;
+                    }
+                    Ok(result)
+                }
                 Some(PostprocessPlan::VtableUpdate(plan)) => {
                     let result = self.backend.execute(&output.sql, &output.params).await?;
                     if should_refresh_file_cache {
@@ -252,17 +268,26 @@ impl Engine {
                             collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key)?,
                         );
                     }
+                    let additional_schema_keys = detected_file_domain_changes
+                        .iter()
+                        .map(|change| change.schema_key.clone())
+                        .collect::<BTreeSet<_>>();
+                    for schema_key in additional_schema_keys {
+                        register_schema(self.backend.as_ref(), &schema_key).await?;
+                    }
                     let mut followup_functions = functions.clone();
                     let followup_sql = build_update_followup_sql(
                         self.backend.as_ref(),
                         &plan,
                         &result.rows,
+                        &detected_file_domain_changes,
                         &mut followup_functions,
                     )
                     .await?;
                     if !followup_sql.is_empty() {
                         self.backend.execute(&followup_sql, &[]).await?;
                     }
+                    plugin_changes_committed = true;
                     Ok(result)
                 }
                 Some(PostprocessPlan::VtableDelete(plan)) => {
@@ -272,17 +297,26 @@ impl Engine {
                             collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key)?,
                         );
                     }
+                    let additional_schema_keys = detected_file_domain_changes
+                        .iter()
+                        .map(|change| change.schema_key.clone())
+                        .collect::<BTreeSet<_>>();
+                    for schema_key in additional_schema_keys {
+                        register_schema(self.backend.as_ref(), &schema_key).await?;
+                    }
                     let mut followup_functions = functions.clone();
                     let followup_sql = build_delete_followup_sql(
                         self.backend.as_ref(),
                         &plan,
                         &result.rows,
+                        &detected_file_domain_changes,
                         &mut followup_functions,
                     )
                     .await?;
                     if !followup_sql.is_empty() {
                         self.backend.execute(&followup_sql, &[]).await?;
                     }
+                    plugin_changes_committed = true;
                     Ok(result)
                 }
             }?;
@@ -312,30 +346,9 @@ impl Engine {
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
 
-        if let Some(runtime) = self.wasm_runtime.as_ref() {
-            if !pending_file_writes.is_empty() {
-                let requests = pending_file_writes
-                    .iter()
-                    .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
-                        file_id: write.file_id.clone(),
-                        version_id: write.version_id.clone(),
-                        path: write.path.clone(),
-                        before_data: write.before_data.clone(),
-                        after_data: write.after_data.clone(),
-                    })
-                    .collect::<Vec<_>>();
-
-                let detected = crate::plugin::runtime::detect_file_changes_with_plugins(
-                    self.backend.as_ref(),
-                    runtime.as_ref(),
-                    &requests,
-                )
-                .await
-                .map_err(|error| LixError {
-                    message: format!("file detect stage failed: {}", error.message),
-                })?;
-                self.persist_detected_file_changes(&detected).await?;
-            }
+        if !plugin_changes_committed && !detected_file_changes.is_empty() {
+            self.persist_detected_file_changes(&detected_file_changes)
+                .await?;
         }
         self.persist_pending_file_data_updates(&pending_file_writes)
             .await?;
@@ -859,62 +872,81 @@ impl Engine {
         Ok(())
     }
 
+    async fn detect_file_changes_for_pending_writes(
+        &self,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    ) -> Result<Vec<crate::plugin::runtime::DetectedFileChange>, LixError> {
+        let Some(runtime) = self.wasm_runtime.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requests = writes
+            .iter()
+            .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
+                file_id: write.file_id.clone(),
+                version_id: write.version_id.clone(),
+                path: write.path.clone(),
+                before_data: write.before_data.clone(),
+                after_data: write.after_data.clone(),
+            })
+            .collect::<Vec<_>>();
+        let detected = crate::plugin::runtime::detect_file_changes_with_plugins(
+            self.backend.as_ref(),
+            runtime.as_ref(),
+            &requests,
+        )
+        .await
+        .map_err(|error| LixError {
+            message: format!("file detect stage failed: {}", error.message),
+        })?;
+        Ok(dedupe_detected_file_changes(&detected))
+    }
+
     async fn persist_detected_file_changes(
         &self,
         changes: &[crate::plugin::runtime::DetectedFileChange],
     ) -> Result<(), LixError> {
-        let mut latest_by_key: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
-        for (index, change) in changes.iter().enumerate() {
-            latest_by_key.insert(
-                (
-                    change.file_id.clone(),
-                    change.version_id.clone(),
-                    change.schema_key.clone(),
-                    change.entity_id.clone(),
-                ),
-                index,
-            );
+        let deduped_changes = dedupe_detected_file_changes(changes);
+        if deduped_changes.is_empty() {
+            return Ok(());
         }
 
-        for index in latest_by_key.into_values() {
-            let change = &changes[index];
-            match &change.snapshot_content {
-                Some(snapshot_content) => {
-                    Box::pin(self.execute(
-                        "INSERT INTO lix_internal_state_vtable (\
-                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            Value::Text(change.entity_id.clone()),
-                            Value::Text(change.schema_key.clone()),
-                            Value::Text(change.file_id.clone()),
-                            Value::Text(change.version_id.clone()),
-                            Value::Text(change.plugin_key.clone()),
-                            Value::Text(snapshot_content.clone()),
-                            Value::Text(change.schema_version.clone()),
-                        ],
-                    ))
-                    .await?;
-                }
-                None => {
-                    Box::pin(self.execute(
-                        "INSERT INTO lix_internal_state_vtable (\
-                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            Value::Text(change.entity_id.clone()),
-                            Value::Text(change.schema_key.clone()),
-                            Value::Text(change.file_id.clone()),
-                            Value::Text(change.version_id.clone()),
-                            Value::Text(change.plugin_key.clone()),
-                            Value::Null,
-                            Value::Text(change.schema_version.clone()),
-                        ],
-                    ))
-                    .await?;
-                }
-            }
+        let mut params = Vec::with_capacity(deduped_changes.len() * 7);
+        let mut rows = Vec::with_capacity(deduped_changes.len());
+        for (row_index, change) in deduped_changes.iter().enumerate() {
+            let base = row_index * 7;
+            rows.push(format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7
+            ));
+            params.push(Value::Text(change.entity_id.clone()));
+            params.push(Value::Text(change.schema_key.clone()));
+            params.push(Value::Text(change.file_id.clone()));
+            params.push(Value::Text(change.version_id.clone()));
+            params.push(Value::Text(change.plugin_key.clone()));
+            params.push(match &change.snapshot_content {
+                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::Text(change.schema_version.clone()));
         }
+
+        let sql = format!(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES {}",
+            rows.join(", ")
+        );
+        Box::pin(self.execute(&sql, &params)).await?;
 
         Ok(())
     }
@@ -1073,7 +1105,8 @@ fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet
         .filter(|mutation| !mutation.untracked)
         .filter(|mutation| mutation.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
         .filter(|mutation| {
-            matches!(mutation.operation, MutationOperation::Delete) || mutation.snapshot_content.is_none()
+            matches!(mutation.operation, MutationOperation::Delete)
+                || mutation.snapshot_content.is_none()
         })
         .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
@@ -1120,6 +1153,49 @@ fn collect_postprocess_file_cache_targets(
     }
 
     Ok(targets)
+}
+
+fn dedupe_detected_file_changes(
+    changes: &[crate::plugin::runtime::DetectedFileChange],
+) -> Vec<crate::plugin::runtime::DetectedFileChange> {
+    let mut latest_by_key: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        latest_by_key.insert(
+            (
+                change.file_id.clone(),
+                change.version_id.clone(),
+                change.schema_key.clone(),
+                change.entity_id.clone(),
+            ),
+            index,
+        );
+    }
+
+    let mut ordered_indexes = latest_by_key.into_values().collect::<Vec<_>>();
+    ordered_indexes.sort_unstable();
+    ordered_indexes
+        .into_iter()
+        .filter_map(|index| changes.get(index).cloned())
+        .collect()
+}
+
+fn detected_file_domain_changes_from_detected_file_changes(
+    changes: &[crate::plugin::runtime::DetectedFileChange],
+) -> Vec<DetectedFileDomainChange> {
+    changes
+        .iter()
+        .map(|change| DetectedFileDomainChange {
+            entity_id: change.entity_id.clone(),
+            schema_key: change.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            version_id: change.version_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: None,
+            writer_key: None,
+        })
+        .collect()
 }
 
 fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
@@ -1574,8 +1650,8 @@ mod tests {
         active_version_from_update_validations, active_version_schema_key,
         file_descriptor_cache_eviction_targets, should_refresh_file_cache_for_sql,
     };
-    use crate::sql::{parse_sql_statements, MutationOperation, MutationRow};
     use crate::sql::UpdateValidationPlan;
+    use crate::sql::{parse_sql_statements, MutationOperation, MutationRow};
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
 

@@ -80,14 +80,7 @@ pub(crate) async fn collect_pending_file_delete_targets(
         let Statement::Delete(delete) = statement else {
             continue;
         };
-        collect_delete_targets(
-            backend,
-            &delete,
-            params,
-            active_version_id,
-            &mut targets,
-        )
-        .await?;
+        collect_delete_targets(backend, &delete, params, active_version_id, &mut targets).await?;
     }
 
     Ok(targets)
