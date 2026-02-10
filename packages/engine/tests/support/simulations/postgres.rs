@@ -42,7 +42,7 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
                 .insert("shared_buffers".to_string(), "8MB".to_string());
             settings
                 .configuration
-                .insert("max_connections".to_string(), "10".to_string());
+                .insert("max_connections".to_string(), "64".to_string());
             let mut pg = PostgreSQL::new(settings);
             if pg.settings().data_dir.exists() {
                 if pg.settings().data_dir.join("postmaster.pid").exists() {
