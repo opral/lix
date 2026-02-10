@@ -13,12 +13,14 @@ mod init;
 mod json_truthiness;
 mod key_value;
 mod materialization;
+mod plugin;
 mod schema;
 mod schema_registry;
 mod sql;
 mod types;
 mod validation;
 mod version;
+mod wasm_runtime;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
@@ -42,3 +44,4 @@ pub use materialization::{
     VersionPointerDebugRow,
 };
 pub use types::{QueryResult, Value};
+pub use wasm_runtime::{LoadWasmComponentRequest, WasmInstance, WasmLimits, WasmRuntime};

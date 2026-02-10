@@ -1,7 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use postgresql_embedded::{PostgreSQL, Status};
+use postgresql_embedded::PostgreSQL;
 use sqlx::{Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
@@ -13,6 +14,7 @@ static POSTGRES: OnceCell<Arc<PostgresInstance>> = OnceCell::const_new();
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct PostgresInstance {
+    _lock: FileLock,
     postgresql: TokioMutex<PostgreSQL>,
     settings: postgresql_embedded::Settings,
 }
@@ -20,9 +22,16 @@ struct PostgresInstance {
 async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
     POSTGRES
         .get_or_try_init(|| async {
+            let lock_path = std::env::temp_dir().join("lix-embedded-postgres.global.lock");
+            let lock = acquire_lock(&lock_path).await?;
+            cleanup_stale_embedded_postgres_processes()?;
+
+            let process_id = std::process::id();
             let mut settings = postgresql_embedded::Settings::new();
-            settings.data_dir = std::env::temp_dir().join("lix-embedded-postgres");
-            settings.password_file = std::env::temp_dir().join("lix-embedded-postgres.pgpass");
+            settings.data_dir =
+                std::env::temp_dir().join(format!("lix-embedded-postgres-{process_id}"));
+            settings.password_file =
+                std::env::temp_dir().join(format!("lix-embedded-postgres-{process_id}.pgpass"));
             settings.password = "lix_test_password".to_string();
             settings.temporary = false;
             settings
@@ -36,9 +45,7 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
                 .insert("max_connections".to_string(), "10".to_string());
             let mut pg = PostgreSQL::new(settings);
             if pg.settings().data_dir.exists() {
-                if pg.settings().data_dir.join("postmaster.pid").exists()
-                    && pg.status() == Status::Started
-                {
+                if pg.settings().data_dir.join("postmaster.pid").exists() {
                     let _ = pg.stop().await;
                 }
                 let _ = std::fs::remove_dir_all(pg.settings().data_dir.clone());
@@ -52,9 +59,11 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
             pg.start().await.map_err(|err| LixError {
                 message: err.to_string(),
             })?;
+
             let settings = pg.settings().clone();
 
             Ok(Arc::new(PostgresInstance {
+                _lock: lock,
                 postgresql: TokioMutex::new(pg),
                 settings,
             }))
@@ -74,7 +83,12 @@ pub fn postgres_simulation() -> Simulation {
             Box::pin(async move {
                 let instance = ensure_postgres().await?;
                 let db_index = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let db_name = format!("lix_test_{}", db_index);
+                let process_id = std::process::id();
+                let now_nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0);
+                let db_name = format!("lix_test_{}_{}_{}", process_id, now_nanos, db_index);
 
                 {
                     let pg = instance.postgresql.lock().await;
@@ -225,4 +239,137 @@ fn map_postgres_value(row: &sqlx::postgres::PgRow, index: usize) -> Result<Value
     }
 
     Ok(Value::Null)
+}
+
+struct FileLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn acquire_lock(path: &std::path::Path) -> Result<FileLock, LixError> {
+    let started = std::time::Instant::now();
+    let timeout = Duration::from_secs(1800);
+    let stale_after = Duration::from_secs(300);
+
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let pid = std::process::id();
+                let _ = writeln!(file, "{pid}");
+                return Ok(FileLock {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(owner_pid) = content.trim().parse::<u32>() {
+                        if !is_pid_alive(owner_pid) {
+                            let _ = std::fs::remove_file(path);
+                            continue;
+                        }
+                    }
+                }
+
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified.elapsed().unwrap_or_default() > stale_after {
+                            let _ = std::fs::remove_file(path);
+                            continue;
+                        }
+                    }
+                }
+
+                if started.elapsed() > timeout {
+                    return Err(LixError {
+                        message: format!(
+                            "Timed out acquiring postgres simulation lock at {}",
+                            path.display()
+                        ),
+                    });
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(LixError {
+                    message: format!(
+                        "Failed to acquire postgres simulation lock at {}: {}",
+                        path.display(),
+                        error
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn cleanup_stale_embedded_postgres_processes() -> Result<(), LixError> {
+    let output = std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,command="])
+        .output()
+        .map_err(|error| LixError {
+            message: format!("failed to list processes for postgres simulation cleanup: {error}"),
+        })?;
+
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut pids = Vec::new();
+    for line in listing.lines() {
+        if !line.contains("/postgres") || !line.contains("lix-embedded-postgres-") {
+            continue;
+        }
+        let Some(pid_text) = line.split_whitespace().next() else {
+            continue;
+        };
+        if let Ok(pid) = pid_text.parse::<u32>() {
+            pids.push(pid);
+        }
+    }
+
+    pids.sort_unstable();
+    pids.dedup();
+
+    for pid in &pids {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    for pid in &pids {
+        if is_pid_alive(*pid) {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    Ok(())
 }

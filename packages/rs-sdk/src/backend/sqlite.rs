@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lix_engine::{LixBackend, LixError, QueryResult, Value};
+use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 use rusqlite::{params_from_iter, Connection, Row};
 use std::sync::Mutex;
 
@@ -20,6 +20,10 @@ impl SqliteBackend {
 
 #[async_trait(?Send)]
 impl LixBackend for SqliteBackend {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Sqlite
+    }
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let conn = self.conn.lock().map_err(|_| LixError {
             message: "sqlite mutex poisoned".to_string(),

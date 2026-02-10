@@ -2119,19 +2119,6 @@ fn detect_file_changes(
 }
 ```
 
-### Host Bindings (extended)
-
-```rust
-pub trait HostBindings {
-    fn execute(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>>;
-
-    // Plugin callbacks
-    fn get_all_plugins(&self) -> Result<Vec<Plugin>>;
-    fn apply_changes(&self, plugin_key: &str, file: &FileDescriptor, changes: &[Entity]) -> Result<Vec<u8>>;
-    fn detect_changes(&self, plugin_key: &str, file: &FileDescriptor, before: Option<&[u8]>, after: &[u8]) -> Result<Vec<EntityChange>>;
-}
-```
-
 ### Tasks
 
 1. Extend HostBindings with plugin callback methods
