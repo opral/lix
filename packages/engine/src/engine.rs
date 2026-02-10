@@ -27,7 +27,8 @@ use crate::plugin::types::PluginManifest;
 use crate::schema_registry::register_schema;
 use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, escape_sql_string, parse_sql_statements,
-    preprocess_sql_with_provider, MutationRow, PostprocessPlan, UpdateValidationPlan,
+    preprocess_sql_with_provider, MutationOperation, MutationRow, PostprocessPlan,
+    UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -44,8 +45,8 @@ use crate::WasmRuntime;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Statement, TableFactor,
-    TableObject, TableWithJoins,
+    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,6 +145,24 @@ impl Engine {
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let active_version_id = self.active_version_id.read().unwrap().clone();
+        if let Some(runtime) = self.wasm_runtime.as_ref() {
+            if let Some(scope) = file_read_materialization_scope_for_sql(sql) {
+                let versions = match scope {
+                    FileReadMaterializationScope::ActiveVersionOnly => {
+                        let mut set = BTreeSet::new();
+                        set.insert(active_version_id.clone());
+                        Some(set)
+                    }
+                    FileReadMaterializationScope::AllVersions => None,
+                };
+                crate::plugin::runtime::materialize_missing_file_data_with_plugins(
+                    self.backend.as_ref(),
+                    runtime.as_ref(),
+                    versions.as_ref(),
+                )
+                .await?;
+            }
+        }
         let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
         let pending_file_writes =
             crate::filesystem::pending_file_writes::collect_pending_file_writes(
@@ -155,6 +174,17 @@ impl Engine {
             .await
             .map_err(|error| LixError {
                 message: format!("pending file writes collection failed: {}", error.message),
+            })?;
+        let pending_file_delete_targets =
+            crate::filesystem::pending_file_writes::collect_pending_file_delete_targets(
+                self.backend.as_ref(),
+                sql,
+                params,
+                &active_version_id,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!("pending file delete collection failed: {}", error.message),
             })?;
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
@@ -269,6 +299,11 @@ impl Engine {
         } else {
             BTreeSet::new()
         };
+        let descriptor_cache_eviction_targets =
+            file_descriptor_cache_eviction_targets(&output.mutations);
+        let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
+        file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
+        file_cache_invalidation_targets.extend(pending_file_delete_targets);
 
         if let Some(runtime) = self.wasm_runtime.as_ref() {
             if !pending_file_writes.is_empty() {
@@ -297,7 +332,7 @@ impl Engine {
         }
         self.persist_pending_file_data_updates(&pending_file_writes)
             .await?;
-        self.invalidate_file_data_cache_entries(&file_cache_refresh_targets)
+        self.invalidate_file_data_cache_entries(&file_cache_invalidation_targets)
             .await?;
         if self.wasm_runtime.is_some() {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
@@ -1025,6 +1060,18 @@ fn direct_state_file_cache_refresh_targets(
         .collect()
 }
 
+fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet<(String, String)> {
+    mutations
+        .iter()
+        .filter(|mutation| !mutation.untracked)
+        .filter(|mutation| mutation.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+        .filter(|mutation| {
+            matches!(mutation.operation, MutationOperation::Delete) || mutation.snapshot_content.is_none()
+        })
+        .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
+        .collect()
+}
+
 fn collect_postprocess_file_cache_targets(
     rows: &[Vec<Value>],
     schema_key: &str,
@@ -1118,6 +1165,117 @@ fn object_name_targets_file_cache_refresh(name: &ObjectName) -> bool {
 fn table_name_targets_file_cache_refresh(table_name: &str) -> bool {
     table_name.eq_ignore_ascii_case("lix_state")
         || table_name.eq_ignore_ascii_case("lix_state_by_version")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileReadMaterializationScope {
+    ActiveVersionOnly,
+    AllVersions,
+}
+
+fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterializationScope> {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return None;
+    };
+
+    let mut scope = None;
+    for statement in &statements {
+        let Some(statement_scope) = file_read_materialization_scope_for_statement(statement) else {
+            continue;
+        };
+        match statement_scope {
+            FileReadMaterializationScope::AllVersions => {
+                return Some(FileReadMaterializationScope::AllVersions);
+            }
+            FileReadMaterializationScope::ActiveVersionOnly => {
+                scope.get_or_insert(FileReadMaterializationScope::ActiveVersionOnly);
+            }
+        }
+    }
+    scope
+}
+
+fn file_read_materialization_scope_for_statement(
+    statement: &Statement,
+) -> Option<FileReadMaterializationScope> {
+    let Statement::Query(query) = statement else {
+        return None;
+    };
+
+    let mentions_by_version = query_mentions_table_name(query, "lix_file_by_version")
+        || query_mentions_table_name(query, "lix_file_history");
+    if mentions_by_version {
+        return Some(FileReadMaterializationScope::AllVersions);
+    }
+    if query_mentions_table_name(query, "lix_file") {
+        return Some(FileReadMaterializationScope::ActiveVersionOnly);
+    }
+    None
+}
+
+fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
+    if query_set_expr_mentions_table_name(query.body.as_ref(), table_name) {
+        return true;
+    }
+
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            if query_mentions_table_name(&cte.query, table_name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn query_set_expr_mentions_table_name(expr: &SetExpr, table_name: &str) -> bool {
+    match expr {
+        SetExpr::Select(select) => select_mentions_table_name(select, table_name),
+        SetExpr::Query(query) => query_mentions_table_name(query, table_name),
+        SetExpr::SetOperation { left, right, .. } => {
+            query_set_expr_mentions_table_name(left.as_ref(), table_name)
+                || query_set_expr_mentions_table_name(right.as_ref(), table_name)
+        }
+        _ => false,
+    }
+}
+
+fn select_mentions_table_name(select: &Select, table_name: &str) -> bool {
+    select
+        .from
+        .iter()
+        .any(|table| table_with_joins_mentions_table_name(table, table_name))
+}
+
+fn table_with_joins_mentions_table_name(table: &TableWithJoins, table_name: &str) -> bool {
+    if table_factor_mentions_table_name(&table.relation, table_name) {
+        return true;
+    }
+
+    table
+        .joins
+        .iter()
+        .any(|join| table_factor_mentions_table_name(&join.relation, table_name))
+}
+
+fn table_factor_mentions_table_name(table: &TableFactor, table_name: &str) -> bool {
+    match table {
+        TableFactor::Table { name, .. } => object_name_matches_table_name(name, table_name),
+        TableFactor::Derived { subquery, .. } => query_mentions_table_name(subquery, table_name),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => table_with_joins_mentions_table_name(table_with_joins, table_name),
+        _ => false,
+    }
+}
+
+fn object_name_matches_table_name(name: &ObjectName, table_name: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
+        .unwrap_or(false)
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -1392,9 +1550,9 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         active_version_from_update_validations, active_version_schema_key,
-        should_refresh_file_cache_for_sql,
+        file_descriptor_cache_eviction_targets, should_refresh_file_cache_for_sql,
     };
-    use crate::sql::parse_sql_statements;
+    use crate::sql::{parse_sql_statements, MutationOperation, MutationRow};
     use crate::sql::UpdateValidationPlan;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
@@ -1458,6 +1616,48 @@ mod tests {
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
+    }
+
+    #[test]
+    fn descriptor_delete_targets_cache_eviction_by_entity_id_and_version_id() {
+        let targets = file_descriptor_cache_eviction_targets(&[
+            MutationRow {
+                operation: MutationOperation::Delete,
+                entity_id: "file-a".to_string(),
+                schema_key: "lix_file_descriptor".to_string(),
+                schema_version: "1".to_string(),
+                file_id: "lix".to_string(),
+                version_id: "version-a".to_string(),
+                plugin_key: "lix".to_string(),
+                snapshot_content: None,
+                untracked: false,
+            },
+            MutationRow {
+                operation: MutationOperation::Delete,
+                entity_id: "ignored-dir".to_string(),
+                schema_key: "lix_directory_descriptor".to_string(),
+                schema_version: "1".to_string(),
+                file_id: "lix".to_string(),
+                version_id: "version-a".to_string(),
+                plugin_key: "lix".to_string(),
+                snapshot_content: None,
+                untracked: false,
+            },
+            MutationRow {
+                operation: MutationOperation::Delete,
+                entity_id: "ignored-untracked".to_string(),
+                schema_key: "lix_file_descriptor".to_string(),
+                schema_version: "1".to_string(),
+                file_id: "lix".to_string(),
+                version_id: "version-a".to_string(),
+                plugin_key: "lix".to_string(),
+                snapshot_content: None,
+                untracked: true,
+            },
+        ]);
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains(&("file-a".to_string(), "version-a".to_string())));
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {

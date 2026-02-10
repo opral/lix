@@ -1,5 +1,5 @@
 use crate::cel::CelEvaluator;
-use crate::materialization::{MaterializationPlan, MaterializationWriteOp};
+use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
 use crate::plugin::types::{InstalledPlugin, PluginRuntime};
 use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, LoadWasmComponentRequest, Value, WasmLimits, WasmRuntime};
@@ -267,19 +267,41 @@ pub(crate) async fn materialize_file_data_with_plugins(
         delete_file_cache_data(backend, &file_id, &version_id).await?;
     }
 
+    let mut writes_by_target: BTreeMap<(String, String, String), Vec<&MaterializationWrite>> =
+        BTreeMap::new();
+    for write in &plan.writes {
+        if write.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
+            continue;
+        }
+        writes_by_target
+            .entry((
+                write.version_id.clone(),
+                write.file_id.clone(),
+                write.plugin_key.clone(),
+            ))
+            .or_default()
+            .push(write);
+    }
+
+    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmInstance>> =
+        BTreeMap::new();
+
     for descriptor in descriptors.values() {
         let Some(plugin) = select_plugin_for_file(descriptor, &installed_plugins) else {
             continue;
         };
 
+        let Some(grouped_writes) = writes_by_target.get(&(
+            descriptor.version_id.clone(),
+            descriptor.file_id.clone(),
+            plugin.key.clone(),
+        )) else {
+            continue;
+        };
+
         let mut seen_keys: BTreeSet<(String, String)> = BTreeSet::new();
         let mut changes: Vec<PluginEntityChange> = Vec::new();
-        for write in plan.writes.iter().filter(|write| {
-            write.version_id == descriptor.version_id
-                && write.file_id == descriptor.file_id
-                && write.plugin_key == plugin.key
-                && write.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY
-        }) {
+        for write in grouped_writes {
             let dedupe_key = (write.schema_key.clone(), write.entity_id.clone());
             if !seen_keys.insert(dedupe_key.clone()) {
                 return Err(LixError {
@@ -326,14 +348,95 @@ pub(crate) async fn materialize_file_data_with_plugins(
             ),
         })?;
 
-        let instance = runtime
-            .load_component(LoadWasmComponentRequest {
-                key: plugin.key.clone(),
-                bytes: plugin.wasm.clone(),
-                world: PLUGIN_WORLD.to_string(),
-                limits: WasmLimits::default(),
-            })
-            .await?;
+        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
+            existing.clone()
+        } else {
+            let loaded = runtime
+                .load_component(LoadWasmComponentRequest {
+                    key: plugin.key.clone(),
+                    bytes: plugin.wasm.clone(),
+                    world: PLUGIN_WORLD.to_string(),
+                    limits: WasmLimits::default(),
+                })
+                .await?;
+            loaded_instances.insert(plugin.key.clone(), loaded.clone());
+            loaded
+        };
+        let output = call_apply_changes(instance.as_ref(), &payload).await?;
+        upsert_file_cache_data(
+            backend,
+            &descriptor.file_id,
+            &descriptor.version_id,
+            &output,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn materialize_missing_file_data_with_plugins(
+    backend: &dyn LixBackend,
+    runtime: &dyn WasmRuntime,
+    versions: Option<&BTreeSet<String>>,
+) -> Result<(), LixError> {
+    let installed_plugins = load_installed_plugins(backend).await?;
+    if installed_plugins.is_empty() {
+        return Ok(());
+    }
+
+    let descriptors = load_missing_file_descriptors(backend, versions).await?;
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+
+    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmInstance>> =
+        BTreeMap::new();
+
+    for descriptor in descriptors.values() {
+        let Some(plugin) = select_plugin_for_file(descriptor, &installed_plugins) else {
+            continue;
+        };
+
+        let changes = load_plugin_state_changes_for_file(
+            backend,
+            &descriptor.file_id,
+            &descriptor.version_id,
+            &plugin.key,
+        )
+        .await?;
+        if changes.is_empty() {
+            continue;
+        }
+
+        let payload = serde_json::to_vec(&ApplyChangesRequest {
+            file: PluginFile {
+                id: descriptor.file_id.clone(),
+                path: descriptor.path.clone(),
+                data: Vec::new(),
+            },
+            changes,
+        })
+        .map_err(|error| LixError {
+            message: format!(
+                "plugin materialization: failed to encode on-demand apply-changes payload: {error}"
+            ),
+        })?;
+
+        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
+            existing.clone()
+        } else {
+            let loaded = runtime
+                .load_component(LoadWasmComponentRequest {
+                    key: plugin.key.clone(),
+                    bytes: plugin.wasm.clone(),
+                    world: PLUGIN_WORLD.to_string(),
+                    limits: WasmLimits::default(),
+                })
+                .await?;
+            loaded_instances.insert(plugin.key.clone(), loaded.clone());
+            loaded
+        };
         let output = call_apply_changes(instance.as_ref(), &payload).await?;
         upsert_file_cache_data(
             backend,
@@ -518,6 +621,68 @@ async fn load_plugin_state_changes_for_file(
         });
     }
     Ok(changes)
+}
+
+async fn load_missing_file_descriptors(
+    backend: &dyn LixBackend,
+    versions: Option<&BTreeSet<String>>,
+) -> Result<BTreeMap<(String, String), FileDescriptorRow>, LixError> {
+    let mut sql = String::from(
+        "SELECT entity_id, version_id, snapshot_content \
+         FROM lix_state_by_version \
+         WHERE schema_key = 'lix_file_descriptor' \
+           AND snapshot_content IS NOT NULL \
+           AND NOT EXISTS (\
+               SELECT 1 \
+               FROM lix_internal_file_data_cache cache \
+               WHERE cache.file_id = entity_id \
+                 AND cache.version_id = version_id\
+           )",
+    );
+    let mut params = Vec::new();
+    if let Some(versions) = versions {
+        if versions.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut placeholders = Vec::with_capacity(versions.len());
+        for version in versions {
+            placeholders.push(format!("${}", params.len() + 1));
+            params.push(Value::Text(version.clone()));
+        }
+        sql.push_str(" AND version_id IN (");
+        sql.push_str(&placeholders.join(", "));
+        sql.push(')');
+    }
+    sql.push_str(" ORDER BY version_id, entity_id");
+
+    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
+    let rows = backend
+        .execute(&preprocessed.sql, &preprocessed.params)
+        .await?;
+
+    let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
+    for row in rows.rows {
+        let file_id = text_required(&row, 0, "entity_id")?;
+        let version_id = text_required(&row, 1, "version_id")?;
+        let snapshot_raw = text_required(&row, 2, "snapshot_content")?;
+        let snapshot: FileDescriptorSnapshot =
+            serde_json::from_str(&snapshot_raw).map_err(|error| LixError {
+                message: format!(
+                    "plugin materialization: invalid file descriptor snapshot JSON: {error}"
+                ),
+            })?;
+        let path = file_path_from_snapshot(&snapshot);
+        descriptors.insert(
+            (version_id.clone(), file_id.clone()),
+            FileDescriptorRow {
+                file_id,
+                version_id,
+                path,
+                extension: normalize_extension(snapshot.extension),
+            },
+        );
+    }
+    Ok(descriptors)
 }
 
 struct PluginEntityKey {

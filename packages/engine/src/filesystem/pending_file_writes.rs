@@ -5,7 +5,8 @@ use crate::sql::{
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
-    Assignment, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor, TableObject, Update,
+    Assignment, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
+    TableObject, Update,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,6 +65,32 @@ pub(crate) async fn collect_pending_file_writes(
     }
 
     Ok(writes)
+}
+
+pub(crate) async fn collect_pending_file_delete_targets(
+    backend: &dyn LixBackend,
+    sql: &str,
+    params: &[Value],
+    active_version_id: &str,
+) -> Result<BTreeSet<(String, String)>, LixError> {
+    let statements = parse_sql_statements(sql)?;
+    let mut targets = BTreeSet::new();
+
+    for statement in statements {
+        let Statement::Delete(delete) = statement else {
+            continue;
+        };
+        collect_delete_targets(
+            backend,
+            &delete,
+            params,
+            active_version_id,
+            &mut targets,
+        )
+        .await?;
+    }
+
+    Ok(targets)
 }
 
 fn collect_insert_writes(
@@ -283,6 +310,61 @@ async fn collect_update_writes(
     Ok(())
 }
 
+async fn collect_delete_targets(
+    backend: &dyn LixBackend,
+    delete: &sqlparser::ast::Delete,
+    params: &[Value],
+    active_version_id: &str,
+    targets: &mut BTreeSet<(String, String)>,
+) -> Result<(), LixError> {
+    let Some(target) = file_write_target_from_delete(delete) else {
+        return Ok(());
+    };
+
+    let mut query_sql = match target {
+        FileWriteTarget::ActiveVersion => "SELECT id FROM lix_file".to_string(),
+        FileWriteTarget::ExplicitVersion => {
+            "SELECT id, lixcol_version_id FROM lix_file_by_version".to_string()
+        }
+    };
+    if let Some(selection) = delete.selection.as_ref() {
+        query_sql.push_str(" WHERE ");
+        query_sql.push_str(&selection.to_string());
+    }
+
+    let bound = bind_sql_with_state(
+        &query_sql,
+        params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
+    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "pending_file_writes delete prefetch failed for '{}': {}",
+                bound.sql, error.message
+            ),
+        })?
+        .rows;
+
+    for row in rows {
+        let Some(file_id) = row.first().and_then(value_as_text) else {
+            continue;
+        };
+        let version_id = match target {
+            FileWriteTarget::ActiveVersion => active_version_id.to_string(),
+            FileWriteTarget::ExplicitVersion => row
+                .get(1)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string()),
+        };
+        targets.insert((file_id, version_id));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct OverlayWriteState {
     path: String,
@@ -366,6 +448,26 @@ fn file_write_target_from_update(update: &Update) -> Option<FileWriteTarget> {
         return None;
     }
     let TableFactor::Table { name, .. } = &update.table.relation else {
+        return None;
+    };
+
+    let table_name = object_name_terminal(name)?;
+    file_write_target_from_name(&table_name)
+}
+
+fn file_write_target_from_delete(delete: &sqlparser::ast::Delete) -> Option<FileWriteTarget> {
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    if tables.len() != 1 {
+        return None;
+    }
+
+    let table = &tables[0];
+    if !table.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &table.relation else {
         return None;
     };
 
