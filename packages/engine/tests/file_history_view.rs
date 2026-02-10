@@ -481,6 +481,274 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_history_view_directory_rename_propagates_into_file_history_paths,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-dir-rename-file', '/docs/readme.json', '{\"content\":\"hello\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+        let before_rename_commit_id = active_version_commit_id(&engine).await;
+        let docs_directory = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_directory \
+                 WHERE path = '/docs/' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("docs directory lookup should succeed");
+        assert_eq!(docs_directory.rows.len(), 1);
+        let docs_directory_id = match &docs_directory.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected docs directory id text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_directory \
+                     SET name = 'guides' \
+                     WHERE id = '{}'",
+                    docs_directory_id
+                ),
+                &[],
+            )
+            .await
+            .expect("directory rename should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET metadata = '{\"stage\":\"after-rename\"}' \
+                 WHERE id = 'history-dir-rename-file'",
+                &[],
+            )
+            .await
+            .expect("file metadata touch after directory rename should succeed");
+        let after_rename_commit_id = active_version_commit_id(&engine).await;
+
+        let before_rename_row = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-dir-rename-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    before_rename_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("before-rename history row query should succeed");
+        assert_eq!(before_rename_row.rows.len(), 1);
+        assert_text(&before_rename_row.rows[0][0], "/docs/readme.json");
+        assert_text(&before_rename_row.rows[0][1], &before_rename_commit_id);
+        assert_text(&before_rename_row.rows[0][2], &before_rename_commit_id);
+        assert_integer(&before_rename_row.rows[0][3], 0);
+
+        let after_rename_row = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-dir-rename-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    after_rename_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("after-rename history row query should succeed");
+        assert_eq!(after_rename_row.rows.len(), 1);
+        assert_text(&after_rename_row.rows[0][0], "/guides/readme.json");
+        assert_text(&after_rename_row.rows[0][1], &after_rename_commit_id);
+        assert_text(&after_rename_row.rows[0][2], &after_rename_commit_id);
+        assert_integer(&after_rename_row.rows[0][3], 0);
+
+        let historical_paths = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-dir-rename-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                     ORDER BY lixcol_depth ASC",
+                    after_rename_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("after-rename depth scan should succeed");
+        assert!(
+            historical_paths.rows.iter().any(|row| {
+                matches!(row.get(0), Some(Value::Text(path)) if path == "/docs/readme.json")
+                    && matches!(row.get(1), Some(Value::Integer(depth)) if *depth > 0)
+            }),
+            "expected old path to remain in deeper history after directory rename"
+        );
+    }
+);
+
+simulation_test!(
+    file_history_view_directory_move_propagates_into_file_history_paths,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-dir-move-articles', '/articles/')",
+                &[],
+            )
+            .await
+            .expect("articles directory insert should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-dir-move-file', '/docs/guides/intro.json', '{\"note\":\"move\"}')",
+                &[],
+            )
+            .await
+            .expect("initial nested file insert should succeed");
+        let before_move_commit_id = active_version_commit_id(&engine).await;
+
+        let docs_directory = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_directory \
+                 WHERE name = 'docs' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("docs directory lookup should succeed");
+        assert_eq!(docs_directory.rows.len(), 1);
+        let docs_directory_id = match &docs_directory.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected docs directory id text, got {other:?}"),
+        };
+
+        let guides_directory = engine
+            .execute(
+                &format!(
+                    "SELECT id \
+                     FROM lix_directory \
+                     WHERE name = 'guides' \
+                       AND parent_id = '{}' \
+                     LIMIT 1",
+                    docs_directory_id
+                ),
+                &[],
+            )
+            .await
+            .expect("guides directory lookup should succeed");
+        assert_eq!(guides_directory.rows.len(), 1);
+        let guides_directory_id = match &guides_directory.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected guides directory id text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_directory \
+                     SET parent_id = 'history-dir-move-articles' \
+                     WHERE id = '{}'",
+                    guides_directory_id
+                ),
+                &[],
+            )
+            .await
+            .expect("directory move should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET metadata = '{\"stage\":\"after-move\"}' \
+                 WHERE id = 'history-dir-move-file'",
+                &[],
+            )
+            .await
+            .expect("file metadata touch after directory move should succeed");
+        let after_move_commit_id = active_version_commit_id(&engine).await;
+
+        let before_move_row = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-dir-move-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    before_move_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("before-move history row query should succeed");
+        assert_eq!(before_move_row.rows.len(), 1);
+        assert_text(&before_move_row.rows[0][0], "/docs/guides/intro.json");
+        assert_text(&before_move_row.rows[0][1], &before_move_commit_id);
+        assert_text(&before_move_row.rows[0][2], &before_move_commit_id);
+        assert_integer(&before_move_row.rows[0][3], 0);
+
+        let after_move_row = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-dir-move-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    after_move_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("after-move history row query should succeed");
+        assert_eq!(after_move_row.rows.len(), 1);
+        assert_text(&after_move_row.rows[0][0], "/articles/guides/intro.json");
+        assert_text(&after_move_row.rows[0][1], &after_move_commit_id);
+        assert_text(&after_move_row.rows[0][2], &after_move_commit_id);
+        assert_integer(&after_move_row.rows[0][3], 0);
+
+        let historical_paths = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-dir-move-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                     ORDER BY lixcol_depth ASC",
+                    after_move_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("after-move depth scan should succeed");
+        assert!(
+            historical_paths.rows.iter().any(|row| {
+                matches!(row.get(0), Some(Value::Text(path)) if path == "/docs/guides/intro.json")
+                    && matches!(row.get(1), Some(Value::Integer(depth)) if *depth > 0)
+            }),
+            "expected old path to remain in deeper history after directory move"
+        );
+    }
+);
+
+simulation_test!(
     file_history_view_read_does_not_override_live_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
