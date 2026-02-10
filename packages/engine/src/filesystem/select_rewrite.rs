@@ -430,7 +430,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     d.hidden, \
                     c.id AS lixcol_entity_id, \
                     d.lixcol_schema_key, \
-                    d.lixcol_file_id, \
+                    c.id AS lixcol_file_id, \
                     d.lixcol_version_id, \
                     d.lixcol_plugin_key, \
                     d.lixcol_schema_version, \
