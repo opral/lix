@@ -131,6 +131,13 @@ fn assert_integer(value: &Value, expected: i64) {
     }
 }
 
+fn assert_not_null(value: &Value, label: &str) {
+    assert!(
+        !matches!(value, Value::Null),
+        "expected non-null value for {label}, got Null"
+    );
+}
+
 fn value_as_i64(value: &Value) -> i64 {
     match value {
         Value::Integer(v) => *v,
@@ -917,7 +924,16 @@ simulation_test!(
         let after = engine
             .execute(
                 &format!(
-                    "SELECT data, lixcol_change_id, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                    "SELECT \
+                        data, \
+                        lixcol_schema_key, \
+                        lixcol_file_id, \
+                        lixcol_plugin_key, \
+                        lixcol_schema_version, \
+                        lixcol_change_id, \
+                        lixcol_commit_id, \
+                        lixcol_root_commit_id, \
+                        lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-partial' \
                        AND lixcol_root_commit_id = '{}' \
@@ -933,9 +949,129 @@ simulation_test!(
             &after.rows[0][0],
             serde_json::json!({"name":"test-item","value":105}),
         );
-        assert_text(&after.rows[0][1], &expected_after_content_change_id);
-        assert_text(&after.rows[0][2], &after_commit_id);
-        assert_text(&after.rows[0][3], &after_commit_id);
-        assert_integer(&after.rows[0][4], 0);
+        assert_text(&after.rows[0][1], "lix_file_descriptor");
+        assert_text(&after.rows[0][2], "lix");
+        assert_text(&after.rows[0][3], "lix");
+        assert_text(&after.rows[0][4], "1");
+        assert_text(&after.rows[0][5], &expected_after_content_change_id);
+        assert_text(&after.rows[0][6], &after_commit_id);
+        assert_text(&after.rows[0][7], &after_commit_id);
+        assert_integer(&after.rows[0][8], 0);
+    }
+);
+
+simulation_test!(
+    file_history_view_exposes_lixcol_surface_parity_with_key_value_history,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (\
+                 key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
+                 ) VALUES (\
+                 'history-lixcol-kv', 'value-0', 'lix', 'lix', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .expect("key_value insert should succeed");
+        let key_value_root_commit_id = active_version_commit_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-lixcol-file', '/history-lixcol-file.json', '{\"value\":\"x\"}')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        let file_root_commit_id = active_version_commit_id(&engine).await;
+
+        let file_history = engine
+            .execute(
+                &format!(
+                    "SELECT \
+                        lixcol_entity_id, \
+                        lixcol_schema_key, \
+                        lixcol_file_id, \
+                        lixcol_version_id, \
+                        lixcol_plugin_key, \
+                        lixcol_schema_version, \
+                        lixcol_change_id, \
+                        lixcol_metadata, \
+                        lixcol_commit_id, \
+                        lixcol_root_commit_id, \
+                        lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-lixcol-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    file_root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("file_history lixcol surface query should succeed");
+        assert_eq!(file_history.rows.len(), 1);
+        assert_eq!(file_history.rows[0].len(), 11);
+        assert_text(&file_history.rows[0][0], "history-lixcol-file");
+        assert_text(&file_history.rows[0][1], "lix_file_descriptor");
+        assert_text(&file_history.rows[0][2], "lix");
+        assert_not_null(&file_history.rows[0][3], "file_history.lixcol_version_id");
+        assert_text(&file_history.rows[0][4], "lix");
+        assert_text(&file_history.rows[0][5], "1");
+        assert_not_null(&file_history.rows[0][6], "file_history.lixcol_change_id");
+        assert_text(&file_history.rows[0][8], &file_root_commit_id);
+        assert_text(&file_history.rows[0][9], &file_root_commit_id);
+        assert_integer(&file_history.rows[0][10], 0);
+
+        let key_value_history = engine
+            .execute(
+                &format!(
+                    "SELECT \
+                        lixcol_entity_id, \
+                        lixcol_schema_key, \
+                        lixcol_file_id, \
+                        lixcol_version_id, \
+                        lixcol_plugin_key, \
+                        lixcol_schema_version, \
+                        lixcol_change_id, \
+                        lixcol_metadata, \
+                        lixcol_commit_id, \
+                        lixcol_root_commit_id, \
+                        lixcol_depth \
+                     FROM lix_key_value_history \
+                     WHERE key = 'history-lixcol-kv' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    key_value_root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("key_value_history lixcol surface query should succeed");
+        assert_eq!(key_value_history.rows.len(), 1);
+        assert_eq!(key_value_history.rows[0].len(), 11);
+        assert_text(&key_value_history.rows[0][0], "history-lixcol-kv");
+        assert_text(&key_value_history.rows[0][1], "lix_key_value");
+        assert_text(&key_value_history.rows[0][2], "lix");
+        assert_not_null(
+            &key_value_history.rows[0][3],
+            "key_value_history.lixcol_version_id",
+        );
+        assert_text(&key_value_history.rows[0][4], "lix");
+        assert_text(&key_value_history.rows[0][5], "1");
+        assert_not_null(
+            &key_value_history.rows[0][6],
+            "key_value_history.lixcol_change_id",
+        );
+        assert_text(&key_value_history.rows[0][8], &key_value_root_commit_id);
+        assert_text(&key_value_history.rows[0][9], &key_value_root_commit_id);
+        assert_integer(&key_value_history.rows[0][10], 0);
+
+        // Keep parity with legacy intent: the relevant lixcol surface should be selectable on both views.
+        assert_eq!(file_history.rows[0].len(), key_value_history.rows[0].len());
     }
 );
