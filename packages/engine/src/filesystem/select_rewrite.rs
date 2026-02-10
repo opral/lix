@@ -393,20 +393,32 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ), \
              content_only_roots AS (\
                 SELECT \
-                    sh.file_id AS id, \
-                    sh.root_commit_id AS lixcol_root_commit_id, \
-                    MIN(sh.commit_id) AS lixcol_commit_id \
-                FROM lix_state_history sh \
-                LEFT JOIN descriptor_depth_zero_roots d0 \
-                  ON d0.id = sh.file_id \
-                 AND d0.lixcol_root_commit_id = sh.root_commit_id \
-                WHERE sh.depth = 0 \
-                  AND sh.file_id IS NOT NULL \
-                  AND sh.file_id != 'lix' \
-                  AND sh.schema_key != 'lix_file_descriptor' \
-                  AND sh.snapshot_content IS NOT NULL \
-                  AND d0.id IS NULL \
-                GROUP BY sh.file_id, sh.root_commit_id\
+                    ranked.id, \
+                    ranked.lixcol_root_commit_id, \
+                    ranked.lixcol_commit_id, \
+                    ranked.lixcol_change_id \
+                FROM (\
+                    SELECT \
+                        sh.file_id AS id, \
+                        sh.root_commit_id AS lixcol_root_commit_id, \
+                        sh.commit_id AS lixcol_commit_id, \
+                        sh.change_id AS lixcol_change_id, \
+                        ROW_NUMBER() OVER (\
+                            PARTITION BY sh.file_id, sh.root_commit_id \
+                            ORDER BY sh.commit_id ASC, sh.change_id ASC\
+                        ) AS row_num \
+                    FROM lix_state_history sh \
+                    LEFT JOIN descriptor_depth_zero_roots d0 \
+                      ON d0.id = sh.file_id \
+                     AND d0.lixcol_root_commit_id = sh.root_commit_id \
+                    WHERE sh.depth = 0 \
+                      AND sh.file_id IS NOT NULL \
+                      AND sh.file_id != 'lix' \
+                      AND sh.schema_key != 'lix_file_descriptor' \
+                      AND sh.snapshot_content IS NOT NULL \
+                      AND d0.id IS NULL\
+                ) ranked \
+                WHERE ranked.row_num = 1\
              ), \
              content_history_rows AS (\
                 SELECT \
@@ -422,7 +434,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     d.lixcol_version_id, \
                     d.lixcol_plugin_key, \
                     d.lixcol_schema_version, \
-                    d.lixcol_change_id, \
+                    c.lixcol_change_id, \
                     d.lixcol_metadata, \
                     c.lixcol_commit_id, \
                     c.lixcol_root_commit_id, \

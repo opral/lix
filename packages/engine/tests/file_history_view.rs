@@ -865,6 +865,31 @@ simulation_test!(
             .await
             .expect("partial file update should succeed");
         let after_commit_id = active_version_commit_id(&engine).await;
+        let expected_after_content_change_id_rows = engine
+            .execute(
+                &format!(
+                    "SELECT change_id \
+                     FROM lix_state_history \
+                     WHERE file_id = 'history-partial' \
+                       AND root_commit_id = '{}' \
+                       AND depth = 0 \
+                       AND schema_key != 'lix_file_descriptor' \
+                       AND snapshot_content IS NOT NULL \
+                     ORDER BY commit_id ASC, change_id ASC \
+                     LIMIT 1",
+                    after_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("content-root change id lookup should succeed");
+        assert_eq!(expected_after_content_change_id_rows.rows.len(), 1);
+        let expected_after_content_change_id = match &expected_after_content_change_id_rows.rows[0]
+            [0]
+        {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected content-root change id text, got {other:?}"),
+        };
 
         let before = engine
             .execute(
@@ -892,7 +917,7 @@ simulation_test!(
         let after = engine
             .execute(
                 &format!(
-                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                    "SELECT data, lixcol_change_id, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-partial' \
                        AND lixcol_root_commit_id = '{}' \
@@ -908,8 +933,9 @@ simulation_test!(
             &after.rows[0][0],
             serde_json::json!({"name":"test-item","value":105}),
         );
-        assert_text(&after.rows[0][1], &after_commit_id);
+        assert_text(&after.rows[0][1], &expected_after_content_change_id);
         assert_text(&after.rows[0][2], &after_commit_id);
-        assert_integer(&after.rows[0][3], 0);
+        assert_text(&after.rows[0][3], &after_commit_id);
+        assert_integer(&after.rows[0][4], 0);
     }
 );
