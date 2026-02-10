@@ -90,6 +90,19 @@ pub struct VtableDeleteRewrite {
     pub plan: VtableDeletePlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedFileDomainChange {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub plugin_key: String,
+    pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+}
+
 pub fn rewrite_insert(
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
@@ -146,6 +159,7 @@ pub async fn rewrite_insert_with_backend(
     backend: &dyn LixBackend,
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Option<VtableWriteRewrite>, LixError> {
     if !table_object_is_vtable(&insert.table) {
@@ -179,6 +193,7 @@ pub async fn rewrite_insert_with_backend(
             tracked_rows,
             &mut registrations,
             &mut mutations,
+            detected_file_domain_changes,
             functions,
         )
         .await?;
@@ -393,9 +408,17 @@ pub async fn build_update_followup_sql(
     backend: &dyn LixBackend,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
-    let statements = build_update_followup_statements(backend, plan, rows, functions).await?;
+    let statements = build_update_followup_statements(
+        backend,
+        plan,
+        rows,
+        detected_file_domain_changes,
+        functions,
+    )
+    .await?;
     Ok(statements
         .into_iter()
         .map(|statement| statement.to_string())
@@ -407,9 +430,17 @@ pub async fn build_delete_followup_sql(
     backend: &dyn LixBackend,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
-    let statements = build_delete_followup_statements(backend, plan, rows, functions).await?;
+    let statements = build_delete_followup_statements(
+        backend,
+        plan,
+        rows,
+        detected_file_domain_changes,
+        functions,
+    )
+    .await?;
     Ok(statements
         .into_iter()
         .map(|statement| statement.to_string())
@@ -803,6 +834,7 @@ async fn rewrite_tracked_rows_with_backend(
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     registrations: &mut Vec<SchemaRegistration>,
     mutations: &mut Vec<MutationRow>,
+    detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
@@ -884,6 +916,24 @@ async fn rewrite_tracked_rows_with_backend(
             plugin_key,
             snapshot_content: snapshot_json,
             untracked: false,
+        });
+    }
+
+    for change in detected_file_domain_changes {
+        affected_versions.insert(change.version_id.clone());
+        ensure_registration(registrations, &change.schema_key);
+        domain_changes.push(DomainChangeInput {
+            id: functions.uuid_v7(),
+            entity_id: change.entity_id.clone(),
+            schema_key: change.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            version_id: change.version_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            created_at: timestamp.clone(),
+            writer_key: change.writer_key.clone(),
         });
     }
 
@@ -1001,57 +1051,79 @@ async fn load_version_info_for_versions(
     version_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
     let mut versions = BTreeMap::new();
+    if version_ids.is_empty() {
+        return Ok(versions);
+    }
 
     for version_id in version_ids {
-        let sql = format!(
-            "SELECT snapshot_content \
-             FROM {table_name} \
-             WHERE schema_key = '{schema_key}' \
-               AND entity_id = '{entity_id}' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-             LIMIT 1",
-            table_name = VERSION_POINTER_TABLE,
-            schema_key = VERSION_POINTER_SCHEMA_KEY,
-            entity_id = escape_sql_string(version_id),
-            global_version = GLOBAL_VERSION,
-        );
-
-        let mut info = VersionInfo {
-            parent_commit_ids: Vec::new(),
-            snapshot: VersionSnapshot {
-                id: version_id.clone(),
-                working_commit_id: version_id.clone(),
+        versions.insert(
+            version_id.clone(),
+            VersionInfo {
+                parent_commit_ids: Vec::new(),
+                snapshot: VersionSnapshot {
+                    id: version_id.clone(),
+                    working_commit_id: version_id.clone(),
+                },
             },
-        };
+        );
+    }
 
-        match backend.execute(&sql, &[]).await {
-            Ok(result) => {
-                if let Some(row) = result.rows.first() {
-                    if let Some(parsed) = parse_version_info_from_tip_snapshot(row, version_id)? {
-                        info = parsed;
-                    }
+    let in_list = version_ids
+        .iter()
+        .map(|version_id| format!("'{}'", escape_sql_string(version_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT entity_id, snapshot_content \
+         FROM {table_name} \
+         WHERE schema_key = '{schema_key}' \
+           AND version_id = '{global_version}' \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL \
+           AND entity_id IN ({in_list})",
+        table_name = VERSION_POINTER_TABLE,
+        schema_key = VERSION_POINTER_SCHEMA_KEY,
+        global_version = GLOBAL_VERSION,
+        in_list = in_list,
+    );
+
+    match backend.execute(&sql, &[]).await {
+        Ok(result) => {
+            for row in result.rows {
+                if row.len() < 2 {
+                    continue;
                 }
+                let entity_id = match &row[0] {
+                    EngineValue::Text(value) => value.clone(),
+                    EngineValue::Null => continue,
+                    _ => {
+                        return Err(LixError {
+                            message: "version tip entity_id must be text".to_string(),
+                        });
+                    }
+                };
+                if !version_ids.contains(&entity_id) {
+                    continue;
+                }
+                let Some(parsed) = parse_version_info_from_tip_snapshot(&row[1], &entity_id)?
+                else {
+                    continue;
+                };
+                versions.insert(entity_id, parsed);
             }
-            Err(err) if is_missing_relation_error(&err) => {}
-            Err(err) => return Err(err),
         }
-
-        versions.insert(version_id.clone(), info);
+        Err(err) if is_missing_relation_error(&err) => {}
+        Err(err) => return Err(err),
     }
 
     Ok(versions)
 }
 
 fn parse_version_info_from_tip_snapshot(
-    row: &[EngineValue],
+    value: &EngineValue,
     fallback_version_id: &str,
 ) -> Result<Option<VersionInfo>, LixError> {
-    let Some(first_value) = row.first() else {
-        return Ok(None);
-    };
-    let raw_snapshot = match first_value {
+    let raw_snapshot = match value {
         EngineValue::Text(value) => value,
         EngineValue::Null => return Ok(None),
         _ => {
@@ -1196,9 +1268,10 @@ async fn build_update_followup_statements(
     backend: &dyn LixBackend,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
-    if rows.is_empty() {
+    if rows.is_empty() && detected_file_domain_changes.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1237,6 +1310,23 @@ async fn build_update_followup_statements(
         });
     }
 
+    for change in detected_file_domain_changes {
+        affected_versions.insert(change.version_id.clone());
+        domain_changes.push(DomainChangeInput {
+            id: functions.uuid_v7(),
+            entity_id: change.entity_id.clone(),
+            schema_key: change.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            version_id: change.version_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            created_at: timestamp.clone(),
+            writer_key: change.writer_key.clone(),
+        });
+    }
+
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;
     let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
     let commit_result = generate_commit(
@@ -1255,9 +1345,10 @@ async fn build_delete_followup_statements(
     backend: &dyn LixBackend,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
-    if rows.is_empty() {
+    if rows.is_empty() && detected_file_domain_changes.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1311,6 +1402,23 @@ async fn build_delete_followup_statements(
             affected_versions.insert(change.version_id.clone());
             domain_changes.push(change);
         }
+    }
+
+    for change in detected_file_domain_changes {
+        affected_versions.insert(change.version_id.clone());
+        domain_changes.push(DomainChangeInput {
+            id: functions.uuid_v7(),
+            entity_id: change.entity_id.clone(),
+            schema_key: change.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            version_id: change.version_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            created_at: timestamp.clone(),
+            writer_key: change.writer_key.clone(),
+        });
     }
 
     let versions = load_version_info_for_versions(backend, &affected_versions).await?;

@@ -117,6 +117,20 @@ fn assert_blob_json_eq(value: &Value, expected: JsonValue) {
     assert_eq!(actual, expected);
 }
 
+fn assert_text(value: &Value, expected: &str) {
+    match value {
+        Value::Text(actual) => assert_eq!(actual, expected),
+        other => panic!("expected text value '{expected}', got {other:?}"),
+    }
+}
+
+fn assert_integer(value: &Value, expected: i64) {
+    match value {
+        Value::Integer(actual) => assert_eq!(*actual, expected),
+        other => panic!("expected integer value {expected}, got {other:?}"),
+    }
+}
+
 fn value_as_i64(value: &Value) -> i64 {
     match value {
         Value::Integer(v) => *v,
@@ -257,7 +271,7 @@ simulation_test!(
         let after_row = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT id, path, data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-data' \
                        AND lixcol_root_commit_id = '{}' \
@@ -269,12 +283,17 @@ simulation_test!(
             .await
             .expect("updated-root depth-0 file history read should succeed");
         assert_eq!(after_row.rows.len(), 1);
-        assert_blob_json_eq(&after_row.rows[0][0], serde_json::json!({"value":"v1"}));
+        assert_text(&after_row.rows[0][0], "history-data");
+        assert_text(&after_row.rows[0][1], "/history-data.json");
+        assert_blob_json_eq(&after_row.rows[0][2], serde_json::json!({"value":"v1"}));
+        assert_text(&after_row.rows[0][3], &update_commit_id);
+        assert_text(&after_row.rows[0][4], &update_commit_id);
+        assert_integer(&after_row.rows[0][5], 0);
 
         let before_row = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT id, path, data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-data' \
                        AND lixcol_root_commit_id = '{}' \
@@ -286,7 +305,12 @@ simulation_test!(
             .await
             .expect("insert-root depth-0 file history read should succeed");
         assert_eq!(before_row.rows.len(), 1);
-        assert_blob_json_eq(&before_row.rows[0][0], serde_json::json!({"value":"v0"}));
+        assert_text(&before_row.rows[0][0], "history-data");
+        assert_text(&before_row.rows[0][1], "/history-data.json");
+        assert_blob_json_eq(&before_row.rows[0][2], serde_json::json!({"value":"v0"}));
+        assert_text(&before_row.rows[0][3], &insert_commit_id);
+        assert_text(&before_row.rows[0][4], &insert_commit_id);
+        assert_integer(&before_row.rows[0][5], 0);
     }
 );
 
@@ -324,7 +348,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-cache' \
                        AND lixcol_root_commit_id = '{}' \
@@ -337,12 +361,122 @@ simulation_test!(
             .expect("file history read should succeed");
         assert_eq!(rows.rows.len(), 1);
         assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"value":"after"}));
+        assert_text(&rows.rows[0][1], &update_commit_id);
+        assert_text(&rows.rows[0][2], &update_commit_id);
+        assert_integer(&rows.rows[0][3], 0);
 
         assert_eq!(
             file_history_cache_row_count_at_depth(&engine, "history-cache", &update_commit_id, 0)
                 .await,
             1
         );
+        assert_eq!(
+            file_history_cache_row_count(&engine, "history-cache", &update_commit_id).await,
+            2
+        );
+    }
+);
+
+simulation_test!(
+    file_history_view_rename_and_move_reconstructs_path_history_per_root_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-docs-dir', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("docs directory insert should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-archive-dir', '/archive/')",
+                &[],
+            )
+            .await
+            .expect("archive directory insert should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-path', '/docs/a.json', '{\"value\":\"v0\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+        let insert_commit_id = active_version_commit_id(&engine).await;
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/docs/a-renamed.json' \
+                 WHERE id = 'history-path'",
+                &[],
+            )
+            .await
+            .expect("file rename should succeed");
+        let rename_commit_id = active_version_commit_id(&engine).await;
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/archive/a-renamed.json' \
+                 WHERE id = 'history-path'",
+                &[],
+            )
+            .await
+            .expect("file move should succeed");
+        let move_commit_id = active_version_commit_id(&engine).await;
+
+        for (depth, expected_commit_id, expected_path) in [
+            (0_i64, move_commit_id.as_str(), "/archive/a-renamed.json"),
+            (1_i64, rename_commit_id.as_str(), "/docs/a-renamed.json"),
+            (2_i64, insert_commit_id.as_str(), "/docs/a.json"),
+        ] {
+            let rows = engine
+                .execute(
+                    &format!(
+                        "SELECT path, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                         FROM lix_file_history \
+                         WHERE id = 'history-path' \
+                           AND lixcol_root_commit_id = '{}' \
+                           AND lixcol_depth = {}",
+                        move_commit_id, depth
+                    ),
+                    &[],
+                )
+                .await
+                .expect("latest-root depth-scoped file history read should succeed");
+            assert_eq!(rows.rows.len(), 1);
+            assert_text(&rows.rows[0][0], expected_path);
+            assert_text(&rows.rows[0][1], expected_commit_id);
+            assert_text(&rows.rows[0][2], &move_commit_id);
+            assert_integer(&rows.rows[0][3], depth);
+        }
+
+        let latest_root_count = engine
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) \
+                     FROM lix_file_history \
+                     WHERE id = 'history-path' \
+                       AND lixcol_root_commit_id = '{}'",
+                    move_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("latest-root history count should succeed");
+        assert_eq!(latest_root_count.rows.len(), 1);
+        assert_eq!(value_as_i64(&latest_root_count.rows[0][0]), 3);
+
+        assert_ne!(insert_commit_id, rename_commit_id);
+        assert_ne!(rename_commit_id, move_commit_id);
     }
 );
 
@@ -385,7 +519,7 @@ simulation_test!(
         let historical_before = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-live' \
                        AND lixcol_root_commit_id = '{}' \
@@ -397,12 +531,18 @@ simulation_test!(
             .await
             .expect("historical before-root read should succeed");
         assert_eq!(historical_before.rows.len(), 1);
-        assert_blob_json_eq(&historical_before.rows[0][0], serde_json::json!({"value":"new"}));
+        assert_blob_json_eq(
+            &historical_before.rows[0][0],
+            serde_json::json!({"value":"new"}),
+        );
+        assert_text(&historical_before.rows[0][1], &insert_commit_id);
+        assert_text(&historical_before.rows[0][2], &insert_commit_id);
+        assert_integer(&historical_before.rows[0][3], 0);
 
         let historical_after = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-live' \
                        AND lixcol_root_commit_id = '{}' \
@@ -414,7 +554,13 @@ simulation_test!(
             .await
             .expect("historical after-root read should succeed");
         assert_eq!(historical_after.rows.len(), 1);
-        assert_blob_json_eq(&historical_after.rows[0][0], serde_json::json!({"value":"newer"}));
+        assert_blob_json_eq(
+            &historical_after.rows[0][0],
+            serde_json::json!({"value":"newer"}),
+        );
+        assert_text(&historical_after.rows[0][1], &update_commit_id);
+        assert_text(&historical_after.rows[0][2], &update_commit_id);
+        assert_integer(&historical_after.rows[0][3], 0);
 
         let live = engine
             .execute("SELECT data FROM lix_file WHERE id = 'history-live'", &[])
@@ -455,7 +601,7 @@ simulation_test!(
         let before = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-partial' \
                        AND lixcol_root_commit_id = '{}' \
@@ -471,11 +617,14 @@ simulation_test!(
             &before.rows[0][0],
             serde_json::json!({"name":"test-item","value":100}),
         );
+        assert_text(&before.rows[0][1], &before_commit_id);
+        assert_text(&before.rows[0][2], &before_commit_id);
+        assert_integer(&before.rows[0][3], 0);
 
         let after = engine
             .execute(
                 &format!(
-                    "SELECT data \
+                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-partial' \
                        AND lixcol_root_commit_id = '{}' \
@@ -491,5 +640,8 @@ simulation_test!(
             &after.rows[0][0],
             serde_json::json!({"name":"test-item","value":105}),
         );
+        assert_text(&after.rows[0][1], &after_commit_id);
+        assert_text(&after.rows[0][2], &after_commit_id);
+        assert_integer(&after.rows[0][3], 0);
     }
 );
