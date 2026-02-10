@@ -177,7 +177,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                lix_empty_blob() AS data, \
+                COALESCE(fd.data, lix_empty_blob()) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -198,6 +198,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
               AND dp.lixcol_version_id = f.lixcol_version_id \
              LEFT JOIN lix_version v \
                ON v.id = f.lixcol_version_id \
+             LEFT JOIN lix_internal_file_data_cache fd \
+               ON fd.file_id = f.id \
+              AND fd.version_id = f.lixcol_version_id \
              WHERE {active_version_scope}",
             active_version_scope = active_version_scope_predicate("f.lixcol_version_id")
         ),
@@ -267,7 +270,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                lix_empty_blob() AS data, \
+                COALESCE(fd.data, lix_empty_blob()) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -288,7 +291,10 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                ON dp.id = f.directory_id \
               AND dp.lixcol_version_id = f.lixcol_version_id \
              LEFT JOIN lix_version v \
-               ON v.id = f.lixcol_version_id"
+               ON v.id = f.lixcol_version_id \
+             LEFT JOIN lix_internal_file_data_cache fd \
+               ON fd.file_id = f.id \
+              AND fd.version_id = f.lixcol_version_id"
             .to_string(),
         FILE_HISTORY_VIEW => "WITH RECURSIVE directory_history_base AS (\
                  SELECT \
@@ -369,7 +375,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                lix_empty_blob() AS data, \
+                COALESCE(fd.data, lix_empty_blob()) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -415,8 +421,11 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                   WHERE candidate.id = f.directory_id \
                     AND candidate.lixcol_root_commit_id = f.lixcol_root_commit_id \
                     AND candidate.lixcol_depth >= f.lixcol_depth\
-              )"
-        .to_string(),
+              ) \
+             LEFT JOIN lix_internal_file_data_cache fd \
+               ON fd.file_id = f.id \
+              AND fd.version_id = f.lixcol_version_id"
+            .to_string(),
         DIRECTORY_VIEW => format!(
             "WITH RECURSIVE directory_descriptor_rows AS (\
                  SELECT \
@@ -720,7 +729,7 @@ mod tests {
             .expect("query should be rewritten")
             .to_string();
 
-        assert!(rewritten.contains("lix_empty_blob() AS data"));
+        assert!(rewritten.contains("COALESCE(fd.data, lix_empty_blob()) AS data"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("FROM lix_internal_state_untracked"));

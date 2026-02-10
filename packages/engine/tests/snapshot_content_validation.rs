@@ -114,6 +114,47 @@ simulation_test!(requires_stored_schema, |sim| async move {
     );
 });
 
+simulation_test!(
+    rejects_insert_with_mismatched_primary_key_entity_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"pk_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}}'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let result = engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1', 'pk_schema', 'file-1', 'version-1', 'lix', '{\"id\":\"entity-2\",\"name\":\"Ada\"}', '1'\
+             )",
+            &[],
+        )
+        .await;
+
+        let err = result.expect_err("expected entity_id consistency error");
+        assert!(
+            err.to_string()
+                .contains("entity_id 'entity-1' is inconsistent for schema 'pk_schema' (1)"),
+            "unexpected error: {err}"
+        );
+    }
+);
+
 simulation_test!(rejects_invalid_update, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
@@ -207,6 +248,100 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
         "unexpected error: {err}"
     );
 });
+
+simulation_test!(
+    rejects_update_with_mismatched_primary_key_entity_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"pk_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}}'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1', 'pk_schema', 'file-1', 'version-1', 'lix', '{\"id\":\"entity-1\",\"name\":\"Ada\"}', '1'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let result = engine
+        .execute(
+            "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"id\":\"entity-2\",\"name\":\"Ada\"}' \
+             WHERE entity_id = 'entity-1' AND schema_key = 'pk_schema' AND file_id = 'file-1' AND version_id = 'version-1'",
+            &[],
+        )
+        .await;
+
+        let err = result.expect_err("expected entity_id consistency error");
+        assert!(
+            err.to_string()
+                .contains("entity_id 'entity-1' is inconsistent for schema 'pk_schema' (1)"),
+            "unexpected error: {err}"
+        );
+    }
+);
+
+simulation_test!(
+    allows_composite_primary_key_entity_id_roundtrip,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"composite_pk_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\",\"/locale\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"locale\",\"name\"],\"additionalProperties\":false}}'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let insert_result = engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             'entity-1~en', 'composite_pk_schema', 'file-1', 'version-1', 'lix', '{\"id\":\"entity-1\",\"locale\":\"en\",\"name\":\"Ada\"}', '1'\
+             )",
+            &[],
+        )
+        .await;
+        assert!(insert_result.is_ok(), "{insert_result:?}");
+
+        let update_result = engine
+        .execute(
+            "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"id\":\"entity-1\",\"locale\":\"en\",\"name\":\"Ada Lovelace\"}' \
+             WHERE entity_id = 'entity-1~en' AND schema_key = 'composite_pk_schema' AND file_id = 'file-1' AND version_id = 'version-1'",
+            &[],
+        )
+        .await;
+        assert!(update_result.is_ok(), "{update_result:?}");
+    }
+);
 
 simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
     let engine = sim
