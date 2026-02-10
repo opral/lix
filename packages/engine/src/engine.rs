@@ -26,8 +26,7 @@ use crate::plugin::types::PluginManifest;
 use crate::schema_registry::register_schema;
 use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, escape_sql_string, parse_sql_statements,
-    preprocess_sql_with_provider, resolve_values_rows, MutationRow, PostprocessPlan,
-    UpdateValidationPlan,
+    preprocess_sql_with_provider, MutationRow, PostprocessPlan, UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -43,28 +42,13 @@ use crate::version::{
 use crate::WasmRuntime;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, TableObject};
+use sqlparser::ast::{BinaryOperator, Expr, Statement};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileWriteTarget {
-    ActiveVersion,
-    ExplicitVersion,
-}
-
-#[derive(Debug, Clone)]
-struct PendingFileWrite {
-    file_id: String,
-    version_id: String,
-    path: String,
-    before_data: Option<Vec<u8>>,
-    after_data: Vec<u8>,
-}
 
 #[derive(Debug, Clone)]
 pub struct BootKeyValue {
@@ -153,12 +137,18 @@ impl Engine {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let pending_file_writes = if self.wasm_runtime.is_some() {
-            self.collect_pending_file_writes(sql, params)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let active_version_id = self.active_version_id.read().unwrap().clone();
+        let pending_file_writes =
+            crate::filesystem::pending_file_writes::collect_pending_file_writes(
+                self.backend.as_ref(),
+                sql,
+                params,
+                &active_version_id,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!("pending file writes collection failed: {}", error.message),
+            })?;
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
         if self.deterministic_boot_pending.load(Ordering::SeqCst) {
@@ -174,14 +164,21 @@ impl Engine {
         let functions =
             SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, sequence_start));
 
-        let output = preprocess_sql_with_provider(
+        let output = match preprocess_sql_with_provider(
             self.backend.as_ref(),
             &self.cel_evaluator,
             sql,
             params,
             functions.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(output) => output,
+            Err(error) if should_sequentialize_postprocess_multi_statement(sql, params, &error) => {
+                return self.execute_multi_statement_sequential(sql).await;
+            }
+            Err(error) => return Err(error),
+        };
         let next_active_version_id_from_mutations =
             active_version_from_mutations(&output.mutations)?;
         let next_active_version_id_from_updates =
@@ -250,13 +247,13 @@ impl Engine {
         if let Some(runtime) = self.wasm_runtime.as_ref() {
             if !pending_file_writes.is_empty() {
                 let requests = pending_file_writes
-                    .into_iter()
+                    .iter()
                     .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
-                        file_id: write.file_id,
-                        version_id: write.version_id,
-                        path: write.path,
-                        before_data: write.before_data,
-                        after_data: write.after_data,
+                        file_id: write.file_id.clone(),
+                        version_id: write.version_id.clone(),
+                        path: write.path.clone(),
+                        before_data: write.before_data.clone(),
+                        after_data: write.after_data.clone(),
                     })
                     .collect::<Vec<_>>();
 
@@ -265,10 +262,15 @@ impl Engine {
                     runtime.as_ref(),
                     &requests,
                 )
-                .await?;
+                .await
+                .map_err(|error| LixError {
+                    message: format!("file detect stage failed: {}", error.message),
+                })?;
                 self.persist_detected_file_changes(&detected).await?;
             }
         }
+        self.persist_pending_file_data_updates(&pending_file_writes)
+            .await?;
 
         Ok(result)
     }
@@ -783,99 +785,6 @@ impl Engine {
         Ok(())
     }
 
-    fn collect_pending_file_writes(
-        &self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<Vec<PendingFileWrite>, LixError> {
-        let statements = parse_sql_statements(sql)?;
-        let active_version_id = self.active_version_id.read().unwrap().clone();
-        let mut writes = Vec::new();
-
-        for statement in statements {
-            let Statement::Insert(insert) = statement else {
-                continue;
-            };
-
-            let Some(target) = file_write_target_from_insert(&insert.table) else {
-                continue;
-            };
-
-            let Some(source) = insert.source.as_ref() else {
-                continue;
-            };
-            let SetExpr::Values(values) = source.body.as_ref() else {
-                continue;
-            };
-
-            let data_index = insert
-                .columns
-                .iter()
-                .position(|column| column.value.eq_ignore_ascii_case("data"));
-            let id_index = insert
-                .columns
-                .iter()
-                .position(|column| column.value.eq_ignore_ascii_case("id"));
-            let path_index = insert
-                .columns
-                .iter()
-                .position(|column| column.value.eq_ignore_ascii_case("path"));
-            let version_index = insert.columns.iter().position(|column| {
-                column.value.eq_ignore_ascii_case("lixcol_version_id")
-                    || column.value.eq_ignore_ascii_case("version_id")
-            });
-
-            let (Some(data_index), Some(id_index), Some(path_index)) =
-                (data_index, id_index, path_index)
-            else {
-                continue;
-            };
-
-            let resolved_rows = resolve_values_rows(&values.rows, params)?;
-            for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
-                if row.len() != insert.columns.len() {
-                    continue;
-                }
-
-                let Some(file_id) = resolved_cell_text(resolved_row.get(id_index)) else {
-                    continue;
-                };
-                let Some(path) = resolved_cell_text(resolved_row.get(path_index)) else {
-                    continue;
-                };
-                let Some(after_data) =
-                    resolved_cell_blob_or_text_bytes(resolved_row.get(data_index))
-                else {
-                    continue;
-                };
-
-                let version_id = match target {
-                    FileWriteTarget::ActiveVersion => active_version_id.clone(),
-                    FileWriteTarget::ExplicitVersion => {
-                        let Some(version_index) = version_index else {
-                            continue;
-                        };
-                        let Some(version_id) = resolved_cell_text(resolved_row.get(version_index))
-                        else {
-                            continue;
-                        };
-                        version_id
-                    }
-                };
-
-                writes.push(PendingFileWrite {
-                    file_id,
-                    version_id,
-                    path,
-                    before_data: None,
-                    after_data,
-                });
-            }
-        }
-
-        Ok(writes)
-    }
-
     async fn persist_detected_file_changes(
         &self,
         changes: &[crate::plugin::runtime::DetectedFileChange],
@@ -915,21 +824,54 @@ impl Engine {
                 }
                 None => {
                     Box::pin(self.execute(
-                        "DELETE FROM lix_internal_state_vtable \
-                         WHERE entity_id = $1 \
-                           AND schema_key = $2 \
-                           AND file_id = $3 \
-                           AND version_id = $4",
+                        "INSERT INTO lix_internal_state_vtable (\
+                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                         &[
                             Value::Text(change.entity_id.clone()),
                             Value::Text(change.schema_key.clone()),
                             Value::Text(change.file_id.clone()),
                             Value::Text(change.version_id.clone()),
+                            Value::Text(change.plugin_key.clone()),
+                            Value::Null,
+                            Value::Text(change.schema_version.clone()),
                         ],
                     ))
                     .await?;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn persist_pending_file_data_updates(
+        &self,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    ) -> Result<(), LixError> {
+        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for (index, write) in writes.iter().enumerate() {
+            if write.kind != crate::filesystem::pending_file_writes::PendingFileWriteKind::Update {
+                continue;
+            }
+            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+        }
+
+        for index in latest_by_key.into_values() {
+            let write = &writes[index];
+            self.backend
+                .execute(
+                    "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     data = EXCLUDED.data",
+                    &[
+                        Value::Text(write.file_id.clone()),
+                        Value::Text(write.version_id.clone()),
+                        Value::Blob(write.after_data.clone()),
+                    ],
+                )
+                .await?;
         }
 
         Ok(())
@@ -942,41 +884,41 @@ impl Engine {
         }
         *guard = version_id;
     }
+
+    async fn execute_multi_statement_sequential(&self, sql: &str) -> Result<QueryResult, LixError> {
+        let statements = parse_sql_statements(sql)?;
+        let mut last_result = QueryResult { rows: Vec::new() };
+        for statement in statements {
+            last_result = Box::pin(self.execute(&statement.to_string(), &[])).await?;
+        }
+        Ok(last_result)
+    }
 }
 
-fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget> {
-    let TableObject::TableName(name) = table else {
-        return None;
+fn should_sequentialize_postprocess_multi_statement(
+    sql: &str,
+    params: &[Value],
+    error: &LixError,
+) -> bool {
+    if !params.is_empty() || error.message != "postprocess rewrites require a single statement" {
+        return false;
+    }
+
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
     };
-
-    let table_name = name
-        .0
-        .last()
-        .and_then(sqlparser::ast::ObjectNamePart::as_ident)
-        .map(|ident| ident.value.as_str())?;
-
-    if table_name.eq_ignore_ascii_case("lix_file") {
-        Some(FileWriteTarget::ActiveVersion)
-    } else if table_name.eq_ignore_ascii_case("lix_file_by_version") {
-        Some(FileWriteTarget::ExplicitVersion)
-    } else {
-        None
+    if statements.len() <= 1 {
+        return false;
     }
-}
 
-fn resolved_cell_text(cell: Option<&crate::sql::ResolvedCell>) -> Option<String> {
-    match cell.and_then(|entry| entry.value.as_ref()) {
-        Some(Value::Text(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn resolved_cell_blob_or_text_bytes(cell: Option<&crate::sql::ResolvedCell>) -> Option<Vec<u8>> {
-    match cell.and_then(|entry| entry.value.as_ref()) {
-        Some(Value::Blob(bytes)) => Some(bytes.clone()),
-        Some(Value::Text(text)) => Some(text.as_bytes().to_vec()),
-        _ => None,
-    }
+    !statements.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+        )
+    })
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {

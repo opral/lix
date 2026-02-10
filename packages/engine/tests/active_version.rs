@@ -251,15 +251,22 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
 
         engine.init().await.unwrap();
+        let (active_id, _) = read_active_version_view_row(&engine).await;
         engine
             .execute(
                 "UPDATE lix_internal_state_vtable \
-                 SET snapshot_content = '{\"id\":\"preserved\",\"version_id\":\"version-a\"}' \
+                 SET snapshot_content = $1 \
                  WHERE untracked = 1 \
                    AND schema_key = 'lix_active_version' \
                    AND file_id = 'lix' \
                    AND version_id = 'global'",
-                &[],
+                &[Value::Text(
+                    serde_json::json!({
+                        "id": active_id,
+                        "version_id": "version-a"
+                    })
+                    .to_string(),
+                )],
             )
             .await
             .unwrap();
@@ -277,16 +284,23 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
 
         engine.init().await.unwrap();
+        let (active_id, _) = read_active_version_view_row(&engine).await;
 
         engine
             .execute(
                 "UPDATE lix_internal_state_vtable \
-                 SET snapshot_content = '{\"id\":\"preserved\",\"version_id\":\"version-b\"}' \
+                 SET snapshot_content = $1 \
                  WHERE untracked = 1 \
                    AND schema_key = 'lix_active_version' \
                    AND file_id = 'lix' \
                    AND version_id = 'global'",
-                &[],
+                &[Value::Text(
+                    serde_json::json!({
+                        "id": active_id,
+                        "version_id": "version-b"
+                    })
+                    .to_string(),
+                )],
             )
             .await
             .unwrap();

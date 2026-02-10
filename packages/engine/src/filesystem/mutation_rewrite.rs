@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_data_only_update_to_noop_statement() {
+    fn rewrites_data_only_update_to_noop_main_statement() {
         let sql = "UPDATE lix_file SET data = X'01' WHERE id = 'f1'";
         let statements = parse_sql_statements(sql).expect("parse");
         let update = match statements.into_iter().next().expect("statement") {

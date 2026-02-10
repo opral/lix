@@ -1,5 +1,7 @@
+use crate::cel::CelEvaluator;
 use crate::materialization::{MaterializationPlan, MaterializationWriteOp};
 use crate::plugin::types::{InstalledPlugin, PluginRuntime};
+use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, LoadWasmComponentRequest, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,7 +92,36 @@ pub(crate) async fn detect_file_changes_with_plugins(
             continue;
         };
 
-        let before = write.before_data.as_ref().map(|data| PluginFile {
+        let instance = runtime
+            .load_component(LoadWasmComponentRequest {
+                key: plugin.key.clone(),
+                bytes: plugin.wasm.clone(),
+                world: PLUGIN_WORLD.to_string(),
+                limits: WasmLimits::default(),
+            })
+            .await?;
+
+        let mut before_data = write.before_data.clone();
+        if before_data.is_none() {
+            let cached = load_file_cache_data(backend, &write.file_id, &write.version_id).await?;
+            if !cached.is_empty() {
+                before_data = Some(cached);
+            }
+        }
+        if before_data.is_none() {
+            before_data = reconstruct_before_file_data_from_state(
+                backend,
+                instance.as_ref(),
+                plugin,
+                &write.file_id,
+                &write.version_id,
+                &write.path,
+            )
+            .await?;
+        }
+
+        let had_before_data = before_data.is_some();
+        let before = before_data.as_ref().map(|data| PluginFile {
             id: write.file_id.clone(),
             path: write.path.clone(),
             data: data.clone(),
@@ -101,32 +132,63 @@ pub(crate) async fn detect_file_changes_with_plugins(
             data: write.after_data.clone(),
         };
 
-        let payload =
-            serde_json::to_vec(&DetectChangesRequest { before, after }).map_err(|error| {
-                LixError {
-                    message: format!(
-                        "plugin detect-changes: failed to encode request payload: {error}"
-                    ),
-                }
-            })?;
-
-        let instance = runtime
-            .load_component(LoadWasmComponentRequest {
-                key: plugin.key.clone(),
-                bytes: plugin.wasm.clone(),
-                world: PLUGIN_WORLD.to_string(),
-                limits: WasmLimits::default(),
-            })
-            .await?;
-
-        let output = call_detect_changes(instance.as_ref(), &payload).await?;
-        let plugin_changes: Vec<PluginEntityChange> =
-            serde_json::from_slice(&output).map_err(|error| LixError {
+        let detect_payload = serde_json::to_vec(&DetectChangesRequest {
+            before: before.clone(),
+            after: after.clone(),
+        })
+        .map_err(|error| LixError {
+            message: format!("plugin detect-changes: failed to encode request payload: {error}"),
+        })?;
+        let detect_output = call_detect_changes(instance.as_ref(), &detect_payload).await?;
+        let mut plugin_changes: Vec<PluginEntityChange> = serde_json::from_slice(&detect_output)
+            .map_err(|error| LixError {
                 message: format!(
                     "plugin detect-changes: failed to decode plugin output for key '{}': {error}",
                     plugin.key
                 ),
             })?;
+
+        let full_after_changes = if had_before_data {
+            let full_payload = serde_json::to_vec(&DetectChangesRequest {
+                before: None,
+                after: after.clone(),
+            })
+            .map_err(|error| LixError {
+                message: format!(
+                    "plugin detect-changes: failed to encode full-state payload: {error}"
+                ),
+            })?;
+            let full_output = call_detect_changes(instance.as_ref(), &full_payload).await?;
+            serde_json::from_slice::<Vec<PluginEntityChange>>(&full_output).map_err(|error| {
+                LixError {
+                    message: format!(
+                        "plugin detect-changes: failed to decode full-state output for key '{}': {error}",
+                        plugin.key
+                    ),
+                }
+            })?
+        } else {
+            plugin_changes.clone()
+        };
+        let full_after_keys = full_after_changes
+            .iter()
+            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
+
+        for existing in
+            load_existing_plugin_entities(backend, &write.file_id, &write.version_id, &plugin.key)
+                .await?
+        {
+            let key = (existing.schema_key.clone(), existing.entity_id.clone());
+            if !full_after_keys.contains(&key) {
+                plugin_changes.push(PluginEntityChange {
+                    entity_id: existing.entity_id,
+                    schema_key: existing.schema_key,
+                    schema_version: existing.schema_version,
+                    snapshot_content: None,
+                });
+            }
+        }
 
         let mut seen_keys: BTreeSet<(String, String)> = BTreeSet::new();
         for change in plugin_changes {
@@ -384,6 +446,102 @@ async fn call_detect_changes(
             errors.join("; ")
         ),
     })
+}
+
+async fn reconstruct_before_file_data_from_state(
+    backend: &dyn LixBackend,
+    instance: &dyn crate::WasmInstance,
+    plugin: &InstalledPlugin,
+    file_id: &str,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let changes =
+        load_plugin_state_changes_for_file(backend, file_id, version_id, &plugin.key).await?;
+    if changes.is_empty() {
+        return Ok(None);
+    }
+
+    let payload = serde_json::to_vec(&ApplyChangesRequest {
+        file: PluginFile {
+            id: file_id.to_string(),
+            path: path.to_string(),
+            data: Vec::new(),
+        },
+        changes,
+    })
+    .map_err(|error| LixError {
+        message: format!("plugin detect-changes: failed to encode apply fallback payload: {error}"),
+    })?;
+
+    match call_apply_changes(instance, &payload).await {
+        Ok(data) => Ok(Some(data)),
+        Err(_) => Ok(None),
+    }
+}
+
+async fn load_plugin_state_changes_for_file(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+    plugin_key: &str,
+) -> Result<Vec<PluginEntityChange>, LixError> {
+    let params = vec![
+        Value::Text(file_id.to_string()),
+        Value::Text(version_id.to_string()),
+        Value::Text(plugin_key.to_string()),
+    ];
+    let preprocessed = preprocess_sql(
+        backend,
+        &CelEvaluator::new(),
+        "SELECT entity_id, schema_key, schema_version, snapshot_content \
+         FROM lix_state_by_version \
+         WHERE file_id = $1 \
+           AND version_id = $2 \
+           AND plugin_key = $3 \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY entity_id",
+        &params,
+    )
+    .await?;
+    let rows = backend
+        .execute(&preprocessed.sql, &preprocessed.params)
+        .await?;
+
+    let mut changes = Vec::with_capacity(rows.rows.len());
+    for row in rows.rows {
+        changes.push(PluginEntityChange {
+            entity_id: text_required(&row, 0, "entity_id")?,
+            schema_key: text_required(&row, 1, "schema_key")?,
+            schema_version: text_required(&row, 2, "schema_version")?,
+            snapshot_content: Some(text_required(&row, 3, "snapshot_content")?),
+        });
+    }
+    Ok(changes)
+}
+
+struct PluginEntityKey {
+    entity_id: String,
+    schema_key: String,
+    schema_version: String,
+}
+
+async fn load_existing_plugin_entities(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+    plugin_key: &str,
+) -> Result<Vec<PluginEntityKey>, LixError> {
+    let changes =
+        load_plugin_state_changes_for_file(backend, file_id, version_id, plugin_key).await?;
+    Ok(changes
+        .into_iter()
+        .map(|change| PluginEntityKey {
+            entity_id: change.entity_id,
+            schema_key: change.schema_key,
+            schema_version: change.schema_version,
+        })
+        .collect())
 }
 
 async fn load_installed_plugins(

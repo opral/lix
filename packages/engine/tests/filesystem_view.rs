@@ -20,6 +20,14 @@ fn assert_empty_blob(value: &Value) {
     }
 }
 
+fn assert_blob_text(value: &Value, expected: &str) {
+    match value {
+        Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
+        Value::Text(actual) => assert_eq!(actual, expected),
+        other => panic!("expected blob value, got {other:?}"),
+    }
+}
+
 fn assert_non_empty_text(value: &Value) {
     match value {
         Value::Text(actual) => assert!(
@@ -218,7 +226,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(file_view_update_data_is_noop, |sim| async move {
+simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
         .await
@@ -244,6 +252,7 @@ simulation_test!(file_view_update_data_is_noop, |sim| async move {
         .await
         .unwrap();
     assert_eq!(before.rows.len(), 1);
+    let version_id = active_version_id(&engine).await;
 
     engine
         .execute(
@@ -272,8 +281,56 @@ simulation_test!(file_view_update_data_is_noop, |sim| async move {
         .await
         .unwrap();
     assert_eq!(file_row.rows.len(), 1);
-    assert_empty_blob(&file_row.rows[0][0]);
+    assert_blob_text(&file_row.rows[0][0], "ignored-again");
+
+    let cache_row = engine
+        .execute(
+            &format!(
+                "SELECT data FROM lix_internal_file_data_cache \
+                 WHERE file_id = 'file-2' \
+                   AND version_id = '{}'",
+                version_id.replace('\'', "''")
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cache_row.rows.len(), 1);
+    assert_blob_text(&cache_row.rows[0][0], "ignored-again");
 });
+
+simulation_test!(
+    file_view_update_data_expression_fails_fast,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-2-expr', '/src/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "UPDATE lix_file SET data = data WHERE id = 'file-2-expr'",
+                &[],
+            )
+            .await
+            .expect_err("data expression updates should fail fast");
+        assert!(
+            err.message
+                .contains("unsupported file data update expression"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
 
 simulation_test!(
     directory_insert_by_path_autocreates_missing_ancestors,
@@ -650,7 +707,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .unwrap();
     assert_eq!(row_b.rows.len(), 1);
     assert_text(&row_b.rows[0][0], "/shared/config-renamed.json");
-    assert_empty_blob(&row_b.rows[0][1]);
+    assert_blob_text(&row_b.rows[0][1], "ignored-again");
 
     engine
         .execute(
@@ -1017,7 +1074,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(file_row.rows.len(), 1);
-        assert_empty_blob(&file_row.rows[0][0]);
+        assert_blob_text(&file_row.rows[0][0], "ignored-again");
         assert!(
             matches!(&file_row.rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"sam\"")),
             "expected metadata containing owner key, got {:?}",
