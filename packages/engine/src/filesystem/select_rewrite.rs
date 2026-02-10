@@ -359,6 +359,89 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                   AND terminal.root_commit_id = walk.root_commit_id \
                   AND terminal.target_depth = walk.target_depth \
                   AND terminal.max_step = walk.step \
+             ), \
+             file_history_descriptor_rows AS (\
+                SELECT \
+                    lix_json_text(snapshot_content, 'id') AS id, \
+                    lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
+                    lix_json_text(snapshot_content, 'name') AS name, \
+                    lix_json_text(snapshot_content, 'extension') AS extension, \
+                    lix_json_text(snapshot_content, 'metadata') AS metadata, \
+                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    entity_id AS lixcol_entity_id, \
+                    schema_key AS lixcol_schema_key, \
+                    file_id AS lixcol_file_id, \
+                    version_id AS lixcol_version_id, \
+                    plugin_key AS lixcol_plugin_key, \
+                    schema_version AS lixcol_schema_version, \
+                    change_id AS lixcol_change_id, \
+                    metadata AS lixcol_metadata, \
+                    commit_id AS lixcol_commit_id, \
+                    root_commit_id AS lixcol_root_commit_id, \
+                    depth AS lixcol_depth \
+                FROM lix_state_history \
+                WHERE schema_key = 'lix_file_descriptor' \
+                  AND snapshot_content IS NOT NULL\
+             ), \
+             descriptor_depth_zero_roots AS (\
+                SELECT \
+                    id, \
+                    lixcol_root_commit_id \
+                FROM file_history_descriptor_rows \
+                WHERE lixcol_depth = 0 \
+                GROUP BY id, lixcol_root_commit_id\
+             ), \
+             content_only_roots AS (\
+                SELECT \
+                    sh.file_id AS id, \
+                    sh.root_commit_id AS lixcol_root_commit_id, \
+                    MIN(sh.commit_id) AS lixcol_commit_id \
+                FROM lix_state_history sh \
+                LEFT JOIN descriptor_depth_zero_roots d0 \
+                  ON d0.id = sh.file_id \
+                 AND d0.lixcol_root_commit_id = sh.root_commit_id \
+                WHERE sh.depth = 0 \
+                  AND sh.file_id IS NOT NULL \
+                  AND sh.file_id != 'lix' \
+                  AND sh.schema_key != 'lix_file_descriptor' \
+                  AND sh.snapshot_content IS NOT NULL \
+                  AND d0.id IS NULL \
+                GROUP BY sh.file_id, sh.root_commit_id\
+             ), \
+             content_history_rows AS (\
+                SELECT \
+                    d.id, \
+                    d.directory_id, \
+                    d.name, \
+                    d.extension, \
+                    d.metadata, \
+                    d.hidden, \
+                    c.id AS lixcol_entity_id, \
+                    d.lixcol_schema_key, \
+                    d.lixcol_file_id, \
+                    d.lixcol_version_id, \
+                    d.lixcol_plugin_key, \
+                    d.lixcol_schema_version, \
+                    d.lixcol_change_id, \
+                    d.lixcol_metadata, \
+                    c.lixcol_commit_id, \
+                    c.lixcol_root_commit_id, \
+                    0 AS lixcol_depth \
+                FROM content_only_roots c \
+                JOIN file_history_descriptor_rows d \
+                  ON d.id = c.id \
+                 AND d.lixcol_root_commit_id = c.lixcol_root_commit_id \
+                 AND d.lixcol_depth = (\
+                      SELECT MIN(candidate.lixcol_depth) \
+                      FROM file_history_descriptor_rows candidate \
+                      WHERE candidate.id = c.id \
+                        AND candidate.lixcol_root_commit_id = c.lixcol_root_commit_id\
+                 )\
+             ), \
+             file_history_rows AS (\
+                SELECT * FROM file_history_descriptor_rows \
+                UNION ALL \
+                SELECT * FROM content_history_rows\
              ) \
              SELECT \
                 f.id, \
@@ -389,29 +472,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 f.lixcol_commit_id, \
                 f.lixcol_root_commit_id, \
                 f.lixcol_depth \
-             FROM (\
-                SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'extension') AS extension, \
-                    lix_json_text(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
-                    entity_id AS lixcol_entity_id, \
-                    schema_key AS lixcol_schema_key, \
-                    file_id AS lixcol_file_id, \
-                    version_id AS lixcol_version_id, \
-                    plugin_key AS lixcol_plugin_key, \
-                    schema_version AS lixcol_schema_version, \
-                    change_id AS lixcol_change_id, \
-                    metadata AS lixcol_metadata, \
-                    commit_id AS lixcol_commit_id, \
-                    root_commit_id AS lixcol_root_commit_id, \
-                    depth AS lixcol_depth \
-                FROM lix_state_history \
-                WHERE schema_key = 'lix_file_descriptor' \
-                  AND snapshot_content IS NOT NULL\
-             ) f \
+             FROM file_history_rows f \
              LEFT JOIN directory_history_paths dp \
                ON dp.target_id = f.directory_id \
               AND dp.root_commit_id = f.lixcol_root_commit_id \
@@ -422,9 +483,10 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     AND candidate.lixcol_root_commit_id = f.lixcol_root_commit_id \
                     AND candidate.lixcol_depth >= f.lixcol_depth\
               ) \
-             LEFT JOIN lix_internal_file_data_cache fd \
+             LEFT JOIN lix_internal_file_history_data_cache fd \
                ON fd.file_id = f.id \
-              AND fd.version_id = f.lixcol_version_id"
+              AND fd.root_commit_id = f.lixcol_root_commit_id \
+              AND fd.depth = f.lixcol_depth"
             .to_string(),
         DIRECTORY_VIEW => format!(
             "WITH RECURSIVE directory_descriptor_rows AS (\

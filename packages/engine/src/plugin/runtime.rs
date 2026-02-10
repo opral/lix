@@ -39,6 +39,14 @@ struct FileDescriptorRow {
     extension: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct FileHistoryDescriptorRow {
+    file_id: String,
+    root_commit_id: String,
+    depth: i64,
+    path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct FileDescriptorSnapshot {
     name: String,
@@ -450,6 +458,82 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
     Ok(())
 }
 
+pub(crate) async fn materialize_missing_file_history_data_with_plugins(
+    backend: &dyn LixBackend,
+    runtime: &dyn WasmRuntime,
+) -> Result<(), LixError> {
+    let installed_plugins = load_installed_plugins(backend).await?;
+    if installed_plugins.is_empty() {
+        return Ok(());
+    }
+
+    let descriptors = load_missing_file_history_descriptors(backend).await?;
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+
+    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmInstance>> =
+        BTreeMap::new();
+
+    for descriptor in descriptors.values() {
+        let Some(plugin) = select_plugin_for_path(&descriptor.path, &installed_plugins) else {
+            continue;
+        };
+
+        let changes = load_plugin_state_changes_for_file_at_history_slice(
+            backend,
+            &descriptor.file_id,
+            &plugin.key,
+            &descriptor.root_commit_id,
+            descriptor.depth,
+        )
+        .await?;
+        if changes.is_empty() {
+            continue;
+        }
+
+        let payload = serde_json::to_vec(&ApplyChangesRequest {
+            file: PluginFile {
+                id: descriptor.file_id.clone(),
+                path: descriptor.path.clone(),
+                data: Vec::new(),
+            },
+            changes,
+        })
+        .map_err(|error| LixError {
+            message: format!(
+                "plugin materialization: failed to encode history apply-changes payload: {error}"
+            ),
+        })?;
+
+        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
+            existing.clone()
+        } else {
+            let loaded = runtime
+                .load_component(LoadWasmComponentRequest {
+                    key: plugin.key.clone(),
+                    bytes: plugin.wasm.clone(),
+                    world: PLUGIN_WORLD.to_string(),
+                    limits: WasmLimits::default(),
+                })
+                .await?;
+            loaded_instances.insert(plugin.key.clone(), loaded.clone());
+            loaded
+        };
+        let output = call_apply_changes(instance.as_ref(), &payload).await?;
+        upsert_file_history_cache_data(
+            backend,
+            &descriptor.file_id,
+            &descriptor.root_commit_id,
+            descriptor.depth,
+            &output,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 fn file_path_from_snapshot(snapshot: &FileDescriptorSnapshot) -> String {
     let name = snapshot.name.trim();
     let extension = snapshot
@@ -685,6 +769,101 @@ async fn load_missing_file_descriptors(
     Ok(descriptors)
 }
 
+async fn load_missing_file_history_descriptors(
+    backend: &dyn LixBackend,
+) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
+    let sql = "SELECT \
+                 id AS file_id, \
+                 lixcol_root_commit_id AS root_commit_id, \
+                 lixcol_depth AS depth, \
+                 path \
+               FROM lix_file_history \
+               WHERE path IS NOT NULL \
+                 AND NOT EXISTS (\
+                   SELECT 1 \
+                   FROM lix_internal_file_history_data_cache cache \
+                   WHERE cache.file_id = id \
+                     AND cache.root_commit_id = lixcol_root_commit_id \
+                     AND cache.depth = lixcol_depth\
+                 ) \
+               ORDER BY lixcol_root_commit_id, lixcol_depth, id";
+
+    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
+    let rows = backend
+        .execute(&preprocessed.sql, &preprocessed.params)
+        .await?;
+
+    let mut descriptors: BTreeMap<(String, String, i64), FileHistoryDescriptorRow> =
+        BTreeMap::new();
+    for row in rows.rows {
+        let file_id = text_required(&row, 0, "file_id")?;
+        let root_commit_id = text_required(&row, 1, "root_commit_id")?;
+        let depth = i64_required(&row, 2, "depth")?;
+        let path = text_required(&row, 3, "path")?;
+        descriptors.insert(
+            (root_commit_id.clone(), file_id.clone(), depth),
+            FileHistoryDescriptorRow {
+                file_id,
+                root_commit_id,
+                depth,
+                path,
+            },
+        );
+    }
+    Ok(descriptors)
+}
+
+async fn load_plugin_state_changes_for_file_at_history_slice(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    plugin_key: &str,
+    root_commit_id: &str,
+    depth: i64,
+) -> Result<Vec<PluginEntityChange>, LixError> {
+    let params = vec![
+        Value::Text(file_id.to_string()),
+        Value::Text(plugin_key.to_string()),
+        Value::Text(root_commit_id.to_string()),
+        Value::Integer(depth),
+    ];
+    let preprocessed = preprocess_sql(
+        backend,
+        &CelEvaluator::new(),
+        "SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
+         FROM lix_state_history \
+         WHERE file_id = $1 \
+           AND plugin_key = $2 \
+           AND root_commit_id = $3 \
+           AND depth >= $4 \
+         ORDER BY entity_id ASC, depth ASC",
+        &params,
+    )
+    .await?;
+    let rows = backend
+        .execute(&preprocessed.sql, &preprocessed.params)
+        .await?;
+
+    let mut changes = Vec::new();
+    let mut previous_entity_id: Option<String> = None;
+    for row in rows.rows {
+        let entity_id = text_required(&row, 0, "entity_id")?;
+        if previous_entity_id
+            .as_ref()
+            .is_some_and(|previous| previous == &entity_id)
+        {
+            continue;
+        }
+        previous_entity_id = Some(entity_id.clone());
+        changes.push(PluginEntityChange {
+            entity_id,
+            schema_key: text_required(&row, 1, "schema_key")?,
+            schema_version: text_required(&row, 2, "schema_version")?,
+            snapshot_content: nullable_text(&row, 3, "snapshot_content")?,
+        });
+    }
+    Ok(changes)
+}
+
 struct PluginEntityKey {
     entity_id: String,
     schema_key: String,
@@ -798,6 +977,30 @@ async fn upsert_file_cache_data(
     Ok(())
 }
 
+async fn upsert_file_history_cache_data(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    root_commit_id: &str,
+    depth: i64,
+    data: &[u8],
+) -> Result<(), LixError> {
+    backend
+        .execute(
+            "INSERT INTO lix_internal_file_history_data_cache (file_id, root_commit_id, depth, data) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (file_id, root_commit_id, depth) DO UPDATE SET \
+             data = EXCLUDED.data",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(root_commit_id.to_string()),
+                Value::Integer(depth),
+                Value::Blob(data.to_vec()),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn delete_file_cache_data(
     backend: &dyn LixBackend,
     file_id: &str,
@@ -829,6 +1032,43 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
         other => Err(LixError {
             message: format!(
                 "plugin materialization: expected text column '{column}' at index {index}, got {other:?}"
+            ),
+        }),
+    }
+}
+
+fn nullable_text(row: &[Value], index: usize, column: &str) -> Result<Option<String>, LixError> {
+    let Some(value) = row.get(index) else {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: row missing column '{column}' at index {index}"
+            ),
+        });
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => Ok(Some(text.clone())),
+        other => Err(LixError {
+            message: format!(
+                "plugin materialization: expected nullable text column '{column}' at index {index}, got {other:?}"
+            ),
+        }),
+    }
+}
+
+fn i64_required(row: &[Value], index: usize, column: &str) -> Result<i64, LixError> {
+    let Some(value) = row.get(index) else {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: row missing column '{column}' at index {index}"
+            ),
+        });
+    };
+    match value {
+        Value::Integer(number) => Ok(*number),
+        other => Err(LixError {
+            message: format!(
+                "plugin materialization: expected integer column '{column}' at index {index}, got {other:?}"
             ),
         }),
     }

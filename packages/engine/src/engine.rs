@@ -162,6 +162,13 @@ impl Engine {
                 )
                 .await?;
             }
+            if file_history_read_materialization_required_for_sql(sql) {
+                crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
+                    self.backend.as_ref(),
+                    runtime.as_ref(),
+                )
+                .await?;
+            }
         }
         let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
         let pending_file_writes =
@@ -1195,6 +1202,22 @@ fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterial
     scope
 }
 
+fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    statements
+        .iter()
+        .any(file_history_read_materialization_required_for_statement)
+}
+
+fn file_history_read_materialization_required_for_statement(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    query_mentions_table_name(query, "lix_file_history")
+}
+
 fn file_read_materialization_scope_for_statement(
     statement: &Statement,
 ) -> Option<FileReadMaterializationScope> {
@@ -1202,8 +1225,7 @@ fn file_read_materialization_scope_for_statement(
         return None;
     };
 
-    let mentions_by_version = query_mentions_table_name(query, "lix_file_by_version")
-        || query_mentions_table_name(query, "lix_file_history");
+    let mentions_by_version = query_mentions_table_name(query, "lix_file_by_version");
     if mentions_by_version {
         return Some(FileReadMaterializationScope::AllVersions);
     }
