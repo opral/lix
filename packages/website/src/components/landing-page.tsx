@@ -590,10 +590,10 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    It's just a library
+                    Fits into your tech stack
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Lix is a library you import. Get branching, diff, rollback in your existing stack.
+                    Import Lix and get branching, diff, and rollback without changing your architecture.
                   </p>
                 </div>
               </div>
@@ -706,7 +706,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="text-center sm:text-left">
                   <h3 className="text-lg font-semibold text-gray-900">
-                    Approval workflows for agents
+                    Human in the loop for agents
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
                     Agents propose changes in isolated versions. Humans review, approve, and merge.
