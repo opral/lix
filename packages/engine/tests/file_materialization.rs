@@ -1942,6 +1942,41 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_multi_statement_delete_with_metadata_predicate_works_with_overlay_prefetch,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data, metadata) \
+                 VALUES ('file-json-overlay-meta-delete', '/overlay-meta-delete.json', '{\"v\":1}', '{\"tag\":\"x\"}'); \
+                 DELETE FROM lix_file \
+                 WHERE metadata IS NOT NULL \
+                   AND id = 'file-json-overlay-meta-delete'",
+                &[],
+            )
+            .await
+            .expect("metadata-predicate delete should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT id FROM lix_file \
+                 WHERE id = 'file-json-overlay-meta-delete' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("post-delete read should succeed");
+        assert!(rows.rows.is_empty());
+        assert_eq!(
+            file_cache_row_count(&engine, "file-json-overlay-meta-delete", &main_version_id).await,
+            0
+        );
+    }
+);
+
+simulation_test!(
     file_read_materializes_cache_miss_without_explicit_materialize,
     simulations = [sqlite, postgres],
     |sim| async move {

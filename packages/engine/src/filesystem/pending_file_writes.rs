@@ -614,15 +614,25 @@ async fn execute_delete_overlay_prefetch_query(
         FileWriteTarget::ExplicitVersion => "lix_file_by_version",
     };
     let mut query_sql = format!(
-        "WITH {alias}(id, path, lixcol_version_id, version_id) AS (VALUES {}) \
+        "WITH {alias}(\
+            id, directory_id, name, extension, path, data, metadata, hidden, \
+            lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_version_id, version_id, \
+            lixcol_plugin_key, lixcol_schema_version, lixcol_inherited_from_version_id, \
+            lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
+            lixcol_writer_key, lixcol_untracked, lixcol_metadata\
+         ) AS (VALUES {}) \
          SELECT id, lixcol_version_id FROM {alias}",
         overlay_rows
             .iter()
             .map(|(file_id, path, version_id)| {
                 format!(
-                    "('{}', '{}', '{}', '{}')",
+                    "('{}', NULL, NULL, NULL, '{}', NULL, NULL, 0, \
+                      '{}', 'lix_file_descriptor', '{}', '{}', '{}', \
+                      'lix', '1', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL)",
                     escape_sql_string(file_id),
                     escape_sql_string(path),
+                    escape_sql_string(file_id),
+                    escape_sql_string(file_id),
                     escape_sql_string(version_id),
                     escape_sql_string(version_id)
                 )
