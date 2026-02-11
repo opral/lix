@@ -1,7 +1,7 @@
 use crate::cel::CelEvaluator;
 use crate::sql::{
-    bind_sql_with_state, parse_sql_statements, preprocess_sql, resolve_expr_cell_with_state,
-    resolve_values_rows, PlaceholderState,
+    bind_sql_with_state, escape_sql_string, parse_sql_statements, preprocess_sql,
+    resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
@@ -70,12 +70,44 @@ pub(crate) async fn collect_pending_file_delete_targets(
 ) -> Result<BTreeSet<(String, String)>, LixError> {
     let statements = parse_sql_statements(sql)?;
     let mut targets = BTreeSet::new();
+    let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
+    let mut writes = Vec::new();
 
     for statement in statements {
-        let Statement::Delete(delete) = statement else {
-            continue;
-        };
-        collect_delete_targets(backend, &delete, params, active_version_id, &mut targets).await?;
+        let start_len = writes.len();
+        match statement {
+            Statement::Insert(insert) => {
+                collect_insert_writes(&insert, params, active_version_id, &mut writes)?;
+                apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
+            }
+            Statement::Update(update) => {
+                collect_update_writes(
+                    backend,
+                    &update,
+                    params,
+                    active_version_id,
+                    &overlay,
+                    &mut writes,
+                )
+                .await?;
+                apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
+            }
+            Statement::Delete(delete) => {
+                let statement_targets = collect_delete_targets(
+                    backend,
+                    &delete,
+                    params,
+                    active_version_id,
+                    &overlay,
+                    &mut targets,
+                )
+                .await?;
+                for target in statement_targets {
+                    overlay.remove(&target);
+                }
+            }
+            _ => {}
+        }
     }
 
     Ok(targets)
@@ -278,7 +310,10 @@ async fn collect_update_writes(
             let key = (write.file_id.clone(), write.version_id.clone());
             if write.before_data.is_none() {
                 write.before_data = cache_data.get(&key).cloned();
-            } else if write.before_data.as_ref().is_some_and(|bytes| bytes.is_empty())
+            } else if write
+                .before_data
+                .as_ref()
+                .is_some_and(|bytes| bytes.is_empty())
                 && !cache_data.contains_key(&key)
             {
                 // lix_file views coalesce cache misses to empty blobs; convert that shape back
@@ -312,11 +347,13 @@ async fn collect_delete_targets(
     delete: &sqlparser::ast::Delete,
     params: &[Value],
     active_version_id: &str,
+    overlay: &BTreeMap<(String, String), OverlayWriteState>,
     targets: &mut BTreeSet<(String, String)>,
-) -> Result<(), LixError> {
+) -> Result<BTreeSet<(String, String)>, LixError> {
     let Some(target) = file_write_target_from_delete(delete) else {
-        return Ok(());
+        return Ok(BTreeSet::new());
     };
+    let mut statement_targets = BTreeSet::new();
 
     let mut query_sql = match target {
         FileWriteTarget::ActiveVersion => "SELECT id FROM lix_file".to_string(),
@@ -356,10 +393,34 @@ async fn collect_delete_targets(
                 .and_then(value_as_text)
                 .unwrap_or_else(|| active_version_id.to_string()),
         };
-        targets.insert((file_id, version_id));
+        let key = (file_id, version_id);
+        statement_targets.insert(key.clone());
+        targets.insert(key);
     }
 
-    Ok(())
+    let overlay_rows = execute_delete_overlay_prefetch_query(
+        backend,
+        delete,
+        params,
+        active_version_id,
+        target,
+        overlay,
+    )
+    .await?;
+    for row in overlay_rows {
+        let Some(file_id) = row.first().and_then(value_as_text) else {
+            continue;
+        };
+        let version_id = row
+            .get(1)
+            .and_then(value_as_text)
+            .unwrap_or_else(|| active_version_id.to_string());
+        let key = (file_id, version_id);
+        statement_targets.insert(key.clone());
+        targets.insert(key);
+    }
+
+    Ok(statement_targets)
 }
 
 #[derive(Debug, Clone)]
@@ -533,4 +594,69 @@ async fn execute_prefetch_query(
 ) -> Result<QueryResult, LixError> {
     let output = preprocess_sql(backend, &CelEvaluator::new(), sql, params).await?;
     backend.execute(&output.sql, &output.params).await
+}
+
+async fn execute_delete_overlay_prefetch_query(
+    backend: &dyn LixBackend,
+    delete: &sqlparser::ast::Delete,
+    params: &[Value],
+    active_version_id: &str,
+    target: FileWriteTarget,
+    overlay: &BTreeMap<(String, String), OverlayWriteState>,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let overlay_rows = overlay_rows_for_target(overlay, active_version_id, target);
+    if overlay_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let alias = match target {
+        FileWriteTarget::ActiveVersion => "lix_file",
+        FileWriteTarget::ExplicitVersion => "lix_file_by_version",
+    };
+    let mut query_sql = format!(
+        "WITH {alias}(id, path, lixcol_version_id, version_id) AS (VALUES {}) \
+         SELECT id, lixcol_version_id FROM {alias}",
+        overlay_rows
+            .iter()
+            .map(|(file_id, path, version_id)| {
+                format!(
+                    "('{}', '{}', '{}', '{}')",
+                    escape_sql_string(file_id),
+                    escape_sql_string(path),
+                    escape_sql_string(version_id),
+                    escape_sql_string(version_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some(selection) = delete.selection.as_ref() {
+        query_sql.push_str(" WHERE ");
+        query_sql.push_str(&selection.to_string());
+    }
+
+    let bound = bind_sql_with_state(
+        &query_sql,
+        params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
+    let rows = backend.execute(&bound.sql, &bound.params).await?.rows;
+    Ok(rows)
+}
+
+fn overlay_rows_for_target(
+    overlay: &BTreeMap<(String, String), OverlayWriteState>,
+    active_version_id: &str,
+    target: FileWriteTarget,
+) -> Vec<(String, String, String)> {
+    overlay
+        .iter()
+        .filter_map(|((file_id, version_id), state)| {
+            if matches!(target, FileWriteTarget::ActiveVersion) && version_id != active_version_id {
+                return None;
+            }
+            Some((file_id.clone(), state.path.clone(), version_id.clone()))
+        })
+        .collect()
 }

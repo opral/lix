@@ -1934,6 +1934,10 @@ simulation_test!(
             .expect("kept file query should succeed");
         assert_eq!(kept_rows.rows.len(), 1);
         assert_blob_json_eq(&kept_rows.rows[0][0], serde_json::json!({"keep":"yes"}));
+        assert_eq!(
+            file_cache_row_count(&engine, "file-json-mixed-drop", &main_version_id).await,
+            0
+        );
     }
 );
 

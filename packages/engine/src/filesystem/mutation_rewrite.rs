@@ -14,7 +14,7 @@ use crate::filesystem::path::{
 };
 use crate::sql::escape_sql_string;
 use crate::sql::{
-    lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
+    bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
     rewrite_read_query_with_backend, DetectedFileDomainChange, PlaceholderState, ResolvedCell,
 };
 use crate::version::{
@@ -345,7 +345,8 @@ pub async fn update_side_effects_with_backend(
         return Ok(FilesystemUpdateSideEffects::default());
     };
 
-    let version_id = resolve_update_version_id(backend, update, params, target).await?;
+    let version_id =
+        resolve_update_version_id(backend, update, params, target, &mut placeholder_state).await?;
     let parsed = parse_file_path(&raw_path)?;
     let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
     if ancestor_paths.is_empty() {
@@ -890,10 +891,21 @@ async fn rewrite_file_update_assignments_with_backend(
         return Ok(());
     };
 
-    let version_id = resolve_update_version_id(backend, update, params, target).await?;
+    let selection_placeholder_state = placeholder_state;
+    let mut version_predicate_state = selection_placeholder_state;
+    let version_id =
+        resolve_update_version_id(backend, update, params, target, &mut version_predicate_state)
+            .await?;
     let parsed = parse_file_path(&raw_path)?;
     assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
-    let matching_file_ids = file_ids_matching_update(backend, update, target, params).await?;
+    let matching_file_ids = file_ids_matching_update(
+        backend,
+        update,
+        target,
+        params,
+        selection_placeholder_state,
+    )
+    .await?;
     if matching_file_ids.len() > 1 {
         return Err(file_unique_error(&parsed.normalized_path, &version_id));
     }
@@ -1037,7 +1049,8 @@ async fn rewrite_directory_update_assignments_with_backend(
         return Ok(());
     }
 
-    let version_id = resolve_update_version_id(backend, update, params, target).await?;
+    let version_id =
+        resolve_update_version_id(backend, update, params, target, &mut placeholder_state).await?;
     let current_directory_id =
         extract_predicate_string(update.selection.as_ref(), &["id", "lixcol_entity_id"]);
     let Some(current_directory_id) = current_directory_id else {
@@ -1170,15 +1183,17 @@ async fn resolve_update_version_id(
     update: &Update,
     params: &[EngineValue],
     target: FilesystemTarget,
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<String, LixError> {
     if target.uses_active_version_scope() {
         return load_active_version_id(backend).await;
     }
     if target.requires_explicit_version_scope() {
-        return extract_predicate_string_with_params(
+        return extract_predicate_string_with_params_and_state(
             update.selection.as_ref(),
             &["lixcol_version_id", "version_id"],
             params,
+            placeholder_state,
         )
         .map_err(|error| LixError {
             message: format!(
@@ -1983,6 +1998,7 @@ async fn file_ids_matching_update(
     update: &Update,
     target: FilesystemTarget,
     params: &[EngineValue],
+    placeholder_state: PlaceholderState,
 ) -> Result<Vec<String>, LixError> {
     let where_clause = update
         .selection
@@ -1995,13 +2011,19 @@ async fn file_ids_matching_update(
         where_clause = where_clause
     );
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        params,
+        backend.dialect(),
+        placeholder_state,
+    )?;
     let result = backend
-        .execute(&rewritten_sql, params)
+        .execute(&bound.sql, &bound.params)
         .await
         .map_err(|error| LixError {
             message: format!(
                 "file update scope prefetch failed for '{}': {}",
-                rewritten_sql, error.message
+                bound.sql, error.message
             ),
         })?;
 
@@ -2262,8 +2284,14 @@ fn noop_statement() -> Result<Statement, LixError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_delete, rewrite_insert, rewrite_update};
+    use super::{
+        extract_predicate_string_with_params_and_state, parse_expression, rewrite_delete,
+        rewrite_insert, rewrite_update,
+    };
+    use crate::sql::resolve_expr_cell_with_state;
+    use crate::sql::PlaceholderState;
     use crate::sql::parse_sql_statements;
+    use crate::Value;
     use sqlparser::ast::Statement;
 
     #[test]
@@ -2320,5 +2348,42 @@ mod tests {
         assert!(rewritten
             .to_string()
             .contains("DELETE FROM lix_directory_descriptor"));
+    }
+
+    #[test]
+    fn version_predicate_extraction_respects_existing_placeholder_offset() {
+        let selection =
+            parse_expression("id = 'file-1' AND lixcol_version_id = ?").expect("parse selection");
+        let prior_placeholder = parse_expression("?").expect("parse placeholder expression");
+        let params = vec![
+            Value::Text("metadata-placeholder".to_string()),
+            Value::Text("version-target".to_string()),
+        ];
+
+        let mut offset_state = PlaceholderState::new();
+        resolve_expr_cell_with_state(&prior_placeholder, &params, &mut offset_state)
+            .expect("consume first placeholder");
+
+        let extracted_with_offset = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut offset_state,
+        )
+        .expect("extract with offset");
+        assert_eq!(extracted_with_offset.as_deref(), Some("version-target"));
+
+        let mut fresh_state = PlaceholderState::new();
+        let extracted_from_fresh = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut fresh_state,
+        )
+        .expect("extract with fresh state");
+        assert_eq!(
+            extracted_from_fresh.as_deref(),
+            Some("metadata-placeholder")
+        );
     }
 }
