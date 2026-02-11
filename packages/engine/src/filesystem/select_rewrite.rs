@@ -547,16 +547,12 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     lix_json_text(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
-                    file_id AS lixcol_file_id, \
                     version_id AS lixcol_version_id, \
-                    plugin_key AS lixcol_plugin_key, \
-                    schema_version AS lixcol_schema_version, \
                     inherited_from_version_id AS lixcol_inherited_from_version_id, \
                     change_id AS lixcol_change_id, \
                     created_at AS lixcol_created_at, \
                     updated_at AS lixcol_updated_at, \
-                    untracked AS lixcol_untracked, \
-                    metadata AS lixcol_metadata \
+                    untracked AS lixcol_untracked \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
                    AND snapshot_content IS NOT NULL\
@@ -586,16 +582,12 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 d.hidden, \
                 d.lixcol_entity_id, \
                 d.lixcol_schema_key, \
-                d.lixcol_file_id, \
-                d.lixcol_plugin_key, \
-                d.lixcol_schema_version, \
                 d.lixcol_inherited_from_version_id, \
                 d.lixcol_change_id, \
                 d.lixcol_created_at, \
                 d.lixcol_updated_at, \
                 v.commit_id AS lixcol_commit_id, \
-                d.lixcol_untracked, \
-                d.lixcol_metadata \
+                d.lixcol_untracked \
              FROM directory_descriptor_rows d \
              LEFT JOIN directory_paths dp \
                ON dp.id = d.id \
@@ -613,16 +605,12 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     lix_json_text(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
-                    file_id AS lixcol_file_id, \
                     version_id AS lixcol_version_id, \
-                    plugin_key AS lixcol_plugin_key, \
-                    schema_version AS lixcol_schema_version, \
                     inherited_from_version_id AS lixcol_inherited_from_version_id, \
                     change_id AS lixcol_change_id, \
                     created_at AS lixcol_created_at, \
                     updated_at AS lixcol_updated_at, \
-                    untracked AS lixcol_untracked, \
-                    metadata AS lixcol_metadata \
+                    untracked AS lixcol_untracked \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
                    AND snapshot_content IS NOT NULL\
@@ -652,17 +640,13 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 d.hidden, \
                 d.lixcol_entity_id, \
                 d.lixcol_schema_key, \
-                d.lixcol_file_id, \
                 d.lixcol_version_id, \
-                d.lixcol_plugin_key, \
-                d.lixcol_schema_version, \
                 d.lixcol_inherited_from_version_id, \
                 d.lixcol_change_id, \
                 d.lixcol_created_at, \
                 d.lixcol_updated_at, \
                 v.commit_id AS lixcol_commit_id, \
-                d.lixcol_untracked, \
-                d.lixcol_metadata \
+                d.lixcol_untracked \
              FROM directory_descriptor_rows d \
              LEFT JOIN directory_paths dp \
                ON dp.id = d.id \

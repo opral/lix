@@ -1776,9 +1776,9 @@ simulation_test!(
         let directory_rows = engine
             .execute(
                 "SELECT \
-                lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
-                lixcol_schema_version, lixcol_inherited_from_version_id, lixcol_change_id, \
-                lixcol_created_at, lixcol_updated_at, lixcol_untracked, lixcol_metadata \
+                lixcol_entity_id, lixcol_schema_key, lixcol_inherited_from_version_id, \
+                lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
+                lixcol_untracked \
              FROM lix_directory WHERE id = 'lixcol-dir'",
                 &[],
             )
@@ -1786,7 +1786,6 @@ simulation_test!(
             .unwrap();
         assert_eq!(directory_rows.rows.len(), 1);
         assert_text(&directory_rows.rows[0][1], "lix_directory_descriptor");
-        assert_text(&directory_rows.rows[0][3], "lix");
     }
 );
 
