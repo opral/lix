@@ -1768,9 +1768,9 @@ simulation_test!(
         let directory_rows = engine
             .execute(
                 "SELECT \
-                lixcol_entity_id, lixcol_schema_key, lixcol_inherited_from_version_id, \
+                lixcol_entity_id, lixcol_schema_key, lixcol_schema_version, lixcol_inherited_from_version_id, \
                 lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
-                lixcol_untracked \
+                lixcol_untracked, lixcol_metadata \
              FROM lix_directory WHERE id = 'lixcol-dir'",
                 &[],
             )
@@ -1778,6 +1778,37 @@ simulation_test!(
             .unwrap();
         assert_eq!(directory_rows.rows.len(), 1);
         assert_text(&directory_rows.rows[0][1], "lix_directory_descriptor");
+        match &directory_rows.rows[0][2] {
+            Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
+            other => panic!("expected lixcol_schema_version as text, got {other:?}"),
+        }
+        match &directory_rows.rows[0][9] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected lixcol_metadata as text/null, got {other:?}"),
+        }
+
+        let directory_by_version_rows = engine
+            .execute(
+                &format!(
+                    "SELECT \
+                    lixcol_schema_version, lixcol_metadata \
+                 FROM lix_directory_by_version \
+                 WHERE id = 'lixcol-dir' \
+                   AND lixcol_version_id = '{active_version}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(directory_by_version_rows.rows.len(), 1);
+        match &directory_by_version_rows.rows[0][0] {
+            Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
+            other => panic!("expected by-version schema version as text, got {other:?}"),
+        }
+        match &directory_by_version_rows.rows[0][1] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected by-version metadata as text/null, got {other:?}"),
+        }
     }
 );
 
