@@ -1316,6 +1316,63 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_update_path_only_plugin_switch_does_not_write_non_authoritative_cache_data,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-json-path-only-cache-guard', '/cache-guard.json', '{\"hello\":\"before\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
+                .await,
+            1
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-json-path-only-cache-guard' \
+                       AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+        assert_eq!(
+            file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
+                .await,
+            0
+        );
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/cache-guard.txt' \
+                 WHERE id = 'file-json-path-only-cache-guard'",
+                &[],
+            )
+            .await
+            .expect("path-only file update should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
+                .await,
+            0
+        );
+    }
+);
+
+simulation_test!(
     file_update_json_by_version_detects_and_materializes,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -1611,7 +1668,7 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
-            0
+            1
         );
 
         let before_rows = engine
@@ -1730,6 +1787,23 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
+            1
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-read-miss' AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
             0
         );
 
@@ -1787,6 +1861,24 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
+            1
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-read-miss-by-version' \
+                       AND version_id = '{}'",
+                    version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
             0
         );
 
@@ -1827,6 +1919,24 @@ simulation_test!(
             )
             .await
             .expect("file insert should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
+            1
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-read-insert-select' \
+                       AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
@@ -1898,6 +2008,24 @@ simulation_test!(
             )
             .await
             .expect("file_by_version insert should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
+            1
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-read-insert-select-by-version' \
+                       AND version_id = '{}'",
+                    version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,

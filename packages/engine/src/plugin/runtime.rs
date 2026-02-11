@@ -218,13 +218,17 @@ pub(crate) async fn detect_file_changes_with_plugins(
             .iter()
             .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
             .collect::<BTreeSet<_>>();
+        let mut plugin_change_keys = plugin_changes
+            .iter()
+            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
 
         for existing in
             load_existing_plugin_entities(backend, &write.file_id, &write.version_id, &plugin.key)
                 .await?
         {
             let key = (existing.schema_key.clone(), existing.entity_id.clone());
-            if !full_after_keys.contains(&key) {
+            if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
                 plugin_changes.push(PluginEntityChange {
                     entity_id: existing.entity_id,
                     schema_key: existing.schema_key,

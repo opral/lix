@@ -12,19 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFileWrite {
-    pub(crate) kind: PendingFileWriteKind,
     pub(crate) file_id: String,
     pub(crate) version_id: String,
     pub(crate) before_path: Option<String>,
     pub(crate) path: String,
+    pub(crate) data_is_authoritative: bool,
     pub(crate) before_data: Option<Vec<u8>>,
     pub(crate) after_data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingFileWriteKind {
-    Insert,
-    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,11 +151,11 @@ fn collect_insert_writes(
         };
 
         writes.push(PendingFileWrite {
-            kind: PendingFileWriteKind::Insert,
             file_id,
             version_id,
             before_path: None,
             path,
+            data_is_authoritative: true,
             before_data: None,
             after_data,
         });
@@ -264,11 +258,11 @@ async fn collect_update_writes(
         }
 
         pending.push(PendingFileWrite {
-            kind: PendingFileWriteKind::Update,
             file_id,
             version_id,
             before_path: Some(before_path_for_write),
             path,
+            data_is_authoritative: saw_data_assignment,
             before_data,
             after_data: assigned_after_data.clone().unwrap_or_else(|| Vec::new()),
         });

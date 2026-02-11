@@ -9,17 +9,6 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
-fn assert_empty_blob(value: &Value) {
-    match value {
-        Value::Blob(actual) => assert!(
-            actual.is_empty(),
-            "expected empty blob, got {} bytes",
-            actual.len()
-        ),
-        other => panic!("expected blob value, got {other:?}"),
-    }
-}
-
 fn assert_blob_text(value: &Value, expected: &str) {
     match value {
         Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
@@ -110,14 +99,16 @@ async fn insert_version(
     engine.execute(&sql, &[]).await.unwrap();
 }
 
-simulation_test!(file_view_insert_reads_empty_blob_data, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine_deterministic()
-        .await
-        .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+simulation_test!(
+    file_view_insert_reads_inserted_blob_data,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
 
-    engine
+        engine
         .execute(
             "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/src/index.ts', 'ignored')",
             &[],
@@ -125,21 +116,22 @@ simulation_test!(file_view_insert_reads_empty_blob_data, |sim| async move {
         .await
         .unwrap();
 
-    let result = engine
-        .execute(
-            "SELECT id, path, data, lixcol_schema_key FROM lix_file WHERE id = 'file-1'",
-            &[],
-        )
-        .await
-        .unwrap();
+        let result = engine
+            .execute(
+                "SELECT id, path, data, lixcol_schema_key FROM lix_file WHERE id = 'file-1'",
+                &[],
+            )
+            .await
+            .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 1);
-    assert_text(&result.rows[0][0], "file-1");
-    assert_text(&result.rows[0][1], "/src/index.ts");
-    assert_empty_blob(&result.rows[0][2]);
-    assert_text(&result.rows[0][3], "lix_file_descriptor");
-});
+        sim.assert_deterministic(result.rows.clone());
+        assert_eq!(result.rows.len(), 1);
+        assert_text(&result.rows[0][0], "file-1");
+        assert_text(&result.rows[0][1], "/src/index.ts");
+        assert_blob_text(&result.rows[0][2], "ignored");
+        assert_text(&result.rows[0][3], "lix_file_descriptor");
+    }
+);
 
 simulation_test!(
     file_insert_autocreates_first_level_directory,
@@ -692,7 +684,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .unwrap();
     assert_eq!(row_a.rows.len(), 1);
     assert_text(&row_a.rows[0][0], "/shared/config.json");
-    assert_empty_blob(&row_a.rows[0][1]);
+    assert_blob_text(&row_a.rows[0][1], "ignored");
 
     let row_b = engine
         .execute(
