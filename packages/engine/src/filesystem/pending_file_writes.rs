@@ -233,7 +233,7 @@ async fn collect_update_writes(
         .rows;
 
     let mut pending = Vec::with_capacity(rows.len());
-    let mut missing_before_data = BTreeSet::<(String, String)>::new();
+    let mut cache_lookup_keys = BTreeSet::<(String, String)>::new();
 
     for row in rows {
         let Some(before_file_id) = row.get(0).and_then(value_as_text) else {
@@ -253,8 +253,8 @@ async fn collect_update_writes(
                 .unwrap_or_else(|| active_version_id.to_string()),
         };
         let before_data = row.get(2).and_then(value_as_blob_or_text_bytes);
-        if before_data.is_none() {
-            missing_before_data.insert((file_id.clone(), version_id.clone()));
+        if before_data.is_none() || before_data.as_ref().is_some_and(|bytes| bytes.is_empty()) {
+            cache_lookup_keys.insert((file_id.clone(), version_id.clone()));
         }
 
         pending.push(PendingFileWrite {
@@ -268,17 +268,22 @@ async fn collect_update_writes(
         });
     }
 
-    if !missing_before_data.is_empty() {
+    if !cache_lookup_keys.is_empty() {
         let cache_data = load_before_data_from_cache_batch(
             backend,
-            &missing_before_data.into_iter().collect::<Vec<_>>(),
+            &cache_lookup_keys.into_iter().collect::<Vec<_>>(),
         )
         .await?;
         for write in &mut pending {
+            let key = (write.file_id.clone(), write.version_id.clone());
             if write.before_data.is_none() {
-                write.before_data = cache_data
-                    .get(&(write.file_id.clone(), write.version_id.clone()))
-                    .cloned();
+                write.before_data = cache_data.get(&key).cloned();
+            } else if write.before_data.as_ref().is_some_and(|bytes| bytes.is_empty())
+                && !cache_data.contains_key(&key)
+            {
+                // lix_file views coalesce cache misses to empty blobs; convert that shape back
+                // to None so detect stage can reconstruct true before_data from state.
+                write.before_data = None;
             }
         }
     }
