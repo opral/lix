@@ -390,6 +390,7 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
             message: format!("{} does not support UPDATE", target.view_name),
         });
     }
+    reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
         update.assignments.retain(|assignment| {
@@ -419,6 +420,7 @@ pub async fn rewrite_update_with_backend(
             message: format!("{} does not support UPDATE", target.view_name),
         });
     }
+    reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
         update.assignments.retain(|assignment| {
@@ -1240,6 +1242,26 @@ fn set_or_replace_update_assignment(update: &mut Update, column: &str, value: Ex
         target: sqlparser::ast::AssignmentTarget::ColumnName(table_name(column)),
         value,
     });
+}
+
+fn reject_immutable_id_update(update: &Update, target: FilesystemTarget) -> Result<(), LixError> {
+    let mutates_id = update.assignments.iter().any(|assignment| {
+        assignment_target_name(assignment)
+            .map(|name| {
+                name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("lixcol_entity_id")
+            })
+            .unwrap_or(false)
+    });
+    if !mutates_id {
+        return Ok(());
+    }
+
+    Err(LixError {
+        message: format!(
+            "{} id is immutable; create a new row and delete the old row instead",
+            target.view_name
+        ),
+    })
 }
 
 fn ensure_insert_column(insert: &mut Insert, column: &str) -> Result<usize, LixError> {
@@ -2439,6 +2461,40 @@ mod tests {
             .expect("rewrite")
             .expect("should rewrite");
         assert_eq!(rewritten.to_string(), "SELECT 0 WHERE 1 = 0");
+    }
+
+    #[test]
+    fn rejects_file_id_update() {
+        let sql = "UPDATE lix_file SET id = 'f2' WHERE id = 'f1'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let update = match statements.into_iter().next().expect("statement") {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update).expect_err("id update should fail");
+        assert!(
+            err.message.contains("lix_file id is immutable"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_directory_id_update() {
+        let sql = "UPDATE lix_directory SET id = 'dir-2' WHERE id = 'dir-1'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let update = match statements.into_iter().next().expect("statement") {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update).expect_err("id update should fail");
+        assert!(
+            err.message.contains("lix_directory id is immutable"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]
