@@ -82,6 +82,7 @@ const config = defineConfig(({ mode, command }) => {
           autoSubfolderIndex: true,
           autoStaticPathsDiscovery: true,
           crawlLinks: true,
+          filter: (page) => page.path === "/" || !page.path.endsWith("/"),
           concurrency: 8,
           retryCount: 2,
           retryDelay: 1000,
