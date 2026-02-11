@@ -44,6 +44,7 @@ struct FileHistoryDescriptorRow {
     file_id: String,
     root_commit_id: String,
     depth: i64,
+    commit_id: String,
     path: String,
 }
 
@@ -485,6 +486,7 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
             &descriptor.file_id,
             &plugin.key,
             &descriptor.root_commit_id,
+            &descriptor.commit_id,
             descriptor.depth,
         )
         .await?;
@@ -776,6 +778,7 @@ async fn load_missing_file_history_descriptors(
                  id AS file_id, \
                  lixcol_root_commit_id AS root_commit_id, \
                  lixcol_depth AS depth, \
+                 lixcol_commit_id AS commit_id, \
                  path \
                FROM lix_file_history \
                WHERE path IS NOT NULL \
@@ -799,13 +802,15 @@ async fn load_missing_file_history_descriptors(
         let file_id = text_required(&row, 0, "file_id")?;
         let root_commit_id = text_required(&row, 1, "root_commit_id")?;
         let depth = i64_required(&row, 2, "depth")?;
-        let path = text_required(&row, 3, "path")?;
+        let commit_id = text_required(&row, 3, "commit_id")?;
+        let path = text_required(&row, 4, "path")?;
         descriptors.insert(
             (root_commit_id.clone(), file_id.clone(), depth),
             FileHistoryDescriptorRow {
                 file_id,
                 root_commit_id,
                 depth,
+                commit_id,
                 path,
             },
         );
@@ -818,23 +823,32 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     file_id: &str,
     plugin_key: &str,
     root_commit_id: &str,
+    commit_id: &str,
     depth: i64,
 ) -> Result<Vec<PluginEntityChange>, LixError> {
     let params = vec![
         Value::Text(file_id.to_string()),
         Value::Text(plugin_key.to_string()),
         Value::Text(root_commit_id.to_string()),
+        Value::Text(commit_id.to_string()),
         Value::Integer(depth),
     ];
     let preprocessed = preprocess_sql(
         backend,
         &CelEvaluator::new(),
-        "SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
+        "WITH target_commit_depth AS (\
+            SELECT MIN(depth) AS raw_depth \
+            FROM lix_state_history \
+            WHERE file_id = $1 \
+              AND root_commit_id = $3 \
+              AND commit_id = $4\
+         ) \
+         SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
          FROM lix_state_history \
          WHERE file_id = $1 \
            AND plugin_key = $2 \
            AND root_commit_id = $3 \
-           AND depth >= $4 \
+           AND depth >= COALESCE((SELECT raw_depth FROM target_commit_depth), $5) \
          ORDER BY entity_id ASC, depth ASC",
         &params,
     )
