@@ -489,10 +489,11 @@ pub async fn rewrite_delete_with_backend(
         });
     }
     if target.requires_explicit_version_scope() {
-        let version_id = extract_predicate_string_with_params(
+        let version_id = extract_predicate_string_with_params_and_dialect(
             delete.selection.as_ref(),
             &["lixcol_version_id", "version_id"],
             params,
+            backend.dialect(),
         )?;
         if version_id.is_none() {
             return Err(LixError {
@@ -1230,6 +1231,7 @@ async fn resolve_update_version_id(
             &["lixcol_version_id", "version_id"],
             params,
             placeholder_state,
+            backend.dialect(),
         )
         .map_err(|error| LixError {
             message: format!(
@@ -1586,12 +1588,27 @@ fn extract_predicate_string_with_params(
     columns: &[&str],
     params: &[EngineValue],
 ) -> Result<Option<String>, LixError> {
+    extract_predicate_string_with_params_and_dialect(
+        selection,
+        columns,
+        params,
+        crate::SqlDialect::Sqlite,
+    )
+}
+
+fn extract_predicate_string_with_params_and_dialect(
+    selection: Option<&Expr>,
+    columns: &[&str],
+    params: &[EngineValue],
+    dialect: crate::SqlDialect,
+) -> Result<Option<String>, LixError> {
     let mut placeholder_state = PlaceholderState::new();
     extract_predicate_string_with_params_and_state(
         selection,
         columns,
         params,
         &mut placeholder_state,
+        dialect,
     )
 }
 
@@ -1600,6 +1617,7 @@ fn extract_predicate_string_with_params_and_state(
     columns: &[&str],
     params: &[EngineValue],
     placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
 ) -> Result<Option<String>, LixError> {
     let selection = match selection {
         Some(selection) => selection,
@@ -1638,6 +1656,7 @@ fn extract_predicate_string_with_params_and_state(
                 columns,
                 params,
                 placeholder_state,
+                dialect,
             )?;
             if left_match.is_some() {
                 return Ok(left_match);
@@ -1647,6 +1666,7 @@ fn extract_predicate_string_with_params_and_state(
                 columns,
                 params,
                 placeholder_state,
+                dialect,
             )
         }
         Expr::Nested(inner) => extract_predicate_string_with_params_and_state(
@@ -1654,9 +1674,10 @@ fn extract_predicate_string_with_params_and_state(
             columns,
             params,
             placeholder_state,
+            dialect,
         ),
         _ => {
-            consume_placeholders_in_expr(selection, params, placeholder_state)?;
+            consume_placeholders_in_expr(selection, params, placeholder_state, dialect)?;
             Ok(None)
         }
     }
@@ -1666,6 +1687,7 @@ fn consume_placeholders_in_expr(
     expr: &Expr,
     params: &[EngineValue],
     placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
 ) -> Result<(), LixError> {
     match expr {
         Expr::Value(ValueWithSpan {
@@ -1676,31 +1698,33 @@ fn consume_placeholders_in_expr(
             Ok(())
         }
         Expr::BinaryOp { left, right, .. } => {
-            consume_placeholders_in_expr(left, params, placeholder_state)?;
-            consume_placeholders_in_expr(right, params, placeholder_state)
+            consume_placeholders_in_expr(left, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(right, params, placeholder_state, dialect)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => consume_placeholders_in_expr(expr, params, placeholder_state),
+        | Expr::Cast { expr, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)
+        }
         Expr::InList { expr, list, .. } => {
-            consume_placeholders_in_expr(expr, params, placeholder_state)?;
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
             for item in list {
-                consume_placeholders_in_expr(item, params, placeholder_state)?;
+                consume_placeholders_in_expr(item, params, placeholder_state, dialect)?;
             }
             Ok(())
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            consume_placeholders_in_expr(expr, params, placeholder_state)?;
-            consume_placeholders_in_expr(low, params, placeholder_state)?;
-            consume_placeholders_in_expr(high, params, placeholder_state)
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(low, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(high, params, placeholder_state, dialect)
         }
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            consume_placeholders_in_expr(expr, params, placeholder_state)?;
-            consume_placeholders_in_expr(pattern, params, placeholder_state)
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(pattern, params, placeholder_state, dialect)
         }
         Expr::Function(function) => match &function.args {
             sqlparser::ast::FunctionArguments::List(list) => {
@@ -1708,11 +1732,21 @@ fn consume_placeholders_in_expr(
                     match arg {
                         sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(expr),
-                        ) => consume_placeholders_in_expr(expr, params, placeholder_state)?,
+                        ) => consume_placeholders_in_expr(
+                            expr,
+                            params,
+                            placeholder_state,
+                            dialect,
+                        )?,
                         sqlparser::ast::FunctionArg::Named { arg, .. }
                         | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => {
                             if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
-                                consume_placeholders_in_expr(expr, params, placeholder_state)?;
+                                consume_placeholders_in_expr(
+                                    expr,
+                                    params,
+                                    placeholder_state,
+                                    dialect,
+                                )?;
                             }
                         }
                         _ => {}
@@ -1723,15 +1757,15 @@ fn consume_placeholders_in_expr(
             _ => Ok(()),
         },
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            consume_placeholders_in_expr(left, params, placeholder_state)?;
-            consume_placeholders_in_expr(right, params, placeholder_state)
+            consume_placeholders_in_expr(left, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(right, params, placeholder_state, dialect)
         }
         Expr::InSubquery { expr, subquery, .. } => {
-            consume_placeholders_in_expr(expr, params, placeholder_state)?;
-            consume_placeholders_in_query(subquery, params, placeholder_state)
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            consume_placeholders_in_query(subquery, params, placeholder_state, dialect)
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
-            consume_placeholders_in_query(subquery, params, placeholder_state)
+            consume_placeholders_in_query(subquery, params, placeholder_state, dialect)
         }
         _ => Ok(()),
     }
@@ -1741,14 +1775,10 @@ fn consume_placeholders_in_query(
     query: &sqlparser::ast::Query,
     params: &[EngineValue],
     placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
 ) -> Result<(), LixError> {
     let probe_sql = format!("SELECT 1 WHERE EXISTS ({})", query);
-    let bound = bind_sql_with_state(
-        &probe_sql,
-        params,
-        crate::SqlDialect::Sqlite,
-        *placeholder_state,
-    )?;
+    let bound = bind_sql_with_state(&probe_sql, params, dialect, *placeholder_state)?;
     *placeholder_state = bound.state;
     Ok(())
 }
@@ -2438,6 +2468,7 @@ mod tests {
         extract_predicate_string_with_params_and_state, parse_expression, rewrite_delete,
         rewrite_insert, rewrite_update,
     };
+    use crate::backend::SqlDialect;
     use crate::sql::resolve_expr_cell_with_state;
     use crate::sql::PlaceholderState;
     use crate::sql::parse_sql_statements;
@@ -2553,6 +2584,7 @@ mod tests {
             &["lixcol_version_id", "version_id"],
             &params,
             &mut offset_state,
+            SqlDialect::Sqlite,
         )
         .expect("extract with offset");
         assert_eq!(extracted_with_offset.as_deref(), Some("version-target"));
@@ -2563,6 +2595,7 @@ mod tests {
             &["lixcol_version_id", "version_id"],
             &params,
             &mut fresh_state,
+            SqlDialect::Sqlite,
         )
         .expect("extract with fresh state");
         assert_eq!(
@@ -2586,6 +2619,7 @@ mod tests {
             &["lixcol_version_id", "version_id"],
             &params,
             &mut state,
+            SqlDialect::Sqlite,
         )
         .expect("extract version predicate");
         assert_eq!(extracted.as_deref(), Some("version-target"));
@@ -2607,6 +2641,7 @@ mod tests {
             &["lixcol_version_id", "version_id"],
             &params,
             &mut state,
+            SqlDialect::Sqlite,
         )
         .expect("extract version predicate");
         assert_eq!(extracted.as_deref(), Some("version-target"));
