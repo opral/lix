@@ -1,13 +1,16 @@
 mod support;
 
+use async_trait::async_trait;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use lix_engine::{
-    MaterializationDebugMode, MaterializationRequest, MaterializationScope, Value, WasmRuntime,
+    LixError, LoadWasmComponentRequest, MaterializationDebugMode, MaterializationRequest,
+    MaterializationScope, Value, WasmInstance, WasmRuntime,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 const TEST_PLUGIN_MANIFEST: &str = r#"{
@@ -17,6 +20,103 @@ const TEST_PLUGIN_MANIFEST: &str = r#"{
   "detect_changes_glob": "*.json",
   "entry": "plugin.wasm"
 }"#;
+
+#[derive(Debug, Deserialize)]
+struct WirePluginFile {
+    id: String,
+    path: String,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePluginEntityChange {
+    entity_id: String,
+    schema_key: String,
+    schema_version: String,
+    snapshot_content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireDetectChangesRequest {
+    before: Option<WirePluginFile>,
+    after: WirePluginFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireApplyChangesRequest {
+    file: WirePluginFile,
+    changes: Vec<WirePluginEntityChange>,
+}
+
+#[derive(Debug, Serialize)]
+struct WirePluginEntityChangeOutput {
+    entity_id: String,
+    schema_key: String,
+    schema_version: String,
+    snapshot_content: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PathEchoRuntime;
+
+#[derive(Debug, Default)]
+struct PathEchoInstance;
+
+#[async_trait(?Send)]
+impl WasmRuntime for PathEchoRuntime {
+    async fn load_component(
+        &self,
+        _request: LoadWasmComponentRequest,
+    ) -> Result<Arc<dyn WasmInstance>, LixError> {
+        Ok(Arc::new(PathEchoInstance))
+    }
+}
+
+#[async_trait(?Send)]
+impl WasmInstance for PathEchoInstance {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => {
+                let request: WireDetectChangesRequest =
+                    serde_json::from_slice(input).map_err(|error| LixError {
+                        message: format!("failed to decode detect-changes payload: {error}"),
+                    })?;
+                let _ = (
+                    request
+                        .before
+                        .as_ref()
+                        .map(|file| (&file.id, &file.path, &file.data)),
+                    (&request.after.id, &request.after.path, &request.after.data),
+                );
+                serde_json::to_vec(&vec![WirePluginEntityChangeOutput {
+                    entity_id: "".to_string(),
+                    schema_key: "json_pointer".to_string(),
+                    schema_version: "1".to_string(),
+                    snapshot_content: Some(r#"{"path":"","value":{}}"#.to_string()),
+                }])
+                .map_err(|error| LixError {
+                    message: format!("failed to encode detect-changes response: {error}"),
+                })
+            }
+            "apply-changes" | "api#apply-changes" => {
+                let request: WireApplyChangesRequest =
+                    serde_json::from_slice(input).map_err(|error| LixError {
+                        message: format!("failed to decode apply-changes payload: {error}"),
+                    })?;
+                let _ = request.changes.iter().all(|change| {
+                    !change.entity_id.is_empty()
+                        || !change.schema_key.is_empty()
+                        || !change.schema_version.is_empty()
+                        || change.snapshot_content.is_some()
+                });
+                Ok(request.file.path.into_bytes())
+            }
+            other => Err(LixError {
+                message: format!("unsupported test export: {other}"),
+            }),
+        }
+    }
+}
 
 fn plugin_json_v2_manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -184,6 +284,30 @@ async fn boot_engine_with_json_plugin(
     (engine, main_version_id)
 }
 
+async fn boot_engine_with_path_echo_plugin(
+    sim: &support::simulation_test::SimulationArgs,
+) -> (support::simulation_test::SimulationEngine, String) {
+    let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+
+    let engine = sim
+        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            key_values: Vec::new(),
+            active_account: None,
+            wasm_runtime: Some(runtime),
+        }))
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.expect("engine init should succeed");
+    register_plugin_schema(&engine).await;
+    let main_version_id = main_version_id(&engine).await;
+    let plugin_wasm = plugin_json_v2_wasm_bytes();
+    engine
+        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .await
+        .expect("install_plugin should succeed");
+    (engine, main_version_id)
+}
+
 async fn detected_json_pointer_entities(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -220,6 +344,14 @@ fn assert_blob_json_eq(value: &Value, expected: JsonValue) {
     };
     let actual: JsonValue = serde_json::from_slice(bytes).expect("blob should contain valid JSON");
     assert_eq!(actual, expected);
+}
+
+fn assert_blob_bytes_eq(value: &Value, expected: &[u8]) {
+    let bytes = match value {
+        Value::Blob(bytes) => bytes,
+        other => panic!("expected blob value, got {other:?}"),
+    };
+    assert_eq!(bytes.as_slice(), expected);
 }
 
 fn value_as_i64(value: &Value) -> i64 {
@@ -1608,6 +1740,54 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
+            1
+        );
+    }
+);
+
+simulation_test!(
+    on_demand_plugin_materialization_uses_full_file_path,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_path_echo_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-path-echo', '/docs/readme.json', '{\"hello\":\"world\"}')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-path-echo' AND version_id = '{}'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+        assert_eq!(
+            file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
+            0
+        );
+
+        let rows = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'file-path-echo' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("lix_file read should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        assert_blob_bytes_eq(&rows.rows[0][0], b"/docs/readme.json");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
             1
         );
     }
