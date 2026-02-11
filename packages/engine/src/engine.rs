@@ -278,26 +278,39 @@ impl Engine {
                 Ok(result)
             }
             Some(postprocess_plan) => {
-                let result = self.backend.execute(&output.sql, &output.params).await?;
+                let mut transaction = self.backend.begin_transaction().await?;
+                let result = match transaction.execute(&output.sql, &output.params).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
                 match &postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         if should_refresh_file_cache {
-                            postprocess_file_cache_targets.extend(
-                                collect_postprocess_file_cache_targets(
-                                    &result.rows,
-                                    &plan.schema_key,
-                                )?,
-                            );
+                            let targets =
+                                match collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key) {
+                                    Ok(targets) => targets,
+                                    Err(error) => {
+                                        let _ = transaction.rollback().await;
+                                        return Err(error);
+                                    }
+                                };
+                            postprocess_file_cache_targets.extend(targets);
                         }
                     }
                     PostprocessPlan::VtableDelete(plan) => {
                         if should_refresh_file_cache {
-                            postprocess_file_cache_targets.extend(
-                                collect_postprocess_file_cache_targets(
-                                    &result.rows,
-                                    &plan.schema_key,
-                                )?,
-                            );
+                            let targets =
+                                match collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key) {
+                                    Ok(targets) => targets,
+                                    Err(error) => {
+                                        let _ = transaction.rollback().await;
+                                        return Err(error);
+                                    }
+                                };
+                            postprocess_file_cache_targets.extend(targets);
                         }
                     }
                 }
@@ -311,29 +324,47 @@ impl Engine {
                 let mut followup_functions = functions.clone();
                 let followup_sql = match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
-                        build_update_followup_sql(
-                            self.backend.as_ref(),
+                        match build_update_followup_sql(
+                            transaction.as_mut(),
                             &plan,
                             &result.rows,
                             &detected_file_domain_changes,
                             &mut followup_functions,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(sql) => sql,
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                return Err(error);
+                            }
+                        }
                     }
                     PostprocessPlan::VtableDelete(plan) => {
-                        build_delete_followup_sql(
-                            self.backend.as_ref(),
+                        match build_delete_followup_sql(
+                            transaction.as_mut(),
                             &plan,
                             &result.rows,
                             &detected_file_domain_changes,
                             &mut followup_functions,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(sql) => sql,
+                            Err(error) => {
+                                let _ = transaction.rollback().await;
+                                return Err(error);
+                            }
+                        }
                     }
                 };
                 if !followup_sql.is_empty() {
-                    self.backend.execute(&followup_sql, &[]).await?;
+                    if let Err(error) = transaction.execute(&followup_sql, &[]).await {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
                 }
+                transaction.commit().await?;
                 plugin_changes_committed = true;
                 Ok(result)
             }

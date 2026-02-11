@@ -25,11 +25,11 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    escape_sql_string, lowering::lower_statement, resolve_expr_cell_with_state,
-    route::rewrite_read_query_with_backend, PlaceholderState, ResolvedCell, RowSourceResolver,
+    escape_sql_string, lowering::lower_statement, resolve_expr_cell_with_state, PlaceholderState,
+    ResolvedCell, RowSourceResolver,
 };
 use crate::Value as EngineValue;
-use crate::{LixBackend, LixError};
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
@@ -52,6 +52,43 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "metadata",
     "updated_at",
 ];
+
+#[async_trait::async_trait(?Send)]
+trait SqlExecutor {
+    fn dialect(&self) -> SqlDialect;
+
+    async fn execute(&mut self, sql: &str, params: &[EngineValue]) -> Result<QueryResult, LixError>;
+}
+
+struct BackendExecutor<'a> {
+    backend: &'a dyn LixBackend,
+}
+
+#[async_trait::async_trait(?Send)]
+impl SqlExecutor for BackendExecutor<'_> {
+    fn dialect(&self) -> SqlDialect {
+        self.backend.dialect()
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[EngineValue]) -> Result<QueryResult, LixError> {
+        self.backend.execute(sql, params).await
+    }
+}
+
+struct TransactionExecutor<'a> {
+    transaction: &'a mut dyn LixTransaction,
+}
+
+#[async_trait::async_trait(?Send)]
+impl SqlExecutor for TransactionExecutor<'_> {
+    fn dialect(&self) -> SqlDialect {
+        self.transaction.dialect()
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[EngineValue]) -> Result<QueryResult, LixError> {
+        self.transaction.execute(sql, params).await
+    }
+}
 
 pub struct VtableWriteRewrite {
     pub statements: Vec<Statement>,
@@ -405,14 +442,14 @@ pub fn rewrite_delete(delete: Delete) -> Result<Option<DeleteRewrite>, LixError>
 }
 
 pub async fn build_update_followup_sql(
-    backend: &dyn LixBackend,
+    transaction: &mut dyn LixTransaction,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
     let statements = build_update_followup_statements(
-        backend,
+        transaction,
         plan,
         rows,
         detected_file_domain_changes,
@@ -427,14 +464,14 @@ pub async fn build_update_followup_sql(
 }
 
 pub async fn build_delete_followup_sql(
-    backend: &dyn LixBackend,
+    transaction: &mut dyn LixTransaction,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
     let statements = build_delete_followup_statements(
-        backend,
+        transaction,
         plan,
         rows,
         detected_file_domain_changes,
@@ -941,8 +978,9 @@ async fn rewrite_tracked_rows_with_backend(
         return Ok(Vec::new());
     }
 
-    let versions = load_version_info_for_versions(backend, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
+    let mut executor = BackendExecutor { backend };
+    let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
@@ -996,7 +1034,7 @@ fn materialized_row_values(row: &MaterializedStateRow) -> Vec<Expr> {
 }
 
 async fn load_commit_active_accounts(
-    backend: &dyn LixBackend,
+    executor: &mut dyn SqlExecutor,
     domain_changes: &[DomainChangeInput],
 ) -> Result<Vec<String>, LixError> {
     if domain_changes.is_empty() {
@@ -1023,7 +1061,7 @@ async fn load_commit_active_accounts(
         file_id = escape_sql_string(active_account_file_id()),
         version_id = escape_sql_string(active_account_storage_version_id()),
     );
-    let result = backend.execute(&sql, &[]).await?;
+    let result = executor.execute(&sql, &[]).await?;
 
     let mut deduped = BTreeSet::new();
     for row in result.rows {
@@ -1047,7 +1085,7 @@ async fn load_commit_active_accounts(
 }
 
 async fn load_version_info_for_versions(
-    backend: &dyn LixBackend,
+    executor: &mut dyn SqlExecutor,
     version_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
     let mut versions = BTreeMap::new();
@@ -1087,7 +1125,7 @@ async fn load_version_info_for_versions(
         in_list = in_list,
     );
 
-    match backend.execute(&sql, &[]).await {
+    match executor.execute(&sql, &[]).await {
         Ok(result) => {
             for row in result.rows {
                 if row.len() < 2 {
@@ -1265,7 +1303,7 @@ fn build_untracked_insert(
 }
 
 async fn build_update_followup_statements(
-    backend: &dyn LixBackend,
+    transaction: &mut dyn LixTransaction,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
@@ -1327,8 +1365,9 @@ async fn build_update_followup_statements(
         });
     }
 
-    let versions = load_version_info_for_versions(backend, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
+    let mut executor = TransactionExecutor { transaction };
+    let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
@@ -1342,7 +1381,7 @@ async fn build_update_followup_statements(
 }
 
 async fn build_delete_followup_statements(
-    backend: &dyn LixBackend,
+    transaction: &mut dyn LixTransaction,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
@@ -1391,8 +1430,9 @@ async fn build_delete_followup_statements(
     }
 
     if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
+        let mut executor = TransactionExecutor { transaction };
         let cascaded_file_deletes = load_cascaded_file_delete_changes(
-            backend,
+            &mut executor,
             &deleted_directory_scopes,
             &timestamp,
             functions,
@@ -1421,8 +1461,9 @@ async fn build_delete_followup_statements(
         });
     }
 
-    let versions = load_version_info_for_versions(backend, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(backend, &domain_changes).await?;
+    let mut executor = TransactionExecutor { transaction };
+    let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
@@ -1436,7 +1477,7 @@ async fn build_delete_followup_statements(
 }
 
 async fn load_cascaded_file_delete_changes(
-    backend: &dyn LixBackend,
+    executor: &mut dyn SqlExecutor,
     directory_scopes: &[(String, String)],
     timestamp: &str,
     functions: &mut dyn LixFunctionProvider,
@@ -1466,20 +1507,22 @@ async fn load_cascaded_file_delete_changes(
             .join(", ");
         let sql = format!(
             "SELECT \
-                id, \
-                lixcol_file_id, \
-                lixcol_version_id, \
-                lixcol_plugin_key, \
-                lixcol_schema_version, \
-                lixcol_metadata \
-             FROM lix_file_descriptor_by_version \
-             WHERE lixcol_version_id = '{version_id}' \
-               AND directory_id IN ({in_list})",
+                m.entity_id, \
+                m.file_id, \
+                m.version_id, \
+                m.plugin_key, \
+                m.schema_version, \
+                m.metadata \
+             FROM {materialized_table} m \
+             WHERE m.version_id = '{version_id}' \
+               AND m.is_tombstone = 0 \
+               AND lix_json_text(m.snapshot_content, 'directory_id') IN ({in_list})",
+            materialized_table = format!("{MATERIALIZED_PREFIX}{FILE_DESCRIPTOR_SCHEMA_KEY}"),
             version_id = escape_sql_string(&version_id),
             in_list = in_list,
         );
-        let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-        let result = backend.execute(&rewritten_sql, &[]).await?;
+        let lowered_sql = lower_single_statement_for_dialect(&sql, executor.dialect())?;
+        let result = executor.execute(&lowered_sql, &[]).await?;
         for row in result.rows {
             if row.len() < 6 {
                 return Err(LixError {
@@ -1517,26 +1560,17 @@ async fn load_cascaded_file_delete_changes(
     Ok(changes)
 }
 
-async fn rewrite_single_read_query_for_backend(
-    backend: &dyn LixBackend,
-    sql: &str,
-) -> Result<String, LixError> {
+fn lower_single_statement_for_dialect(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         message: error.to_string(),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
-            message: "expected a single SELECT statement".to_string(),
+            message: "expected a single statement".to_string(),
         });
     }
     let statement = statements.remove(0);
-    let Statement::Query(query) = statement else {
-        return Err(LixError {
-            message: "expected SELECT statement".to_string(),
-        });
-    };
-    let rewritten = rewrite_read_query_with_backend(backend, *query).await?;
-    let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
+    let lowered = lower_statement(statement, dialect)?;
     Ok(lowered.to_string())
 }
 

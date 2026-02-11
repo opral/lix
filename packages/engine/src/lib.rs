@@ -28,6 +28,7 @@ pub use schema::{
 };
 
 pub use backend::LixBackend;
+pub use backend::LixTransaction;
 pub use backend::SqlDialect;
 pub use commit::{
     generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
