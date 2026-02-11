@@ -405,9 +405,11 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                         sh.change_id AS lixcol_change_id, \
                         ROW_NUMBER() OVER (\
                             PARTITION BY sh.file_id, sh.root_commit_id \
-                            ORDER BY sh.commit_id ASC, sh.change_id ASC\
+                            ORDER BY ic.created_at DESC, sh.change_id DESC\
                         ) AS row_num \
                     FROM lix_state_history sh \
+                    JOIN lix_internal_change ic \
+                      ON ic.id = sh.change_id \
                     LEFT JOIN descriptor_depth_zero_roots d0 \
                       ON d0.id = sh.file_id \
                      AND d0.lixcol_root_commit_id = sh.root_commit_id \
