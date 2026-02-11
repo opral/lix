@@ -1497,6 +1497,33 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_path_update_noop_does_not_create_parent_directories,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/docs/noop.json' \
+                 WHERE id = 'missing-file'",
+                &[],
+            )
+            .await
+            .expect("no-op file path update should succeed");
+
+        let directories = engine
+            .execute("SELECT id FROM lix_directory WHERE path = '/docs/'", &[])
+            .await
+            .expect("directory lookup should succeed");
+        assert!(directories.rows.is_empty());
+    }
+);
+
+simulation_test!(
     file_view_exposes_active_version_commit_id,
     |sim| async move {
         let engine = sim
