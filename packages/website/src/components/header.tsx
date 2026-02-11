@@ -160,7 +160,9 @@ export function Header() {
   };
 
   const isActive = (href: string, activePrefix?: string) => {
-    const normalized = (activePrefix ?? href).replace(/\/$/, "");
+    const candidate = activePrefix ?? href;
+    const normalized =
+      candidate === "/" ? "/" : candidate.replace(/\/$/, "");
     if (normalized === "/") return pathname === "/";
     return pathname === normalized || pathname.startsWith(`${normalized}/`);
   };
