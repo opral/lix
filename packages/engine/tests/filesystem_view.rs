@@ -1606,6 +1606,80 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_path_update_with_untracked_predicate_persists_missing_parent_directories,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_id_sql = version_id.replace('\'', "''");
+        let snapshot_content = serde_json::json!({
+            "id": "file-path-untracked",
+            "directory_id": null,
+            "name": "a",
+            "extension": "md",
+            "hidden": false
+        })
+        .to_string()
+        .replace('\'', "''");
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                        entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                     ) VALUES (\
+                        'file-path-untracked', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', '{snapshot_content}', '1', 1\
+                     )",
+                    version_id = version_id_sql,
+                    snapshot_content = snapshot_content
+                ),
+                &[],
+            )
+            .await
+            .expect("seed untracked file descriptor should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/docs/guides/a.md' \
+                 WHERE id = 'file-path-untracked' AND lixcol_untracked = 1",
+                &[],
+            )
+            .await
+            .expect("untracked path update should succeed");
+
+        let file_row = engine
+            .execute(
+                "SELECT path \
+                 FROM lix_file \
+                 WHERE id = 'file-path-untracked' AND lixcol_untracked = 1",
+                &[],
+            )
+            .await
+            .expect("updated untracked file row should be readable");
+        assert_eq!(file_row.rows.len(), 1);
+        assert_text(&file_row.rows[0][0], "/docs/guides/a.md");
+
+        let directory_rows = engine
+            .execute(
+                "SELECT path \
+                 FROM lix_directory \
+                 WHERE path IN ('/docs/', '/docs/guides/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("auto-created parent directories should be readable");
+        assert_eq!(directory_rows.rows.len(), 2);
+        assert_text(&directory_rows.rows[0][0], "/docs/");
+        assert_text(&directory_rows.rows[1][0], "/docs/guides/");
+    }
+);
+
+simulation_test!(
     file_path_update_noop_does_not_create_parent_directories,
     |sim| async move {
         let engine = sim

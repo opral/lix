@@ -400,8 +400,8 @@ impl Engine {
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
 
-        if !plugin_changes_committed && !detected_file_changes.is_empty() {
-            self.persist_detected_file_changes(&detected_file_changes)
+        if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
+            self.persist_detected_file_domain_changes(&detected_file_domain_changes)
                 .await?;
         }
         self.persist_pending_file_data_updates(&pending_file_writes)
@@ -960,28 +960,30 @@ impl Engine {
         Ok(dedupe_detected_file_changes(&detected))
     }
 
-    async fn persist_detected_file_changes(
+    async fn persist_detected_file_domain_changes(
         &self,
-        changes: &[crate::plugin::runtime::DetectedFileChange],
+        changes: &[DetectedFileDomainChange],
     ) -> Result<(), LixError> {
-        let deduped_changes = dedupe_detected_file_changes(changes);
+        let deduped_changes = dedupe_detected_file_domain_changes(changes);
         if deduped_changes.is_empty() {
             return Ok(());
         }
 
-        let mut params = Vec::with_capacity(deduped_changes.len() * 7);
+        let mut params = Vec::with_capacity(deduped_changes.len() * 9);
         let mut rows = Vec::with_capacity(deduped_changes.len());
         for (row_index, change) in deduped_changes.iter().enumerate() {
-            let base = row_index * 7;
+            let base = row_index * 9;
             rows.push(format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 base + 1,
                 base + 2,
                 base + 3,
                 base + 4,
                 base + 5,
                 base + 6,
-                base + 7
+                base + 7,
+                base + 8,
+                base + 9
             ));
             params.push(Value::Text(change.entity_id.clone()));
             params.push(Value::Text(change.schema_key.clone()));
@@ -993,11 +995,19 @@ impl Engine {
                 None => Value::Null,
             });
             params.push(Value::Text(change.schema_version.clone()));
+            params.push(match &change.metadata {
+                Some(metadata) => Value::Text(metadata.clone()),
+                None => Value::Null,
+            });
+            params.push(match &change.writer_key {
+                Some(writer_key) => Value::Text(writer_key.clone()),
+                None => Value::Null,
+            });
         }
 
         let sql = format!(
             "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
              ) VALUES {}",
             rows.join(", ")
         );
