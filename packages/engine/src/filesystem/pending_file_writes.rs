@@ -25,6 +25,12 @@ pub(crate) struct PendingFileWrite {
     pub(crate) after_data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PendingFileWriteCollection {
+    pub(crate) writes: Vec<PendingFileWrite>,
+    pub(crate) writes_by_statement: Vec<Vec<PendingFileWrite>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileWriteTarget {
     ActiveVersion,
@@ -36,9 +42,10 @@ pub(crate) async fn collect_pending_file_writes(
     sql: &str,
     params: &[Value],
     active_version_id: &str,
-) -> Result<Vec<PendingFileWrite>, LixError> {
+) -> Result<PendingFileWriteCollection, LixError> {
     let statements = parse_sql_statements(sql)?;
     let mut writes = Vec::new();
+    let mut writes_by_statement = Vec::with_capacity(statements.len());
     let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
     let mut effective_active_version_id = active_version_id.to_string();
 
@@ -61,6 +68,7 @@ pub(crate) async fn collect_pending_file_writes(
             }
             _ => {}
         }
+        writes_by_statement.push(writes[start_len..].to_vec());
         apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
         if let Some(next_active_version_id) = next_active_version_id_from_statement(
             backend,
@@ -74,7 +82,10 @@ pub(crate) async fn collect_pending_file_writes(
         }
     }
 
-    Ok(writes)
+    Ok(PendingFileWriteCollection {
+        writes,
+        writes_by_statement,
+    })
 }
 
 pub(crate) async fn collect_pending_file_delete_targets(
@@ -508,7 +519,8 @@ async fn next_active_version_id_from_statement(
                 return Ok(None);
             };
             if table_name.eq_ignore_ascii_case(ACTIVE_VERSION_VIEW) {
-                return active_version_id_from_lix_active_version_update(backend, update, params).await;
+                return active_version_id_from_lix_active_version_update(backend, update, params)
+                    .await;
             }
             if table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE)
                 || table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED)
@@ -550,12 +562,7 @@ async fn active_version_id_from_lix_active_version_update(
         query_sql.push_str(" WHERE ");
         query_sql.push_str(&selection.to_string());
     }
-    let bound = bind_sql_with_state(
-        &query_sql,
-        params,
-        backend.dialect(),
-        placeholder_state,
-    )?;
+    let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
     let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
         .await
         .map_err(|error| LixError {
@@ -623,12 +630,7 @@ async fn active_version_id_from_internal_state_update(
         query_sql.push_str(&selection.to_string());
         query_sql.push(')');
     }
-    let bound = bind_sql_with_state(
-        &query_sql,
-        params,
-        backend.dialect(),
-        placeholder_state,
-    )?;
+    let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
     let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
         .await
         .map_err(|error| LixError {
@@ -686,13 +688,17 @@ fn active_version_id_from_internal_state_insert(
         .columns
         .iter()
         .position(|column| column.value.eq_ignore_ascii_case("untracked"));
-    let (Some(schema_key_index), Some(file_id_index), Some(version_id_index), Some(snapshot_content_index)) =
-        (
-            schema_key_index,
-            file_id_index,
-            version_id_index,
-            snapshot_content_index,
-        )
+    let (
+        Some(schema_key_index),
+        Some(file_id_index),
+        Some(version_id_index),
+        Some(snapshot_content_index),
+    ) = (
+        schema_key_index,
+        file_id_index,
+        version_id_index,
+        snapshot_content_index,
+    )
     else {
         return Ok(None);
     };
@@ -702,7 +708,8 @@ fn active_version_id_from_internal_state_insert(
     for resolved_row in &resolved_rows {
         let schema_key = resolved_cell_text(resolved_row.get(schema_key_index))
             .unwrap_or_else(|| "".to_string());
-        let file_id = resolved_cell_text(resolved_row.get(file_id_index)).unwrap_or_else(|| "".to_string());
+        let file_id =
+            resolved_cell_text(resolved_row.get(file_id_index)).unwrap_or_else(|| "".to_string());
         let version_id = resolved_cell_text(resolved_row.get(version_id_index))
             .unwrap_or_else(|| current_active_version_id.to_string());
         if schema_key != active_version_schema_key()

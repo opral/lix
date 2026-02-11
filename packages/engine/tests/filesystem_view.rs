@@ -580,37 +580,39 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
     );
 });
 
-simulation_test!(filesystem_directory_view_rejects_id_updates, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine_deterministic()
-        .await
-        .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+simulation_test!(
+    filesystem_directory_view_rejects_id_updates,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
 
-    engine
-        .execute(
-            "INSERT INTO lix_directory (id, path, parent_id, name) \
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
              VALUES ('dir-id-immutable', '/immutable-dir/', NULL, 'immutable-dir')",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    let directory_update_err = engine
-        .execute(
-            "UPDATE lix_directory SET id = 'dir-id-new' WHERE id = 'dir-id-immutable'",
-            &[],
-        )
-        .await
-        .expect_err("lix_directory id update should fail");
-    assert!(
-        directory_update_err.message.contains("id is immutable"),
-        "unexpected error: {}",
-        directory_update_err.message
-    );
+        let directory_update_err = engine
+            .execute(
+                "UPDATE lix_directory SET id = 'dir-id-new' WHERE id = 'dir-id-immutable'",
+                &[],
+            )
+            .await
+            .expect_err("lix_directory id update should fail");
+        assert!(
+            directory_update_err.message.contains("id is immutable"),
+            "unexpected error: {}",
+            directory_update_err.message
+        );
 
-    let version_id = active_version_id(&engine).await;
-    engine
+        let version_id = active_version_id(&engine).await;
+        engine
         .execute(
             "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
              VALUES ('dir-id-immutable-by-version', '/immutable-dir-by-version/', NULL, 'immutable-dir-by-version', $1)",
@@ -619,21 +621,22 @@ simulation_test!(filesystem_directory_view_rejects_id_updates, |sim| async move 
         .await
         .unwrap();
 
-    let by_version_update_err = engine
-        .execute(
-            "UPDATE lix_directory_by_version \
+        let by_version_update_err = engine
+            .execute(
+                "UPDATE lix_directory_by_version \
              SET id = 'dir-id-new-by-version' \
              WHERE id = 'dir-id-immutable-by-version' AND lixcol_version_id = $1",
-            &[Value::Text(version_id)],
-        )
-        .await
-        .expect_err("lix_directory_by_version id update should fail");
-    assert!(
-        by_version_update_err.message.contains("id is immutable"),
-        "unexpected error: {}",
-        by_version_update_err.message
-    );
-});
+                &[Value::Text(version_id)],
+            )
+            .await
+            .expect_err("lix_directory_by_version id update should fail");
+        assert!(
+            by_version_update_err.message.contains("id is immutable"),
+            "unexpected error: {}",
+            by_version_update_err.message
+        );
+    }
+);
 
 simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
     let engine = sim

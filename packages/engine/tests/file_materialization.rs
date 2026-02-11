@@ -433,6 +433,27 @@ async fn detected_json_pointer_entities(
         .collect::<Vec<_>>()
 }
 
+async fn json_pointer_change_count(
+    engine: &support::simulation_test::SimulationEngine,
+    file_id: &str,
+) -> i64 {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_change \
+                 WHERE file_id = '{}' \
+                   AND schema_key = 'json_pointer'",
+                file_id
+            ),
+            &[],
+        )
+        .await
+        .expect("json_pointer change count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
 fn assert_blob_json_eq(value: &Value, expected: JsonValue) {
     let bytes = match value {
         Value::Blob(bytes) => bytes,
@@ -1660,6 +1681,43 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_insert_json_multi_statement_does_not_replay_detected_changes,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-json-multi-insert-1', '/multi-insert-1.json', '{\"first\":1}'); \
+                 INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-json-multi-insert-2', '/multi-insert-2.json', '{\"second\":2}')",
+                &[],
+            )
+            .await
+            .expect("multi-statement insert should succeed");
+
+        let detected_one =
+            detected_json_pointer_entities(&engine, "file-json-multi-insert-1", &main_version_id)
+                .await;
+        let detected_two =
+            detected_json_pointer_entities(&engine, "file-json-multi-insert-2", &main_version_id)
+                .await;
+        assert_eq!(detected_one, vec!["".to_string(), "/first".to_string()]);
+        assert_eq!(detected_two, vec!["".to_string(), "/second".to_string()]);
+
+        assert_eq!(
+            json_pointer_change_count(&engine, "file-json-multi-insert-1").await,
+            2
+        );
+        assert_eq!(
+            json_pointer_change_count(&engine, "file-json-multi-insert-2").await,
+            2
+        );
+    }
+);
+
+simulation_test!(
     file_update_json_multi_statement_uses_sequential_before_data,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -1792,7 +1850,10 @@ simulation_test!(
         assert_eq!(active_version_id(&engine).await, version_b);
 
         let rows = engine
-            .execute("SELECT data FROM lix_file WHERE id = 'file-active-switch' LIMIT 1", &[])
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'file-active-switch' LIMIT 1",
+                &[],
+            )
             .await
             .expect("lix_file read after active switch update should succeed");
         assert_eq!(rows.rows.len(), 1);
