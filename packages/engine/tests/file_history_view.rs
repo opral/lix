@@ -645,27 +645,23 @@ simulation_test!(
         assert_text(&after_rename_row.rows[0][2], &after_rename_commit_id);
         assert_integer(&after_rename_row.rows[0][3], 0);
 
-        let historical_paths = engine
+        let history_after_rename_depth_one = engine
             .execute(
                 &format!(
                     "SELECT path, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-dir-rename-file' \
                        AND lixcol_root_commit_id = '{}' \
-                     ORDER BY lixcol_depth ASC",
+                       AND lixcol_depth = 1",
                     after_rename_commit_id
                 ),
                 &[],
             )
             .await
-            .expect("after-rename depth scan should succeed");
-        assert!(
-            historical_paths.rows.iter().any(|row| {
-                matches!(row.get(0), Some(Value::Text(path)) if path == "/docs/readme.json")
-                    && matches!(row.get(1), Some(Value::Integer(depth)) if *depth > 0)
-            }),
-            "expected old path to remain in deeper history after directory rename"
-        );
+            .expect("after-rename depth-1 history query should succeed");
+        assert_eq!(history_after_rename_depth_one.rows.len(), 1);
+        assert_text(&history_after_rename_depth_one.rows[0][0], "/docs/readme.json");
+        assert_integer(&history_after_rename_depth_one.rows[0][1], 1);
     }
 );
 
@@ -805,27 +801,23 @@ simulation_test!(
         assert_text(&after_move_row.rows[0][2], &after_move_commit_id);
         assert_integer(&after_move_row.rows[0][3], 0);
 
-        let historical_paths = engine
+        let history_after_move_depth_one = engine
             .execute(
                 &format!(
                     "SELECT path, lixcol_depth \
                      FROM lix_file_history \
                      WHERE id = 'history-dir-move-file' \
                        AND lixcol_root_commit_id = '{}' \
-                     ORDER BY lixcol_depth ASC",
+                       AND lixcol_depth = 1",
                     after_move_commit_id
                 ),
                 &[],
             )
             .await
-            .expect("after-move depth scan should succeed");
-        assert!(
-            historical_paths.rows.iter().any(|row| {
-                matches!(row.get(0), Some(Value::Text(path)) if path == "/docs/guides/intro.json")
-                    && matches!(row.get(1), Some(Value::Integer(depth)) if *depth > 0)
-            }),
-            "expected old path to remain in deeper history after directory move"
-        );
+            .expect("after-move depth-1 history query should succeed");
+        assert_eq!(history_after_move_depth_one.rows.len(), 1);
+        assert_text(&history_after_move_depth_one.rows[0][0], "/docs/guides/intro.json");
+        assert_integer(&history_after_move_depth_one.rows[0][1], 1);
     }
 );
 
@@ -1032,6 +1024,107 @@ simulation_test!(
         assert_text(&after.rows[0][6], &after_commit_id);
         assert_text(&after.rows[0][7], &after_commit_id);
         assert_integer(&after.rows[0][8], 0);
+    }
+);
+
+simulation_test!(
+    file_history_view_prefers_descriptor_change_id_after_content_then_path_update,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-mixed-change-id', '/document.json', '{\"title\":\"Original Title\",\"content\":\"Original content\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = '{\"title\":\"Updated Title\",\"content\":\"Updated content\"}' \
+                 WHERE id = 'history-mixed-change-id'",
+                &[],
+            )
+            .await
+            .expect("content update should succeed");
+
+        let after_content_update = engine
+            .execute(
+                "SELECT lixcol_change_id \
+                 FROM lix_file \
+                 WHERE id = 'history-mixed-change-id' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("post-content lix_file read should succeed");
+        assert_eq!(after_content_update.rows.len(), 1);
+        let content_change_id = match &after_content_update.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected content change id text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/renamed-document.json' \
+                 WHERE id = 'history-mixed-change-id'",
+                &[],
+            )
+            .await
+            .expect("path update should succeed");
+
+        let after_path_update = engine
+            .execute(
+                "SELECT path, lixcol_change_id, lixcol_commit_id \
+                 FROM lix_file \
+                 WHERE id = 'history-mixed-change-id' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("post-path lix_file read should succeed");
+        assert_eq!(after_path_update.rows.len(), 1);
+        assert_text(&after_path_update.rows[0][0], "/renamed-document.json");
+        let descriptor_change_id = match &after_path_update.rows[0][1] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected descriptor change id text, got {other:?}"),
+        };
+        assert_ne!(descriptor_change_id, content_change_id);
+        let checkpoint_commit_id = match &after_path_update.rows[0][2] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected checkpoint commit id text, got {other:?}"),
+        };
+
+        let file_history_at_checkpoint = engine
+            .execute(
+                &format!(
+                    "SELECT path, data, lixcol_schema_key, lixcol_change_id, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-mixed-change-id' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    checkpoint_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("file_history depth-0 read should succeed");
+        assert_eq!(file_history_at_checkpoint.rows.len(), 1);
+        assert_text(&file_history_at_checkpoint.rows[0][0], "/renamed-document.json");
+        assert_blob_json_eq(
+            &file_history_at_checkpoint.rows[0][1],
+            serde_json::json!({"title":"Updated Title","content":"Updated content"}),
+        );
+        assert_text(&file_history_at_checkpoint.rows[0][2], "lix_file_descriptor");
+        assert_text(&file_history_at_checkpoint.rows[0][3], &descriptor_change_id);
+        assert_text(&file_history_at_checkpoint.rows[0][4], &checkpoint_commit_id);
+        assert_text(&file_history_at_checkpoint.rows[0][5], &checkpoint_commit_id);
+        assert_integer(&file_history_at_checkpoint.rows[0][6], 0);
     }
 );
 

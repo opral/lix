@@ -456,6 +456,34 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 SELECT * FROM file_history_descriptor_rows \
                 UNION ALL \
                 SELECT * FROM content_history_rows\
+             ), \
+             file_history_ranked_rows AS (\
+                SELECT \
+                    fhr.id, \
+                    fhr.directory_id, \
+                    fhr.name, \
+                    fhr.extension, \
+                    fhr.metadata, \
+                    fhr.hidden, \
+                    fhr.lixcol_entity_id, \
+                    fhr.lixcol_schema_key, \
+                    fhr.lixcol_file_id, \
+                    fhr.lixcol_version_id, \
+                    fhr.lixcol_plugin_key, \
+                    fhr.lixcol_schema_version, \
+                    fhr.lixcol_change_id, \
+                    fhr.lixcol_metadata, \
+                    fhr.lixcol_commit_id, \
+                    fhr.lixcol_root_commit_id, \
+                    fhr.lixcol_depth AS lixcol_raw_depth, \
+                    ROW_NUMBER() OVER (\
+                        PARTITION BY fhr.id, fhr.lixcol_root_commit_id \
+                        ORDER BY \
+                            fhr.lixcol_depth ASC, \
+                            fhr.lixcol_commit_id DESC, \
+                            fhr.lixcol_change_id DESC\
+                    ) - 1 AS lixcol_depth \
+                FROM file_history_rows fhr\
              ) \
              SELECT \
                 f.id, \
@@ -486,7 +514,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 f.lixcol_commit_id, \
                 f.lixcol_root_commit_id, \
                 f.lixcol_depth \
-             FROM file_history_rows f \
+             FROM file_history_ranked_rows f \
              LEFT JOIN directory_history_paths dp \
                ON dp.target_id = f.directory_id \
               AND dp.root_commit_id = f.lixcol_root_commit_id \
@@ -495,7 +523,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                   FROM directory_history_base candidate \
                   WHERE candidate.id = f.directory_id \
                     AND candidate.lixcol_root_commit_id = f.lixcol_root_commit_id \
-                    AND candidate.lixcol_depth >= f.lixcol_depth\
+                    AND candidate.lixcol_depth >= f.lixcol_raw_depth\
               ) \
              LEFT JOIN lix_internal_file_history_data_cache fd \
                ON fd.file_id = f.id \
