@@ -15,6 +15,7 @@ pub(crate) struct PendingFileWrite {
     pub(crate) kind: PendingFileWriteKind,
     pub(crate) file_id: String,
     pub(crate) version_id: String,
+    pub(crate) before_path: Option<String>,
     pub(crate) path: String,
     pub(crate) before_data: Option<Vec<u8>>,
     pub(crate) after_data: Vec<u8>,
@@ -159,6 +160,7 @@ fn collect_insert_writes(
             kind: PendingFileWriteKind::Insert,
             file_id,
             version_id,
+            before_path: None,
             path,
             before_data: None,
             after_data,
@@ -181,7 +183,7 @@ async fn collect_update_writes(
     };
 
     let mut placeholder_state = PlaceholderState::new();
-    let mut after_data: Option<Vec<u8>> = None;
+    let mut assigned_after_data: Option<Vec<u8>> = None;
     let mut saw_data_assignment = false;
     let mut next_path: Option<String> = None;
     let mut next_file_id: Option<String> = None;
@@ -194,8 +196,8 @@ async fn collect_update_writes(
             resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
         if column.eq_ignore_ascii_case("data") {
             saw_data_assignment = true;
-            after_data = resolved_cell_blob_or_text_bytes(Some(&resolved));
-            if after_data.is_none() {
+            assigned_after_data = resolved_cell_blob_or_text_bytes(Some(&resolved));
+            if assigned_after_data.is_none() {
                 return Err(LixError {
                     message: format!(
                         "unsupported file data update expression '{}': only literal/blob or bound placeholder values are supported",
@@ -210,12 +212,9 @@ async fn collect_update_writes(
         }
     }
 
-    if !saw_data_assignment {
+    if !saw_data_assignment && next_path.is_none() {
         return Ok(());
     }
-    let Some(after_data) = after_data else {
-        return Ok(());
-    };
 
     let mut query_sql = match target {
         FileWriteTarget::ActiveVersion => "SELECT id, path, data FROM lix_file".to_string(),
@@ -249,6 +248,7 @@ async fn collect_update_writes(
         let Some(before_path) = row.get(1).and_then(value_as_text) else {
             continue;
         };
+        let before_path_for_write = before_path.clone();
         let file_id = next_file_id.clone().unwrap_or(before_file_id);
         let path = next_path.clone().unwrap_or(before_path);
         let version_id = match target {
@@ -267,9 +267,10 @@ async fn collect_update_writes(
             kind: PendingFileWriteKind::Update,
             file_id,
             version_id,
+            before_path: Some(before_path_for_write),
             path,
             before_data,
-            after_data: after_data.clone(),
+            after_data: assigned_after_data.clone().unwrap_or_else(|| Vec::new()),
         });
     }
 
@@ -292,9 +293,13 @@ async fn collect_update_writes(
         if let Some(overlay_state) = overlay.get(&(write.file_id.clone(), write.version_id.clone()))
         {
             write.before_data = Some(overlay_state.data.clone());
+            write.before_path = Some(overlay_state.path.clone());
             if next_path.is_none() {
                 write.path = overlay_state.path.clone();
             }
+        }
+        if !saw_data_assignment {
+            write.after_data = write.before_data.clone().unwrap_or_default();
         }
     }
 

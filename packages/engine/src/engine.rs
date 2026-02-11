@@ -907,6 +907,7 @@ impl Engine {
             .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
                 file_id: write.file_id.clone(),
                 version_id: write.version_id.clone(),
+                before_path: write.before_path.clone(),
                 path: write.path.clone(),
                 before_data: write.before_data.clone(),
                 after_data: write.after_data.clone(),

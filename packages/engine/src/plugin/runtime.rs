@@ -15,6 +15,7 @@ const PLUGIN_WORLD: &str = "lix:plugin/plugin@0.1.0";
 pub(crate) struct FileChangeDetectionRequest {
     pub file_id: String,
     pub version_id: String,
+    pub before_path: Option<String>,
     pub path: String,
     pub before_data: Option<Vec<u8>>,
     pub after_data: Vec<u8>,
@@ -91,9 +92,45 @@ pub(crate) async fn detect_file_changes_with_plugins(
 
     let mut detected = Vec::new();
     for write in writes {
-        let Some(plugin) = select_plugin_for_path(&write.path, &installed_plugins) else {
+        let before_path = write.before_path.as_deref().unwrap_or(write.path.as_str());
+        let before_plugin = select_plugin_for_path(before_path, &installed_plugins);
+        let after_plugin = select_plugin_for_path(&write.path, &installed_plugins);
+
+        if let Some(previous_plugin) = before_plugin {
+            let plugin_changed = after_plugin
+                .map(|plugin| plugin.key.as_str())
+                .unwrap_or_default()
+                != previous_plugin.key.as_str();
+            if plugin_changed {
+                for existing in load_existing_plugin_entities(
+                    backend,
+                    &write.file_id,
+                    &write.version_id,
+                    &previous_plugin.key,
+                )
+                .await?
+                {
+                    detected.push(DetectedFileChange {
+                        entity_id: existing.entity_id,
+                        schema_key: existing.schema_key,
+                        schema_version: existing.schema_version,
+                        file_id: write.file_id.clone(),
+                        version_id: write.version_id.clone(),
+                        plugin_key: previous_plugin.key.clone(),
+                        snapshot_content: None,
+                    });
+                }
+            }
+        }
+
+        let Some(plugin) = after_plugin else {
             continue;
         };
+
+        let plugin_changed = before_plugin
+            .map(|entry| entry.key.as_str())
+            .unwrap_or_default()
+            != plugin.key.as_str();
 
         let instance = runtime
             .load_component(LoadWasmComponentRequest {
@@ -104,21 +141,25 @@ pub(crate) async fn detect_file_changes_with_plugins(
             })
             .await?;
 
-        let mut before_data = write.before_data.clone();
-        if before_data.is_none() {
+        let mut before_data = if plugin_changed {
+            None
+        } else {
+            write.before_data.clone()
+        };
+        if before_data.is_none() && !plugin_changed {
             let cached = load_file_cache_data(backend, &write.file_id, &write.version_id).await?;
             if !cached.is_empty() {
                 before_data = Some(cached);
             }
         }
-        if before_data.is_none() {
+        if before_data.is_none() && !plugin_changed {
             before_data = reconstruct_before_file_data_from_state(
                 backend,
                 instance.as_ref(),
                 plugin,
                 &write.file_id,
                 &write.version_id,
-                &write.path,
+                before_path,
             )
             .await?;
         }
@@ -126,7 +167,7 @@ pub(crate) async fn detect_file_changes_with_plugins(
         let had_before_data = before_data.is_some();
         let before = before_data.as_ref().map(|data| PluginFile {
             id: write.file_id.clone(),
-            path: write.path.clone(),
+            path: before_path.to_string(),
             data: data.clone(),
         });
         let after = PluginFile {

@@ -1248,6 +1248,74 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_update_path_only_plugin_switch_tombstones_previous_plugin_entities,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-json-path-only-switch', '/switch.json', '{\"hello\":\"before\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+
+        let before_entities =
+            detected_json_pointer_entities(&engine, "file-json-path-only-switch", &main_version_id)
+                .await;
+        assert_eq!(before_entities, vec!["".to_string(), "/hello".to_string()]);
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/switch.txt' \
+                 WHERE id = 'file-json-path-only-switch'",
+                &[],
+            )
+            .await
+            .expect("path-only file update should succeed");
+
+        let after_entities =
+            detected_json_pointer_entities(&engine, "file-json-path-only-switch", &main_version_id)
+                .await;
+        assert!(after_entities.is_empty());
+
+        let tombstone_rows = engine
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) \
+                     FROM lix_internal_state_vtable \
+                     WHERE file_id = 'file-json-path-only-switch' \
+                       AND version_id = '{}' \
+                       AND schema_key = 'json_pointer' \
+                       AND snapshot_content IS NULL",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("json_pointer tombstone count query should succeed");
+        assert_eq!(tombstone_rows.rows.len(), 1);
+        assert_eq!(value_as_i64(&tombstone_rows.rows[0][0]), 2);
+
+        let file_rows = engine
+            .execute(
+                "SELECT path \
+                 FROM lix_file \
+                 WHERE id = 'file-json-path-only-switch' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("path-only updated file read should succeed");
+        assert_eq!(file_rows.rows.len(), 1);
+        assert_eq!(file_rows.rows[0][0], Value::Text("/switch.txt".to_string()));
+    }
+);
+
+simulation_test!(
     file_update_json_by_version_detects_and_materializes,
     simulations = [sqlite, postgres],
     |sim| async move {
