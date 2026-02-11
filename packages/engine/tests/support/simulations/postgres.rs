@@ -6,7 +6,7 @@ use postgresql_embedded::PostgreSQL;
 use sqlx::{Executor, PgPool, Row, ValueRef};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
-use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
+use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
@@ -125,6 +125,10 @@ struct PostgresBackend {
     pool: OnceCell<PgPool>,
 }
 
+struct PostgresBackendTransaction {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+}
+
 struct PostgresConfig {
     connection_string: String,
 }
@@ -186,6 +190,76 @@ impl LixBackend for PostgresBackend {
         }
 
         Ok(QueryResult { rows: result_rows })
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        let pool = self.pool().await?;
+        let mut conn = pool.acquire().await.map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+        sqlx::query("BEGIN")
+            .execute(&mut *conn)
+            .await
+            .map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+        Ok(Box::new(PostgresBackendTransaction { conn }))
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl LixTransaction for PostgresBackendTransaction {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Postgres
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        if params.is_empty() && sql.contains(';') {
+            self.conn.execute(sql).await.map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            return Ok(QueryResult { rows: Vec::new() });
+        }
+
+        let mut query = sqlx::query(sql);
+        for param in params {
+            query = bind_param_postgres(query, param);
+        }
+
+        let rows = query.fetch_all(&mut *self.conn).await.map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+
+        let mut result_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut out = Vec::with_capacity(row.columns().len());
+            for i in 0..row.columns().len() {
+                out.push(map_postgres_value(&row, i)?);
+            }
+            result_rows.push(out);
+        }
+
+        Ok(QueryResult { rows: result_rows })
+    }
+
+    async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
+        sqlx::query("COMMIT")
+            .execute(&mut *self.conn)
+            .await
+            .map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+        Ok(())
+    }
+
+    async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *self.conn)
+            .await
+            .map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+        Ok(())
     }
 }
 
