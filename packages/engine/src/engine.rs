@@ -196,8 +196,24 @@ impl Engine {
         let detected_file_changes = self
             .detect_file_changes_for_pending_writes(&pending_file_writes)
             .await?;
-        let detected_file_domain_changes =
+        let mut detected_file_domain_changes =
             detected_file_domain_changes_from_detected_file_changes(&detected_file_changes);
+        let filesystem_update_domain_changes =
+            collect_filesystem_update_detected_file_domain_changes(
+                self.backend.as_ref(),
+                sql,
+                params,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!(
+                    "filesystem update side-effect detection failed: {}",
+                    error.message
+                ),
+            })?;
+        detected_file_domain_changes.extend(filesystem_update_domain_changes);
+        detected_file_domain_changes =
+            dedupe_detected_file_domain_changes(&detected_file_domain_changes);
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
         if self.deterministic_boot_pending.load(Ordering::SeqCst) {
@@ -1179,6 +1195,30 @@ fn dedupe_detected_file_changes(
         .collect()
 }
 
+fn dedupe_detected_file_domain_changes(
+    changes: &[DetectedFileDomainChange],
+) -> Vec<DetectedFileDomainChange> {
+    let mut latest_by_key: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        latest_by_key.insert(
+            (
+                change.file_id.clone(),
+                change.version_id.clone(),
+                change.schema_key.clone(),
+                change.entity_id.clone(),
+            ),
+            index,
+        );
+    }
+
+    let mut ordered_indexes = latest_by_key.into_values().collect::<Vec<_>>();
+    ordered_indexes.sort_unstable();
+    ordered_indexes
+        .into_iter()
+        .filter_map(|index| changes.get(index).cloned())
+        .collect()
+}
+
 fn detected_file_domain_changes_from_detected_file_changes(
     changes: &[crate::plugin::runtime::DetectedFileChange],
 ) -> Vec<DetectedFileDomainChange> {
@@ -1196,6 +1236,27 @@ fn detected_file_domain_changes_from_detected_file_changes(
             writer_key: None,
         })
         .collect()
+}
+
+async fn collect_filesystem_update_detected_file_domain_changes(
+    backend: &dyn LixBackend,
+    sql: &str,
+    params: &[Value],
+) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+    let statements = parse_sql_statements(sql)?;
+    let mut detected_changes = Vec::new();
+    for statement in statements {
+        let Statement::Update(update) = statement else {
+            continue;
+        };
+        let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
+            backend, &update, params,
+        )
+        .await?;
+        detected_changes.extend(side_effects.tracked_directory_changes);
+    }
+
+    Ok(dedupe_detected_file_domain_changes(&detected_changes))
 }
 
 fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
