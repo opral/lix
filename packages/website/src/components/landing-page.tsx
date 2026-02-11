@@ -217,7 +217,7 @@ const GoIcon = ({ className = "" }) => (
  * <LandingPage />
  */
 function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
-  const docsPath = "/docs";
+  const docsPath = "/docs/what-is-lix";
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   });
@@ -232,8 +232,8 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
 
   const navLinks = [
     { href: docsPath, label: "Docs" },
-    { href: "/plugins/", label: "Plugins" },
-    { href: "/blog/", label: "Blog" },
+    { href: "/plugins", label: "Plugins" },
+    { href: "/blog", label: "Blog" },
   ];
 
   const isActive = (href: string) =>

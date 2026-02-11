@@ -120,9 +120,9 @@ export const MenuIcon = ({ className = "" }) => (
 );
 
 const navLinks = [
-  { href: "/docs", label: "Docs" },
-  { href: "/plugins/", label: "Plugins" },
-  { href: "/blog/", label: "Blog" },
+  { href: "/docs/what-is-lix", label: "Docs" },
+  { href: "/plugins", label: "Plugins" },
+  { href: "/blog", label: "Blog" },
 ];
 
 const socialLinks = [
