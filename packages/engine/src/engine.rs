@@ -1174,20 +1174,39 @@ fn collect_postprocess_file_cache_targets(
     Ok(targets)
 }
 
-fn dedupe_detected_file_changes(
-    changes: &[crate::plugin::runtime::DetectedFileChange],
-) -> Vec<crate::plugin::runtime::DetectedFileChange> {
-    let mut latest_by_key: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
+trait DedupableDetectedFileChange {
+    fn dedupe_key(&self) -> (&str, &str, &str, &str);
+}
+
+impl DedupableDetectedFileChange for crate::plugin::runtime::DetectedFileChange {
+    fn dedupe_key(&self) -> (&str, &str, &str, &str) {
+        (
+            &self.file_id,
+            &self.version_id,
+            &self.schema_key,
+            &self.entity_id,
+        )
+    }
+}
+
+impl DedupableDetectedFileChange for DetectedFileDomainChange {
+    fn dedupe_key(&self) -> (&str, &str, &str, &str) {
+        (
+            &self.file_id,
+            &self.version_id,
+            &self.schema_key,
+            &self.entity_id,
+        )
+    }
+}
+
+fn dedupe_detected_changes<T>(changes: &[T]) -> Vec<T>
+where
+    T: DedupableDetectedFileChange + Clone,
+{
+    let mut latest_by_key: BTreeMap<(&str, &str, &str, &str), usize> = BTreeMap::new();
     for (index, change) in changes.iter().enumerate() {
-        latest_by_key.insert(
-            (
-                change.file_id.clone(),
-                change.version_id.clone(),
-                change.schema_key.clone(),
-                change.entity_id.clone(),
-            ),
-            index,
-        );
+        latest_by_key.insert(change.dedupe_key(), index);
     }
 
     let mut ordered_indexes = latest_by_key.into_values().collect::<Vec<_>>();
@@ -1198,28 +1217,16 @@ fn dedupe_detected_file_changes(
         .collect()
 }
 
+fn dedupe_detected_file_changes(
+    changes: &[crate::plugin::runtime::DetectedFileChange],
+) -> Vec<crate::plugin::runtime::DetectedFileChange> {
+    dedupe_detected_changes(changes)
+}
+
 fn dedupe_detected_file_domain_changes(
     changes: &[DetectedFileDomainChange],
 ) -> Vec<DetectedFileDomainChange> {
-    let mut latest_by_key: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
-    for (index, change) in changes.iter().enumerate() {
-        latest_by_key.insert(
-            (
-                change.file_id.clone(),
-                change.version_id.clone(),
-                change.schema_key.clone(),
-                change.entity_id.clone(),
-            ),
-            index,
-        );
-    }
-
-    let mut ordered_indexes = latest_by_key.into_values().collect::<Vec<_>>();
-    ordered_indexes.sort_unstable();
-    ordered_indexes
-        .into_iter()
-        .filter_map(|index| changes.get(index).cloned())
-        .collect()
+    dedupe_detected_changes(changes)
 }
 
 fn detected_file_domain_changes_from_detected_file_changes(
