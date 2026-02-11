@@ -1743,6 +1743,88 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_update_after_active_version_switch_in_same_batch_uses_new_active_scope,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let version_b = "file-active-switch-version-b";
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_version (\
+                     id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                     ) VALUES (\
+                     '{version_b}', '{version_b}', '{main_version}', 0, 'commit-{version_b}', 'working-{version_b}'\
+                     )",
+                    version_b = version_b,
+                    main_version = main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("version insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                     VALUES ('file-active-switch', '/active-switch.json', '{{\"hello\":\"before\"}}', '{}')",
+                    version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("file_by_version insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_active_version SET version_id = '{}'; \
+                     UPDATE lix_file SET data = '{{\"hello\":\"after\"}}' WHERE id = 'file-active-switch'",
+                    version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("active-version switch + file update should succeed");
+
+        assert_eq!(active_version_id(&engine).await, version_b);
+
+        let rows = engine
+            .execute("SELECT data FROM lix_file WHERE id = 'file-active-switch' LIMIT 1", &[])
+            .await
+            .expect("lix_file read after active switch update should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"hello":"after"}));
+
+        let pointer_rows = engine
+            .execute(
+                &format!(
+                    "SELECT snapshot_content \
+                     FROM lix_state_by_version \
+                     WHERE file_id = 'file-active-switch' \
+                       AND version_id = '{}' \
+                       AND schema_key = 'json_pointer' \
+                       AND entity_id = '/hello' \
+                     LIMIT 1",
+                    version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("json pointer row read should succeed");
+        assert_eq!(pointer_rows.rows.len(), 1);
+        let snapshot = match &pointer_rows.rows[0][0] {
+            Value::Text(text) => serde_json::from_str::<JsonValue>(text)
+                .expect("json pointer snapshot_content should be valid JSON"),
+            other => panic!("expected snapshot_content text, got {other:?}"),
+        };
+        assert_eq!(snapshot["value"], serde_json::json!("after"));
+    }
+);
+
+simulation_test!(
     file_delete_json_tombstones_detected_rows_and_clears_cache,
     simulations = [sqlite, postgres],
     |sim| async move {

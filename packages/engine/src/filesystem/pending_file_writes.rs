@@ -3,6 +3,10 @@ use crate::sql::{
     bind_sql_with_state, escape_sql_string, parse_sql_statements, preprocess_sql,
     resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
 };
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
     Assignment, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
@@ -36,19 +40,20 @@ pub(crate) async fn collect_pending_file_writes(
     let statements = parse_sql_statements(sql)?;
     let mut writes = Vec::new();
     let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
+    let mut effective_active_version_id = active_version_id.to_string();
 
     for statement in statements {
         let start_len = writes.len();
-        match statement {
+        match &statement {
             Statement::Insert(insert) => {
-                collect_insert_writes(&insert, params, active_version_id, &mut writes)?;
+                collect_insert_writes(insert, params, &effective_active_version_id, &mut writes)?;
             }
             Statement::Update(update) => {
                 collect_update_writes(
                     backend,
-                    &update,
+                    update,
                     params,
-                    active_version_id,
+                    &effective_active_version_id,
                     &overlay,
                     &mut writes,
                 )
@@ -57,6 +62,16 @@ pub(crate) async fn collect_pending_file_writes(
             _ => {}
         }
         apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
+        if let Some(next_active_version_id) = next_active_version_id_from_statement(
+            backend,
+            &statement,
+            params,
+            &effective_active_version_id,
+        )
+        .await?
+        {
+            effective_active_version_id = next_active_version_id;
+        }
     }
 
     Ok(writes)
@@ -72,20 +87,21 @@ pub(crate) async fn collect_pending_file_delete_targets(
     let mut targets = BTreeSet::new();
     let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
     let mut writes = Vec::new();
+    let mut effective_active_version_id = active_version_id.to_string();
 
     for statement in statements {
         let start_len = writes.len();
-        match statement {
+        match &statement {
             Statement::Insert(insert) => {
-                collect_insert_writes(&insert, params, active_version_id, &mut writes)?;
+                collect_insert_writes(insert, params, &effective_active_version_id, &mut writes)?;
                 apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
             }
             Statement::Update(update) => {
                 collect_update_writes(
                     backend,
-                    &update,
+                    update,
                     params,
-                    active_version_id,
+                    &effective_active_version_id,
                     &overlay,
                     &mut writes,
                 )
@@ -95,9 +111,9 @@ pub(crate) async fn collect_pending_file_delete_targets(
             Statement::Delete(delete) => {
                 let statement_targets = collect_delete_targets(
                     backend,
-                    &delete,
+                    delete,
                     params,
-                    active_version_id,
+                    &effective_active_version_id,
                     &overlay,
                     &mut targets,
                 )
@@ -107,6 +123,16 @@ pub(crate) async fn collect_pending_file_delete_targets(
                 }
             }
             _ => {}
+        }
+        if let Some(next_active_version_id) = next_active_version_id_from_statement(
+            backend,
+            &statement,
+            params,
+            &effective_active_version_id,
+        )
+        .await?
+        {
+            effective_active_version_id = next_active_version_id;
         }
     }
 
@@ -243,13 +269,21 @@ async fn collect_update_writes(
     }
 
     let mut query_sql = match target {
-        FileWriteTarget::ActiveVersion => "SELECT id, path, data FROM lix_file".to_string(),
+        FileWriteTarget::ActiveVersion => format!(
+            "SELECT id, path, data, lixcol_version_id FROM lix_file_by_version \
+             WHERE lixcol_version_id = '{}'",
+            escape_sql_string(active_version_id)
+        ),
         FileWriteTarget::ExplicitVersion => {
             "SELECT id, path, data, lixcol_version_id FROM lix_file_by_version".to_string()
         }
     };
     if let Some(selection) = update.selection.as_ref() {
-        query_sql.push_str(" WHERE ");
+        query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
+            " AND "
+        } else {
+            " WHERE "
+        });
         query_sql.push_str(&selection.to_string());
     }
 
@@ -278,7 +312,10 @@ async fn collect_update_writes(
         let file_id = next_file_id.clone().unwrap_or(before_file_id);
         let path = next_path.clone().unwrap_or(before_path);
         let version_id = match target {
-            FileWriteTarget::ActiveVersion => active_version_id.to_string(),
+            FileWriteTarget::ActiveVersion => row
+                .get(3)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string()),
             FileWriteTarget::ExplicitVersion => row
                 .get(3)
                 .and_then(value_as_text)
@@ -356,13 +393,21 @@ async fn collect_delete_targets(
     let mut statement_targets = BTreeSet::new();
 
     let mut query_sql = match target {
-        FileWriteTarget::ActiveVersion => "SELECT id FROM lix_file".to_string(),
+        FileWriteTarget::ActiveVersion => format!(
+            "SELECT id, lixcol_version_id FROM lix_file_by_version \
+             WHERE lixcol_version_id = '{}'",
+            escape_sql_string(active_version_id)
+        ),
         FileWriteTarget::ExplicitVersion => {
             "SELECT id, lixcol_version_id FROM lix_file_by_version".to_string()
         }
     };
     if let Some(selection) = delete.selection.as_ref() {
-        query_sql.push_str(" WHERE ");
+        query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
+            " AND "
+        } else {
+            " WHERE "
+        });
         query_sql.push_str(&selection.to_string());
     }
 
@@ -387,7 +432,10 @@ async fn collect_delete_targets(
             continue;
         };
         let version_id = match target {
-            FileWriteTarget::ActiveVersion => active_version_id.to_string(),
+            FileWriteTarget::ActiveVersion => row
+                .get(1)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string()),
             FileWriteTarget::ExplicitVersion => row
                 .get(1)
                 .and_then(value_as_text)
@@ -429,6 +477,10 @@ struct OverlayWriteState {
     data: Vec<u8>,
 }
 
+const ACTIVE_VERSION_VIEW: &str = "lix_active_version";
+const INTERNAL_STATE_VTABLE: &str = "lix_internal_state_vtable";
+const INTERNAL_STATE_UNTRACKED: &str = "lix_internal_state_untracked";
+
 fn apply_statement_writes_to_overlay(
     statement_writes: &[PendingFileWrite],
     overlay: &mut BTreeMap<(String, String), OverlayWriteState>,
@@ -442,6 +494,282 @@ fn apply_statement_writes_to_overlay(
             },
         );
     }
+}
+
+async fn next_active_version_id_from_statement(
+    backend: &dyn LixBackend,
+    statement: &Statement,
+    params: &[Value],
+    current_active_version_id: &str,
+) -> Result<Option<String>, LixError> {
+    match statement {
+        Statement::Update(update) => {
+            let Some(table_name) = update_target_table_name(update) else {
+                return Ok(None);
+            };
+            if table_name.eq_ignore_ascii_case(ACTIVE_VERSION_VIEW) {
+                return active_version_id_from_lix_active_version_update(backend, update, params).await;
+            }
+            if table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE)
+                || table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED)
+            {
+                return active_version_id_from_internal_state_update(backend, update, params).await;
+            }
+            Ok(None)
+        }
+        Statement::Insert(insert) => {
+            active_version_id_from_internal_state_insert(insert, params, current_active_version_id)
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn active_version_id_from_lix_active_version_update(
+    backend: &dyn LixBackend,
+    update: &Update,
+    params: &[Value],
+) -> Result<Option<String>, LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    let mut next_active_version_id: Option<String> = None;
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            continue;
+        };
+        let resolved =
+            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
+        if column.eq_ignore_ascii_case("version_id") {
+            next_active_version_id = resolved_cell_text(Some(&resolved));
+        }
+    }
+    let Some(next_active_version_id) = next_active_version_id else {
+        return Ok(None);
+    };
+
+    let mut query_sql = format!("SELECT 1 FROM {ACTIVE_VERSION_VIEW}");
+    if let Some(selection) = update.selection.as_ref() {
+        query_sql.push_str(" WHERE ");
+        query_sql.push_str(&selection.to_string());
+    }
+    let bound = bind_sql_with_state(
+        &query_sql,
+        params,
+        backend.dialect(),
+        placeholder_state,
+    )?;
+    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "active version update prefetch failed for '{}': {}",
+                bound.sql, error.message
+            ),
+        })?
+        .rows;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(next_active_version_id))
+}
+
+async fn active_version_id_from_internal_state_update(
+    backend: &dyn LixBackend,
+    update: &Update,
+    params: &[Value],
+) -> Result<Option<String>, LixError> {
+    let Some(table_name) = update_target_table_name(update) else {
+        return Ok(None);
+    };
+    let mut placeholder_state = PlaceholderState::new();
+    let mut next_active_version_id: Option<String> = None;
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            continue;
+        };
+        let resolved =
+            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
+        if column.eq_ignore_ascii_case("snapshot_content") {
+            next_active_version_id = resolved
+                .value
+                .as_ref()
+                .and_then(active_version_id_from_snapshot_value);
+        }
+    }
+    let Some(next_active_version_id) = next_active_version_id else {
+        return Ok(None);
+    };
+
+    let active_version_predicate = if table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE) {
+        format!(
+            "schema_key = '{}' AND file_id = '{}' AND version_id = '{}' AND untracked = 1",
+            escape_sql_string(active_version_schema_key()),
+            escape_sql_string(active_version_file_id()),
+            escape_sql_string(active_version_storage_version_id()),
+        )
+    } else if table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED) {
+        format!(
+            "schema_key = '{}' AND file_id = '{}' AND version_id = '{}'",
+            escape_sql_string(active_version_schema_key()),
+            escape_sql_string(active_version_file_id()),
+            escape_sql_string(active_version_storage_version_id()),
+        )
+    } else {
+        return Ok(None);
+    };
+
+    let mut query_sql = format!("SELECT 1 FROM {table_name} WHERE {active_version_predicate}");
+    if let Some(selection) = update.selection.as_ref() {
+        query_sql.push_str(" AND (");
+        query_sql.push_str(&selection.to_string());
+        query_sql.push(')');
+    }
+    let bound = bind_sql_with_state(
+        &query_sql,
+        params,
+        backend.dialect(),
+        placeholder_state,
+    )?;
+    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "active version internal update prefetch failed for '{}': {}",
+                bound.sql, error.message
+            ),
+        })?
+        .rows;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(next_active_version_id))
+}
+
+fn active_version_id_from_internal_state_insert(
+    insert: &sqlparser::ast::Insert,
+    params: &[Value],
+    current_active_version_id: &str,
+) -> Result<Option<String>, LixError> {
+    let Some(table_name) = insert_target_table_name(insert) else {
+        return Ok(None);
+    };
+    let is_vtable = table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE);
+    let is_untracked = table_name.eq_ignore_ascii_case(INTERNAL_STATE_UNTRACKED);
+    if !is_vtable && !is_untracked {
+        return Ok(None);
+    }
+
+    let Some(source) = insert.source.as_ref() else {
+        return Ok(None);
+    };
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Ok(None);
+    };
+
+    let schema_key_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("schema_key"));
+    let file_id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("file_id"));
+    let version_id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("version_id"));
+    let snapshot_content_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("snapshot_content"));
+    let untracked_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("untracked"));
+    let (Some(schema_key_index), Some(file_id_index), Some(version_id_index), Some(snapshot_content_index)) =
+        (
+            schema_key_index,
+            file_id_index,
+            version_id_index,
+            snapshot_content_index,
+        )
+    else {
+        return Ok(None);
+    };
+
+    let resolved_rows = resolve_values_rows(&values.rows, params)?;
+    let mut next_active_version_id = None;
+    for resolved_row in &resolved_rows {
+        let schema_key = resolved_cell_text(resolved_row.get(schema_key_index))
+            .unwrap_or_else(|| "".to_string());
+        let file_id = resolved_cell_text(resolved_row.get(file_id_index)).unwrap_or_else(|| "".to_string());
+        let version_id = resolved_cell_text(resolved_row.get(version_id_index))
+            .unwrap_or_else(|| current_active_version_id.to_string());
+        if schema_key != active_version_schema_key()
+            || file_id != active_version_file_id()
+            || version_id != active_version_storage_version_id()
+        {
+            continue;
+        }
+
+        if is_vtable {
+            let Some(untracked_index) = untracked_index else {
+                continue;
+            };
+            let is_untracked_row = resolved_row
+                .get(untracked_index)
+                .and_then(|cell| cell.value.as_ref())
+                .is_some_and(value_is_truthy);
+            if !is_untracked_row {
+                continue;
+            }
+        }
+
+        let parsed = resolved_row
+            .get(snapshot_content_index)
+            .and_then(|cell| cell.value.as_ref())
+            .and_then(active_version_id_from_snapshot_value);
+        if parsed.is_some() {
+            next_active_version_id = parsed;
+        }
+    }
+
+    Ok(next_active_version_id)
+}
+
+fn active_version_id_from_snapshot_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => parse_active_version_snapshot(text).ok(),
+        _ => None,
+    }
+}
+
+fn value_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Integer(value) => *value != 0,
+        Value::Text(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true"
+        }
+        _ => false,
+    }
+}
+
+fn update_target_table_name(update: &Update) -> Option<String> {
+    if !update.table.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, .. } = &update.table.relation else {
+        return None;
+    };
+    object_name_terminal(name)
+}
+
+fn insert_target_table_name(insert: &sqlparser::ast::Insert) -> Option<String> {
+    let TableObject::TableName(name) = &insert.table else {
+        return None;
+    };
+    object_name_terminal(name)
 }
 
 async fn load_before_data_from_cache_batch(
