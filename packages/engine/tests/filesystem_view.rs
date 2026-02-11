@@ -1636,7 +1636,7 @@ simulation_test!(
                 "SELECT \
                 lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
                 lixcol_schema_version, lixcol_inherited_from_version_id, lixcol_change_id, \
-                lixcol_created_at, lixcol_updated_at, lixcol_untracked, lixcol_metadata \
+                lixcol_created_at, lixcol_updated_at, lixcol_writer_key, lixcol_untracked, lixcol_metadata \
              FROM lix_file WHERE id = 'lixcol-file'",
                 &[],
             )
@@ -1645,6 +1645,52 @@ simulation_test!(
         assert_eq!(file_rows.rows.len(), 1);
         assert_text(&file_rows.rows[0][1], "lix_file_descriptor");
         assert_text(&file_rows.rows[0][3], "lix");
+        match &file_rows.rows[0][9] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected lixcol_writer_key as text/null, got {other:?}"),
+        }
+
+        let file_shape_rows = engine
+            .execute(
+                "SELECT directory_id, name, extension \
+                 FROM lix_file \
+                 WHERE id = 'lixcol-file'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_shape_rows.rows.len(), 1);
+        match &file_shape_rows.rows[0][0] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected directory_id as text/null, got {other:?}"),
+        }
+        assert_text(&file_shape_rows.rows[0][1], "lixcol");
+        assert_text(&file_shape_rows.rows[0][2], "json");
+
+        let active_version = active_version_id(&engine).await.replace('\'', "''");
+        let file_by_version_shape_rows = engine
+            .execute(
+                &format!(
+                    "SELECT directory_id, name, extension, lixcol_writer_key \
+                     FROM lix_file_by_version \
+                     WHERE id = 'lixcol-file' \
+                       AND lixcol_version_id = '{active_version}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_by_version_shape_rows.rows.len(), 1);
+        match &file_by_version_shape_rows.rows[0][0] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected file_by_version directory_id as text/null, got {other:?}"),
+        }
+        assert_text(&file_by_version_shape_rows.rows[0][1], "lixcol");
+        assert_text(&file_by_version_shape_rows.rows[0][2], "json");
+        match &file_by_version_shape_rows.rows[0][3] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected file_by_version writer key as text/null, got {other:?}"),
+        }
 
         let directory_rows = engine
             .execute(
