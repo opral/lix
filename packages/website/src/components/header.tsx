@@ -120,9 +120,9 @@ export const MenuIcon = ({ className = "" }) => (
 );
 
 const navLinks = [
-  { href: "/docs/what-is-lix", label: "Docs" },
-  { href: "/plugins", label: "Plugins" },
-  { href: "/blog", label: "Blog" },
+  { href: "/docs/what-is-lix", label: "Docs", activePrefix: "/docs" },
+  { href: "/plugins", label: "Plugins", activePrefix: "/plugins" },
+  { href: "/blog", label: "Blog", activePrefix: "/blog" },
 ];
 
 const socialLinks = [
@@ -159,10 +159,11 @@ export function Header() {
     return count.toString();
   };
 
-  const isActive = (href: string) =>
-    href === "/"
-      ? pathname === "/"
-      : pathname === href || pathname.startsWith(`${href.replace(/\/$/, "")}/`);
+  const isActive = (href: string, activePrefix?: string) => {
+    const normalized = (activePrefix ?? href).replace(/\/$/, "");
+    if (normalized === "/") return pathname === "/";
+    return pathname === normalized || pathname.startsWith(`${normalized}/`);
+  };
 
   return (
     <header className="sticky top-0 z-50 border-b border-gray-200 bg-white/80 backdrop-blur">
@@ -177,18 +178,18 @@ export function Header() {
         </Link>
         <div className="flex items-center gap-6">
           <nav className="hidden items-center gap-4 text-sm font-medium text-gray-700 sm:flex">
-            {navLinks.map(({ href, label }) => (
+            {navLinks.map(({ href, label, activePrefix }) => (
               <Link
                 key={href + label}
                 to={href}
                 className={
-                  isActive(href)
+                  isActive(href, activePrefix)
                     ? href.startsWith("/plugins")
                       ? "px-2 py-1 text-[#0891B2] hover:text-[#0692B6]"
                       : "px-2 py-1 text-[#0891B2]"
                     : "px-2 py-1 transition-colors hover:text-[#0692B6]"
                 }
-                aria-current={isActive(href) ? "page" : undefined}
+                aria-current={isActive(href, activePrefix) ? "page" : undefined}
               >
                 {label}
               </Link>
