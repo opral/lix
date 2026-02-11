@@ -1360,17 +1360,23 @@ fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
 }
 
 fn file_history_read_materialization_required_for_statement(statement: &Statement) -> bool {
-    let Statement::Query(query) = statement else {
-        return false;
-    };
-    query_mentions_table_name(query, "lix_file_history")
+    match statement {
+        Statement::Query(query) => query_mentions_table_name(query, "lix_file_history"),
+        Statement::Insert(insert) => insert
+            .source
+            .as_deref()
+            .is_some_and(|query| query_mentions_table_name(query, "lix_file_history")),
+        _ => false,
+    }
 }
 
 fn file_read_materialization_scope_for_statement(
     statement: &Statement,
 ) -> Option<FileReadMaterializationScope> {
-    let Statement::Query(query) = statement else {
-        return None;
+    let query = match statement {
+        Statement::Query(query) => query.as_ref(),
+        Statement::Insert(insert) => insert.source.as_deref()?,
+        _ => return None,
     };
 
     let mentions_by_version = query_mentions_table_name(query, "lix_file_by_version");
@@ -1720,7 +1726,9 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         active_version_from_update_validations, active_version_schema_key,
-        file_descriptor_cache_eviction_targets, should_refresh_file_cache_for_sql,
+        file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
+        file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
+        FileReadMaterializationScope,
     };
     use crate::sql::UpdateValidationPlan;
     use crate::sql::{parse_sql_statements, MutationOperation, MutationRow};
@@ -1785,6 +1793,35 @@ mod tests {
         ));
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
+        ));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_insert_select_lix_file() {
+        let scope = file_read_materialization_scope_for_sql(
+            "INSERT INTO some_table (payload) \
+             SELECT data FROM lix_file WHERE id = 'file-a'",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_insert_select_lix_file_by_version() {
+        let scope = file_read_materialization_scope_for_sql(
+            "INSERT INTO some_table (payload) \
+             SELECT data FROM lix_file_by_version \
+             WHERE id = 'file-a' AND lixcol_version_id = 'version-a'",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
+    }
+
+    #[test]
+    fn file_history_materialization_detection_includes_insert_select_sources() {
+        assert!(file_history_read_materialization_required_for_sql(
+            "INSERT INTO some_table (payload) \
+             SELECT data FROM lix_file_history \
+             WHERE id = 'file-a' \
+             LIMIT 1",
         ));
     }
 
