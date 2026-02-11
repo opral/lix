@@ -289,27 +289,31 @@ impl Engine {
                 match &postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         if should_refresh_file_cache {
-                            let targets =
-                                match collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key) {
-                                    Ok(targets) => targets,
-                                    Err(error) => {
-                                        let _ = transaction.rollback().await;
-                                        return Err(error);
-                                    }
-                                };
+                            let targets = match collect_postprocess_file_cache_targets(
+                                &result.rows,
+                                &plan.schema_key,
+                            ) {
+                                Ok(targets) => targets,
+                                Err(error) => {
+                                    let _ = transaction.rollback().await;
+                                    return Err(error);
+                                }
+                            };
                             postprocess_file_cache_targets.extend(targets);
                         }
                     }
                     PostprocessPlan::VtableDelete(plan) => {
                         if should_refresh_file_cache {
-                            let targets =
-                                match collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key) {
-                                    Ok(targets) => targets,
-                                    Err(error) => {
-                                        let _ = transaction.rollback().await;
-                                        return Err(error);
-                                    }
-                                };
+                            let targets = match collect_postprocess_file_cache_targets(
+                                &result.rows,
+                                &plan.schema_key,
+                            ) {
+                                Ok(targets) => targets,
+                                Err(error) => {
+                                    let _ = transaction.rollback().await;
+                                    return Err(error);
+                                }
+                            };
                             postprocess_file_cache_targets.extend(targets);
                         }
                     }
@@ -327,40 +331,36 @@ impl Engine {
                 }
                 let mut followup_functions = functions.clone();
                 let followup_sql = match postprocess_plan {
-                    PostprocessPlan::VtableUpdate(plan) => {
-                        match build_update_followup_sql(
-                            transaction.as_mut(),
-                            &plan,
-                            &result.rows,
-                            &detected_file_domain_changes,
-                            &mut followup_functions,
-                        )
-                        .await
-                        {
-                            Ok(sql) => sql,
-                            Err(error) => {
-                                let _ = transaction.rollback().await;
-                                return Err(error);
-                            }
+                    PostprocessPlan::VtableUpdate(plan) => match build_update_followup_sql(
+                        transaction.as_mut(),
+                        &plan,
+                        &result.rows,
+                        &detected_file_domain_changes,
+                        &mut followup_functions,
+                    )
+                    .await
+                    {
+                        Ok(sql) => sql,
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
                         }
-                    }
-                    PostprocessPlan::VtableDelete(plan) => {
-                        match build_delete_followup_sql(
-                            transaction.as_mut(),
-                            &plan,
-                            &result.rows,
-                            &detected_file_domain_changes,
-                            &mut followup_functions,
-                        )
-                        .await
-                        {
-                            Ok(sql) => sql,
-                            Err(error) => {
-                                let _ = transaction.rollback().await;
-                                return Err(error);
-                            }
+                    },
+                    PostprocessPlan::VtableDelete(plan) => match build_delete_followup_sql(
+                        transaction.as_mut(),
+                        &plan,
+                        &result.rows,
+                        &detected_file_domain_changes,
+                        &mut followup_functions,
+                    )
+                    .await
+                    {
+                        Ok(sql) => sql,
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
                         }
-                    }
+                    },
                 };
                 if !followup_sql.is_empty() {
                     if let Err(error) = transaction.execute(&followup_sql, &[]).await {
@@ -1418,38 +1418,28 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
             .as_deref()
             .is_some_and(|query| query_mentions_table_name(query, table_name)),
         Statement::Update(update) => {
-            update
-                .from
+            update.from.as_ref().is_some_and(|from| match from {
+                UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => from
+                    .iter()
+                    .any(|table| table_with_joins_mentions_table_name(table, table_name)),
+            }) || update
+                .selection
                 .as_ref()
-                .is_some_and(|from| match from {
-                    UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => {
-                        from.iter().any(|table| {
-                            table_with_joins_mentions_table_name(table, table_name)
-                        })
-                    }
-                })
-                || update
-                    .selection
-                    .as_ref()
-                    .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+                .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
                 || update
                     .assignments
                     .iter()
                     .any(|assignment| expr_mentions_table_name(&assignment.value, table_name))
         }
         Statement::Delete(delete) => {
-            delete
-                .using
+            delete.using.as_ref().is_some_and(|tables| {
+                tables
+                    .iter()
+                    .any(|table| table_with_joins_mentions_table_name(table, table_name))
+            }) || delete
+                .selection
                 .as_ref()
-                .is_some_and(|tables| {
-                    tables
-                        .iter()
-                        .any(|table| table_with_joins_mentions_table_name(table, table_name))
-                })
-                || delete
-                    .selection
-                    .as_ref()
-                    .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+                .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
         }
         _ => false,
     }
@@ -1468,6 +1458,31 @@ fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
         }
     }
 
+    if query
+        .order_by
+        .as_ref()
+        .is_some_and(|order_by| order_by_mentions_table_name(order_by, table_name))
+    {
+        return true;
+    }
+
+    if query
+        .limit_clause
+        .as_ref()
+        .is_some_and(|limit_clause| limit_clause_mentions_table_name(limit_clause, table_name))
+    {
+        return true;
+    }
+
+    if query
+        .fetch
+        .as_ref()
+        .and_then(|fetch| fetch.quantity.as_ref())
+        .is_some_and(|quantity| expr_mentions_table_name(quantity, table_name))
+    {
+        return true;
+    }
+
     false
 }
 
@@ -1479,15 +1494,110 @@ fn query_set_expr_mentions_table_name(expr: &SetExpr, table_name: &str) -> bool 
             query_set_expr_mentions_table_name(left.as_ref(), table_name)
                 || query_set_expr_mentions_table_name(right.as_ref(), table_name)
         }
-        _ => false,
+        SetExpr::Values(values) => values
+            .rows
+            .iter()
+            .flatten()
+            .any(|expr| expr_mentions_table_name(expr, table_name)),
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => statement_reads_table_name(statement, table_name),
+        SetExpr::Table(table) => table
+            .table_name
+            .as_ref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(table_name)),
     }
 }
 
 fn select_mentions_table_name(select: &Select, table_name: &str) -> bool {
-    select
+    if select
         .from
         .iter()
         .any(|table| table_with_joins_mentions_table_name(table, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .projection
+        .iter()
+        .any(|item| select_item_mentions_table_name(item, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .prewhere
+        .as_ref()
+        .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .selection
+        .as_ref()
+        .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+    {
+        return true;
+    }
+
+    if group_by_expr_mentions_table_name(&select.group_by, table_name) {
+        return true;
+    }
+
+    if select
+        .cluster_by
+        .iter()
+        .any(|expr| expr_mentions_table_name(expr, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .distribute_by
+        .iter()
+        .any(|expr| expr_mentions_table_name(expr, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .sort_by
+        .iter()
+        .any(|order_by_expr| order_by_expr_mentions_table_name(order_by_expr, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .having
+        .as_ref()
+        .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+    {
+        return true;
+    }
+
+    if select
+        .qualify
+        .as_ref()
+        .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+    {
+        return true;
+    }
+
+    if select.connect_by.as_ref().is_some_and(|connect_by| {
+        expr_mentions_table_name(&connect_by.condition, table_name)
+            || connect_by
+                .relationships
+                .iter()
+                .any(|expr| expr_mentions_table_name(expr, table_name))
+    }) {
+        return true;
+    }
+
+    false
 }
 
 fn table_with_joins_mentions_table_name(table: &TableWithJoins, table_name: &str) -> bool {
@@ -1495,10 +1605,10 @@ fn table_with_joins_mentions_table_name(table: &TableWithJoins, table_name: &str
         return true;
     }
 
-    table
-        .joins
-        .iter()
-        .any(|join| table_factor_mentions_table_name(&join.relation, table_name))
+    table.joins.iter().any(|join| {
+        table_factor_mentions_table_name(&join.relation, table_name)
+            || join_operator_mentions_table_name(&join.join_operator, table_name)
+    })
 }
 
 fn table_factor_mentions_table_name(table: &TableFactor, table_name: &str) -> bool {
@@ -1512,10 +1622,141 @@ fn table_factor_mentions_table_name(table: &TableFactor, table_name: &str) -> bo
     }
 }
 
+fn select_item_mentions_table_name(item: &sqlparser::ast::SelectItem, table_name: &str) -> bool {
+    match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(expr)
+        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+            expr_mentions_table_name(expr, table_name)
+        }
+        sqlparser::ast::SelectItem::QualifiedWildcard(
+            sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
+            _,
+        ) => expr_mentions_table_name(expr, table_name),
+        _ => false,
+    }
+}
+
+fn group_by_expr_mentions_table_name(
+    group_by: &sqlparser::ast::GroupByExpr,
+    table_name: &str,
+) -> bool {
+    match group_by {
+        sqlparser::ast::GroupByExpr::All(_) => false,
+        sqlparser::ast::GroupByExpr::Expressions(expressions, _) => expressions
+            .iter()
+            .any(|expr| expr_mentions_table_name(expr, table_name)),
+    }
+}
+
+fn order_by_mentions_table_name(order_by: &sqlparser::ast::OrderBy, table_name: &str) -> bool {
+    match &order_by.kind {
+        sqlparser::ast::OrderByKind::All(_) => false,
+        sqlparser::ast::OrderByKind::Expressions(expressions) => expressions
+            .iter()
+            .any(|expr| order_by_expr_mentions_table_name(expr, table_name)),
+    }
+}
+
+fn order_by_expr_mentions_table_name(
+    order_by_expr: &sqlparser::ast::OrderByExpr,
+    table_name: &str,
+) -> bool {
+    if expr_mentions_table_name(&order_by_expr.expr, table_name) {
+        return true;
+    }
+
+    order_by_expr.with_fill.as_ref().is_some_and(|with_fill| {
+        with_fill
+            .from
+            .as_ref()
+            .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+            || with_fill
+                .to
+                .as_ref()
+                .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+            || with_fill
+                .step
+                .as_ref()
+                .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+    })
+}
+
+fn limit_clause_mentions_table_name(
+    limit_clause: &sqlparser::ast::LimitClause,
+    table_name: &str,
+) -> bool {
+    match limit_clause {
+        sqlparser::ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            limit
+                .as_ref()
+                .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+                || offset
+                    .as_ref()
+                    .is_some_and(|offset| expr_mentions_table_name(&offset.value, table_name))
+                || limit_by
+                    .iter()
+                    .any(|expr| expr_mentions_table_name(expr, table_name))
+        }
+        sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+            expr_mentions_table_name(offset, table_name)
+                || expr_mentions_table_name(limit, table_name)
+        }
+    }
+}
+
+fn join_operator_mentions_table_name(
+    join_operator: &sqlparser::ast::JoinOperator,
+    table_name: &str,
+) -> bool {
+    let (match_condition, constraint) = match join_operator {
+        sqlparser::ast::JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => (Some(match_condition), Some(constraint)),
+        sqlparser::ast::JoinOperator::Join(constraint)
+        | sqlparser::ast::JoinOperator::Inner(constraint)
+        | sqlparser::ast::JoinOperator::Left(constraint)
+        | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+        | sqlparser::ast::JoinOperator::Right(constraint)
+        | sqlparser::ast::JoinOperator::RightOuter(constraint)
+        | sqlparser::ast::JoinOperator::FullOuter(constraint)
+        | sqlparser::ast::JoinOperator::CrossJoin(constraint)
+        | sqlparser::ast::JoinOperator::Semi(constraint)
+        | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+        | sqlparser::ast::JoinOperator::RightSemi(constraint)
+        | sqlparser::ast::JoinOperator::Anti(constraint)
+        | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+        | sqlparser::ast::JoinOperator::RightAnti(constraint)
+        | sqlparser::ast::JoinOperator::StraightJoin(constraint) => (None, Some(constraint)),
+        sqlparser::ast::JoinOperator::CrossApply | sqlparser::ast::JoinOperator::OuterApply => {
+            (None, None)
+        }
+    };
+
+    match_condition.is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+        || constraint
+            .is_some_and(|constraint| join_constraint_mentions_table_name(constraint, table_name))
+}
+
+fn join_constraint_mentions_table_name(
+    constraint: &sqlparser::ast::JoinConstraint,
+    table_name: &str,
+) -> bool {
+    match constraint {
+        sqlparser::ast::JoinConstraint::On(expr) => expr_mentions_table_name(expr, table_name),
+        _ => false,
+    }
+}
+
 fn expr_mentions_table_name(expr: &Expr, table_name: &str) -> bool {
     match expr {
         Expr::BinaryOp { left, right, .. } => {
-            expr_mentions_table_name(left, table_name) || expr_mentions_table_name(right, table_name)
+            expr_mentions_table_name(left, table_name)
+                || expr_mentions_table_name(right, table_name)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -1550,25 +1791,28 @@ fn expr_mentions_table_name(expr: &Expr, table_name: &str) -> bool {
                 || expr_mentions_table_name(array_expr, table_name)
         }
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            expr_mentions_table_name(left, table_name) || expr_mentions_table_name(right, table_name)
+            expr_mentions_table_name(left, table_name)
+                || expr_mentions_table_name(right, table_name)
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
             query_mentions_table_name(subquery, table_name)
         }
         Expr::Function(function) => match &function.args {
-            sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
-                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
-                    expr_mentions_table_name(expr, table_name)
-                }
-                sqlparser::ast::FunctionArg::Named { arg, .. }
-                | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
-                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                        expr_mentions_table_name(expr, table_name)
-                    }
+            sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.iter().any(|arg| match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) => expr_mentions_table_name(expr, table_name),
+                    sqlparser::ast::FunctionArg::Named { arg, .. }
+                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                            expr_mentions_table_name(expr, table_name)
+                        }
+                        _ => false,
+                    },
                     _ => false,
-                },
-                _ => false,
-            }),
+                })
+            }
             _ => false,
         },
         Expr::Case {
@@ -1965,6 +2209,39 @@ mod tests {
     }
 
     #[test]
+    fn file_read_materialization_scope_detects_select_projection_subquery_lix_file_by_version() {
+        let scope = file_read_materialization_scope_for_sql(
+            "SELECT (\
+                SELECT data FROM lix_file_by_version \
+                WHERE id = 'file-a' AND lixcol_version_id = 'version-a'\
+             ) AS payload",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_select_where_exists_subquery_lix_file() {
+        let scope = file_read_materialization_scope_for_sql(
+            "SELECT 1 \
+             WHERE EXISTS (\
+                SELECT 1 FROM lix_file WHERE id = 'file-a'\
+             )",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_select_join_on_subquery_lix_file() {
+        let scope = file_read_materialization_scope_for_sql(
+            "SELECT t.id \
+             FROM some_table t \
+             LEFT JOIN other_table o \
+               ON EXISTS (SELECT 1 FROM lix_file WHERE id = 'file-a')",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
     fn file_read_materialization_scope_detects_update_where_subquery_lix_file() {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE some_table \
@@ -1993,6 +2270,16 @@ mod tests {
              SELECT data FROM lix_file_history \
              WHERE id = 'file-a' \
              LIMIT 1",
+        ));
+    }
+
+    #[test]
+    fn file_history_materialization_detection_includes_select_where_subquery_sources() {
+        assert!(file_history_read_materialization_required_for_sql(
+            "SELECT 1 \
+             WHERE EXISTS (\
+                SELECT 1 FROM lix_file_history WHERE id = 'file-a'\
+             )",
         ));
     }
 
