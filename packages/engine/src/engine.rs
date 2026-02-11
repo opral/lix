@@ -26,9 +26,10 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::PluginManifest;
 use crate::schema_registry::{register_schema, register_schema_sql};
 use crate::sql::{
-    build_delete_followup_sql, build_update_followup_sql, escape_sql_string, parse_sql_statements,
+    bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
+    parse_sql_statements,
     preprocess_sql_with_provider_and_detected_file_domain_changes, DetectedFileDomainChange,
-    MutationOperation, MutationRow, PostprocessPlan, UpdateValidationPlan,
+    MutationOperation, MutationRow, PlaceholderState, PostprocessPlan, UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -1289,19 +1290,52 @@ async fn collect_filesystem_update_detected_file_domain_changes(
     params: &[Value],
 ) -> Result<Vec<DetectedFileDomainChange>, LixError> {
     let statements = parse_sql_statements(sql)?;
+    let mut placeholder_state = PlaceholderState::new();
     let mut detected_changes = Vec::new();
     for statement in statements {
-        let Statement::Update(update) = statement else {
-            continue;
-        };
-        let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-            backend, &update, params,
-        )
-        .await?;
-        detected_changes.extend(side_effects.tracked_directory_changes);
+        match statement {
+            Statement::Update(update) => {
+                let side_effects =
+                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
+                        backend,
+                        &update,
+                        params,
+                        &mut placeholder_state,
+                    )
+                    .await?;
+                detected_changes.extend(side_effects.tracked_directory_changes);
+            }
+            other => {
+                advance_placeholder_state_for_statement(
+                    &other,
+                    params,
+                    backend.dialect(),
+                    &mut placeholder_state,
+                )?;
+            }
+        }
     }
 
     Ok(dedupe_detected_file_domain_changes(&detected_changes))
+}
+
+fn advance_placeholder_state_for_statement(
+    statement: &Statement,
+    params: &[Value],
+    dialect: crate::backend::SqlDialect,
+    placeholder_state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    let statement_sql = statement.to_string();
+    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
+        |error| LixError {
+            message: format!(
+                "filesystem side-effect placeholder binding failed for '{}': {}",
+                statement_sql, error.message
+            ),
+        },
+    )?;
+    *placeholder_state = bound.state;
+    Ok(())
 }
 
 fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
@@ -2118,13 +2152,17 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_version_from_update_validations, active_version_schema_key,
-        file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
-        file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
-        FileReadMaterializationScope,
+        advance_placeholder_state_for_statement, active_version_from_update_validations,
+        active_version_schema_key, file_descriptor_cache_eviction_targets,
+        file_history_read_materialization_required_for_sql, file_read_materialization_scope_for_sql,
+        should_refresh_file_cache_for_sql, FileReadMaterializationScope,
     };
+    use crate::backend::SqlDialect;
     use crate::sql::UpdateValidationPlan;
-    use crate::sql::{parse_sql_statements, MutationOperation, MutationRow};
+    use crate::sql::{
+        bind_sql_with_state, parse_sql_statements, MutationOperation, MutationRow, PlaceholderState,
+    };
+    use crate::Value;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
 
@@ -2187,6 +2225,34 @@ mod tests {
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
+    }
+
+    #[test]
+    fn filesystem_side_effect_scan_advances_placeholder_state_across_statements() {
+        let mut statements = parse_sql_statements(
+            "UPDATE lix_file SET path = ? WHERE id = 'file-a'; \
+             UPDATE lix_file SET path = ? WHERE id = 'file-b'",
+        )
+        .expect("parse sql");
+        assert_eq!(statements.len(), 2);
+
+        let params = vec![
+            Value::Text("/docs/a.json".to_string()),
+            Value::Text("/archive/b.json".to_string()),
+        ];
+        let mut placeholder_state = PlaceholderState::new();
+        advance_placeholder_state_for_statement(
+            &statements.remove(0),
+            &params,
+            SqlDialect::Sqlite,
+            &mut placeholder_state,
+        )
+        .expect("advance placeholder state for first statement");
+
+        let bound = bind_sql_with_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
+            .expect("bind placeholder with carried state");
+        assert_eq!(bound.params.len(), 1);
+        assert_eq!(bound.params[0], Value::Text("/archive/b.json".to_string()));
     }
 
     #[test]

@@ -320,7 +320,24 @@ pub async fn update_side_effects_with_backend(
     backend: &dyn LixBackend,
     update: &Update,
     params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<FilesystemUpdateSideEffects, LixError> {
+    let statement_start_state = *placeholder_state;
+    let statement_sql = update.to_string();
+    let bound = bind_sql_with_state(
+        &statement_sql,
+        params,
+        backend.dialect(),
+        statement_start_state,
+    )
+    .map_err(|error| LixError {
+        message: format!(
+            "filesystem update placeholder binding failed for '{}': {}",
+            statement_sql, error.message
+        ),
+    })?;
+    *placeholder_state = bound.state;
+
     let Some(target) = target_from_update_table(&update.table) else {
         return Ok(FilesystemUpdateSideEffects::default());
     };
@@ -328,14 +345,17 @@ pub async fn update_side_effects_with_backend(
         return Ok(FilesystemUpdateSideEffects::default());
     }
 
-    let mut placeholder_state = PlaceholderState::new();
+    let mut statement_placeholder_state = statement_start_state;
     let mut next_path: Option<String> = None;
     for assignment in &update.assignments {
         let Some(column) = assignment_target_name(assignment) else {
             continue;
         };
-        let resolved =
-            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
+        let resolved = resolve_expr_cell_with_state(
+            &assignment.value,
+            params,
+            &mut statement_placeholder_state,
+        )?;
         if column.eq_ignore_ascii_case("path") {
             next_path = resolve_text_expr(Some(&assignment.value), Some(&resolved), "file path")?;
         }
@@ -345,7 +365,7 @@ pub async fn update_side_effects_with_backend(
         return Ok(FilesystemUpdateSideEffects::default());
     };
 
-    let selection_placeholder_state = placeholder_state;
+    let selection_placeholder_state = statement_placeholder_state;
     let mut version_predicate_state = selection_placeholder_state;
     let version_id =
         resolve_update_version_id(backend, update, params, target, &mut version_predicate_state)
