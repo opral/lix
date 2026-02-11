@@ -48,6 +48,7 @@ pub struct FilesystemInsertSideEffects {
 #[derive(Debug, Default)]
 pub struct FilesystemUpdateSideEffects {
     pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
+    pub untracked_directory_changes: Vec<DetectedFileDomainChange>,
 }
 
 pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
@@ -381,6 +382,7 @@ pub async fn update_side_effects_with_backend(
     if matching_file_ids.is_empty() {
         return Ok(FilesystemUpdateSideEffects::default());
     }
+    let all_untracked = matching_file_ids.iter().all(|row| row.untracked);
     let parsed = parse_file_path(&raw_path)?;
     let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
     if ancestor_paths.is_empty() {
@@ -393,12 +395,20 @@ pub async fn update_side_effects_with_backend(
             .then_with(|| left.cmp(right))
     });
     ancestor_paths.dedup();
-    let tracked_directory_changes =
-        tracked_missing_directory_changes(backend, &version_id, &ancestor_paths).await?;
+    let directory_changes = tracked_missing_directory_changes(backend, &version_id, &ancestor_paths)
+        .await?;
 
-    Ok(FilesystemUpdateSideEffects {
-        tracked_directory_changes,
-    })
+    if all_untracked {
+        Ok(FilesystemUpdateSideEffects {
+            tracked_directory_changes: Vec::new(),
+            untracked_directory_changes: directory_changes,
+        })
+    } else {
+        Ok(FilesystemUpdateSideEffects {
+            tracked_directory_changes: directory_changes,
+            untracked_directory_changes: Vec::new(),
+        })
+    }
 }
 
 pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
@@ -943,6 +953,10 @@ async fn rewrite_file_update_assignments_with_backend(
         selection_placeholder_state,
     )
     .await?;
+    let matching_file_ids = matching_file_ids
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
     if matching_file_ids.len() > 1 {
         return Err(file_unique_error(&parsed.normalized_path, &version_id));
     }
@@ -2173,20 +2187,26 @@ async fn directory_rows_matching_delete(
     Ok(rows)
 }
 
+#[derive(Debug, Clone)]
+struct ScopedFileUpdateRow {
+    id: String,
+    untracked: bool,
+}
+
 async fn file_ids_matching_update(
     backend: &dyn LixBackend,
     update: &Update,
     target: FilesystemTarget,
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
-) -> Result<Vec<String>, LixError> {
+) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
     let where_clause = update
         .selection
         .as_ref()
         .map(|selection| format!(" WHERE {selection}"))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT id FROM {view_name}{where_clause}",
+        "SELECT id, lixcol_untracked FROM {view_name}{where_clause}",
         view_name = target.view_name,
         where_clause = where_clause
     );
@@ -2207,22 +2227,50 @@ async fn file_ids_matching_update(
             ),
         })?;
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<ScopedFileUpdateRow> = Vec::new();
     for row in result.rows {
-        let Some(value) = row.first() else {
+        let Some(id_value) = row.first() else {
             continue;
         };
-        let EngineValue::Text(id) = value else {
+        let EngineValue::Text(id) = id_value else {
             return Err(LixError {
-                message: format!("file update id lookup expected text, got {value:?}"),
+                message: format!("file update id lookup expected text, got {id_value:?}"),
             });
         };
-        out.push(id.clone());
+        let untracked = row
+            .get(1)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        out.push(ScopedFileUpdateRow {
+            id: id.clone(),
+            untracked,
+        });
     }
 
-    out.sort();
-    out.dedup();
+    out.sort_by(|left, right| left.id.cmp(&right.id));
+    out.dedup_by(|left, right| left.id == right.id);
     Ok(out)
+}
+
+fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
+    match value {
+        EngineValue::Integer(v) => Ok(*v != 0),
+        EngineValue::Text(v) => {
+            let normalized = v.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" => Ok(true),
+                "0" | "false" | "" => Ok(false),
+                _ => Err(LixError {
+                    message: format!("file update untracked lookup expected boolean-like text, got '{v}'"),
+                }),
+            }
+        }
+        EngineValue::Null => Ok(false),
+        other => Err(LixError {
+            message: format!("file update untracked lookup expected boolean-like value, got {other:?}"),
+        }),
+    }
 }
 
 async fn expand_directory_descendants(
