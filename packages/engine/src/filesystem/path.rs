@@ -234,7 +234,10 @@ mod tests {
             "/unicodé/段落.md",
             "/docs/%20notes.md",
         ] {
-            assert!(normalize_file_path(path).is_ok(), "expected valid path {path}");
+            assert!(
+                normalize_file_path(path).is_ok(),
+                "expected valid path {path}"
+            );
         }
     }
 
@@ -284,7 +287,14 @@ mod tests {
                 "expected valid directory path {path}"
             );
         }
-        for path in ["/", "/file.md", "/docs", "/docs/ ", "no-leading", "/docs/%zz/"] {
+        for path in [
+            "/",
+            "/file.md",
+            "/docs",
+            "/docs/ ",
+            "no-leading",
+            "/docs/%zz/",
+        ] {
             assert!(
                 normalize_directory_path(path).is_err(),
                 "expected invalid directory path {path}"

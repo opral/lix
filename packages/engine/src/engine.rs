@@ -257,6 +257,7 @@ impl Engine {
                 self.backend.as_ref(),
                 &self.schema_cache,
                 &output.update_validations,
+                &output.params,
             )
             .await?;
         }

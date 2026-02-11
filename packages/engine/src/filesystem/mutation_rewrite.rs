@@ -345,7 +345,7 @@ pub async fn update_side_effects_with_backend(
         return Ok(FilesystemUpdateSideEffects::default());
     };
 
-    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let version_id = resolve_update_version_id(backend, update, params, target).await?;
     let parsed = parse_file_path(&raw_path)?;
     let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
     if ancestor_paths.is_empty() {
@@ -451,19 +451,20 @@ pub async fn rewrite_delete_with_backend(
             message: format!("{} does not support DELETE", target.view_name),
         });
     }
-    if target.requires_explicit_version_scope()
-        && extract_predicate_string(
+    if target.requires_explicit_version_scope() {
+        let version_id = extract_predicate_string_with_params(
             delete.selection.as_ref(),
             &["lixcol_version_id", "version_id"],
-        )
-        .is_none()
-    {
-        return Err(LixError {
-            message: format!(
-                "{} delete requires a version_id predicate",
-                target.view_name
-            ),
-        });
+            params,
+        )?;
+        if version_id.is_none() {
+            return Err(LixError {
+                message: format!(
+                    "{} delete requires a version_id predicate",
+                    target.view_name
+                ),
+            });
+        }
     }
 
     if target.is_directory() {
@@ -889,7 +890,7 @@ async fn rewrite_file_update_assignments_with_backend(
         return Ok(());
     };
 
-    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let version_id = resolve_update_version_id(backend, update, params, target).await?;
     let parsed = parse_file_path(&raw_path)?;
     assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
     let matching_file_ids = file_ids_matching_update(backend, update, target, params).await?;
@@ -1036,7 +1037,7 @@ async fn rewrite_directory_update_assignments_with_backend(
         return Ok(());
     }
 
-    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let version_id = resolve_update_version_id(backend, update, params, target).await?;
     let current_directory_id =
         extract_predicate_string(update.selection.as_ref(), &["id", "lixcol_entity_id"]);
     let Some(current_directory_id) = current_directory_id else {
@@ -1167,16 +1168,24 @@ fn resolve_insert_row_version_id(
 async fn resolve_update_version_id(
     backend: &dyn LixBackend,
     update: &Update,
+    params: &[EngineValue],
     target: FilesystemTarget,
 ) -> Result<String, LixError> {
     if target.uses_active_version_scope() {
         return load_active_version_id(backend).await;
     }
     if target.requires_explicit_version_scope() {
-        return extract_predicate_string(
+        return extract_predicate_string_with_params(
             update.selection.as_ref(),
             &["lixcol_version_id", "version_id"],
+            params,
         )
+        .map_err(|error| LixError {
+            message: format!(
+                "{} update version predicate failed: {}",
+                target.view_name, error.message
+            ),
+        })?
         .ok_or_else(|| LixError {
             message: format!(
                 "{} update requires a version_id predicate",
@@ -1496,7 +1505,35 @@ fn resolve_untracked_expr(
 }
 
 fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Option<String> {
-    let selection = selection?;
+    extract_predicate_string_with_params(selection, columns, &[])
+        .ok()
+        .flatten()
+}
+
+fn extract_predicate_string_with_params(
+    selection: Option<&Expr>,
+    columns: &[&str],
+    params: &[EngineValue],
+) -> Result<Option<String>, LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    extract_predicate_string_with_params_and_state(
+        selection,
+        columns,
+        params,
+        &mut placeholder_state,
+    )
+}
+
+fn extract_predicate_string_with_params_and_state(
+    selection: Option<&Expr>,
+    columns: &[&str],
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<String>, LixError> {
+    let selection = match selection {
+        Some(selection) => selection,
+        None => return Ok(None),
+    };
     match selection {
         Expr::BinaryOp { left, op, right } => {
             if op.to_string().eq_ignore_ascii_case("=") {
@@ -1505,8 +1542,10 @@ fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Optio
                         .iter()
                         .any(|candidate| column.eq_ignore_ascii_case(candidate))
                     {
-                        if let Some(value) = expr_string_literal(right) {
-                            return Some(value);
+                        if let Some(value) =
+                            expr_string_literal_or_placeholder(right, params, placeholder_state)?
+                        {
+                            return Ok(Some(value));
                         }
                     }
                 }
@@ -1515,17 +1554,37 @@ fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Optio
                         .iter()
                         .any(|candidate| column.eq_ignore_ascii_case(candidate))
                     {
-                        if let Some(value) = expr_string_literal(left) {
-                            return Some(value);
+                        if let Some(value) =
+                            expr_string_literal_or_placeholder(left, params, placeholder_state)?
+                        {
+                            return Ok(Some(value));
                         }
                     }
                 }
             }
-            extract_predicate_string(Some(left), columns)
-                .or_else(|| extract_predicate_string(Some(right), columns))
+            let left_match = extract_predicate_string_with_params_and_state(
+                Some(left),
+                columns,
+                params,
+                placeholder_state,
+            )?;
+            if left_match.is_some() {
+                return Ok(left_match);
+            }
+            extract_predicate_string_with_params_and_state(
+                Some(right),
+                columns,
+                params,
+                placeholder_state,
+            )
         }
-        Expr::Nested(inner) => extract_predicate_string(Some(inner), columns),
-        _ => None,
+        Expr::Nested(inner) => extract_predicate_string_with_params_and_state(
+            Some(inner),
+            columns,
+            params,
+            placeholder_state,
+        ),
+        _ => Ok(None),
     }
 }
 
@@ -1566,6 +1625,29 @@ fn expr_string_literal(expr: &Expr) -> Option<String> {
             "0".to_string()
         }),
         AstValue::Null | AstValue::Placeholder(_) => None,
+    }
+}
+
+fn expr_string_literal_or_placeholder(
+    expr: &Expr,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<String>, LixError> {
+    if let Some(value) = expr_string_literal(expr) {
+        return Ok(Some(value));
+    }
+    let resolved = resolve_expr_cell_with_state(expr, params, placeholder_state)?;
+    let Some(value) = resolved.value else {
+        return Ok(None);
+    };
+    match value {
+        EngineValue::Text(value) => Ok(Some(value)),
+        EngineValue::Integer(value) => Ok(Some(value.to_string())),
+        EngineValue::Real(value) => Ok(Some(value.to_string())),
+        EngineValue::Null => Ok(None),
+        EngineValue::Blob(_) => Err(LixError {
+            message: "version_id predicate expects text-compatible value".to_string(),
+        }),
     }
 }
 
@@ -1840,7 +1922,15 @@ async fn directory_rows_matching_delete(
         )
     };
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-    let result = backend.execute(&rewritten_sql, params).await?;
+    let result = backend
+        .execute(&rewritten_sql, params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "directory delete scope prefetch failed for '{}': {}",
+                rewritten_sql, error.message
+            ),
+        })?;
 
     let mut rows: Vec<ScopedDirectoryId> = Vec::new();
     for row in result.rows {
@@ -1905,7 +1995,15 @@ async fn file_ids_matching_update(
         where_clause = where_clause
     );
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-    let result = backend.execute(&rewritten_sql, params).await?;
+    let result = backend
+        .execute(&rewritten_sql, params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update scope prefetch failed for '{}': {}",
+                rewritten_sql, error.message
+            ),
+        })?;
 
     let mut out: Vec<String> = Vec::new();
     for row in result.rows {

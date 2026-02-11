@@ -819,6 +819,46 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         "unexpected error: {}",
         delete_err.message
     );
+
+    engine
+        .execute(
+            "UPDATE lix_file_by_version \
+             SET path = '/changed.json' \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized version predicate update should succeed");
+
+    let after_update = engine
+        .execute(
+            "SELECT path FROM lix_file_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized version predicate select should succeed");
+    assert_eq!(after_update.rows.len(), 1);
+    assert_text(&after_update.rows[0][0], "/changed.json");
+
+    engine
+        .execute(
+            "DELETE FROM lix_file_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized version predicate delete should succeed");
+
+    let after_delete = engine
+        .execute(
+            "SELECT id FROM lix_file_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("post-delete parameterized select should succeed");
+    assert!(after_delete.rows.is_empty());
 });
 
 simulation_test!(
@@ -1014,6 +1054,47 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         "unexpected error: {}",
         delete_err.message
     );
+
+    engine
+        .execute(
+            "UPDATE lix_directory_by_version \
+             SET path = '/changed/', name = 'changed' \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized directory version predicate update should succeed");
+
+    let after_update = engine
+        .execute(
+            "SELECT path, name FROM lix_directory_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized directory select should succeed");
+    assert_eq!(after_update.rows.len(), 1);
+    assert_text(&after_update.rows[0][0], "/changed/");
+    assert_text(&after_update.rows[0][1], "changed");
+
+    engine
+        .execute(
+            "DELETE FROM lix_directory_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized directory version predicate delete should succeed");
+
+    let after_delete = engine
+        .execute(
+            "SELECT id FROM lix_directory_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("post-delete parameterized directory select should succeed");
+    assert!(after_delete.rows.is_empty());
 });
 
 simulation_test!(

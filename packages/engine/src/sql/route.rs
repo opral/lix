@@ -202,10 +202,12 @@ where
                     backend, &insert, params,
                 )
                 .await?;
-            let mut insert_detected_file_domain_changes =
-                detected_file_domain_changes.to_vec();
-            insert_detected_file_domain_changes
-                .extend(filesystem_insert_side_effects.tracked_directory_changes.clone());
+            let mut insert_detected_file_domain_changes = detected_file_domain_changes.to_vec();
+            insert_detected_file_domain_changes.extend(
+                filesystem_insert_side_effects
+                    .tracked_directory_changes
+                    .clone(),
+            );
             let insert = if let Some(rewritten) =
                 filesystem_step::rewrite_insert_with_backend(backend, insert.clone(), params)
                     .await?
