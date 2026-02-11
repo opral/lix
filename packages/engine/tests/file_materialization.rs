@@ -1814,6 +1814,129 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_insert_select_from_lix_file_materializes_cache_miss_before_source_read,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-read-insert-select', '/insert-select.json', '{\"hello\":\"from-insert-select\"}')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
+            0
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) \
+                     SELECT \
+                     'insert-select-probe-main', \
+                     'json_pointer', \
+                     'file-read-insert-select', \
+                     '{}', \
+                     'json', \
+                     '{{\"path\":\"probe-main\",\"value\":{{\"ok\":true}}}}', \
+                     '1' \
+                     FROM lix_file \
+                     WHERE id = 'file-read-insert-select' \
+                     LIMIT 1",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("insert-select from lix_file should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
+            1
+        );
+    }
+);
+
+simulation_test!(
+    file_insert_select_from_lix_file_by_version_materializes_non_active_cache_miss,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let version_b = "file-read-insert-select-version-b";
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_version (\
+                     id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                     ) VALUES (\
+                     '{version_b}', '{version_b}', '{main_version}', 0, 'commit-{version_b}', 'working-{version_b}'\
+                     )",
+                    version_b = version_b,
+                    main_version = main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("version insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                     VALUES ('file-read-insert-select-by-version', '/insert-select-by-version.json', '{{\"hello\":\"from-version-b\"}}', '{}')",
+                    version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("file_by_version insert should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
+            0
+        );
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) \
+                     SELECT \
+                     'insert-select-probe-version-b', \
+                     'json_pointer', \
+                     'file-read-insert-select-by-version', \
+                     '{}', \
+                     'json', \
+                     '{{\"path\":\"probe-version\",\"value\":{{\"ok\":true}}}}', \
+                     '1' \
+                     FROM lix_file_by_version \
+                     WHERE id = 'file-read-insert-select-by-version' \
+                       AND lixcol_version_id = '{}' \
+                     LIMIT 1",
+                    main_version_id, version_b
+                ),
+                &[],
+            )
+            .await
+            .expect("insert-select from lix_file_by_version should succeed");
+
+        assert_eq!(
+            file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
+            1
+        );
+    }
+);
+
+simulation_test!(
     on_demand_plugin_materialization_uses_full_file_path,
     simulations = [sqlite, postgres],
     |sim| async move {
