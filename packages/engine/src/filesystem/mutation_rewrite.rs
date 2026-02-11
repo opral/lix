@@ -345,8 +345,22 @@ pub async fn update_side_effects_with_backend(
         return Ok(FilesystemUpdateSideEffects::default());
     };
 
+    let selection_placeholder_state = placeholder_state;
+    let mut version_predicate_state = selection_placeholder_state;
     let version_id =
-        resolve_update_version_id(backend, update, params, target, &mut placeholder_state).await?;
+        resolve_update_version_id(backend, update, params, target, &mut version_predicate_state)
+            .await?;
+    let matching_file_ids = file_ids_matching_update(
+        backend,
+        update,
+        target,
+        params,
+        selection_placeholder_state,
+    )
+    .await?;
+    if matching_file_ids.is_empty() {
+        return Ok(FilesystemUpdateSideEffects::default());
+    }
     let parsed = parse_file_path(&raw_path)?;
     let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
     if ancestor_paths.is_empty() {
