@@ -278,12 +278,29 @@ impl Engine {
                     }
                     Ok(result)
                 }
-                Some(PostprocessPlan::VtableUpdate(plan)) => {
+                Some(postprocess_plan) => {
                     let result = self.backend.execute(&output.sql, &output.params).await?;
-                    if should_refresh_file_cache {
-                        postprocess_file_cache_targets.extend(
-                            collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key)?,
-                        );
+                    match &postprocess_plan {
+                        PostprocessPlan::VtableUpdate(plan) => {
+                            if should_refresh_file_cache {
+                                postprocess_file_cache_targets.extend(
+                                    collect_postprocess_file_cache_targets(
+                                        &result.rows,
+                                        &plan.schema_key,
+                                    )?,
+                                );
+                            }
+                        }
+                        PostprocessPlan::VtableDelete(plan) => {
+                            if should_refresh_file_cache {
+                                postprocess_file_cache_targets.extend(
+                                    collect_postprocess_file_cache_targets(
+                                        &result.rows,
+                                        &plan.schema_key,
+                                    )?,
+                                );
+                            }
+                        }
                     }
                     let additional_schema_keys = detected_file_domain_changes
                         .iter()
@@ -293,43 +310,28 @@ impl Engine {
                         register_schema(self.backend.as_ref(), &schema_key).await?;
                     }
                     let mut followup_functions = functions.clone();
-                    let followup_sql = build_update_followup_sql(
-                        self.backend.as_ref(),
-                        &plan,
-                        &result.rows,
-                        &detected_file_domain_changes,
-                        &mut followup_functions,
-                    )
-                    .await?;
-                    if !followup_sql.is_empty() {
-                        self.backend.execute(&followup_sql, &[]).await?;
-                    }
-                    plugin_changes_committed = true;
-                    Ok(result)
-                }
-                Some(PostprocessPlan::VtableDelete(plan)) => {
-                    let result = self.backend.execute(&output.sql, &output.params).await?;
-                    if should_refresh_file_cache {
-                        postprocess_file_cache_targets.extend(
-                            collect_postprocess_file_cache_targets(&result.rows, &plan.schema_key)?,
-                        );
-                    }
-                    let additional_schema_keys = detected_file_domain_changes
-                        .iter()
-                        .map(|change| change.schema_key.clone())
-                        .collect::<BTreeSet<_>>();
-                    for schema_key in additional_schema_keys {
-                        register_schema(self.backend.as_ref(), &schema_key).await?;
-                    }
-                    let mut followup_functions = functions.clone();
-                    let followup_sql = build_delete_followup_sql(
-                        self.backend.as_ref(),
-                        &plan,
-                        &result.rows,
-                        &detected_file_domain_changes,
-                        &mut followup_functions,
-                    )
-                    .await?;
+                    let followup_sql = match postprocess_plan {
+                        PostprocessPlan::VtableUpdate(plan) => {
+                            build_update_followup_sql(
+                                self.backend.as_ref(),
+                                &plan,
+                                &result.rows,
+                                &detected_file_domain_changes,
+                                &mut followup_functions,
+                            )
+                            .await?
+                        }
+                        PostprocessPlan::VtableDelete(plan) => {
+                            build_delete_followup_sql(
+                                self.backend.as_ref(),
+                                &plan,
+                                &result.rows,
+                                &detected_file_domain_changes,
+                                &mut followup_functions,
+                            )
+                            .await?
+                        }
+                    };
                     if !followup_sql.is_empty() {
                         self.backend.execute(&followup_sql, &[]).await?;
                     }
