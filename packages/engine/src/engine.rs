@@ -24,7 +24,7 @@ use crate::materialization::{
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::PluginManifest;
-use crate::schema_registry::register_schema;
+use crate::schema_registry::{register_schema, register_schema_sql};
 use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, escape_sql_string, parse_sql_statements,
     preprocess_sql_with_provider_and_detected_file_domain_changes, DetectedFileDomainChange,
@@ -319,7 +319,11 @@ impl Engine {
                     .map(|change| change.schema_key.clone())
                     .collect::<BTreeSet<_>>();
                 for schema_key in additional_schema_keys {
-                    register_schema(self.backend.as_ref(), &schema_key).await?;
+                    let create_sql = register_schema_sql(&schema_key);
+                    if let Err(error) = transaction.execute(&create_sql, &[]).await {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
                 }
                 let mut followup_functions = functions.clone();
                 let followup_sql = match postprocess_plan {
