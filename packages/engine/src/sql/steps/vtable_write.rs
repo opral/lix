@@ -57,7 +57,8 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
 trait SqlExecutor {
     fn dialect(&self) -> SqlDialect;
 
-    async fn execute(&mut self, sql: &str, params: &[EngineValue]) -> Result<QueryResult, LixError>;
+    async fn execute(&mut self, sql: &str, params: &[EngineValue])
+        -> Result<QueryResult, LixError>;
 }
 
 struct BackendExecutor<'a> {
@@ -70,7 +71,11 @@ impl SqlExecutor for BackendExecutor<'_> {
         self.backend.dialect()
     }
 
-    async fn execute(&mut self, sql: &str, params: &[EngineValue]) -> Result<QueryResult, LixError> {
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[EngineValue],
+    ) -> Result<QueryResult, LixError> {
         self.backend.execute(sql, params).await
     }
 }
@@ -85,7 +90,11 @@ impl SqlExecutor for TransactionExecutor<'_> {
         self.transaction.dialect()
     }
 
-    async fn execute(&mut self, sql: &str, params: &[EngineValue]) -> Result<QueryResult, LixError> {
+    async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[EngineValue],
+    ) -> Result<QueryResult, LixError> {
         self.transaction.execute(sql, params).await
     }
 }

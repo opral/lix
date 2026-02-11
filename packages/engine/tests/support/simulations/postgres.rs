@@ -226,9 +226,12 @@ impl LixTransaction for PostgresBackendTransaction {
             query = bind_param_postgres(query, param);
         }
 
-        let rows = query.fetch_all(&mut *self.conn).await.map_err(|err| LixError {
-            message: err.to_string(),
-        })?;
+        let rows = query
+            .fetch_all(&mut *self.conn)
+            .await
+            .map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
 
         let mut result_rows = Vec::with_capacity(rows.len());
         for row in rows {

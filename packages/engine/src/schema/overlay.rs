@@ -178,9 +178,7 @@ mod tests {
             })
         }
 
-        async fn begin_transaction(
-            &self,
-        ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
             Err(LixError {
                 message: "FakeBackend does not support transactions".to_string(),
             })

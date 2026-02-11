@@ -27,9 +27,9 @@ use crate::plugin::types::PluginManifest;
 use crate::schema_registry::{register_schema, register_schema_sql};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
-    parse_sql_statements,
-    preprocess_sql_with_provider_and_detected_file_domain_changes, DetectedFileDomainChange,
-    MutationOperation, MutationRow, PlaceholderState, PostprocessPlan, UpdateValidationPlan,
+    parse_sql_statements, preprocess_sql_with_provider_and_detected_file_domain_changes,
+    DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState, PostprocessPlan,
+    UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -172,7 +172,7 @@ impl Engine {
             }
         }
         let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
-        let pending_file_writes =
+        let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes(
                 self.backend.as_ref(),
                 sql,
@@ -183,6 +183,10 @@ impl Engine {
             .map_err(|error| LixError {
                 message: format!("pending file writes collection failed: {}", error.message),
             })?;
+        let crate::filesystem::pending_file_writes::PendingFileWriteCollection {
+            writes: pending_file_writes,
+            writes_by_statement: pending_file_writes_by_statement,
+        } = pending_file_write_collection;
         let pending_file_delete_targets =
             crate::filesystem::pending_file_writes::collect_pending_file_delete_targets(
                 self.backend.as_ref(),
@@ -194,11 +198,13 @@ impl Engine {
             .map_err(|error| LixError {
                 message: format!("pending file delete collection failed: {}", error.message),
             })?;
-        let detected_file_changes = self
-            .detect_file_changes_for_pending_writes(&pending_file_writes)
+        let detected_file_changes_by_statement = self
+            .detect_file_changes_for_pending_writes_by_statement(&pending_file_writes_by_statement)
             .await?;
-        let mut detected_file_domain_changes =
-            detected_file_domain_changes_from_detected_file_changes(&detected_file_changes);
+        let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
+            .into_iter()
+            .map(|changes| detected_file_domain_changes_from_detected_file_changes(&changes))
+            .collect::<Vec<_>>();
         let filesystem_update_domain_changes =
             collect_filesystem_update_detected_file_domain_changes(
                 self.backend.as_ref(),
@@ -212,11 +218,31 @@ impl Engine {
                     error.message
                 ),
             })?;
-        detected_file_domain_changes.extend(filesystem_update_domain_changes.tracked_changes);
+        let statement_count = detected_file_domain_changes_by_statement.len().max(
+            filesystem_update_domain_changes
+                .tracked_changes_by_statement
+                .len(),
+        );
+        detected_file_domain_changes_by_statement.resize_with(statement_count, Vec::new);
+        for (index, tracked_changes) in filesystem_update_domain_changes
+            .tracked_changes_by_statement
+            .into_iter()
+            .enumerate()
+        {
+            detected_file_domain_changes_by_statement[index].extend(tracked_changes);
+            detected_file_domain_changes_by_statement[index] = dedupe_detected_file_domain_changes(
+                &detected_file_domain_changes_by_statement[index],
+            );
+        }
+        let mut detected_file_domain_changes = detected_file_domain_changes_by_statement
+            .iter()
+            .flat_map(|changes| changes.iter().cloned())
+            .collect::<Vec<_>>();
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
-        let untracked_filesystem_update_domain_changes =
-            dedupe_detected_file_domain_changes(&filesystem_update_domain_changes.untracked_changes);
+        let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
+            &filesystem_update_domain_changes.untracked_changes,
+        );
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
         if self.deterministic_boot_pending.load(Ordering::SeqCst) {
@@ -238,7 +264,7 @@ impl Engine {
             sql,
             params,
             functions.clone(),
-            &detected_file_domain_changes,
+            &detected_file_domain_changes_by_statement,
         )
         .await
         {
@@ -932,38 +958,45 @@ impl Engine {
         Ok(())
     }
 
-    async fn detect_file_changes_for_pending_writes(
+    async fn detect_file_changes_for_pending_writes_by_statement(
         &self,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    ) -> Result<Vec<crate::plugin::runtime::DetectedFileChange>, LixError> {
+        writes_by_statement: &[Vec<crate::filesystem::pending_file_writes::PendingFileWrite>],
+    ) -> Result<Vec<Vec<crate::plugin::runtime::DetectedFileChange>>, LixError> {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(vec![Vec::new(); writes_by_statement.len()]);
         };
-        if writes.is_empty() {
-            return Ok(Vec::new());
+
+        let mut detected_by_statement = Vec::with_capacity(writes_by_statement.len());
+        for writes in writes_by_statement {
+            if writes.is_empty() {
+                detected_by_statement.push(Vec::new());
+                continue;
+            }
+
+            let requests = writes
+                .iter()
+                .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
+                    file_id: write.file_id.clone(),
+                    version_id: write.version_id.clone(),
+                    before_path: write.before_path.clone(),
+                    path: write.path.clone(),
+                    before_data: write.before_data.clone(),
+                    after_data: write.after_data.clone(),
+                })
+                .collect::<Vec<_>>();
+            let detected = crate::plugin::runtime::detect_file_changes_with_plugins(
+                self.backend.as_ref(),
+                runtime.as_ref(),
+                &requests,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!("file detect stage failed: {}", error.message),
+            })?;
+            detected_by_statement.push(dedupe_detected_file_changes(&detected));
         }
 
-        let requests = writes
-            .iter()
-            .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
-                file_id: write.file_id.clone(),
-                version_id: write.version_id.clone(),
-                before_path: write.before_path.clone(),
-                path: write.path.clone(),
-                before_data: write.before_data.clone(),
-                after_data: write.after_data.clone(),
-            })
-            .collect::<Vec<_>>();
-        let detected = crate::plugin::runtime::detect_file_changes_with_plugins(
-            self.backend.as_ref(),
-            runtime.as_ref(),
-            &requests,
-        )
-        .await
-        .map_err(|error| LixError {
-            message: format!("file detect stage failed: {}", error.message),
-        })?;
-        Ok(dedupe_detected_file_changes(&detected))
+        Ok(detected_by_statement)
     }
 
     async fn persist_detected_file_domain_changes(
@@ -1326,7 +1359,7 @@ async fn collect_filesystem_update_detected_file_domain_changes(
 ) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
     let statements = parse_sql_statements(sql)?;
     let mut placeholder_state = PlaceholderState::new();
-    let mut tracked_changes = Vec::new();
+    let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
     let mut untracked_changes = Vec::new();
     for statement in statements {
         match statement {
@@ -1339,10 +1372,13 @@ async fn collect_filesystem_update_detected_file_domain_changes(
                         &mut placeholder_state,
                     )
                     .await?;
-                tracked_changes.extend(side_effects.tracked_directory_changes);
+                let statement_tracked_changes =
+                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
+                tracked_changes_by_statement.push(statement_tracked_changes);
                 untracked_changes.extend(side_effects.untracked_directory_changes);
             }
             other => {
+                tracked_changes_by_statement.push(Vec::new());
                 advance_placeholder_state_for_statement(
                     &other,
                     params,
@@ -1354,14 +1390,14 @@ async fn collect_filesystem_update_detected_file_domain_changes(
     }
 
     Ok(FilesystemUpdateDomainChangeCollection {
-        tracked_changes: dedupe_detected_file_domain_changes(&tracked_changes),
         untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
+        tracked_changes_by_statement,
     })
 }
 
 struct FilesystemUpdateDomainChangeCollection {
-    tracked_changes: Vec<DetectedFileDomainChange>,
     untracked_changes: Vec<DetectedFileDomainChange>,
+    tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
 }
 
 fn advance_placeholder_state_for_statement(
@@ -2197,10 +2233,11 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_placeholder_state_for_statement, active_version_from_update_validations,
-        active_version_schema_key, file_descriptor_cache_eviction_targets,
-        file_history_read_materialization_required_for_sql, file_read_materialization_scope_for_sql,
-        should_refresh_file_cache_for_sql, FileReadMaterializationScope,
+        active_version_from_update_validations, active_version_schema_key,
+        advance_placeholder_state_for_statement, file_descriptor_cache_eviction_targets,
+        file_history_read_materialization_required_for_sql,
+        file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
+        FileReadMaterializationScope,
     };
     use crate::backend::SqlDialect;
     use crate::sql::UpdateValidationPlan;

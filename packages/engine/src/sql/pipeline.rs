@@ -84,7 +84,7 @@ async fn preprocess_statements_with_provider_and_backend<P>(
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
 ) -> Result<PreprocessOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -94,13 +94,17 @@ where
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut mutations = Vec::new();
     let mut update_validations = Vec::new();
-    for statement in statements {
+    for (statement_index, statement) in statements.into_iter().enumerate() {
+        let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
+            .get(statement_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let output = rewrite_statement_with_backend(
             backend,
             statement,
             params,
             provider,
-            detected_file_domain_changes,
+            statement_detected_file_domain_changes,
         )
         .await?;
         registrations.extend(output.registrations);
@@ -177,7 +181,7 @@ pub async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: Li
     sql: &str,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
 ) -> Result<PreprocessOutput, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -199,7 +203,7 @@ where
         statements,
         &params,
         &mut provider,
-        detected_file_domain_changes,
+        detected_file_domain_changes_by_statement,
     )
     .await
 }

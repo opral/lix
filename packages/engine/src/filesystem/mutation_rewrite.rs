@@ -368,17 +368,17 @@ pub async fn update_side_effects_with_backend(
 
     let selection_placeholder_state = statement_placeholder_state;
     let mut version_predicate_state = selection_placeholder_state;
-    let version_id =
-        resolve_update_version_id(backend, update, params, target, &mut version_predicate_state)
-            .await?;
-    let matching_file_ids = file_ids_matching_update(
+    let version_id = resolve_update_version_id(
         backend,
         update,
-        target,
         params,
-        selection_placeholder_state,
+        target,
+        &mut version_predicate_state,
     )
     .await?;
+    let matching_file_ids =
+        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
+            .await?;
     if matching_file_ids.is_empty() {
         return Ok(FilesystemUpdateSideEffects::default());
     }
@@ -395,8 +395,8 @@ pub async fn update_side_effects_with_backend(
             .then_with(|| left.cmp(right))
     });
     ancestor_paths.dedup();
-    let directory_changes = tracked_missing_directory_changes(backend, &version_id, &ancestor_paths)
-        .await?;
+    let directory_changes =
+        tracked_missing_directory_changes(backend, &version_id, &ancestor_paths).await?;
 
     if all_untracked {
         Ok(FilesystemUpdateSideEffects {
@@ -940,19 +940,19 @@ async fn rewrite_file_update_assignments_with_backend(
 
     let selection_placeholder_state = placeholder_state;
     let mut version_predicate_state = selection_placeholder_state;
-    let version_id =
-        resolve_update_version_id(backend, update, params, target, &mut version_predicate_state)
-            .await?;
-    let parsed = parse_file_path(&raw_path)?;
-    assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
-    let matching_file_ids = file_ids_matching_update(
+    let version_id = resolve_update_version_id(
         backend,
         update,
-        target,
         params,
-        selection_placeholder_state,
+        target,
+        &mut version_predicate_state,
     )
     .await?;
+    let parsed = parse_file_path(&raw_path)?;
+    assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
+    let matching_file_ids =
+        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
+            .await?;
     let matching_file_ids = matching_file_ids
         .into_iter()
         .map(|row| row.id)
@@ -1746,12 +1746,9 @@ fn consume_placeholders_in_expr(
                     match arg {
                         sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Expr(expr),
-                        ) => consume_placeholders_in_expr(
-                            expr,
-                            params,
-                            placeholder_state,
-                            dialect,
-                        )?,
+                        ) => {
+                            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?
+                        }
                         sqlparser::ast::FunctionArg::Named { arg, .. }
                         | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => {
                             if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
@@ -2211,12 +2208,7 @@ async fn file_ids_matching_update(
         where_clause = where_clause
     );
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-    let bound = bind_sql_with_state(
-        &rewritten_sql,
-        params,
-        backend.dialect(),
-        placeholder_state,
-    )?;
+    let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
     let result = backend
         .execute(&bound.sql, &bound.params)
         .await
@@ -2262,13 +2254,17 @@ fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
                 "1" | "true" => Ok(true),
                 "0" | "false" | "" => Ok(false),
                 _ => Err(LixError {
-                    message: format!("file update untracked lookup expected boolean-like text, got '{v}'"),
+                    message: format!(
+                        "file update untracked lookup expected boolean-like text, got '{v}'"
+                    ),
                 }),
             }
         }
         EngineValue::Null => Ok(false),
         other => Err(LixError {
-            message: format!("file update untracked lookup expected boolean-like value, got {other:?}"),
+            message: format!(
+                "file update untracked lookup expected boolean-like value, got {other:?}"
+            ),
         }),
     }
 }
@@ -2517,9 +2513,9 @@ mod tests {
         rewrite_insert, rewrite_update,
     };
     use crate::backend::SqlDialect;
+    use crate::sql::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
     use crate::sql::PlaceholderState;
-    use crate::sql::parse_sql_statements;
     use crate::Value;
     use sqlparser::ast::Statement;
 
