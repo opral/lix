@@ -322,6 +322,69 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_history_view_single_root_orders_multi_depth_content_history,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-ordered-depth', '/config.json', '{\"name\":\"My Project\",\"version\":\"1.0.0\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+        let before_commit_id = active_version_commit_id(&engine).await;
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = '{\"name\":\"My Cool Project\",\"version\":\"1.1.0\"}' \
+                 WHERE id = 'history-ordered-depth'",
+                &[],
+            )
+            .await
+            .expect("file content update should succeed");
+        let after_commit_id = active_version_commit_id(&engine).await;
+
+        let rows = engine
+            .execute(
+                &format!(
+                    "SELECT data, lixcol_commit_id, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-ordered-depth' \
+                       AND path = '/config.json' \
+                       AND lixcol_root_commit_id = '{}' \
+                     ORDER BY lixcol_depth ASC",
+                    after_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("ordered multi-depth history query should succeed");
+
+        assert_eq!(rows.rows.len(), 2);
+
+        assert_blob_json_eq(
+            &rows.rows[0][0],
+            serde_json::json!({"name":"My Cool Project","version":"1.1.0"}),
+        );
+        assert_text(&rows.rows[0][1], &after_commit_id);
+        assert_text(&rows.rows[0][2], &after_commit_id);
+        assert_integer(&rows.rows[0][3], 0);
+
+        assert_blob_json_eq(
+            &rows.rows[1][0],
+            serde_json::json!({"name":"My Project","version":"1.0.0"}),
+        );
+        assert_text(&rows.rows[1][1], &before_commit_id);
+        assert_text(&rows.rows[1][2], &after_commit_id);
+        assert_integer(&rows.rows[1][3], 1);
+    }
+);
+
+simulation_test!(
     file_history_view_read_materializes_history_cache_on_demand,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -679,6 +742,17 @@ simulation_test!(
             )
             .await
             .expect("directory move should succeed");
+
+        // Legacy parity: touch destination directory so its history participates in this window.
+        engine
+            .execute(
+                "UPDATE lix_directory \
+                 SET name = 'articles' \
+                 WHERE id = 'history-dir-move-articles'",
+                &[],
+            )
+            .await
+            .expect("destination directory touch should succeed");
 
         engine
             .execute(
