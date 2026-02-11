@@ -46,7 +46,7 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins,
+    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1394,33 +1394,65 @@ fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
 }
 
 fn file_history_read_materialization_required_for_statement(statement: &Statement) -> bool {
-    match statement {
-        Statement::Query(query) => query_mentions_table_name(query, "lix_file_history"),
-        Statement::Insert(insert) => insert
-            .source
-            .as_deref()
-            .is_some_and(|query| query_mentions_table_name(query, "lix_file_history")),
-        _ => false,
-    }
+    statement_reads_table_name(statement, "lix_file_history")
 }
 
 fn file_read_materialization_scope_for_statement(
     statement: &Statement,
 ) -> Option<FileReadMaterializationScope> {
-    let query = match statement {
-        Statement::Query(query) => query.as_ref(),
-        Statement::Insert(insert) => insert.source.as_deref()?,
-        _ => return None,
-    };
-
-    let mentions_by_version = query_mentions_table_name(query, "lix_file_by_version");
+    let mentions_by_version = statement_reads_table_name(statement, "lix_file_by_version");
     if mentions_by_version {
         return Some(FileReadMaterializationScope::AllVersions);
     }
-    if query_mentions_table_name(query, "lix_file") {
+    if statement_reads_table_name(statement, "lix_file") {
         return Some(FileReadMaterializationScope::ActiveVersionOnly);
     }
     None
+}
+
+fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
+    match statement {
+        Statement::Query(query) => query_mentions_table_name(query, table_name),
+        Statement::Insert(insert) => insert
+            .source
+            .as_deref()
+            .is_some_and(|query| query_mentions_table_name(query, table_name)),
+        Statement::Update(update) => {
+            update
+                .from
+                .as_ref()
+                .is_some_and(|from| match from {
+                    UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => {
+                        from.iter().any(|table| {
+                            table_with_joins_mentions_table_name(table, table_name)
+                        })
+                    }
+                })
+                || update
+                    .selection
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+                || update
+                    .assignments
+                    .iter()
+                    .any(|assignment| expr_mentions_table_name(&assignment.value, table_name))
+        }
+        Statement::Delete(delete) => {
+            delete
+                .using
+                .as_ref()
+                .is_some_and(|tables| {
+                    tables
+                        .iter()
+                        .any(|table| table_with_joins_mentions_table_name(table, table_name))
+                })
+                || delete
+                    .selection
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+        }
+        _ => false,
+    }
 }
 
 fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
@@ -1476,6 +1508,89 @@ fn table_factor_mentions_table_name(table: &TableFactor, table_name: &str) -> bo
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => table_with_joins_mentions_table_name(table_with_joins, table_name),
+        _ => false,
+    }
+}
+
+fn expr_mentions_table_name(expr: &Expr, table_name: &str) -> bool {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_mentions_table_name(left, table_name) || expr_mentions_table_name(right, table_name)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => expr_mentions_table_name(expr, table_name),
+        Expr::InList { expr, list, .. } => {
+            expr_mentions_table_name(expr, table_name)
+                || list
+                    .iter()
+                    .any(|item| expr_mentions_table_name(item, table_name))
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_mentions_table_name(expr, table_name)
+                || query_mentions_table_name(subquery, table_name)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_mentions_table_name(expr, table_name)
+                || expr_mentions_table_name(low, table_name)
+                || expr_mentions_table_name(high, table_name)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            expr_mentions_table_name(expr, table_name)
+                || expr_mentions_table_name(pattern, table_name)
+        }
+        Expr::InUnnest {
+            expr, array_expr, ..
+        } => {
+            expr_mentions_table_name(expr, table_name)
+                || expr_mentions_table_name(array_expr, table_name)
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            expr_mentions_table_name(left, table_name) || expr_mentions_table_name(right, table_name)
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            query_mentions_table_name(subquery, table_name)
+        }
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    expr_mentions_table_name(expr, table_name)
+                }
+                sqlparser::ast::FunctionArg::Named { arg, .. }
+                | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                        expr_mentions_table_name(expr, table_name)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }),
+            _ => false,
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|operand| expr_mentions_table_name(operand, table_name))
+                || conditions.iter().any(|condition| {
+                    expr_mentions_table_name(&condition.condition, table_name)
+                        || expr_mentions_table_name(&condition.result, table_name)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|value| expr_mentions_table_name(value, table_name))
+        }
+        Expr::Tuple(items) => items
+            .iter()
+            .any(|item| expr_mentions_table_name(item, table_name)),
         _ => false,
     }
 }
@@ -1850,12 +1965,46 @@ mod tests {
     }
 
     #[test]
+    fn file_read_materialization_scope_detects_update_where_subquery_lix_file() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE some_table \
+             SET payload = 'x' \
+             WHERE id IN (SELECT id FROM lix_file WHERE id = 'file-a')",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_delete_where_subquery_lix_file_by_version() {
+        let scope = file_read_materialization_scope_for_sql(
+            "DELETE FROM some_table \
+             WHERE EXISTS (\
+                 SELECT 1 FROM lix_file_by_version \
+                 WHERE id = 'file-a' AND lixcol_version_id = 'version-a'\
+             )",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
+    }
+
+    #[test]
     fn file_history_materialization_detection_includes_insert_select_sources() {
         assert!(file_history_read_materialization_required_for_sql(
             "INSERT INTO some_table (payload) \
              SELECT data FROM lix_file_history \
              WHERE id = 'file-a' \
              LIMIT 1",
+        ));
+    }
+
+    #[test]
+    fn file_history_materialization_detection_includes_update_where_subquery_sources() {
+        assert!(file_history_read_materialization_required_for_sql(
+            "UPDATE some_table \
+             SET payload = 'x' \
+             WHERE EXISTS (\
+                 SELECT 1 FROM lix_file_history \
+                 WHERE id = 'file-a' \
+             )",
         ));
     }
 
