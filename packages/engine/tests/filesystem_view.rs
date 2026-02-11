@@ -1330,6 +1330,100 @@ simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
 });
 
 simulation_test!(
+    file_path_update_auto_creates_missing_parent_directories_in_same_commit,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-path-auto-dir', '/a.md', 'ignored')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_file SET path = '/docs/guides/a.md' WHERE id = 'file-path-auto-dir'",
+                &[],
+            )
+            .await
+            .expect("path update should auto-create parent directories");
+
+        let file_row = engine
+            .execute(
+                "SELECT path, lixcol_commit_id \
+                 FROM lix_file \
+                 WHERE id = 'file-path-auto-dir'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_row.rows.len(), 1);
+        assert_text(&file_row.rows[0][0], "/docs/guides/a.md");
+        let file_commit_id = match &file_row.rows[0][1] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected file commit_id as text, got {other:?}"),
+        };
+        let version_id = active_version_id(&engine).await.replace('\'', "''");
+        let file_descriptor_row = engine
+            .execute(
+                &format!(
+                    "SELECT directory_id \
+                     FROM lix_file_descriptor_by_version \
+                     WHERE id = 'file-path-auto-dir' \
+                       AND lixcol_version_id = '{version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_descriptor_row.rows.len(), 1);
+        let file_directory_id = match &file_descriptor_row.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected file directory_id as text, got {other:?}"),
+        };
+
+        let directory_rows = engine
+            .execute(
+                "SELECT id, path, parent_id, lixcol_commit_id \
+                 FROM lix_directory \
+                 WHERE path IN ('/docs/', '/docs/guides/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(directory_rows.rows.len(), 2);
+
+        assert_text(&directory_rows.rows[0][1], "/docs/");
+        let docs_directory_id = match &directory_rows.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected docs directory id as text, got {other:?}"),
+        };
+        match &directory_rows.rows[0][2] {
+            Value::Null => {}
+            other => panic!("expected /docs/ parent_id to be NULL, got {other:?}"),
+        }
+        assert_text(&directory_rows.rows[0][3], &file_commit_id);
+
+        assert_text(&directory_rows.rows[1][1], "/docs/guides/");
+        assert_text(&directory_rows.rows[1][2], &docs_directory_id);
+        assert_text(&directory_rows.rows[1][3], &file_commit_id);
+        let guides_directory_id = match &directory_rows.rows[1][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected guides directory id as text, got {other:?}"),
+        };
+        assert_eq!(file_directory_id, guides_directory_id);
+    }
+);
+
+simulation_test!(
     file_view_exposes_active_version_commit_id,
     |sim| async move {
         let engine = sim

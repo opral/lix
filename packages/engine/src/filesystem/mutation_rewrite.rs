@@ -1,10 +1,10 @@
+use serde_json::json;
 use sqlparser::ast::{
     Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr, Statement,
     TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan, Values,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::filesystem::path::{
@@ -14,8 +14,8 @@ use crate::filesystem::path::{
 };
 use crate::sql::escape_sql_string;
 use crate::sql::{
-    lower_statement, resolve_expr_cell_with_state, resolve_values_rows, DetectedFileDomainChange,
-    rewrite_read_query_with_backend, PlaceholderState, ResolvedCell,
+    lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
+    rewrite_read_query_with_backend, DetectedFileDomainChange, PlaceholderState, ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -42,6 +42,11 @@ const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 #[derive(Debug, Default)]
 pub struct FilesystemInsertSideEffects {
     pub statements: Vec<Statement>,
+    pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
+}
+
+#[derive(Debug, Default)]
+pub struct FilesystemUpdateSideEffects {
     pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
 }
 
@@ -309,6 +314,56 @@ pub async fn insert_side_effect_statements_with_backend(
     }
 
     Ok(side_effects)
+}
+
+pub async fn update_side_effects_with_backend(
+    backend: &dyn LixBackend,
+    update: &Update,
+    params: &[EngineValue],
+) -> Result<FilesystemUpdateSideEffects, LixError> {
+    let Some(target) = target_from_update_table(&update.table) else {
+        return Ok(FilesystemUpdateSideEffects::default());
+    };
+    if target.read_only || !target.is_file {
+        return Ok(FilesystemUpdateSideEffects::default());
+    }
+
+    let mut placeholder_state = PlaceholderState::new();
+    let mut next_path: Option<String> = None;
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            continue;
+        };
+        let resolved =
+            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
+        if column.eq_ignore_ascii_case("path") {
+            next_path = resolve_text_expr(Some(&assignment.value), Some(&resolved), "file path")?;
+        }
+    }
+
+    let Some(raw_path) = next_path else {
+        return Ok(FilesystemUpdateSideEffects::default());
+    };
+
+    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let parsed = parse_file_path(&raw_path)?;
+    let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
+    if ancestor_paths.is_empty() {
+        return Ok(FilesystemUpdateSideEffects::default());
+    }
+
+    ancestor_paths.sort_by(|left, right| {
+        path_depth(left)
+            .cmp(&path_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+    ancestor_paths.dedup();
+    let tracked_directory_changes =
+        tracked_missing_directory_changes(backend, &version_id, &ancestor_paths).await?;
+
+    Ok(FilesystemUpdateSideEffects {
+        tracked_directory_changes,
+    })
 }
 
 pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
@@ -857,12 +912,7 @@ async fn rewrite_file_update_assignments_with_backend(
         Some(
             find_directory_id_by_path(backend, &version_id, directory_path)
                 .await?
-                .ok_or_else(|| LixError {
-                    message: format!(
-                        "Parent directory does not exist for path {}",
-                        directory_path
-                    ),
-                })?,
+                .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
         )
     } else {
         None
@@ -886,6 +936,68 @@ async fn rewrite_file_update_assignments_with_backend(
     );
 
     Ok(())
+}
+
+async fn tracked_missing_directory_changes(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    ancestor_paths: &[String],
+) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+    if ancestor_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut known_ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut tracked_directory_changes = Vec::new();
+
+    for path in ancestor_paths {
+        if known_ids.contains_key(path) {
+            continue;
+        }
+        if let Some(existing_id) = find_directory_id_by_path(backend, version_id, path).await? {
+            known_ids.insert(path.clone(), existing_id);
+            continue;
+        }
+
+        let parent_id = match parent_directory_path(path) {
+            Some(parent_path) => {
+                if let Some(parent_id) = known_ids.get(&parent_path) {
+                    Some(parent_id.clone())
+                } else if let Some(existing_parent_id) =
+                    find_directory_id_by_path(backend, version_id, &parent_path).await?
+                {
+                    known_ids.insert(parent_path, existing_parent_id.clone());
+                    Some(existing_parent_id)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let id = auto_directory_id(version_id, path);
+        let name = directory_name_from_path(path).unwrap_or_default();
+        let snapshot_content = json!({
+            "id": id,
+            "parent_id": parent_id,
+            "name": name,
+            "hidden": false,
+        })
+        .to_string();
+        tracked_directory_changes.push(DetectedFileDomainChange {
+            entity_id: id.clone(),
+            schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            schema_version: DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
+            file_id: INTERNAL_DESCRIPTOR_FILE_ID.to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: INTERNAL_DESCRIPTOR_PLUGIN_KEY.to_string(),
+            snapshot_content: Some(snapshot_content),
+            metadata: None,
+            writer_key: None,
+        });
+        known_ids.insert(path.clone(), id);
+    }
+
+    Ok(tracked_directory_changes)
 }
 
 async fn rewrite_directory_update_assignments_with_backend(
