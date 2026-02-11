@@ -62,6 +62,12 @@ struct PathEchoRuntime;
 #[derive(Debug, Default)]
 struct PathEchoInstance;
 
+#[derive(Debug, Default)]
+struct BeforeAwareRuntime;
+
+#[derive(Debug, Default)]
+struct BeforeAwareInstance;
+
 #[async_trait(?Send)]
 impl WasmRuntime for PathEchoRuntime {
     async fn load_component(
@@ -110,6 +116,57 @@ impl WasmInstance for PathEchoInstance {
                         || change.snapshot_content.is_some()
                 });
                 Ok(request.file.path.into_bytes())
+            }
+            other => Err(LixError {
+                message: format!("unsupported test export: {other}"),
+            }),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl WasmRuntime for BeforeAwareRuntime {
+    async fn load_component(
+        &self,
+        _request: LoadWasmComponentRequest,
+    ) -> Result<Arc<dyn WasmInstance>, LixError> {
+        Ok(Arc::new(BeforeAwareInstance))
+    }
+}
+
+#[async_trait(?Send)]
+impl WasmInstance for BeforeAwareInstance {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => {
+                let request: WireDetectChangesRequest =
+                    serde_json::from_slice(input).map_err(|error| LixError {
+                        message: format!("failed to decode detect-changes payload: {error}"),
+                    })?;
+                let marker = match request.before {
+                    None => "none",
+                    Some(file) if file.data.is_empty() => "empty",
+                    Some(_) => "non-empty",
+                };
+                let snapshot_content =
+                    serde_json::json!({"path":"/before","value":marker}).to_string();
+                serde_json::to_vec(&vec![WirePluginEntityChangeOutput {
+                    entity_id: "/before".to_string(),
+                    schema_key: "json_pointer".to_string(),
+                    schema_version: "1".to_string(),
+                    snapshot_content: Some(snapshot_content),
+                }])
+                .map_err(|error| LixError {
+                    message: format!("failed to encode detect-changes response: {error}"),
+                })
+            }
+            "apply-changes" | "api#apply-changes" => {
+                let request: WireApplyChangesRequest =
+                    serde_json::from_slice(input).map_err(|error| LixError {
+                        message: format!("failed to decode apply-changes payload: {error}"),
+                    })?;
+                let _ = request;
+                Ok(b"reconstructed-before".to_vec())
             }
             other => Err(LixError {
                 message: format!("unsupported test export: {other}"),
@@ -257,6 +314,21 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     }
 }
 
+async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let rows = engine
+        .execute(
+            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("active version query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    match &rows.rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected active version id text, got {other:?}"),
+    }
+}
+
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> (support::simulation_test::SimulationEngine, String) {
@@ -288,6 +360,30 @@ async fn boot_engine_with_path_echo_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> (support::simulation_test::SimulationEngine, String) {
     let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+
+    let engine = sim
+        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            key_values: Vec::new(),
+            active_account: None,
+            wasm_runtime: Some(runtime),
+        }))
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.expect("engine init should succeed");
+    register_plugin_schema(&engine).await;
+    let main_version_id = main_version_id(&engine).await;
+    let plugin_wasm = plugin_json_v2_wasm_bytes();
+    engine
+        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .await
+        .expect("install_plugin should succeed");
+    (engine, main_version_id)
+}
+
+async fn boot_engine_with_before_aware_plugin(
+    sim: &support::simulation_test::SimulationArgs,
+) -> (support::simulation_test::SimulationEngine, String) {
+    let runtime = Arc::new(BeforeAwareRuntime) as Arc<dyn WasmRuntime>;
 
     let engine = sim
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
@@ -1368,6 +1464,77 @@ simulation_test!(
             file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
                 .await,
             0
+        );
+    }
+);
+
+simulation_test!(
+    file_update_cache_miss_uses_reconstructed_before_data_for_detect_stage,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, _main_version_id) = boot_engine_with_before_aware_plugin(&sim).await;
+        let active_version_id = active_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-before-aware', '/before-aware.json', '{\"hello\":\"before\"}')",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-before-aware' AND version_id = '{}'",
+                    active_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+        assert_eq!(
+            file_cache_row_count(&engine, "file-before-aware", &active_version_id).await,
+            0
+        );
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = '{\"hello\":\"after\"}' \
+                 WHERE id = 'file-before-aware'",
+                &[],
+            )
+            .await
+            .expect("file update should succeed");
+
+        let rows = engine
+            .execute(
+                &format!(
+                    "SELECT snapshot_content \
+                     FROM lix_state_by_version \
+                     WHERE file_id = 'file-before-aware' \
+                       AND version_id = '{}' \
+                       AND schema_key = 'json_pointer' \
+                       AND entity_id = '/before' \
+                     LIMIT 1",
+                    active_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("before marker query should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        let snapshot = match &rows.rows[0][0] {
+            Value::Text(value) => value,
+            other => panic!("expected snapshot_content text, got {other:?}"),
+        };
+        assert!(
+            snapshot.contains("\"value\":\"non-empty\""),
+            "expected non-empty before marker, got: {}",
+            snapshot
         );
     }
 );
