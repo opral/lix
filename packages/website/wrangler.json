@@ -3,6 +3,7 @@
   "name": "lix-website",
   "compatibility_date": "2025-11-23",
   "assets": {
-    "directory": "./dist/client"
+    "directory": "./dist/client",
+    "html_handling": "drop-trailing-slash"
   }
 }
