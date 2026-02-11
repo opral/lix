@@ -660,7 +660,10 @@ simulation_test!(
             .await
             .expect("after-rename depth-1 history query should succeed");
         assert_eq!(history_after_rename_depth_one.rows.len(), 1);
-        assert_text(&history_after_rename_depth_one.rows[0][0], "/docs/readme.json");
+        assert_text(
+            &history_after_rename_depth_one.rows[0][0],
+            "/docs/readme.json",
+        );
         assert_integer(&history_after_rename_depth_one.rows[0][1], 1);
     }
 );
@@ -816,7 +819,10 @@ simulation_test!(
             .await
             .expect("after-move depth-1 history query should succeed");
         assert_eq!(history_after_move_depth_one.rows.len(), 1);
-        assert_text(&history_after_move_depth_one.rows[0][0], "/docs/guides/intro.json");
+        assert_text(
+            &history_after_move_depth_one.rows[0][0],
+            "/docs/guides/intro.json",
+        );
         assert_integer(&history_after_move_depth_one.rows[0][1], 1);
     }
 );
@@ -958,12 +964,11 @@ simulation_test!(
             .await
             .expect("content-root change id lookup should succeed");
         assert_eq!(expected_after_content_change_id_rows.rows.len(), 1);
-        let expected_after_content_change_id = match &expected_after_content_change_id_rows.rows[0]
-            [0]
-        {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected content-root change id text, got {other:?}"),
-        };
+        let expected_after_content_change_id =
+            match &expected_after_content_change_id_rows.rows[0][0] {
+                Value::Text(value) => value.clone(),
+                other => panic!("expected content-root change id text, got {other:?}"),
+            };
 
         let before = engine
             .execute(
@@ -1115,15 +1120,30 @@ simulation_test!(
             .await
             .expect("file_history depth-0 read should succeed");
         assert_eq!(file_history_at_checkpoint.rows.len(), 1);
-        assert_text(&file_history_at_checkpoint.rows[0][0], "/renamed-document.json");
+        assert_text(
+            &file_history_at_checkpoint.rows[0][0],
+            "/renamed-document.json",
+        );
         assert_blob_json_eq(
             &file_history_at_checkpoint.rows[0][1],
             serde_json::json!({"title":"Updated Title","content":"Updated content"}),
         );
-        assert_text(&file_history_at_checkpoint.rows[0][2], "lix_file_descriptor");
-        assert_text(&file_history_at_checkpoint.rows[0][3], &descriptor_change_id);
-        assert_text(&file_history_at_checkpoint.rows[0][4], &checkpoint_commit_id);
-        assert_text(&file_history_at_checkpoint.rows[0][5], &checkpoint_commit_id);
+        assert_text(
+            &file_history_at_checkpoint.rows[0][2],
+            "lix_file_descriptor",
+        );
+        assert_text(
+            &file_history_at_checkpoint.rows[0][3],
+            &descriptor_change_id,
+        );
+        assert_text(
+            &file_history_at_checkpoint.rows[0][4],
+            &checkpoint_commit_id,
+        );
+        assert_text(
+            &file_history_at_checkpoint.rows[0][5],
+            &checkpoint_commit_id,
+        );
         assert_integer(&file_history_at_checkpoint.rows[0][6], 0);
     }
 );
