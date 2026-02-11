@@ -48,12 +48,6 @@ struct FileHistoryDescriptorRow {
     path: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct FileDescriptorSnapshot {
-    name: String,
-    extension: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PluginFile {
     id: String,
@@ -240,7 +234,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
         return Ok(());
     }
 
-    let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
+    let mut descriptor_targets: BTreeSet<(String, String)> = BTreeSet::new();
     let mut tombstoned_files: Vec<(String, String)> = Vec::new();
     for write in &plan.writes {
         if write.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY {
@@ -251,29 +245,28 @@ pub(crate) async fn materialize_file_data_with_plugins(
             tombstoned_files.push((key.1, key.0));
             continue;
         }
-        let Some(snapshot_json) = write.snapshot_content.as_deref() else {
+        let Some(_) = write.snapshot_content.as_deref() else {
             continue;
         };
-        let snapshot: FileDescriptorSnapshot =
-            serde_json::from_str(snapshot_json).map_err(|error| LixError {
-                message: format!(
-                    "plugin materialization: invalid file descriptor snapshot JSON: {error}"
-                ),
-            })?;
-        let path = file_path_from_snapshot(&snapshot);
-        descriptors.insert(
-            key.clone(),
-            FileDescriptorRow {
-                file_id: key.1,
-                version_id: key.0,
-                path,
-                extension: normalize_extension(snapshot.extension),
-            },
-        );
+        descriptor_targets.insert(key);
     }
 
     for (file_id, version_id) in tombstoned_files {
         delete_file_cache_data(backend, &file_id, &version_id).await?;
+    }
+
+    let descriptor_paths = load_file_paths_for_descriptors(backend, &descriptor_targets).await?;
+    let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
+    for ((version_id, file_id), path) in descriptor_paths {
+        descriptors.insert(
+            (version_id.clone(), file_id.clone()),
+            FileDescriptorRow {
+                file_id,
+                version_id,
+                extension: file_extension_from_path(&path),
+                path,
+            },
+        );
     }
 
     let mut writes_by_target: BTreeMap<(String, String, String), Vec<&MaterializationWrite>> =
@@ -536,27 +529,6 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
     Ok(())
 }
 
-fn file_path_from_snapshot(snapshot: &FileDescriptorSnapshot) -> String {
-    let name = snapshot.name.trim();
-    let extension = snapshot
-        .extension
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    if let Some(extension) = extension {
-        format!("/{name}.{extension}")
-    } else {
-        format!("/{name}")
-    }
-}
-
-fn normalize_extension(value: Option<String>) -> Option<String> {
-    value
-        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
-        .filter(|entry| !entry.is_empty())
-}
-
 fn select_plugin_for_file<'a>(
     descriptor: &FileDescriptorRow,
     plugins: &'a [InstalledPlugin],
@@ -580,6 +552,12 @@ fn file_extension_from_path(path: &str) -> Option<String> {
     let file_name = path.rsplit('/').next().unwrap_or(path);
     let extension = file_name.rsplit_once('.').map(|(_, ext)| ext.to_string());
     normalize_extension(extension)
+}
+
+fn normalize_extension(value: Option<String>) -> Option<String> {
+    value
+        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
 }
 
 fn glob_matches_extension(glob: &str, extension: Option<&str>) -> bool {
@@ -714,15 +692,14 @@ async fn load_missing_file_descriptors(
     versions: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<(String, String), FileDescriptorRow>, LixError> {
     let mut sql = String::from(
-        "SELECT entity_id, version_id, snapshot_content \
-         FROM lix_state_by_version \
-         WHERE schema_key = 'lix_file_descriptor' \
-           AND snapshot_content IS NOT NULL \
+        "SELECT id, lixcol_version_id, path \
+         FROM lix_file_by_version \
+         WHERE path IS NOT NULL \
            AND NOT EXISTS (\
                SELECT 1 \
                FROM lix_internal_file_data_cache cache \
-               WHERE cache.file_id = entity_id \
-                 AND cache.version_id = version_id\
+               WHERE cache.file_id = id \
+                 AND cache.version_id = lixcol_version_id\
            )",
     );
     let mut params = Vec::new();
@@ -735,11 +712,11 @@ async fn load_missing_file_descriptors(
             placeholders.push(format!("${}", params.len() + 1));
             params.push(Value::Text(version.clone()));
         }
-        sql.push_str(" AND version_id IN (");
+        sql.push_str(" AND lixcol_version_id IN (");
         sql.push_str(&placeholders.join(", "));
         sql.push(')');
     }
-    sql.push_str(" ORDER BY version_id, entity_id");
+    sql.push_str(" ORDER BY lixcol_version_id, id");
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let rows = backend
@@ -748,27 +725,69 @@ async fn load_missing_file_descriptors(
 
     let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
     for row in rows.rows {
-        let file_id = text_required(&row, 0, "entity_id")?;
-        let version_id = text_required(&row, 1, "version_id")?;
-        let snapshot_raw = text_required(&row, 2, "snapshot_content")?;
-        let snapshot: FileDescriptorSnapshot =
-            serde_json::from_str(&snapshot_raw).map_err(|error| LixError {
-                message: format!(
-                    "plugin materialization: invalid file descriptor snapshot JSON: {error}"
-                ),
-            })?;
-        let path = file_path_from_snapshot(&snapshot);
+        let file_id = text_required(&row, 0, "id")?;
+        let version_id = text_required(&row, 1, "lixcol_version_id")?;
+        let path = text_required(&row, 2, "path")?;
         descriptors.insert(
             (version_id.clone(), file_id.clone()),
             FileDescriptorRow {
                 file_id,
                 version_id,
+                extension: file_extension_from_path(&path),
                 path,
-                extension: normalize_extension(snapshot.extension),
             },
         );
     }
     Ok(descriptors)
+}
+
+async fn load_file_paths_for_descriptors(
+    backend: &dyn LixBackend,
+    targets: &BTreeSet<(String, String)>,
+) -> Result<BTreeMap<(String, String), String>, LixError> {
+    if targets.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut sql = String::from("WITH requested(file_id, version_id) AS (VALUES ");
+    let mut params = Vec::with_capacity(targets.len() * 2);
+    for (index, (version_id, file_id)) in targets.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        let file_placeholder = params.len() + 1;
+        params.push(Value::Text(file_id.clone()));
+        let version_placeholder = params.len() + 1;
+        params.push(Value::Text(version_id.clone()));
+        sql.push_str(&format!(
+            "(${}, ${})",
+            file_placeholder, version_placeholder
+        ));
+    }
+    sql.push_str(
+        ") \
+         SELECT f.id, f.lixcol_version_id, f.path \
+         FROM lix_file_by_version f \
+         JOIN requested r \
+           ON r.file_id = f.id \
+          AND r.version_id = f.lixcol_version_id \
+         WHERE f.path IS NOT NULL \
+         ORDER BY f.lixcol_version_id, f.id",
+    );
+
+    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
+    let rows = backend
+        .execute(&preprocessed.sql, &preprocessed.params)
+        .await?;
+
+    let mut out = BTreeMap::new();
+    for row in rows.rows {
+        let file_id = text_required(&row, 0, "id")?;
+        let version_id = text_required(&row, 1, "lixcol_version_id")?;
+        let path = text_required(&row, 2, "path")?;
+        out.insert((version_id, file_id), path);
+    }
+    Ok(out)
 }
 
 async fn load_missing_file_history_descriptors(
