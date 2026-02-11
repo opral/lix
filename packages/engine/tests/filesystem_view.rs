@@ -1665,7 +1665,7 @@ simulation_test!(
 
         let directory_rows = engine
             .execute(
-                "SELECT path \
+                "SELECT path, lixcol_untracked \
                  FROM lix_directory \
                  WHERE path IN ('/docs/', '/docs/guides/') \
                  ORDER BY path",
@@ -1676,6 +1676,8 @@ simulation_test!(
         assert_eq!(directory_rows.rows.len(), 2);
         assert_text(&directory_rows.rows[0][0], "/docs/");
         assert_text(&directory_rows.rows[1][0], "/docs/guides/");
+        assert_boolean_like(&directory_rows.rows[0][1], true);
+        assert_boolean_like(&directory_rows.rows[1][1], true);
     }
 );
 

@@ -212,9 +212,11 @@ impl Engine {
                     error.message
                 ),
             })?;
-        detected_file_domain_changes.extend(filesystem_update_domain_changes);
+        detected_file_domain_changes.extend(filesystem_update_domain_changes.tracked_changes);
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
+        let untracked_filesystem_update_domain_changes =
+            dedupe_detected_file_domain_changes(&filesystem_update_domain_changes.untracked_changes);
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
         if self.deterministic_boot_pending.load(Ordering::SeqCst) {
@@ -402,6 +404,10 @@ impl Engine {
 
         if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
             self.persist_detected_file_domain_changes(&detected_file_domain_changes)
+                .await?;
+        }
+        if !untracked_filesystem_update_domain_changes.is_empty() {
+            self.persist_untracked_file_domain_changes(&untracked_filesystem_update_domain_changes)
                 .await?;
         }
         self.persist_pending_file_data_updates(&pending_file_writes)
@@ -964,17 +970,34 @@ impl Engine {
         &self,
         changes: &[DetectedFileDomainChange],
     ) -> Result<(), LixError> {
+        self.persist_detected_file_domain_changes_with_untracked(changes, false)
+            .await
+    }
+
+    async fn persist_untracked_file_domain_changes(
+        &self,
+        changes: &[DetectedFileDomainChange],
+    ) -> Result<(), LixError> {
+        self.persist_detected_file_domain_changes_with_untracked(changes, true)
+            .await
+    }
+
+    async fn persist_detected_file_domain_changes_with_untracked(
+        &self,
+        changes: &[DetectedFileDomainChange],
+        untracked: bool,
+    ) -> Result<(), LixError> {
         let deduped_changes = dedupe_detected_file_domain_changes(changes);
         if deduped_changes.is_empty() {
             return Ok(());
         }
 
-        let mut params = Vec::with_capacity(deduped_changes.len() * 9);
+        let mut params = Vec::with_capacity(deduped_changes.len() * 10);
         let mut rows = Vec::with_capacity(deduped_changes.len());
         for (row_index, change) in deduped_changes.iter().enumerate() {
-            let base = row_index * 9;
+            let base = row_index * 10;
             rows.push(format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 base + 1,
                 base + 2,
                 base + 3,
@@ -983,7 +1006,8 @@ impl Engine {
                 base + 6,
                 base + 7,
                 base + 8,
-                base + 9
+                base + 9,
+                base + 10
             ));
             params.push(Value::Text(change.entity_id.clone()));
             params.push(Value::Text(change.schema_key.clone()));
@@ -1003,11 +1027,12 @@ impl Engine {
                 Some(writer_key) => Value::Text(writer_key.clone()),
                 None => Value::Null,
             });
+            params.push(Value::Integer(if untracked { 1 } else { 0 }));
         }
 
         let sql = format!(
             "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
              ) VALUES {}",
             rows.join(", ")
         );
@@ -1298,10 +1323,11 @@ async fn collect_filesystem_update_detected_file_domain_changes(
     backend: &dyn LixBackend,
     sql: &str,
     params: &[Value],
-) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
     let statements = parse_sql_statements(sql)?;
     let mut placeholder_state = PlaceholderState::new();
-    let mut detected_changes = Vec::new();
+    let mut tracked_changes = Vec::new();
+    let mut untracked_changes = Vec::new();
     for statement in statements {
         match statement {
             Statement::Update(update) => {
@@ -1313,7 +1339,8 @@ async fn collect_filesystem_update_detected_file_domain_changes(
                         &mut placeholder_state,
                     )
                     .await?;
-                detected_changes.extend(side_effects.tracked_directory_changes);
+                tracked_changes.extend(side_effects.tracked_directory_changes);
+                untracked_changes.extend(side_effects.untracked_directory_changes);
             }
             other => {
                 advance_placeholder_state_for_statement(
@@ -1326,7 +1353,15 @@ async fn collect_filesystem_update_detected_file_domain_changes(
         }
     }
 
-    Ok(dedupe_detected_file_domain_changes(&detected_changes))
+    Ok(FilesystemUpdateDomainChangeCollection {
+        tracked_changes: dedupe_detected_file_domain_changes(&tracked_changes),
+        untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
+    })
+}
+
+struct FilesystemUpdateDomainChangeCollection {
+    tracked_changes: Vec<DetectedFileDomainChange>,
+    untracked_changes: Vec<DetectedFileDomainChange>,
 }
 
 fn advance_placeholder_state_for_statement(
