@@ -164,6 +164,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ) \
              SELECT \
                 f.id, \
+                f.directory_id, \
+                f.name, \
+                f.extension, \
                 CASE \
                     WHEN f.directory_id IS NULL THEN \
                         CASE \
@@ -190,6 +193,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 f.lixcol_created_at, \
                 f.lixcol_updated_at, \
                 v.commit_id AS lixcol_commit_id, \
+                NULL AS lixcol_writer_key, \
                 f.lixcol_untracked, \
                 f.lixcol_metadata \
              FROM file_descriptor_rows f \
@@ -257,6 +261,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ) \
              SELECT \
                 f.id, \
+                f.directory_id, \
+                f.name, \
+                f.extension, \
                 CASE \
                     WHEN f.directory_id IS NULL THEN \
                         CASE \
@@ -284,6 +291,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 f.lixcol_created_at, \
                 f.lixcol_updated_at, \
                 v.commit_id AS lixcol_commit_id, \
+                NULL AS lixcol_writer_key, \
                 f.lixcol_untracked, \
                 f.lixcol_metadata \
              FROM file_descriptor_rows f \
