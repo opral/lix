@@ -1599,8 +1599,102 @@ fn extract_predicate_string_with_params_and_state(
             params,
             placeholder_state,
         ),
-        _ => Ok(None),
+        _ => {
+            consume_placeholders_in_expr(selection, params, placeholder_state)?;
+            Ok(None)
+        }
     }
+}
+
+fn consume_placeholders_in_expr(
+    expr: &Expr,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::Placeholder(_),
+            ..
+        }) => {
+            let _ = resolve_expr_cell_with_state(expr, params, placeholder_state)?;
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            consume_placeholders_in_expr(left, params, placeholder_state)?;
+            consume_placeholders_in_expr(right, params, placeholder_state)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => consume_placeholders_in_expr(expr, params, placeholder_state),
+        Expr::InList { expr, list, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state)?;
+            for item in list {
+                consume_placeholders_in_expr(item, params, placeholder_state)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state)?;
+            consume_placeholders_in_expr(low, params, placeholder_state)?;
+            consume_placeholders_in_expr(high, params, placeholder_state)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state)?;
+            consume_placeholders_in_expr(pattern, params, placeholder_state)
+        }
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => {
+                for arg in &list.args {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(expr),
+                        ) => consume_placeholders_in_expr(expr, params, placeholder_state)?,
+                        sqlparser::ast::FunctionArg::Named { arg, .. }
+                        | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => {
+                            if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+                                consume_placeholders_in_expr(expr, params, placeholder_state)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            consume_placeholders_in_expr(left, params, placeholder_state)?;
+            consume_placeholders_in_expr(right, params, placeholder_state)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state)?;
+            consume_placeholders_in_query(subquery, params, placeholder_state)
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            consume_placeholders_in_query(subquery, params, placeholder_state)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn consume_placeholders_in_query(
+    query: &sqlparser::ast::Query,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    let probe_sql = format!("SELECT 1 WHERE EXISTS ({})", query);
+    let bound = bind_sql_with_state(
+        &probe_sql,
+        params,
+        crate::SqlDialect::Sqlite,
+        *placeholder_state,
+    )?;
+    *placeholder_state = bound.state;
+    Ok(())
 }
 
 fn expr_column_name(expr: &Expr) -> Option<String> {
@@ -2385,5 +2479,46 @@ mod tests {
             extracted_from_fresh.as_deref(),
             Some("metadata-placeholder")
         );
+    }
+
+    #[test]
+    fn version_predicate_extraction_skips_unrelated_equality_placeholders() {
+        let selection =
+            parse_expression("id = ? AND lixcol_version_id = ?").expect("parse selection");
+        let params = vec![
+            Value::Text("file-placeholder".to_string()),
+            Value::Text("version-target".to_string()),
+        ];
+
+        let mut state = PlaceholderState::new();
+        let extracted = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut state,
+        )
+        .expect("extract version predicate");
+        assert_eq!(extracted.as_deref(), Some("version-target"));
+    }
+
+    #[test]
+    fn version_predicate_extraction_skips_unrelated_in_list_placeholders() {
+        let selection =
+            parse_expression("id IN (?, ?) AND lixcol_version_id = ?").expect("parse selection");
+        let params = vec![
+            Value::Text("file-a".to_string()),
+            Value::Text("file-b".to_string()),
+            Value::Text("version-target".to_string()),
+        ];
+
+        let mut state = PlaceholderState::new();
+        let extracted = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut state,
+        )
+        .expect("extract version predicate");
+        assert_eq!(extracted.as_deref(), Some("version-target"));
     }
 }
