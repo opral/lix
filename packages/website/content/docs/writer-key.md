@@ -6,6 +6,11 @@ A writer key is a lightweight identity attached to state mutations. It lets UIs 
 - Propagated end‑to‑end through the transaction pipeline and emitted on `onStateCommit`.
 - Nullable: `null` means “unspecified/unknown writer”. Treat `null` as external relative to any editor.
 
+## Writer Key Semantics (Contract)
+
+1. `writer_key` is an origin tag used for echo suppression.
+2. Suppress only when `state.writer_key == my_writer_key`.
+
 ## Why it exists
 
 Writer keys solve a general problem: any state that can be changed by multiple actors (tabs, services, background jobs, bots, imports, etc.) needs a way to react to external updates while avoiding feedback loops from its own writes.

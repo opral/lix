@@ -156,6 +156,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     change_id AS lixcol_change_id, \
                     created_at AS lixcol_created_at, \
                     updated_at AS lixcol_updated_at, \
+                    writer_key AS lixcol_writer_key, \
                     untracked AS lixcol_untracked, \
                     metadata AS lixcol_metadata \
                  FROM lix_state_by_version \
@@ -193,7 +194,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 f.lixcol_created_at, \
                 f.lixcol_updated_at, \
                 v.commit_id AS lixcol_commit_id, \
-                NULL AS lixcol_writer_key, \
+                f.lixcol_writer_key, \
                 f.lixcol_untracked, \
                 f.lixcol_metadata \
              FROM file_descriptor_rows f \
@@ -253,6 +254,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     change_id AS lixcol_change_id, \
                     created_at AS lixcol_created_at, \
                     updated_at AS lixcol_updated_at, \
+                    writer_key AS lixcol_writer_key, \
                     untracked AS lixcol_untracked, \
                     metadata AS lixcol_metadata \
                  FROM lix_state_by_version \
@@ -291,7 +293,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                 f.lixcol_created_at, \
                 f.lixcol_updated_at, \
                 v.commit_id AS lixcol_commit_id, \
-                NULL AS lixcol_writer_key, \
+                f.lixcol_writer_key, \
                 f.lixcol_untracked, \
                 f.lixcol_metadata \
              FROM file_descriptor_rows f \
