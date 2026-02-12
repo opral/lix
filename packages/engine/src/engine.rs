@@ -112,11 +112,13 @@ pub struct Engine {
     active_version_id: RwLock<String>,
 }
 
+#[must_use = "EngineTransaction must be committed or rolled back"]
 pub struct EngineTransaction<'a> {
     engine: &'a Engine,
     transaction: Option<Box<dyn LixTransaction + 'a>>,
     options: ExecuteOptions,
     active_version_id: String,
+    active_version_changed: bool,
 }
 
 impl<'a> EngineTransaction<'a> {
@@ -135,10 +137,12 @@ impl<'a> EngineTransaction<'a> {
         if options.writer_key.is_some() {
             effective_options.writer_key = options.writer_key;
         }
+        let previous_active_version_id = self.active_version_id.clone();
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             message: "transaction is no longer active".to_string(),
         })?;
-        self.engine
+        let result = self
+            .engine
             .execute_with_options_in_transaction(
                 transaction.as_mut(),
                 sql,
@@ -146,7 +150,11 @@ impl<'a> EngineTransaction<'a> {
                 &effective_options,
                 &mut self.active_version_id,
             )
-            .await
+            .await?;
+        if self.active_version_id != previous_active_version_id {
+            self.active_version_changed = true;
+        }
+        Ok(result)
     }
 
     pub async fn commit(mut self) -> Result<(), LixError> {
@@ -154,7 +162,10 @@ impl<'a> EngineTransaction<'a> {
             message: "transaction is no longer active".to_string(),
         })?;
         transaction.commit().await?;
-        self.engine.set_active_version_id(self.active_version_id);
+        if self.active_version_changed {
+            self.engine
+                .set_active_version_id(std::mem::take(&mut self.active_version_id));
+        }
         Ok(())
     }
 
@@ -163,6 +174,14 @@ impl<'a> EngineTransaction<'a> {
             message: "transaction is no longer active".to_string(),
         })?;
         transaction.rollback().await
+    }
+}
+
+impl Drop for EngineTransaction<'_> {
+    fn drop(&mut self) {
+        if self.transaction.is_some() && !std::thread::panicking() {
+            panic!("EngineTransaction dropped without commit() or rollback()");
+        }
     }
 }
 
@@ -507,6 +526,7 @@ impl Engine {
             transaction: Some(transaction),
             options,
             active_version_id: self.active_version_id.read().unwrap().clone(),
+            active_version_changed: false,
         })
     }
 
