@@ -44,6 +44,7 @@ use crate::version::{
 };
 use crate::WasmRuntime;
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
@@ -511,14 +512,21 @@ impl Engine {
         F: for<'tx> FnOnce(&'tx mut EngineTransaction<'_>) -> EngineTransactionFuture<'tx, T>,
     {
         let mut transaction = self.begin_transaction_with_options(options).await?;
-        match f(&mut transaction).await {
-            Ok(value) => {
+        match std::panic::AssertUnwindSafe(f(&mut transaction))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(value)) => {
                 transaction.commit().await?;
                 Ok(value)
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let _ = transaction.rollback().await;
                 Err(error)
+            }
+            Err(payload) => {
+                let _ = transaction.rollback().await;
+                std::panic::resume_unwind(payload);
             }
         }
     }
@@ -1832,12 +1840,8 @@ impl Engine {
         let statements = parse_sql_statements(sql)?;
         let mut last_result = QueryResult { rows: Vec::new() };
         for statement in statements {
-            last_result = Box::pin(self.execute(
-                &statement.to_string(),
-                params,
-                options.clone(),
-            ))
-            .await?;
+            last_result =
+                Box::pin(self.execute(&statement.to_string(), params, options.clone())).await?;
         }
         Ok(last_result)
     }

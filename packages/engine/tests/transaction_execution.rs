@@ -1,5 +1,6 @@
 mod support;
 
+use futures_util::FutureExt;
 use lix_engine::{ExecuteOptions, Value};
 
 fn deterministic_uuid(counter: i64) -> String {
@@ -193,5 +194,48 @@ simulation_test!(
             .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_blob_text(&result.rows[0][0], "after");
+    }
+);
+
+simulation_test!(
+    transaction_path_rolls_back_when_callback_panics,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let panic_result = std::panic::AssertUnwindSafe(engine.raw_engine().transaction(
+            ExecuteOptions::default(),
+            |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) VALUES ('tx-panic-rollback', '/tx-panic-rollback.json', 'before')",
+                        &[],
+                    )
+                    .await?;
+                    panic!("intentional panic in transaction callback");
+                    #[allow(unreachable_code)]
+                    Ok::<(), lix_engine::LixError>(())
+                })
+            },
+        ))
+        .catch_unwind()
+        .await;
+        assert!(
+            panic_result.is_err(),
+            "expected transaction callback to panic"
+        );
+
+        let rows = engine
+            .execute(
+                "SELECT id FROM lix_file WHERE id = 'tx-panic-rollback'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(rows.rows.is_empty(), "panic path should roll back writes");
     }
 );

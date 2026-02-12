@@ -1807,6 +1807,7 @@ dependencies = [
  "async-trait",
  "cel",
  "chrono",
+ "futures-util",
  "jsonschema",
  "paste",
  "postgresql_embedded",
