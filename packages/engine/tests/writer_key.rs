@@ -9,6 +9,13 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_blob_text(value: &Value, expected: &str) {
+    match value {
+        Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
+        other => panic!("expected blob value '{expected}', got {other:?}"),
+    }
+}
+
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
@@ -242,5 +249,68 @@ simulation_test!(
             .await
             .unwrap();
         assert!(file_rows.rows.is_empty());
+    }
+);
+
+simulation_test!(
+    transaction_file_writes_persist_file_data_cache,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .raw_engine()
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-cache', '/wk-tx-cache.json', 'before')",
+                        &[],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        engine
+            .raw_engine()
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE lix_file SET data = 'after' WHERE id = 'wk-tx-cache'",
+                        &[],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let file_rows = engine
+            .execute("SELECT data FROM lix_file WHERE id = 'wk-tx-cache'", &[])
+            .await
+            .unwrap();
+        assert_eq!(file_rows.rows.len(), 1);
+        assert_blob_text(&file_rows.rows[0][0], "after");
+
+        let version_id = active_version_id(&engine).await;
+        let cache_rows = engine
+            .execute(
+                &format!(
+                    "SELECT data FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'wk-tx-cache' AND version_id = '{version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache_rows.rows.len(), 1);
+        assert_blob_text(&cache_rows.rows[0][0], "after");
     }
 );

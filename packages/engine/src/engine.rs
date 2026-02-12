@@ -172,6 +172,14 @@ struct TransactionBackendAdapter<'a> {
     _lifetime: PhantomData<&'a ()>,
 }
 
+struct CollectedExecutionSideEffects {
+    pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
+    pending_file_delete_targets: BTreeSet<(String, String)>,
+    detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
+    detected_file_domain_changes: Vec<DetectedFileDomainChange>,
+    untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
+}
+
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
 // Internal access to the raw transaction pointer is serialized with a mutex.
 unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
@@ -266,123 +274,27 @@ impl Engine {
     ) -> Result<QueryResult, LixError> {
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
-        if let Some(runtime) = self.wasm_runtime.as_ref() {
-            if let Some(scope) = file_read_materialization_scope_for_sql(sql) {
-                let versions = match scope {
-                    FileReadMaterializationScope::ActiveVersionOnly => {
-                        let mut set = BTreeSet::new();
-                        set.insert(active_version_id.clone());
-                        Some(set)
-                    }
-                    FileReadMaterializationScope::AllVersions => None,
-                };
-                crate::plugin::runtime::materialize_missing_file_data_with_plugins(
-                    self.backend.as_ref(),
-                    runtime.as_ref(),
-                    versions.as_ref(),
-                )
-                .await?;
-            }
-            if file_history_read_materialization_required_for_sql(sql) {
-                crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
-                    self.backend.as_ref(),
-                    runtime.as_ref(),
-                )
-                .await?;
-            }
-        }
-        let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
-        let pending_file_write_collection =
-            crate::filesystem::pending_file_writes::collect_pending_file_writes(
-                self.backend.as_ref(),
-                sql,
-                params,
-                &active_version_id,
-            )
-            .await
-            .map_err(|error| LixError {
-                message: format!("pending file writes collection failed: {}", error.message),
-            })?;
-        let crate::filesystem::pending_file_writes::PendingFileWriteCollection {
-            writes: pending_file_writes,
-            writes_by_statement: pending_file_writes_by_statement,
-        } = pending_file_write_collection;
-        let pending_file_delete_targets =
-            crate::filesystem::pending_file_writes::collect_pending_file_delete_targets(
-                self.backend.as_ref(),
-                sql,
-                params,
-                &active_version_id,
-            )
-            .await
-            .map_err(|error| LixError {
-                message: format!("pending file delete collection failed: {}", error.message),
-            })?;
-        let detected_file_changes_by_statement = self
-            .detect_file_changes_for_pending_writes_by_statement(&pending_file_writes_by_statement)
+        self.maybe_materialize_reads_with_backend(self.backend.as_ref(), sql, &active_version_id)
             .await?;
-        let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
-            .into_iter()
-            .map(|changes| {
-                detected_file_domain_changes_from_detected_file_changes(&changes, writer_key)
-            })
-            .collect::<Vec<_>>();
-        let filesystem_update_domain_changes =
-            collect_filesystem_update_detected_file_domain_changes(
+        let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
+        let CollectedExecutionSideEffects {
+            pending_file_writes,
+            pending_file_delete_targets,
+            detected_file_domain_changes_by_statement,
+            detected_file_domain_changes,
+            untracked_filesystem_update_domain_changes,
+        } = self
+            .collect_execution_side_effects_with_backend(
                 self.backend.as_ref(),
                 sql,
                 params,
-            )
-            .await
-            .map_err(|error| LixError {
-                message: format!(
-                    "filesystem update side-effect detection failed: {}",
-                    error.message
-                ),
-            })?;
-        let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
-            .tracked_changes_by_statement
-            .iter()
-            .map(|changes| detected_file_domain_changes_with_writer_key(changes, writer_key))
-            .collect::<Vec<_>>();
-        let statement_count = detected_file_domain_changes_by_statement
-            .len()
-            .max(filesystem_update_tracked_changes_by_statement.len());
-        detected_file_domain_changes_by_statement.resize_with(statement_count, Vec::new);
-        for (index, tracked_changes) in filesystem_update_tracked_changes_by_statement
-            .into_iter()
-            .enumerate()
-        {
-            detected_file_domain_changes_by_statement[index].extend(tracked_changes);
-            detected_file_domain_changes_by_statement[index] = dedupe_detected_file_domain_changes(
-                &detected_file_domain_changes_by_statement[index],
-            );
-        }
-        let mut detected_file_domain_changes = detected_file_domain_changes_by_statement
-            .iter()
-            .flat_map(|changes| changes.iter().cloned())
-            .collect::<Vec<_>>();
-        detected_file_domain_changes =
-            dedupe_detected_file_domain_changes(&detected_file_domain_changes);
-        let untracked_filesystem_update_domain_changes =
-            dedupe_detected_file_domain_changes(&detected_file_domain_changes_with_writer_key(
-                &filesystem_update_domain_changes.untracked_changes,
+                &active_version_id,
                 writer_key,
-            ));
-
-        let mut settings = load_settings(self.backend.as_ref()).await?;
-        if self.deterministic_boot_pending.load(Ordering::SeqCst) {
-            if let Some(boot_settings) = self.boot_deterministic_settings {
-                settings = boot_settings;
-            }
-        }
-        let sequence_start = if settings.enabled {
-            load_persisted_sequence_next(self.backend.as_ref()).await?
-        } else {
-            0
-        };
-        let functions =
-            SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, sequence_start));
+            )
+            .await?;
+        let (settings, sequence_start, functions) = self
+            .prepare_runtime_functions_with_backend(self.backend.as_ref())
+            .await?;
 
         let output = match preprocess_sql_with_provider_and_detected_file_domain_changes(
             self.backend.as_ref(),
@@ -534,12 +446,13 @@ impl Engine {
             }
         }?;
 
-        if settings.enabled {
-            let sequence_end = functions.with_lock(|provider| provider.next_sequence());
-            if sequence_end > sequence_start {
-                persist_sequence_highest(self.backend.as_ref(), sequence_end - 1).await?;
-            }
-        }
+        self.persist_runtime_sequence_with_backend(
+            self.backend.as_ref(),
+            settings,
+            sequence_start,
+            &functions,
+        )
+        .await?;
 
         if let Some(version_id) =
             next_active_version_id_from_mutations.or(next_active_version_id_from_updates)
@@ -624,20 +537,38 @@ impl Engine {
     ) -> Result<QueryResult, LixError> {
         let writer_key = options.writer_key.as_deref();
         let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
-        let pending_file_writes = Vec::new();
-        let pending_file_delete_targets = BTreeSet::new();
-        let detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>> =
-            Vec::new();
-        let detected_file_domain_changes: Vec<DetectedFileDomainChange> = Vec::new();
-
-        let functions = SharedFunctionProvider::new(RuntimeFunctionProvider::new(
-            DeterministicSettings::disabled(),
-            0,
-        ));
-
-        let output = {
+        let (
+            pending_file_writes,
+            pending_file_delete_targets,
+            detected_file_domain_changes,
+            untracked_filesystem_update_domain_changes,
+            settings,
+            sequence_start,
+            functions,
+            output,
+        ) = {
             let backend = TransactionBackendAdapter::new(transaction);
-            preprocess_sql_with_provider_and_detected_file_domain_changes(
+            self.maybe_materialize_reads_with_backend(&backend, sql, active_version_id)
+                .await?;
+            let CollectedExecutionSideEffects {
+                pending_file_writes,
+                pending_file_delete_targets,
+                detected_file_domain_changes_by_statement,
+                detected_file_domain_changes,
+                untracked_filesystem_update_domain_changes,
+            } = self
+                .collect_execution_side_effects_with_backend(
+                    &backend,
+                    sql,
+                    params,
+                    active_version_id,
+                    writer_key,
+                )
+                .await?;
+            let (settings, sequence_start, functions) = self
+                .prepare_runtime_functions_with_backend(&backend)
+                .await?;
+            let output = match preprocess_sql_with_provider_and_detected_file_domain_changes(
                 &backend,
                 &self.cel_evaluator,
                 sql,
@@ -646,7 +577,47 @@ impl Engine {
                 &detected_file_domain_changes_by_statement,
                 writer_key,
             )
-            .await?
+            .await
+            {
+                Ok(output) => output,
+                Err(error)
+                    if should_sequentialize_postprocess_multi_statement(sql, params, &error) =>
+                {
+                    return Box::pin(
+                        self.execute_multi_statement_sequential_with_options_in_transaction(
+                            transaction,
+                            sql,
+                            options,
+                            active_version_id,
+                        ),
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            };
+            if !output.mutations.is_empty() {
+                validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
+            }
+            if !output.update_validations.is_empty() {
+                validate_updates(
+                    &backend,
+                    &self.schema_cache,
+                    &output.update_validations,
+                    &output.params,
+                )
+                .await?;
+            }
+
+            (
+                pending_file_writes,
+                pending_file_delete_targets,
+                detected_file_domain_changes,
+                untracked_filesystem_update_domain_changes,
+                settings,
+                sequence_start,
+                functions,
+                output,
+            )
         };
 
         let next_active_version_id_from_mutations =
@@ -756,13 +727,31 @@ impl Engine {
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
 
         if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
-            // In transaction mode this stays deferred until transaction commit.
+            self.persist_detected_file_domain_changes_in_transaction(
+                transaction,
+                &detected_file_domain_changes,
+            )
+            .await?;
+        }
+        if !untracked_filesystem_update_domain_changes.is_empty() {
+            self.persist_untracked_file_domain_changes_in_transaction(
+                transaction,
+                &untracked_filesystem_update_domain_changes,
+            )
+            .await?;
         }
         self.persist_pending_file_data_updates_in_transaction(transaction, &pending_file_writes)
             .await?;
         self.invalidate_file_data_cache_entries_in_transaction(
             transaction,
             &file_cache_invalidation_targets,
+        )
+        .await?;
+        self.persist_runtime_sequence_with_backend(
+            &TransactionBackendAdapter::new(transaction),
+            settings,
+            sequence_start,
+            &functions,
         )
         .await?;
 
@@ -820,6 +809,181 @@ impl Engine {
         }
 
         Ok(MaterializationReport { plan, apply })
+    }
+
+    async fn maybe_materialize_reads_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        sql: &str,
+        active_version_id: &str,
+    ) -> Result<(), LixError> {
+        let Some(runtime) = self.wasm_runtime.as_ref() else {
+            return Ok(());
+        };
+
+        if let Some(scope) = file_read_materialization_scope_for_sql(sql) {
+            let versions = match scope {
+                FileReadMaterializationScope::ActiveVersionOnly => {
+                    let mut set = BTreeSet::new();
+                    set.insert(active_version_id.to_string());
+                    Some(set)
+                }
+                FileReadMaterializationScope::AllVersions => None,
+            };
+            crate::plugin::runtime::materialize_missing_file_data_with_plugins(
+                backend,
+                runtime.as_ref(),
+                versions.as_ref(),
+            )
+            .await?;
+        }
+        if file_history_read_materialization_required_for_sql(sql) {
+            crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
+                backend,
+                runtime.as_ref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn collect_execution_side_effects_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        sql: &str,
+        params: &[Value],
+        active_version_id: &str,
+        writer_key: Option<&str>,
+    ) -> Result<CollectedExecutionSideEffects, LixError> {
+        let pending_file_write_collection =
+            crate::filesystem::pending_file_writes::collect_pending_file_writes(
+                backend,
+                sql,
+                params,
+                active_version_id,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!("pending file writes collection failed: {}", error.message),
+            })?;
+        let crate::filesystem::pending_file_writes::PendingFileWriteCollection {
+            writes: pending_file_writes,
+            writes_by_statement: pending_file_writes_by_statement,
+        } = pending_file_write_collection;
+        let pending_file_delete_targets =
+            crate::filesystem::pending_file_writes::collect_pending_file_delete_targets(
+                backend,
+                sql,
+                params,
+                active_version_id,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!("pending file delete collection failed: {}", error.message),
+            })?;
+
+        let detected_file_changes_by_statement = self
+            .detect_file_changes_for_pending_writes_by_statement_with_backend(
+                backend,
+                &pending_file_writes_by_statement,
+            )
+            .await?;
+        let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
+            .into_iter()
+            .map(|changes| {
+                detected_file_domain_changes_from_detected_file_changes(&changes, writer_key)
+            })
+            .collect::<Vec<_>>();
+
+        let filesystem_update_domain_changes =
+            collect_filesystem_update_detected_file_domain_changes(backend, sql, params)
+                .await
+                .map_err(|error| LixError {
+                    message: format!(
+                        "filesystem update side-effect detection failed: {}",
+                        error.message
+                    ),
+                })?;
+        let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
+            .tracked_changes_by_statement
+            .iter()
+            .map(|changes| detected_file_domain_changes_with_writer_key(changes, writer_key))
+            .collect::<Vec<_>>();
+        let statement_count = detected_file_domain_changes_by_statement
+            .len()
+            .max(filesystem_update_tracked_changes_by_statement.len());
+        detected_file_domain_changes_by_statement.resize_with(statement_count, Vec::new);
+        for (index, tracked_changes) in filesystem_update_tracked_changes_by_statement
+            .into_iter()
+            .enumerate()
+        {
+            detected_file_domain_changes_by_statement[index].extend(tracked_changes);
+            detected_file_domain_changes_by_statement[index] = dedupe_detected_file_domain_changes(
+                &detected_file_domain_changes_by_statement[index],
+            );
+        }
+        let mut detected_file_domain_changes = detected_file_domain_changes_by_statement
+            .iter()
+            .flat_map(|changes| changes.iter().cloned())
+            .collect::<Vec<_>>();
+        detected_file_domain_changes =
+            dedupe_detected_file_domain_changes(&detected_file_domain_changes);
+        let untracked_filesystem_update_domain_changes =
+            dedupe_detected_file_domain_changes(&detected_file_domain_changes_with_writer_key(
+                &filesystem_update_domain_changes.untracked_changes,
+                writer_key,
+            ));
+
+        Ok(CollectedExecutionSideEffects {
+            pending_file_writes,
+            pending_file_delete_targets,
+            detected_file_domain_changes_by_statement,
+            detected_file_domain_changes,
+            untracked_filesystem_update_domain_changes,
+        })
+    }
+
+    async fn prepare_runtime_functions_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<
+        (
+            DeterministicSettings,
+            i64,
+            SharedFunctionProvider<RuntimeFunctionProvider>,
+        ),
+        LixError,
+    > {
+        let mut settings = load_settings(backend).await?;
+        if self.deterministic_boot_pending.load(Ordering::SeqCst) {
+            if let Some(boot_settings) = self.boot_deterministic_settings {
+                settings = boot_settings;
+            }
+        }
+        let sequence_start = if settings.enabled {
+            load_persisted_sequence_next(backend).await?
+        } else {
+            0
+        };
+        let functions =
+            SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, sequence_start));
+        Ok((settings, sequence_start, functions))
+    }
+
+    async fn persist_runtime_sequence_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        settings: DeterministicSettings,
+        sequence_start: i64,
+        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) -> Result<(), LixError> {
+        if settings.enabled {
+            let sequence_end = functions.with_lock(|provider| provider.next_sequence());
+            if sequence_end > sequence_start {
+                persist_sequence_highest(backend, sequence_end - 1).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
@@ -1279,8 +1443,9 @@ impl Engine {
         Ok(())
     }
 
-    async fn detect_file_changes_for_pending_writes_by_statement(
+    async fn detect_file_changes_for_pending_writes_by_statement_with_backend(
         &self,
+        backend: &dyn LixBackend,
         writes_by_statement: &[Vec<crate::filesystem::pending_file_writes::PendingFileWrite>],
     ) -> Result<Vec<Vec<crate::plugin::runtime::DetectedFileChange>>, LixError> {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
@@ -1306,7 +1471,7 @@ impl Engine {
                 })
                 .collect::<Vec<_>>();
             let detected = crate::plugin::runtime::detect_file_changes_with_plugins(
-                self.backend.as_ref(),
+                backend,
                 runtime.as_ref(),
                 &requests,
             )
@@ -1334,6 +1499,32 @@ impl Engine {
     ) -> Result<(), LixError> {
         self.persist_detected_file_domain_changes_with_untracked(changes, true)
             .await
+    }
+
+    async fn persist_detected_file_domain_changes_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        changes: &[DetectedFileDomainChange],
+    ) -> Result<(), LixError> {
+        self.persist_detected_file_domain_changes_with_untracked_in_transaction(
+            transaction,
+            changes,
+            false,
+        )
+        .await
+    }
+
+    async fn persist_untracked_file_domain_changes_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        changes: &[DetectedFileDomainChange],
+    ) -> Result<(), LixError> {
+        self.persist_detected_file_domain_changes_with_untracked_in_transaction(
+            transaction,
+            changes,
+            true,
+        )
+        .await
     }
 
     async fn persist_detected_file_domain_changes_with_untracked(
@@ -1391,6 +1582,66 @@ impl Engine {
             rows.join(", ")
         );
         Box::pin(self.execute(&sql, &params)).await?;
+
+        Ok(())
+    }
+
+    async fn persist_detected_file_domain_changes_with_untracked_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        changes: &[DetectedFileDomainChange],
+        untracked: bool,
+    ) -> Result<(), LixError> {
+        let deduped_changes = dedupe_detected_file_domain_changes(changes);
+        if deduped_changes.is_empty() {
+            return Ok(());
+        }
+
+        let mut params = Vec::with_capacity(deduped_changes.len() * 10);
+        let mut rows = Vec::with_capacity(deduped_changes.len());
+        for (row_index, change) in deduped_changes.iter().enumerate() {
+            let base = row_index * 10;
+            rows.push(format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 7,
+                base + 8,
+                base + 9,
+                base + 10
+            ));
+            params.push(Value::Text(change.entity_id.clone()));
+            params.push(Value::Text(change.schema_key.clone()));
+            params.push(Value::Text(change.file_id.clone()));
+            params.push(Value::Text(change.version_id.clone()));
+            params.push(Value::Text(change.plugin_key.clone()));
+            params.push(match &change.snapshot_content {
+                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::Text(change.schema_version.clone()));
+            params.push(match &change.metadata {
+                Some(metadata) => Value::Text(metadata.clone()),
+                None => Value::Null,
+            });
+            params.push(match &change.writer_key {
+                Some(writer_key) => Value::Text(writer_key.clone()),
+                None => Value::Null,
+            });
+            params.push(Value::Integer(if untracked { 1 } else { 0 }));
+        }
+
+        let sql = format!(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
+             ) VALUES {}",
+            rows.join(", ")
+        );
+        transaction.execute(&sql, &params).await?;
 
         Ok(())
     }
@@ -1577,6 +1828,28 @@ impl Engine {
             last_result =
                 Box::pin(self.execute_with_options(&statement.to_string(), &[], options.clone()))
                     .await?;
+        }
+        Ok(last_result)
+    }
+
+    async fn execute_multi_statement_sequential_with_options_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        sql: &str,
+        options: &ExecuteOptions,
+        active_version_id: &mut String,
+    ) -> Result<QueryResult, LixError> {
+        let statements = parse_sql_statements(sql)?;
+        let mut last_result = QueryResult { rows: Vec::new() };
+        for statement in statements {
+            last_result = Box::pin(self.execute_with_options_in_transaction(
+                transaction,
+                &statement.to_string(),
+                &[],
+                options,
+                active_version_id,
+            ))
+            .await?;
         }
         Ok(last_result)
     }
