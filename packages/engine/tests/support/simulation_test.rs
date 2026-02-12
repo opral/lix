@@ -12,6 +12,7 @@ use lix_engine::{
     boot, BootAccount, BootArgs, BootKeyValue, Engine, LixBackend, LixError,
     MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
     MaterializationReport, MaterializationRequest, MaterializationScope, QueryResult, Value,
+    WasmRuntime,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -41,6 +42,7 @@ pub struct SimulationArgs {
 pub struct SimulationBootArgs {
     pub key_values: Vec<BootKeyValue>,
     pub active_account: Option<BootAccount>,
+    pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 }
 
 pub struct SimulationEngine {
@@ -81,6 +83,14 @@ impl SimulationEngine {
             }
             StatementKind::Other => self.engine.execute(sql, params).await,
         }
+    }
+
+    pub async fn install_plugin(
+        &self,
+        manifest_json: &str,
+        wasm_bytes: &[u8],
+    ) -> Result<(), LixError> {
+        self.engine.install_plugin(manifest_json, wasm_bytes).await
     }
 
     pub async fn materialization_plan(
@@ -144,6 +154,7 @@ impl SimulationArgs {
         Ok(SimulationEngine {
             engine: boot(BootArgs {
                 backend: (self.backend_factory)(),
+                wasm_runtime: args.wasm_runtime,
                 key_values: args.key_values,
                 active_account: args.active_account,
             }),
@@ -162,6 +173,7 @@ impl SimulationArgs {
                 version_id: None,
             }],
             active_account: None,
+            wasm_runtime: None,
         }))
         .await
     }

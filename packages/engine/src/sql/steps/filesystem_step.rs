@@ -1,5 +1,6 @@
 use sqlparser::ast::{Delete, Insert, Query, Statement, Update};
 
+use crate::filesystem::mutation_rewrite::FilesystemInsertSideEffects;
 use crate::filesystem::{mutation_rewrite, select_rewrite};
 use crate::{LixBackend, LixError, Value as EngineValue};
 
@@ -23,7 +24,7 @@ pub async fn insert_side_effect_statements_with_backend(
     backend: &dyn LixBackend,
     insert: &Insert,
     params: &[EngineValue],
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<FilesystemInsertSideEffects, LixError> {
     mutation_rewrite::insert_side_effect_statements_with_backend(backend, insert, params).await
 }
 

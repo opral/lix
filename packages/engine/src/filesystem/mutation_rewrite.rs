@@ -1,3 +1,4 @@
+use serde_json::json;
 use sqlparser::ast::{
     Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr, Statement,
     TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan, Values,
@@ -13,8 +14,8 @@ use crate::filesystem::path::{
 };
 use crate::sql::escape_sql_string;
 use crate::sql::{
-    lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
-    rewrite_read_query_with_backend, PlaceholderState, ResolvedCell,
+    bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
+    rewrite_read_query_with_backend, DetectedFileDomainChange, PlaceholderState, ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -33,6 +34,22 @@ const FILE_DESCRIPTOR_VIEW: &str = "lix_file_descriptor";
 const FILE_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_file_descriptor_by_version";
 const DIRECTORY_DESCRIPTOR_VIEW: &str = "lix_directory_descriptor";
 const DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_directory_descriptor_by_version";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
+const INTERNAL_DESCRIPTOR_FILE_ID: &str = "lix";
+const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
+
+#[derive(Debug, Default)]
+pub struct FilesystemInsertSideEffects {
+    pub statements: Vec<Statement>,
+    pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
+}
+
+#[derive(Debug, Default)]
+pub struct FilesystemUpdateSideEffects {
+    pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
+    pub untracked_directory_changes: Vec<DetectedFileDomainChange>,
+}
 
 pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
@@ -81,23 +98,23 @@ pub async fn insert_side_effect_statements_with_backend(
     backend: &dyn LixBackend,
     insert: &Insert,
     params: &[EngineValue],
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<FilesystemInsertSideEffects, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     };
     if target.read_only {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     }
 
     let source = match &insert.source {
         Some(source) => source,
-        None => return Ok(Vec::new()),
+        None => return Ok(FilesystemInsertSideEffects::default()),
     };
     let SetExpr::Values(values) = source.body.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     };
     if values.rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     }
 
     let path_index = insert
@@ -105,7 +122,7 @@ pub async fn insert_side_effect_statements_with_backend(
         .iter()
         .position(|column| column.value.eq_ignore_ascii_case("path"));
     let Some(path_index) = path_index else {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     };
 
     let by_version_index = insert.columns.iter().position(|column| {
@@ -119,7 +136,11 @@ pub async fn insert_side_effect_statements_with_backend(
     };
 
     let resolved_rows = resolve_values_rows(&values.rows, params)?;
-    let mut directory_requests: Vec<(String, String)> = Vec::new();
+    let untracked_index = insert.columns.iter().position(|column| {
+        column.value.eq_ignore_ascii_case("lixcol_untracked")
+            || column.value.eq_ignore_ascii_case("untracked")
+    });
+    let mut directory_requests: BTreeMap<(String, String), bool> = BTreeMap::new();
 
     for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
         if row.len() != insert.columns.len() {
@@ -157,39 +178,58 @@ pub async fn insert_side_effect_statements_with_backend(
         } else {
             continue;
         };
+        let untracked = untracked_index
+            .map(|index| {
+                resolve_untracked_expr(
+                    row.get(index),
+                    resolved_row.get(index),
+                    "filesystem insert untracked",
+                )
+            })
+            .transpose()?
+            .flatten()
+            .unwrap_or(false);
 
         if target.is_file {
             for ancestor in file_ancestor_directory_paths(&normalized_path) {
-                directory_requests.push((version_id.clone(), ancestor));
+                let key = (version_id.clone(), ancestor);
+                directory_requests
+                    .entry(key)
+                    .and_modify(|existing| *existing = *existing && untracked)
+                    .or_insert(untracked);
             }
         } else {
             for ancestor in directory_ancestor_paths(&normalized_path) {
-                directory_requests.push((version_id.clone(), ancestor));
+                let key = (version_id.clone(), ancestor);
+                directory_requests
+                    .entry(key)
+                    .and_modify(|existing| *existing = *existing && untracked)
+                    .or_insert(untracked);
             }
         }
     }
 
     if directory_requests.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FilesystemInsertSideEffects::default());
     }
 
-    directory_requests.sort_by(|left, right| {
-        let version_order = left.0.cmp(&right.0);
+    let mut ordered_requests = directory_requests.into_iter().collect::<Vec<_>>();
+    ordered_requests.sort_by(|left, right| {
+        let version_order = left.0 .0.cmp(&right.0 .0);
         if version_order != std::cmp::Ordering::Equal {
             return version_order;
         }
-        let left_depth = path_depth(&left.1);
-        let right_depth = path_depth(&right.1);
+        let left_depth = path_depth(&left.0 .1);
+        let right_depth = path_depth(&right.0 .1);
         left_depth
             .cmp(&right_depth)
-            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.0 .1.cmp(&right.0 .1))
     });
-    directory_requests.dedup();
 
     let mut known_ids: BTreeMap<(String, String), String> = BTreeMap::new();
-    let mut statements: Vec<Statement> = Vec::new();
+    let mut side_effects = FilesystemInsertSideEffects::default();
 
-    for (version_id, path) in directory_requests {
+    for ((version_id, path), untracked) in ordered_requests {
         let key = (version_id.clone(), path.clone());
         if known_ids.contains_key(&key) {
             continue;
@@ -219,35 +259,156 @@ pub async fn insert_side_effect_statements_with_backend(
 
         let id = auto_directory_id(&version_id, &path);
         let name = directory_name_from_path(&path).unwrap_or_default();
-        let statement_sql = if target.uses_active_version_scope() {
-            format!(
-                "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_untracked) \
-                 VALUES ('{id}', {parent_id}, '{name}', 0, 1)",
-                table = DIRECTORY_DESCRIPTOR_VIEW,
-                id = escape_sql_string(&id),
-                parent_id = parent_id
-                    .map(|value| format!("'{}'", escape_sql_string(&value)))
-                    .unwrap_or_else(|| "NULL".to_string()),
-                name = escape_sql_string(&name),
-            )
+        if untracked {
+            let statement_sql = if target.uses_active_version_scope() {
+                format!(
+                    "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_untracked) \
+                     VALUES ('{id}', {parent_id}, '{name}', 0, 1)",
+                    table = DIRECTORY_DESCRIPTOR_VIEW,
+                    id = escape_sql_string(&id),
+                    parent_id = parent_id
+                        .as_ref()
+                        .map(|value| format!("'{}'", escape_sql_string(value)))
+                        .unwrap_or_else(|| "NULL".to_string()),
+                    name = escape_sql_string(&name),
+                )
+            } else {
+                format!(
+                    "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_version_id, lixcol_untracked) \
+                     VALUES ('{id}', {parent_id}, '{name}', 0, '{version_id}', 1)",
+                    table = DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
+                    id = escape_sql_string(&id),
+                    parent_id = parent_id
+                        .as_ref()
+                        .map(|value| format!("'{}'", escape_sql_string(value)))
+                        .unwrap_or_else(|| "NULL".to_string()),
+                    name = escape_sql_string(&name),
+                    version_id = escape_sql_string(&version_id),
+                )
+            };
+            side_effects
+                .statements
+                .push(parse_single_statement(&statement_sql)?);
         } else {
-            format!(
-                "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_version_id, lixcol_untracked) \
-                 VALUES ('{id}', {parent_id}, '{name}', 0, '{version_id}', 1)",
-                table = DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
-                id = escape_sql_string(&id),
-                parent_id = parent_id
-                    .map(|value| format!("'{}'", escape_sql_string(&value)))
-                    .unwrap_or_else(|| "NULL".to_string()),
-                name = escape_sql_string(&name),
-                version_id = escape_sql_string(&version_id),
-            )
-        };
-        statements.push(parse_single_statement(&statement_sql)?);
+            let snapshot_content = json!({
+                "id": id,
+                "parent_id": parent_id,
+                "name": name,
+                "hidden": false,
+            })
+            .to_string();
+            side_effects
+                .tracked_directory_changes
+                .push(DetectedFileDomainChange {
+                    entity_id: id.clone(),
+                    schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                    schema_version: DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
+                    file_id: INTERNAL_DESCRIPTOR_FILE_ID.to_string(),
+                    version_id: version_id.clone(),
+                    plugin_key: INTERNAL_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                    snapshot_content: Some(snapshot_content),
+                    metadata: None,
+                    writer_key: None,
+                });
+        }
         known_ids.insert(key, id);
     }
 
-    Ok(statements)
+    Ok(side_effects)
+}
+
+pub async fn update_side_effects_with_backend(
+    backend: &dyn LixBackend,
+    update: &Update,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<FilesystemUpdateSideEffects, LixError> {
+    let statement_start_state = *placeholder_state;
+    let statement_sql = update.to_string();
+    let bound = bind_sql_with_state(
+        &statement_sql,
+        params,
+        backend.dialect(),
+        statement_start_state,
+    )
+    .map_err(|error| LixError {
+        message: format!(
+            "filesystem update placeholder binding failed for '{}': {}",
+            statement_sql, error.message
+        ),
+    })?;
+    *placeholder_state = bound.state;
+
+    let Some(target) = target_from_update_table(&update.table) else {
+        return Ok(FilesystemUpdateSideEffects::default());
+    };
+    if target.read_only || !target.is_file {
+        return Ok(FilesystemUpdateSideEffects::default());
+    }
+
+    let mut statement_placeholder_state = statement_start_state;
+    let mut next_path: Option<String> = None;
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            continue;
+        };
+        let resolved = resolve_expr_cell_with_state(
+            &assignment.value,
+            params,
+            &mut statement_placeholder_state,
+        )?;
+        if column.eq_ignore_ascii_case("path") {
+            next_path = resolve_text_expr(Some(&assignment.value), Some(&resolved), "file path")?;
+        }
+    }
+
+    let Some(raw_path) = next_path else {
+        return Ok(FilesystemUpdateSideEffects::default());
+    };
+
+    let selection_placeholder_state = statement_placeholder_state;
+    let mut version_predicate_state = selection_placeholder_state;
+    let version_id = resolve_update_version_id(
+        backend,
+        update,
+        params,
+        target,
+        &mut version_predicate_state,
+    )
+    .await?;
+    let matching_file_ids =
+        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
+            .await?;
+    if matching_file_ids.is_empty() {
+        return Ok(FilesystemUpdateSideEffects::default());
+    }
+    let all_untracked = matching_file_ids.iter().all(|row| row.untracked);
+    let parsed = parse_file_path(&raw_path)?;
+    let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
+    if ancestor_paths.is_empty() {
+        return Ok(FilesystemUpdateSideEffects::default());
+    }
+
+    ancestor_paths.sort_by(|left, right| {
+        path_depth(left)
+            .cmp(&path_depth(right))
+            .then_with(|| left.cmp(right))
+    });
+    ancestor_paths.dedup();
+    let directory_changes =
+        tracked_missing_directory_changes(backend, &version_id, &ancestor_paths).await?;
+
+    if all_untracked {
+        Ok(FilesystemUpdateSideEffects {
+            tracked_directory_changes: Vec::new(),
+            untracked_directory_changes: directory_changes,
+        })
+    } else {
+        Ok(FilesystemUpdateSideEffects {
+            tracked_directory_changes: directory_changes,
+            untracked_directory_changes: Vec::new(),
+        })
+    }
 }
 
 pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
@@ -259,6 +420,7 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
             message: format!("{} does not support UPDATE", target.view_name),
         });
     }
+    reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
         update.assignments.retain(|assignment| {
@@ -288,6 +450,7 @@ pub async fn rewrite_update_with_backend(
             message: format!("{} does not support UPDATE", target.view_name),
         });
     }
+    reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
         update.assignments.retain(|assignment| {
@@ -335,19 +498,21 @@ pub async fn rewrite_delete_with_backend(
             message: format!("{} does not support DELETE", target.view_name),
         });
     }
-    if target.requires_explicit_version_scope()
-        && extract_predicate_string(
+    if target.requires_explicit_version_scope() {
+        let version_id = extract_predicate_string_with_params_and_dialect(
             delete.selection.as_ref(),
             &["lixcol_version_id", "version_id"],
-        )
-        .is_none()
-    {
-        return Err(LixError {
-            message: format!(
-                "{} delete requires a version_id predicate",
-                target.view_name
-            ),
-        });
+            params,
+            backend.dialect(),
+        )?;
+        if version_id.is_none() {
+            return Err(LixError {
+                message: format!(
+                    "{} delete requires a version_id predicate",
+                    target.view_name
+                ),
+            });
+        }
     }
 
     if target.is_directory() {
@@ -773,10 +938,25 @@ async fn rewrite_file_update_assignments_with_backend(
         return Ok(());
     };
 
-    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let selection_placeholder_state = placeholder_state;
+    let mut version_predicate_state = selection_placeholder_state;
+    let version_id = resolve_update_version_id(
+        backend,
+        update,
+        params,
+        target,
+        &mut version_predicate_state,
+    )
+    .await?;
     let parsed = parse_file_path(&raw_path)?;
     assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
-    let matching_file_ids = file_ids_matching_update(backend, update, target, params).await?;
+    let matching_file_ids =
+        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
+            .await?;
+    let matching_file_ids = matching_file_ids
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
     if matching_file_ids.len() > 1 {
         return Err(file_unique_error(&parsed.normalized_path, &version_id));
     }
@@ -796,12 +976,7 @@ async fn rewrite_file_update_assignments_with_backend(
         Some(
             find_directory_id_by_path(backend, &version_id, directory_path)
                 .await?
-                .ok_or_else(|| LixError {
-                    message: format!(
-                        "Parent directory does not exist for path {}",
-                        directory_path
-                    ),
-                })?,
+                .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
         )
     } else {
         None
@@ -825,6 +1000,68 @@ async fn rewrite_file_update_assignments_with_backend(
     );
 
     Ok(())
+}
+
+async fn tracked_missing_directory_changes(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    ancestor_paths: &[String],
+) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+    if ancestor_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut known_ids: BTreeMap<String, String> = BTreeMap::new();
+    let mut tracked_directory_changes = Vec::new();
+
+    for path in ancestor_paths {
+        if known_ids.contains_key(path) {
+            continue;
+        }
+        if let Some(existing_id) = find_directory_id_by_path(backend, version_id, path).await? {
+            known_ids.insert(path.clone(), existing_id);
+            continue;
+        }
+
+        let parent_id = match parent_directory_path(path) {
+            Some(parent_path) => {
+                if let Some(parent_id) = known_ids.get(&parent_path) {
+                    Some(parent_id.clone())
+                } else if let Some(existing_parent_id) =
+                    find_directory_id_by_path(backend, version_id, &parent_path).await?
+                {
+                    known_ids.insert(parent_path, existing_parent_id.clone());
+                    Some(existing_parent_id)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let id = auto_directory_id(version_id, path);
+        let name = directory_name_from_path(path).unwrap_or_default();
+        let snapshot_content = json!({
+            "id": id,
+            "parent_id": parent_id,
+            "name": name,
+            "hidden": false,
+        })
+        .to_string();
+        tracked_directory_changes.push(DetectedFileDomainChange {
+            entity_id: id.clone(),
+            schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            schema_version: DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
+            file_id: INTERNAL_DESCRIPTOR_FILE_ID.to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: INTERNAL_DESCRIPTOR_PLUGIN_KEY.to_string(),
+            snapshot_content: Some(snapshot_content),
+            metadata: None,
+            writer_key: None,
+        });
+        known_ids.insert(path.clone(), id);
+    }
+
+    Ok(tracked_directory_changes)
 }
 
 async fn rewrite_directory_update_assignments_with_backend(
@@ -863,7 +1100,8 @@ async fn rewrite_directory_update_assignments_with_backend(
         return Ok(());
     }
 
-    let version_id = resolve_update_version_id(backend, update, target).await?;
+    let version_id =
+        resolve_update_version_id(backend, update, params, target, &mut placeholder_state).await?;
     let current_directory_id =
         extract_predicate_string(update.selection.as_ref(), &["id", "lixcol_entity_id"]);
     let Some(current_directory_id) = current_directory_id else {
@@ -994,16 +1232,27 @@ fn resolve_insert_row_version_id(
 async fn resolve_update_version_id(
     backend: &dyn LixBackend,
     update: &Update,
+    params: &[EngineValue],
     target: FilesystemTarget,
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<String, LixError> {
     if target.uses_active_version_scope() {
         return load_active_version_id(backend).await;
     }
     if target.requires_explicit_version_scope() {
-        return extract_predicate_string(
+        return extract_predicate_string_with_params_and_state(
             update.selection.as_ref(),
             &["lixcol_version_id", "version_id"],
+            params,
+            placeholder_state,
+            backend.dialect(),
         )
+        .map_err(|error| LixError {
+            message: format!(
+                "{} update version predicate failed: {}",
+                target.view_name, error.message
+            ),
+        })?
         .ok_or_else(|| LixError {
             message: format!(
                 "{} update requires a version_id predicate",
@@ -1029,6 +1278,26 @@ fn set_or_replace_update_assignment(update: &mut Update, column: &str, value: Ex
         target: sqlparser::ast::AssignmentTarget::ColumnName(table_name(column)),
         value,
     });
+}
+
+fn reject_immutable_id_update(update: &Update, target: FilesystemTarget) -> Result<(), LixError> {
+    let mutates_id = update.assignments.iter().any(|assignment| {
+        assignment_target_name(assignment)
+            .map(|name| {
+                name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("lixcol_entity_id")
+            })
+            .unwrap_or(false)
+    });
+    if !mutates_id {
+        return Ok(());
+    }
+
+    Err(LixError {
+        message: format!(
+            "{} id is immutable; create a new row and delete the old row instead",
+            target.view_name
+        ),
+    })
 }
 
 fn ensure_insert_column(insert: &mut Insert, column: &str) -> Result<usize, LixError> {
@@ -1236,8 +1505,138 @@ fn resolve_text_expr(
     }
 }
 
+fn resolve_untracked_expr(
+    expr: Option<&Expr>,
+    cell: Option<&ResolvedCell>,
+    context: &str,
+) -> Result<Option<bool>, LixError> {
+    if let Some(cell) = cell {
+        if let Some(value) = &cell.value {
+            return match value {
+                EngineValue::Null => Ok(None),
+                EngineValue::Integer(value) => Ok(Some(*value != 0)),
+                EngineValue::Real(value) => Ok(Some(*value != 0.0)),
+                EngineValue::Text(value) => {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    match normalized.as_str() {
+                        "1" | "true" => Ok(Some(true)),
+                        "0" | "false" | "" => Ok(Some(false)),
+                        _ => Err(LixError {
+                            message: format!(
+                                "{context} expects a boolean-like value, got '{}'",
+                                value
+                            ),
+                        }),
+                    }
+                }
+                EngineValue::Blob(_) => Err(LixError {
+                    message: format!("{context} does not support blob values"),
+                }),
+            };
+        }
+    }
+
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return Ok(None);
+    };
+    match value {
+        AstValue::Null => Ok(None),
+        AstValue::Boolean(value) => Ok(Some(*value)),
+        AstValue::Number(value, _) => match value.trim() {
+            "1" => Ok(Some(true)),
+            "0" => Ok(Some(false)),
+            _ => Err(LixError {
+                message: format!("{context} expects 0/1, got '{}'", value),
+            }),
+        },
+        AstValue::SingleQuotedString(value)
+        | AstValue::DoubleQuotedString(value)
+        | AstValue::TripleSingleQuotedString(value)
+        | AstValue::TripleDoubleQuotedString(value)
+        | AstValue::EscapedStringLiteral(value)
+        | AstValue::UnicodeStringLiteral(value)
+        | AstValue::NationalStringLiteral(value)
+        | AstValue::HexStringLiteral(value)
+        | AstValue::SingleQuotedRawStringLiteral(value)
+        | AstValue::DoubleQuotedRawStringLiteral(value)
+        | AstValue::TripleSingleQuotedRawStringLiteral(value)
+        | AstValue::TripleDoubleQuotedRawStringLiteral(value)
+        | AstValue::SingleQuotedByteStringLiteral(value)
+        | AstValue::DoubleQuotedByteStringLiteral(value)
+        | AstValue::TripleSingleQuotedByteStringLiteral(value)
+        | AstValue::TripleDoubleQuotedByteStringLiteral(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" => Ok(Some(true)),
+                "0" | "false" | "" => Ok(Some(false)),
+                _ => Err(LixError {
+                    message: format!("{context} expects boolean-like text, got '{}'", value),
+                }),
+            }
+        }
+        AstValue::DollarQuotedString(value) => {
+            let normalized = value.value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" => Ok(Some(true)),
+                "0" | "false" | "" => Ok(Some(false)),
+                _ => Err(LixError {
+                    message: format!("{context} expects boolean-like text, got '{}'", value.value),
+                }),
+            }
+        }
+        AstValue::Placeholder(_) => Ok(None),
+    }
+}
+
 fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Option<String> {
-    let selection = selection?;
+    extract_predicate_string_with_params(selection, columns, &[])
+        .ok()
+        .flatten()
+}
+
+fn extract_predicate_string_with_params(
+    selection: Option<&Expr>,
+    columns: &[&str],
+    params: &[EngineValue],
+) -> Result<Option<String>, LixError> {
+    extract_predicate_string_with_params_and_dialect(
+        selection,
+        columns,
+        params,
+        crate::SqlDialect::Sqlite,
+    )
+}
+
+fn extract_predicate_string_with_params_and_dialect(
+    selection: Option<&Expr>,
+    columns: &[&str],
+    params: &[EngineValue],
+    dialect: crate::SqlDialect,
+) -> Result<Option<String>, LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    extract_predicate_string_with_params_and_state(
+        selection,
+        columns,
+        params,
+        &mut placeholder_state,
+        dialect,
+    )
+}
+
+fn extract_predicate_string_with_params_and_state(
+    selection: Option<&Expr>,
+    columns: &[&str],
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
+) -> Result<Option<String>, LixError> {
+    let selection = match selection {
+        Some(selection) => selection,
+        None => return Ok(None),
+    };
     match selection {
         Expr::BinaryOp { left, op, right } => {
             if op.to_string().eq_ignore_ascii_case("=") {
@@ -1246,8 +1645,10 @@ fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Optio
                         .iter()
                         .any(|candidate| column.eq_ignore_ascii_case(candidate))
                     {
-                        if let Some(value) = expr_string_literal(right) {
-                            return Some(value);
+                        if let Some(value) =
+                            expr_string_literal_or_placeholder(right, params, placeholder_state)?
+                        {
+                            return Ok(Some(value));
                         }
                     }
                 }
@@ -1256,18 +1657,141 @@ fn extract_predicate_string(selection: Option<&Expr>, columns: &[&str]) -> Optio
                         .iter()
                         .any(|candidate| column.eq_ignore_ascii_case(candidate))
                     {
-                        if let Some(value) = expr_string_literal(left) {
-                            return Some(value);
+                        if let Some(value) =
+                            expr_string_literal_or_placeholder(left, params, placeholder_state)?
+                        {
+                            return Ok(Some(value));
                         }
                     }
                 }
             }
-            extract_predicate_string(Some(left), columns)
-                .or_else(|| extract_predicate_string(Some(right), columns))
+            let left_match = extract_predicate_string_with_params_and_state(
+                Some(left),
+                columns,
+                params,
+                placeholder_state,
+                dialect,
+            )?;
+            if left_match.is_some() {
+                return Ok(left_match);
+            }
+            extract_predicate_string_with_params_and_state(
+                Some(right),
+                columns,
+                params,
+                placeholder_state,
+                dialect,
+            )
         }
-        Expr::Nested(inner) => extract_predicate_string(Some(inner), columns),
-        _ => None,
+        Expr::Nested(inner) => extract_predicate_string_with_params_and_state(
+            Some(inner),
+            columns,
+            params,
+            placeholder_state,
+            dialect,
+        ),
+        _ => {
+            consume_placeholders_in_expr(selection, params, placeholder_state, dialect)?;
+            Ok(None)
+        }
     }
+}
+
+fn consume_placeholders_in_expr(
+    expr: &Expr,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
+) -> Result<(), LixError> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::Placeholder(_),
+            ..
+        }) => {
+            let _ = resolve_expr_cell_with_state(expr, params, placeholder_state)?;
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            consume_placeholders_in_expr(left, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(right, params, placeholder_state, dialect)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)
+        }
+        Expr::InList { expr, list, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            for item in list {
+                consume_placeholders_in_expr(item, params, placeholder_state, dialect)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(low, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(high, params, placeholder_state, dialect)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(pattern, params, placeholder_state, dialect)
+        }
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => {
+                for arg in &list.args {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(expr),
+                        ) => {
+                            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?
+                        }
+                        sqlparser::ast::FunctionArg::Named { arg, .. }
+                        | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => {
+                            if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+                                consume_placeholders_in_expr(
+                                    expr,
+                                    params,
+                                    placeholder_state,
+                                    dialect,
+                                )?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            consume_placeholders_in_expr(left, params, placeholder_state, dialect)?;
+            consume_placeholders_in_expr(right, params, placeholder_state, dialect)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            consume_placeholders_in_expr(expr, params, placeholder_state, dialect)?;
+            consume_placeholders_in_query(subquery, params, placeholder_state, dialect)
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            consume_placeholders_in_query(subquery, params, placeholder_state, dialect)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn consume_placeholders_in_query(
+    query: &sqlparser::ast::Query,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
+) -> Result<(), LixError> {
+    let probe_sql = format!("SELECT 1 WHERE EXISTS ({})", query);
+    let bound = bind_sql_with_state(&probe_sql, params, dialect, *placeholder_state)?;
+    *placeholder_state = bound.state;
+    Ok(())
 }
 
 fn expr_column_name(expr: &Expr) -> Option<String> {
@@ -1307,6 +1831,29 @@ fn expr_string_literal(expr: &Expr) -> Option<String> {
             "0".to_string()
         }),
         AstValue::Null | AstValue::Placeholder(_) => None,
+    }
+}
+
+fn expr_string_literal_or_placeholder(
+    expr: &Expr,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<String>, LixError> {
+    if let Some(value) = expr_string_literal(expr) {
+        return Ok(Some(value));
+    }
+    let resolved = resolve_expr_cell_with_state(expr, params, placeholder_state)?;
+    let Some(value) = resolved.value else {
+        return Ok(None);
+    };
+    match value {
+        EngineValue::Text(value) => Ok(Some(value)),
+        EngineValue::Integer(value) => Ok(Some(value.to_string())),
+        EngineValue::Real(value) => Ok(Some(value.to_string())),
+        EngineValue::Null => Ok(None),
+        EngineValue::Blob(_) => Err(LixError {
+            message: "version_id predicate expects text-compatible value".to_string(),
+        }),
     }
 }
 
@@ -1581,7 +2128,15 @@ async fn directory_rows_matching_delete(
         )
     };
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-    let result = backend.execute(&rewritten_sql, params).await?;
+    let result = backend
+        .execute(&rewritten_sql, params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "directory delete scope prefetch failed for '{}': {}",
+                rewritten_sql, error.message
+            ),
+        })?;
 
     let mut rows: Vec<ScopedDirectoryId> = Vec::new();
     for row in result.rows {
@@ -1629,41 +2184,89 @@ async fn directory_rows_matching_delete(
     Ok(rows)
 }
 
+#[derive(Debug, Clone)]
+struct ScopedFileUpdateRow {
+    id: String,
+    untracked: bool,
+}
+
 async fn file_ids_matching_update(
     backend: &dyn LixBackend,
     update: &Update,
     target: FilesystemTarget,
     params: &[EngineValue],
-) -> Result<Vec<String>, LixError> {
+    placeholder_state: PlaceholderState,
+) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
     let where_clause = update
         .selection
         .as_ref()
         .map(|selection| format!(" WHERE {selection}"))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT id FROM {view_name}{where_clause}",
+        "SELECT id, lixcol_untracked FROM {view_name}{where_clause}",
         view_name = target.view_name,
         where_clause = where_clause
     );
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
-    let result = backend.execute(&rewritten_sql, params).await?;
+    let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
+    let result = backend
+        .execute(&bound.sql, &bound.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update scope prefetch failed for '{}': {}",
+                bound.sql, error.message
+            ),
+        })?;
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<ScopedFileUpdateRow> = Vec::new();
     for row in result.rows {
-        let Some(value) = row.first() else {
+        let Some(id_value) = row.first() else {
             continue;
         };
-        let EngineValue::Text(id) = value else {
+        let EngineValue::Text(id) = id_value else {
             return Err(LixError {
-                message: format!("file update id lookup expected text, got {value:?}"),
+                message: format!("file update id lookup expected text, got {id_value:?}"),
             });
         };
-        out.push(id.clone());
+        let untracked = row
+            .get(1)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        out.push(ScopedFileUpdateRow {
+            id: id.clone(),
+            untracked,
+        });
     }
 
-    out.sort();
-    out.dedup();
+    out.sort_by(|left, right| left.id.cmp(&right.id));
+    out.dedup_by(|left, right| left.id == right.id);
     Ok(out)
+}
+
+fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
+    match value {
+        EngineValue::Integer(v) => Ok(*v != 0),
+        EngineValue::Text(v) => {
+            let normalized = v.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" => Ok(true),
+                "0" | "false" | "" => Ok(false),
+                _ => Err(LixError {
+                    message: format!(
+                        "file update untracked lookup expected boolean-like text, got '{v}'"
+                    ),
+                }),
+            }
+        }
+        EngineValue::Null => Ok(false),
+        other => Err(LixError {
+            message: format!(
+                "file update untracked lookup expected boolean-like value, got {other:?}"
+            ),
+        }),
+    }
 }
 
 async fn expand_directory_descendants(
@@ -1905,8 +2508,15 @@ fn noop_statement() -> Result<Statement, LixError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_delete, rewrite_insert, rewrite_update};
+    use super::{
+        extract_predicate_string_with_params_and_state, parse_expression, rewrite_delete,
+        rewrite_insert, rewrite_update,
+    };
+    use crate::backend::SqlDialect;
     use crate::sql::parse_sql_statements;
+    use crate::sql::resolve_expr_cell_with_state;
+    use crate::sql::PlaceholderState;
+    use crate::Value;
     use sqlparser::ast::Statement;
 
     #[test]
@@ -1934,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_data_only_update_to_noop_statement() {
+    fn rewrites_data_only_update_to_noop_main_statement() {
         let sql = "UPDATE lix_file SET data = X'01' WHERE id = 'f1'";
         let statements = parse_sql_statements(sql).expect("parse");
         let update = match statements.into_iter().next().expect("statement") {
@@ -1946,6 +2556,40 @@ mod tests {
             .expect("rewrite")
             .expect("should rewrite");
         assert_eq!(rewritten.to_string(), "SELECT 0 WHERE 1 = 0");
+    }
+
+    #[test]
+    fn rejects_file_id_update() {
+        let sql = "UPDATE lix_file SET id = 'f2' WHERE id = 'f1'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let update = match statements.into_iter().next().expect("statement") {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update).expect_err("id update should fail");
+        assert!(
+            err.message.contains("lix_file id is immutable"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rejects_directory_id_update() {
+        let sql = "UPDATE lix_directory SET id = 'dir-2' WHERE id = 'dir-1'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let update = match statements.into_iter().next().expect("statement") {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update).expect_err("id update should fail");
+        assert!(
+            err.message.contains("lix_directory id is immutable"),
+            "unexpected error: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1963,5 +2607,87 @@ mod tests {
         assert!(rewritten
             .to_string()
             .contains("DELETE FROM lix_directory_descriptor"));
+    }
+
+    #[test]
+    fn version_predicate_extraction_respects_existing_placeholder_offset() {
+        let selection =
+            parse_expression("id = 'file-1' AND lixcol_version_id = ?").expect("parse selection");
+        let prior_placeholder = parse_expression("?").expect("parse placeholder expression");
+        let params = vec![
+            Value::Text("metadata-placeholder".to_string()),
+            Value::Text("version-target".to_string()),
+        ];
+
+        let mut offset_state = PlaceholderState::new();
+        resolve_expr_cell_with_state(&prior_placeholder, &params, &mut offset_state)
+            .expect("consume first placeholder");
+
+        let extracted_with_offset = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut offset_state,
+            SqlDialect::Sqlite,
+        )
+        .expect("extract with offset");
+        assert_eq!(extracted_with_offset.as_deref(), Some("version-target"));
+
+        let mut fresh_state = PlaceholderState::new();
+        let extracted_from_fresh = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut fresh_state,
+            SqlDialect::Sqlite,
+        )
+        .expect("extract with fresh state");
+        assert_eq!(
+            extracted_from_fresh.as_deref(),
+            Some("metadata-placeholder")
+        );
+    }
+
+    #[test]
+    fn version_predicate_extraction_skips_unrelated_equality_placeholders() {
+        let selection =
+            parse_expression("id = ? AND lixcol_version_id = ?").expect("parse selection");
+        let params = vec![
+            Value::Text("file-placeholder".to_string()),
+            Value::Text("version-target".to_string()),
+        ];
+
+        let mut state = PlaceholderState::new();
+        let extracted = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut state,
+            SqlDialect::Sqlite,
+        )
+        .expect("extract version predicate");
+        assert_eq!(extracted.as_deref(), Some("version-target"));
+    }
+
+    #[test]
+    fn version_predicate_extraction_skips_unrelated_in_list_placeholders() {
+        let selection =
+            parse_expression("id IN (?, ?) AND lixcol_version_id = ?").expect("parse selection");
+        let params = vec![
+            Value::Text("file-a".to_string()),
+            Value::Text("file-b".to_string()),
+            Value::Text("version-target".to_string()),
+        ];
+
+        let mut state = PlaceholderState::new();
+        let extracted = extract_predicate_string_with_params_and_state(
+            Some(&selection),
+            &["lixcol_version_id", "version_id"],
+            &params,
+            &mut state,
+            SqlDialect::Sqlite,
+        )
+        .expect("extract version predicate");
+        assert_eq!(extracted.as_deref(), Some("version-target"));
     }
 }

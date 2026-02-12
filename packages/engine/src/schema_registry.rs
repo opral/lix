@@ -1,10 +1,16 @@
 use crate::{LixBackend, LixError};
 
 pub async fn register_schema(backend: &dyn LixBackend, schema_key: &str) -> Result<(), LixError> {
+    let create_sql = register_schema_sql(schema_key);
+    backend.execute(&create_sql, &[]).await?;
+    Ok(())
+}
+
+pub fn register_schema_sql(schema_key: &str) -> String {
     let table_name = format!("lix_internal_state_materialized_v1_{}", schema_key);
     let table_ident = quote_ident(&table_name);
 
-    let create_sql = format!(
+    format!(
         "CREATE TABLE IF NOT EXISTS {table} (\
          entity_id TEXT NOT NULL,\
          schema_key TEXT NOT NULL,\
@@ -22,11 +28,7 @@ pub async fn register_schema(backend: &dyn LixBackend, schema_key: &str) -> Resu
          PRIMARY KEY (entity_id, file_id, version_id)\
          )",
         table = table_ident
-    );
-
-    backend.execute(&create_sql, &[]).await?;
-
-    Ok(())
+    )
 }
 
 fn quote_ident(value: &str) -> String {

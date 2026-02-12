@@ -233,6 +233,12 @@ mod tests {
                 message: format!("unexpected SQL in FakeBackend: {sql}"),
             })
         }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+            Err(LixError {
+                message: "FakeBackend does not support transactions".to_string(),
+            })
+        }
     }
 
     fn extract_single_quoted(sql: &str, prefix: &str) -> Option<String> {

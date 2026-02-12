@@ -6,7 +6,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::sql::params::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::steps::vtable_read;
+use crate::sql::{lower_statement, rewrite_read_query_with_backend};
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,9 +147,12 @@ pub async fn materialize_vtable_insert_select_sources(
                 continue;
             };
             let source_query = (**source).clone();
-            let rewritten_source =
-                vtable_read::rewrite_query(source_query.clone())?.unwrap_or(source_query);
-            let select_sql = rewritten_source.to_string();
+            let rewritten_source = rewrite_read_query_with_backend(backend, source_query).await?;
+            let lowered_source = lower_statement(
+                Statement::Query(Box::new(rewritten_source)),
+                backend.dialect(),
+            )?;
+            let select_sql = lowered_source.to_string();
             let result = backend.execute(&select_sql, params).await?;
 
             if result.rows.is_empty() {

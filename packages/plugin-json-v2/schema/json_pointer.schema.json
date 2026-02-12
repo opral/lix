@@ -1,0 +1,41 @@
+{
+  "x-lix-key": "json_pointer",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/path"
+  ],
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "RFC 6901 JSON Pointer path (empty string for root)."
+    },
+    "value": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "path",
+    "value"
+  ],
+  "additionalProperties": false
+}

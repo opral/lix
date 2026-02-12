@@ -44,7 +44,9 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         .collect();
     let engine = boot(BootArgs {
         backend,
+        wasm_runtime: None,
         key_values,
+        active_account: None,
     });
     engine.init().await?;
     Ok(Lix { engine })
