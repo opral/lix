@@ -349,6 +349,10 @@ pub fn rewrite_update(
     })?;
 
     let schema_key = extract_single_schema_key(&stripped_selection)?;
+    let writer_key_assignment_present = update
+        .assignments
+        .iter()
+        .any(|assignment| assignment_target_is_column(&assignment.target, "writer_key"));
     let explicit_writer_key = extract_explicit_writer_key_assignment(&update.assignments, params)?;
 
     let mut new_update = update.clone();
@@ -369,6 +373,7 @@ pub fn rewrite_update(
         plan: VtableUpdatePlan {
             schema_key,
             explicit_writer_key,
+            writer_key_assignment_present,
         },
         validation,
     })))
@@ -1407,10 +1412,13 @@ async fn build_update_followup_statements(
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
-        let row_writer_key = match &plan.explicit_writer_key {
-            Some(explicit) => explicit.clone(),
-            None => value_to_optional_text(&row[7], "writer_key")?
-                .or_else(|| writer_key.map(ToString::to_string)),
+        let row_writer_key = match (
+            &plan.explicit_writer_key,
+            plan.writer_key_assignment_present,
+        ) {
+            (Some(explicit), _) => explicit.clone(),
+            (None, true) => value_to_optional_text(&row[7], "writer_key")?,
+            (None, false) => writer_key.map(ToString::to_string),
         };
 
         affected_versions.insert(version_id.clone());
@@ -1495,8 +1503,7 @@ async fn build_delete_followup_statements(
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let _snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
-        let row_writer_key = value_to_optional_text(&row[7], "writer_key")?
-            .or_else(|| writer_key.map(ToString::to_string));
+        let row_writer_key = writer_key.map(ToString::to_string);
         if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
             deleted_directory_scopes.push((version_id.clone(), entity_id.clone()));
         }
@@ -3257,6 +3264,7 @@ mod tests {
             planned.plan.explicit_writer_key,
             Some(Some("editor:explicit".to_string()))
         );
+        assert!(planned.plan.writer_key_assignment_present);
     }
 
     #[test]
@@ -3282,6 +3290,33 @@ mod tests {
         };
 
         assert_eq!(planned.plan.explicit_writer_key, None);
+        assert!(planned.plan.writer_key_assignment_present);
+    }
+
+    #[test]
+    fn rewrite_update_without_writer_key_assignment_marks_absent() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET snapshot_content = '{"key":"value"}'
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(update, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(planned.plan.explicit_writer_key, None);
+        assert!(!planned.plan.writer_key_assignment_present);
     }
 
     #[test]

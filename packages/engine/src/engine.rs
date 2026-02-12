@@ -2059,9 +2059,7 @@ fn detected_file_domain_changes_with_writer_key(
         .iter()
         .map(|change| {
             let mut next = change.clone();
-            if next.writer_key.is_none() {
-                next.writer_key = writer_key.map(ToString::to_string);
-            }
+            next.writer_key = writer_key.map(ToString::to_string);
             next
         })
         .collect()
@@ -2954,15 +2952,16 @@ mod tests {
         active_version_from_update_validations, active_version_schema_key,
         advance_placeholder_state_for_statement,
         detected_file_domain_changes_from_detected_file_changes,
-        file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
+        detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
+        file_history_read_materialization_required_for_sql,
         file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
         FileReadMaterializationScope,
     };
     use crate::backend::SqlDialect;
-    use crate::sql::UpdateValidationPlan;
     use crate::sql::{
         bind_sql_with_state, parse_sql_statements, MutationOperation, MutationRow, PlaceholderState,
     };
+    use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
     use crate::Value;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
@@ -3154,6 +3153,31 @@ mod tests {
         let with_writer_key =
             detected_file_domain_changes_from_detected_file_changes(&detected, Some("writer-123"));
         assert_eq!(with_writer_key[0].writer_key.as_deref(), Some("writer-123"));
+    }
+
+    #[test]
+    fn detected_file_domain_changes_writer_key_is_overwritten_by_execution_writer() {
+        let detected = vec![DetectedFileDomainChange {
+            entity_id: "entity-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            schema_version: "1.0".to_string(),
+            file_id: "file-1".to_string(),
+            version_id: "version-1".to_string(),
+            plugin_key: "plugin-1".to_string(),
+            snapshot_content: Some("{\"a\":1}".to_string()),
+            metadata: None,
+            writer_key: Some("writer-stale".to_string()),
+        }];
+
+        let with_writer_key = detected_file_domain_changes_with_writer_key(&detected, None);
+        assert_eq!(with_writer_key[0].writer_key, None);
+
+        let with_writer_key =
+            detected_file_domain_changes_with_writer_key(&detected, Some("writer-current"));
+        assert_eq!(
+            with_writer_key[0].writer_key.as_deref(),
+            Some("writer-current")
+        );
     }
 
     #[test]

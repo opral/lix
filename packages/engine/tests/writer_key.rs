@@ -16,6 +16,13 @@ fn assert_blob_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_null(value: &Value) {
+    match value {
+        Value::Null => {}
+        other => panic!("expected null value, got {other:?}"),
+    }
+}
+
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
@@ -204,6 +211,103 @@ simulation_test!(
         assert_text(&rows.rows[0][1], "editor:override");
         assert_text(&rows.rows[1][0], "wk-override-2");
         assert_text(&rows.rows[1][1], "editor:tx-default");
+    }
+);
+
+simulation_test!(
+    update_without_writer_key_clears_writer_key,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute_with_options(
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-clear-update', '/wk-clear-update.json', 'before')",
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:initial".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_internal_state_vtable \
+                 SET metadata = '{\"source\":\"update\"}' \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND entity_id = 'wk-clear-update'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let state_row = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_file_descriptor' \
+                       AND entity_id = 'wk-clear-update' \
+                       AND version_id = '{version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_row.rows.len(), 1);
+        assert_null(&state_row.rows[0][0]);
+    }
+);
+
+simulation_test!(
+    delete_without_writer_key_clears_tombstone_writer_key,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute_with_options(
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-clear-delete', '/wk-clear-delete.json', 'before')",
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:initial".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute("DELETE FROM lix_file WHERE id = 'wk-clear-delete'", &[])
+            .await
+            .unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let tombstone = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key, is_tombstone \
+                     FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                     WHERE entity_id = 'wk-clear-delete' \
+                       AND version_id = '{version_id}' \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tombstone.rows.len(), 1);
+        assert_null(&tombstone.rows[0][0]);
+        assert_eq!(tombstone.rows[0][1], Value::Integer(1));
     }
 );
 
