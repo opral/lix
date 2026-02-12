@@ -22,24 +22,48 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
     params: &[Value],
     functions: &mut P,
 ) -> Result<RewriteOutput, LixError> {
+    rewrite_statement_with_writer_key(statement, params, functions, None)
+}
+
+pub(crate) fn rewrite_statement_with_writer_key<P: LixFunctionProvider>(
+    statement: Statement,
+    params: &[Value],
+    functions: &mut P,
+    writer_key: Option<&str>,
+) -> Result<RewriteOutput, LixError> {
     match statement {
         Statement::Insert(insert) => {
             lix_state_history_view_write::reject_insert(&insert)?;
             if let Some(rewritten) = filesystem_step::rewrite_insert(insert.clone())? {
-                return rewrite_statement(Statement::Insert(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Insert(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
             if let Some(version_inserts) =
                 lix_version_view_write::rewrite_insert(insert.clone(), params)?
             {
-                return rewrite_vtable_inserts(version_inserts, params, functions);
+                return rewrite_vtable_inserts(version_inserts, params, functions, writer_key);
             }
             if let Some(active_account_inserts) =
                 lix_active_account_view_write::rewrite_insert(insert.clone(), params)?
             {
-                return rewrite_vtable_inserts(active_account_inserts, params, functions);
+                return rewrite_vtable_inserts(
+                    active_account_inserts,
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
             if let Some(rewritten) = entity_view_write::rewrite_insert(insert.clone(), params)? {
-                return rewrite_statement(Statement::Insert(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Insert(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
 
             let mut current = Statement::Insert(insert);
@@ -63,9 +87,12 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
                 }
             }
             if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) =
-                    vtable_write::rewrite_insert(inner.clone(), params, functions)?
-                {
+                if let Some(rewritten) = vtable_write::rewrite_insert_with_writer_key(
+                    inner.clone(),
+                    params,
+                    writer_key,
+                    functions,
+                )? {
                     registrations.extend(rewritten.registrations);
                     statements = rewritten.statements;
                     mutations = rewritten.mutations;
@@ -87,10 +114,15 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
         Statement::Update(update) => {
             lix_state_history_view_write::reject_update(&update)?;
             if let Some(rewritten) = filesystem_step::rewrite_update(update.clone())? {
-                return rewrite_statement(rewritten, params, functions);
+                return rewrite_statement_with_writer_key(rewritten, params, functions, writer_key);
             }
             if let Some(rewritten) = entity_view_write::rewrite_update(update.clone(), params)? {
-                return rewrite_statement(Statement::Update(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Update(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
             let update = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_update(update.clone())?
@@ -127,10 +159,20 @@ pub fn rewrite_statement<P: LixFunctionProvider>(
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
             if let Some(rewritten) = filesystem_step::rewrite_delete(delete.clone())? {
-                return rewrite_statement(Statement::Delete(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Delete(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
             if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
-                return rewrite_statement(Statement::Delete(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Delete(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
             let delete = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
@@ -190,6 +232,7 @@ pub async fn rewrite_statement_with_backend<P>(
     params: &[Value],
     functions: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -226,6 +269,7 @@ where
                     params,
                     functions,
                     &insert_detected_file_domain_changes,
+                    writer_key,
                 )
                 .await;
             }
@@ -238,6 +282,7 @@ where
                     params,
                     functions,
                     &insert_detected_file_domain_changes,
+                    writer_key,
                 )
                 .await;
             }
@@ -289,6 +334,7 @@ where
                     inner.clone(),
                     params,
                     &insert_detected_file_domain_changes,
+                    writer_key,
                     functions,
                 )
                 .await?
@@ -319,6 +365,7 @@ where
                     params,
                     functions,
                     detected_file_domain_changes,
+                    writer_key,
                 )
                 .await?;
             }
@@ -333,7 +380,11 @@ where
             {
                 match rewritten {
                     Statement::Update(update) => update,
-                    other => return rewrite_statement(other, params, functions),
+                    other => {
+                        return rewrite_statement_with_writer_key(
+                            other, params, functions, writer_key,
+                        )
+                    }
                 }
             } else {
                 update
@@ -360,6 +411,7 @@ where
                     params,
                     functions,
                     detected_file_domain_changes,
+                    writer_key,
                 )
                 .await;
             }
@@ -367,14 +419,24 @@ where
             if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_update(update.clone())?
             {
-                return rewrite_statement(Statement::Update(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Update(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
 
             if let Some(rewritten) =
                 lix_state_view_write::rewrite_update_with_backend(backend, update.clone(), params)
                     .await?
             {
-                return rewrite_statement(Statement::Update(rewritten), params, functions);
+                return rewrite_statement_with_writer_key(
+                    Statement::Update(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                );
             }
 
             if let Some(version_inserts) =
@@ -387,11 +449,17 @@ where
                     params,
                     functions,
                     detected_file_domain_changes,
+                    writer_key,
                 )
                 .await;
             }
 
-            rewrite_statement(Statement::Update(update), params, functions)
+            rewrite_statement_with_writer_key(
+                Statement::Update(update),
+                params,
+                functions,
+                writer_key,
+            )
         }
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
@@ -413,7 +481,12 @@ where
             let output = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
-                rewrite_statement(Statement::Delete(rewritten), params, functions)?
+                rewrite_statement_with_writer_key(
+                    Statement::Delete(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                )?
             } else if let Some(rewritten) =
                 lix_active_account_view_write::rewrite_delete_with_backend(
                     backend,
@@ -422,11 +495,16 @@ where
                 )
                 .await?
             {
-                rewrite_statement(rewritten, params, functions)?
+                rewrite_statement_with_writer_key(rewritten, params, functions, writer_key)?
             } else if let Some(rewritten) =
                 lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
             {
-                rewrite_statement(Statement::Delete(rewritten), params, functions)?
+                rewrite_statement_with_writer_key(
+                    Statement::Delete(rewritten),
+                    params,
+                    functions,
+                    writer_key,
+                )?
             } else if let Some(version_inserts) =
                 lix_version_view_write::rewrite_delete_with_backend(backend, delete.clone(), params)
                     .await?
@@ -437,10 +515,16 @@ where
                     params,
                     functions,
                     detected_file_domain_changes,
+                    writer_key,
                 )
                 .await?
             } else {
-                rewrite_statement(Statement::Delete(delete), params, functions)?
+                rewrite_statement_with_writer_key(
+                    Statement::Delete(delete),
+                    params,
+                    functions,
+                    writer_key,
+                )?
             };
             Ok(output)
         }
@@ -454,7 +538,7 @@ where
                 update_validations: Vec::new(),
             })
         }
-        other => rewrite_statement(other, params, functions),
+        other => rewrite_statement_with_writer_key(other, params, functions, writer_key),
     }
 }
 
@@ -521,6 +605,7 @@ async fn prepend_statements_with_backend<P>(
     params: &[Value],
     functions: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -544,6 +629,7 @@ where
             params,
             functions,
             detected_file_domain_changes,
+            writer_key,
         ))
         .await?;
         merge_rewrite_output(&mut prefixed, rewritten)?;
@@ -586,13 +672,16 @@ fn rewrite_vtable_inserts<P: LixFunctionProvider>(
     inserts: Vec<Insert>,
     params: &[Value],
     functions: &mut P,
+    writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError> {
     let mut statements = Vec::new();
     let mut registrations = Vec::new();
     let mut mutations = Vec::new();
 
     for insert in inserts {
-        let Some(rewritten) = vtable_write::rewrite_insert(insert, params, functions)? else {
+        let Some(rewritten) =
+            vtable_write::rewrite_insert_with_writer_key(insert, params, writer_key, functions)?
+        else {
             return Err(LixError {
                 message: "lix_version rewrite expected vtable insert rewrite".to_string(),
             });
@@ -617,6 +706,7 @@ async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
     params: &[Value],
     functions: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError> {
     let mut statements = Vec::new();
     let mut registrations = Vec::new();
@@ -628,6 +718,7 @@ async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
             insert,
             params,
             detected_file_domain_changes,
+            writer_key,
             functions,
         )
         .await?

@@ -16,6 +16,7 @@ pub use pipeline::{
     parse_sql_statements, preprocess_sql, preprocess_sql_rewrite_only,
     preprocess_sql_with_provider, preprocess_sql_with_provider_and_detected_file_domain_changes,
     preprocess_statements, preprocess_statements_with_provider,
+    preprocess_statements_with_provider_and_writer_key,
 };
 pub(crate) use route::rewrite_read_query_with_backend;
 pub(crate) use row_resolution::{

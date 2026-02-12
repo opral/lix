@@ -133,6 +133,7 @@ fn build_lix_state_by_version_view_query() -> Result<Query, LixError> {
              ranked.change_id AS change_id, \
              ranked.commit_id AS commit_id, \
              ranked.untracked AS untracked, \
+             ranked.writer_key AS writer_key, \
              ranked.metadata AS metadata \
          FROM ( \
            WITH RECURSIVE \
@@ -215,6 +216,7 @@ fn build_lix_state_by_version_view_query() -> Result<Query, LixError> {
              s.change_id AS change_id, \
              COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) AS commit_id, \
              s.untracked AS untracked, \
+             s.writer_key AS writer_key, \
              s.metadata AS metadata, \
              ROW_NUMBER() OVER ( \
                PARTITION BY vc.target_version_id, s.entity_id, s.schema_key, s.file_id \

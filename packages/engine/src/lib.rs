@@ -34,7 +34,10 @@ pub use commit::{
     generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
     MaterializedStateRow, VersionInfo, VersionSnapshot,
 };
-pub use engine::{boot, BootAccount, BootArgs, BootKeyValue, Engine};
+pub use engine::{
+    boot, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction, EngineTransactionFuture,
+    ExecuteOptions,
+};
 pub use error::LixError;
 pub use materialization::{
     apply_materialization_plan, materialization_plan, materialize, InheritanceWinnerDebugRow,

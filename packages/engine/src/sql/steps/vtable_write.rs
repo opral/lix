@@ -4,7 +4,7 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, DoUpdate, Expr, Function,
     FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, OnConflict,
     OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, Value, ValueWithSpan, Values,
+    TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -50,6 +50,7 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "schema_version",
     "snapshot_content",
     "metadata",
+    "writer_key",
     "updated_at",
 ];
 
@@ -149,9 +150,19 @@ pub struct DetectedFileDomainChange {
     pub writer_key: Option<String>,
 }
 
+#[allow(dead_code)]
 pub fn rewrite_insert(
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<Option<VtableWriteRewrite>, LixError> {
+    rewrite_insert_with_writer_key(insert, params, None, functions)
+}
+
+pub fn rewrite_insert_with_writer_key(
+    insert: sqlparser::ast::Insert,
+    params: &[EngineValue],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Option<VtableWriteRewrite>, LixError> {
     if !table_object_is_vtable(&insert.table) {
@@ -184,6 +195,7 @@ pub fn rewrite_insert(
             tracked_rows,
             &mut registrations,
             &mut mutations,
+            writer_key,
             functions,
         )?;
         statements.extend(tracked);
@@ -206,6 +218,7 @@ pub async fn rewrite_insert_with_backend(
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Option<VtableWriteRewrite>, LixError> {
     if !table_object_is_vtable(&insert.table) {
@@ -240,6 +253,7 @@ pub async fn rewrite_insert_with_backend(
             &mut registrations,
             &mut mutations,
             detected_file_domain_changes,
+            writer_key,
             functions,
         )
         .await?;
@@ -335,6 +349,11 @@ pub fn rewrite_update(
     })?;
 
     let schema_key = extract_single_schema_key(&stripped_selection)?;
+    let writer_key_assignment_present = update
+        .assignments
+        .iter()
+        .any(|assignment| assignment_target_is_column(&assignment.target, "writer_key"));
+    let explicit_writer_key = extract_explicit_writer_key_assignment(&update.assignments, params)?;
 
     let mut new_update = update.clone();
     replace_table_with_materialized(&mut new_update.table, &schema_key);
@@ -351,7 +370,11 @@ pub fn rewrite_update(
 
     Ok(Some(UpdateRewrite::Planned(VtableUpdateRewrite {
         statement: Statement::Update(new_update),
-        plan: VtableUpdatePlan { schema_key },
+        plan: VtableUpdatePlan {
+            schema_key,
+            explicit_writer_key,
+            writer_key_assignment_present,
+        },
         validation,
     })))
 }
@@ -455,13 +478,16 @@ pub async fn build_update_followup_sql(
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
+    let mut executor = TransactionExecutor { transaction };
     let statements = build_update_followup_statements(
-        transaction,
+        &mut executor,
         plan,
         rows,
         detected_file_domain_changes,
+        writer_key,
         functions,
     )
     .await?;
@@ -477,13 +503,16 @@ pub async fn build_delete_followup_sql(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<String, LixError> {
+    let mut executor = TransactionExecutor { transaction };
     let statements = build_delete_followup_statements(
-        transaction,
+        &mut executor,
         plan,
         rows,
         detected_file_domain_changes,
+        writer_key,
         functions,
     )
     .await?;
@@ -611,6 +640,15 @@ fn build_materialized_on_conflict() -> OnInsert {
                 },
                 Assignment {
                     target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("writer_key")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("writer_key"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
                         ObjectNamePart::Identifier(Ident::new("updated_at")),
                     ])),
                     value: Expr::CompoundIdentifier(vec![
@@ -682,6 +720,7 @@ fn rewrite_tracked_rows(
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     registrations: &mut Vec<SchemaRegistration>,
     mutations: &mut Vec<MutationRow>,
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
@@ -692,6 +731,7 @@ fn rewrite_tracked_rows(
     let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
     let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
     let metadata_idx = find_column_index(&insert.columns, "metadata");
+    let writer_key_idx = find_column_index(&insert.columns, "writer_key");
 
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
@@ -734,6 +774,18 @@ fn rewrite_tracked_rows(
             Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
             None => null_expr(),
         };
+        let explicit_writer_key = match writer_key_idx {
+            Some(index) => {
+                resolved_optional_string(materialized.get(index), row.get(index), "writer_key")?
+            }
+            None => None,
+        };
+        let resolved_writer_key =
+            explicit_writer_key.or_else(|| writer_key.map(ToString::to_string));
+        let writer_key_expr = resolved_writer_key
+            .as_ref()
+            .map(|value| string_expr(value))
+            .unwrap_or_else(null_expr);
 
         change_rows.push(vec![
             string_expr(&change_id),
@@ -763,6 +815,7 @@ fn rewrite_tracked_rows(
             snapshot_content,
             string_expr(&change_id),
             metadata_expr,
+            writer_key_expr,
             number_expr("0"),
             string_expr(&created_at),
             string_expr(&updated_at),
@@ -862,6 +915,7 @@ fn rewrite_tracked_rows(
                 Ident::new("snapshot_content"),
                 Ident::new("change_id"),
                 Ident::new("metadata"),
+                Ident::new("writer_key"),
                 Ident::new("is_tombstone"),
                 Ident::new("created_at"),
                 Ident::new("updated_at"),
@@ -881,6 +935,7 @@ async fn rewrite_tracked_rows_with_backend(
     registrations: &mut Vec<SchemaRegistration>,
     mutations: &mut Vec<MutationRow>,
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
@@ -891,6 +946,7 @@ async fn rewrite_tracked_rows_with_backend(
     let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
     let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
     let metadata_idx = find_column_index(&insert.columns, "metadata");
+    let writer_key_idx = find_column_index(&insert.columns, "writer_key");
 
     let timestamp = functions.timestamp();
     let mut domain_changes = Vec::new();
@@ -933,6 +989,13 @@ async fn rewrite_tracked_rows_with_backend(
             }
             None => None,
         };
+        let explicit_writer_key = match writer_key_idx {
+            Some(index) => {
+                resolved_optional_string(materialized.get(index), row.get(index), "writer_key")?
+            }
+            None => None,
+        };
+        let domain_writer_key = explicit_writer_key.or_else(|| writer_key.map(ToString::to_string));
 
         ensure_registration(registrations, &schema_key);
 
@@ -949,7 +1012,7 @@ async fn rewrite_tracked_rows_with_backend(
             metadata: metadata_json.as_ref().map(JsonValue::to_string),
             created_at: timestamp.clone(),
             version_id: version_id.clone(),
-            writer_key: None,
+            writer_key: domain_writer_key,
         });
 
         mutations.push(MutationRow {
@@ -968,6 +1031,10 @@ async fn rewrite_tracked_rows_with_backend(
     for change in detected_file_domain_changes {
         affected_versions.insert(change.version_id.clone());
         ensure_registration(registrations, &change.schema_key);
+        let domain_writer_key = change
+            .writer_key
+            .clone()
+            .or_else(|| writer_key.map(ToString::to_string));
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
             entity_id: change.entity_id.clone(),
@@ -979,7 +1046,7 @@ async fn rewrite_tracked_rows_with_backend(
             snapshot_content: change.snapshot_content.clone(),
             metadata: change.metadata.clone(),
             created_at: timestamp.clone(),
-            writer_key: change.writer_key.clone(),
+            writer_key: domain_writer_key,
         });
     }
 
@@ -1033,6 +1100,10 @@ fn materialized_row_values(row: &MaterializedStateRow) -> Vec<Expr> {
             .unwrap_or_else(null_expr),
         string_expr(&row.id),
         row.metadata
+            .as_ref()
+            .map(|value| string_expr(value))
+            .unwrap_or_else(null_expr),
+        row.writer_key
             .as_ref()
             .map(|value| string_expr(value))
             .unwrap_or_else(null_expr),
@@ -1312,10 +1383,11 @@ fn build_untracked_insert(
 }
 
 async fn build_update_followup_statements(
-    transaction: &mut dyn LixTransaction,
+    executor: &mut dyn SqlExecutor,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     if rows.is_empty() && detected_file_domain_changes.is_empty() {
@@ -1340,6 +1412,14 @@ async fn build_update_followup_statements(
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
+        let row_writer_key = match (
+            &plan.explicit_writer_key,
+            plan.writer_key_assignment_present,
+        ) {
+            (Some(explicit), _) => explicit.clone(),
+            (None, true) => value_to_optional_text(&row[7], "writer_key")?,
+            (None, false) => writer_key.map(ToString::to_string),
+        };
 
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
@@ -1353,12 +1433,16 @@ async fn build_update_followup_statements(
             snapshot_content,
             metadata,
             created_at: timestamp.clone(),
-            writer_key: None,
+            writer_key: row_writer_key,
         });
     }
 
     for change in detected_file_domain_changes {
         affected_versions.insert(change.version_id.clone());
+        let domain_writer_key = change
+            .writer_key
+            .clone()
+            .or_else(|| writer_key.map(ToString::to_string));
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
             entity_id: change.entity_id.clone(),
@@ -1370,13 +1454,12 @@ async fn build_update_followup_statements(
             snapshot_content: change.snapshot_content.clone(),
             metadata: change.metadata.clone(),
             created_at: timestamp.clone(),
-            writer_key: change.writer_key.clone(),
+            writer_key: domain_writer_key,
         });
     }
 
-    let mut executor = TransactionExecutor { transaction };
-    let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
+    let versions = load_version_info_for_versions(executor, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
@@ -1390,10 +1473,11 @@ async fn build_update_followup_statements(
 }
 
 async fn build_delete_followup_statements(
-    transaction: &mut dyn LixTransaction,
+    executor: &mut dyn SqlExecutor,
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<Statement>, LixError> {
     if rows.is_empty() && detected_file_domain_changes.is_empty() {
@@ -1419,6 +1503,7 @@ async fn build_delete_followup_statements(
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let _snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
+        let row_writer_key = writer_key.map(ToString::to_string);
         if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
             deleted_directory_scopes.push((version_id.clone(), entity_id.clone()));
         }
@@ -1434,16 +1519,16 @@ async fn build_delete_followup_statements(
             snapshot_content: None,
             metadata,
             created_at: timestamp.clone(),
-            writer_key: None,
+            writer_key: row_writer_key,
         });
     }
 
     if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-        let mut executor = TransactionExecutor { transaction };
         let cascaded_file_deletes = load_cascaded_file_delete_changes(
-            &mut executor,
+            executor,
             &deleted_directory_scopes,
             &timestamp,
+            writer_key,
             functions,
         )
         .await?;
@@ -1455,6 +1540,10 @@ async fn build_delete_followup_statements(
 
     for change in detected_file_domain_changes {
         affected_versions.insert(change.version_id.clone());
+        let domain_writer_key = change
+            .writer_key
+            .clone()
+            .or_else(|| writer_key.map(ToString::to_string));
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
             entity_id: change.entity_id.clone(),
@@ -1466,13 +1555,12 @@ async fn build_delete_followup_statements(
             snapshot_content: change.snapshot_content.clone(),
             metadata: change.metadata.clone(),
             created_at: timestamp.clone(),
-            writer_key: change.writer_key.clone(),
+            writer_key: domain_writer_key,
         });
     }
 
-    let mut executor = TransactionExecutor { transaction };
-    let versions = load_version_info_for_versions(&mut executor, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes).await?;
+    let versions = load_version_info_for_versions(executor, &affected_versions).await?;
+    let active_accounts = load_commit_active_accounts(executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
@@ -1489,6 +1577,7 @@ async fn load_cascaded_file_delete_changes(
     executor: &mut dyn SqlExecutor,
     directory_scopes: &[(String, String)],
     timestamp: &str,
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Vec<DomainChangeInput>, LixError> {
     if directory_scopes.is_empty() {
@@ -1561,7 +1650,7 @@ async fn load_cascaded_file_delete_changes(
                 snapshot_content: None,
                 metadata,
                 created_at: timestamp.to_string(),
-                writer_key: None,
+                writer_key: writer_key.map(ToString::to_string),
             });
         }
     }
@@ -1606,6 +1695,87 @@ fn build_update_returning() -> Vec<SelectItem> {
         .iter()
         .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*column))))
         .collect()
+}
+
+fn extract_explicit_writer_key_assignment(
+    assignments: &[Assignment],
+    params: &[EngineValue],
+) -> Result<Option<Option<String>>, LixError> {
+    let mut state = PlaceholderState::new();
+    for assignment in assignments {
+        let resolved =
+            resolve_assignment_with_placeholder_state(&assignment.value, params, &mut state)?;
+        if !assignment_target_is_column(&assignment.target, "writer_key") {
+            continue;
+        }
+
+        return match resolved.value {
+            Some(EngineValue::Text(value)) => Ok(Some(Some(value))),
+            Some(EngineValue::Null) => Ok(Some(None)),
+            None => Ok(None),
+            Some(other) => Err(LixError {
+                message: format!("writer_key assignment expects text or null, got {other:?}"),
+            }),
+        };
+    }
+
+    Ok(None)
+}
+
+fn resolve_assignment_with_placeholder_state(
+    expr: &Expr,
+    params: &[EngineValue],
+    state: &mut PlaceholderState,
+) -> Result<ResolvedCell, LixError> {
+    let resolved = resolve_expr_cell_with_state(expr, params, state)?;
+    if resolved.value.is_none() {
+        advance_placeholder_state_for_expr(expr, params, state)?;
+    }
+    Ok(resolved)
+}
+
+fn advance_placeholder_state_for_expr(
+    expr: &Expr,
+    params: &[EngineValue],
+    state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    struct PlaceholderStateAdvancer<'a> {
+        params_len: usize,
+        state: &'a mut PlaceholderState,
+        error: Option<LixError>,
+    }
+
+    impl Visitor for PlaceholderStateAdvancer<'_> {
+        type Break = ();
+
+        fn pre_visit_value(&mut self, value: &Value) -> std::ops::ControlFlow<Self::Break> {
+            let Value::Placeholder(token) = value else {
+                return std::ops::ControlFlow::Continue(());
+            };
+
+            if let Err(error) =
+                crate::sql::params::resolve_placeholder_index(token, self.params_len, self.state)
+            {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    let mut advancer = PlaceholderStateAdvancer {
+        params_len: params.len(),
+        state,
+        error: None,
+    };
+    let _ = expr.visit(&mut advancer);
+
+    if let Some(error) = advancer.error {
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn lix_timestamp_expr() -> Expr {
@@ -1727,6 +1897,7 @@ fn build_statements_from_generate_commit_result(
                 Ident::new("snapshot_content"),
                 Ident::new("change_id"),
                 Ident::new("metadata"),
+                Ident::new("writer_key"),
                 Ident::new("is_tombstone"),
                 Ident::new("created_at"),
                 Ident::new("updated_at"),
@@ -1975,6 +2146,37 @@ fn resolved_optional_json(
     }
 
     literal_optional_json(expr, field_name)
+}
+
+fn resolved_optional_string(
+    cell: Option<&ResolvedCell>,
+    expr: Option<&Expr>,
+    field_name: &str,
+) -> Result<Option<String>, LixError> {
+    if let Some(cell) = cell {
+        match &cell.value {
+            Some(EngineValue::Null) => return Ok(None),
+            Some(EngineValue::Text(value)) => return Ok(Some(value.clone())),
+            _ => {}
+        }
+    }
+
+    let Some(expr) = expr else {
+        return Ok(None);
+    };
+
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => Ok(None),
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(value),
+            ..
+        }) => Ok(Some(value.clone())),
+        _ => Err(LixError {
+            message: format!("vtable insert requires literal {field_name}"),
+        }),
+    }
 }
 
 fn resolved_expr_or_original(
@@ -3028,6 +3230,93 @@ mod tests {
 
         let validation = planned.validation.expect("validation plan");
         assert_eq!(validation.snapshot_content, Some(json!({ "key": "value" })));
+    }
+
+    #[test]
+    fn rewrite_update_extracts_writer_key_after_prior_placeholders() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET metadata = ? || '', writer_key = ?
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(
+            update,
+            &[
+                EngineValue::Text("ignored".to_string()),
+                EngineValue::Text("editor:explicit".to_string()),
+            ],
+        )
+        .expect("rewrite ok")
+        .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(
+            planned.plan.explicit_writer_key,
+            Some(Some("editor:explicit".to_string()))
+        );
+        assert!(planned.plan.writer_key_assignment_present);
+    }
+
+    #[test]
+    fn rewrite_update_non_literal_writer_key_does_not_force_null() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET writer_key = lower('EDITOR')
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(update, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(planned.plan.explicit_writer_key, None);
+        assert!(planned.plan.writer_key_assignment_present);
+    }
+
+    #[test]
+    fn rewrite_update_without_writer_key_assignment_marks_absent() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET snapshot_content = '{"key":"value"}'
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(update, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(planned.plan.explicit_writer_key, None);
+        assert!(!planned.plan.writer_key_assignment_present);
     }
 
     #[test]
