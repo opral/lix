@@ -329,7 +329,7 @@ impl Engine {
             Ok(output) => output,
             Err(error) if should_sequentialize_postprocess_multi_statement(sql, params, &error) => {
                 return self
-                    .execute_multi_statement_sequential_with_options(sql, &options)
+                    .execute_multi_statement_sequential_with_options(sql, params, &options)
                     .await;
             }
             Err(error) => return Err(error),
@@ -607,6 +607,7 @@ impl Engine {
                         self.execute_multi_statement_sequential_with_options_in_transaction(
                             transaction,
                             sql,
+                            params,
                             options,
                             active_version_id,
                         ),
@@ -1840,14 +1841,18 @@ impl Engine {
     async fn execute_multi_statement_sequential_with_options(
         &self,
         sql: &str,
+        params: &[Value],
         options: &ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
         let statements = parse_sql_statements(sql)?;
         let mut last_result = QueryResult { rows: Vec::new() };
         for statement in statements {
-            last_result =
-                Box::pin(self.execute_with_options(&statement.to_string(), &[], options.clone()))
-                    .await?;
+            last_result = Box::pin(self.execute_with_options(
+                &statement.to_string(),
+                params,
+                options.clone(),
+            ))
+            .await?;
         }
         Ok(last_result)
     }
@@ -1856,6 +1861,7 @@ impl Engine {
         &self,
         transaction: &mut dyn LixTransaction,
         sql: &str,
+        params: &[Value],
         options: &ExecuteOptions,
         active_version_id: &mut String,
     ) -> Result<QueryResult, LixError> {
@@ -1865,7 +1871,7 @@ impl Engine {
             last_result = Box::pin(self.execute_with_options_in_transaction(
                 transaction,
                 &statement.to_string(),
-                &[],
+                params,
                 options,
                 active_version_id,
             ))

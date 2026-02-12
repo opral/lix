@@ -365,3 +365,71 @@ simulation_test!(
         assert_text(&state_row.rows[0][0], "editor:explicit-update");
     }
 );
+
+simulation_test!(
+    init_migrates_legacy_writer_key_columns,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine
+            .raw_engine()
+            .execute(
+                "CREATE TABLE lix_internal_state_materialized_v1_legacy_schema (\
+                 entity_id TEXT NOT NULL,\
+                 schema_key TEXT NOT NULL,\
+                 schema_version TEXT NOT NULL,\
+                 file_id TEXT NOT NULL,\
+                 version_id TEXT NOT NULL,\
+                 plugin_key TEXT NOT NULL,\
+                 snapshot_content TEXT,\
+                 inherited_from_version_id TEXT,\
+                 change_id TEXT NOT NULL,\
+                 metadata TEXT,\
+                 is_tombstone INTEGER NOT NULL DEFAULT 0,\
+                 created_at TEXT NOT NULL,\
+                 updated_at TEXT NOT NULL,\
+                 PRIMARY KEY (entity_id, file_id, version_id)\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .raw_engine()
+            .execute(
+                "CREATE TABLE lix_internal_file_lixcol_cache (\
+                 file_id TEXT NOT NULL,\
+                 version_id TEXT NOT NULL,\
+                 latest_change_id TEXT,\
+                 latest_commit_id TEXT,\
+                 created_at TEXT,\
+                 updated_at TEXT,\
+                 PRIMARY KEY (file_id, version_id)\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "SELECT writer_key FROM lix_internal_state_materialized_v1_legacy_schema LIMIT 0",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "SELECT writer_key FROM lix_internal_file_lixcol_cache LIMIT 0",
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+);
