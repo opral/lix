@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, Engine, LixBackend, LixError,
+    boot, BootAccount, BootArgs, BootKeyValue, Engine, ExecuteOptions, LixBackend, LixError,
     MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
     MaterializationReport, MaterializationRequest, MaterializationScope, QueryResult, Value,
     WasmRuntime,
@@ -83,6 +83,32 @@ impl SimulationEngine {
             }
             StatementKind::Other => self.engine.execute(sql, params).await,
         }
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
+        match classify_statement(sql) {
+            StatementKind::Read => {
+                self.rematerialize_before_read_if_needed().await?;
+                self.engine.execute_with_options(sql, params, options).await
+            }
+            StatementKind::Write => {
+                let result = self.engine.execute_with_options(sql, params, options).await;
+                if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
+                    self.rematerialization_pending.store(true, Ordering::SeqCst);
+                }
+                result
+            }
+            StatementKind::Other => self.engine.execute_with_options(sql, params, options).await,
+        }
+    }
+
+    pub fn raw_engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub async fn install_plugin(

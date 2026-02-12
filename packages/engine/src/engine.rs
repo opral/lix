@@ -43,20 +43,31 @@ use crate::version::{
     version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
 };
 use crate::WasmRuntime;
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
     TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecuteOptions {
+    pub writer_key: Option<String>,
+}
+
+pub type EngineTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LixError>> + 'a>>;
 
 #[derive(Debug, Clone)]
 pub struct BootKeyValue {
@@ -99,6 +110,104 @@ pub struct Engine {
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
+}
+
+pub struct EngineTransaction<'a> {
+    engine: &'a Engine,
+    transaction: Option<Box<dyn LixTransaction + 'a>>,
+    options: ExecuteOptions,
+    active_version_id: String,
+}
+
+impl<'a> EngineTransaction<'a> {
+    pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
+        let mut effective_options = self.options.clone();
+        if options.writer_key.is_some() {
+            effective_options.writer_key = options.writer_key;
+        }
+        let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
+            message: "transaction is no longer active".to_string(),
+        })?;
+        self.engine
+            .execute_with_options_in_transaction(
+                transaction.as_mut(),
+                sql,
+                params,
+                &effective_options,
+                &mut self.active_version_id,
+            )
+            .await
+    }
+
+    pub async fn commit(mut self) -> Result<(), LixError> {
+        let transaction = self.transaction.take().ok_or_else(|| LixError {
+            message: "transaction is no longer active".to_string(),
+        })?;
+        transaction.commit().await?;
+        self.engine.set_active_version_id(self.active_version_id);
+        Ok(())
+    }
+
+    pub async fn rollback(mut self) -> Result<(), LixError> {
+        let transaction = self.transaction.take().ok_or_else(|| LixError {
+            message: "transaction is no longer active".to_string(),
+        })?;
+        transaction.rollback().await
+    }
+}
+
+struct TransactionBackendAdapter<'a> {
+    dialect: crate::SqlDialect,
+    transaction: Mutex<*mut (dyn LixTransaction + 'a)>,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+// SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
+// Internal access to the raw transaction pointer is serialized with a mutex.
+unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
+// SAFETY: see `Send` impl above.
+unsafe impl<'a> Sync for TransactionBackendAdapter<'a> {}
+
+impl<'a> TransactionBackendAdapter<'a> {
+    fn new(transaction: &'a mut dyn LixTransaction) -> Self {
+        Self {
+            dialect: transaction.dialect(),
+            transaction: Mutex::new(transaction as *mut (dyn LixTransaction + 'a)),
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a> LixBackend for TransactionBackendAdapter<'a> {
+    fn dialect(&self) -> crate::SqlDialect {
+        self.dialect
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        let mut guard = self.transaction.lock().map_err(|_| LixError {
+            message: "transaction adapter lock poisoned".to_string(),
+        })?;
+        // SAFETY: the pointer is created from a live `&mut dyn LixTransaction` and
+        // this mutex serializes all calls so the mutable borrow is not aliased.
+        unsafe { (&mut **guard).execute(sql, params).await }
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        Err(LixError {
+            message: "nested transactions are not supported".to_string(),
+        })
+    }
 }
 
 pub fn boot(args: BootArgs) -> Engine {
@@ -145,7 +254,18 @@ impl Engine {
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
         let active_version_id = self.active_version_id.read().unwrap().clone();
+        let writer_key = options.writer_key.as_deref();
         if let Some(runtime) = self.wasm_runtime.as_ref() {
             if let Some(scope) = file_read_materialization_scope_for_sql(sql) {
                 let versions = match scope {
@@ -203,7 +323,9 @@ impl Engine {
             .await?;
         let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
             .into_iter()
-            .map(|changes| detected_file_domain_changes_from_detected_file_changes(&changes))
+            .map(|changes| {
+                detected_file_domain_changes_from_detected_file_changes(&changes, writer_key)
+            })
             .collect::<Vec<_>>();
         let filesystem_update_domain_changes =
             collect_filesystem_update_detected_file_domain_changes(
@@ -218,14 +340,16 @@ impl Engine {
                     error.message
                 ),
             })?;
-        let statement_count = detected_file_domain_changes_by_statement.len().max(
-            filesystem_update_domain_changes
-                .tracked_changes_by_statement
-                .len(),
-        );
-        detected_file_domain_changes_by_statement.resize_with(statement_count, Vec::new);
-        for (index, tracked_changes) in filesystem_update_domain_changes
+        let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
             .tracked_changes_by_statement
+            .iter()
+            .map(|changes| detected_file_domain_changes_with_writer_key(changes, writer_key))
+            .collect::<Vec<_>>();
+        let statement_count = detected_file_domain_changes_by_statement
+            .len()
+            .max(filesystem_update_tracked_changes_by_statement.len());
+        detected_file_domain_changes_by_statement.resize_with(statement_count, Vec::new);
+        for (index, tracked_changes) in filesystem_update_tracked_changes_by_statement
             .into_iter()
             .enumerate()
         {
@@ -240,9 +364,11 @@ impl Engine {
             .collect::<Vec<_>>();
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
-        let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
-            &filesystem_update_domain_changes.untracked_changes,
-        );
+        let untracked_filesystem_update_domain_changes =
+            dedupe_detected_file_domain_changes(&detected_file_domain_changes_with_writer_key(
+                &filesystem_update_domain_changes.untracked_changes,
+                writer_key,
+            ));
 
         let mut settings = load_settings(self.backend.as_ref()).await?;
         if self.deterministic_boot_pending.load(Ordering::SeqCst) {
@@ -265,12 +391,15 @@ impl Engine {
             params,
             functions.clone(),
             &detected_file_domain_changes_by_statement,
+            writer_key,
         )
         .await
         {
             Ok(output) => output,
             Err(error) if should_sequentialize_postprocess_multi_statement(sql, params, &error) => {
-                return self.execute_multi_statement_sequential(sql).await;
+                return self
+                    .execute_multi_statement_sequential_with_options(sql, &options)
+                    .await;
             }
             Err(error) => return Err(error),
         };
@@ -365,6 +494,7 @@ impl Engine {
                         &plan,
                         &result.rows,
                         &detected_file_domain_changes,
+                        writer_key,
                         &mut followup_functions,
                     )
                     .await
@@ -380,6 +510,7 @@ impl Engine {
                         &plan,
                         &result.rows,
                         &detected_file_domain_changes,
+                        writer_key,
                         &mut followup_functions,
                     )
                     .await
@@ -444,6 +575,196 @@ impl Engine {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
                 .await?;
         }
+
+        Ok(result)
+    }
+
+    pub async fn begin_transaction(&self) -> Result<EngineTransaction<'_>, LixError> {
+        self.begin_transaction_with_options(ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn begin_transaction_with_options(
+        &self,
+        options: ExecuteOptions,
+    ) -> Result<EngineTransaction<'_>, LixError> {
+        let transaction = self.backend.begin_transaction().await?;
+        Ok(EngineTransaction {
+            engine: self,
+            transaction: Some(transaction),
+            options,
+            active_version_id: self.active_version_id.read().unwrap().clone(),
+        })
+    }
+
+    pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
+    where
+        F: for<'tx> FnOnce(&'tx mut EngineTransaction<'_>) -> EngineTransactionFuture<'tx, T>,
+    {
+        let mut transaction = self.begin_transaction_with_options(options).await?;
+        match f(&mut transaction).await {
+            Ok(value) => {
+                transaction.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_with_options_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        sql: &str,
+        params: &[Value],
+        options: &ExecuteOptions,
+        active_version_id: &mut String,
+    ) -> Result<QueryResult, LixError> {
+        let writer_key = options.writer_key.as_deref();
+        let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
+        let pending_file_writes = Vec::new();
+        let pending_file_delete_targets = BTreeSet::new();
+        let detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>> =
+            Vec::new();
+        let detected_file_domain_changes: Vec<DetectedFileDomainChange> = Vec::new();
+
+        let functions = SharedFunctionProvider::new(RuntimeFunctionProvider::new(
+            DeterministicSettings::disabled(),
+            0,
+        ));
+
+        let output = {
+            let backend = TransactionBackendAdapter::new(transaction);
+            preprocess_sql_with_provider_and_detected_file_domain_changes(
+                &backend,
+                &self.cel_evaluator,
+                sql,
+                params,
+                functions.clone(),
+                &detected_file_domain_changes_by_statement,
+                writer_key,
+            )
+            .await?
+        };
+
+        let next_active_version_id_from_mutations =
+            active_version_from_mutations(&output.mutations)?;
+        let next_active_version_id_from_updates =
+            active_version_from_update_validations(&output.update_validations)?;
+        for registration in output.registrations {
+            let create_sql = register_schema_sql(&registration.schema_key);
+            transaction.execute(&create_sql, &[]).await?;
+        }
+
+        let mut postprocess_file_cache_targets = BTreeSet::new();
+        let mut plugin_changes_committed = false;
+        let result = match output.postprocess {
+            None => {
+                let result = transaction.execute(&output.sql, &output.params).await?;
+                let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
+                    mutation.operation == MutationOperation::Insert && !mutation.untracked
+                });
+                if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
+                    plugin_changes_committed = true;
+                }
+                result
+            }
+            Some(postprocess_plan) => {
+                let result = transaction.execute(&output.sql, &output.params).await?;
+                match &postprocess_plan {
+                    PostprocessPlan::VtableUpdate(plan) => {
+                        if should_refresh_file_cache {
+                            postprocess_file_cache_targets.extend(
+                                collect_postprocess_file_cache_targets(
+                                    &result.rows,
+                                    &plan.schema_key,
+                                )?,
+                            );
+                        }
+                    }
+                    PostprocessPlan::VtableDelete(plan) => {
+                        if should_refresh_file_cache {
+                            postprocess_file_cache_targets.extend(
+                                collect_postprocess_file_cache_targets(
+                                    &result.rows,
+                                    &plan.schema_key,
+                                )?,
+                            );
+                        }
+                    }
+                }
+                let additional_schema_keys = detected_file_domain_changes
+                    .iter()
+                    .map(|change| change.schema_key.clone())
+                    .collect::<BTreeSet<_>>();
+                for schema_key in additional_schema_keys {
+                    let create_sql = register_schema_sql(&schema_key);
+                    transaction.execute(&create_sql, &[]).await?;
+                }
+                let mut followup_functions = functions.clone();
+                let followup_sql = match postprocess_plan {
+                    PostprocessPlan::VtableUpdate(plan) => {
+                        build_update_followup_sql(
+                            transaction,
+                            &plan,
+                            &result.rows,
+                            &detected_file_domain_changes,
+                            writer_key,
+                            &mut followup_functions,
+                        )
+                        .await?
+                    }
+                    PostprocessPlan::VtableDelete(plan) => {
+                        build_delete_followup_sql(
+                            transaction,
+                            &plan,
+                            &result.rows,
+                            &detected_file_domain_changes,
+                            writer_key,
+                            &mut followup_functions,
+                        )
+                        .await?
+                    }
+                };
+                if !followup_sql.is_empty() {
+                    transaction.execute(&followup_sql, &[]).await?;
+                }
+                plugin_changes_committed = true;
+                result
+            }
+        };
+
+        if let Some(version_id) =
+            next_active_version_id_from_mutations.or(next_active_version_id_from_updates)
+        {
+            *active_version_id = version_id;
+        }
+
+        let file_cache_refresh_targets = if should_refresh_file_cache {
+            let mut targets = direct_state_file_cache_refresh_targets(&output.mutations);
+            targets.extend(postprocess_file_cache_targets);
+            targets
+        } else {
+            BTreeSet::new()
+        };
+        let descriptor_cache_eviction_targets =
+            file_descriptor_cache_eviction_targets(&output.mutations);
+        let mut file_cache_invalidation_targets = file_cache_refresh_targets;
+        file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
+        file_cache_invalidation_targets.extend(pending_file_delete_targets);
+
+        if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
+            // In transaction mode this stays deferred until transaction commit.
+        }
+        self.persist_pending_file_data_updates_in_transaction(transaction, &pending_file_writes)
+            .await?;
+        self.invalidate_file_data_cache_entries_in_transaction(
+            transaction,
+            &file_cache_invalidation_targets,
+        )
+        .await?;
 
         Ok(result)
     }
@@ -1106,6 +1427,39 @@ impl Engine {
         Ok(())
     }
 
+    async fn persist_pending_file_data_updates_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    ) -> Result<(), LixError> {
+        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for (index, write) in writes.iter().enumerate() {
+            if !write.data_is_authoritative {
+                continue;
+            }
+            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+        }
+
+        for index in latest_by_key.into_values() {
+            let write = &writes[index];
+            transaction
+                .execute(
+                    "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     data = EXCLUDED.data",
+                    &[
+                        Value::Text(write.file_id.clone()),
+                        Value::Text(write.version_id.clone()),
+                        Value::Blob(write.after_data.clone()),
+                    ],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     async fn invalidate_file_data_cache_entries(
         &self,
         targets: &BTreeSet<(String, String)>,
@@ -1131,6 +1485,45 @@ impl Engine {
             }
 
             self.backend
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
+                         WHERE {}",
+                        predicates.join(" OR ")
+                    ),
+                    &params,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_file_data_cache_entries_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        const PAIRS_PER_CHUNK: usize = 200;
+        let keys = targets.iter().cloned().collect::<Vec<_>>();
+
+        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            let mut predicates = Vec::with_capacity(chunk.len());
+            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
+                let file_param = index * 2 + 1;
+                let version_param = file_param + 1;
+                predicates.push(format!(
+                    "(file_id = ${file_param} AND version_id = ${version_param})"
+                ));
+                params.push(Value::Text(file_id.clone()));
+                params.push(Value::Text(version_id.clone()));
+            }
+
+            transaction
                 .execute(
                     &format!(
                         "DELETE FROM lix_internal_file_data_cache \
@@ -1173,11 +1566,17 @@ impl Engine {
         *guard = version_id;
     }
 
-    async fn execute_multi_statement_sequential(&self, sql: &str) -> Result<QueryResult, LixError> {
+    async fn execute_multi_statement_sequential_with_options(
+        &self,
+        sql: &str,
+        options: &ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
         let statements = parse_sql_statements(sql)?;
         let mut last_result = QueryResult { rows: Vec::new() };
         for statement in statements {
-            last_result = Box::pin(self.execute(&statement.to_string(), &[])).await?;
+            last_result =
+                Box::pin(self.execute_with_options(&statement.to_string(), &[], options.clone()))
+                    .await?;
         }
         Ok(last_result)
     }
@@ -1335,6 +1734,7 @@ fn dedupe_detected_file_domain_changes(
 
 fn detected_file_domain_changes_from_detected_file_changes(
     changes: &[crate::plugin::runtime::DetectedFileChange],
+    writer_key: Option<&str>,
 ) -> Vec<DetectedFileDomainChange> {
     changes
         .iter()
@@ -1347,7 +1747,23 @@ fn detected_file_domain_changes_from_detected_file_changes(
             plugin_key: change.plugin_key.clone(),
             snapshot_content: change.snapshot_content.clone(),
             metadata: None,
-            writer_key: None,
+            writer_key: writer_key.map(ToString::to_string),
+        })
+        .collect()
+}
+
+fn detected_file_domain_changes_with_writer_key(
+    changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
+) -> Vec<DetectedFileDomainChange> {
+    changes
+        .iter()
+        .map(|change| {
+            let mut next = change.clone();
+            if next.writer_key.is_none() {
+                next.writer_key = writer_key.map(ToString::to_string);
+            }
+            next
         })
         .collect()
 }
@@ -2237,8 +2653,9 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         active_version_from_update_validations, active_version_schema_key,
-        advance_placeholder_state_for_statement, file_descriptor_cache_eviction_targets,
-        file_history_read_materialization_required_for_sql,
+        advance_placeholder_state_for_statement,
+        detected_file_domain_changes_from_detected_file_changes,
+        file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
         file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
         FileReadMaterializationScope,
     };
@@ -2421,6 +2838,23 @@ mod tests {
                AND lixcol_version_id = 'version-a'",
         );
         assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
+    }
+
+    #[test]
+    fn detected_file_domain_changes_apply_writer_key_fallback() {
+        let detected = vec![crate::plugin::runtime::DetectedFileChange {
+            entity_id: "entity-1".to_string(),
+            schema_key: "schema-1".to_string(),
+            schema_version: "1.0".to_string(),
+            file_id: "file-1".to_string(),
+            version_id: "version-1".to_string(),
+            plugin_key: "plugin-1".to_string(),
+            snapshot_content: Some("{\"a\":1}".to_string()),
+        }];
+
+        let with_writer_key =
+            detected_file_domain_changes_from_detected_file_changes(&detected, Some("writer-123"));
+        assert_eq!(with_writer_key[0].writer_key.as_deref(), Some("writer-123"));
     }
 
     #[test]
