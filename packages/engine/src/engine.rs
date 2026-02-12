@@ -1533,14 +1533,17 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
             .as_deref()
             .is_some_and(|query| query_mentions_table_name(query, table_name)),
         Statement::Update(update) => {
-            update.from.as_ref().is_some_and(|from| match from {
-                UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => from
-                    .iter()
-                    .any(|table| table_with_joins_mentions_table_name(table, table_name)),
-            }) || update
-                .selection
-                .as_ref()
-                .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
+            table_with_joins_mentions_table_name(&update.table, table_name)
+                || update.from.as_ref().is_some_and(|from| match from {
+                    UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => {
+                        from.iter()
+                            .any(|table| table_with_joins_mentions_table_name(table, table_name))
+                    }
+                })
+                || update
+                    .selection
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_table_name(expr, table_name))
                 || update
                     .assignments
                     .iter()
@@ -2397,6 +2400,27 @@ mod tests {
              WHERE id IN (SELECT id FROM lix_file WHERE id = 'file-a')",
         );
         assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_update_target_lix_file() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE id = 'file-a'",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn file_read_materialization_scope_detects_update_target_lix_file_by_version() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file_by_version \
+             SET path = '/renamed.json' \
+             WHERE id = 'file-a' \
+               AND lixcol_version_id = 'version-a'",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
     }
 
     #[test]
