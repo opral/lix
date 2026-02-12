@@ -3,12 +3,53 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, BootArgs, LixBackend, LixError, QueryResult as EngineQueryResult,
-        Value as EngineValue,
+        boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
+        QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue,
     };
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
+
+    #[wasm_bindgen(typescript_custom_section)]
+    const LIX_BACKEND_TYPES: &str = r#"
+export type LixSqlDialect = "sqlite" | "postgres";
+
+export type LixValueLike =
+  | { kind: "Null" | "Integer" | "Real" | "Text" | "Blob"; value: unknown }
+  | null
+  | undefined
+  | number
+  | string
+  | Uint8Array
+  | ArrayBuffer;
+
+export type LixQueryResultLike = { rows: LixValueLike[][] } | LixValueLike[][];
+
+export type LixTransaction = {
+  dialect?: LixSqlDialect | (() => LixSqlDialect);
+  execute(
+    sql: string,
+    params: LixValueLike[],
+  ): Promise<LixQueryResultLike> | LixQueryResultLike;
+  commit(): Promise<void> | void;
+  rollback(): Promise<void> | void;
+};
+
+export type LixBackend = {
+  dialect?: LixSqlDialect | (() => LixSqlDialect);
+  execute(
+    sql: string,
+    params: LixValueLike[],
+  ): Promise<LixQueryResultLike> | LixQueryResultLike;
+  beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
+};
+"#;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(typescript_type = "LixBackend")]
+        pub type JsLixBackend;
+    }
 
     #[wasm_bindgen]
     pub struct Lix {
@@ -24,21 +65,122 @@ mod wasm {
             for value in params.iter() {
                 values.push(value_from_js(value).map_err(js_error)?);
             }
-            let result = self.engine.execute(&sql, &values).await.map_err(js_error)?;
+            let result = self
+                .engine
+                .execute(&sql, &values, ExecuteOptions::default())
+                .await
+                .map_err(js_error)?;
             Ok(query_result_to_js(result))
+        }
+
+        #[wasm_bindgen(js_name = installPlugin)]
+        pub async fn install_plugin(
+            &self,
+            manifest_json: String,
+            wasm_bytes: Uint8Array,
+        ) -> Result<(), JsValue> {
+            let mut bytes = vec![0u8; wasm_bytes.length() as usize];
+            wasm_bytes.copy_to(&mut bytes);
+            self.engine
+                .install_plugin(&manifest_json, &bytes)
+                .await
+                .map_err(js_error)
         }
     }
 
     #[wasm_bindgen(js_name = openLix)]
-    pub fn open_lix(backend: JsValue) -> Result<Lix, JsValue> {
-        let backend = Box::new(JsBackend { backend });
-        Ok(Lix {
-            engine: boot(BootArgs::new(backend)),
-        })
+    pub async fn open_lix(backend: JsLixBackend) -> Result<Lix, JsValue> {
+        let backend = Box::new(JsBackend {
+            backend: backend.into(),
+        });
+        let engine = boot(BootArgs::new(backend));
+        engine.init().await.map_err(js_error)?;
+        Ok(Lix { engine })
     }
 
     struct JsBackend {
         backend: JsValue,
+    }
+
+    impl JsBackend {
+        fn dialect_from_object(target: &JsValue) -> Option<SqlDialect> {
+            let raw = Reflect::get(target, &JsValue::from_str("dialect"))
+                .ok()
+                .and_then(|value| {
+                    if let Some(text) = value.as_string() {
+                        return Some(text);
+                    }
+                    value
+                        .dyn_into::<Function>()
+                        .ok()
+                        .and_then(|func| func.call0(target).ok())
+                        .and_then(|value| value.as_string())
+                })?;
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "postgres" | "postgresql" => Some(SqlDialect::Postgres),
+                "sqlite" => Some(SqlDialect::Sqlite),
+                _ => None,
+            }
+        }
+
+        fn get_optional_method(target: &JsValue, name: &str) -> Result<Option<Function>, LixError> {
+            let value = Reflect::get(target, &JsValue::from_str(name)).map_err(js_to_lix_error)?;
+            if value.is_null() || value.is_undefined() {
+                return Ok(None);
+            }
+            value
+                .dyn_into::<Function>()
+                .map(Some)
+                .map_err(js_to_lix_error)
+        }
+
+        async fn await_if_promise(value: JsValue) -> Result<JsValue, LixError> {
+            if value.is_instance_of::<Promise>() {
+                let promise: Promise = value.unchecked_into();
+                return JsFuture::from(promise).await.map_err(js_to_lix_error);
+            }
+            Ok(value)
+        }
+
+        async fn execute_raw_on(
+            &self,
+            target: &JsValue,
+            sql: &str,
+            params: &[EngineValue],
+        ) -> Result<EngineQueryResult, LixError> {
+            let func = Self::get_optional_method(target, "execute")?.ok_or_else(|| LixError {
+                message: "backend.execute is required".to_string(),
+            })?;
+            let js_params = Array::new();
+            for param in params.iter().cloned() {
+                let value: JsValue = value_to_js(param);
+                js_params.push(&value);
+            }
+            let result = func
+                .call2(target, &JsValue::from_str(sql), &js_params)
+                .map_err(js_to_lix_error)?;
+            let resolved = Self::await_if_promise(result).await?;
+            query_result_from_js(resolved)
+        }
+
+        async fn execute_raw(
+            &self,
+            sql: &str,
+            params: &[EngineValue],
+        ) -> Result<EngineQueryResult, LixError> {
+            self.execute_raw_on(&self.backend, sql, params).await
+        }
+    }
+
+    enum JsTransactionKind {
+        Sql,
+        Js { transaction: JsValue },
+    }
+
+    struct JsTransaction<'a> {
+        backend: &'a JsBackend,
+        kind: JsTransactionKind,
+        closed: bool,
     }
 
     // WASM is single-threaded by default; this avoids Send/Sync bounds in the engine.
@@ -47,27 +189,116 @@ mod wasm {
 
     #[async_trait(?Send)]
     impl LixBackend for JsBackend {
+        fn dialect(&self) -> SqlDialect {
+            Self::dialect_from_object(&self.backend).unwrap_or(SqlDialect::Sqlite)
+        }
+
         async fn execute(
             &self,
             sql: &str,
             params: &[EngineValue],
         ) -> Result<EngineQueryResult, LixError> {
-            let func = Reflect::get(&self.backend, &JsValue::from_str("execute"))
-                .map_err(js_to_lix_error)?
-                .dyn_into::<Function>()
-                .map_err(js_to_lix_error)?;
-            let js_params = Array::new();
-            for param in params.iter().cloned() {
-                let value: JsValue = value_to_js(param);
-                js_params.push(&value);
+            self.execute_raw(sql, params).await
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            if let Some(begin_transaction) =
+                Self::get_optional_method(&self.backend, "beginTransaction")?
+            {
+                let transaction = begin_transaction
+                    .call0(&self.backend)
+                    .map_err(js_to_lix_error)?;
+                let transaction = Self::await_if_promise(transaction).await?;
+                if transaction.is_null() || transaction.is_undefined() {
+                    return Err(LixError {
+                        message: "beginTransaction() returned no transaction object".to_string(),
+                    });
+                }
+                return Ok(Box::new(JsTransaction {
+                    backend: self,
+                    kind: JsTransactionKind::Js { transaction },
+                    closed: false,
+                }));
             }
-            let promise = func
-                .call2(&self.backend, &JsValue::from_str(sql), &js_params)
-                .map_err(js_to_lix_error)?;
-            let result = JsFuture::from(Promise::from(promise))
-                .await
-                .map_err(js_to_lix_error)?;
-            query_result_from_js(result)
+
+            self.execute_raw("BEGIN", &[]).await?;
+            Ok(Box::new(JsTransaction {
+                backend: self,
+                kind: JsTransactionKind::Sql,
+                closed: false,
+            }))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixTransaction for JsTransaction<'_> {
+        fn dialect(&self) -> SqlDialect {
+            match &self.kind {
+                JsTransactionKind::Sql => self.backend.dialect(),
+                JsTransactionKind::Js { transaction } => {
+                    JsBackend::dialect_from_object(transaction).unwrap_or(self.backend.dialect())
+                }
+            }
+        }
+
+        async fn execute(
+            &mut self,
+            sql: &str,
+            params: &[EngineValue],
+        ) -> Result<EngineQueryResult, LixError> {
+            if self.closed {
+                return Err(LixError {
+                    message: "transaction is already closed".to_string(),
+                });
+            }
+            match &self.kind {
+                JsTransactionKind::Sql => self.backend.execute_raw(sql, params).await,
+                JsTransactionKind::Js { transaction } => {
+                    self.backend.execute_raw_on(transaction, sql, params).await
+                }
+            }
+        }
+
+        async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
+            if self.closed {
+                return Ok(());
+            }
+            match &self.kind {
+                JsTransactionKind::Sql => {
+                    self.backend.execute_raw("COMMIT", &[]).await?;
+                }
+                JsTransactionKind::Js { transaction } => {
+                    let commit = JsBackend::get_optional_method(transaction, "commit")?
+                        .ok_or_else(|| LixError {
+                            message: "transaction.commit is required".to_string(),
+                        })?;
+                    let result = commit.call0(transaction).map_err(js_to_lix_error)?;
+                    JsBackend::await_if_promise(result).await?;
+                }
+            }
+            self.closed = true;
+            Ok(())
+        }
+
+        async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
+            if self.closed {
+                return Ok(());
+            }
+            match &self.kind {
+                JsTransactionKind::Sql => {
+                    self.backend.execute_raw("ROLLBACK", &[]).await?;
+                }
+                JsTransactionKind::Js { transaction } => {
+                    let rollback = JsBackend::get_optional_method(transaction, "rollback")?
+                        .ok_or_else(|| LixError {
+                            message: "transaction.rollback is required".to_string(),
+                        })?;
+                    let result = rollback.call0(transaction).map_err(js_to_lix_error)?;
+                    JsBackend::await_if_promise(result).await?;
+                }
+            }
+            self.closed = true;
+            Ok(())
         }
     }
 
@@ -232,6 +463,26 @@ mod wasm {
     }
 
     fn js_value_to_string(value: &JsValue) -> String {
+        if let Ok(error) = value.clone().dyn_into::<js_sys::Error>() {
+            let message: String = error.message().into();
+            if !message.is_empty() {
+                let stack = Reflect::get(&error, &JsValue::from_str("stack"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .unwrap_or_default();
+                if !stack.is_empty() {
+                    return format!("{message}\n{stack}");
+                }
+                return message;
+            }
+        }
+        if let Ok(message) = Reflect::get(value, &JsValue::from_str("message")) {
+            if let Some(text) = message.as_string() {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+        }
         value
             .as_string()
             .or_else(|| js_sys::JSON::stringify(value).ok().map(|v| v.into()))
