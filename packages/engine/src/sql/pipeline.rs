@@ -9,7 +9,9 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::sql::bind_sql;
 use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
-use crate::sql::route::{rewrite_statement, rewrite_statement_with_backend};
+use crate::sql::route::{
+    rewrite_statement, rewrite_statement_with_backend, rewrite_statement_with_writer_key,
+};
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreprocessOutput, SchemaRegistration};
 use crate::sql::DetectedFileDomainChange;
@@ -37,13 +39,27 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
     provider: &mut P,
     dialect: SqlDialect,
 ) -> Result<PreprocessOutput, LixError> {
+    preprocess_statements_with_provider_and_writer_key(statements, params, provider, dialect, None)
+}
+
+pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
+    statements: Vec<Statement>,
+    params: &[Value],
+    provider: &mut P,
+    dialect: SqlDialect,
+    writer_key: Option<&str>,
+) -> Result<PreprocessOutput, LixError> {
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut mutations = Vec::new();
     let mut update_validations = Vec::new();
     for statement in statements {
-        let output = rewrite_statement(statement, params, provider)?;
+        let output = if writer_key.is_some() {
+            rewrite_statement_with_writer_key(statement, params, provider, writer_key)?
+        } else {
+            rewrite_statement(statement, params, provider)?
+        };
         registrations.extend(output.registrations);
         if let Some(plan) = output.postprocess {
             if postprocess.is_some() {
@@ -85,6 +101,7 @@ async fn preprocess_statements_with_provider_and_backend<P>(
     params: &[Value],
     provider: &mut P,
     detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    writer_key: Option<&str>,
 ) -> Result<PreprocessOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -105,6 +122,7 @@ where
             params,
             provider,
             statement_detected_file_domain_changes,
+            writer_key,
         )
         .await?;
         registrations.extend(output.registrations);
@@ -171,6 +189,7 @@ where
         params,
         functions,
         &[],
+        None,
     )
     .await
 }
@@ -182,6 +201,7 @@ pub async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: Li
     params: &[Value],
     functions: SharedFunctionProvider<P>,
     detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    writer_key: Option<&str>,
 ) -> Result<PreprocessOutput, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -204,6 +224,7 @@ where
         &params,
         &mut provider,
         detected_file_domain_changes_by_statement,
+        writer_key,
     )
     .await
 }
