@@ -14,6 +14,7 @@ pub struct SchemaRegistration {
 pub struct VtableUpdatePlan {
     pub schema_key: String,
     pub explicit_writer_key: Option<Option<String>>,
+    pub writer_key_assignment_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
