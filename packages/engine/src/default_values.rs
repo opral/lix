@@ -268,6 +268,10 @@ mod tests {
         async fn execute(&self, _: &str, _: &[Value]) -> Result<QueryResult, LixError> {
             panic!("defaulting should resolve schema from pending in-request inserts")
         }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+            panic!("defaulting should not open transactions in this test backend")
+        }
     }
 
     fn system_functions() -> SharedFunctionProvider<SystemFunctionProvider> {

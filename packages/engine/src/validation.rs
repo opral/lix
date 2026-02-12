@@ -9,7 +9,7 @@ use crate::schema::{
     schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
     SchemaProvider, SqlStoredSchemaProvider,
 };
-use crate::sql::{MutationOperation, MutationRow, UpdateValidationPlan};
+use crate::sql::{bind_sql, MutationOperation, MutationRow, UpdateValidationPlan};
 use crate::{LixBackend, LixError, Value};
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
@@ -54,6 +54,13 @@ pub async fn validate_inserts(
 
         let key = SchemaKey::new(row.schema_key.clone(), row.schema_version.clone());
         validate_snapshot_content(&mut schema_provider, cache, &key, snapshot).await?;
+        validate_entity_id_matches_primary_key(
+            &mut schema_provider,
+            &key,
+            &row.entity_id,
+            snapshot,
+        )
+        .await?;
     }
 
     Ok(())
@@ -63,6 +70,7 @@ pub async fn validate_updates(
     backend: &dyn LixBackend,
     cache: &SchemaCache,
     plans: &[UpdateValidationPlan],
+    params: &[Value],
 ) -> Result<(), LixError> {
     let mut schema_provider = SqlStoredSchemaProvider::new(backend);
 
@@ -76,12 +84,14 @@ pub async fn validate_updates(
             sql.push_str(&where_clause.to_string());
         }
 
-        let result = backend.execute(&sql, &[]).await?;
+        let bound = bind_sql(&sql, params, backend.dialect())?;
+        let result = backend.execute(&bound.sql, &bound.params).await?;
         if result.rows.is_empty() {
             continue;
         }
 
         for row in result.rows {
+            let entity_id = value_to_string(&row[0], "entity_id")?;
             let schema_key = value_to_string(&row[4], "schema_key")?;
             let schema_version = value_to_string(&row[5], "schema_version")?;
             let snapshot = resolve_update_snapshot(plan, row.get(6), &schema_key)?;
@@ -107,6 +117,13 @@ pub async fn validate_updates(
 
             if let Some(snapshot) = snapshot.as_ref() {
                 validate_snapshot_content(&mut schema_provider, cache, &key, snapshot).await?;
+                validate_entity_id_matches_primary_key(
+                    &mut schema_provider,
+                    &key,
+                    &entity_id,
+                    snapshot,
+                )
+                .await?;
             }
         }
     }
@@ -360,4 +377,137 @@ fn apply_snapshot_patch(
         object.insert(property.clone(), value.clone());
     }
     Ok(())
+}
+
+async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
+    provider: &mut P,
+    key: &SchemaKey,
+    entity_id: &str,
+    snapshot: &JsonValue,
+) -> Result<(), LixError> {
+    let schema = provider.load_schema(key).await?;
+    let Some(primary_key) = schema
+        .get("x-lix-primary-key")
+        .and_then(JsonValue::as_array)
+    else {
+        return Ok(());
+    };
+    if primary_key.is_empty() {
+        return Ok(());
+    }
+
+    let mut parts = Vec::with_capacity(primary_key.len());
+    for pointer_value in primary_key {
+        let pointer = pointer_value.as_str().ok_or_else(|| LixError {
+            message: format!(
+                "schema '{}' ({}) has non-string x-lix-primary-key entry",
+                key.schema_key, key.schema_version
+            ),
+        })?;
+        let pointer_path = parse_json_pointer(pointer)?;
+        if pointer_path.is_empty() {
+            return Err(LixError {
+                message: format!(
+                    "schema '{}' ({}) has invalid empty x-lix-primary-key pointer",
+                    key.schema_key, key.schema_version
+                ),
+            });
+        }
+
+        let value = json_pointer_get(snapshot, &pointer_path).ok_or_else(|| LixError {
+            message: format!(
+                "entity_id '{}' is inconsistent for schema '{}' ({}): missing primary-key field at pointer '{}'",
+                entity_id, key.schema_key, key.schema_version, pointer
+            ),
+        })?;
+        parts.push(entity_id_component_from_json_value(value, pointer)?);
+    }
+
+    let expected = if parts.len() == 1 {
+        parts.pop().unwrap()
+    } else {
+        parts.join("~")
+    };
+
+    if expected != entity_id {
+        return Err(LixError {
+            message: format!(
+                "entity_id '{}' is inconsistent for schema '{}' ({}): expected '{}'",
+                entity_id, key.schema_key, key.schema_version, expected
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn entity_id_component_from_json_value(
+    value: &JsonValue,
+    pointer: &str,
+) -> Result<String, LixError> {
+    match value {
+        JsonValue::Null => Err(LixError {
+            message: format!(
+                "cannot derive entity_id from null primary-key value at pointer '{}'",
+                pointer
+            ),
+        }),
+        JsonValue::String(text) => Ok(text.clone()),
+        JsonValue::Bool(flag) => Ok(flag.to_string()),
+        JsonValue::Number(number) => Ok(number.to_string()),
+        JsonValue::Array(_) | JsonValue::Object(_) => Ok(value.to_string()),
+    }
+}
+
+fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
+    if pointer.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !pointer.starts_with('/') {
+        return Err(LixError {
+            message: format!("invalid JSON pointer '{pointer}'"),
+        });
+    }
+    pointer[1..]
+        .split('/')
+        .map(decode_json_pointer_segment)
+        .collect()
+}
+
+fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
+    let mut out = String::new();
+    let mut chars = segment.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') => out.push('~'),
+                Some('1') => out.push('/'),
+                _ => {
+                    return Err(LixError {
+                        message: format!("invalid JSON pointer segment '{segment}'"),
+                    })
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+fn json_pointer_get<'a>(value: &'a JsonValue, pointer: &[String]) -> Option<&'a JsonValue> {
+    let mut current = value;
+    for segment in pointer {
+        match current {
+            JsonValue::Object(object) => {
+                current = object.get(segment)?;
+            }
+            JsonValue::Array(array) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = array.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
 }

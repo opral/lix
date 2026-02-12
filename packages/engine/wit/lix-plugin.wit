@@ -1,0 +1,40 @@
+package lix:plugin@0.1.0;
+
+interface api {
+  /// Current materialized file payload. Plugins should treat this as an
+  /// implementation detail cache and must not rely on mutation order.
+  record file {
+    id: string,
+    path: string,
+    data: list<u8>,
+  }
+
+  /// Represents the latest visible row for an entity.
+  ///
+  /// `apply-changes` receives an unordered set of these rows for a single file.
+  /// Implementations must be order-independent and produce the same output for
+  /// any ordering of `changes`.
+  ///
+  /// Uniqueness: callers provide at most one row per
+  /// (`schema-key`, `entity-id`) for the same (`file.id`, version).
+  record entity-change {
+    entity-id: string,
+    schema-key: string,
+    schema-version: string,
+    snapshot-content: option<string>,
+  }
+
+  variant plugin-error {
+    invalid-input(string),
+    internal(string),
+  }
+
+  /// Computes row-level state transitions between two file payloads.
+  detect-changes: func(before: option<file>, after: file) -> result<list<entity-change>, plugin-error>;
+  /// Rebuilds file bytes from the unordered latest-state row set.
+  apply-changes: func(file: file, changes: list<entity-change>) -> result<list<u8>, plugin-error>;
+}
+
+world plugin {
+  export api;
+}

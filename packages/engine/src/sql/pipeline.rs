@@ -12,6 +12,7 @@ use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::route::{rewrite_statement, rewrite_statement_with_backend};
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreprocessOutput, SchemaRegistration};
+use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
@@ -83,6 +84,7 @@ async fn preprocess_statements_with_provider_and_backend<P>(
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
 ) -> Result<PreprocessOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -92,8 +94,19 @@ where
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut mutations = Vec::new();
     let mut update_validations = Vec::new();
-    for statement in statements {
-        let output = rewrite_statement_with_backend(backend, statement, params, provider).await?;
+    for (statement_index, statement) in statements.into_iter().enumerate() {
+        let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
+            .get(statement_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let output = rewrite_statement_with_backend(
+            backend,
+            statement,
+            params,
+            provider,
+            statement_detected_file_domain_changes,
+        )
+        .await?;
         registrations.extend(output.registrations);
         if let Some(plan) = output.postprocess {
             if postprocess.is_some() {
@@ -151,6 +164,28 @@ pub async fn preprocess_sql_with_provider<P: LixFunctionProvider>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    preprocess_sql_with_provider_and_detected_file_domain_changes(
+        backend,
+        evaluator,
+        sql,
+        params,
+        functions,
+        &[],
+    )
+    .await
+}
+
+pub async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: LixFunctionProvider>(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    sql: &str,
+    params: &[Value],
+    functions: SharedFunctionProvider<P>,
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let params = params.to_vec();
     let mut statements = coalesce_vtable_inserts_in_transactions(parse_sql_statements(sql)?)?;
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
@@ -163,8 +198,14 @@ where
     )
     .await?;
     let mut provider = functions.clone();
-    preprocess_statements_with_provider_and_backend(backend, statements, &params, &mut provider)
-        .await
+    preprocess_statements_with_provider_and_backend(
+        backend,
+        statements,
+        &params,
+        &mut provider,
+        detected_file_domain_changes_by_statement,
+    )
+    .await
 }
 
 #[allow(dead_code)]

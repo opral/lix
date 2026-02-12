@@ -34,7 +34,42 @@ pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
             message: "path segment must not contain slashes".to_string(),
         });
     }
+    if !segment_has_valid_percent_encoding(&normalized) {
+        return Err(LixError {
+            message: "path segment contains invalid percent encoding".to_string(),
+        });
+    }
+    if !normalized.chars().all(is_allowed_segment_char) {
+        return Err(LixError {
+            message: "path segment contains unsupported characters".to_string(),
+        });
+    }
     Ok(normalized)
+}
+
+fn is_allowed_segment_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '.' | '_' | '~' | '%' | '-')
+}
+
+fn segment_has_valid_percent_encoding(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return false;
+            }
+            let hi = bytes[index + 1];
+            let lo = bytes[index + 2];
+            if !hi.is_ascii_hexdigit() || !lo.is_ascii_hexdigit() {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        index += 1;
+    }
+    true
 }
 
 pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
@@ -183,5 +218,87 @@ pub(crate) fn compose_directory_path(parent_path: &str, name: &str) -> Result<St
         Err(LixError {
             message: format!("Invalid directory parent path {parent_path}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_normalized_file_paths_with_unicode_and_percent_encoding() {
+        for path in [
+            "/docs/readme.md",
+            "/a/b/c.txt",
+            "/dash--path",
+            "/unicodé/段落.md",
+            "/docs/%20notes.md",
+        ] {
+            assert!(
+                normalize_file_path(path).is_ok(),
+                "expected valid path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_structural_file_path_anomalies() {
+        for path in ["/", "/trailing/", "no-leading", "/bad//double"] {
+            assert!(
+                normalize_file_path(path).is_err(),
+                "expected invalid path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_file_paths_with_dot_segments() {
+        for path in ["/docs/./file", "/docs/../file"] {
+            assert!(
+                normalize_file_path(path).is_err(),
+                "expected invalid dot-segment path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_file_paths_with_reserved_characters() {
+        for path in ["/docs/file?.md", "/docs/#hash", "/docs/foo:bar"] {
+            assert!(
+                normalize_file_path(path).is_err(),
+                "expected invalid reserved-char path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_percent_encoding_in_file_paths() {
+        assert!(normalize_file_path("/docs/%20notes.md").is_ok());
+        assert!(normalize_file_path("/docs/%zz.md").is_err());
+        assert!(normalize_file_path("/docs/abc%.md").is_err());
+        assert!(normalize_file_path("/docs/abc%2.md").is_err());
+    }
+
+    #[test]
+    fn accepts_and_rejects_directory_paths_like_legacy_rules() {
+        for path in ["/docs/", "/docs/guides/", "/unicodé/章节/", "/docs/%20/"] {
+            assert!(
+                normalize_directory_path(path).is_ok(),
+                "expected valid directory path {path}"
+            );
+        }
+        for path in [
+            "/",
+            "/file.md",
+            "/docs",
+            "/docs/ ",
+            "no-leading",
+            "/docs/%zz/",
+        ] {
+            assert!(
+                normalize_directory_path(path).is_err(),
+                "expected invalid directory path {path}"
+            );
+        }
     }
 }

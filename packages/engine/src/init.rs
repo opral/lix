@@ -51,11 +51,20 @@ const INIT_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
-     data TEXT NOT NULL,\
+     data BYTEA NOT NULL,\
      PRIMARY KEY (file_id, version_id)\
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_data_cache_version_id \
      ON lix_internal_file_data_cache (version_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_history_data_cache (\
+     file_id TEXT NOT NULL,\
+     root_commit_id TEXT NOT NULL,\
+     depth BIGINT NOT NULL,\
+     data BYTEA NOT NULL,\
+     PRIMARY KEY (file_id, root_commit_id, depth)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_history_data_cache_root_depth \
+     ON lix_internal_file_history_data_cache (root_commit_id, depth)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
@@ -81,6 +90,19 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_file_lixcol_cache_lookup \
      ON lix_internal_file_lixcol_cache (file_id, version_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_plugin (\
+     key TEXT PRIMARY KEY,\
+     runtime TEXT NOT NULL,\
+     api_version TEXT NOT NULL,\
+     detect_changes_glob TEXT NOT NULL,\
+     entry TEXT NOT NULL,\
+     manifest_json TEXT NOT NULL,\
+     wasm BYTEA NOT NULL,\
+     created_at TEXT NOT NULL,\
+     updated_at TEXT NOT NULL\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_plugin_runtime \
+     ON lix_internal_plugin (runtime)",
 ];
 
 pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {

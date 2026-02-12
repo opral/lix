@@ -9,13 +9,10 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
-fn assert_empty_blob(value: &Value) {
+fn assert_blob_text(value: &Value, expected: &str) {
     match value {
-        Value::Blob(actual) => assert!(
-            actual.is_empty(),
-            "expected empty blob, got {} bytes",
-            actual.len()
-        ),
+        Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
+        Value::Text(actual) => assert_eq!(actual, expected),
         other => panic!("expected blob value, got {other:?}"),
     }
 }
@@ -102,14 +99,16 @@ async fn insert_version(
     engine.execute(&sql, &[]).await.unwrap();
 }
 
-simulation_test!(file_view_insert_reads_empty_blob_data, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine_deterministic()
-        .await
-        .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+simulation_test!(
+    file_view_insert_reads_inserted_blob_data,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
 
-    engine
+        engine
         .execute(
             "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/src/index.ts', 'ignored')",
             &[],
@@ -117,21 +116,22 @@ simulation_test!(file_view_insert_reads_empty_blob_data, |sim| async move {
         .await
         .unwrap();
 
-    let result = engine
-        .execute(
-            "SELECT id, path, data, lixcol_schema_key FROM lix_file WHERE id = 'file-1'",
-            &[],
-        )
-        .await
-        .unwrap();
+        let result = engine
+            .execute(
+                "SELECT id, path, data, lixcol_schema_key FROM lix_file WHERE id = 'file-1'",
+                &[],
+            )
+            .await
+            .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 1);
-    assert_text(&result.rows[0][0], "file-1");
-    assert_text(&result.rows[0][1], "/src/index.ts");
-    assert_empty_blob(&result.rows[0][2]);
-    assert_text(&result.rows[0][3], "lix_file_descriptor");
-});
+        sim.assert_deterministic(result.rows.clone());
+        assert_eq!(result.rows.len(), 1);
+        assert_text(&result.rows[0][0], "file-1");
+        assert_text(&result.rows[0][1], "/src/index.ts");
+        assert_blob_text(&result.rows[0][2], "ignored");
+        assert_text(&result.rows[0][3], "lix_file_descriptor");
+    }
+);
 
 simulation_test!(
     file_insert_autocreates_first_level_directory,
@@ -218,7 +218,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(file_view_update_data_is_noop, |sim| async move {
+simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
         .await
@@ -244,6 +244,7 @@ simulation_test!(file_view_update_data_is_noop, |sim| async move {
         .await
         .unwrap();
     assert_eq!(before.rows.len(), 1);
+    let version_id = active_version_id(&engine).await;
 
     engine
         .execute(
@@ -272,8 +273,56 @@ simulation_test!(file_view_update_data_is_noop, |sim| async move {
         .await
         .unwrap();
     assert_eq!(file_row.rows.len(), 1);
-    assert_empty_blob(&file_row.rows[0][0]);
+    assert_blob_text(&file_row.rows[0][0], "ignored-again");
+
+    let cache_row = engine
+        .execute(
+            &format!(
+                "SELECT data FROM lix_internal_file_data_cache \
+                 WHERE file_id = 'file-2' \
+                   AND version_id = '{}'",
+                version_id.replace('\'', "''")
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cache_row.rows.len(), 1);
+    assert_blob_text(&cache_row.rows[0][0], "ignored-again");
 });
+
+simulation_test!(
+    file_view_update_data_expression_fails_fast,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-2-expr', '/src/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "UPDATE lix_file SET data = data WHERE id = 'file-2-expr'",
+                &[],
+            )
+            .await
+            .expect_err("data expression updates should fail fast");
+        assert!(
+            err.message
+                .contains("unsupported file data update expression"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
 
 simulation_test!(
     directory_insert_by_path_autocreates_missing_ancestors,
@@ -477,6 +526,118 @@ simulation_test!(
     }
 );
 
+simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine_deterministic()
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
+
+    engine
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-id-immutable', '/immutable.json', 'ignored')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let file_update_err = engine
+        .execute(
+            "UPDATE lix_file SET id = 'file-id-new' WHERE id = 'file-id-immutable'",
+            &[],
+        )
+        .await
+        .expect_err("lix_file id update should fail");
+    assert!(
+        file_update_err.message.contains("id is immutable"),
+        "unexpected error: {}",
+        file_update_err.message
+    );
+
+    let version_id = active_version_id(&engine).await;
+    engine
+        .execute(
+            "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+             VALUES ('file-id-immutable-by-version', '/immutable-by-version.json', 'ignored', $1)",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .unwrap();
+
+    let by_version_update_err = engine
+        .execute(
+            "UPDATE lix_file_by_version \
+             SET id = 'file-id-new-by-version' \
+             WHERE id = 'file-id-immutable-by-version' AND lixcol_version_id = $1",
+            &[Value::Text(version_id)],
+        )
+        .await
+        .expect_err("lix_file_by_version id update should fail");
+    assert!(
+        by_version_update_err.message.contains("id is immutable"),
+        "unexpected error: {}",
+        by_version_update_err.message
+    );
+});
+
+simulation_test!(
+    filesystem_directory_view_rejects_id_updates,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
+             VALUES ('dir-id-immutable', '/immutable-dir/', NULL, 'immutable-dir')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let directory_update_err = engine
+            .execute(
+                "UPDATE lix_directory SET id = 'dir-id-new' WHERE id = 'dir-id-immutable'",
+                &[],
+            )
+            .await
+            .expect_err("lix_directory id update should fail");
+        assert!(
+            directory_update_err.message.contains("id is immutable"),
+            "unexpected error: {}",
+            directory_update_err.message
+        );
+
+        let version_id = active_version_id(&engine).await;
+        engine
+        .execute(
+            "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
+             VALUES ('dir-id-immutable-by-version', '/immutable-dir-by-version/', NULL, 'immutable-dir-by-version', $1)",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .unwrap();
+
+        let by_version_update_err = engine
+            .execute(
+                "UPDATE lix_directory_by_version \
+             SET id = 'dir-id-new-by-version' \
+             WHERE id = 'dir-id-immutable-by-version' AND lixcol_version_id = $1",
+                &[Value::Text(version_id)],
+            )
+            .await
+            .expect_err("lix_directory_by_version id update should fail");
+        assert!(
+            by_version_update_err.message.contains("id is immutable"),
+            "unexpected error: {}",
+            by_version_update_err.message
+        );
+    }
+);
+
 simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -635,7 +796,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .unwrap();
     assert_eq!(row_a.rows.len(), 1);
     assert_text(&row_a.rows[0][0], "/shared/config.json");
-    assert_empty_blob(&row_a.rows[0][1]);
+    assert_blob_text(&row_a.rows[0][1], "ignored");
 
     let row_b = engine
         .execute(
@@ -650,7 +811,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .unwrap();
     assert_eq!(row_b.rows.len(), 1);
     assert_text(&row_b.rows[0][0], "/shared/config-renamed.json");
-    assert_empty_blob(&row_b.rows[0][1]);
+    assert_blob_text(&row_b.rows[0][1], "ignored-again");
 
     engine
         .execute(
@@ -762,6 +923,46 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         "unexpected error: {}",
         delete_err.message
     );
+
+    engine
+        .execute(
+            "UPDATE lix_file_by_version \
+             SET path = '/changed.json' \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized version predicate update should succeed");
+
+    let after_update = engine
+        .execute(
+            "SELECT path FROM lix_file_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized version predicate select should succeed");
+    assert_eq!(after_update.rows.len(), 1);
+    assert_text(&after_update.rows[0][0], "/changed.json");
+
+    engine
+        .execute(
+            "DELETE FROM lix_file_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized version predicate delete should succeed");
+
+    let after_delete = engine
+        .execute(
+            "SELECT id FROM lix_file_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("post-delete parameterized select should succeed");
+    assert!(after_delete.rows.is_empty());
 });
 
 simulation_test!(
@@ -957,6 +1158,47 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         "unexpected error: {}",
         delete_err.message
     );
+
+    engine
+        .execute(
+            "UPDATE lix_directory_by_version \
+             SET path = '/changed/', name = 'changed' \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized directory version predicate update should succeed");
+
+    let after_update = engine
+        .execute(
+            "SELECT path, name FROM lix_directory_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized directory select should succeed");
+    assert_eq!(after_update.rows.len(), 1);
+    assert_text(&after_update.rows[0][0], "/changed/");
+    assert_text(&after_update.rows[0][1], "changed");
+
+    engine
+        .execute(
+            "DELETE FROM lix_directory_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("parameterized directory version predicate delete should succeed");
+
+    let after_delete = engine
+        .execute(
+            "SELECT id FROM lix_directory_by_version \
+             WHERE id = 'needs-version-predicate' AND lixcol_version_id = $1",
+            &[Value::Text(version_id.clone())],
+        )
+        .await
+        .expect("post-delete parameterized directory select should succeed");
+    assert!(after_delete.rows.is_empty());
 });
 
 simulation_test!(
@@ -1017,7 +1259,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(file_row.rows.len(), 1);
-        assert_empty_blob(&file_row.rows[0][0]);
+        assert_blob_text(&file_row.rows[0][0], "ignored-again");
         assert!(
             matches!(&file_row.rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"sam\"")),
             "expected metadata containing owner key, got {:?}",
@@ -1273,6 +1515,203 @@ simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
 });
 
 simulation_test!(
+    file_path_update_auto_creates_missing_parent_directories_in_same_commit,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-path-auto-dir', '/a.md', 'ignored')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_file SET path = '/docs/guides/a.md' WHERE id = 'file-path-auto-dir'",
+                &[],
+            )
+            .await
+            .expect("path update should auto-create parent directories");
+
+        let file_row = engine
+            .execute(
+                "SELECT path, lixcol_commit_id \
+                 FROM lix_file \
+                 WHERE id = 'file-path-auto-dir'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_row.rows.len(), 1);
+        assert_text(&file_row.rows[0][0], "/docs/guides/a.md");
+        let file_commit_id = match &file_row.rows[0][1] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected file commit_id as text, got {other:?}"),
+        };
+        let version_id = active_version_id(&engine).await.replace('\'', "''");
+        let file_descriptor_row = engine
+            .execute(
+                &format!(
+                    "SELECT directory_id \
+                     FROM lix_file_descriptor_by_version \
+                     WHERE id = 'file-path-auto-dir' \
+                       AND lixcol_version_id = '{version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_descriptor_row.rows.len(), 1);
+        let file_directory_id = match &file_descriptor_row.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected file directory_id as text, got {other:?}"),
+        };
+
+        let directory_rows = engine
+            .execute(
+                "SELECT id, path, parent_id, lixcol_commit_id \
+                 FROM lix_directory \
+                 WHERE path IN ('/docs/', '/docs/guides/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(directory_rows.rows.len(), 2);
+
+        assert_text(&directory_rows.rows[0][1], "/docs/");
+        let docs_directory_id = match &directory_rows.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected docs directory id as text, got {other:?}"),
+        };
+        match &directory_rows.rows[0][2] {
+            Value::Null => {}
+            other => panic!("expected /docs/ parent_id to be NULL, got {other:?}"),
+        }
+        assert_text(&directory_rows.rows[0][3], &file_commit_id);
+
+        assert_text(&directory_rows.rows[1][1], "/docs/guides/");
+        assert_text(&directory_rows.rows[1][2], &docs_directory_id);
+        assert_text(&directory_rows.rows[1][3], &file_commit_id);
+        let guides_directory_id = match &directory_rows.rows[1][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected guides directory id as text, got {other:?}"),
+        };
+        assert_eq!(file_directory_id, guides_directory_id);
+    }
+);
+
+simulation_test!(
+    file_path_update_with_untracked_predicate_persists_missing_parent_directories,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_id_sql = version_id.replace('\'', "''");
+        let snapshot_content = serde_json::json!({
+            "id": "file-path-untracked",
+            "directory_id": null,
+            "name": "a",
+            "extension": "md",
+            "hidden": false
+        })
+        .to_string()
+        .replace('\'', "''");
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                        entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                     ) VALUES (\
+                        'file-path-untracked', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', '{snapshot_content}', '1', 1\
+                     )",
+                    version_id = version_id_sql,
+                    snapshot_content = snapshot_content
+                ),
+                &[],
+            )
+            .await
+            .expect("seed untracked file descriptor should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/docs/guides/a.md' \
+                 WHERE id = 'file-path-untracked' AND lixcol_untracked = 1",
+                &[],
+            )
+            .await
+            .expect("untracked path update should succeed");
+
+        let file_row = engine
+            .execute(
+                "SELECT path \
+                 FROM lix_file \
+                 WHERE id = 'file-path-untracked' AND lixcol_untracked = 1",
+                &[],
+            )
+            .await
+            .expect("updated untracked file row should be readable");
+        assert_eq!(file_row.rows.len(), 1);
+        assert_text(&file_row.rows[0][0], "/docs/guides/a.md");
+
+        let directory_rows = engine
+            .execute(
+                "SELECT path, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE path IN ('/docs/', '/docs/guides/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("auto-created parent directories should be readable");
+        assert_eq!(directory_rows.rows.len(), 2);
+        assert_text(&directory_rows.rows[0][0], "/docs/");
+        assert_text(&directory_rows.rows[1][0], "/docs/guides/");
+        assert_boolean_like(&directory_rows.rows[0][1], true);
+        assert_boolean_like(&directory_rows.rows[1][1], true);
+    }
+);
+
+simulation_test!(
+    file_path_update_noop_does_not_create_parent_directories,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/docs/noop.json' \
+                 WHERE id = 'missing-file'",
+                &[],
+            )
+            .await
+            .expect("no-op file path update should succeed");
+
+        let directories = engine
+            .execute("SELECT id FROM lix_directory WHERE path = '/docs/'", &[])
+            .await
+            .expect("directory lookup should succeed");
+        assert!(directories.rows.is_empty());
+    }
+);
+
+simulation_test!(
     file_view_exposes_active_version_commit_id,
     |sim| async move {
         let engine = sim
@@ -1485,7 +1924,7 @@ simulation_test!(
                 "SELECT \
                 lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
                 lixcol_schema_version, lixcol_inherited_from_version_id, lixcol_change_id, \
-                lixcol_created_at, lixcol_updated_at, lixcol_untracked, lixcol_metadata \
+                lixcol_created_at, lixcol_updated_at, lixcol_writer_key, lixcol_untracked, lixcol_metadata \
              FROM lix_file WHERE id = 'lixcol-file'",
                 &[],
             )
@@ -1494,13 +1933,59 @@ simulation_test!(
         assert_eq!(file_rows.rows.len(), 1);
         assert_text(&file_rows.rows[0][1], "lix_file_descriptor");
         assert_text(&file_rows.rows[0][3], "lix");
+        match &file_rows.rows[0][9] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected lixcol_writer_key as text/null, got {other:?}"),
+        }
+
+        let file_shape_rows = engine
+            .execute(
+                "SELECT directory_id, name, extension \
+                 FROM lix_file \
+                 WHERE id = 'lixcol-file'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_shape_rows.rows.len(), 1);
+        match &file_shape_rows.rows[0][0] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected directory_id as text/null, got {other:?}"),
+        }
+        assert_text(&file_shape_rows.rows[0][1], "lixcol");
+        assert_text(&file_shape_rows.rows[0][2], "json");
+
+        let active_version = active_version_id(&engine).await.replace('\'', "''");
+        let file_by_version_shape_rows = engine
+            .execute(
+                &format!(
+                    "SELECT directory_id, name, extension, lixcol_writer_key \
+                     FROM lix_file_by_version \
+                     WHERE id = 'lixcol-file' \
+                       AND lixcol_version_id = '{active_version}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(file_by_version_shape_rows.rows.len(), 1);
+        match &file_by_version_shape_rows.rows[0][0] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected file_by_version directory_id as text/null, got {other:?}"),
+        }
+        assert_text(&file_by_version_shape_rows.rows[0][1], "lixcol");
+        assert_text(&file_by_version_shape_rows.rows[0][2], "json");
+        match &file_by_version_shape_rows.rows[0][3] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected file_by_version writer key as text/null, got {other:?}"),
+        }
 
         let directory_rows = engine
             .execute(
                 "SELECT \
-                lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
-                lixcol_schema_version, lixcol_inherited_from_version_id, lixcol_change_id, \
-                lixcol_created_at, lixcol_updated_at, lixcol_untracked, lixcol_metadata \
+                lixcol_entity_id, lixcol_schema_key, lixcol_schema_version, lixcol_inherited_from_version_id, \
+                lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
+                lixcol_untracked, lixcol_metadata \
              FROM lix_directory WHERE id = 'lixcol-dir'",
                 &[],
             )
@@ -1508,7 +1993,37 @@ simulation_test!(
             .unwrap();
         assert_eq!(directory_rows.rows.len(), 1);
         assert_text(&directory_rows.rows[0][1], "lix_directory_descriptor");
-        assert_text(&directory_rows.rows[0][3], "lix");
+        match &directory_rows.rows[0][2] {
+            Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
+            other => panic!("expected lixcol_schema_version as text, got {other:?}"),
+        }
+        match &directory_rows.rows[0][9] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected lixcol_metadata as text/null, got {other:?}"),
+        }
+
+        let directory_by_version_rows = engine
+            .execute(
+                &format!(
+                    "SELECT \
+                    lixcol_schema_version, lixcol_metadata \
+                 FROM lix_directory_by_version \
+                 WHERE id = 'lixcol-dir' \
+                   AND lixcol_version_id = '{active_version}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(directory_by_version_rows.rows.len(), 1);
+        match &directory_by_version_rows.rows[0][0] {
+            Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
+            other => panic!("expected by-version schema version as text, got {other:?}"),
+        }
+        match &directory_by_version_rows.rows[0][1] {
+            Value::Text(_) | Value::Null => {}
+            other => panic!("expected by-version metadata as text/null, got {other:?}"),
+        }
     }
 );
 
