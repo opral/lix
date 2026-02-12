@@ -4,7 +4,7 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, DoUpdate, Expr, Function,
     FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, OnConflict,
     OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, Value, ValueWithSpan, Values,
+    TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, Visitor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1694,22 +1694,81 @@ fn extract_explicit_writer_key_assignment(
     assignments: &[Assignment],
     params: &[EngineValue],
 ) -> Result<Option<Option<String>>, LixError> {
-    let Some(assignment) = assignments
-        .iter()
-        .find(|assignment| assignment_target_is_column(&assignment.target, "writer_key"))
-    else {
-        return Ok(None);
-    };
-
     let mut state = PlaceholderState::new();
-    let resolved = resolve_expr_cell_with_state(&assignment.value, params, &mut state)?;
-    match resolved.value {
-        Some(EngineValue::Text(value)) => Ok(Some(Some(value))),
-        Some(EngineValue::Null) | None => Ok(Some(None)),
-        Some(other) => Err(LixError {
-            message: format!("writer_key assignment expects text or null, got {other:?}"),
-        }),
+    for assignment in assignments {
+        let resolved =
+            resolve_assignment_with_placeholder_state(&assignment.value, params, &mut state)?;
+        if !assignment_target_is_column(&assignment.target, "writer_key") {
+            continue;
+        }
+
+        return match resolved.value {
+            Some(EngineValue::Text(value)) => Ok(Some(Some(value))),
+            Some(EngineValue::Null) => Ok(Some(None)),
+            None => Ok(None),
+            Some(other) => Err(LixError {
+                message: format!("writer_key assignment expects text or null, got {other:?}"),
+            }),
+        };
     }
+
+    Ok(None)
+}
+
+fn resolve_assignment_with_placeholder_state(
+    expr: &Expr,
+    params: &[EngineValue],
+    state: &mut PlaceholderState,
+) -> Result<ResolvedCell, LixError> {
+    let resolved = resolve_expr_cell_with_state(expr, params, state)?;
+    if resolved.value.is_none() {
+        advance_placeholder_state_for_expr(expr, params, state)?;
+    }
+    Ok(resolved)
+}
+
+fn advance_placeholder_state_for_expr(
+    expr: &Expr,
+    params: &[EngineValue],
+    state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    struct PlaceholderStateAdvancer<'a> {
+        params_len: usize,
+        state: &'a mut PlaceholderState,
+        error: Option<LixError>,
+    }
+
+    impl Visitor for PlaceholderStateAdvancer<'_> {
+        type Break = ();
+
+        fn pre_visit_value(&mut self, value: &Value) -> std::ops::ControlFlow<Self::Break> {
+            let Value::Placeholder(token) = value else {
+                return std::ops::ControlFlow::Continue(());
+            };
+
+            if let Err(error) =
+                crate::sql::params::resolve_placeholder_index(token, self.params_len, self.state)
+            {
+                self.error = Some(error);
+                return std::ops::ControlFlow::Break(());
+            }
+
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    let mut advancer = PlaceholderStateAdvancer {
+        params_len: params.len(),
+        state,
+        error: None,
+    };
+    let _ = expr.visit(&mut advancer);
+
+    if let Some(error) = advancer.error {
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn lix_timestamp_expr() -> Expr {
@@ -3164,6 +3223,65 @@ mod tests {
 
         let validation = planned.validation.expect("validation plan");
         assert_eq!(validation.snapshot_content, Some(json!({ "key": "value" })));
+    }
+
+    #[test]
+    fn rewrite_update_extracts_writer_key_after_prior_placeholders() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET metadata = ? || '', writer_key = ?
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(
+            update,
+            &[
+                EngineValue::Text("ignored".to_string()),
+                EngineValue::Text("editor:explicit".to_string()),
+            ],
+        )
+        .expect("rewrite ok")
+        .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(
+            planned.plan.explicit_writer_key,
+            Some(Some("editor:explicit".to_string()))
+        );
+    }
+
+    #[test]
+    fn rewrite_update_non_literal_writer_key_does_not_force_null() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET writer_key = lower('EDITOR')
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(update, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(planned.plan.explicit_writer_key, None);
     }
 
     #[test]
