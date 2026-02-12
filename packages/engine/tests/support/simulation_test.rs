@@ -72,16 +72,25 @@ impl SimulationEngine {
         match classify_statement(sql) {
             StatementKind::Read => {
                 self.rematerialize_before_read_if_needed().await?;
-                self.engine.execute(sql, params).await
+                self.engine
+                    .execute(sql, params, ExecuteOptions::default())
+                    .await
             }
             StatementKind::Write => {
-                let result = self.engine.execute(sql, params).await;
+                let result = self
+                    .engine
+                    .execute(sql, params, ExecuteOptions::default())
+                    .await;
                 if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
                     self.rematerialization_pending.store(true, Ordering::SeqCst);
                 }
                 result
             }
-            StatementKind::Other => self.engine.execute(sql, params).await,
+            StatementKind::Other => {
+                self.engine
+                    .execute(sql, params, ExecuteOptions::default())
+                    .await
+            }
         }
     }
 
@@ -94,16 +103,16 @@ impl SimulationEngine {
         match classify_statement(sql) {
             StatementKind::Read => {
                 self.rematerialize_before_read_if_needed().await?;
-                self.engine.execute_with_options(sql, params, options).await
+                self.engine.execute(sql, params, options).await
             }
             StatementKind::Write => {
-                let result = self.engine.execute_with_options(sql, params, options).await;
+                let result = self.engine.execute(sql, params, options).await;
                 if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
                     self.rematerialization_pending.store(true, Ordering::SeqCst);
                 }
                 result
             }
-            StatementKind::Other => self.engine.execute_with_options(sql, params, options).await,
+            StatementKind::Other => self.engine.execute(sql, params, options).await,
         }
     }
 

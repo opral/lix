@@ -123,20 +123,6 @@ pub struct EngineTransaction<'a> {
 
 impl<'a> EngineTransaction<'a> {
     pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
-    }
-
-    pub async fn execute_with_options(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
-        let mut effective_options = self.options.clone();
-        if options.writer_key.is_some() {
-            effective_options.writer_key = options.writer_key;
-        }
         let previous_active_version_id = self.active_version_id.clone();
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             message: "transaction is no longer active".to_string(),
@@ -147,7 +133,7 @@ impl<'a> EngineTransaction<'a> {
                 transaction.as_mut(),
                 sql,
                 params,
-                &effective_options,
+                &self.options,
                 &mut self.active_version_id,
             )
             .await?;
@@ -280,12 +266,7 @@ impl Engine {
         result
     }
 
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.execute_with_options(sql, params, ExecuteOptions::default())
-            .await
-    }
-
-    pub async fn execute_with_options(
+    pub async fn execute(
         &self,
         sql: &str,
         params: &[Value],
@@ -511,12 +492,7 @@ impl Engine {
         Ok(result)
     }
 
-    pub async fn begin_transaction(&self) -> Result<EngineTransaction<'_>, LixError> {
-        self.begin_transaction_with_options(ExecuteOptions::default())
-            .await
-    }
-
-    pub async fn begin_transaction_with_options(
+    async fn begin_transaction_with_options(
         &self,
         options: ExecuteOptions,
     ) -> Result<EngineTransaction<'_>, LixError> {
@@ -1023,6 +999,7 @@ impl Engine {
                        AND snapshot_content IS NOT NULL \
                      LIMIT 1",
                     &[Value::Text(entity_id.clone())],
+                    ExecuteOptions::default(),
                 )
                 .await?;
             if !existing.rows.is_empty() {
@@ -1037,6 +1014,7 @@ impl Engine {
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) \
                  VALUES ('lix_stored_schema', $1)",
                 &[Value::Text(snapshot_content)],
+                ExecuteOptions::default(),
             )
             .await?;
         }
@@ -1069,6 +1047,7 @@ impl Engine {
                     Value::Text(snapshot_content),
                     Value::Text(key_value_schema_version().to_string()),
                 ],
+                ExecuteOptions::default(),
             )
             .await?;
         }
@@ -1129,6 +1108,7 @@ impl Engine {
                     Value::Text(account_file_id().to_string()),
                     Value::Text(account_storage_version_id().to_string()),
                 ],
+                ExecuteOptions::default(),
             )
             .await?;
         if exists.rows.is_empty() {
@@ -1145,6 +1125,7 @@ impl Engine {
                     Value::Text(account_snapshot_content(&account.id, &account.name)),
                     Value::Text(account_schema_version().to_string()),
                 ],
+                ExecuteOptions::default(),
             )
             .await?;
         }
@@ -1160,6 +1141,7 @@ impl Engine {
                 Value::Text(active_account_file_id().to_string()),
                 Value::Text(active_account_storage_version_id().to_string()),
             ],
+            ExecuteOptions::default(),
         )
         .await?;
 
@@ -1176,6 +1158,7 @@ impl Engine {
                 Value::Text(active_account_snapshot_content(&account.id)),
                 Value::Text(active_account_schema_version().to_string()),
             ],
+            ExecuteOptions::default(),
         )
         .await?;
 
@@ -1406,7 +1389,9 @@ impl Engine {
     }
 
     async fn generate_runtime_uuid(&self) -> Result<String, LixError> {
-        let result = self.execute("SELECT lix_uuid_v7()", &[]).await?;
+        let result = self
+            .execute("SELECT lix_uuid_v7()", &[], ExecuteOptions::default())
+            .await?;
         let row = result.rows.first().ok_or_else(|| LixError {
             message: "lix_uuid_v7 query returned no rows".to_string(),
         })?;
@@ -1602,7 +1587,7 @@ impl Engine {
              ) VALUES {}",
             rows.join(", ")
         );
-        Box::pin(self.execute(&sql, &params)).await?;
+        Box::pin(self.execute(&sql, &params, ExecuteOptions::default())).await?;
 
         Ok(())
     }
@@ -1847,7 +1832,7 @@ impl Engine {
         let statements = parse_sql_statements(sql)?;
         let mut last_result = QueryResult { rows: Vec::new() };
         for statement in statements {
-            last_result = Box::pin(self.execute_with_options(
+            last_result = Box::pin(self.execute(
                 &statement.to_string(),
                 params,
                 options.clone(),

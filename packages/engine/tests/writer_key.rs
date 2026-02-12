@@ -154,67 +154,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    writer_key_statement_override_works_inside_transaction,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine_deterministic()
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
-
-        engine
-            .raw_engine()
-            .transaction(
-                ExecuteOptions {
-                    writer_key: Some("editor:tx-default".to_string()),
-                },
-                |tx| {
-                    Box::pin(async move {
-                        tx.execute_with_options(
-                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-override-1', '/wk-override-1.json', 'ignored')",
-                            &[],
-                            ExecuteOptions {
-                                writer_key: Some("editor:override".to_string()),
-                            },
-                        )
-                        .await?;
-                        tx.execute(
-                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-override-2', '/wk-override-2.json', 'ignored')",
-                            &[],
-                        )
-                        .await?;
-                        Ok(())
-                    })
-                },
-            )
-            .await
-            .unwrap();
-
-        let version_id = active_version_id(&engine).await;
-        let rows = engine
-            .execute(
-                &format!(
-                    "SELECT entity_id, writer_key \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_file_descriptor' \
-                       AND version_id = '{version_id}' \
-                       AND entity_id IN ('wk-override-1', 'wk-override-2') \
-                     ORDER BY entity_id"
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.rows.len(), 2);
-        assert_text(&rows.rows[0][0], "wk-override-1");
-        assert_text(&rows.rows[0][1], "editor:override");
-        assert_text(&rows.rows[1][0], "wk-override-2");
-        assert_text(&rows.rows[1][1], "editor:tx-default");
-    }
-);
-
-simulation_test!(
     update_without_writer_key_clears_writer_key,
     simulations = [sqlite, postgres],
     |sim| async move {

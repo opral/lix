@@ -49,17 +49,6 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine
         .expect("sequence value must be integer")
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
-    let sql = format!(
-        "INSERT INTO lix_version (\
-         id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
-         ) VALUES (\
-         '{version_id}', '{version_id}', 'global', 0, 'commit-{version_id}', 'working-{version_id}'\
-         )",
-    );
-    engine.execute(&sql, &[]).await.unwrap();
-}
-
 simulation_test!(
     transaction_path_applies_insert_validation,
     simulations = [sqlite, postgres],
@@ -104,61 +93,6 @@ simulation_test!(
                 .contains("snapshot_content does not match schema 'tx_validation_schema' (1)"),
             "unexpected error: {}",
             error.message
-        );
-    }
-);
-
-simulation_test!(
-    committing_unchanged_transaction_does_not_overwrite_active_version_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
-        insert_version(&engine, "version-tx-stale").await;
-
-        let tx = engine.raw_engine().begin_transaction().await.unwrap();
-        engine
-            .execute(
-                "UPDATE lix_active_version SET version_id = 'version-tx-stale'",
-                &[],
-            )
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-
-        let active = engine
-            .execute(
-                "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(active.rows.len(), 1);
-        assert_eq!(
-            active.rows[0][0],
-            Value::Text("version-tx-stale".to_string())
-        );
-    }
-);
-
-simulation_test!(
-    dropping_open_transaction_panics,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
-
-        let tx = engine.raw_engine().begin_transaction().await.unwrap();
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(tx)));
-        assert!(
-            panic_result.is_err(),
-            "expected drop without commit/rollback to panic"
         );
     }
 );
