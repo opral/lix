@@ -13,6 +13,7 @@ pub struct SchemaRegistration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VtableUpdatePlan {
     pub schema_key: String,
+    pub explicit_writer_key: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

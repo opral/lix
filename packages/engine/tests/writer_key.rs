@@ -314,3 +314,54 @@ simulation_test!(
         assert_blob_text(&cache_rows.rows[0][0], "after");
     }
 );
+
+simulation_test!(
+    explicit_writer_key_update_is_preserved_in_followup_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute_with_options(
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-update-writer', '/wk-update-writer.json', 'ignored')",
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:initial".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_internal_state_vtable \
+                 SET writer_key = 'editor:explicit-update' \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND entity_id = 'wk-update-writer'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let state_row = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_file_descriptor' \
+                       AND entity_id = 'wk-update-writer' \
+                       AND version_id = '{version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_row.rows.len(), 1);
+        assert_text(&state_row.rows[0][0], "editor:explicit-update");
+    }
+);
