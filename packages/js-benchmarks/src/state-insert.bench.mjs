@@ -299,13 +299,6 @@ function percentile(sorted, p) {
   return sorted[index];
 }
 
-function percentDelta(current, baseline) {
-  if (baseline === 0) {
-    return null;
-  }
-  return ((current - baseline) / baseline) * 100;
-}
-
 function scalarToString(value, context) {
   if (value === null || value === undefined) {
     throw new Error(`Missing scalar value for ${context}`);
