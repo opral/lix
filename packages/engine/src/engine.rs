@@ -3189,7 +3189,8 @@ mod tests {
     }
 
     #[test]
-    fn regression_update_target_lix_file_with_data_predicate_requires_active_materialization_scope() {
+    fn regression_update_target_lix_file_with_data_predicate_requires_active_materialization_scope()
+    {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE lix_file \
              SET path = '/renamed.json' \
@@ -3199,7 +3200,8 @@ mod tests {
     }
 
     #[test]
-    fn regression_update_target_lix_file_by_version_with_data_predicate_requires_all_versions_scope() {
+    fn regression_update_target_lix_file_by_version_with_data_predicate_requires_all_versions_scope(
+    ) {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE lix_file_by_version \
              SET path = '/renamed.json' \

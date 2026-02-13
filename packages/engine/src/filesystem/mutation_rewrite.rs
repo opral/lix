@@ -698,19 +698,6 @@ async fn rewrite_file_insert_columns_with_backend(
             .transpose()?
             .flatten();
 
-        assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
-        if let Some(existing_id) =
-            find_file_id_by_path(backend, &version_id, &parsed.normalized_path).await?
-        {
-            let same_id = explicit_id
-                .as_deref()
-                .map(|value| value == existing_id.as_str())
-                .unwrap_or(false);
-            if !same_id {
-                return Err(file_unique_error(&parsed.normalized_path, &version_id));
-            }
-        }
-
         let directory_id = if let Some(directory_path) = &parsed.directory_path {
             if let Some(existing_id) =
                 find_directory_id_by_path(backend, &version_id, directory_path).await?
@@ -722,6 +709,45 @@ async fn rewrite_file_insert_columns_with_backend(
         } else {
             None
         };
+
+        let candidate_name = match parsed.extension.as_deref() {
+            Some(extension) => format!("{}.{}", parsed.name, extension),
+            None => parsed.name.clone(),
+        };
+        if find_directory_child_id(
+            backend,
+            &version_id,
+            directory_id.as_deref(),
+            &candidate_name,
+        )
+        .await?
+        .is_some()
+        {
+            return Err(LixError {
+                message: format!(
+                    "File path collides with existing directory path: {}/",
+                    parsed.normalized_path
+                ),
+            });
+        }
+
+        if let Some(existing_id) = find_file_id_by_components(
+            backend,
+            &version_id,
+            directory_id.as_deref(),
+            &parsed.name,
+            parsed.extension.as_deref(),
+        )
+        .await?
+        {
+            let same_id = explicit_id
+                .as_deref()
+                .map(|value| value == existing_id.as_str())
+                .unwrap_or(false);
+            if !same_id {
+                return Err(file_unique_error(&parsed.normalized_path, &version_id));
+            }
+        }
 
         row[directory_id_index] = optional_string_literal_expr(directory_id.as_deref());
         row[name_index] = string_literal_expr(&parsed.name);
@@ -1454,9 +1480,26 @@ async fn find_file_id_by_path(
         None
     };
 
+    find_file_id_by_components(
+        backend,
+        version_id,
+        directory_id.as_deref(),
+        &parsed.name,
+        parsed.extension.as_deref(),
+    )
+    .await
+}
+
+async fn find_file_id_by_components(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: Option<&str>,
+    name: &str,
+    extension: Option<&str>,
+) -> Result<Option<String>, LixError> {
     let mut params = vec![
         EngineValue::Text(version_id.to_string()),
-        EngineValue::Text(parsed.name.clone()),
+        EngineValue::Text(name.to_string()),
     ];
     let lookup_sql = format!(
         "SELECT entity_id \
@@ -1468,18 +1511,13 @@ async fn find_file_id_by_path(
            AND {directory_predicate} \
            AND {extension_predicate} \
          LIMIT 1",
-        directory_predicate = if directory_id.is_some() {
-            params.push(EngineValue::Text(
-                directory_id
-                    .as_ref()
-                    .expect("directory id is_some checked")
-                    .clone(),
-            ));
+        directory_predicate = if let Some(directory_id) = directory_id {
+            params.push(EngineValue::Text(directory_id.to_string()));
             "lix_json_text(snapshot_content, 'directory_id') = $3".to_string()
         } else {
             "lix_json_text(snapshot_content, 'directory_id') IS NULL".to_string()
         },
-        extension_predicate = if let Some(extension) = parsed.extension.as_deref() {
+        extension_predicate = if let Some(extension) = extension {
             let index = params.len() + 1;
             params.push(EngineValue::Text(extension.to_string()));
             format!("lix_json_text(snapshot_content, 'extension') = ${index}")

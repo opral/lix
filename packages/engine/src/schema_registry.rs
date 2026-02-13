@@ -172,7 +172,8 @@ mod tests {
 
     #[test]
     fn postgres_file_descriptor_index_names_do_not_truncate_to_collisions() {
-        let statements = register_schema_sql_statements("lix_file_descriptor", SqlDialect::Postgres);
+        let statements =
+            register_schema_sql_statements("lix_file_descriptor", SqlDialect::Postgres);
         let mut by_truncated = BTreeMap::<String, Vec<String>>::new();
         for statement in statements {
             let Some(rest) = statement.strip_prefix("CREATE INDEX IF NOT EXISTS \"") else {
