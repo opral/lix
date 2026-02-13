@@ -6,11 +6,11 @@
   "description": "Cross-benchmark suite for old @lix-js/sdk vs new js-sdk",
   "scripts": {
     "bench": "pnpm run bench:state",
-    "bench:state": "pnpm --filter js-sdk run build && pnpm --filter @lix-js/sdk run build && pnpm run bench:state:run",
+    "bench:state": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm --filter @lix-js/sdk run build && pnpm run bench:state:run",
     "bench:state:run": "node ./src/state-insert.bench.mjs",
     "bench:quick": "pnpm run bench:state:quick",
     "bench:state:quick": "BENCH_ITER_SINGLE=40 BENCH_ITER_CHUNK_10=20 BENCH_ITER_CHUNK_100=8 BENCH_WARMUP=1 pnpm run bench:state",
-    "bench:json": "pnpm --filter js-sdk run build && pnpm --filter @lix-js/sdk run build && pnpm --filter @lix-js/plugin-json run build && pnpm run bench:json:run",
+    "bench:json": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm --filter @lix-js/sdk run build && pnpm --filter @lix-js/plugin-json run build && pnpm run bench:json:run",
     "bench:json:run": "node ./src/json-insert.bench.mjs",
     "bench:json:quick": "BENCH_JSON_ITER=24 BENCH_JSON_LEAF_COUNT=120 BENCH_WARMUP=1 pnpm run bench:json"
   },

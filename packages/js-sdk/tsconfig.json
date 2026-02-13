@@ -9,5 +9,6 @@
     "outDir": "dist",
     "skipLibCheck": true
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests"],
+  "exclude": ["src/engine-wasm/wasm/lix_engine_wasm_bindgen_bg.wasm.d.ts"]
 }

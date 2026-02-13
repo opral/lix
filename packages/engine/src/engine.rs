@@ -394,7 +394,9 @@ impl Engine {
                     .map(|change| change.schema_key.clone())
                     .collect::<BTreeSet<_>>();
                 for schema_key in additional_schema_keys {
-                    for statement in register_schema_sql_statements(&schema_key) {
+                    for statement in
+                        register_schema_sql_statements(&schema_key, transaction.dialect())
+                    {
                         if let Err(error) = transaction.execute(&statement, &[]).await {
                             let _ = transaction.rollback().await;
                             return Err(error);
@@ -631,7 +633,9 @@ impl Engine {
         let next_active_version_id_from_updates =
             active_version_from_update_validations(&output.update_validations)?;
         for registration in output.registrations {
-            for statement in register_schema_sql_statements(&registration.schema_key) {
+            for statement in
+                register_schema_sql_statements(&registration.schema_key, transaction.dialect())
+            {
                 transaction.execute(&statement, &[]).await?;
             }
         }
@@ -678,7 +682,9 @@ impl Engine {
                     .map(|change| change.schema_key.clone())
                     .collect::<BTreeSet<_>>();
                 for schema_key in additional_schema_keys {
-                    for statement in register_schema_sql_statements(&schema_key) {
+                    for statement in
+                        register_schema_sql_statements(&schema_key, transaction.dialect())
+                    {
                         transaction.execute(&statement, &[]).await?;
                     }
                 }

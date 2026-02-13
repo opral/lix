@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
 import { openLix as openOldLix } from "@lix-js/sdk";
 import { plugin as legacyJsonPlugin } from "@lix-js/plugin-json";
-import { openLix as openNewLix } from "js-sdk/dist/open-lix.js";
+import { openLix as openNewLix } from "js-sdk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, "..", "results");
