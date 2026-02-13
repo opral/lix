@@ -153,11 +153,6 @@ export async function openLix(
     try {
       if (typeof (wasmLix as any).free === "function") {
         (wasmLix as any).free();
-      } else if (
-        typeof Symbol.dispose === "symbol" &&
-        typeof (wasmLix as any)[Symbol.dispose] === "function"
-      ) {
-        (wasmLix as any)[Symbol.dispose]();
       }
     } catch (error) {
       firstError = error;
