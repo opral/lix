@@ -1367,20 +1367,63 @@ async fn find_directory_id_by_path(
     version_id: &str,
     path: &str,
 ) -> Result<Option<String>, LixError> {
-    let lookup_sql = "SELECT id \
-         FROM lix_directory_by_version \
-         WHERE lixcol_version_id = $1 AND path = $2 \
-         LIMIT 1";
-    let rewritten_lookup_sql = rewrite_single_read_query_for_backend(backend, lookup_sql).await?;
-    let result = backend
-        .execute(
-            &rewritten_lookup_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(path.to_string()),
-            ],
+    let normalized_path = normalize_directory_path(path)?;
+    let trimmed = normalized_path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let mut current_parent: Option<String> = None;
+    for segment in trimmed.split('/') {
+        let Some(next_id) =
+            find_directory_child_id(backend, version_id, current_parent.as_deref(), segment)
+                .await?
+        else {
+            return Ok(None);
+        };
+        current_parent = Some(next_id);
+    }
+
+    Ok(current_parent)
+}
+
+async fn find_directory_child_id(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+) -> Result<Option<String>, LixError> {
+    let mut params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(name.to_string()),
+    ];
+    let lookup_sql = if let Some(parent_id) = parent_id {
+        params.push(EngineValue::Text(parent_id.to_string()));
+        format!(
+            "SELECT entity_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_directory_descriptor' \
+               AND version_id = $1 \
+               AND snapshot_content IS NOT NULL \
+               AND lix_json_text(snapshot_content, 'name') = $2 \
+               AND lix_json_text(snapshot_content, 'parent_id') = $3 \
+             LIMIT 1",
         )
-        .await?;
+    } else {
+        format!(
+            "SELECT entity_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_directory_descriptor' \
+               AND version_id = $1 \
+               AND snapshot_content IS NOT NULL \
+               AND lix_json_text(snapshot_content, 'name') = $2 \
+               AND lix_json_text(snapshot_content, 'parent_id') IS NULL \
+             LIMIT 1",
+        )
+    };
+
+    let rewritten_lookup_sql = rewrite_single_read_query_for_backend(backend, &lookup_sql).await?;
+    let result = backend.execute(&rewritten_lookup_sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -1400,20 +1443,52 @@ async fn find_file_id_by_path(
     version_id: &str,
     path: &str,
 ) -> Result<Option<String>, LixError> {
-    let lookup_sql = "SELECT id \
-         FROM lix_file_by_version \
-         WHERE lixcol_version_id = $1 AND path = $2 \
-         LIMIT 1";
-    let rewritten_lookup_sql = rewrite_single_read_query_for_backend(backend, lookup_sql).await?;
-    let result = backend
-        .execute(
-            &rewritten_lookup_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(path.to_string()),
-            ],
-        )
-        .await?;
+    let parsed = parse_file_path(path)?;
+    let directory_id = if let Some(directory_path) = parsed.directory_path.as_deref() {
+        let resolved = find_directory_id_by_path(backend, version_id, directory_path).await?;
+        let Some(directory_id) = resolved else {
+            return Ok(None);
+        };
+        Some(directory_id)
+    } else {
+        None
+    };
+
+    let mut params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(parsed.name.clone()),
+    ];
+    let lookup_sql = format!(
+        "SELECT entity_id \
+         FROM lix_state_by_version \
+         WHERE schema_key = 'lix_file_descriptor' \
+           AND version_id = $1 \
+           AND snapshot_content IS NOT NULL \
+           AND lix_json_text(snapshot_content, 'name') = $2 \
+           AND {directory_predicate} \
+           AND {extension_predicate} \
+         LIMIT 1",
+        directory_predicate = if directory_id.is_some() {
+            params.push(EngineValue::Text(
+                directory_id
+                    .as_ref()
+                    .expect("directory id is_some checked")
+                    .clone(),
+            ));
+            "lix_json_text(snapshot_content, 'directory_id') = $3".to_string()
+        } else {
+            "lix_json_text(snapshot_content, 'directory_id') IS NULL".to_string()
+        },
+        extension_predicate = if let Some(extension) = parsed.extension.as_deref() {
+            let index = params.len() + 1;
+            params.push(EngineValue::Text(extension.to_string()));
+            format!("lix_json_text(snapshot_content, 'extension') = ${index}")
+        } else {
+            "lix_json_text(snapshot_content, 'extension') IS NULL".to_string()
+        },
+    );
+    let rewritten_lookup_sql = rewrite_single_read_query_for_backend(backend, &lookup_sql).await?;
+    let result = backend.execute(&rewritten_lookup_sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -1928,21 +2003,10 @@ async fn assert_no_directory_at_file_path(
     file_path: &str,
 ) -> Result<(), LixError> {
     let directory_path = format!("{file_path}/");
-    let sql = "SELECT id \
-         FROM lix_directory_by_version \
-         WHERE lixcol_version_id = $1 AND path = $2 \
-         LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
-    let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(directory_path.clone()),
-            ],
-        )
-        .await?;
-    if result.rows.is_empty() {
+    if find_directory_id_by_path(backend, version_id, &directory_path)
+        .await?
+        .is_none()
+    {
         return Ok(());
     }
     Err(LixError {
@@ -1956,21 +2020,10 @@ async fn assert_no_file_at_directory_path(
     directory_path: &str,
 ) -> Result<(), LixError> {
     let file_path = directory_path.trim_end_matches('/').to_string();
-    let sql = "SELECT id \
-         FROM lix_file_by_version \
-         WHERE lixcol_version_id = $1 AND path = $2 \
-         LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
-    let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(file_path.clone()),
-            ],
-        )
-        .await?;
-    if result.rows.is_empty() {
+    if find_file_id_by_path(backend, version_id, &file_path)
+        .await?
+        .is_none()
+    {
         return Ok(());
     }
     Err(LixError {

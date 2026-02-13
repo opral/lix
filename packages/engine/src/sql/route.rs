@@ -174,14 +174,20 @@ pub(crate) fn rewrite_statement_with_writer_key<P: LixFunctionProvider>(
                     writer_key,
                 );
             }
+            let mut effective_scope_fallback = false;
             let delete = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
+                effective_scope_fallback = true;
                 rewritten
             } else {
                 delete
             };
-            let rewritten = vtable_write::rewrite_delete(delete.clone())?;
+            let rewritten = if effective_scope_fallback {
+                vtable_write::rewrite_delete_with_options(delete.clone(), true)?
+            } else {
+                vtable_write::rewrite_delete(delete.clone())?
+            };
             match rewritten {
                 Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
                     statements: vec![statement],
@@ -463,6 +469,7 @@ where
         }
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
+            let mut effective_scope_fallback = false;
             let delete = if let Some(rewritten) =
                 filesystem_step::rewrite_delete_with_backend(backend, delete.clone(), params)
                     .await?
@@ -478,16 +485,15 @@ where
             } else {
                 delete
             };
-            let output = if let Some(rewritten) =
+            let delete = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
-                rewrite_statement_with_writer_key(
-                    Statement::Delete(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                )?
-            } else if let Some(rewritten) =
+                effective_scope_fallback = true;
+                rewritten
+            } else {
+                delete
+            };
+            let output = if let Some(rewritten) =
                 lix_active_account_view_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
@@ -496,35 +502,63 @@ where
                 .await?
             {
                 rewrite_statement_with_writer_key(rewritten, params, functions, writer_key)?
-            } else if let Some(rewritten) =
-                lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
-            {
-                rewrite_statement_with_writer_key(
-                    Statement::Delete(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                )?
-            } else if let Some(version_inserts) =
-                lix_version_view_write::rewrite_delete_with_backend(backend, delete.clone(), params)
-                    .await?
-            {
-                rewrite_vtable_inserts_with_backend(
-                    backend,
-                    version_inserts,
-                    params,
-                    functions,
-                    detected_file_domain_changes,
-                    writer_key,
-                )
-                .await?
             } else {
-                rewrite_statement_with_writer_key(
-                    Statement::Delete(delete),
-                    params,
-                    functions,
-                    writer_key,
-                )?
+                let delete = if let Some(rewritten) =
+                    lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone())
+                        .await?
+                {
+                    effective_scope_fallback = !selection_mentions_inherited_from_version_id(
+                        delete.selection.as_ref(),
+                    );
+                    rewritten
+                } else {
+                    delete
+                };
+                if let Some(version_inserts) =
+                    lix_version_view_write::rewrite_delete_with_backend(
+                        backend,
+                        delete.clone(),
+                        params,
+                    )
+                    .await?
+                {
+                    rewrite_vtable_inserts_with_backend(
+                        backend,
+                        version_inserts,
+                        params,
+                        functions,
+                        detected_file_domain_changes,
+                        writer_key,
+                    )
+                    .await?
+                } else {
+                    let rewritten = vtable_write::rewrite_delete_with_options(
+                        delete.clone(),
+                        effective_scope_fallback,
+                    )?;
+                    match rewritten {
+                        Some(vtable_write::DeleteRewrite::Statement(statement)) => RewriteOutput {
+                            statements: vec![statement],
+                            registrations: Vec::new(),
+                            postprocess: None,
+                            mutations: Vec::new(),
+                            update_validations: Vec::new(),
+                        },
+                        Some(vtable_write::DeleteRewrite::Planned(rewrite)) => RewriteOutput {
+                            statements: vec![rewrite.statement],
+                            registrations: Vec::new(),
+                            postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
+                            mutations: Vec::new(),
+                            update_validations: Vec::new(),
+                        },
+                        None => rewrite_statement_with_writer_key(
+                            Statement::Delete(delete),
+                            params,
+                            functions,
+                            writer_key,
+                        )?,
+                    }
+                }
             };
             Ok(output)
         }
@@ -596,6 +630,16 @@ fn query_mentions_identifier(query: &Query, identifier: &str) -> bool {
         .to_string()
         .to_ascii_lowercase()
         .contains(&identifier.to_ascii_lowercase())
+}
+
+fn selection_mentions_inherited_from_version_id(selection: Option<&sqlparser::ast::Expr>) -> bool {
+    selection
+        .map(|expr| {
+            expr.to_string()
+                .to_ascii_lowercase()
+                .contains("inherited_from_version_id")
+        })
+        .unwrap_or(false)
 }
 
 async fn prepend_statements_with_backend<P>(

@@ -35,6 +35,18 @@ JSON plugin run without rebuilding packages:
 pnpm -C packages/js-benchmarks run bench:json:run
 ```
 
+JSON insert breakdown (new js-sdk only):
+
+```bash
+pnpm -C packages/js-benchmarks run bench:json:breakdown
+```
+
+JSON insert breakdown quick run:
+
+```bash
+pnpm -C packages/js-benchmarks run bench:json:breakdown:quick
+```
+
 Force ANSI colors (useful for screenshots):
 
 ```bash
@@ -47,6 +59,7 @@ Results are written to:
 
 - `packages/js-benchmarks/results/state-insert.bench.json`
 - `packages/js-benchmarks/results/json-insert.bench.json`
+- `packages/js-benchmarks/results/json-insert-breakdown.bench.json`
 
 ## Notes
 
