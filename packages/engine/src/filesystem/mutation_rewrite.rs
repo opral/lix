@@ -39,10 +39,13 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const INTERNAL_DESCRIPTOR_FILE_ID: &str = "lix";
 const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 
+pub type ResolvedDirectoryIdMap = BTreeMap<(String, String), String>;
+
 #[derive(Debug, Default)]
 pub struct FilesystemInsertSideEffects {
     pub statements: Vec<Statement>,
     pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
+    pub resolved_directory_ids: ResolvedDirectoryIdMap,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +76,7 @@ pub async fn rewrite_insert_with_backend(
     backend: &dyn LixBackend,
     mut insert: Insert,
     params: &[EngineValue],
+    resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
 ) -> Result<Option<Insert>, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
         return Ok(None);
@@ -85,7 +89,14 @@ pub async fn rewrite_insert_with_backend(
 
     if target.is_file {
         strip_file_data_from_insert(&mut insert)?;
-        rewrite_file_insert_columns_with_backend(backend, &mut insert, params, target).await?;
+        rewrite_file_insert_columns_with_backend(
+            backend,
+            &mut insert,
+            params,
+            target,
+            resolved_directory_ids,
+        )
+        .await?;
     } else {
         rewrite_directory_insert_columns_with_backend(backend, &mut insert, params, target).await?;
     }
@@ -313,6 +324,8 @@ pub async fn insert_side_effect_statements_with_backend(
         }
         known_ids.insert(key, id);
     }
+
+    side_effects.resolved_directory_ids = known_ids;
 
     Ok(side_effects)
 }
@@ -631,6 +644,7 @@ async fn rewrite_file_insert_columns_with_backend(
     insert: &mut Insert,
     params: &[EngineValue],
     target: FilesystemTarget,
+    resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
 ) -> Result<(), LixError> {
     let id_index = insert
         .columns
@@ -699,7 +713,13 @@ async fn rewrite_file_insert_columns_with_backend(
             .flatten();
 
         let directory_id = if let Some(directory_path) = &parsed.directory_path {
-            if let Some(existing_id) =
+            let lookup_key = (version_id.clone(), directory_path.clone());
+            if let Some(existing_id) = resolved_directory_ids
+                .and_then(|known| known.get(&lookup_key))
+                .cloned()
+            {
+                Some(existing_id)
+            } else if let Some(existing_id) =
                 find_directory_id_by_path(backend, &version_id, directory_path).await?
             {
                 Some(existing_id)

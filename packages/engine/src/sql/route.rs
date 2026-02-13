@@ -257,9 +257,13 @@ where
                     .tracked_directory_changes
                     .clone(),
             );
-            let insert = if let Some(rewritten) =
-                filesystem_step::rewrite_insert_with_backend(backend, insert.clone(), params)
-                    .await?
+            let insert = if let Some(rewritten) = filesystem_step::rewrite_insert_with_backend(
+                backend,
+                insert.clone(),
+                params,
+                Some(&filesystem_insert_side_effects.resolved_directory_ids),
+            )
+            .await?
             {
                 rewritten
             } else {
