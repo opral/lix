@@ -51,6 +51,16 @@ pub async fn rewrite_query_with_backend(
     } else {
         Vec::new()
     };
+    let plugin_keys = if top_level_targets_vtable {
+        extract_plugin_keys_from_query(&query).unwrap_or_default()
+    } else {
+        extract_plugin_keys_from_top_level_derived_subquery(&query).unwrap_or_default()
+    };
+    if schema_keys.is_empty() {
+        if !plugin_keys.is_empty() {
+            schema_keys = fetch_schema_keys_for_plugins(backend, &plugin_keys).await?;
+        }
+    }
     if schema_keys.is_empty() {
         schema_keys = fetch_materialized_schema_keys(backend).await?;
     }
@@ -333,7 +343,44 @@ fn table_factor_is_vtable(relation: &TableFactor) -> bool {
 }
 
 fn extract_schema_keys_from_query(query: &Query) -> Option<Vec<String>> {
-    extract_schema_keys_from_set_expr(&query.body)
+    extract_column_keys_from_query(query, expr_is_schema_key_column)
+}
+
+fn extract_plugin_keys_from_query(query: &Query) -> Option<Vec<String>> {
+    extract_column_keys_from_query(query, expr_is_plugin_key_column)
+}
+
+fn extract_plugin_keys_from_top_level_derived_subquery(query: &Query) -> Option<Vec<String>> {
+    let select = match query.body.as_ref() {
+        SetExpr::Select(select) => select,
+        _ => return None,
+    };
+    if select.projection.len() != 1 {
+        return None;
+    }
+    let projection_normalized = select.projection[0]
+        .to_string()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if projection_normalized != "count(*)" {
+        return None;
+    }
+    if select.selection.is_some() {
+        return None;
+    }
+    if select.from.len() != 1 {
+        return None;
+    }
+    let table = select.from.first()?;
+    if !table.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Derived { subquery, .. } = &table.relation else {
+        return None;
+    };
+    extract_plugin_keys_from_query(subquery)
 }
 
 fn extract_pushdown_predicate(query: &Query) -> Option<Expr> {
@@ -345,34 +392,52 @@ fn extract_pushdown_predicate(query: &Query) -> Option<Expr> {
     strip_qualifiers(selection.clone())
 }
 
-fn extract_schema_keys_from_set_expr(expr: &SetExpr) -> Option<Vec<String>> {
+fn extract_column_keys_from_query(
+    query: &Query,
+    is_target_column: fn(&Expr) -> bool,
+) -> Option<Vec<String>> {
+    extract_column_keys_from_set_expr(&query.body, is_target_column)
+}
+
+fn extract_column_keys_from_set_expr(
+    expr: &SetExpr,
+    is_target_column: fn(&Expr) -> bool,
+) -> Option<Vec<String>> {
     match expr {
-        SetExpr::Select(select) => extract_schema_keys_from_select(select),
-        SetExpr::Query(query) => extract_schema_keys_from_set_expr(&query.body),
-        SetExpr::SetOperation { left, right, .. } => extract_schema_keys_from_set_expr(left)
-            .or_else(|| extract_schema_keys_from_set_expr(right)),
+        SetExpr::Select(select) => extract_column_keys_from_select(select, is_target_column),
+        SetExpr::Query(query) => extract_column_keys_from_set_expr(&query.body, is_target_column),
+        SetExpr::SetOperation { left, right, .. } => {
+            extract_column_keys_from_set_expr(left, is_target_column)
+                .or_else(|| extract_column_keys_from_set_expr(right, is_target_column))
+        }
         _ => None,
     }
 }
 
-fn extract_schema_keys_from_select(select: &Select) -> Option<Vec<String>> {
+fn extract_column_keys_from_select(
+    select: &Select,
+    is_target_column: fn(&Expr) -> bool,
+) -> Option<Vec<String>> {
     select
         .selection
         .as_ref()
-        .and_then(extract_schema_keys_from_expr)
+        .and_then(|expr| extract_column_keys_from_expr(expr, is_target_column))
 }
 
-fn extract_schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
+fn extract_column_keys_from_expr(
+    expr: &Expr,
+    is_target_column: fn(&Expr) -> bool,
+) -> Option<Vec<String>> {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
         } => {
-            if expr_is_schema_key_column(left) {
+            if is_target_column(left) {
                 return string_literal_value(right).map(|value| vec![value]);
             }
-            if expr_is_schema_key_column(right) {
+            if is_target_column(right) {
                 return string_literal_value(left).map(|value| vec![value]);
             }
             None
@@ -382,8 +447,8 @@ fn extract_schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
             op: BinaryOperator::And,
             right,
         } => match (
-            extract_schema_keys_from_expr(left),
-            extract_schema_keys_from_expr(right),
+            extract_column_keys_from_expr(left, is_target_column),
+            extract_column_keys_from_expr(right, is_target_column),
         ) {
             (Some(left), Some(right)) => {
                 let intersection = intersect_strings(&left, &right);
@@ -401,8 +466,8 @@ fn extract_schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
             op: BinaryOperator::Or,
             right,
         } => match (
-            extract_schema_keys_from_expr(left),
-            extract_schema_keys_from_expr(right),
+            extract_column_keys_from_expr(left, is_target_column),
+            extract_column_keys_from_expr(right, is_target_column),
         ) {
             (Some(left), Some(right)) => Some(union_strings(&left, &right)),
             _ => None,
@@ -412,7 +477,7 @@ fn extract_schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
             list,
             negated: false,
         } => {
-            if !expr_is_schema_key_column(expr) {
+            if !is_target_column(expr) {
                 return None;
             }
             let mut values = Vec::with_capacity(list.len());
@@ -426,17 +491,25 @@ fn extract_schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
                 Some(dedup_strings(values))
             }
         }
-        Expr::Nested(inner) => extract_schema_keys_from_expr(inner),
+        Expr::Nested(inner) => extract_column_keys_from_expr(inner, is_target_column),
         _ => None,
     }
 }
 
 fn expr_is_schema_key_column(expr: &Expr) -> bool {
+    expr_last_identifier_eq(expr, "schema_key")
+}
+
+fn expr_is_plugin_key_column(expr: &Expr) -> bool {
+    expr_last_identifier_eq(expr, "plugin_key")
+}
+
+fn expr_last_identifier_eq(expr: &Expr, target: &str) -> bool {
     match expr {
-        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("schema_key"),
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(target),
         Expr::CompoundIdentifier(idents) => idents
             .last()
-            .map(|ident| ident.value.eq_ignore_ascii_case("schema_key"))
+            .map(|ident| ident.value.eq_ignore_ascii_case(target))
             .unwrap_or(false),
         _ => false,
     }
@@ -688,9 +761,70 @@ async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<
     Ok(keys)
 }
 
+async fn fetch_schema_keys_for_plugins(
+    backend: &dyn LixBackend,
+    plugin_keys: &[String],
+) -> Result<Vec<String>, LixError> {
+    if plugin_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let changes_placeholders = numbered_placeholders(1, plugin_keys.len());
+    let untracked_placeholders = numbered_placeholders(plugin_keys.len() + 1, plugin_keys.len());
+    let sql = format!(
+        "SELECT DISTINCT schema_key \
+         FROM lix_internal_change \
+         WHERE plugin_key IN ({changes_placeholders}) \
+         UNION \
+         SELECT DISTINCT schema_key \
+         FROM {untracked_table} \
+         WHERE plugin_key IN ({untracked_placeholders})",
+        untracked_table = UNTRACKED_TABLE,
+    );
+
+    let mut params = Vec::with_capacity(plugin_keys.len() * 2);
+    for key in plugin_keys {
+        params.push(LixValue::Text(key.clone()));
+    }
+    for key in plugin_keys {
+        params.push(LixValue::Text(key.clone()));
+    }
+
+    let result = backend.execute(&sql, &params).await?;
+
+    let mut keys = Vec::new();
+    for row in &result.rows {
+        let Some(LixValue::Text(schema_key)) = row.first() else {
+            continue;
+        };
+        if schema_key.is_empty() {
+            continue;
+        }
+        if !keys.iter().any(|existing| existing == schema_key) {
+            keys.push(schema_key.clone());
+        }
+    }
+
+    keys.sort();
+    Ok(keys)
+}
+
+fn numbered_placeholders(start: usize, count: usize) -> String {
+    (0..count)
+        .map(|offset| format!("${}", start + offset))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        extract_plugin_keys_from_query, extract_plugin_keys_from_top_level_derived_subquery,
+    };
     use crate::sql::preprocess_sql_rewrite_only as preprocess_sql;
+    use sqlparser::ast::{Query, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
     fn compact_sql(sql: &str) -> String {
         sql.chars().filter(|c| !c.is_whitespace()).collect()
@@ -954,5 +1088,59 @@ mod tests {
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
             &["NOT(entity_id='entity-1')"],
         );
+    }
+
+    #[test]
+    fn extracts_plugin_keys_from_eq_and_in_list() {
+        let query = parse_query(
+            "SELECT * FROM lix_internal_state_vtable \
+             WHERE plugin_key = 'plugin_json' OR plugin_key IN ('plugin_text', 'plugin_json')",
+        );
+        let keys = extract_plugin_keys_from_query(&query).expect("plugin keys should be extracted");
+        assert_eq!(
+            keys,
+            vec!["plugin_json".to_string(), "plugin_text".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_plugin_keys_from_qualified_identifier() {
+        let query = parse_query(
+            "SELECT * FROM lix_internal_state_vtable AS s WHERE s.plugin_key = 'plugin_json'",
+        );
+        let keys = extract_plugin_keys_from_query(&query).expect("plugin keys should be extracted");
+        assert_eq!(keys, vec!["plugin_json".to_string()]);
+    }
+
+    #[test]
+    fn extracts_plugin_keys_from_derived_subquery_filter() {
+        let query = parse_query(
+            "SELECT COUNT(*) \
+             FROM (SELECT * FROM lix_internal_state_vtable WHERE plugin_key = 'plugin_json') AS ranked",
+        );
+        let keys = extract_plugin_keys_from_top_level_derived_subquery(&query)
+            .expect("plugin keys should be extracted");
+        assert_eq!(keys, vec!["plugin_json".to_string()]);
+    }
+
+    #[test]
+    fn plugin_key_extraction_skips_mixed_or_predicate() {
+        let query = parse_query(
+            "SELECT * FROM lix_internal_state_vtable \
+             WHERE plugin_key = 'plugin_json' OR schema_key = 'json_pointer'",
+        );
+        assert!(
+            extract_plugin_keys_from_query(&query).is_none(),
+            "mixed OR should not produce a plugin-only key set"
+        );
+    }
+
+    fn parse_query(sql: &str) -> Query {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
+        assert_eq!(statements.len(), 1);
+        match statements.remove(0) {
+            Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        }
     }
 }
