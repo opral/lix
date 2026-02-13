@@ -140,6 +140,18 @@ importers:
         specifier: ^4.5.3
         version: 4.5.4(@types/node@24.10.2)(rollup@4.53.2)(typescript@5.8.3)(vite@6.3.5(@types/node@24.10.2)(jiti@2.6.1)(lightningcss@1.30.2)(sass-embedded@1.89.2)(terser@5.36.0)(tsx@4.20.5)(yaml@2.8.1))
 
+  packages/js-benchmarks:
+    dependencies:
+      '@lix-js/plugin-json':
+        specifier: workspace:*
+        version: link:../plugin-json
+      '@lix-js/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      js-sdk:
+        specifier: workspace:*
+        version: link:../js-sdk
+
   packages/js-sdk:
     dependencies:
       '@sqlite.org/sqlite-wasm':

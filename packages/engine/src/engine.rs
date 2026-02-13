@@ -24,7 +24,7 @@ use crate::materialization::{
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::PluginManifest;
-use crate::schema_registry::{register_schema, register_schema_sql};
+use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
     parse_sql_statements, preprocess_sql_with_provider_and_detected_file_domain_changes,
@@ -394,10 +394,11 @@ impl Engine {
                     .map(|change| change.schema_key.clone())
                     .collect::<BTreeSet<_>>();
                 for schema_key in additional_schema_keys {
-                    let create_sql = register_schema_sql(&schema_key);
-                    if let Err(error) = transaction.execute(&create_sql, &[]).await {
-                        let _ = transaction.rollback().await;
-                        return Err(error);
+                    for statement in register_schema_sql_statements(&schema_key) {
+                        if let Err(error) = transaction.execute(&statement, &[]).await {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
                     }
                 }
                 let mut followup_functions = functions.clone();
@@ -630,8 +631,9 @@ impl Engine {
         let next_active_version_id_from_updates =
             active_version_from_update_validations(&output.update_validations)?;
         for registration in output.registrations {
-            let create_sql = register_schema_sql(&registration.schema_key);
-            transaction.execute(&create_sql, &[]).await?;
+            for statement in register_schema_sql_statements(&registration.schema_key) {
+                transaction.execute(&statement, &[]).await?;
+            }
         }
 
         let mut postprocess_file_cache_targets = BTreeSet::new();
@@ -676,8 +678,9 @@ impl Engine {
                     .map(|change| change.schema_key.clone())
                     .collect::<BTreeSet<_>>();
                 for schema_key in additional_schema_keys {
-                    let create_sql = register_schema_sql(&schema_key);
-                    transaction.execute(&create_sql, &[]).await?;
+                    for statement in register_schema_sql_statements(&schema_key) {
+                        transaction.execute(&statement, &[]).await?;
+                    }
                 }
                 let mut followup_functions = functions.clone();
                 let followup_sql = match postprocess_plan {
