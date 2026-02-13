@@ -4,8 +4,11 @@ mod wasm {
     use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
         boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue,
+        LoadWasmComponentRequest, QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue,
+        WasmInstance, WasmRuntime,
     };
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
@@ -93,9 +96,152 @@ export type LixBackend = {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
         });
-        let engine = boot(BootArgs::new(backend));
+        let mut boot_args = BootArgs::new(backend);
+        boot_args.wasm_runtime = Some(Arc::new(JsBuiltinWasmRuntime));
+        let engine = boot(boot_args);
         engine.init().await.map_err(js_error)?;
         Ok(Lix { engine })
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuntimePluginFile {
+        id: String,
+        path: String,
+        data: Vec<u8>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuntimePluginEntityChange {
+        entity_id: String,
+        schema_key: String,
+        schema_version: String,
+        snapshot_content: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuntimeDetectChangesRequest {
+        before: Option<RuntimePluginFile>,
+        after: RuntimePluginFile,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RuntimeApplyChangesRequest {
+        file: RuntimePluginFile,
+        changes: Vec<RuntimePluginEntityChange>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct RuntimePluginEntityChangeResponse {
+        entity_id: String,
+        schema_key: String,
+        schema_version: String,
+        snapshot_content: Option<String>,
+    }
+
+    struct JsBuiltinWasmRuntime;
+    struct JsonPluginV2Instance;
+
+    #[async_trait(?Send)]
+    impl WasmRuntime for JsBuiltinWasmRuntime {
+        async fn load_component(
+            &self,
+            request: LoadWasmComponentRequest,
+        ) -> Result<Arc<dyn WasmInstance>, LixError> {
+            if request.world != "lix:plugin/plugin@0.1.0" {
+                return Err(LixError {
+                    message: format!("unsupported plugin world '{}'", request.world),
+                });
+            }
+            if request.bytes.is_empty() {
+                return Err(LixError {
+                    message: format!("plugin '{}' has empty wasm bytes", request.key),
+                });
+            }
+            match request.key.as_str() {
+                // Current js-sdk runtime supports plugin-json-v2 execution directly.
+                "plugin_json" | "json" => Ok(Arc::new(JsonPluginV2Instance)),
+                other => Err(LixError {
+                    message: format!(
+                        "plugin runtime for key '{other}' is not available in js-sdk yet"
+                    ),
+                }),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl WasmInstance for JsonPluginV2Instance {
+        async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+            match export {
+                "detect-changes" | "api#detect-changes" => {
+                    let request: RuntimeDetectChangesRequest =
+                        serde_json::from_slice(input).map_err(|error| LixError {
+                            message: format!(
+                                "plugin-json-v2 detect-changes payload decode failed: {error}"
+                            ),
+                        })?;
+                    let before = request.before.map(to_plugin_file);
+                    let after = to_plugin_file(request.after);
+                    let changes = plugin_json_v2::detect_changes(before, after)
+                        .map_err(plugin_error_to_lix_error)?;
+                    let output = changes
+                        .into_iter()
+                        .map(|change| RuntimePluginEntityChangeResponse {
+                            entity_id: change.entity_id,
+                            schema_key: change.schema_key,
+                            schema_version: change.schema_version,
+                            snapshot_content: change.snapshot_content,
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::to_vec(&output).map_err(|error| LixError {
+                        message: format!(
+                            "plugin-json-v2 detect-changes response encode failed: {error}"
+                        ),
+                    })
+                }
+                "apply-changes" | "api#apply-changes" => {
+                    let request: RuntimeApplyChangesRequest =
+                        serde_json::from_slice(input).map_err(|error| LixError {
+                            message: format!(
+                                "plugin-json-v2 apply-changes payload decode failed: {error}"
+                            ),
+                        })?;
+                    let file = to_plugin_file(request.file);
+                    let changes = request
+                        .changes
+                        .into_iter()
+                        .map(to_plugin_change)
+                        .collect::<Vec<_>>();
+                    plugin_json_v2::apply_changes(file, changes).map_err(plugin_error_to_lix_error)
+                }
+                other => Err(LixError {
+                    message: format!("unsupported plugin export '{other}'"),
+                }),
+            }
+        }
+    }
+
+    fn to_plugin_file(file: RuntimePluginFile) -> plugin_json_v2::PluginFile {
+        plugin_json_v2::PluginFile {
+            id: file.id,
+            path: file.path,
+            data: file.data,
+        }
+    }
+
+    fn to_plugin_change(change: RuntimePluginEntityChange) -> plugin_json_v2::PluginEntityChange {
+        plugin_json_v2::PluginEntityChange {
+            entity_id: change.entity_id,
+            schema_key: change.schema_key,
+            schema_version: change.schema_version,
+            snapshot_content: change.snapshot_content,
+        }
+    }
+
+    fn plugin_error_to_lix_error(error: plugin_json_v2::PluginApiError) -> LixError {
+        LixError {
+            message: format!("{error:?}"),
+        }
     }
 
     struct JsBackend {
