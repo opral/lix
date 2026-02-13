@@ -80,12 +80,11 @@ pub(crate) async fn detect_file_changes_with_plugins(
     backend: &dyn LixBackend,
     runtime: &dyn WasmRuntime,
     writes: &[FileChangeDetectionRequest],
+    installed_plugins: &[InstalledPlugin],
 ) -> Result<Vec<DetectedFileChange>, LixError> {
     if writes.is_empty() {
         return Ok(Vec::new());
     }
-
-    let installed_plugins = load_installed_plugins(backend).await?;
     if installed_plugins.is_empty() {
         return Ok(Vec::new());
     }
@@ -95,11 +94,11 @@ pub(crate) async fn detect_file_changes_with_plugins(
         let has_before_context = write.before_path.is_some() || write.before_data.is_some();
         let before_path = write.before_path.as_deref().unwrap_or(write.path.as_str());
         let before_plugin = if has_before_context {
-            select_plugin_for_path(before_path, &installed_plugins)
+            select_plugin_for_path(before_path, installed_plugins)
         } else {
             None
         };
-        let after_plugin = select_plugin_for_path(&write.path, &installed_plugins);
+        let after_plugin = select_plugin_for_path(&write.path, installed_plugins);
 
         if let Some(previous_plugin) = before_plugin {
             let plugin_changed = after_plugin
@@ -977,7 +976,7 @@ async fn load_existing_plugin_entities(
         .collect())
 }
 
-async fn load_installed_plugins(
+pub(crate) async fn load_installed_plugins(
     backend: &dyn LixBackend,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let rows = backend

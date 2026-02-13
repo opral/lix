@@ -23,7 +23,7 @@ use crate::materialization::{
     MaterializationReport, MaterializationRequest, MaterializationScope,
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
-use crate::plugin::types::PluginManifest;
+use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
@@ -111,6 +111,7 @@ pub struct Engine {
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
+    installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -237,12 +238,49 @@ pub fn boot(args: BootArgs) -> Engine {
         boot_deterministic_settings,
         deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
         active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
+        installed_plugins_cache: RwLock::new(None),
     }
 }
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Option<Arc<dyn WasmRuntime>> {
         self.wasm_runtime.clone()
+    }
+
+    async fn load_installed_plugins_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        allow_cache: bool,
+    ) -> Result<Vec<InstalledPlugin>, LixError> {
+        if allow_cache {
+            let cached = self
+                .installed_plugins_cache
+                .read()
+                .map_err(|_| LixError {
+                    message: "installed plugin cache lock poisoned".to_string(),
+                })?
+                .clone();
+            if let Some(plugins) = cached {
+                return Ok(plugins);
+            }
+        }
+
+        let loaded = crate::plugin::runtime::load_installed_plugins(backend).await?;
+        if allow_cache {
+            let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
+                message: "installed plugin cache lock poisoned".to_string(),
+            })?;
+            *guard = Some(loaded.clone());
+        }
+        Ok(loaded)
+    }
+
+    fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
+        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
+            message: "installed plugin cache lock poisoned".to_string(),
+        })?;
+        *guard = None;
+        Ok(())
     }
 
     pub async fn init(&self) -> Result<(), LixError> {
@@ -291,6 +329,7 @@ impl Engine {
                 params,
                 &active_version_id,
                 writer_key,
+                true,
             )
             .await?;
         let (settings, sequence_start, functions) = self
@@ -493,6 +532,9 @@ impl Engine {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
                 .await?;
         }
+        if contains_word_case_insensitive(sql, "lix_internal_plugin") {
+            self.invalidate_installed_plugins_cache()?;
+        }
 
         Ok(result)
     }
@@ -571,6 +613,7 @@ impl Engine {
                     params,
                     active_version_id,
                     writer_key,
+                    false,
                 )
                 .await?;
             let (settings, sequence_start, functions) = self
@@ -770,6 +813,9 @@ impl Engine {
             &functions,
         )
         .await?;
+        if contains_word_case_insensitive(sql, "lix_internal_plugin") {
+            self.invalidate_installed_plugins_cache()?;
+        }
 
         Ok(result)
     }
@@ -789,7 +835,9 @@ impl Engine {
             wasm_bytes,
             &now,
         )
-        .await
+        .await?;
+        self.invalidate_installed_plugins_cache()?;
+        Ok(())
     }
 
     pub async fn materialization_plan(
@@ -870,6 +918,7 @@ impl Engine {
         params: &[Value],
         active_version_id: &str,
         writer_key: Option<&str>,
+        allow_plugin_cache: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes(
@@ -902,6 +951,7 @@ impl Engine {
             .detect_file_changes_for_pending_writes_by_statement_with_backend(
                 backend,
                 &pending_file_writes_by_statement,
+                allow_plugin_cache,
             )
             .await?;
         let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
@@ -1472,10 +1522,17 @@ impl Engine {
         &self,
         backend: &dyn LixBackend,
         writes_by_statement: &[Vec<crate::filesystem::pending_file_writes::PendingFileWrite>],
+        allow_plugin_cache: bool,
     ) -> Result<Vec<Vec<crate::plugin::runtime::DetectedFileChange>>, LixError> {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(vec![Vec::new(); writes_by_statement.len()]);
         };
+        let installed_plugins = self
+            .load_installed_plugins_with_backend(backend, allow_plugin_cache)
+            .await?;
+        if installed_plugins.is_empty() {
+            return Ok(vec![Vec::new(); writes_by_statement.len()]);
+        }
 
         let mut detected_by_statement = Vec::with_capacity(writes_by_statement.len());
         for writes in writes_by_statement {
@@ -1499,6 +1556,7 @@ impl Engine {
                 backend,
                 runtime.as_ref(),
                 &requests,
+                &installed_plugins,
             )
             .await
             .map_err(|error| LixError {
