@@ -222,6 +222,37 @@ pub(crate) fn rewrite_statement_with_writer_key<P: LixFunctionProvider>(
                 update_validations: Vec::new(),
             })
         }
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let statement = match *statement {
+                Statement::Query(query) => Statement::Query(Box::new(rewrite_read_query(*query)?)),
+                other => other,
+            };
+            Ok(RewriteOutput {
+                statements: vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(statement),
+                    format,
+                    options,
+                }],
+                registrations: Vec::new(),
+                postprocess: None,
+                mutations: Vec::new(),
+                update_validations: Vec::new(),
+            })
+        }
         other => Ok(RewriteOutput {
             statements: vec![other],
             registrations: Vec::new(),
@@ -568,6 +599,39 @@ where
             let query = rewrite_read_query_with_backend(backend, *query).await?;
             Ok(RewriteOutput {
                 statements: vec![Statement::Query(Box::new(query))],
+                registrations: Vec::new(),
+                postprocess: None,
+                mutations: Vec::new(),
+                update_validations: Vec::new(),
+            })
+        }
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let statement = match *statement {
+                Statement::Query(query) => Statement::Query(Box::new(
+                    rewrite_read_query_with_backend(backend, *query).await?,
+                )),
+                other => other,
+            };
+            Ok(RewriteOutput {
+                statements: vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(statement),
+                    format,
+                    options,
+                }],
                 registrations: Vec::new(),
                 postprocess: None,
                 mutations: Vec::new(),
