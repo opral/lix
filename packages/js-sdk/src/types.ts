@@ -1,5 +1,13 @@
-import type { Value, QueryResult } from "./engine-wasm/index.js";
+import type {
+  LixBackend as WasmLixBackend,
+  LixQueryResultLike,
+  LixSqlDialect,
+  LixTransaction,
+  LixValueLike,
+} from "./engine-wasm/index.js";
 
-export type LixBackend = {
-  execute(sql: string, params: Value[]): Promise<QueryResult>;
+export type LixBackend = WasmLixBackend & {
+  close?: () => Promise<void> | void;
 };
+
+export type { LixQueryResultLike, LixSqlDialect, LixTransaction, LixValueLike };

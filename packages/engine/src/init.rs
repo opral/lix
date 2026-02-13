@@ -35,6 +35,20 @@ const INIT_STATEMENTS: &[&str] = &[
      updated_at TEXT NOT NULL,\
      PRIMARY KEY (entity_id, file_id, version_id)\
      )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_version_id \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_vfe \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_ve \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, entity_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_fv \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (file_id, version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_live_vfe \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id) \
+     WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_tomb_vfe \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id) \
+     WHERE is_tombstone = 1 AND snapshot_content IS NULL",
     "CREATE TABLE IF NOT EXISTS lix_internal_state_untracked (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
@@ -48,6 +62,10 @@ const INIT_STATEMENTS: &[&str] = &[
      updated_at TEXT NOT NULL,\
      PRIMARY KEY (entity_id, schema_key, file_id, version_id)\
      )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_untracked_version_id \
+     ON lix_internal_state_untracked (version_id)",
+    "CREATE INDEX IF NOT EXISTS ix_unt_v_f_s_e \
+     ON lix_internal_state_untracked (version_id, file_id, schema_key, entity_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\

@@ -1,8 +1,9 @@
-use crate::{LixBackend, LixError};
+use crate::{LixBackend, LixError, SqlDialect};
 
 pub async fn register_schema(backend: &dyn LixBackend, schema_key: &str) -> Result<(), LixError> {
-    let create_sql = register_schema_sql(schema_key);
-    backend.execute(&create_sql, &[]).await?;
+    for statement in register_schema_sql_statements(schema_key, backend.dialect()) {
+        backend.execute(&statement, &[]).await?;
+    }
     Ok(())
 }
 
@@ -32,7 +33,109 @@ pub fn register_schema_sql(schema_key: &str) -> String {
     )
 }
 
+pub fn register_schema_sql_statements(schema_key: &str, dialect: SqlDialect) -> Vec<String> {
+    let table_name = format!("lix_internal_state_materialized_v1_{}", schema_key);
+    let table_ident = quote_ident(&table_name);
+
+    let mut statements = vec![register_schema_sql(schema_key)];
+
+    let index_statements = vec![
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id)",
+            index = quote_ident(&format!("idx_{}_version_id", table_name)),
+            table = table_ident,
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, file_id, entity_id)",
+            index = quote_ident(&format!("idx_{}_vfe", table_name)),
+            table = table_ident,
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, entity_id)",
+            index = quote_ident(&format!("idx_{}_ve", table_name)),
+            table = table_ident,
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (file_id, version_id)",
+            index = quote_ident(&format!("idx_{}_fv", table_name)),
+            table = table_ident,
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} \
+             ON {table} (version_id, file_id, entity_id) \
+             WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
+            index = quote_ident(&format!("idx_{}_live_vfe", table_name)),
+            table = table_ident,
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} \
+             ON {table} (version_id, file_id, entity_id) \
+             WHERE is_tombstone = 1 AND snapshot_content IS NULL",
+            index = quote_ident(&format!("idx_{}_tomb_vfe", table_name)),
+            table = table_ident,
+        ),
+    ];
+    statements.extend(index_statements);
+
+    if schema_key == "lix_version_descriptor" {
+        let inherits_from_expr = json_text_extract_expr(dialect, "inherits_from_version_id");
+        let id_expr = json_text_extract_expr(dialect, "id");
+        statements.push(format!(
+            "CREATE INDEX IF NOT EXISTS {index} \
+             ON {table}({inherits_from_expr}) \
+             WHERE {inherits_from_expr} IS NOT NULL",
+            index = quote_ident(&format!("idx_{}_inherits_from", table_name)),
+            table = table_ident,
+            inherits_from_expr = inherits_from_expr,
+        ));
+        statements.push(format!(
+            "CREATE INDEX IF NOT EXISTS {index} \
+             ON {table}({id_expr}, {inherits_from_expr})",
+            index = quote_ident(&format!("idx_{}_id_parent", table_name)),
+            table = table_ident,
+            id_expr = id_expr,
+            inherits_from_expr = inherits_from_expr,
+        ));
+    }
+
+    statements
+}
+
 fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{}\"", escaped)
+}
+
+fn json_text_extract_expr(dialect: SqlDialect, key: &str) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!("json_extract(snapshot_content, '$.{key}')"),
+        SqlDialect::Postgres => {
+            format!("jsonb_extract_path_text(CAST(snapshot_content AS JSONB), '{key}')")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_schema_sql_statements;
+    use crate::SqlDialect;
+
+    #[test]
+    fn version_descriptor_indexes_use_sqlite_json_extract_on_sqlite() {
+        let statements =
+            register_schema_sql_statements("lix_version_descriptor", SqlDialect::Sqlite).join("\n");
+        assert!(statements.contains("json_extract(snapshot_content, '$.inherits_from_version_id')"));
+        assert!(!statements.contains("jsonb_extract_path_text("));
+    }
+
+    #[test]
+    fn version_descriptor_indexes_use_postgres_json_extract_on_postgres() {
+        let statements =
+            register_schema_sql_statements("lix_version_descriptor", SqlDialect::Postgres)
+                .join("\n");
+        assert!(statements.contains(
+            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'inherits_from_version_id')"
+        ));
+        assert!(!statements.contains("json_extract(snapshot_content"));
+    }
 }

@@ -26,5 +26,3 @@ harness = false
 [[bench]]
 name = "roundtrip"
 harness = false
-
-[workspace]
