@@ -7,6 +7,7 @@ test("openLix executes SQL against default in-memory sqlite backend", async () =
 
   expect(result.rows.length).toBe(1);
   expect(result.rows[0][0]).toEqual({ kind: "Integer", value: 2 });
+  await lix.close();
 });
 
 test("createVersion + switchVersion use the JS API surface", async () => {
@@ -23,6 +24,7 @@ test("createVersion + switchVersion use the JS API surface", async () => {
   );
   expect(active.rows.length).toBe(1);
   expect(active.rows[0][0]).toEqual({ kind: "Text", value: created.id });
+  await lix.close();
 });
 
 test("installPlugin stores plugin metadata", async () => {
@@ -34,7 +36,9 @@ test("installPlugin stores plugin metadata", async () => {
     api_version: "0.1.0",
     detect_changes_glob: "*.json",
   });
-  const wasmBytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+  const wasmBytes = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  ]);
 
   await lix.installPlugin({ manifestJson, wasmBytes });
 
@@ -43,4 +47,15 @@ test("installPlugin stores plugin metadata", async () => {
   );
   expect(result.rows.length).toBe(1);
   expect(result.rows[0][0]).toEqual({ kind: "Text", value: "plugin_json" });
+  await lix.close();
+});
+
+test("close is idempotent and blocks further API calls", async () => {
+  const lix = await openLix();
+  await lix.close();
+  await lix.close();
+
+  await expect(lix.execute("SELECT 1", [])).rejects.toThrow("lix is closed");
+  await expect(lix.createVersion()).rejects.toThrow("lix is closed");
+  await expect(lix.switchVersion("v1")).rejects.toThrow("lix is closed");
 });
