@@ -1667,10 +1667,7 @@ simulation_test!(
             .expect("child tombstone delete should succeed");
 
         let deleted_rows = engine
-            .execute(
-                "SELECT id FROM lix_file WHERE path = '/readme.md'",
-                &[],
-            )
+            .execute("SELECT id FROM lix_file WHERE path = '/readme.md'", &[])
             .await
             .expect("post-delete query should succeed");
         assert!(

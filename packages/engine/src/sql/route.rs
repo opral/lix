@@ -507,20 +507,18 @@ where
                     lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone())
                         .await?
                 {
-                    effective_scope_fallback = !selection_mentions_inherited_from_version_id(
-                        delete.selection.as_ref(),
-                    );
+                    effective_scope_fallback =
+                        !selection_mentions_inherited_from_version_id(delete.selection.as_ref());
                     rewritten
                 } else {
                     delete
                 };
-                if let Some(version_inserts) =
-                    lix_version_view_write::rewrite_delete_with_backend(
-                        backend,
-                        delete.clone(),
-                        params,
-                    )
-                    .await?
+                if let Some(version_inserts) = lix_version_view_write::rewrite_delete_with_backend(
+                    backend,
+                    delete.clone(),
+                    params,
+                )
+                .await?
                 {
                     rewrite_vtable_inserts_with_backend(
                         backend,

@@ -25,11 +25,12 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, lowering::lower_statement, resolve_expr_cell_with_state,
-    PlaceholderState, ResolvedCell, RowSourceResolver,
+    bind_sql_with_state, escape_sql_string, lowering::lower_statement,
+    resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::version::{
-    version_descriptor_file_id, version_descriptor_schema_key, version_descriptor_storage_version_id,
+    version_descriptor_file_id, version_descriptor_schema_key,
+    version_descriptor_storage_version_id,
 };
 use crate::Value as EngineValue;
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect};
