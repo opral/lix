@@ -48,7 +48,7 @@ use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
+    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -425,6 +425,7 @@ impl Engine {
                         transaction.as_mut(),
                         &plan,
                         &result.rows,
+                        &output.params,
                         &detected_file_domain_changes,
                         writer_key,
                         &mut followup_functions,
@@ -706,6 +707,7 @@ impl Engine {
                             transaction,
                             &plan,
                             &result.rows,
+                            &output.params,
                             &detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
@@ -2244,7 +2246,8 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
             .as_deref()
             .is_some_and(|query| query_mentions_table_name(query, table_name)),
         Statement::Update(update) => {
-            table_with_joins_mentions_table_name(&update.table, table_name)
+            let target_matches = table_with_joins_mentions_table_name(&update.table, table_name);
+            (target_matches && update_references_data_column(update))
                 || update.from.as_ref().is_some_and(|from| match from {
                     UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => {
                         from.iter()
@@ -2272,6 +2275,55 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn update_references_data_column(update: &Update) -> bool {
+    update
+        .selection
+        .as_ref()
+        .is_some_and(expr_references_data_column)
+        || update
+            .assignments
+            .iter()
+            .any(|assignment| expr_references_data_column(&assignment.value))
+}
+
+fn expr_references_data_column(expr: &Expr) -> bool {
+    contains_word_case_insensitive(&expr.to_string(), "data")
+}
+
+fn contains_word_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+
+    for start in 0..=(haystack.len() - needle.len()) {
+        if !haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            continue;
+        }
+
+        let before_is_word = if start == 0 {
+            false
+        } else {
+            is_word_byte(haystack[start - 1])
+        };
+        let after_is_word = if start + needle.len() >= haystack.len() {
+            false
+        } else {
+            is_word_byte(haystack[start + needle.len()])
+        };
+        if !before_is_word && !after_is_word {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
@@ -3116,21 +3168,42 @@ mod tests {
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_update_target_lix_file() {
+    fn file_read_materialization_scope_ignores_update_target_lix_file() {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE lix_file \
              SET path = '/renamed.json' \
              WHERE id = 'file-a'",
         );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+        assert_eq!(scope, None);
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_update_target_lix_file_by_version() {
+    fn file_read_materialization_scope_ignores_update_target_lix_file_by_version() {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE lix_file_by_version \
              SET path = '/renamed.json' \
              WHERE id = 'file-a' \
+               AND lixcol_version_id = 'version-a'",
+        );
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_with_data_predicate_requires_active_materialization_scope() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE data IS NOT NULL",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_by_version_with_data_predicate_requires_all_versions_scope() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file_by_version \
+             SET path = '/renamed.json' \
+             WHERE data IS NOT NULL \
                AND lixcol_version_id = 'version-a'",
         );
         assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
