@@ -16,9 +16,14 @@ unicode-normalization = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 postgresql_embedded = { version = "0.20", features = ["tokio"] }
 paste = "1"
 sqlx = { version = "0.8", features = ["sqlite", "postgres", "runtime-tokio-rustls"] }
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 wasmtime = { version = "30", features = ["component-model"] }
 wasmtime-wasi = "30"
+
+[[bench]]
+name = "lix_state"
+harness = false
