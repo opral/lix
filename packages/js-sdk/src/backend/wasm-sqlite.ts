@@ -4,9 +4,9 @@ import type {
   Sqlite3Static,
   SqlValue,
 } from "@sqlite.org/sqlite-wasm";
-import { wasmBinary } from "./wasm-sqlite.wasm.js";
-import type { LixBackend } from "../types.js";
+import type { LixBackend, LixTransaction } from "../types.js";
 import { Value } from "../engine-wasm/index.js";
+import type { QueryResult } from "../engine-wasm/index.js";
 
 type SqliteWasmDatabase = Database & {
   sqlite3: Sqlite3Static;
@@ -27,11 +27,7 @@ let sqlite3: Sqlite3Static | undefined;
 
 async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
   if (!sqlite3) {
-    sqlite3 = await sqlite3InitModule({
-      // @ts-expect-error - wasmBinary type mismatch
-      wasmBinary,
-      locateFile: () => "sqlite3.wasm",
-    });
+    sqlite3 = await sqlite3InitModule();
   }
 
   const db = new sqlite3.oo1.DB(":memory:", "c");
@@ -42,8 +38,17 @@ async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
 
 export async function createWasmSqliteBackend(): Promise<LixBackend> {
   const db = await createInMemoryDatabase();
-  return {
-    async execute(sql: string, params: Value[]): Promise<any> {
+  let backendClosed = false;
+
+  const ensureBackendOpen = (): void => {
+    if (backendClosed) {
+      throw new Error("sqlite backend is closed");
+    }
+  };
+
+  const runQuery = (sql: string, params: ReadonlyArray<unknown>): QueryResult => {
+    ensureBackendOpen();
+    try {
       const boundParams: SqlValue[] = params.map(toSqlParam);
       const rows: SqlValue[][] = [];
       db.exec({
@@ -58,11 +63,65 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
       return {
         rows: normalizedRows,
       };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${message}\nwhile executing SQL:\n${sql}`);
+    }
+  };
+
+  const createTransaction = (): LixTransaction => {
+    let transactionClosed = false;
+
+    return {
+      dialect: "sqlite",
+      async execute(sql: string, params: ReadonlyArray<unknown>): Promise<QueryResult> {
+        if (transactionClosed) {
+          throw new Error("transaction is already closed");
+        }
+        ensureBackendOpen();
+        return runQuery(sql, params);
+      },
+      async commit(): Promise<void> {
+        if (transactionClosed) {
+          return;
+        }
+        ensureBackendOpen();
+        runQuery("COMMIT", []);
+        transactionClosed = true;
+      },
+      async rollback(): Promise<void> {
+        if (transactionClosed) {
+          return;
+        }
+        ensureBackendOpen();
+        runQuery("ROLLBACK", []);
+        transactionClosed = true;
+      },
+    };
+  };
+
+  return {
+    dialect: "sqlite",
+    async execute(sql: string, params: ReadonlyArray<unknown>): Promise<QueryResult> {
+      return runQuery(sql, params);
+    },
+    async beginTransaction(): Promise<LixTransaction> {
+      ensureBackendOpen();
+      runQuery("BEGIN", []);
+      return createTransaction();
+    },
+    async close(): Promise<void> {
+      if (backendClosed) {
+        return;
+      }
+      backendClosed = true;
+      db.close();
     },
   };
 }
 
-function toSqlParam(value: Value): SqlValue {
+function toSqlParam(raw: unknown): SqlValue {
+  const value = Value.from(raw);
   switch (value.kind) {
     case "Null":
       return null;
@@ -77,7 +136,6 @@ function toSqlParam(value: Value): SqlValue {
     default:
       return null;
   }
-  return null;
 }
 
 function fromSqlValue(value: SqlValue): Value {

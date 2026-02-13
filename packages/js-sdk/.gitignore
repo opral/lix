@@ -1,5 +1,14 @@
-/src/backend/wasm-sqlite.wasm.ts
-/src/backend/wasm-sqlite.wasm.ts.d.ts
+/dist
+
+# wasm-bindgen generated engine outputs
+/src/engine-wasm/wasm
 /src/engine-wasm/engine-wasm-binary.js
 /src/engine-wasm/engine-wasm-binary.d.ts
-/src/engine-wasm/wasm
+
+# legacy embedded wasm wrappers (generated artifacts)
+/src/backend/wasm-sqlite.wasm.ts
+/src/backend/wasm-sqlite.wasm.ts.d.ts
+
+# wasm modules and generated declarations
+*.wasm
+*.wasm.d.ts

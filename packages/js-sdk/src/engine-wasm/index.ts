@@ -1,6 +1,6 @@
 export { default } from "./wasm/lix_engine_wasm_bindgen.js";
 export * from "./wasm/lix_engine_wasm_bindgen.js";
-export { wasmBinary } from "./engine-wasm-binary.js";
+import type { InitInput } from "./wasm/lix_engine_wasm_bindgen.js";
 
 export type ValueKind = "Null" | "Integer" | "Real" | "Text" | "Blob";
 
@@ -89,3 +89,35 @@ export class Value {
 }
 
 export type QueryResult = any;
+
+const engineWasmUrl = new URL("./wasm/lix_engine_wasm_bindgen_bg.wasm", import.meta.url);
+
+function isNodeRuntime(): boolean {
+  const processLike = (globalThis as { process?: { versions?: { node?: string } } })
+    .process;
+  return (
+    !!processLike &&
+    typeof processLike.versions === "object" &&
+    !!processLike.versions?.node
+  );
+}
+
+/**
+ * Returns a wasm-bindgen-compatible init input that works in both browser and Node.
+ *
+ * - Browser: use a URL so the runtime fetches the `.wasm` asset.
+ * - Node: read bytes from disk because `fetch(file://...)` is not supported.
+ */
+export async function resolveEngineWasmModuleOrPath(): Promise<InitInput> {
+  if (!isNodeRuntime()) {
+    return engineWasmUrl;
+  }
+
+  const fsModuleName = "node:fs/promises";
+  const urlModuleName = "node:url";
+  const [{ readFile }, { fileURLToPath }] = await Promise.all([
+    import(fsModuleName),
+    import(urlModuleName),
+  ]);
+  return readFile(fileURLToPath(engineWasmUrl));
+}
