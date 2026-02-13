@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins,
+    BinaryOperator, Expr, Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
+    TableAlias, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -63,31 +63,45 @@ fn rewrite_set_expr(expr: SetExpr, changed: &mut bool) -> Result<SetExpr, LixErr
 }
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
+    let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
     for table in &mut select.from {
-        rewrite_table_with_joins(table, changed)?;
+        rewrite_table_with_joins(table, &mut select.selection, allow_unqualified, changed)?;
     }
     Ok(())
 }
 
 fn rewrite_table_with_joins(
     table: &mut TableWithJoins,
+    selection: &mut Option<Expr>,
+    allow_unqualified: bool,
     changed: &mut bool,
 ) -> Result<bool, LixError> {
-    let mut rewrote_target = rewrite_table_factor(&mut table.relation, changed)?;
+    let mut rewrote_target =
+        rewrite_table_factor(&mut table.relation, selection, allow_unqualified, changed)?;
     for join in &mut table.joins {
-        if rewrite_table_factor(&mut join.relation, changed)? {
+        if rewrite_table_factor(&mut join.relation, selection, false, changed)? {
             rewrote_target = true;
         }
     }
     Ok(rewrote_target)
 }
 
-fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Result<bool, LixError> {
+fn rewrite_table_factor(
+    relation: &mut TableFactor,
+    selection: &mut Option<Expr>,
+    allow_unqualified: bool,
+    changed: &mut bool,
+) -> Result<bool, LixError> {
     match relation {
         TableFactor::Table { name, alias, .. }
             if object_name_matches(name, LIX_STATE_BY_VERSION_VIEW_NAME) =>
         {
-            let derived_query = build_lix_state_by_version_view_query()?;
+            let relation_name = alias
+                .as_ref()
+                .map(|value| value.name.value.clone())
+                .unwrap_or_else(|| LIX_STATE_BY_VERSION_VIEW_NAME.to_string());
+            let pushdown = take_pushdown_predicates(selection, &relation_name, allow_unqualified);
+            let derived_query = build_lix_state_by_version_view_query(&pushdown)?;
             let derived_alias = alias
                 .clone()
                 .or_else(|| Some(default_lix_state_by_version_alias()));
@@ -108,12 +122,149 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => rewrite_table_with_joins(table_with_joins, changed),
+        } => rewrite_table_with_joins(table_with_joins, selection, allow_unqualified, changed),
         _ => Ok(false),
     }
 }
 
-fn build_lix_state_by_version_view_query() -> Result<Query, LixError> {
+#[derive(Default)]
+struct StatePushdown {
+    source_predicates: Vec<String>,
+    ranked_predicates: Vec<String>,
+}
+
+fn take_pushdown_predicates(
+    selection: &mut Option<Expr>,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> StatePushdown {
+    let Some(selection_expr) = selection.take() else {
+        return StatePushdown::default();
+    };
+
+    let mut pushdown = StatePushdown::default();
+    let mut remaining = Vec::new();
+    for predicate in split_conjunction(selection_expr) {
+        let Some((column, value_sql)) =
+            extract_pushdown_comparison(&predicate, relation_name, allow_unqualified)
+        else {
+            remaining.push(predicate);
+            continue;
+        };
+
+        match column.as_str() {
+            "entity_id" | "schema_key" | "file_id" => {
+                pushdown
+                    .source_predicates
+                    .push(format!("s.{column} = {value_sql}"));
+            }
+            "plugin_key" => {
+                // Keep plugin filtering after winner selection to preserve row-choice semantics.
+                pushdown
+                    .ranked_predicates
+                    .push(format!("ranked.{column} = {value_sql}"));
+            }
+            _ => remaining.push(predicate),
+        }
+    }
+    *selection = join_conjunction(remaining);
+    pushdown
+}
+
+fn split_conjunction(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut out = split_conjunction(*left);
+            out.extend(split_conjunction(*right));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn join_conjunction(mut predicates: Vec<Expr>) -> Option<Expr> {
+    if predicates.is_empty() {
+        return None;
+    }
+    let mut current = predicates.remove(0);
+    for predicate in predicates {
+        current = Expr::BinaryOp {
+            left: Box::new(current),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
+        };
+    }
+    Some(current)
+}
+
+fn extract_pushdown_comparison(
+    predicate: &Expr,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> Option<(String, String)> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = predicate
+    else {
+        return None;
+    };
+
+    if let Some(column) = extract_target_column(left, relation_name, allow_unqualified) {
+        return Some((column, right.to_string()));
+    }
+    if let Some(column) = extract_target_column(right, relation_name, allow_unqualified) {
+        return Some((column, left.to_string()));
+    }
+    None
+}
+
+fn extract_target_column(
+    expr: &Expr,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) if allow_unqualified => normalize_state_column(&ident.value),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let qualifier = &parts[parts.len() - 2].value;
+            if !qualifier.eq_ignore_ascii_case(relation_name) {
+                return None;
+            }
+            let column = &parts[parts.len() - 1].value;
+            normalize_state_column(column)
+        }
+        Expr::Nested(inner) => extract_target_column(inner, relation_name, allow_unqualified),
+        _ => None,
+    }
+}
+
+fn normalize_state_column(raw: &str) -> Option<String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "entity_id" | "lixcol_entity_id" => Some("entity_id".to_string()),
+        "schema_key" | "lixcol_schema_key" => Some("schema_key".to_string()),
+        "file_id" | "lixcol_file_id" => Some("file_id".to_string()),
+        "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
+        _ => None,
+    }
+}
+
+fn build_lix_state_by_version_view_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
+    let source_pushdown = if pushdown.source_predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
+    };
+    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
+    };
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
@@ -227,15 +378,19 @@ fn build_lix_state_by_version_view_query() -> Result<Query, LixError> {
              ON vc.ancestor_version_id = s.version_id \
            LEFT JOIN change_commit_by_change_id cc \
              ON cc.change_id = s.change_id \
+           {source_pushdown} \
          ) AS ranked \
          WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL",
+           AND ranked.snapshot_content IS NOT NULL\
+           {ranked_pushdown}",
         descriptor_table = descriptor_table,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         vtable_name = VTABLE_NAME,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        source_pushdown = source_pushdown,
+        ranked_pushdown = ranked_pushdown,
     );
     parse_single_query(&sql)
 }
@@ -277,4 +432,38 @@ fn object_name_matches(name: &ObjectName, target: &str) -> bool {
 fn quote_ident(value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_query;
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    #[test]
+    fn pushes_alias_qualified_filters_into_lix_state_by_version_derived_query() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.file_id = ?1 AND sv.plugin_key = 'plugin_json'",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.file_id = ?1"));
+        assert!(sql.contains("ranked.plugin_key = 'plugin_json'"));
+        assert!(!sql.contains("sv.file_id = ?1"));
+    }
+
+    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
+        assert_eq!(statements.len(), 1);
+        match statements.remove(0) {
+            Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        }
+    }
 }
