@@ -39,6 +39,7 @@ export type Lix = {
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
   switchVersion(versionId: string): Promise<void>;
   installPlugin(args: InstallPluginOptions): Promise<void>;
+  close(): Promise<void>;
 };
 
 let wasmReady: Promise<void> | null = null;
@@ -60,17 +61,26 @@ export async function openLix(
   await ensureWasmReady();
   const backend = args.backend ?? (await createWasmSqliteBackend());
   const wasmLix = await openLixWasm(backend);
+  let closed = false;
+
+  const ensureOpen = (methodName: string): void => {
+    if (closed) {
+      throw new Error(`lix is closed; ${methodName}() is unavailable`);
+    }
+  };
 
   const execute = async (
     sql: string,
     params: ReadonlyArray<unknown> = [],
   ): Promise<QueryResult> => {
+    ensureOpen("execute");
     return wasmLix.execute(sql, params.map((param) => Value.from(param)));
   };
 
   const createVersion = async (
     args2: CreateVersionOptions = {},
   ): Promise<CreateVersionResult> => {
+    ensureOpen("createVersion");
     const activeVersionResult = await execute(
       "SELECT av.version_id, v.commit_id \
        FROM lix_active_version av \
@@ -109,6 +119,7 @@ export async function openLix(
   };
 
   const switchVersion = async (versionId: string): Promise<void> => {
+    ensureOpen("switchVersion");
     if (!versionId || typeof versionId !== "string") {
       throw new Error("switchVersion requires a non-empty versionId string");
     }
@@ -116,6 +127,7 @@ export async function openLix(
   };
 
   const installPlugin = async (args2: InstallPluginOptions): Promise<void> => {
+    ensureOpen("installPlugin");
     if (typeof (wasmLix as any).installPlugin !== "function") {
       throw new Error("installPlugin is not available in this wasm build");
     }
@@ -131,11 +143,49 @@ export async function openLix(
     await (wasmLix as any).installPlugin(manifestJson, wasmBytes);
   };
 
+  const close = async (): Promise<void> => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+
+    let firstError: unknown;
+    try {
+      if (typeof (wasmLix as any).free === "function") {
+        (wasmLix as any).free();
+      } else if (
+        typeof Symbol.dispose === "symbol" &&
+        typeof (wasmLix as any)[Symbol.dispose] === "function"
+      ) {
+        (wasmLix as any)[Symbol.dispose]();
+      }
+    } catch (error) {
+      firstError = error;
+    }
+
+    try {
+      if (typeof backend.close === "function") {
+        await backend.close();
+      }
+    } catch (error) {
+      if (!firstError) {
+        firstError = error;
+      }
+    }
+
+    if (firstError) {
+      throw firstError instanceof Error
+        ? firstError
+        : new Error(String(firstError));
+    }
+  };
+
   return {
     execute,
     createVersion,
     switchVersion,
     installPlugin,
+    close,
   };
 }
 

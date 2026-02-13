@@ -46,3 +46,14 @@ test("beginTransaction rollback discards writes", async () => {
   const rows = rowsOf(result);
   expect(rows[0][0]).toEqual({ kind: "Integer", value: 0 });
 });
+
+test("close is idempotent and prevents further queries", async () => {
+  const backend = await createWasmSqliteBackend();
+  await backend.execute("CREATE TABLE t (value INTEGER)", []);
+  await backend.close?.();
+  await backend.close?.();
+
+  await expect(backend.execute("SELECT 1", [])).rejects.toThrow(
+    "sqlite backend is closed",
+  );
+});

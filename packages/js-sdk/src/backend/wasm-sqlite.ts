@@ -38,8 +38,16 @@ async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
 
 export async function createWasmSqliteBackend(): Promise<LixBackend> {
   const db = await createInMemoryDatabase();
+  let backendClosed = false;
+
+  const ensureBackendOpen = (): void => {
+    if (backendClosed) {
+      throw new Error("sqlite backend is closed");
+    }
+  };
 
   const runQuery = (sql: string, params: ReadonlyArray<unknown>): QueryResult => {
+    ensureBackendOpen();
     try {
       const boundParams: SqlValue[] = params.map(toSqlParam);
       const rows: SqlValue[][] = [];
@@ -62,29 +70,32 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
   };
 
   const createTransaction = (): LixTransaction => {
-    let closed = false;
+    let transactionClosed = false;
 
     return {
       dialect: "sqlite",
       async execute(sql: string, params: ReadonlyArray<unknown>): Promise<QueryResult> {
-        if (closed) {
+        if (transactionClosed) {
           throw new Error("transaction is already closed");
         }
+        ensureBackendOpen();
         return runQuery(sql, params);
       },
       async commit(): Promise<void> {
-        if (closed) {
+        if (transactionClosed) {
           return;
         }
+        ensureBackendOpen();
         runQuery("COMMIT", []);
-        closed = true;
+        transactionClosed = true;
       },
       async rollback(): Promise<void> {
-        if (closed) {
+        if (transactionClosed) {
           return;
         }
+        ensureBackendOpen();
         runQuery("ROLLBACK", []);
-        closed = true;
+        transactionClosed = true;
       },
     };
   };
@@ -95,8 +106,16 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
       return runQuery(sql, params);
     },
     async beginTransaction(): Promise<LixTransaction> {
+      ensureBackendOpen();
       runQuery("BEGIN", []);
       return createTransaction();
+    },
+    async close(): Promise<void> {
+      if (backendClosed) {
+        return;
+      }
+      backendClosed = true;
+      db.close();
     },
   };
 }
