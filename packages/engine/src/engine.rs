@@ -122,6 +122,7 @@ pub struct EngineTransaction<'a> {
     options: ExecuteOptions,
     active_version_id: String,
     active_version_changed: bool,
+    installed_plugins_cache_invalidation_pending: bool,
 }
 
 impl<'a> EngineTransaction<'a> {
@@ -143,6 +144,9 @@ impl<'a> EngineTransaction<'a> {
         if self.active_version_id != previous_active_version_id {
             self.active_version_changed = true;
         }
+        if should_invalidate_installed_plugins_cache_for_sql(sql) {
+            self.installed_plugins_cache_invalidation_pending = true;
+        }
         Ok(result)
     }
 
@@ -154,6 +158,9 @@ impl<'a> EngineTransaction<'a> {
         if self.active_version_changed {
             self.engine
                 .set_active_version_id(std::mem::take(&mut self.active_version_id));
+        }
+        if self.installed_plugins_cache_invalidation_pending {
+            self.engine.invalidate_installed_plugins_cache()?;
         }
         Ok(())
     }
@@ -551,6 +558,7 @@ impl Engine {
             options,
             active_version_id: self.active_version_id.read().unwrap().clone(),
             active_version_changed: false,
+            installed_plugins_cache_invalidation_pending: false,
         })
     }
 
@@ -814,10 +822,6 @@ impl Engine {
             &functions,
         )
         .await?;
-        if should_invalidate_installed_plugins_cache_for_sql(sql) {
-            self.invalidate_installed_plugins_cache()?;
-        }
-
         Ok(result)
     }
 
@@ -3040,21 +3044,76 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         active_version_from_update_validations, active_version_schema_key,
-        advance_placeholder_state_for_statement,
+        advance_placeholder_state_for_statement, boot,
         detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
         file_history_read_materialization_required_for_sql,
         file_read_materialization_scope_for_sql, should_invalidate_installed_plugins_cache_for_sql,
-        should_refresh_file_cache_for_sql, FileReadMaterializationScope,
+        should_refresh_file_cache_for_sql, BootArgs, ExecuteOptions, FileReadMaterializationScope,
     };
-    use crate::backend::SqlDialect;
+    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::sql::{
         bind_sql_with_state, parse_sql_statements, MutationOperation, MutationRow, PlaceholderState,
     };
     use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
-    use crate::Value;
+    use crate::{LixError, QueryResult, Value};
+    use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    struct TestBackend {
+        commit_called: Arc<AtomicBool>,
+        rollback_called: Arc<AtomicBool>,
+    }
+
+    struct TestTransaction {
+        commit_called: Arc<AtomicBool>,
+        rollback_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for TestBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(TestTransaction {
+                commit_called: Arc::clone(&self.commit_called),
+                rollback_called: Arc::clone(&self.rollback_called),
+            }))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixTransaction for TestTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            self.commit_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            self.rollback_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[test]
     fn detects_active_version_update_with_single_quoted_schema_key() {
@@ -3131,6 +3190,97 @@ mod tests {
         assert!(!should_invalidate_installed_plugins_cache_for_sql(
             "SELECT * FROM lix_internal_plugin WHERE key = 'k'"
         ));
+    }
+
+    #[tokio::test]
+    async fn transaction_plugin_cache_invalidation_happens_after_commit() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(Box::new(TestBackend {
+            commit_called: Arc::clone(&commit_called),
+            rollback_called: Arc::clone(&rollback_called),
+        })));
+
+        {
+            let mut cache = engine
+                .installed_plugins_cache
+                .write()
+                .expect("installed plugins cache lock");
+            *cache = Some(Vec::new());
+        }
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin transaction");
+        tx.execute(
+            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'",
+            &[],
+        )
+        .await
+        .expect("transaction execute should succeed");
+
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_some(),
+            "cache should remain populated before commit"
+        );
+
+        tx.commit().await.expect("commit should succeed");
+        assert!(commit_called.load(Ordering::SeqCst));
+        assert!(!rollback_called.load(Ordering::SeqCst));
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_none(),
+            "cache should be invalidated after successful commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_plugin_cache_invalidation_skips_rollback() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(Box::new(TestBackend {
+            commit_called: Arc::clone(&commit_called),
+            rollback_called: Arc::clone(&rollback_called),
+        })));
+
+        {
+            let mut cache = engine
+                .installed_plugins_cache
+                .write()
+                .expect("installed plugins cache lock");
+            *cache = Some(Vec::new());
+        }
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin transaction");
+        tx.execute(
+            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'",
+            &[],
+        )
+        .await
+        .expect("transaction execute should succeed");
+        tx.rollback().await.expect("rollback should succeed");
+
+        assert!(!commit_called.load(Ordering::SeqCst));
+        assert!(rollback_called.load(Ordering::SeqCst));
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_some(),
+            "cache should remain populated after rollback"
+        );
     }
 
     #[test]
