@@ -25,8 +25,8 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, lowering::lower_statement,
-    resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver,
+    bind_sql_with_state, escape_sql_string, lowering::lower_statement, object_name_matches,
+    quote_ident, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
@@ -1849,10 +1849,6 @@ fn lower_single_statement_for_dialect(sql: &str, dialect: SqlDialect) -> Result<
     Ok(lowered.to_string())
 }
 
-fn quote_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
     assignments
         .into_iter()
@@ -2968,14 +2964,6 @@ fn unwrap_cast_expr(mut expr: &Expr) -> &Expr {
             _ => return expr,
         }
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
 
 fn extract_single_schema_key(expr: &Expr) -> Result<String, LixError> {

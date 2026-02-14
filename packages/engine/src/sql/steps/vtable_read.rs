@@ -1,11 +1,12 @@
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, ObjectName, Query, Select, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
+    TableWithJoins, UnaryOperator, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
+use crate::sql::{object_name_matches, quote_ident};
 use crate::{LixBackend, LixError, Value as LixValue};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
@@ -310,14 +311,6 @@ fn build_untracked_union_query(
             message: "derived query did not parse as SELECT".to_string(),
         }),
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
 
 fn query_targets_vtable(query: &Query) -> bool {
@@ -720,11 +713,6 @@ fn default_vtable_alias() -> TableAlias {
 
 fn escape_string_literal(value: &str) -> String {
     value.replace('\'', "''")
-}
-
-fn quote_ident(value: &str) -> String {
-    let escaped = value.replace('"', "\"\"");
-    format!("\"{}\"", escaped)
 }
 
 async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {

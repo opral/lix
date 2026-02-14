@@ -1,4 +1,4 @@
-use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Query, SetExpr, Statement};
+use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -9,6 +9,7 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::sql::bind_sql;
 use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
+use crate::sql::object_name_matches;
 use crate::sql::route::{
     rewrite_statement, rewrite_statement_with_backend, rewrite_statement_with_writer_key,
 };
@@ -384,14 +385,6 @@ fn insert_targets_vtable(insert: &Insert) -> bool {
         }
         _ => false,
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
 
 fn plain_values_rows(insert: &Insert) -> Option<&Vec<Vec<Expr>>> {

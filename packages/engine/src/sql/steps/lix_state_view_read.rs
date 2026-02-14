@@ -1,13 +1,11 @@
-use sqlparser::ast::{
-    Expr, Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias,
-    TableFactor, TableWithJoins,
-};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::ast::{Expr, Query, Select, TableFactor, TableWithJoins};
 
-use crate::sql::escape_sql_string;
 use crate::sql::steps::state_pushdown::{
     select_supports_count_fast_path, take_pushdown_predicates, StatePushdown,
+};
+use crate::sql::{
+    default_alias, escape_sql_string, object_name_matches, parse_single_query, quote_ident,
+    rewrite_query_with_select_rewriter,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -22,19 +20,11 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     if !query_targets_lix_state(&query) {
         return Ok(None);
     }
-    let mut changed = false;
-    let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
-
-    if changed {
-        Ok(Some(new_query))
-    } else {
-        Ok(None)
-    }
+    rewrite_query_with_select_rewriter(query, &mut rewrite_select)
 }
 
 fn query_targets_lix_state(query: &Query) -> bool {
-    let SetExpr::Select(select) = query.body.as_ref() else {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;
     };
     select.from.iter().any(table_with_joins_targets_lix_state)
@@ -53,33 +43,6 @@ fn table_factor_is_lix_state(relation: &TableFactor) -> bool {
         relation,
         TableFactor::Table { name, .. } if object_name_matches(name, LIX_STATE_VIEW_NAME)
     )
-}
-
-fn rewrite_set_expr(expr: SetExpr, changed: &mut bool) -> Result<SetExpr, LixError> {
-    Ok(match expr {
-        SetExpr::Select(select) => {
-            let mut select = *select;
-            rewrite_select(&mut select, changed)?;
-            SetExpr::Select(Box::new(select))
-        }
-        SetExpr::Query(query) => {
-            let mut query = *query;
-            query.body = Box::new(rewrite_set_expr(*query.body, changed)?);
-            SetExpr::Query(Box::new(query))
-        }
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left: Box::new(rewrite_set_expr(*left, changed)?),
-            right: Box::new(rewrite_set_expr(*right, changed)?),
-        },
-        other => other,
-    })
 }
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
@@ -145,12 +108,6 @@ fn rewrite_table_factor(
                 alias: derived_alias,
             };
             *changed = true;
-        }
-        TableFactor::Derived { subquery, .. } => {
-            if let Some(rewritten) = rewrite_query((**subquery).clone())? {
-                *subquery = Box::new(rewritten);
-                *changed = true;
-            }
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
@@ -384,43 +341,8 @@ fn build_lix_state_view_count_query(pushdown: &StatePushdown) -> Result<Query, L
     parse_single_query(&sql)
 }
 
-fn default_lix_state_alias() -> TableAlias {
-    TableAlias {
-        explicit: false,
-        name: Ident::new(LIX_STATE_VIEW_NAME),
-        columns: Vec::new(),
-    }
-}
-
-fn parse_single_query(sql: &str) -> Result<Query, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single SELECT statement".to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    match statement {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            message: "expected SELECT statement".to_string(),
-        }),
-    }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
-}
-
-fn quote_ident(value: &str) -> String {
-    let escaped = value.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+fn default_lix_state_alias() -> sqlparser::ast::TableAlias {
+    default_alias(LIX_STATE_VIEW_NAME)
 }
 
 #[cfg(test)]
