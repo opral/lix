@@ -17,9 +17,16 @@ pub async fn rewrite_insert_with_backend(
     insert: Insert,
     params: &[EngineValue],
     resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<Insert>, LixError> {
-    mutation_rewrite::rewrite_insert_with_backend(backend, insert, params, resolved_directory_ids)
-        .await
+    mutation_rewrite::rewrite_insert_with_backend(
+        backend,
+        insert,
+        params,
+        resolved_directory_ids,
+        active_version_id_hint,
+    )
+    .await
 }
 
 pub async fn insert_side_effect_statements_with_backend(

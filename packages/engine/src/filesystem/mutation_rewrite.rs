@@ -47,6 +47,7 @@ pub struct FilesystemInsertSideEffects {
     pub statements: Vec<Statement>,
     pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
     pub resolved_directory_ids: ResolvedDirectoryIdMap,
+    pub active_version_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +79,7 @@ pub async fn rewrite_insert_with_backend(
     mut insert: Insert,
     params: &[EngineValue],
     resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<Insert>, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
         return Ok(None);
@@ -96,10 +98,18 @@ pub async fn rewrite_insert_with_backend(
             params,
             target,
             resolved_directory_ids,
+            active_version_id_hint,
         )
         .await?;
     } else {
-        rewrite_directory_insert_columns_with_backend(backend, &mut insert, params, target).await?;
+        rewrite_directory_insert_columns_with_backend(
+            backend,
+            &mut insert,
+            params,
+            target,
+            active_version_id_hint,
+        )
+        .await?;
     }
 
     insert.table = TableObject::TableName(table_name(target.rewrite_view_name));
@@ -145,6 +155,10 @@ pub async fn insert_side_effect_statements_with_backend(
         Some(load_active_version_id(backend).await?)
     } else {
         None
+    };
+    let mut side_effects = FilesystemInsertSideEffects {
+        active_version_id: active_version_id.clone(),
+        ..FilesystemInsertSideEffects::default()
     };
 
     let resolved_rows = resolve_values_rows(&values.rows, params)?;
@@ -222,7 +236,7 @@ pub async fn insert_side_effect_statements_with_backend(
     }
 
     if directory_requests.is_empty() {
-        return Ok(FilesystemInsertSideEffects::default());
+        return Ok(side_effects);
     }
 
     let mut ordered_requests = directory_requests.into_iter().collect::<Vec<_>>();
@@ -239,7 +253,6 @@ pub async fn insert_side_effect_statements_with_backend(
     });
 
     let mut known_ids: BTreeMap<(String, String), String> = BTreeMap::new();
-    let mut side_effects = FilesystemInsertSideEffects::default();
 
     for ((version_id, path), untracked) in ordered_requests {
         let key = (version_id.clone(), path.clone());
@@ -646,6 +659,7 @@ async fn rewrite_file_insert_columns_with_backend(
     params: &[EngineValue],
     target: FilesystemTarget,
     resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
+    active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
     let id_index = insert
         .columns
@@ -663,7 +677,11 @@ async fn rewrite_file_insert_columns_with_backend(
             || column.value.eq_ignore_ascii_case("version_id")
     });
     let active_version_id = if target.uses_active_version_scope() {
-        Some(load_active_version_id(backend).await?)
+        Some(
+            active_version_id_hint
+                .map(ToString::to_string)
+                .unwrap_or(load_active_version_id(backend).await?),
+        )
     } else {
         None
     };
@@ -784,6 +802,7 @@ async fn rewrite_directory_insert_columns_with_backend(
     insert: &mut Insert,
     params: &[EngineValue],
     target: FilesystemTarget,
+    active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
     let path_index = insert
         .columns
@@ -806,7 +825,11 @@ async fn rewrite_directory_insert_columns_with_backend(
             || column.value.eq_ignore_ascii_case("version_id")
     });
     let active_version_id = if target.uses_active_version_scope() {
-        Some(load_active_version_id(backend).await?)
+        Some(
+            active_version_id_hint
+                .map(ToString::to_string)
+                .unwrap_or(load_active_version_id(backend).await?),
+        )
     } else {
         None
     };
