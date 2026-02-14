@@ -1694,7 +1694,7 @@ async fn find_file_id_by_components(
 
 fn json_text_extract_for_dialect(dialect: SqlDialect, value_expr: &str, key: &str) -> String {
     match dialect {
-        SqlDialect::Sqlite => format!("json_extract({value_expr}, '$.\"{key}\"')"),
+        SqlDialect::Sqlite => format!("json_extract({value_expr}, '$.{key}')"),
         SqlDialect::Postgres => {
             format!("jsonb_extract_path_text(CAST({value_expr} AS JSONB), '{key}')")
         }
@@ -2760,8 +2760,8 @@ fn noop_statement() -> Result<Statement, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_predicate_string_with_params_and_state, parse_expression, rewrite_delete,
-        rewrite_insert, rewrite_update,
+        extract_predicate_string_with_params_and_state, json_text_extract_for_dialect,
+        parse_expression, rewrite_delete, rewrite_insert, rewrite_update,
     };
     use crate::backend::SqlDialect;
     use crate::sql::parse_sql_statements;
@@ -2769,6 +2769,21 @@ mod tests {
     use crate::sql::PlaceholderState;
     use crate::Value;
     use sqlparser::ast::Statement;
+
+    #[test]
+    fn sqlite_json_extract_expression_matches_schema_registry_index_shape() {
+        let expr = json_text_extract_for_dialect(SqlDialect::Sqlite, "snapshot_content", "name");
+        assert_eq!(expr, "json_extract(snapshot_content, '$.name')");
+    }
+
+    #[test]
+    fn postgres_json_extract_expression_uses_jsonb_extract_path_text() {
+        let expr = json_text_extract_for_dialect(SqlDialect::Postgres, "snapshot_content", "name");
+        assert_eq!(
+            expr,
+            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'name')"
+        );
+    }
 
     #[test]
     fn rewrites_file_insert_and_drops_data_column() {
