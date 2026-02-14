@@ -1,7 +1,6 @@
-use sqlparser::ast::{
-    Delete, FromTable, Insert, ObjectName, ObjectNamePart, TableFactor, TableObject, Update,
-};
+use sqlparser::ast::{Delete, FromTable, Insert, TableFactor, TableObject, Update};
 
+use crate::sql::object_name_matches;
 use crate::LixError;
 
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
@@ -54,12 +53,4 @@ fn delete_from_is_lix_state_history(delete: &Delete) -> bool {
             tables.iter().any(table_with_joins_is_lix_state_history)
         }
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }

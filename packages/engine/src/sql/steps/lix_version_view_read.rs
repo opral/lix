@@ -1,68 +1,19 @@
-use sqlparser::ast::{
-    Ident, ObjectName, Query, Select, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins,
-};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::ast::{Query, Select, TableFactor};
 
+use crate::sql::{
+    default_alias, object_name_matches, parse_single_query, rewrite_query_with_select_rewriter,
+    rewrite_table_factors_in_select,
+};
 use crate::LixError;
 
 const LIX_VERSION_VIEW_NAME: &str = "lix_version";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    let mut changed = false;
-    let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
-
-    if changed {
-        Ok(Some(new_query))
-    } else {
-        Ok(None)
-    }
-}
-
-fn rewrite_set_expr(expr: SetExpr, changed: &mut bool) -> Result<SetExpr, LixError> {
-    Ok(match expr {
-        SetExpr::Select(select) => {
-            let mut select = *select;
-            rewrite_select(&mut select, changed)?;
-            SetExpr::Select(Box::new(select))
-        }
-        SetExpr::Query(query) => {
-            let mut query = *query;
-            query.body = Box::new(rewrite_set_expr(*query.body, changed)?);
-            SetExpr::Query(Box::new(query))
-        }
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left: Box::new(rewrite_set_expr(*left, changed)?),
-            right: Box::new(rewrite_set_expr(*right, changed)?),
-        },
-        other => other,
-    })
+    rewrite_query_with_select_rewriter(query, &mut rewrite_select)
 }
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
-    for table in &mut select.from {
-        rewrite_table_with_joins(table, changed)?;
-    }
-    Ok(())
-}
-
-fn rewrite_table_with_joins(
-    table: &mut TableWithJoins,
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    rewrite_table_factor(&mut table.relation, changed)?;
-    for join in &mut table.joins {
-        rewrite_table_factor(&mut join.relation, changed)?;
-    }
-    Ok(())
+    rewrite_table_factors_in_select(select, &mut rewrite_table_factor, changed)
 }
 
 fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Result<(), LixError> {
@@ -79,24 +30,12 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
             };
             *changed = true;
         }
-        TableFactor::Derived { subquery, .. } => {
-            if let Some(rewritten) = rewrite_query((**subquery).clone())? {
-                *subquery = Box::new(rewritten);
-                *changed = true;
-            }
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            rewrite_table_with_joins(table_with_joins, changed)?;
-        }
         _ => {}
     }
     Ok(())
 }
 
 fn build_lix_version_view_query() -> Result<Query, LixError> {
-    let dialect = GenericDialect {};
     let sql = "SELECT \
                  d.id AS id, \
                  d.name AS name, \
@@ -147,37 +86,8 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    AND snapshot_content IS NOT NULL \
                ) AS t \
                  ON t.id = d.id";
-
-    let mut statements = Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
-        message: err.to_string(),
-    })?;
-
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected single derived query statement".to_string(),
-        });
-    }
-
-    match statements.remove(0) {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            message: "derived query did not parse as SELECT".to_string(),
-        }),
-    }
+    parse_single_query(sql)
 }
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
-}
-
-fn default_lix_version_alias() -> TableAlias {
-    TableAlias {
-        explicit: false,
-        name: Ident::new(LIX_VERSION_VIEW_NAME),
-        columns: Vec::new(),
-    }
+fn default_lix_version_alias() -> sqlparser::ast::TableAlias {
+    default_alias(LIX_VERSION_VIEW_NAME)
 }

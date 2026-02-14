@@ -20,6 +20,8 @@ pub struct VtableUpdatePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VtableDeletePlan {
     pub schema_key: String,
+    pub effective_scope_fallback: bool,
+    pub effective_scope_selection_sql: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

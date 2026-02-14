@@ -80,21 +80,25 @@ pub(crate) async fn detect_file_changes_with_plugins(
     backend: &dyn LixBackend,
     runtime: &dyn WasmRuntime,
     writes: &[FileChangeDetectionRequest],
+    installed_plugins: &[InstalledPlugin],
 ) -> Result<Vec<DetectedFileChange>, LixError> {
     if writes.is_empty() {
         return Ok(Vec::new());
     }
-
-    let installed_plugins = load_installed_plugins(backend).await?;
     if installed_plugins.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut detected = Vec::new();
     for write in writes {
+        let has_before_context = write.before_path.is_some() || write.before_data.is_some();
         let before_path = write.before_path.as_deref().unwrap_or(write.path.as_str());
-        let before_plugin = select_plugin_for_path(before_path, &installed_plugins);
-        let after_plugin = select_plugin_for_path(&write.path, &installed_plugins);
+        let before_plugin = if has_before_context {
+            select_plugin_for_path(before_path, installed_plugins)
+        } else {
+            None
+        };
+        let after_plugin = select_plugin_for_path(&write.path, installed_plugins);
 
         if let Some(previous_plugin) = before_plugin {
             let plugin_changed = after_plugin
@@ -141,18 +145,18 @@ pub(crate) async fn detect_file_changes_with_plugins(
             })
             .await?;
 
-        let mut before_data = if plugin_changed {
+        let mut before_data = if plugin_changed || !has_before_context {
             None
         } else {
             write.before_data.clone()
         };
-        if before_data.is_none() && !plugin_changed {
+        if before_data.is_none() && !plugin_changed && has_before_context {
             let cached = load_file_cache_data(backend, &write.file_id, &write.version_id).await?;
             if !cached.is_empty() {
                 before_data = Some(cached);
             }
         }
-        if before_data.is_none() && !plugin_changed {
+        if before_data.is_none() && !plugin_changed && has_before_context {
             before_data = reconstruct_before_file_data_from_state(
                 backend,
                 instance.as_ref(),
@@ -223,18 +227,24 @@ pub(crate) async fn detect_file_changes_with_plugins(
             .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
             .collect::<BTreeSet<_>>();
 
-        for existing in
-            load_existing_plugin_entities(backend, &write.file_id, &write.version_id, &plugin.key)
-                .await?
-        {
-            let key = (existing.schema_key.clone(), existing.entity_id.clone());
-            if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
-                plugin_changes.push(PluginEntityChange {
-                    entity_id: existing.entity_id,
-                    schema_key: existing.schema_key,
-                    schema_version: existing.schema_version,
-                    snapshot_content: None,
-                });
+        if has_before_context {
+            for existing in load_existing_plugin_entities(
+                backend,
+                &write.file_id,
+                &write.version_id,
+                &plugin.key,
+            )
+            .await?
+            {
+                let key = (existing.schema_key.clone(), existing.entity_id.clone());
+                if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
+                    plugin_changes.push(PluginEntityChange {
+                        entity_id: existing.entity_id,
+                        schema_key: existing.schema_key,
+                        schema_version: existing.schema_version,
+                        snapshot_content: None,
+                    });
+                }
             }
         }
 
@@ -966,7 +976,7 @@ async fn load_existing_plugin_entities(
         .collect())
 }
 
-async fn load_installed_plugins(
+pub(crate) async fn load_installed_plugins(
     backend: &dyn LixBackend,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let rows = backend
