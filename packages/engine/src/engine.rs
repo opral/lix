@@ -2408,7 +2408,89 @@ fn expr_references_column_name(expr: &Expr, column: &str) -> bool {
             }
             _ => false,
         },
-        Expr::InSubquery { expr, .. } => expr_references_column_name(expr, column),
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_references_column_name(expr, column)
+                || query_references_column_name(subquery, column)
+        }
+        Expr::Subquery(subquery) | Expr::Exists { subquery, .. } => {
+            query_references_column_name(subquery, column)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|operand| expr_references_column_name(operand, column))
+                || conditions.iter().any(|condition| {
+                    expr_references_column_name(&condition.condition, column)
+                        || expr_references_column_name(&condition.result, column)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|value| expr_references_column_name(value, column))
+        }
+        Expr::Tuple(items) => items
+            .iter()
+            .any(|item| expr_references_column_name(item, column)),
+        _ => false,
+    }
+}
+
+fn query_references_column_name(query: &Query, column: &str) -> bool {
+    if query_set_expr_references_column_name(query.body.as_ref(), column) {
+        return true;
+    }
+
+    query.with.as_ref().is_some_and(|with| {
+        with.cte_tables
+            .iter()
+            .any(|cte| query_references_column_name(&cte.query, column))
+    })
+}
+
+fn query_set_expr_references_column_name(expr: &SetExpr, column: &str) -> bool {
+    match expr {
+        SetExpr::Select(select) => {
+            select.projection.iter().any(|item| match item {
+                sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                    expr_references_column_name(expr, column)
+                }
+                sqlparser::ast::SelectItem::QualifiedWildcard(
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
+                    _,
+                ) => expr_references_column_name(expr, column),
+                _ => false,
+            }) || select
+                .selection
+                .as_ref()
+                .is_some_and(|expr| expr_references_column_name(expr, column))
+                || select
+                    .prewhere
+                    .as_ref()
+                    .is_some_and(|expr| expr_references_column_name(expr, column))
+                || select
+                    .having
+                    .as_ref()
+                    .is_some_and(|expr| expr_references_column_name(expr, column))
+                || select
+                    .qualify
+                    .as_ref()
+                    .is_some_and(|expr| expr_references_column_name(expr, column))
+        }
+        SetExpr::Query(query) => query_references_column_name(query, column),
+        SetExpr::SetOperation { left, right, .. } => {
+            query_set_expr_references_column_name(left.as_ref(), column)
+                || query_set_expr_references_column_name(right.as_ref(), column)
+        }
+        SetExpr::Values(values) => values
+            .rows
+            .iter()
+            .flatten()
+            .any(|expr| expr_references_column_name(expr, column)),
         _ => false,
     }
 }
@@ -3322,6 +3404,37 @@ mod tests {
              WHERE metadata = 'data'",
         );
         assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_exists_subquery_data_requires_active_materialization_scope(
+    ) {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE EXISTS (SELECT 1 WHERE data IS NOT NULL)",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_case_data_requires_active_materialization_scope() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE CASE WHEN data IS NULL THEN 0 ELSE 1 END = 1",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_tuple_data_requires_active_materialization_scope() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE (data, id) IN (('x', 'file-a'))",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
     }
 
     #[test]
