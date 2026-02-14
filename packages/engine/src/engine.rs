@@ -532,7 +532,7 @@ impl Engine {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
                 .await?;
         }
-        if contains_word_case_insensitive(sql, "lix_internal_plugin") {
+        if should_invalidate_installed_plugins_cache_for_sql(sql) {
             self.invalidate_installed_plugins_cache()?;
         }
 
@@ -813,7 +813,7 @@ impl Engine {
             &functions,
         )
         .await?;
-        if contains_word_case_insensitive(sql, "lix_internal_plugin") {
+        if should_invalidate_installed_plugins_cache_for_sql(sql) {
             self.invalidate_installed_plugins_cache()?;
         }
 
@@ -2200,46 +2200,55 @@ fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
 }
 
 fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
+    statement_targets_table_name(statement, "lix_state")
+        || statement_targets_table_name(statement, "lix_state_by_version")
+}
+
+fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    statements
+        .iter()
+        .any(|statement| statement_targets_table_name(statement, "lix_internal_plugin"))
+}
+
+fn statement_targets_table_name(statement: &Statement, table_name: &str) -> bool {
     match statement {
-        Statement::Insert(insert) => table_object_targets_file_cache_refresh(&insert.table),
-        Statement::Update(update) => table_with_joins_targets_file_cache_refresh(&update.table),
+        Statement::Insert(insert) => table_object_targets_table_name(&insert.table, table_name),
+        Statement::Update(update) => table_with_joins_targets_table_name(&update.table, table_name),
         Statement::Delete(delete) => {
             let tables = match &delete.from {
                 FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
             };
             tables
                 .iter()
-                .any(table_with_joins_targets_file_cache_refresh)
+                .any(|table| table_with_joins_targets_table_name(table, table_name))
         }
         _ => false,
     }
 }
 
-fn table_object_targets_file_cache_refresh(table: &TableObject) -> bool {
+fn table_object_targets_table_name(table: &TableObject, table_name: &str) -> bool {
     let TableObject::TableName(name) = table else {
         return false;
     };
-    object_name_targets_file_cache_refresh(name)
+    object_name_targets_table_name(name, table_name)
 }
 
-fn table_with_joins_targets_file_cache_refresh(table: &TableWithJoins) -> bool {
+fn table_with_joins_targets_table_name(table: &TableWithJoins, table_name: &str) -> bool {
     let TableFactor::Table { name, .. } = &table.relation else {
         return false;
     };
-    object_name_targets_file_cache_refresh(name)
+    object_name_targets_table_name(name, table_name)
 }
 
-fn object_name_targets_file_cache_refresh(name: &ObjectName) -> bool {
+fn object_name_targets_table_name(name: &ObjectName, table_name: &str) -> bool {
     name.0
         .last()
         .and_then(ObjectNamePart::as_ident)
-        .map(|ident| table_name_targets_file_cache_refresh(&ident.value))
+        .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
         .unwrap_or(false)
-}
-
-fn table_name_targets_file_cache_refresh(table_name: &str) -> bool {
-    table_name.eq_ignore_ascii_case("lix_state")
-        || table_name.eq_ignore_ascii_case("lix_state_by_version")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2347,41 +2356,61 @@ fn update_references_data_column(update: &Update) -> bool {
 }
 
 fn expr_references_data_column(expr: &Expr) -> bool {
-    contains_word_case_insensitive(&expr.to_string(), "data")
+    expr_references_column_name(expr, "data")
 }
 
-fn contains_word_case_insensitive(haystack: &str, needle: &str) -> bool {
-    let haystack = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-
-    for start in 0..=(haystack.len() - needle.len()) {
-        if !haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
-            continue;
+fn expr_references_column_name(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column),
+        Expr::CompoundIdentifier(idents) => idents
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case(column))
+            .unwrap_or(false),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_column_name(left, column) || expr_references_column_name(right, column)
         }
-
-        let before_is_word = if start == 0 {
-            false
-        } else {
-            is_word_byte(haystack[start - 1])
-        };
-        let after_is_word = if start + needle.len() >= haystack.len() {
-            false
-        } else {
-            is_word_byte(haystack[start + needle.len()])
-        };
-        if !before_is_word && !after_is_word {
-            return true;
+        Expr::UnaryOp { expr, .. } => expr_references_column_name(expr, column),
+        Expr::Nested(inner) => expr_references_column_name(inner, column),
+        Expr::InList { expr, list, .. } => {
+            expr_references_column_name(expr, column)
+                || list
+                    .iter()
+                    .any(|item| expr_references_column_name(item, column))
         }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_column_name(expr, column)
+                || expr_references_column_name(low, column)
+                || expr_references_column_name(high, column)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            expr_references_column_name(expr, column)
+                || expr_references_column_name(pattern, column)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_references_column_name(inner, column),
+        Expr::Cast { expr, .. } => expr_references_column_name(expr, column),
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.iter().any(|arg| match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) => expr_references_column_name(expr, column),
+                    sqlparser::ast::FunctionArg::Named { arg, .. }
+                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                            expr_references_column_name(expr, column)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                })
+            }
+            _ => false,
+        },
+        Expr::InSubquery { expr, .. } => expr_references_column_name(expr, column),
+        _ => false,
     }
-
-    false
-}
-
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
@@ -3062,8 +3091,8 @@ mod tests {
         detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
         file_history_read_materialization_required_for_sql,
-        file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
-        FileReadMaterializationScope,
+        file_read_materialization_scope_for_sql, should_invalidate_installed_plugins_cache_for_sql,
+        should_refresh_file_cache_for_sql, FileReadMaterializationScope,
     };
     use crate::backend::SqlDialect;
     use crate::sql::{
@@ -3132,6 +3161,22 @@ mod tests {
         ));
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
+        ));
+    }
+
+    #[test]
+    fn plugin_cache_invalidation_detects_internal_plugin_mutations_only() {
+        assert!(should_invalidate_installed_plugins_cache_for_sql(
+            "INSERT INTO lix_internal_plugin (key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
+        ));
+        assert!(should_invalidate_installed_plugins_cache_for_sql(
+            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'"
+        ));
+        assert!(should_invalidate_installed_plugins_cache_for_sql(
+            "DELETE FROM lix_internal_plugin WHERE key = 'k'"
+        ));
+        assert!(!should_invalidate_installed_plugins_cache_for_sql(
+            "SELECT * FROM lix_internal_plugin WHERE key = 'k'"
         ));
     }
 
@@ -3267,6 +3312,16 @@ mod tests {
                AND lixcol_version_id = 'version-a'",
         );
         assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_string_literal_data_does_not_trigger_materialization() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE metadata = 'data'",
+        );
+        assert_eq!(scope, None);
     }
 
     #[test]
