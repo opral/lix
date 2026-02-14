@@ -371,6 +371,22 @@ mod tests {
         assert!(!sql.contains("change_commit_by_change_id"));
     }
 
+    #[test]
+    fn does_not_push_down_bare_placeholders_when_it_would_reorder_bindings() {
+        let query =
+            parse_query("SELECT COUNT(*) FROM lix_state WHERE plugin_key = ? AND file_id = ?");
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(!sql.contains("ranked.plugin_key = ?"));
+        assert!(!sql.contains("s.file_id = ?"));
+        assert!(sql.contains("plugin_key = ?"));
+        assert!(sql.contains("file_id = ?"));
+    }
+
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
         assert_eq!(statements.len(), 1);

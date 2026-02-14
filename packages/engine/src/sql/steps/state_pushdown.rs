@@ -6,6 +6,19 @@ pub(crate) struct StatePushdown {
     pub(crate) ranked_predicates: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PushdownBucket {
+    Source = 0,
+    Ranked = 1,
+    Remaining = 2,
+}
+
+struct PredicatePart {
+    predicate: Expr,
+    extracted: Option<(PushdownBucket, String)>,
+    has_bare_placeholder: bool,
+}
+
 pub(crate) fn select_supports_count_fast_path(select: &Select) -> bool {
     if select.projection.len() != 1 {
         return false;
@@ -58,33 +71,72 @@ pub(crate) fn take_pushdown_predicates(
         return StatePushdown::default();
     };
 
+    let mut parts = Vec::new();
+    for predicate in split_conjunction(selection_expr) {
+        let extracted = extract_pushdown_comparison(&predicate, relation_name, allow_unqualified)
+            .and_then(|(column, value_sql)| match column.as_str() {
+                "entity_id" | "schema_key" | "file_id" => {
+                    Some((PushdownBucket::Source, format!("s.{column} = {value_sql}")))
+                }
+                "plugin_key" => {
+                    // Keep plugin filtering after winner selection to preserve row-choice semantics.
+                    Some((
+                        PushdownBucket::Ranked,
+                        format!("ranked.{column} = {value_sql}"),
+                    ))
+                }
+                _ => None,
+            });
+        let has_bare_placeholder = expr_contains_bare_placeholder(&predicate);
+        parts.push(PredicatePart {
+            predicate,
+            extracted,
+            has_bare_placeholder,
+        });
+    }
+
+    let has_bare_placeholder_reordering = has_bare_placeholder_reordering(&parts);
+
     let mut pushdown = StatePushdown::default();
     let mut remaining = Vec::new();
-    for predicate in split_conjunction(selection_expr) {
-        let Some((column, value_sql)) =
-            extract_pushdown_comparison(&predicate, relation_name, allow_unqualified)
-        else {
-            remaining.push(predicate);
-            continue;
-        };
-
-        match column.as_str() {
-            "entity_id" | "schema_key" | "file_id" => {
-                pushdown
-                    .source_predicates
-                    .push(format!("s.{column} = {value_sql}"));
+    for part in parts {
+        match part.extracted {
+            Some((bucket, sql))
+                if !(part.has_bare_placeholder && has_bare_placeholder_reordering) =>
+            {
+                match bucket {
+                    PushdownBucket::Source => pushdown.source_predicates.push(sql),
+                    PushdownBucket::Ranked => pushdown.ranked_predicates.push(sql),
+                    PushdownBucket::Remaining => remaining.push(part.predicate),
+                }
             }
-            "plugin_key" => {
-                // Keep plugin filtering after winner selection to preserve row-choice semantics.
-                pushdown
-                    .ranked_predicates
-                    .push(format!("ranked.{column} = {value_sql}"));
-            }
-            _ => remaining.push(predicate),
+            _ => remaining.push(part.predicate),
         }
     }
+
     *selection = join_conjunction(remaining);
     pushdown
+}
+
+fn has_bare_placeholder_reordering(parts: &[PredicatePart]) -> bool {
+    let mut last_bucket = PushdownBucket::Source;
+    let mut saw_any = false;
+    for part in parts {
+        if !part.has_bare_placeholder {
+            continue;
+        }
+        let bucket = part
+            .extracted
+            .as_ref()
+            .map(|(bucket, _)| *bucket)
+            .unwrap_or(PushdownBucket::Remaining);
+        if saw_any && bucket < last_bucket {
+            return true;
+        }
+        last_bucket = bucket;
+        saw_any = true;
+    }
+    false
 }
 
 fn split_conjunction(expr: Expr) -> Vec<Expr> {
@@ -168,4 +220,67 @@ fn normalize_state_column(raw: &str) -> Option<String> {
         "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
         _ => None,
     }
+}
+
+fn expr_contains_bare_placeholder(expr: &Expr) -> bool {
+    let sql = expr.to_string();
+    sql_contains_bare_placeholder(&sql)
+}
+
+fn sql_contains_bare_placeholder(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        if in_single_quote {
+            if byte == b'\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                    index += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            if byte == b'"' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    index += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                index += 1;
+            }
+            b'"' => {
+                in_double_quote = true;
+                index += 1;
+            }
+            b'?' => {
+                let mut lookahead = index + 1;
+                while lookahead < bytes.len() && bytes[lookahead].is_ascii_digit() {
+                    lookahead += 1;
+                }
+                if lookahead == index + 1 {
+                    return true;
+                }
+                index = lookahead;
+            }
+            _ => index += 1,
+        }
+    }
+    false
 }
