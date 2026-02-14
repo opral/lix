@@ -27,3 +27,7 @@ wasmtime-wasi = "30"
 [[bench]]
 name = "lix_state"
 harness = false
+
+[[bench]]
+name = "lix_file"
+harness = false

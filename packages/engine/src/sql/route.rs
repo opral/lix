@@ -293,6 +293,7 @@ where
                 insert.clone(),
                 params,
                 Some(&filesystem_insert_side_effects.resolved_directory_ids),
+                filesystem_insert_side_effects.active_version_id.as_deref(),
             )
             .await?
             {
