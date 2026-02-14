@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Insert, ObjectName,
-    ObjectNamePart, Statement, TableFactor, TableObject, TableWithJoins, Update,
+    Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Insert, ObjectNamePart,
+    Statement, TableFactor, TableObject, TableWithJoins, Update,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::sql::lowering::lower_statement;
 use crate::sql::steps::{lix_version_view_read, vtable_read};
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, resolve_expr_cell_with_state, PlaceholderState,
-    RowSourceResolver,
+    bind_sql_with_state, escape_sql_string, object_name_matches, resolve_expr_cell_with_state,
+    PlaceholderState, RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -864,12 +864,4 @@ fn delete_from_is_lix_version(delete: &Delete) -> bool {
             table_with_joins_is_lix_version(&tables[0])
         }
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }

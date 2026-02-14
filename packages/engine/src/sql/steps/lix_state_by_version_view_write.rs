@@ -3,6 +3,7 @@ use sqlparser::ast::{
     ObjectNamePart, TableFactor, TableObject, TableWithJoins, Update,
 };
 
+use crate::sql::object_name_matches;
 use crate::LixError;
 
 const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
@@ -209,12 +210,4 @@ fn contains_column_reference(expr: &Expr, column: &str) -> bool {
         Expr::Function(_) => false,
         _ => false,
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }

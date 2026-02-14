@@ -1,12 +1,11 @@
 use sqlparser::ast::{
-    Expr, Insert, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableObject,
-    Value as SqlValue, Values,
+    Expr, Insert, Query, SetExpr, Statement, TableObject, Value as SqlValue, Values,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::sql::params::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::{lower_statement, rewrite_read_query_with_backend};
+use crate::sql::{lower_statement, object_name_matches, rewrite_read_query_with_backend};
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,14 +214,6 @@ fn insert_targets_vtable(insert: &Insert) -> bool {
         TableObject::TableName(name) => object_name_matches(name, "lix_internal_state_vtable"),
         _ => false,
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
 
 fn engine_value_to_expr(value: &Value) -> Result<Expr, LixError> {

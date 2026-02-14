@@ -27,7 +27,8 @@ use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
-    parse_sql_statements, preprocess_sql_with_provider_and_detected_file_domain_changes,
+    expr_references_column_name, parse_sql_statements,
+    preprocess_sql_with_provider_and_detected_file_domain_changes, ColumnReferenceOptions,
     DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState, PostprocessPlan,
     UpdateValidationPlan,
 };
@@ -2356,143 +2357,13 @@ fn update_references_data_column(update: &Update) -> bool {
 }
 
 fn expr_references_data_column(expr: &Expr) -> bool {
-    expr_references_column_name(expr, "data")
-}
-
-fn expr_references_column_name(expr: &Expr, column: &str) -> bool {
-    match expr {
-        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column),
-        Expr::CompoundIdentifier(idents) => idents
-            .last()
-            .map(|ident| ident.value.eq_ignore_ascii_case(column))
-            .unwrap_or(false),
-        Expr::BinaryOp { left, right, .. } => {
-            expr_references_column_name(left, column) || expr_references_column_name(right, column)
-        }
-        Expr::UnaryOp { expr, .. } => expr_references_column_name(expr, column),
-        Expr::Nested(inner) => expr_references_column_name(inner, column),
-        Expr::InList { expr, list, .. } => {
-            expr_references_column_name(expr, column)
-                || list
-                    .iter()
-                    .any(|item| expr_references_column_name(item, column))
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_references_column_name(expr, column)
-                || expr_references_column_name(low, column)
-                || expr_references_column_name(high, column)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            expr_references_column_name(expr, column)
-                || expr_references_column_name(pattern, column)
-        }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_references_column_name(inner, column),
-        Expr::Cast { expr, .. } => expr_references_column_name(expr, column),
-        Expr::Function(function) => match &function.args {
-            sqlparser::ast::FunctionArguments::List(list) => {
-                list.args.iter().any(|arg| match arg {
-                    sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(expr),
-                    ) => expr_references_column_name(expr, column),
-                    sqlparser::ast::FunctionArg::Named { arg, .. }
-                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
-                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                            expr_references_column_name(expr, column)
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                })
-            }
-            _ => false,
+    expr_references_column_name(
+        expr,
+        "data",
+        ColumnReferenceOptions {
+            include_from_derived_subqueries: true,
         },
-        Expr::InSubquery { expr, subquery, .. } => {
-            expr_references_column_name(expr, column)
-                || query_references_column_name(subquery, column)
-        }
-        Expr::Subquery(subquery) | Expr::Exists { subquery, .. } => {
-            query_references_column_name(subquery, column)
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|operand| expr_references_column_name(operand, column))
-                || conditions.iter().any(|condition| {
-                    expr_references_column_name(&condition.condition, column)
-                        || expr_references_column_name(&condition.result, column)
-                })
-                || else_result
-                    .as_ref()
-                    .is_some_and(|value| expr_references_column_name(value, column))
-        }
-        Expr::Tuple(items) => items
-            .iter()
-            .any(|item| expr_references_column_name(item, column)),
-        _ => false,
-    }
-}
-
-fn query_references_column_name(query: &Query, column: &str) -> bool {
-    if query_set_expr_references_column_name(query.body.as_ref(), column) {
-        return true;
-    }
-
-    query.with.as_ref().is_some_and(|with| {
-        with.cte_tables
-            .iter()
-            .any(|cte| query_references_column_name(&cte.query, column))
-    })
-}
-
-fn query_set_expr_references_column_name(expr: &SetExpr, column: &str) -> bool {
-    match expr {
-        SetExpr::Select(select) => {
-            select.projection.iter().any(|item| match item {
-                sqlparser::ast::SelectItem::UnnamedExpr(expr)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
-                    expr_references_column_name(expr, column)
-                }
-                sqlparser::ast::SelectItem::QualifiedWildcard(
-                    sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
-                    _,
-                ) => expr_references_column_name(expr, column),
-                _ => false,
-            }) || select
-                .selection
-                .as_ref()
-                .is_some_and(|expr| expr_references_column_name(expr, column))
-                || select
-                    .prewhere
-                    .as_ref()
-                    .is_some_and(|expr| expr_references_column_name(expr, column))
-                || select
-                    .having
-                    .as_ref()
-                    .is_some_and(|expr| expr_references_column_name(expr, column))
-                || select
-                    .qualify
-                    .as_ref()
-                    .is_some_and(|expr| expr_references_column_name(expr, column))
-        }
-        SetExpr::Query(query) => query_references_column_name(query, column),
-        SetExpr::SetOperation { left, right, .. } => {
-            query_set_expr_references_column_name(left.as_ref(), column)
-                || query_set_expr_references_column_name(right.as_ref(), column)
-        }
-        SetExpr::Values(values) => values
-            .rows
-            .iter()
-            .flatten()
-            .any(|expr| expr_references_column_name(expr, column)),
-        _ => false,
-    }
+    )
 }
 
 fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {

@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Expr, Insert, ObjectName, ObjectNamePart, Statement, TableFactor,
+    Assignment, AssignmentTarget, Expr, Insert, ObjectNamePart, Statement, TableFactor,
     TableWithJoins, Update,
 };
 use sqlparser::dialect::GenericDialect;
@@ -9,7 +9,8 @@ use sqlparser::parser::Parser;
 use crate::sql::lowering::lower_statement;
 use crate::sql::steps::{lix_active_version_view_read, vtable_read};
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, resolve_expr_cell_with_state, PlaceholderState,
+    bind_sql_with_state, escape_sql_string, object_name_matches, resolve_expr_cell_with_state,
+    PlaceholderState,
 };
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
@@ -301,12 +302,4 @@ fn table_with_joins_is_lix_active_version(table: &TableWithJoins) -> bool {
             &table.relation,
             TableFactor::Table { name, .. } if object_name_matches(name, LIX_ACTIVE_VERSION_VIEW_NAME)
         )
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }

@@ -1,11 +1,10 @@
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{
-    Expr, Function, FunctionArguments, ObjectName, ObjectNamePart, Statement, Value,
-};
+use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Value};
 use sqlparser::ast::{VisitMut, VisitorMut};
 
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+use crate::sql::object_name_matches;
 
 #[allow(dead_code)]
 pub fn inline_lix_functions(statement: Statement) -> Statement {
@@ -51,14 +50,6 @@ fn function_args_empty(function: &Function) -> bool {
         FunctionArguments::List(list) => list.args.is_empty() && list.clauses.is_empty(),
         FunctionArguments::Subquery(_) => false,
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

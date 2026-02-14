@@ -3,6 +3,7 @@ use sqlparser::ast::{
     ObjectNamePart, SetExpr, TableFactor, TableObject, TableWithJoins, Update, Value,
 };
 
+use crate::sql::object_name_matches;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
@@ -380,12 +381,4 @@ fn assignment_target_is_column(target: &AssignmentTarget, name: &str) -> bool {
             .unwrap_or(false),
         AssignmentTarget::Tuple(_) => false,
     }
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
