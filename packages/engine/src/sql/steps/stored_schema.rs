@@ -4,7 +4,8 @@ use sqlparser::ast::{
 };
 
 use crate::sql::{
-    MutationOperation, MutationRow, ResolvedCell, RowSourceResolver, SchemaRegistration,
+    object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
+    SchemaRegistration,
 };
 use crate::{LixError, Value as EngineValue};
 
@@ -391,14 +392,6 @@ fn ensure_monotonic_version(version: &str) -> Result<(), LixError> {
         });
     }
     Ok(())
-}
-
-fn object_name_matches(name: &ObjectName, target: &str) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.eq_ignore_ascii_case(target))
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

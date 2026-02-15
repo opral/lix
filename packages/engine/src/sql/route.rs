@@ -14,7 +14,7 @@ use crate::sql::steps::{
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
-use crate::sql::DetectedFileDomainChange;
+use crate::sql::{expr_references_column_name, ColumnReferenceOptions, DetectedFileDomainChange};
 use crate::{LixBackend, LixError, Value};
 
 pub fn rewrite_statement<P: LixFunctionProvider>(
@@ -174,14 +174,20 @@ pub(crate) fn rewrite_statement_with_writer_key<P: LixFunctionProvider>(
                     writer_key,
                 );
             }
+            let mut effective_scope_fallback = false;
             let delete = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
+                effective_scope_fallback = true;
                 rewritten
             } else {
                 delete
             };
-            let rewritten = vtable_write::rewrite_delete(delete.clone())?;
+            let rewritten = if effective_scope_fallback {
+                vtable_write::rewrite_delete_with_options(delete.clone(), true)?
+            } else {
+                vtable_write::rewrite_delete(delete.clone())?
+            };
             match rewritten {
                 Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
                     statements: vec![statement],
@@ -210,6 +216,37 @@ pub(crate) fn rewrite_statement_with_writer_key<P: LixFunctionProvider>(
             let query = rewrite_read_query(*query)?;
             Ok(RewriteOutput {
                 statements: vec![Statement::Query(Box::new(query))],
+                registrations: Vec::new(),
+                postprocess: None,
+                mutations: Vec::new(),
+                update_validations: Vec::new(),
+            })
+        }
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let statement = match *statement {
+                Statement::Query(query) => Statement::Query(Box::new(rewrite_read_query(*query)?)),
+                other => other,
+            };
+            Ok(RewriteOutput {
+                statements: vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(statement),
+                    format,
+                    options,
+                }],
                 registrations: Vec::new(),
                 postprocess: None,
                 mutations: Vec::new(),
@@ -251,9 +288,14 @@ where
                     .tracked_directory_changes
                     .clone(),
             );
-            let insert = if let Some(rewritten) =
-                filesystem_step::rewrite_insert_with_backend(backend, insert.clone(), params)
-                    .await?
+            let insert = if let Some(rewritten) = filesystem_step::rewrite_insert_with_backend(
+                backend,
+                insert.clone(),
+                params,
+                Some(&filesystem_insert_side_effects.resolved_directory_ids),
+                filesystem_insert_side_effects.active_version_id.as_deref(),
+            )
+            .await?
             {
                 rewritten
             } else {
@@ -463,6 +505,7 @@ where
         }
         Statement::Delete(delete) => {
             lix_state_history_view_write::reject_delete(&delete)?;
+            let mut effective_scope_fallback = false;
             let delete = if let Some(rewritten) =
                 filesystem_step::rewrite_delete_with_backend(backend, delete.clone(), params)
                     .await?
@@ -478,16 +521,15 @@ where
             } else {
                 delete
             };
-            let output = if let Some(rewritten) =
+            let delete = if let Some(rewritten) =
                 lix_state_by_version_view_write::rewrite_delete(delete.clone())?
             {
-                rewrite_statement_with_writer_key(
-                    Statement::Delete(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                )?
-            } else if let Some(rewritten) =
+                effective_scope_fallback = true;
+                rewritten
+            } else {
+                delete
+            };
+            let output = if let Some(rewritten) =
                 lix_active_account_view_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
@@ -496,35 +538,61 @@ where
                 .await?
             {
                 rewrite_statement_with_writer_key(rewritten, params, functions, writer_key)?
-            } else if let Some(rewritten) =
-                lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
-            {
-                rewrite_statement_with_writer_key(
-                    Statement::Delete(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                )?
-            } else if let Some(version_inserts) =
-                lix_version_view_write::rewrite_delete_with_backend(backend, delete.clone(), params)
-                    .await?
-            {
-                rewrite_vtable_inserts_with_backend(
+            } else {
+                let delete = if let Some(rewritten) =
+                    lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone())
+                        .await?
+                {
+                    effective_scope_fallback =
+                        !selection_mentions_inherited_from_version_id(delete.selection.as_ref());
+                    rewritten
+                } else {
+                    delete
+                };
+                if let Some(version_inserts) = lix_version_view_write::rewrite_delete_with_backend(
                     backend,
-                    version_inserts,
+                    delete.clone(),
                     params,
-                    functions,
-                    detected_file_domain_changes,
-                    writer_key,
                 )
                 .await?
-            } else {
-                rewrite_statement_with_writer_key(
-                    Statement::Delete(delete),
-                    params,
-                    functions,
-                    writer_key,
-                )?
+                {
+                    rewrite_vtable_inserts_with_backend(
+                        backend,
+                        version_inserts,
+                        params,
+                        functions,
+                        detected_file_domain_changes,
+                        writer_key,
+                    )
+                    .await?
+                } else {
+                    let rewritten = vtable_write::rewrite_delete_with_options(
+                        delete.clone(),
+                        effective_scope_fallback,
+                    )?;
+                    match rewritten {
+                        Some(vtable_write::DeleteRewrite::Statement(statement)) => RewriteOutput {
+                            statements: vec![statement],
+                            registrations: Vec::new(),
+                            postprocess: None,
+                            mutations: Vec::new(),
+                            update_validations: Vec::new(),
+                        },
+                        Some(vtable_write::DeleteRewrite::Planned(rewrite)) => RewriteOutput {
+                            statements: vec![rewrite.statement],
+                            registrations: Vec::new(),
+                            postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
+                            mutations: Vec::new(),
+                            update_validations: Vec::new(),
+                        },
+                        None => rewrite_statement_with_writer_key(
+                            Statement::Delete(delete),
+                            params,
+                            functions,
+                            writer_key,
+                        )?,
+                    }
+                }
             };
             Ok(output)
         }
@@ -532,6 +600,39 @@ where
             let query = rewrite_read_query_with_backend(backend, *query).await?;
             Ok(RewriteOutput {
                 statements: vec![Statement::Query(Box::new(query))],
+                registrations: Vec::new(),
+                postprocess: None,
+                mutations: Vec::new(),
+                update_validations: Vec::new(),
+            })
+        }
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let statement = match *statement {
+                Statement::Query(query) => Statement::Query(Box::new(
+                    rewrite_read_query_with_backend(backend, *query).await?,
+                )),
+                other => other,
+            };
+            Ok(RewriteOutput {
+                statements: vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(statement),
+                    format,
+                    options,
+                }],
                 registrations: Vec::new(),
                 postprocess: None,
                 mutations: Vec::new(),
@@ -548,17 +649,9 @@ pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
     let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = if query_mentions_identifier(&query, "lix_state_by_version") {
-        lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query)
-    } else {
-        query
-    };
+    let query = lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = if query_mentions_identifier(&query, "lix_state_history") {
-        lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query)
-    } else {
-        query
-    };
+    let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     Ok(vtable_read::rewrite_query(query.clone())?.unwrap_or(query))
 }
 
@@ -573,17 +666,9 @@ pub(crate) async fn rewrite_read_query_with_backend(
     let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = if query_mentions_identifier(&query, "lix_state_by_version") {
-        lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query)
-    } else {
-        query
-    };
+    let query = lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = if query_mentions_identifier(&query, "lix_state_history") {
-        lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query)
-    } else {
-        query
-    };
+    let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
     Ok(
         vtable_read::rewrite_query_with_backend(backend, query.clone())
             .await?
@@ -591,11 +676,49 @@ pub(crate) async fn rewrite_read_query_with_backend(
     )
 }
 
-fn query_mentions_identifier(query: &Query, identifier: &str) -> bool {
-    query
-        .to_string()
-        .to_ascii_lowercase()
-        .contains(&identifier.to_ascii_lowercase())
+fn selection_mentions_inherited_from_version_id(selection: Option<&sqlparser::ast::Expr>) -> bool {
+    selection
+        .map(|expr| {
+            expr_references_column_name(
+                expr,
+                "inherited_from_version_id",
+                ColumnReferenceOptions {
+                    include_from_derived_subqueries: true,
+                },
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selection_mentions_inherited_from_version_id;
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+
+    #[test]
+    fn inherited_column_detection_ignores_string_literals() {
+        let selection = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier("metadata".into())),
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right: Box::new(Expr::Value(ValueWithSpan::from(Value::SingleQuotedString(
+                "inherited_from_version_id".to_string(),
+            )))),
+        };
+        assert!(!selection_mentions_inherited_from_version_id(Some(
+            &selection
+        )));
+    }
+
+    #[test]
+    fn inherited_column_detection_matches_real_column_reference() {
+        let selection = Expr::IsNull(Box::new(Expr::CompoundIdentifier(vec![
+            "ranked".into(),
+            "inherited_from_version_id".into(),
+        ])));
+        assert!(selection_mentions_inherited_from_version_id(Some(
+            &selection
+        )));
+    }
 }
 
 async fn prepend_statements_with_backend<P>(

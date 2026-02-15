@@ -1443,6 +1443,56 @@ simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
     );
 });
 
+simulation_test!(
+    directory_duplicate_inherited_path_is_rejected_in_child_version,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let parent_version_id = active_version_id(&engine).await;
+        let child_version_id = "directory-inheritance-child";
+        insert_version(&engine, child_version_id, &parent_version_id).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
+                 VALUES ('dir-parent-docs', '/docs/', NULL, 'docs')",
+                &[],
+            )
+            .await
+            .expect("parent version directory insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_active_version SET version_id = '{}'",
+                    child_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("active version switch should succeed");
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
+                 VALUES ('dir-child-docs', '/docs/', NULL, 'docs')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate inherited directory path should fail");
+        assert!(
+            err.message.contains("Unique constraint violation")
+                || err.message.contains("already exists"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
 simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -1474,6 +1524,277 @@ simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
         err.message
     );
 });
+
+simulation_test!(
+    file_duplicate_inherited_path_is_rejected_in_child_version,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let parent_version_id = active_version_id(&engine).await;
+        let child_version_id = "file-inheritance-child";
+        insert_version(&engine, child_version_id, &parent_version_id).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-parent-readme', '/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("parent version file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_active_version SET version_id = '{}'",
+                    child_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("active version switch should succeed");
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-child-readme', '/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate inherited file path should fail");
+        assert!(
+            err.message.contains("Unique constraint violation")
+                || err.message.contains("already exists"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    file_duplicate_inherited_nested_path_is_rejected_in_child_version,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let parent_version_id = active_version_id(&engine).await;
+        let child_version_id = "file-inheritance-nested-child";
+        insert_version(&engine, child_version_id, &parent_version_id).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-parent-docs-readme', '/docs/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("parent version nested file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_active_version SET version_id = '{}'",
+                    child_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("active version switch should succeed");
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-child-docs-readme', '/docs/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate inherited nested file path should fail");
+        assert!(
+            err.message.contains("Unique constraint violation")
+                || err.message.contains("already exists"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    file_reinsert_path_after_child_tombstone_of_inherited_file_succeeds,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let parent_version_id = active_version_id(&engine).await;
+        let child_version_id = "file-inheritance-tombstone-child";
+        insert_version(&engine, child_version_id, &parent_version_id).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-parent-readme-tombstone', '/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("parent version file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_active_version SET version_id = '{}'",
+                    child_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("active version switch should succeed");
+
+        engine
+            .execute(
+                "DELETE FROM lix_file WHERE id = 'file-parent-readme-tombstone'",
+                &[],
+            )
+            .await
+            .expect("child tombstone delete should succeed");
+
+        let deleted_rows = engine
+            .execute("SELECT id FROM lix_file WHERE path = '/readme.md'", &[])
+            .await
+            .expect("post-delete query should succeed");
+        assert!(
+            deleted_rows.rows.is_empty(),
+            "deleted inherited file should not be visible in child version",
+        );
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-child-readme-tombstone', '/readme.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("re-insert after child tombstone should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT id, path FROM lix_file WHERE path = '/readme.md'",
+                &[],
+            )
+            .await
+            .expect("query should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "file-child-readme-tombstone");
+        assert_text(&rows.rows[0][1], "/readme.md");
+    }
+);
+
+simulation_test!(
+    file_path_update_to_inherited_path_is_rejected_in_child_version,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let parent_version_id = active_version_id(&engine).await;
+        let child_version_id = "file-inheritance-update-collision-child";
+        insert_version(&engine, child_version_id, &parent_version_id).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-parent-a', '/docs/a.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("parent version file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_active_version SET version_id = '{}'",
+                    child_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("active version switch should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-child-b', '/docs/b.md', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("child version unique file insert should succeed");
+
+        let err = engine
+            .execute(
+                "UPDATE lix_file SET path = '/docs/a.md' WHERE id = 'file-child-b'",
+                &[],
+            )
+            .await
+            .expect_err("updating to inherited path should fail");
+        assert!(
+            err.message.contains("Unique constraint violation")
+                || err.message.contains("already exists"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    file_insert_nested_path_with_missing_parent_does_not_conflict_with_same_root_filename,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('root-readme', '/readme.md', 'root')",
+                &[],
+            )
+            .await
+            .expect("root file insert should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('nested-readme', '/docs/readme.md', 'nested')",
+                &[],
+            )
+            .await
+            .expect(
+                "nested file insert should succeed even when parent directory is auto-created and root filename matches",
+            );
+
+        let files = engine
+            .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
+            .await
+            .expect("file query should succeed");
+        assert_eq!(files.rows.len(), 2);
+        assert_text(&files.rows[0][0], "nested-readme");
+        assert_text(&files.rows[0][1], "/docs/readme.md");
+        assert_text(&files.rows[1][0], "root-readme");
+        assert_text(&files.rows[1][1], "/readme.md");
+    }
+);
 
 simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
     let engine = sim

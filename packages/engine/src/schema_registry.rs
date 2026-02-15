@@ -98,6 +98,36 @@ pub fn register_schema_sql_statements(schema_key: &str, dialect: SqlDialect) -> 
         ));
     }
 
+    if schema_key == "lix_file_descriptor" {
+        let directory_expr = json_text_extract_expr(dialect, "directory_id");
+        let name_expr = json_text_extract_expr(dialect, "name");
+        let extension_expr = json_text_extract_expr(dialect, "extension");
+        statements.push(format!(
+            "CREATE INDEX IF NOT EXISTS {index} \
+             ON {table}(version_id, {directory_expr}, {name_expr}, {extension_expr}) \
+             WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
+            index = quote_ident("idx_lix_file_desc_v_dne_live"),
+            table = table_ident,
+            directory_expr = directory_expr,
+            name_expr = name_expr,
+            extension_expr = extension_expr,
+        ));
+    }
+
+    if schema_key == "lix_directory_descriptor" {
+        let parent_expr = json_text_extract_expr(dialect, "parent_id");
+        let name_expr = json_text_extract_expr(dialect, "name");
+        statements.push(format!(
+            "CREATE INDEX IF NOT EXISTS {index} \
+             ON {table}(version_id, {parent_expr}, {name_expr}) \
+             WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
+            index = quote_ident("idx_lix_dir_desc_v_pn_live"),
+            table = table_ident,
+            parent_expr = parent_expr,
+            name_expr = name_expr,
+        ));
+    }
+
     statements
 }
 
@@ -119,6 +149,7 @@ fn json_text_extract_expr(dialect: SqlDialect, key: &str) -> String {
 mod tests {
     use super::register_schema_sql_statements;
     use crate::SqlDialect;
+    use std::collections::BTreeMap;
 
     #[test]
     fn version_descriptor_indexes_use_sqlite_json_extract_on_sqlite() {
@@ -137,5 +168,40 @@ mod tests {
             "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'inherits_from_version_id')"
         ));
         assert!(!statements.contains("json_extract(snapshot_content"));
+    }
+
+    #[test]
+    fn postgres_file_descriptor_index_names_do_not_truncate_to_collisions() {
+        let statements =
+            register_schema_sql_statements("lix_file_descriptor", SqlDialect::Postgres);
+        let mut by_truncated = BTreeMap::<String, Vec<String>>::new();
+        for statement in statements {
+            let Some(rest) = statement.strip_prefix("CREATE INDEX IF NOT EXISTS \"") else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('"') else {
+                continue;
+            };
+            let truncated = name.chars().take(63).collect::<String>();
+            by_truncated
+                .entry(truncated)
+                .or_default()
+                .push(name.to_string());
+        }
+
+        let collisions = by_truncated
+            .into_iter()
+            .filter_map(|(truncated, originals)| {
+                if originals.len() <= 1 {
+                    return None;
+                }
+                Some((truncated, originals))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            collisions.is_empty(),
+            "postgres-truncated index name collisions detected: {collisions:?}"
+        );
     }
 }
