@@ -162,7 +162,6 @@ pub(crate) async fn detect_file_changes_with_plugins(
             .await?;
         }
 
-        let had_before_data = before_data.is_some();
         let before = before_data.as_ref().map(|data| PluginFile {
             id: write.file_id.clone(),
             path: before_path.to_string(),
@@ -190,46 +189,39 @@ pub(crate) async fn detect_file_changes_with_plugins(
                 ),
             })?;
 
-        let full_after_changes = if had_before_data {
-            let full_payload = serde_json::to_vec(&DetectChangesRequest {
-                before: None,
-                after: after.clone(),
-            })
-            .map_err(|error| LixError {
-                message: format!(
-                    "plugin detect-changes: failed to encode full-state payload: {error}"
-                ),
-            })?;
-            let full_output = call_detect_changes(instance.as_ref(), &full_payload).await?;
-            serde_json::from_slice::<Vec<PluginEntityChange>>(&full_output).map_err(|error| {
-                LixError {
-                    message: format!(
-                        "plugin detect-changes: failed to decode full-state output for key '{}': {error}",
-                        plugin.key
-                    ),
-                }
-            })?
-        } else {
-            plugin_changes.clone()
-        };
-        let full_after_keys = full_after_changes
-            .iter()
-            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
-            .collect::<BTreeSet<_>>();
         let mut plugin_change_keys = plugin_changes
             .iter()
             .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
             .collect::<BTreeSet<_>>();
+        let mut full_after_keys = plugin_changes
+            .iter()
+            .filter(|change| change.snapshot_content.is_some())
+            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
 
         if has_before_context {
-            for existing in load_existing_plugin_entities(
+            let existing_entities = load_existing_plugin_entities(
                 backend,
                 &write.file_id,
                 &write.version_id,
                 &plugin.key,
             )
-            .await?
-            {
+            .await?;
+            full_after_keys.extend(
+                existing_entities
+                    .iter()
+                    .map(|existing| (existing.schema_key.clone(), existing.entity_id.clone())),
+            );
+            for change in &plugin_changes {
+                let key = (change.schema_key.clone(), change.entity_id.clone());
+                if change.snapshot_content.is_some() {
+                    full_after_keys.insert(key);
+                } else {
+                    full_after_keys.remove(&key);
+                }
+            }
+
+            for existing in existing_entities {
                 let key = (existing.schema_key.clone(), existing.entity_id.clone());
                 if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
                     plugin_changes.push(PluginEntityChange {
