@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { openLix as openOldLix } from "@lix-js/sdk";
 import { plugin as legacyJsonPlugin } from "@lix-js/plugin-json";
 import { openLix as openNewLix } from "js-sdk";
+import { createBenchWasmRuntime } from "./wasm-runtime-node.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, "..", "results");
@@ -52,7 +53,7 @@ async function main() {
     }
     if (newResult.pluginRows.meanPerFile <= 0) {
       warnings.push(
-        "New js-sdk adapter produced 0 plugin rows/file. Wasm plugin execution is currently not active in this runtime (install works, execution does not).",
+        "New js-sdk adapter produced 0 plugin rows/file. Plugin execution did not produce state rows.",
       );
     }
 
@@ -132,7 +133,7 @@ async function setupOldAdapter() {
 }
 
 async function setupNewAdapter() {
-  const lix = await openNewLix();
+  const lix = await openNewLix({ wasmRuntime: createBenchWasmRuntime() });
   const wasmBytes = await loadPluginJsonV2WasmBytes();
 
   await lix.installPlugin({
@@ -161,7 +162,7 @@ async function setupNewAdapter() {
       return scalarToNumber(countResult.rows?.[0]?.[0], "lix_state plugin row count");
     },
     async close() {
-      // js-sdk currently does not expose close().
+      await lix.close();
     },
   };
 }

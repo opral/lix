@@ -5,7 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::{LixError, WasmLimits, WasmModuleInstance, WasmRuntime};
+use lix_engine::{LixError, WasmLimits, WasmComponentInstance, WasmRuntime};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
@@ -114,11 +114,11 @@ impl WasiView for WasiState {
 
 #[async_trait(?Send)]
 impl WasmRuntime for TestWasmtimeRuntime {
-    async fn instantiate(
+    async fn init_component(
         &self,
         bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         let cache_key = ComponentCacheKey::from_bytes(&bytes);
 
         if let Some(component) = self
@@ -160,7 +160,7 @@ impl WasmRuntime for TestWasmtimeRuntime {
 }
 
 #[async_trait(?Send)]
-impl WasmModuleInstance for TestWasmtimeInstance {
+impl WasmComponentInstance for TestWasmtimeInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         let mut store = Store::new(
             &self.engine,

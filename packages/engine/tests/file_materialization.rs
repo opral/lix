@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use lix_engine::{
     LixError, MaterializationDebugMode, MaterializationRequest, MaterializationScope, Value,
-    WasmLimits, WasmModuleInstance, WasmRuntime,
+    WasmLimits, WasmComponentInstance, WasmRuntime,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -70,17 +70,17 @@ struct BeforeAwareInstance;
 
 #[async_trait(?Send)]
 impl WasmRuntime for PathEchoRuntime {
-    async fn instantiate(
+    async fn init_component(
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         Ok(Arc::new(PathEchoInstance))
     }
 }
 
 #[async_trait(?Send)]
-impl WasmModuleInstance for PathEchoInstance {
+impl WasmComponentInstance for PathEchoInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         match export {
             "detect-changes" | "api#detect-changes" => {
@@ -127,17 +127,17 @@ impl WasmModuleInstance for PathEchoInstance {
 
 #[async_trait(?Send)]
 impl WasmRuntime for BeforeAwareRuntime {
-    async fn instantiate(
+    async fn init_component(
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         Ok(Arc::new(BeforeAwareInstance))
     }
 }
 
 #[async_trait(?Send)]
-impl WasmModuleInstance for BeforeAwareInstance {
+impl WasmComponentInstance for BeforeAwareInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         match export {
             "detect-changes" | "api#detect-changes" => {

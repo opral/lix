@@ -136,7 +136,7 @@ pub(crate) async fn detect_file_changes_with_plugins(
             != plugin.key.as_str();
 
         let instance = runtime
-            .instantiate(plugin.wasm.clone(), WasmLimits::default())
+            .init_component(plugin.wasm.clone(), WasmLimits::default())
             .await?;
 
         let mut before_data = if plugin_changed || !has_before_context {
@@ -334,7 +334,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
             .push(write);
     }
 
-    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmModuleInstance>> =
+    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
@@ -403,7 +403,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
             existing.clone()
         } else {
             let loaded = runtime
-                .instantiate(plugin.wasm.clone(), WasmLimits::default())
+                .init_component(plugin.wasm.clone(), WasmLimits::default())
                 .await?;
             loaded_instances.insert(plugin.key.clone(), loaded.clone());
             loaded
@@ -436,7 +436,7 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
         return Ok(());
     }
 
-    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmModuleInstance>> =
+    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
@@ -473,7 +473,7 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
             existing.clone()
         } else {
             let loaded = runtime
-                .instantiate(plugin.wasm.clone(), WasmLimits::default())
+                .init_component(plugin.wasm.clone(), WasmLimits::default())
                 .await?;
             loaded_instances.insert(plugin.key.clone(), loaded.clone());
             loaded
@@ -505,7 +505,7 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
         return Ok(());
     }
 
-    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmModuleInstance>> =
+    let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
@@ -544,7 +544,7 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
             existing.clone()
         } else {
             let loaded = runtime
-                .instantiate(plugin.wasm.clone(), WasmLimits::default())
+                .init_component(plugin.wasm.clone(), WasmLimits::default())
                 .await?;
             loaded_instances.insert(plugin.key.clone(), loaded.clone());
             loaded
@@ -610,7 +610,7 @@ fn glob_matches_extension(glob: &str, extension: Option<&str>) -> bool {
 }
 
 async fn call_apply_changes(
-    instance: &dyn crate::WasmModuleInstance,
+    instance: &dyn crate::WasmComponentInstance,
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let mut errors = Vec::new();
@@ -630,7 +630,7 @@ async fn call_apply_changes(
 }
 
 async fn call_detect_changes(
-    instance: &dyn crate::WasmModuleInstance,
+    instance: &dyn crate::WasmComponentInstance,
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
     let mut errors = Vec::new();
@@ -651,7 +651,7 @@ async fn call_detect_changes(
 
 async fn reconstruct_before_file_data_from_state(
     backend: &dyn LixBackend,
-    instance: &dyn crate::WasmModuleInstance,
+    instance: &dyn crate::WasmComponentInstance,
     plugin: &InstalledPlugin,
     file_id: &str,
     version_id: &str,

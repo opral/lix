@@ -5,7 +5,7 @@ mod wasm {
     use lix_engine::{
         boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
         QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue, WasmLimits,
-        WasmModuleInstance, WasmRuntime,
+        WasmComponentInstance, WasmRuntime,
     };
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -52,7 +52,7 @@ export type LixWasmLimits = {
   timeoutMs?: number;
 };
 
-export type LixWasmModuleInstance = {
+export type LixWasmComponentInstance = {
   call(
     exportName: string,
     input: Uint8Array,
@@ -61,10 +61,10 @@ export type LixWasmModuleInstance = {
 };
 
 export type LixWasmRuntime = {
-  instantiate(
+  initComponent(
     bytes: Uint8Array,
     limits?: LixWasmLimits,
-  ): Promise<LixWasmModuleInstance> | LixWasmModuleInstance;
+  ): Promise<LixWasmComponentInstance> | LixWasmComponentInstance;
 };
 "#;
 
@@ -136,67 +136,75 @@ export type LixWasmRuntime = {
         runtime: JsValue,
     }
 
-    struct JsHostWasmModuleInstance {
-        module: JsValue,
+    struct JsHostWasmComponentInstance {
+        component: JsValue,
     }
 
     // WASM is single-threaded by default; this avoids Send/Sync bounds in the engine.
     unsafe impl Send for JsHostWasmRuntime {}
     unsafe impl Sync for JsHostWasmRuntime {}
-    unsafe impl Send for JsHostWasmModuleInstance {}
-    unsafe impl Sync for JsHostWasmModuleInstance {}
+    unsafe impl Send for JsHostWasmComponentInstance {}
+    unsafe impl Sync for JsHostWasmComponentInstance {}
 
     #[async_trait(?Send)]
     impl WasmRuntime for JsHostWasmRuntime {
-        async fn instantiate(
+        async fn init_component(
             &self,
             bytes: Vec<u8>,
             limits: WasmLimits,
-        ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+        ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
             if bytes.is_empty() {
                 return Err(LixError {
                     message: "plugin wasm bytes are empty".to_string(),
                 });
             }
 
-            let instantiate =
-                required_method(&self.runtime, "instantiate", "wasmRuntime.instantiate")?;
+            let init_component =
+                required_method(&self.runtime, "initComponent", "wasmRuntime.initComponent")?;
             let bytes_arg = Uint8Array::new_with_length(bytes.len() as u32);
             bytes_arg.copy_from(&bytes);
             let limits_arg = wasm_limits_to_js(limits)?;
 
-            let result = instantiate
+            let result = init_component
                 .call2(&self.runtime, &bytes_arg.into(), &limits_arg)
                 .map_err(js_to_lix_error)?;
             let resolved = JsBackend::await_if_promise(result).await?;
             if resolved.is_null() || resolved.is_undefined() {
                 return Err(LixError {
-                    message: "wasmRuntime.instantiate returned no module instance".to_string(),
+                    message: "wasmRuntime.initComponent returned no component instance"
+                        .to_string(),
                 });
             }
 
-            Ok(Arc::new(JsHostWasmModuleInstance { module: resolved }))
+            Ok(Arc::new(JsHostWasmComponentInstance {
+                component: resolved,
+            }))
         }
     }
 
     #[async_trait(?Send)]
-    impl WasmModuleInstance for JsHostWasmModuleInstance {
+    impl WasmComponentInstance for JsHostWasmComponentInstance {
         async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
-            let call_method = required_method(&self.module, "call", "wasmModuleInstance.call")?;
+            let call_method =
+                required_method(&self.component, "call", "wasmComponentInstance.call")?;
             let input_arg = Uint8Array::new_with_length(input.len() as u32);
             input_arg.copy_from(input);
             let result = call_method
-                .call2(&self.module, &JsValue::from_str(export), &input_arg.into())
+                .call2(&self.component, &JsValue::from_str(export), &input_arg.into())
                 .map_err(js_to_lix_error)?;
             let resolved = JsBackend::await_if_promise(result).await?;
-            js_bytes_from_value(resolved, "wasmModuleInstance.call result")
+            js_bytes_from_value(resolved, "wasmComponentInstance.call result")
         }
 
         async fn close(&self) -> Result<(), LixError> {
-            let Some(close_method) = JsBackend::get_optional_method(&self.module, "close")? else {
+            let Some(close_method) =
+                JsBackend::get_optional_method(&self.component, "close")?
+            else {
                 return Ok(());
             };
-            let result = close_method.call0(&self.module).map_err(js_to_lix_error)?;
+            let result = close_method
+                .call0(&self.component)
+                .map_err(js_to_lix_error)?;
             let _ = JsBackend::await_if_promise(result).await?;
             Ok(())
         }
