@@ -110,6 +110,10 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
       runQuery("BEGIN", []);
       return createTransaction();
     },
+    async exportSnapshot(): Promise<Uint8Array> {
+      ensureBackendOpen();
+      return db.sqlite3.capi.sqlite3_js_db_export(db, "main");
+    },
     async close(): Promise<void> {
       if (backendClosed) {
         return;

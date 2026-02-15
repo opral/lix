@@ -845,6 +845,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Exports a portable snapshot as SQLite3 file bytes written via chunk stream.
+    pub async fn export_snapshot(
+        &self,
+        writer: &mut dyn crate::SnapshotChunkWriter,
+    ) -> Result<(), LixError> {
+        self.backend.export_snapshot(writer).await
+    }
+
+    pub async fn restore_from_snapshot(
+        &self,
+        reader: &mut dyn crate::SnapshotChunkReader,
+    ) -> Result<(), LixError> {
+        self.backend.restore_from_snapshot(reader).await
+    }
+
     pub async fn materialization_plan(
         &self,
         req: &MaterializationRequest,

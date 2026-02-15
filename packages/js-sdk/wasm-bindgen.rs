@@ -4,8 +4,8 @@ mod wasm {
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
         boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue, WasmLimits,
-        WasmComponentInstance, WasmRuntime,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect,
+        Value as EngineValue, WasmLimits, WasmComponentInstance, WasmRuntime,
     };
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -44,6 +44,8 @@ export type LixBackend = {
     params: LixValueLike[],
   ): Promise<LixQueryResultLike> | LixQueryResultLike;
   beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
+  // Should return a SQLite database file payload.
+  exportSnapshot?: () => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
 };
 
 export type LixWasmLimits = {
@@ -110,6 +112,29 @@ export type LixWasmRuntime = {
                 .install_plugin(&manifest_json, &bytes)
                 .await
                 .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = exportSnapshot)]
+        pub async fn export_snapshot(&self) -> Result<Uint8Array, JsValue> {
+            let mut writer = VecSnapshotWriter::default();
+            self.engine
+                .export_snapshot(&mut writer)
+                .await
+                .map_err(js_error)?;
+            Ok(Uint8Array::from(writer.bytes.as_slice()))
+        }
+    }
+
+    #[derive(Default)]
+    struct VecSnapshotWriter {
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait(?Send)]
+    impl SnapshotChunkWriter for VecSnapshotWriter {
+        async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
+            self.bytes.extend_from_slice(chunk);
+            Ok(())
         }
     }
 
@@ -392,6 +417,25 @@ export type LixWasmRuntime = {
                 kind: JsTransactionKind::Sql,
                 closed: false,
             }))
+        }
+
+        async fn export_snapshot(
+            &self,
+            writer: &mut dyn SnapshotChunkWriter,
+        ) -> Result<(), LixError> {
+            let export_snapshot =
+                Self::get_optional_method(&self.backend, "exportSnapshot")?
+                    .ok_or_else(|| LixError {
+                        message: "backend.exportSnapshot is required for export_snapshot"
+                            .to_string(),
+                    })?;
+            let result = export_snapshot
+                .call0(&self.backend)
+                .map_err(js_to_lix_error)?;
+            let resolved = Self::await_if_promise(result).await?;
+            let bytes = js_bytes_from_value(resolved, "backend.exportSnapshot result")?;
+            writer.write_chunk(&bytes).await?;
+            writer.finish().await
         }
     }
 

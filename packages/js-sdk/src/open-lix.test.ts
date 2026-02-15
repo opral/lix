@@ -50,6 +50,15 @@ test("installPlugin stores plugin metadata", async () => {
   await lix.close();
 });
 
+test("exportSnapshot returns sqlite bytes", async () => {
+  const lix = await openLix();
+  await lix.execute("INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a.txt', x'01')", []);
+  const snapshot = await lix.exportSnapshot();
+  expect(snapshot).toBeInstanceOf(Uint8Array);
+  expect(snapshot.byteLength).toBeGreaterThan(0);
+  await lix.close();
+});
+
 test("close is idempotent and blocks further API calls", async () => {
   const lix = await openLix();
   await lix.close();
