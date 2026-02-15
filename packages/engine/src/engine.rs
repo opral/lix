@@ -23,11 +23,12 @@ use crate::materialization::{
     MaterializationReport, MaterializationRequest, MaterializationScope,
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
-use crate::plugin::types::PluginManifest;
+use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
-    parse_sql_statements, preprocess_sql_with_provider_and_detected_file_domain_changes,
+    expr_references_column_name, parse_sql_statements,
+    preprocess_sql_with_provider_and_detected_file_domain_changes, ColumnReferenceOptions,
     DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState, PostprocessPlan,
     UpdateValidationPlan,
 };
@@ -48,7 +49,7 @@ use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
+    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -111,6 +112,7 @@ pub struct Engine {
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
+    installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -120,6 +122,7 @@ pub struct EngineTransaction<'a> {
     options: ExecuteOptions,
     active_version_id: String,
     active_version_changed: bool,
+    installed_plugins_cache_invalidation_pending: bool,
 }
 
 impl<'a> EngineTransaction<'a> {
@@ -141,6 +144,9 @@ impl<'a> EngineTransaction<'a> {
         if self.active_version_id != previous_active_version_id {
             self.active_version_changed = true;
         }
+        if should_invalidate_installed_plugins_cache_for_sql(sql) {
+            self.installed_plugins_cache_invalidation_pending = true;
+        }
         Ok(result)
     }
 
@@ -152,6 +158,9 @@ impl<'a> EngineTransaction<'a> {
         if self.active_version_changed {
             self.engine
                 .set_active_version_id(std::mem::take(&mut self.active_version_id));
+        }
+        if self.installed_plugins_cache_invalidation_pending {
+            self.engine.invalidate_installed_plugins_cache()?;
         }
         Ok(())
     }
@@ -237,12 +246,49 @@ pub fn boot(args: BootArgs) -> Engine {
         boot_deterministic_settings,
         deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
         active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
+        installed_plugins_cache: RwLock::new(None),
     }
 }
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Option<Arc<dyn WasmRuntime>> {
         self.wasm_runtime.clone()
+    }
+
+    async fn load_installed_plugins_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        allow_cache: bool,
+    ) -> Result<Vec<InstalledPlugin>, LixError> {
+        if allow_cache {
+            let cached = self
+                .installed_plugins_cache
+                .read()
+                .map_err(|_| LixError {
+                    message: "installed plugin cache lock poisoned".to_string(),
+                })?
+                .clone();
+            if let Some(plugins) = cached {
+                return Ok(plugins);
+            }
+        }
+
+        let loaded = crate::plugin::runtime::load_installed_plugins(backend).await?;
+        if allow_cache {
+            let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
+                message: "installed plugin cache lock poisoned".to_string(),
+            })?;
+            *guard = Some(loaded.clone());
+        }
+        Ok(loaded)
+    }
+
+    fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
+        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
+            message: "installed plugin cache lock poisoned".to_string(),
+        })?;
+        *guard = None;
+        Ok(())
     }
 
     pub async fn init(&self) -> Result<(), LixError> {
@@ -291,6 +337,7 @@ impl Engine {
                 params,
                 &active_version_id,
                 writer_key,
+                true,
             )
             .await?;
         let (settings, sequence_start, functions) = self
@@ -425,6 +472,7 @@ impl Engine {
                         transaction.as_mut(),
                         &plan,
                         &result.rows,
+                        &output.params,
                         &detected_file_domain_changes,
                         writer_key,
                         &mut followup_functions,
@@ -492,6 +540,9 @@ impl Engine {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
                 .await?;
         }
+        if should_invalidate_installed_plugins_cache_for_sql(sql) {
+            self.invalidate_installed_plugins_cache()?;
+        }
 
         Ok(result)
     }
@@ -507,6 +558,7 @@ impl Engine {
             options,
             active_version_id: self.active_version_id.read().unwrap().clone(),
             active_version_changed: false,
+            installed_plugins_cache_invalidation_pending: false,
         })
     }
 
@@ -570,6 +622,7 @@ impl Engine {
                     params,
                     active_version_id,
                     writer_key,
+                    false,
                 )
                 .await?;
             let (settings, sequence_start, functions) = self
@@ -706,6 +759,7 @@ impl Engine {
                             transaction,
                             &plan,
                             &result.rows,
+                            &output.params,
                             &detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
@@ -768,7 +822,6 @@ impl Engine {
             &functions,
         )
         .await?;
-
         Ok(result)
     }
 
@@ -787,7 +840,9 @@ impl Engine {
             wasm_bytes,
             &now,
         )
-        .await
+        .await?;
+        self.invalidate_installed_plugins_cache()?;
+        Ok(())
     }
 
     pub async fn materialization_plan(
@@ -868,6 +923,7 @@ impl Engine {
         params: &[Value],
         active_version_id: &str,
         writer_key: Option<&str>,
+        allow_plugin_cache: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes(
@@ -900,6 +956,7 @@ impl Engine {
             .detect_file_changes_for_pending_writes_by_statement_with_backend(
                 backend,
                 &pending_file_writes_by_statement,
+                allow_plugin_cache,
             )
             .await?;
         let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
@@ -1470,10 +1527,17 @@ impl Engine {
         &self,
         backend: &dyn LixBackend,
         writes_by_statement: &[Vec<crate::filesystem::pending_file_writes::PendingFileWrite>],
+        allow_plugin_cache: bool,
     ) -> Result<Vec<Vec<crate::plugin::runtime::DetectedFileChange>>, LixError> {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(vec![Vec::new(); writes_by_statement.len()]);
         };
+        let installed_plugins = self
+            .load_installed_plugins_with_backend(backend, allow_plugin_cache)
+            .await?;
+        if installed_plugins.is_empty() {
+            return Ok(vec![Vec::new(); writes_by_statement.len()]);
+        }
 
         let mut detected_by_statement = Vec::with_capacity(writes_by_statement.len());
         for writes in writes_by_statement {
@@ -1497,6 +1561,7 @@ impl Engine {
                 backend,
                 runtime.as_ref(),
                 &requests,
+                &installed_plugins,
             )
             .await
             .map_err(|error| LixError {
@@ -2140,46 +2205,55 @@ fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
 }
 
 fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
+    statement_targets_table_name(statement, "lix_state")
+        || statement_targets_table_name(statement, "lix_state_by_version")
+}
+
+fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    statements
+        .iter()
+        .any(|statement| statement_targets_table_name(statement, "lix_internal_plugin"))
+}
+
+fn statement_targets_table_name(statement: &Statement, table_name: &str) -> bool {
     match statement {
-        Statement::Insert(insert) => table_object_targets_file_cache_refresh(&insert.table),
-        Statement::Update(update) => table_with_joins_targets_file_cache_refresh(&update.table),
+        Statement::Insert(insert) => table_object_targets_table_name(&insert.table, table_name),
+        Statement::Update(update) => table_with_joins_targets_table_name(&update.table, table_name),
         Statement::Delete(delete) => {
             let tables = match &delete.from {
                 FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
             };
             tables
                 .iter()
-                .any(table_with_joins_targets_file_cache_refresh)
+                .any(|table| table_with_joins_targets_table_name(table, table_name))
         }
         _ => false,
     }
 }
 
-fn table_object_targets_file_cache_refresh(table: &TableObject) -> bool {
+fn table_object_targets_table_name(table: &TableObject, table_name: &str) -> bool {
     let TableObject::TableName(name) = table else {
         return false;
     };
-    object_name_targets_file_cache_refresh(name)
+    object_name_targets_table_name(name, table_name)
 }
 
-fn table_with_joins_targets_file_cache_refresh(table: &TableWithJoins) -> bool {
+fn table_with_joins_targets_table_name(table: &TableWithJoins, table_name: &str) -> bool {
     let TableFactor::Table { name, .. } = &table.relation else {
         return false;
     };
-    object_name_targets_file_cache_refresh(name)
+    object_name_targets_table_name(name, table_name)
 }
 
-fn object_name_targets_file_cache_refresh(name: &ObjectName) -> bool {
+fn object_name_targets_table_name(name: &ObjectName, table_name: &str) -> bool {
     name.0
         .last()
         .and_then(ObjectNamePart::as_ident)
-        .map(|ident| table_name_targets_file_cache_refresh(&ident.value))
+        .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
         .unwrap_or(false)
-}
-
-fn table_name_targets_file_cache_refresh(table_name: &str) -> bool {
-    table_name.eq_ignore_ascii_case("lix_state")
-        || table_name.eq_ignore_ascii_case("lix_state_by_version")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2244,7 +2318,8 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
             .as_deref()
             .is_some_and(|query| query_mentions_table_name(query, table_name)),
         Statement::Update(update) => {
-            table_with_joins_mentions_table_name(&update.table, table_name)
+            let target_matches = table_with_joins_mentions_table_name(&update.table, table_name);
+            (target_matches && update_references_data_column(update))
                 || update.from.as_ref().is_some_and(|from| match from {
                     UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from) => {
                         from.iter()
@@ -2272,6 +2347,27 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn update_references_data_column(update: &Update) -> bool {
+    update
+        .selection
+        .as_ref()
+        .is_some_and(expr_references_data_column)
+        || update
+            .assignments
+            .iter()
+            .any(|assignment| expr_references_data_column(&assignment.value))
+}
+
+fn expr_references_data_column(expr: &Expr) -> bool {
+    expr_references_column_name(
+        expr,
+        "data",
+        ColumnReferenceOptions {
+            include_from_derived_subqueries: true,
+        },
+    )
 }
 
 fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
@@ -2948,21 +3044,76 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         active_version_from_update_validations, active_version_schema_key,
-        advance_placeholder_state_for_statement,
+        advance_placeholder_state_for_statement, boot,
         detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
         file_history_read_materialization_required_for_sql,
-        file_read_materialization_scope_for_sql, should_refresh_file_cache_for_sql,
-        FileReadMaterializationScope,
+        file_read_materialization_scope_for_sql, should_invalidate_installed_plugins_cache_for_sql,
+        should_refresh_file_cache_for_sql, BootArgs, ExecuteOptions, FileReadMaterializationScope,
     };
-    use crate::backend::SqlDialect;
+    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::sql::{
         bind_sql_with_state, parse_sql_statements, MutationOperation, MutationRow, PlaceholderState,
     };
     use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
-    use crate::Value;
+    use crate::{LixError, QueryResult, Value};
+    use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    struct TestBackend {
+        commit_called: Arc<AtomicBool>,
+        rollback_called: Arc<AtomicBool>,
+    }
+
+    struct TestTransaction {
+        commit_called: Arc<AtomicBool>,
+        rollback_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for TestBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(TestTransaction {
+                commit_called: Arc::clone(&self.commit_called),
+                rollback_called: Arc::clone(&self.rollback_called),
+            }))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixTransaction for TestTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            self.commit_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            self.rollback_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[test]
     fn detects_active_version_update_with_single_quoted_schema_key() {
@@ -3023,6 +3174,113 @@ mod tests {
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
+    }
+
+    #[test]
+    fn plugin_cache_invalidation_detects_internal_plugin_mutations_only() {
+        assert!(should_invalidate_installed_plugins_cache_for_sql(
+            "INSERT INTO lix_internal_plugin (key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
+        ));
+        assert!(should_invalidate_installed_plugins_cache_for_sql(
+            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'"
+        ));
+        assert!(should_invalidate_installed_plugins_cache_for_sql(
+            "DELETE FROM lix_internal_plugin WHERE key = 'k'"
+        ));
+        assert!(!should_invalidate_installed_plugins_cache_for_sql(
+            "SELECT * FROM lix_internal_plugin WHERE key = 'k'"
+        ));
+    }
+
+    #[tokio::test]
+    async fn transaction_plugin_cache_invalidation_happens_after_commit() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(Box::new(TestBackend {
+            commit_called: Arc::clone(&commit_called),
+            rollback_called: Arc::clone(&rollback_called),
+        })));
+
+        {
+            let mut cache = engine
+                .installed_plugins_cache
+                .write()
+                .expect("installed plugins cache lock");
+            *cache = Some(Vec::new());
+        }
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin transaction");
+        tx.execute(
+            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'",
+            &[],
+        )
+        .await
+        .expect("transaction execute should succeed");
+
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_some(),
+            "cache should remain populated before commit"
+        );
+
+        tx.commit().await.expect("commit should succeed");
+        assert!(commit_called.load(Ordering::SeqCst));
+        assert!(!rollback_called.load(Ordering::SeqCst));
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_none(),
+            "cache should be invalidated after successful commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_plugin_cache_invalidation_skips_rollback() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(Box::new(TestBackend {
+            commit_called: Arc::clone(&commit_called),
+            rollback_called: Arc::clone(&rollback_called),
+        })));
+
+        {
+            let mut cache = engine
+                .installed_plugins_cache
+                .write()
+                .expect("installed plugins cache lock");
+            *cache = Some(Vec::new());
+        }
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin transaction");
+        tx.execute(
+            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'",
+            &[],
+        )
+        .await
+        .expect("transaction execute should succeed");
+        tx.rollback().await.expect("rollback should succeed");
+
+        assert!(!commit_called.load(Ordering::SeqCst));
+        assert!(rollback_called.load(Ordering::SeqCst));
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_some(),
+            "cache should remain populated after rollback"
+        );
     }
 
     #[test]
@@ -3116,24 +3374,88 @@ mod tests {
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_update_target_lix_file() {
+    fn file_read_materialization_scope_ignores_update_target_lix_file() {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE lix_file \
              SET path = '/renamed.json' \
              WHERE id = 'file-a'",
         );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+        assert_eq!(scope, None);
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_update_target_lix_file_by_version() {
+    fn file_read_materialization_scope_ignores_update_target_lix_file_by_version() {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE lix_file_by_version \
              SET path = '/renamed.json' \
              WHERE id = 'file-a' \
                AND lixcol_version_id = 'version-a'",
         );
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_with_data_predicate_requires_active_materialization_scope()
+    {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE data IS NOT NULL",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_by_version_with_data_predicate_requires_all_versions_scope(
+    ) {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file_by_version \
+             SET path = '/renamed.json' \
+             WHERE data IS NOT NULL \
+               AND lixcol_version_id = 'version-a'",
+        );
         assert_eq!(scope, Some(FileReadMaterializationScope::AllVersions));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_string_literal_data_does_not_trigger_materialization() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE metadata = 'data'",
+        );
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_exists_subquery_data_requires_active_materialization_scope(
+    ) {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE EXISTS (SELECT 1 WHERE data IS NOT NULL)",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_case_data_requires_active_materialization_scope() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE CASE WHEN data IS NULL THEN 0 ELSE 1 END = 1",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+    }
+
+    #[test]
+    fn regression_update_target_lix_file_tuple_data_requires_active_materialization_scope() {
+        let scope = file_read_materialization_scope_for_sql(
+            "UPDATE lix_file \
+             SET path = '/renamed.json' \
+             WHERE (data, id) IN (('x', 'file-a'))",
+        );
+        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
     }
 
     #[test]

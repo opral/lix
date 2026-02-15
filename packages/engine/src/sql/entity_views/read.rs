@@ -1,12 +1,10 @@
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins,
-};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Select, SetExpr, TableFactor};
 
-use crate::sql::escape_sql_string;
+use crate::sql::{
+    default_alias, escape_sql_string, parse_single_query, quote_ident,
+    rewrite_query_with_select_rewriter, rewrite_table_factors_in_select,
+};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_file_id, version_descriptor_schema_key,
@@ -45,46 +43,9 @@ fn rewrite_query_with_resolver(
     query: Query,
     resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
 ) -> Result<Option<Query>, LixError> {
-    let mut changed = false;
-    let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(*query.body, resolver, &mut changed)?);
-
-    if changed {
-        Ok(Some(new_query))
-    } else {
-        Ok(None)
-    }
-}
-
-fn rewrite_set_expr(
-    expr: SetExpr,
-    resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
-    changed: &mut bool,
-) -> Result<SetExpr, LixError> {
-    Ok(match expr {
-        SetExpr::Select(select) => {
-            let mut select = *select;
-            rewrite_select(&mut select, resolver, changed)?;
-            SetExpr::Select(Box::new(select))
-        }
-        SetExpr::Query(query) => {
-            let mut query = *query;
-            query.body = Box::new(rewrite_set_expr(*query.body, resolver, changed)?);
-            SetExpr::Query(Box::new(query))
-        }
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left: Box::new(rewrite_set_expr(*left, resolver, changed)?),
-            right: Box::new(rewrite_set_expr(*right, resolver, changed)?),
-        },
-        other => other,
-    })
+    let mut rewrite_select_with_resolver =
+        |select: &mut Select, changed: &mut bool| rewrite_select(select, resolver, changed);
+    rewrite_query_with_select_rewriter(query, &mut rewrite_select_with_resolver)
 }
 
 fn rewrite_select(
@@ -92,22 +53,10 @@ fn rewrite_select(
     resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
     changed: &mut bool,
 ) -> Result<(), LixError> {
-    for table in &mut select.from {
-        rewrite_table_with_joins(table, resolver, changed)?;
-    }
-    Ok(())
-}
-
-fn rewrite_table_with_joins(
-    table: &mut TableWithJoins,
-    resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    rewrite_table_factor(&mut table.relation, resolver, changed)?;
-    for join in &mut table.joins {
-        rewrite_table_factor(&mut join.relation, resolver, changed)?;
-    }
-    Ok(())
+    let mut rewrite_factor = |relation: &mut TableFactor, changed: &mut bool| {
+        rewrite_table_factor(relation, resolver, changed)
+    };
+    rewrite_table_factors_in_select(select, &mut rewrite_factor, changed)
 }
 
 fn rewrite_table_factor(
@@ -130,17 +79,6 @@ fn rewrite_table_factor(
                 alias: derived_alias,
             };
             *changed = true;
-        }
-        TableFactor::Derived { subquery, .. } => {
-            if let Some(rewritten) = rewrite_query_with_resolver((**subquery).clone(), resolver)? {
-                *subquery = Box::new(rewritten);
-                *changed = true;
-            }
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            rewrite_table_with_joins(table_with_joins, resolver, changed)?;
         }
         _ => {}
     }
@@ -368,37 +306,6 @@ fn lixcol_aliases_for_variant(
             ("depth", "lixcol_depth"),
         ],
     }
-}
-
-fn default_alias(view_name: &str) -> TableAlias {
-    TableAlias {
-        explicit: false,
-        name: Ident::new(view_name),
-        columns: Vec::new(),
-    }
-}
-
-fn parse_single_query(sql: &str) -> Result<Query, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single SELECT statement".to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    match statement {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            message: "expected SELECT statement".to_string(),
-        }),
-    }
-}
-
-fn quote_ident(value: &str) -> String {
-    let escaped = value.replace('"', "\"\"");
-    format!("\"{escaped}\"")
 }
 
 fn collect_table_view_names(query: &Query) -> Vec<String> {

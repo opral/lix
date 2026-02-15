@@ -4,8 +4,8 @@ mod wasm {
     use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
         boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        LoadWasmComponentRequest, QueryResult as EngineQueryResult, SqlDialect, Value as EngineValue,
-        WasmInstance, WasmRuntime,
+        LoadWasmComponentRequest, QueryResult as EngineQueryResult, SqlDialect,
+        Value as EngineValue, WasmInstance, WasmRuntime,
     };
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
@@ -174,8 +174,8 @@ export type LixBackend = {
         async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
             match export {
                 "detect-changes" | "api#detect-changes" => {
-                    let request: RuntimeDetectChangesRequest =
-                        serde_json::from_slice(input).map_err(|error| LixError {
+                    let request: RuntimeDetectChangesRequest = serde_json::from_slice(input)
+                        .map_err(|error| LixError {
                             message: format!(
                                 "plugin-json-v2 detect-changes payload decode failed: {error}"
                             ),
@@ -200,8 +200,8 @@ export type LixBackend = {
                     })
                 }
                 "apply-changes" | "api#apply-changes" => {
-                    let request: RuntimeApplyChangesRequest =
-                        serde_json::from_slice(input).map_err(|error| LixError {
+                    let request: RuntimeApplyChangesRequest = serde_json::from_slice(input)
+                        .map_err(|error| LixError {
                             message: format!(
                                 "plugin-json-v2 apply-changes payload decode failed: {error}"
                             ),
