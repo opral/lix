@@ -5,7 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::{LixError, LoadWasmComponentRequest, WasmInstance, WasmRuntime};
+use lix_engine::{LixError, WasmLimits, WasmModuleInstance, WasmRuntime};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
@@ -77,19 +77,15 @@ impl TestWasmtimeRuntime {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ComponentCacheKey {
-    plugin_key: String,
-    world: String,
     wasm_fingerprint: u64,
     wasm_len: usize,
 }
 
 impl ComponentCacheKey {
-    fn from_request(request: &LoadWasmComponentRequest) -> Self {
+    fn from_bytes(bytes: &[u8]) -> Self {
         Self {
-            plugin_key: request.key.clone(),
-            world: request.world.clone(),
-            wasm_fingerprint: wasm_fingerprint(&request.bytes),
-            wasm_len: request.bytes.len(),
+            wasm_fingerprint: wasm_fingerprint(bytes),
+            wasm_len: bytes.len(),
         }
     }
 }
@@ -118,11 +114,12 @@ impl WasiView for WasiState {
 
 #[async_trait(?Send)]
 impl WasmRuntime for TestWasmtimeRuntime {
-    async fn load_component(
+    async fn instantiate(
         &self,
-        request: LoadWasmComponentRequest,
-    ) -> Result<Arc<dyn WasmInstance>, LixError> {
-        let cache_key = ComponentCacheKey::from_request(&request);
+        bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+        let cache_key = ComponentCacheKey::from_bytes(&bytes);
 
         if let Some(component) = self
             .component_cache
@@ -137,14 +134,12 @@ impl WasmRuntime for TestWasmtimeRuntime {
             }));
         }
 
-        let compiled = Arc::new(
-            Component::new(&self.engine, &request.bytes).map_err(|error| LixError {
-                message: format!(
-                    "Failed to compile wasm component for plugin '{}': {error}",
-                    request.key
-                ),
-            })?,
-        );
+        let compiled =
+            Arc::new(
+                Component::new(&self.engine, &bytes).map_err(|error| LixError {
+                    message: format!("Failed to compile wasm component: {error}"),
+                })?,
+            );
 
         let component = {
             let mut cache = self
@@ -165,7 +160,7 @@ impl WasmRuntime for TestWasmtimeRuntime {
 }
 
 #[async_trait(?Send)]
-impl WasmInstance for TestWasmtimeInstance {
+impl WasmModuleInstance for TestWasmtimeInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         let mut store = Store::new(
             &self.engine,

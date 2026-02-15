@@ -6,5 +6,8 @@ export type {
   LixSqlDialect,
   LixTransaction,
   LixValueLike,
+  LixWasmLimits,
+  LixWasmModuleInstance,
+  LixWasmRuntime,
 } from "./types.js";
 export { QueryResult, Value } from "./engine-wasm/index.js";
