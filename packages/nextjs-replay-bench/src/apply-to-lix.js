@@ -211,10 +211,36 @@ function stableFileId(path) {
 
 function toLixPath(path) {
   const normalized = String(path).replace(/\\/g, "/");
-  if (normalized.startsWith("/")) {
-    return normalized;
+  const withoutLeadingSlash = normalized.startsWith("/")
+    ? normalized.slice(1)
+    : normalized;
+  const encoded = withoutLeadingSlash
+    .split("/")
+    .map((segment) => encodePathSegment(segment))
+    .join("/");
+  return `/${encoded}`;
+}
+
+function encodePathSegment(segment) {
+  const bytes = new TextEncoder().encode(segment);
+  let encoded = "";
+  for (const byte of bytes) {
+    const isAlphaNum =
+      (byte >= 0x30 && byte <= 0x39) ||
+      (byte >= 0x41 && byte <= 0x5a) ||
+      (byte >= 0x61 && byte <= 0x7a);
+    const isSafe =
+      byte === 0x2e || // .
+      byte === 0x5f || // _
+      byte === 0x7e || // ~
+      byte === 0x2d; // -
+    if (isAlphaNum || isSafe) {
+      encoded += String.fromCharCode(byte);
+    } else {
+      encoded += `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
   }
-  return `/${normalized}`;
+  return encoded;
 }
 
 function chunkArray(values, size) {
