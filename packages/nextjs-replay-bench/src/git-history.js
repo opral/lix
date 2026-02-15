@@ -50,17 +50,18 @@ export async function listLinearCommits(repoPath, { ref = "HEAD", maxCount, firs
   if (firstParent) {
     args.push("--first-parent");
   }
-  if (maxCount && maxCount > 0) {
-    args.push(`--max-count=${maxCount}`);
-  }
   args.push(ref);
 
   const stdout = await runGit(repoPath, args);
-  return stdout
+  const commits = stdout
     .toString("utf8")
     .split("\n")
     .map((entry) => entry.trim())
     .filter(Boolean);
+  if (maxCount && maxCount > 0) {
+    return commits.slice(0, maxCount);
+  }
+  return commits;
 }
 
 export async function readCommitPatchSet(repoPath, commitSha) {

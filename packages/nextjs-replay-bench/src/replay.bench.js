@@ -33,6 +33,8 @@ const CONFIG = {
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
   showProgress: parseEnvBool("BENCH_REPLAY_PROGRESS", true),
   installTextLinesPlugin: parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", true),
+  exportSnapshot: parseEnvBool("BENCH_REPLAY_EXPORT_SNAPSHOT", false),
+  exportSnapshotPath: process.env.BENCH_REPLAY_SNAPSHOT_PATH ?? "",
   maxInsertRows: parseEnvInt("BENCH_REPLAY_MAX_INSERT_ROWS", 200),
   maxInsertSqlChars: parseEnvInt("BENCH_REPLAY_MAX_INSERT_SQL_CHARS", 1_500_000),
 };
@@ -160,6 +162,7 @@ async function main() {
 
     const replayMs = performance.now() - replayStarted;
     const storage = await collectStorageCounters(lix);
+    const snapshotArtifact = await maybeWriteSnapshotArtifact(lix);
 
     const report = {
       generatedAt: new Date().toISOString(),
@@ -196,6 +199,7 @@ async function main() {
         blobMegabytesPerSecond: totalBlobBytes / 1024 / 1024 / Math.max(replayMs / 1000, 0.001),
       },
       storage,
+      snapshotArtifact,
       slowestCommits: slowCommits,
     };
 
@@ -256,6 +260,21 @@ async function executeStatements(lix, statements) {
 
 function statementChars(statements) {
   return statements.reduce((total, sql) => total + sql.length, 0);
+}
+
+async function maybeWriteSnapshotArtifact(lix) {
+  if (!CONFIG.exportSnapshot && !CONFIG.exportSnapshotPath) {
+    return null;
+  }
+
+  const outputPath = CONFIG.exportSnapshotPath || join(OUTPUT_DIR, "nextjs-replay.snapshot.lix");
+  const snapshotBytes = await lix.exportSnapshot();
+  await mkdir(dirname(outputPath), { recursive: true });
+  await writeFile(outputPath, snapshotBytes);
+  return {
+    path: outputPath,
+    bytes: snapshotBytes.byteLength,
+  };
 }
 
 async function loadTextLinesPluginWasmBytes(showProgress) {

@@ -7,7 +7,8 @@
   "scripts": {
     "bench": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm run bench:run",
     "bench:run": "node ./src/replay.bench.js",
-    "bench:quick": "BENCH_REPLAY_COMMITS=100 pnpm run bench",
+    "bench:25": "BENCH_REPLAY_COMMITS=25 pnpm run bench",
+    "bench:100": "BENCH_REPLAY_COMMITS=100 pnpm run bench",
     "bench:1000": "BENCH_REPLAY_COMMITS=1000 pnpm run bench"
   },
   "dependencies": {
