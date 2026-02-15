@@ -1,8 +1,5 @@
 import type {
   LixBackend as WasmLixBackend,
-  LixWasmLimits,
-  LixWasmComponentInstance,
-  LixWasmRuntime,
   LixQueryResultLike,
   LixSqlDialect,
   LixTransaction,
@@ -18,7 +15,4 @@ export type {
   LixSqlDialect,
   LixTransaction,
   LixValueLike,
-  LixWasmLimits,
-  LixWasmComponentInstance,
-  LixWasmRuntime,
 };

@@ -5,7 +5,8 @@ import init, {
   resolveEngineWasmModuleOrPath,
 } from "./engine-wasm/index.js";
 import { createWasmSqliteBackend } from "./backend/wasm-sqlite.js";
-import type { LixBackend, LixWasmRuntime } from "./types.js";
+import type { LixWasmRuntime } from "./engine-wasm/index.js";
+import type { LixBackend } from "./types.js";
 
 export type {
   LixBackend,
@@ -13,9 +14,6 @@ export type {
   LixSqlDialect,
   LixTransaction,
   LixValueLike,
-  LixWasmLimits,
-  LixWasmComponentInstance,
-  LixWasmRuntime,
 } from "./types.js";
 export { QueryResult, Value } from "./engine-wasm/index.js";
 
@@ -46,6 +44,7 @@ export type Lix = {
 };
 
 let wasmReady: Promise<void> | null = null;
+let defaultWasmRuntime: Promise<LixWasmRuntime | undefined> | null = null;
 
 async function ensureWasmReady(): Promise<void> {
   if (!wasmReady) {
@@ -59,12 +58,11 @@ async function ensureWasmReady(): Promise<void> {
 export async function openLix(
   args: {
     backend?: LixBackend;
-    wasmRuntime?: LixWasmRuntime;
   } = {},
 ): Promise<Lix> {
   await ensureWasmReady();
   const backend = args.backend ?? (await createWasmSqliteBackend());
-  const wasmLix = await openLixWasm(backend, args.wasmRuntime);
+  const wasmLix = await openLixWasm(backend, await getDefaultWasmRuntime());
   let closed = false;
 
   const ensureOpen = (methodName: string): void => {
@@ -186,6 +184,36 @@ export async function openLix(
     installPlugin,
     close,
   };
+}
+
+async function getDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+  if (!defaultWasmRuntime) {
+    defaultWasmRuntime = loadDefaultWasmRuntime();
+  }
+  return await defaultWasmRuntime;
+}
+
+async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+  if (!isNodeRuntime()) {
+    return undefined;
+  }
+
+  const module = await import("./wasm-runtime/node.js");
+  if (typeof module.createNodeWasmRuntime !== "function") {
+    throw new Error("js-sdk node runtime module is missing createNodeWasmRuntime()");
+  }
+  return module.createNodeWasmRuntime();
+}
+
+function isNodeRuntime(): boolean {
+  const globalProcess = (globalThis as {
+    process?: { versions?: { node?: string } };
+  }).process;
+  return (
+    typeof globalProcess === "object" &&
+    typeof globalProcess.versions === "object" &&
+    typeof globalProcess.versions?.node === "string"
+  );
 }
 
 function firstRow(result: QueryResult, context: string): unknown[] {

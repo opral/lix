@@ -194,7 +194,7 @@ function createModuleInstance(componentApi) {
   };
 }
 
-export function createBenchWasmRuntime() {
+export function createNodeWasmRuntime() {
   return {
     async initComponent(bytes) {
       const wasmBytes = toUint8Array(bytes);

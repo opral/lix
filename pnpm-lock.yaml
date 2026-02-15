@@ -151,16 +151,15 @@ importers:
       js-sdk:
         specifier: workspace:*
         version: link:../js-sdk
-    devDependencies:
+
+  packages/js-sdk:
+    dependencies:
       '@bytecodealliance/jco':
         specifier: ^1.17.0
         version: 1.17.0
       '@bytecodealliance/preview2-shim':
         specifier: ^0.17.8
         version: 0.17.8
-
-  packages/js-sdk:
-    dependencies:
       '@sqlite.org/sqlite-wasm':
         specifier: ^3.50.4-build1
         version: 3.50.4-build1
@@ -171,6 +170,12 @@ importers:
       vitest:
         specifier: ^4.0.18
         version: 4.0.18(@opentelemetry/api@1.9.0)(@types/node@24.10.2)(happy-dom@18.0.1)(jiti@2.6.1)(jsdom@27.3.0(postcss@8.5.6))(lightningcss@1.30.2)(msw@2.10.2(@types/node@24.10.2)(typescript@5.9.3))(sass-embedded@1.89.2)(terser@5.36.0)(tsx@4.20.5)(yaml@2.8.1)
+
+  packages/nextjs-replay-bench:
+    dependencies:
+      js-sdk:
+        specifier: workspace:*
+        version: link:../js-sdk
 
   packages/plugin-csv:
     dependencies:

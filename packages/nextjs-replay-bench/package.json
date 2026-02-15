@@ -1,0 +1,16 @@
+{
+  "name": "nextjs-replay-bench",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Replay benchmark for linear git history into js-sdk/engine",
+  "scripts": {
+    "bench": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm run bench:run",
+    "bench:run": "node ./src/replay.bench.js",
+    "bench:quick": "BENCH_REPLAY_COMMITS=100 pnpm run bench",
+    "bench:1000": "BENCH_REPLAY_COMMITS=1000 pnpm run bench"
+  },
+  "dependencies": {
+    "js-sdk": "workspace:*"
+  }
+}
