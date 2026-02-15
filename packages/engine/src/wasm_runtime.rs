@@ -23,15 +23,15 @@ impl Default for WasmLimits {
 
 #[async_trait(?Send)]
 pub trait WasmRuntime: Send + Sync {
-    async fn instantiate(
+    async fn init_component(
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmModuleInstance>, LixError>;
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError>;
 }
 
 #[async_trait(?Send)]
-pub trait WasmModuleInstance: Send + Sync {
+pub trait WasmComponentInstance: Send + Sync {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError>;
 
     async fn close(&self) -> Result<(), LixError> {

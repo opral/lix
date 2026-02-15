@@ -48,4 +48,4 @@ pub use materialization::{
     VersionPointerDebugRow,
 };
 pub use types::{QueryResult, Value};
-pub use wasm_runtime::{WasmLimits, WasmModuleInstance, WasmRuntime};
+pub use wasm_runtime::{WasmLimits, WasmComponentInstance, WasmRuntime};

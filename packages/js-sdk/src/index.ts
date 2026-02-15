@@ -7,7 +7,7 @@ export type {
   LixTransaction,
   LixValueLike,
   LixWasmLimits,
-  LixWasmModuleInstance,
+  LixWasmComponentInstance,
   LixWasmRuntime,
 } from "./types.js";
 export { QueryResult, Value } from "./engine-wasm/index.js";

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lix_engine::{LixError, WasmLimits, WasmModuleInstance, WasmRuntime};
+use lix_engine::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
@@ -51,11 +51,11 @@ struct WirePluginEntityChange {
 
 #[async_trait(?Send)]
 impl WasmRuntime for BenchJsonPluginRuntime {
-    async fn instantiate(
+    async fn init_component(
         &self,
         bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         if bytes.is_empty() {
             return Err(LixError {
                 message: "benchmark runtime received empty wasm bytes".to_string(),
@@ -66,7 +66,7 @@ impl WasmRuntime for BenchJsonPluginRuntime {
 }
 
 #[async_trait(?Send)]
-impl WasmModuleInstance for BenchJsonPluginInstance {
+impl WasmComponentInstance for BenchJsonPluginInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         match export {
             "detect-changes" | "api#detect-changes" => detect_changes(input),
