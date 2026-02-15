@@ -21,9 +21,5 @@
     "@lix-js/plugin-json": "workspace:*",
     "@lix-js/sdk": "workspace:*",
     "js-sdk": "workspace:*"
-  },
-  "devDependencies": {
-    "@bytecodealliance/jco": "^1.17.0",
-    "@bytecodealliance/preview2-shim": "^0.17.8"
   }
 }

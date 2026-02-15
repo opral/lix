@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
 import { openLix as openNewLix } from "js-sdk";
-import { createBenchWasmRuntime } from "./wasm-runtime-node.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, "..", "results");
@@ -84,7 +83,7 @@ async function main() {
 }
 
 async function runScenario(scenario, wasmBytes) {
-  const lix = await openNewLix({ wasmRuntime: createBenchWasmRuntime() });
+  const lix = await openNewLix();
   try {
     if (scenario.installPlugin) {
       await lix.installPlugin({ manifestJson: MANIFEST, wasmBytes });
