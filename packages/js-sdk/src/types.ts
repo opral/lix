@@ -1,5 +1,8 @@
 import type {
   LixBackend as WasmLixBackend,
+  LixWasmLimits,
+  LixWasmModuleInstance,
+  LixWasmRuntime,
   LixQueryResultLike,
   LixSqlDialect,
   LixTransaction,
@@ -10,4 +13,12 @@ export type LixBackend = WasmLixBackend & {
   close?: () => Promise<void> | void;
 };
 
-export type { LixQueryResultLike, LixSqlDialect, LixTransaction, LixValueLike };
+export type {
+  LixQueryResultLike,
+  LixSqlDialect,
+  LixTransaction,
+  LixValueLike,
+  LixWasmLimits,
+  LixWasmModuleInstance,
+  LixWasmRuntime,
+};

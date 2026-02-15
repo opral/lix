@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use lix_engine::{LixError, LoadWasmComponentRequest, WasmInstance, WasmRuntime};
+use lix_engine::{LixError, WasmLimits, WasmModuleInstance, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
@@ -51,13 +51,14 @@ struct WirePluginEntityChange {
 
 #[async_trait(?Send)]
 impl WasmRuntime for BenchJsonPluginRuntime {
-    async fn load_component(
+    async fn instantiate(
         &self,
-        request: LoadWasmComponentRequest,
-    ) -> Result<Arc<dyn WasmInstance>, LixError> {
-        if request.key != "test_json_plugin" {
+        bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmModuleInstance>, LixError> {
+        if bytes.is_empty() {
             return Err(LixError {
-                message: format!("unsupported benchmark plugin key '{}'", request.key),
+                message: "benchmark runtime received empty wasm bytes".to_string(),
             });
         }
         Ok(Arc::new(BenchJsonPluginInstance))
@@ -65,7 +66,7 @@ impl WasmRuntime for BenchJsonPluginRuntime {
 }
 
 #[async_trait(?Send)]
-impl WasmInstance for BenchJsonPluginInstance {
+impl WasmModuleInstance for BenchJsonPluginInstance {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
         match export {
             "detect-changes" | "api#detect-changes" => detect_changes(input),

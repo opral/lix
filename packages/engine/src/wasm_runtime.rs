@@ -4,14 +4,6 @@ use async_trait::async_trait;
 
 use crate::LixError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadWasmComponentRequest {
-    pub key: String,
-    pub bytes: Vec<u8>,
-    pub world: String,
-    pub limits: WasmLimits,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmLimits {
     pub max_memory_bytes: u64,
@@ -31,13 +23,18 @@ impl Default for WasmLimits {
 
 #[async_trait(?Send)]
 pub trait WasmRuntime: Send + Sync {
-    async fn load_component(
+    async fn instantiate(
         &self,
-        request: LoadWasmComponentRequest,
-    ) -> Result<Arc<dyn WasmInstance>, LixError>;
+        bytes: Vec<u8>,
+        limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmModuleInstance>, LixError>;
 }
 
 #[async_trait(?Send)]
-pub trait WasmInstance: Send + Sync {
+pub trait WasmModuleInstance: Send + Sync {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError>;
+
+    async fn close(&self) -> Result<(), LixError> {
+        Ok(())
+    }
 }

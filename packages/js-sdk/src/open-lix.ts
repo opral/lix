@@ -5,7 +5,7 @@ import init, {
   resolveEngineWasmModuleOrPath,
 } from "./engine-wasm/index.js";
 import { createWasmSqliteBackend } from "./backend/wasm-sqlite.js";
-import type { LixBackend } from "./types.js";
+import type { LixBackend, LixWasmRuntime } from "./types.js";
 
 export type {
   LixBackend,
@@ -13,6 +13,9 @@ export type {
   LixSqlDialect,
   LixTransaction,
   LixValueLike,
+  LixWasmLimits,
+  LixWasmModuleInstance,
+  LixWasmRuntime,
 } from "./types.js";
 export { QueryResult, Value } from "./engine-wasm/index.js";
 
@@ -56,11 +59,12 @@ async function ensureWasmReady(): Promise<void> {
 export async function openLix(
   args: {
     backend?: LixBackend;
+    wasmRuntime?: LixWasmRuntime;
   } = {},
 ): Promise<Lix> {
   await ensureWasmReady();
   const backend = args.backend ?? (await createWasmSqliteBackend());
-  const wasmLix = await openLixWasm(backend);
+  const wasmLix = await openLixWasm(backend, args.wasmRuntime);
   let closed = false;
 
   const ensureOpen = (methodName: string): void => {
