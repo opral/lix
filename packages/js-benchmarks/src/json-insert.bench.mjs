@@ -132,7 +132,15 @@ async function setupOldAdapter() {
 }
 
 async function setupNewAdapter() {
-  const lix = await openNewLix();
+  const lix = await openNewLix({
+    keyValues: [
+      {
+        key: "lix_deterministic_mode",
+        value: { enabled: true },
+        lixcol_version_id: "global",
+      },
+    ],
+  });
   const wasmBytes = await loadPluginJsonV2WasmBytes();
 
   await lix.installPlugin({

@@ -28,6 +28,7 @@ const CONFIG = {
   repoRef: process.env.BENCH_REPLAY_REF ?? "HEAD",
   cacheDir: process.env.BENCH_REPLAY_CACHE_DIR ?? DEFAULT_CACHE_DIR,
   commitLimit: parseEnvInt("BENCH_REPLAY_COMMITS", 1000),
+  warmupCommitCount: parseEnvNonNegativeInt("BENCH_REPLAY_WARMUP_COMMITS", 0),
   firstParent: parseEnvBool("BENCH_REPLAY_FIRST_PARENT", true),
   syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
@@ -64,9 +65,10 @@ async function main() {
   const repoSetupMs = performance.now() - repoSetupStarted;
 
   const commitDiscoveryStarted = performance.now();
+  const totalRequestedCommits = CONFIG.commitLimit + CONFIG.warmupCommitCount;
   const commits = await listLinearCommits(repo.repoPath, {
     ref: CONFIG.repoRef,
-    maxCount: CONFIG.commitLimit,
+    maxCount: totalRequestedCommits,
     firstParent: CONFIG.firstParent,
   });
   const commitDiscoveryMs = performance.now() - commitDiscoveryStarted;
@@ -75,9 +77,17 @@ async function main() {
     throw new Error(`no commits found at ${repo.repoPath} (${CONFIG.repoRef})`);
   }
 
+  const warmupCommitCount = Math.min(CONFIG.warmupCommitCount, commits.length);
+  const measuredCommits = commits.slice(warmupCommitCount);
+  if (measuredCommits.length === 0) {
+    throw new Error(
+      `warmup consumed all discovered commits (warmup=${warmupCommitCount}, discovered=${commits.length})`,
+    );
+  }
+
   if (CONFIG.showProgress) {
     console.log(
-      `[progress] replaying ${commits.length} commits from ${repo.repoPath} (${repo.source})`,
+      `[progress] replaying ${commits.length} commits (warmup=${warmupCommitCount}, measured=${measuredCommits.length}) from ${repo.repoPath} (${repo.source})`,
     );
   }
 
@@ -132,28 +142,44 @@ async function main() {
     let totalUpdates = 0;
     let totalDeletes = 0;
 
-    const commitLoopStarted = performance.now();
+    let warmupCommitsApplied = 0;
+    let warmupCommitsNoop = 0;
+    let warmupChangedPaths = 0;
+
+    const allCommitLoopStarted = performance.now();
+    let measuredReplayStarted = warmupCommitCount === 0 ? allCommitLoopStarted : null;
+    let warmupMs = 0;
     for (let index = 0; index < commits.length; index++) {
+      if (index === warmupCommitCount && measuredReplayStarted === null) {
+        warmupMs = performance.now() - allCommitLoopStarted;
+        measuredReplayStarted = performance.now();
+      }
+      const isWarmup = index < warmupCommitCount;
       const commitSha = commits[index];
       const commitStarted = performance.now();
 
       const patchSetStarted = performance.now();
       const patchSet = await readCommitPatchSet(repo.repoPath, commitSha);
       const readPatchSetMs = performance.now() - patchSetStarted;
-      phaseDurations.readPatchSetMs.push(readPatchSetMs);
-      phaseTotalsMs.readPatchSetMs += readPatchSetMs;
+      if (!isWarmup) {
+        phaseDurations.readPatchSetMs.push(readPatchSetMs);
+        phaseTotalsMs.readPatchSetMs += readPatchSetMs;
+      }
 
       const prepareStarted = performance.now();
       const prepared = prepareCommitChanges(state, patchSet.changes, patchSet.blobByOid);
       const prepareMs = performance.now() - prepareStarted;
-      phaseDurations.prepareMs.push(prepareMs);
-      phaseTotalsMs.prepareMs += prepareMs;
-
-      totalChangedPaths += patchSet.changes.length;
-      totalBlobBytes += prepared.blobBytes;
-      totalInserts += prepared.inserts.length;
-      totalUpdates += prepared.updates.length;
-      totalDeletes += prepared.deletes.length;
+      if (!isWarmup) {
+        phaseDurations.prepareMs.push(prepareMs);
+        phaseTotalsMs.prepareMs += prepareMs;
+        totalChangedPaths += patchSet.changes.length;
+        totalBlobBytes += prepared.blobBytes;
+        totalInserts += prepared.inserts.length;
+        totalUpdates += prepared.updates.length;
+        totalDeletes += prepared.deletes.length;
+      } else {
+        warmupChangedPaths += patchSet.changes.length;
+      }
 
       const buildStatementsStarted = performance.now();
       const statements = buildReplayCommitStatements(prepared, {
@@ -161,11 +187,17 @@ async function main() {
         maxInsertSqlChars: CONFIG.maxInsertSqlChars,
       });
       const buildStatementsMs = performance.now() - buildStatementsStarted;
-      phaseDurations.buildStatementsMs.push(buildStatementsMs);
-      phaseTotalsMs.buildStatementsMs += buildStatementsMs;
+      if (!isWarmup) {
+        phaseDurations.buildStatementsMs.push(buildStatementsMs);
+        phaseTotalsMs.buildStatementsMs += buildStatementsMs;
+      }
 
       if (statements.length === 0) {
-        commitsNoop += 1;
+        if (isWarmup) {
+          warmupCommitsNoop += 1;
+        } else {
+          commitsNoop += 1;
+        }
       } else {
         let executeResult;
         try {
@@ -180,50 +212,69 @@ async function main() {
         }
         const commitMs = executeResult.totalMs;
 
-        commitsApplied += 1;
-        commitDurations.push(commitMs);
-        phaseDurations.executeStatementsMs.push(commitMs);
-        phaseTotalsMs.executeStatementsMs += commitMs;
-        totalSqlChars += statementChars(statements);
-        totalEngineStatements += statements.length;
-        for (const statement of executeResult.slowestStatements) {
-          pushSlowStatement(slowStatements, {
+        if (isWarmup) {
+          warmupCommitsApplied += 1;
+        } else {
+          commitsApplied += 1;
+          commitDurations.push(commitMs);
+          phaseDurations.executeStatementsMs.push(commitMs);
+          phaseTotalsMs.executeStatementsMs += commitMs;
+          totalSqlChars += statementChars(statements);
+          totalEngineStatements += statements.length;
+          for (const statement of executeResult.slowestStatements) {
+            pushSlowStatement(slowStatements, {
+              commitSha,
+              ...statement,
+            });
+          }
+          pushSlowCommit(slowCommits, {
             commitSha,
-            ...statement,
+            durationMs: commitMs,
+            changedPaths: patchSet.changes.length,
+            inserts: prepared.inserts.length,
+            updates: prepared.updates.length,
+            deletes: prepared.deletes.length,
           });
         }
-        pushSlowCommit(slowCommits, {
-          commitSha,
-          durationMs: commitMs,
-          changedPaths: patchSet.changes.length,
-          inserts: prepared.inserts.length,
-          updates: prepared.updates.length,
-          deletes: prepared.deletes.length,
-        });
       }
 
       const commitTotalMs = performance.now() - commitStarted;
-      phaseDurations.commitTotalMs.push(commitTotalMs);
-      phaseTotalsMs.commitTotalMs += commitTotalMs;
+      if (!isWarmup) {
+        phaseDurations.commitTotalMs.push(commitTotalMs);
+        phaseTotalsMs.commitTotalMs += commitTotalMs;
+      }
 
+      const phaseIndex = isWarmup ? index + 1 : index - warmupCommitCount + 1;
+      const phaseTotal = isWarmup ? warmupCommitCount : measuredCommits.length;
       if (
         CONFIG.showProgress &&
-        (index === 0 || (index + 1) % CONFIG.progressEvery === 0 || index + 1 === commits.length)
+        phaseTotal > 0 &&
+        (phaseIndex === 1 || phaseIndex % CONFIG.progressEvery === 0 || phaseIndex === phaseTotal)
       ) {
         printProgress({
-          index: index + 1,
-          total: commits.length,
+          label: isWarmup ? "warmup" : "measure",
+          index: phaseIndex,
+          total: phaseTotal,
           commitSha,
           elapsedMs: performance.now() - replayStarted,
-          changedPaths: totalChangedPaths,
-          commitsApplied,
-          commitsNoop,
+          changedPaths: isWarmup ? warmupChangedPaths : totalChangedPaths,
+          commitsApplied: isWarmup ? warmupCommitsApplied : commitsApplied,
+          commitsNoop: isWarmup ? warmupCommitsNoop : commitsNoop,
         });
       }
     }
-    const commitLoopMs = performance.now() - commitLoopStarted;
+    if (measuredReplayStarted === null) {
+      throw new Error("internal error: measured replay did not start");
+    }
+    const commitLoopMs = performance.now() - measuredReplayStarted;
+    if (warmupCommitCount === 0) {
+      warmupMs = 0;
+    } else if (warmupMs === 0) {
+      warmupMs = performance.now() - allCommitLoopStarted - commitLoopMs;
+    }
 
-    const replayMs = performance.now() - replayStarted;
+    const replayMs = commitLoopMs;
+    const overallReplayMs = performance.now() - replayStarted;
     const storageQueryStarted = performance.now();
     const storage = await collectStorageCounters(lix);
     const storageQueryMs = performance.now() - storageQueryStarted;
@@ -243,7 +294,13 @@ async function main() {
         ref: CONFIG.repoRef,
       },
       commitTotals: {
+        requested: totalRequestedCommits,
         discovered: commits.length,
+        measuredDiscovered: measuredCommits.length,
+        warmupRequested: CONFIG.warmupCommitCount,
+        warmupUsed: warmupCommitCount,
+        warmupApplied: warmupCommitsApplied,
+        warmupNoop: warmupCommitsNoop,
         applied: commitsApplied,
         noop: commitsNoop,
       },
@@ -258,7 +315,9 @@ async function main() {
       },
       timings: {
         replayMs,
+        overallReplayMs,
         commitLoopMs,
+        warmupMs,
         setup: {
           repoSetupMs,
           commitDiscoveryMs,
@@ -603,6 +662,18 @@ function parseEnvInt(name, fallback) {
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`${name} must be a positive integer, got '${raw}'`);
+  }
+  return parsed;
+}
+
+function parseEnvNonNegativeInt(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer, got '${raw}'`);
   }
   return parsed;
 }
