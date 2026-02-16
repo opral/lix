@@ -1,7 +1,8 @@
 use serde_json::json;
 use sqlparser::ast::{
-    Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan, Values,
+    Assignment, Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan,
+    Values,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -481,6 +482,7 @@ pub async fn rewrite_update_with_backend(
     reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
+        let original_assignments = update.assignments.clone();
         update.assignments.retain(|assignment| {
             assignment_target_name(assignment)
                 .map(|name| !name.eq_ignore_ascii_case("data"))
@@ -489,7 +491,14 @@ pub async fn rewrite_update_with_backend(
         if update.assignments.is_empty() {
             return Ok(Some(noop_statement()?));
         }
-        rewrite_file_update_assignments_with_backend(backend, &mut update, params, target).await?;
+        rewrite_file_update_assignments_with_backend(
+            backend,
+            &mut update,
+            &original_assignments,
+            params,
+            target,
+        )
+        .await?;
     } else {
         rewrite_directory_update_assignments_with_backend(backend, &mut update, params, target)
             .await?;
@@ -990,12 +999,13 @@ async fn rewrite_directory_insert_columns_with_backend(
 async fn rewrite_file_update_assignments_with_backend(
     backend: &dyn LixBackend,
     update: &mut Update,
+    original_assignments: &[Assignment],
     params: &[EngineValue],
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
     let mut placeholder_state = PlaceholderState::new();
     let mut next_path: Option<String> = None;
-    for assignment in &update.assignments {
+    for assignment in original_assignments {
         let Some(column) = assignment_target_name(assignment) else {
             continue;
         };
@@ -2125,9 +2135,7 @@ fn expr_string_literal_or_placeholder(
         EngineValue::Integer(value) => Ok(Some(value.to_string())),
         EngineValue::Real(value) => Ok(Some(value.to_string())),
         EngineValue::Null => Ok(None),
-        EngineValue::Blob(_) => Err(LixError {
-            message: "version_id predicate expects text-compatible value".to_string(),
-        }),
+        EngineValue::Blob(_) => Ok(None),
     }
 }
 
