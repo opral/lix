@@ -7,11 +7,15 @@
   "scripts": {
     "bench": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm run bench:run",
     "bench:run": "node ./src/replay.bench.js",
+    "bench:git-files": "node ./src/git-files.bench.js",
     "bench:profile-slowest": "node ./src/profile-slowest-commit.js",
     "bench:25:cold": "BENCH_REPLAY_COMMITS=25 BENCH_REPLAY_WARMUP_COMMITS=0 pnpm run bench",
     "bench:25": "BENCH_REPLAY_COMMITS=25 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
     "bench:100": "BENCH_REPLAY_COMMITS=100 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
-    "bench:1000": "BENCH_REPLAY_COMMITS=1000 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench"
+    "bench:1000": "BENCH_REPLAY_COMMITS=1000 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
+    "bench:git-files:25": "BENCH_REPLAY_COMMITS=25 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench:git-files",
+    "bench:git-files:100": "BENCH_REPLAY_COMMITS=100 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench:git-files",
+    "bench:git-files:1000": "BENCH_REPLAY_COMMITS=1000 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench:git-files"
   },
   "dependencies": {
     "js-sdk": "workspace:*"
