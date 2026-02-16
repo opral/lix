@@ -52,11 +52,24 @@ export function printSummary(report) {
   console.log(color(`Commits applied: ${report.commitTotals.applied}`, "dim"));
   console.log(color(`Commits skipped (no file changes): ${report.commitTotals.noop}`, "dim"));
   console.log(color(`Replay duration: ${formatMs(report.timings.replayMs)}`, "dim"));
+  if (typeof report.timings.commitLoopMs === "number") {
+    console.log(color(`Commit loop duration: ${formatMs(report.timings.commitLoopMs)}`, "dim"));
+  }
 
   console.log("");
   console.log(`Commit throughput: ${report.throughput.commitsPerSecond.toFixed(2)} commits/s`);
+  if (typeof report.throughput.commitsPerSecondCommitLoop === "number") {
+    console.log(
+      `Commit throughput (apply loop only): ${report.throughput.commitsPerSecondCommitLoop.toFixed(2)} commits/s`,
+    );
+  }
   console.log(`Changed paths/sec: ${report.throughput.changedPathsPerSecond.toFixed(2)}`);
   console.log(`Blob ingest MB/s: ${report.throughput.blobMegabytesPerSecond.toFixed(2)}`);
+  if (typeof report.throughput.executeStatementsPerSecond === "number") {
+    console.log(
+      `SQL statements/sec (engine): ${report.throughput.executeStatementsPerSecond.toFixed(2)}`,
+    );
+  }
 
   console.log("");
   console.log("Commit execution latency");
@@ -64,6 +77,38 @@ export function printSummary(report) {
   console.log(`  p50:  ${formatMs(report.timings.commit.p50Ms)}`);
   console.log(`  p95:  ${formatMs(report.timings.commit.p95Ms)}`);
   console.log(`  max:  ${formatMs(report.timings.commit.maxMs)}`);
+
+  if (Array.isArray(report.timings.phaseBreakdown) && report.timings.phaseBreakdown.length > 0) {
+    console.log("");
+    console.log("Replay phase breakdown");
+    for (const phase of report.timings.phaseBreakdown) {
+      const label = String(phase.phase).padEnd(21, " ");
+      const sharePct = Number(phase.sharePct ?? 0).toFixed(1);
+      console.log(`  ${label} ${formatMs(Number(phase.totalMs ?? 0))} (${sharePct}%)`);
+    }
+  }
+
+  if (report.timings.setup) {
+    console.log("");
+    console.log("Setup timing");
+    console.log(`  repo setup: ${formatMs(Number(report.timings.setup.repoSetupMs ?? 0))}`);
+    console.log(
+      `  commit discovery: ${formatMs(Number(report.timings.setup.commitDiscoveryMs ?? 0))}`,
+    );
+    console.log(`  openLix: ${formatMs(Number(report.timings.setup.lixOpenMs ?? 0))}`);
+    console.log(`  plugin install: ${formatMs(Number(report.timings.setup.pluginInstallMs ?? 0))}`);
+  }
+
+  if (report.timings.postReplay) {
+    console.log("");
+    console.log("Post-replay timing");
+    console.log(
+      `  storage counters: ${formatMs(Number(report.timings.postReplay.storageQueryMs ?? 0))}`,
+    );
+    console.log(
+      `  snapshot export: ${formatMs(Number(report.timings.postReplay.snapshotExportMs ?? 0))}`,
+    );
+  }
 
   console.log("");
   console.log("Storage counters");
@@ -76,6 +121,19 @@ export function printSummary(report) {
     console.log("Top schema change counts");
     for (const row of report.storage.topSchemaCounts) {
       console.log(`  ${String(row.schemaKey).padEnd(28, " ")} ${row.rowCount}`);
+    }
+  }
+
+  if (Array.isArray(report.slowestStatements) && report.slowestStatements.length > 0) {
+    console.log("");
+    console.log("Slowest SQL statements");
+    for (const row of report.slowestStatements.slice(0, 5)) {
+      const commit = String(row.commitSha ?? "").slice(0, 12);
+      const statementIndex = Number(row.statementIndex ?? -1);
+      const sqlChars = Number(row.sqlChars ?? 0);
+      console.log(
+        `  ${formatMs(Number(row.durationMs ?? 0))} commit=${commit} stmt=${statementIndex} chars=${sqlChars}`,
+      );
     }
   }
 }
