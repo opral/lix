@@ -2562,6 +2562,12 @@ async fn try_file_ids_matching_update_fast(
         return Ok(None);
     };
 
+    if let Some(rows) =
+        try_exact_file_descriptor_lookup_current_version(backend, &version_id, &file_id).await?
+    {
+        return Ok(Some(rows));
+    }
+
     let sql = "SELECT entity_id, untracked, \
                     'mutation.file_ids_matching_update.fast_id' AS __lix_trace \
              FROM lix_state_by_version \
@@ -2603,6 +2609,76 @@ async fn try_file_ids_matching_update_fast(
             untracked,
         });
     }
+    Ok(Some(out))
+}
+
+async fn try_exact_file_descriptor_lookup_current_version(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    file_id: &str,
+) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
+    let sql = "SELECT entity_id, untracked, \
+                    'mutation.file_ids_matching_update.fast_id.direct' AS __lix_trace \
+             FROM (\
+                 SELECT entity_id, 1 AS untracked, 0 AS source_priority \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND version_id = $1 \
+                   AND entity_id = $2 \
+                   AND snapshot_content IS NOT NULL \
+                 UNION ALL \
+                 SELECT entity_id, 0 AS untracked, 1 AS source_priority \
+                 FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND version_id = $1 \
+                   AND entity_id = $2 \
+                   AND is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL\
+             ) AS exact_rows \
+             ORDER BY source_priority \
+             LIMIT 1";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(file_id.to_string()),
+            ],
+        )
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update exact current-version prefetch failed for '{}': {}",
+                rewritten_sql, error.message
+            ),
+        })?;
+
+    if result.rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out = Vec::<ScopedFileUpdateRow>::with_capacity(result.rows.len());
+    for row in result.rows {
+        let Some(id_value) = row.first() else {
+            continue;
+        };
+        let EngineValue::Text(id) = id_value else {
+            return Err(LixError {
+                message: format!("file update id lookup expected text, got {id_value:?}"),
+            });
+        };
+        let untracked = row
+            .get(1)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        out.push(ScopedFileUpdateRow {
+            id: id.clone(),
+            untracked,
+        });
+    }
+
     Ok(Some(out))
 }
 

@@ -44,3 +44,35 @@ If we resolve exact `(file_id, version_id)` targets from the SQL predicate itsel
 - `cargo test -p lix_engine pending_file_writes`
 - `cargo test -p lix_engine --test commit`
 
+## Optimize 2: exact current-version lookup for update rewrite prefetch
+
+**Hypothesis**  
+`mutation.file_ids_matching_update.fast_id` still queried `lix_state_by_version` for exact `(version_id, file_id)` update predicates, paying unnecessary planner/view expansion cost per update.
+
+**Implementation**  
+- Added a direct exact lookup path in `mutation_rewrite`:
+  - first checks `lix_internal_state_untracked` for `(schema_key='lix_file_descriptor', version_id, entity_id)`
+  - then checks `lix_internal_state_materialized_v1_lix_file_descriptor` for the same key (non-tombstone)
+- Falls back to the previous `lix_state_by_version` fast-id query only when exact current-version lookup misses.
+- Keeps rewrite semantics intact for inherited/version-chain cases via fallback.
+
+**Result**
+
+| Metric | Before | After | Delta |
+| --- | --- | --- | --- |
+| Replay duration (measured) | `19,784.81ms` | `14,191.52ms` | `-28.3%` |
+| Commit throughput | `23.71 commits/s` | `33.05 commits/s` | `+39.4%` |
+| Execute phase | `12,586.99ms` | `7,074.07ms` | `-43.8%` |
+| Max statement latency | `59.73ms` | `52.72ms` | `-11.7%` |
+
+**Validation**
+- `cargo test -p lix_engine mutation_rewrite`
+- `cargo test -p lix_engine --test commit`
+
+## Current frontier
+
+- After optimize 2, replay is split roughly 50/50:
+  - `executeStatementsMs`: `7,074.07ms` (49.8%)
+  - `readPatchSetMs`: `7,073.03ms` (49.8%)
+- Slowest SQL statements are now ~`50ms` large write payloads, with previous multi-second outliers eliminated.
+- Profiling indicates no remaining single engine rewrite hotspot large enough to plausibly yield another >10% overall reduction without changing higher-level replay strategy (for example batching mode or git patch-read pipeline changes).
