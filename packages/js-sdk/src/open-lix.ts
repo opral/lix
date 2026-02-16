@@ -35,6 +35,14 @@ export type InstallPluginOptions = {
   wasmBytes: Uint8Array | ArrayBuffer;
 };
 
+export type OpenLixKeyValue = {
+  key: string;
+  value: unknown;
+  versionId?: string;
+  version_id?: string;
+  lixcol_version_id?: string;
+};
+
 export type Lix = {
   execute(sql: string, params?: ReadonlyArray<unknown>): Promise<QueryResult>;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
@@ -60,11 +68,16 @@ async function ensureWasmReady(): Promise<void> {
 export async function openLix(
   args: {
     backend?: LixBackend;
+    keyValues?: ReadonlyArray<OpenLixKeyValue>;
   } = {},
 ): Promise<Lix> {
   await ensureWasmReady();
   const backend = args.backend ?? (await createWasmSqliteBackend());
-  const wasmLix = await openLixWasm(backend, await getDefaultWasmRuntime());
+  const wasmLix = await openLixWasm(
+    backend,
+    await getDefaultWasmRuntime(),
+    args.keyValues ? [...args.keyValues] : undefined,
+  );
   let closed = false;
 
   const ensureOpen = (methodName: string): void => {

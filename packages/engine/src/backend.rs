@@ -20,10 +20,7 @@ pub trait LixBackend: Send + Sync {
     ///
     /// Implementations should write a valid SQLite3 database image (for example `.lix`)
     /// to `writer` in one or more chunks.
-    async fn export_snapshot(
-        &self,
-        _writer: &mut dyn SnapshotChunkWriter,
-    ) -> Result<(), LixError> {
+    async fn export_snapshot(&self, _writer: &mut dyn SnapshotChunkWriter) -> Result<(), LixError> {
         Err(LixError {
             message: "export_snapshot is not supported by this backend".to_string(),
         })

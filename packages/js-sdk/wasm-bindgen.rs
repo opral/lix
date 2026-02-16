@@ -3,9 +3,9 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect,
-        Value as EngineValue, WasmLimits, WasmComponentInstance, WasmRuntime,
+        boot, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError, LixTransaction,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
+        WasmComponentInstance, WasmLimits, WasmRuntime,
     };
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
@@ -67,6 +67,14 @@ export type LixWasmRuntime = {
     bytes: Uint8Array,
     limits?: LixWasmLimits,
   ): Promise<LixWasmComponentInstance> | LixWasmComponentInstance;
+};
+
+export type LixBootKeyValue = {
+  key: string;
+  value: unknown;
+  versionId?: string;
+  version_id?: string;
+  lixcol_version_id?: string;
 };
 "#;
 
@@ -142,6 +150,7 @@ export type LixWasmRuntime = {
     pub async fn open_lix(
         backend: JsLixBackend,
         wasm_runtime: Option<JsLixWasmRuntime>,
+        boot_key_values: Option<JsValue>,
     ) -> Result<Lix, JsValue> {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
@@ -152,9 +161,93 @@ export type LixWasmRuntime = {
                 runtime: runtime.into(),
             }) as Arc<dyn WasmRuntime>
         });
+        if let Some(raw_key_values) = boot_key_values {
+            boot_args.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
+        }
         let engine = boot(boot_args);
         engine.init().await.map_err(js_error)?;
         Ok(Lix { engine })
+    }
+
+    fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
+        if input.is_null() || input.is_undefined() {
+            return Ok(Vec::new());
+        }
+        if !Array::is_array(&input) {
+            return Err(LixError {
+                message: "openLix keyValues must be an array".to_string(),
+            });
+        }
+
+        let values = Array::from(&input);
+        let mut parsed = Vec::with_capacity(values.length() as usize);
+        for entry in values.iter() {
+            if !entry.is_object() {
+                return Err(LixError {
+                    message: "openLix keyValues entries must be objects".to_string(),
+                });
+            }
+
+            let key = read_required_string_property(&entry, "key", "openLix keyValues entry")?;
+            let value = Reflect::get(&entry, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+            let value = js_to_json_value(value, &format!("openLix keyValues[{key}].value"))?;
+
+            let version_id = read_optional_string_property(&entry, "versionId")?
+                .or(read_optional_string_property(&entry, "version_id")?)
+                .or(read_optional_string_property(&entry, "lixcol_version_id")?);
+
+            parsed.push(BootKeyValue {
+                key,
+                value,
+                version_id,
+            });
+        }
+
+        Ok(parsed)
+    }
+
+    fn read_required_string_property(
+        object: &JsValue,
+        key: &str,
+        context: &str,
+    ) -> Result<String, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        let text = value.as_string().unwrap_or_default();
+        if text.is_empty() {
+            return Err(LixError {
+                message: format!("{context}.{key} must be a non-empty string"),
+            });
+        }
+        Ok(text)
+    }
+
+    fn read_optional_string_property(object: &JsValue, key: &str) -> Result<Option<String>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        let text = value.as_string().ok_or_else(|| LixError {
+            message: format!("openLix keyValues entry '{key}' must be a string"),
+        })?;
+        if text.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text))
+    }
+
+    fn js_to_json_value(value: JsValue, context: &str) -> Result<serde_json::Value, LixError> {
+        if value.is_undefined() {
+            return Ok(serde_json::Value::Null);
+        }
+        let stringified = js_sys::JSON::stringify(&value).map_err(js_to_lix_error)?;
+        let Some(json_text) = stringified.as_string() else {
+            return Err(LixError {
+                message: format!("{context} must be JSON-serializable"),
+            });
+        };
+        serde_json::from_str(&json_text).map_err(|error| LixError {
+            message: format!("{context} invalid JSON value: {error}"),
+        })
     }
 
     struct JsHostWasmRuntime {
@@ -703,7 +796,7 @@ export type LixWasmRuntime = {
 mod wasm {
     pub struct Lix;
 
-    pub fn open_lix(_: (), _: Option<()>) -> Result<Lix, String> {
+    pub fn open_lix(_: (), _: Option<()>, _: Option<()>) -> Result<Lix, String> {
         Err("engine-wasm is only available for wasm32 targets".to_string())
     }
 }

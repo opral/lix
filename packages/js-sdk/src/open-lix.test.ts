@@ -59,6 +59,29 @@ test("exportSnapshot returns sqlite bytes", async () => {
   await lix.close();
 });
 
+test("openLix seeds keyValues at startup", async () => {
+  const lix = await openLix({
+    keyValues: [
+      {
+        key: "lix_deterministic_mode",
+        value: { enabled: true },
+        lixcol_version_id: "global",
+      },
+    ],
+  });
+  const result = await lix.execute(
+    "SELECT value FROM lix_key_value \
+     WHERE key = 'lix_deterministic_mode' LIMIT 1",
+    [],
+  );
+  expect(result.rows.length).toBe(1);
+  expect(result.rows[0][0]).toEqual({
+    kind: "Text",
+    value: JSON.stringify({ enabled: true }),
+  });
+  await lix.close();
+});
+
 test("close is idempotent and blocks further API calls", async () => {
   const lix = await openLix();
   await lix.close();

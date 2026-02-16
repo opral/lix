@@ -50,4 +50,4 @@ pub use materialization::{
 };
 pub use snapshot::{SnapshotChunkReader, SnapshotChunkWriter};
 pub use types::{QueryResult, Value};
-pub use wasm_runtime::{WasmLimits, WasmComponentInstance, WasmRuntime};
+pub use wasm_runtime::{WasmComponentInstance, WasmLimits, WasmRuntime};
