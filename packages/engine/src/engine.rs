@@ -27,7 +27,7 @@ use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
-    expr_references_column_name, parse_sql_statements,
+    expr_references_column_name, parse_sql_statements, preprocess_sql,
     preprocess_sql_with_provider_and_detected_file_domain_changes, ColumnReferenceOptions,
     DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState, PostprocessPlan,
     UpdateValidationPlan,
@@ -44,12 +44,12 @@ use crate::version::{
     version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
 };
 use crate::WasmRuntime;
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
+    AssignmentTarget, BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select,
+    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -139,6 +139,8 @@ impl<'a> EngineTransaction<'a> {
                 params,
                 &self.options,
                 &mut self.active_version_id,
+                None,
+                false,
             )
             .await?;
         if self.active_version_id != previous_active_version_id {
@@ -193,6 +195,15 @@ struct CollectedExecutionSideEffects {
     detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
     detected_file_domain_changes: Vec<DetectedFileDomainChange>,
     untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
+}
+
+#[derive(Default)]
+struct DeferredTransactionSideEffects {
+    pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
+    pending_file_delete_targets: BTreeSet<(String, String)>,
+    detected_file_domain_changes: Vec<DetectedFileDomainChange>,
+    untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
+    file_cache_invalidation_targets: BTreeSet<(String, String)>,
 }
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
@@ -319,6 +330,12 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
+        if let Some(statements) = extract_explicit_transaction_script(sql, params)? {
+            return self
+                .execute_transaction_script_with_options(statements, options)
+                .await;
+        }
+
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
         self.maybe_materialize_reads_with_backend(self.backend.as_ref(), sql, &active_version_id)
@@ -337,6 +354,7 @@ impl Engine {
                 params,
                 &active_version_id,
                 writer_key,
+                true,
                 true,
             )
             .await?;
@@ -534,7 +552,11 @@ impl Engine {
         }
         self.persist_pending_file_data_updates(&pending_file_writes)
             .await?;
+        self.persist_pending_file_path_updates(&pending_file_writes)
+            .await?;
         self.invalidate_file_data_cache_entries(&file_cache_invalidation_targets)
+            .await?;
+        self.invalidate_file_path_cache_entries(&file_cache_invalidation_targets)
             .await?;
         if self.wasm_runtime.is_some() {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
@@ -545,6 +567,128 @@ impl Engine {
         }
 
         Ok(result)
+    }
+
+    async fn execute_transaction_script_with_options(
+        &self,
+        statements: Vec<Statement>,
+        options: ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
+        let mut transaction = self.backend.begin_transaction().await?;
+        let mut last_result = QueryResult { rows: Vec::new() };
+        let mut active_version_id = self.active_version_id.read().unwrap().clone();
+        let mut active_version_changed = false;
+        let mut installed_plugins_cache_invalidation_pending = false;
+        let coalesced_statements =
+            coalesce_lix_file_transaction_statements(&statements, Some(transaction.dialect()));
+        let can_defer_side_effects = self.wasm_runtime.is_none() && coalesced_statements.is_some();
+        let mut deferred_side_effects = if can_defer_side_effects {
+            let original_sql = statements
+                .iter()
+                .map(Statement::to_string)
+                .collect::<Vec<_>>()
+                .join(";\n");
+            let CollectedExecutionSideEffects {
+                pending_file_writes,
+                pending_file_delete_targets,
+                detected_file_domain_changes: filesystem_tracked_domain_changes,
+                untracked_filesystem_update_domain_changes,
+                ..
+            } = {
+                let backend = TransactionBackendAdapter::new(transaction.as_mut());
+                self.collect_execution_side_effects_with_backend(
+                    &backend,
+                    &original_sql,
+                    &[],
+                    &active_version_id,
+                    options.writer_key.as_deref(),
+                    false,
+                    false,
+                )
+                .await?
+            };
+            Some(DeferredTransactionSideEffects {
+                pending_file_writes,
+                pending_file_delete_targets: pending_file_delete_targets.clone(),
+                detected_file_domain_changes: filesystem_tracked_domain_changes,
+                untracked_filesystem_update_domain_changes,
+                file_cache_invalidation_targets: pending_file_delete_targets,
+            })
+        } else {
+            None
+        };
+        let sql_statements = statements
+            .into_iter()
+            .map(|statement| statement.to_string())
+            .collect::<Vec<_>>();
+        let skip_statement_side_effect_collection = deferred_side_effects.is_some();
+
+        for sql in sql_statements {
+            let previous_active_version_id = active_version_id.clone();
+            let result = if skip_statement_side_effect_collection {
+                self.execute_with_options_in_transaction(
+                    transaction.as_mut(),
+                    &sql,
+                    &[],
+                    &options,
+                    &mut active_version_id,
+                    deferred_side_effects.as_mut(),
+                    true,
+                )
+                .await
+            } else {
+                self.execute_with_options_in_transaction(
+                    transaction.as_mut(),
+                    &sql,
+                    &[],
+                    &options,
+                    &mut active_version_id,
+                    None,
+                    false,
+                )
+                .await
+            };
+
+            match result {
+                Ok(query_result) => {
+                    last_result = query_result;
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            }
+
+            if active_version_id != previous_active_version_id {
+                active_version_changed = true;
+            }
+            if should_invalidate_installed_plugins_cache_for_sql(&sql) {
+                installed_plugins_cache_invalidation_pending = true;
+            }
+        }
+
+        if let Some(side_effects) = deferred_side_effects.as_mut() {
+            if let Err(error) = self
+                .flush_deferred_transaction_side_effects_in_transaction(
+                    transaction.as_mut(),
+                    side_effects,
+                    options.writer_key.as_deref(),
+                )
+                .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+
+        transaction.commit().await?;
+        if active_version_changed {
+            self.set_active_version_id(active_version_id);
+        }
+        if installed_plugins_cache_invalidation_pending {
+            self.invalidate_installed_plugins_cache()?;
+        }
+        Ok(last_result)
     }
 
     async fn begin_transaction_with_options(
@@ -593,8 +737,11 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
         active_version_id: &mut String,
+        deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
+        skip_side_effect_collection: bool,
     ) -> Result<QueryResult, LixError> {
         let writer_key = options.writer_key.as_deref();
+        let defer_side_effects = deferred_side_effects.is_some();
         let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
         let (
             pending_file_writes,
@@ -615,16 +762,26 @@ impl Engine {
                 detected_file_domain_changes_by_statement,
                 detected_file_domain_changes,
                 untracked_filesystem_update_domain_changes,
-            } = self
-                .collect_execution_side_effects_with_backend(
+            } = if skip_side_effect_collection {
+                CollectedExecutionSideEffects {
+                    pending_file_writes: Vec::new(),
+                    pending_file_delete_targets: BTreeSet::new(),
+                    detected_file_domain_changes_by_statement: vec![Vec::new(); 1],
+                    detected_file_domain_changes: Vec::new(),
+                    untracked_filesystem_update_domain_changes: Vec::new(),
+                }
+            } else {
+                self.collect_execution_side_effects_with_backend(
                     &backend,
                     sql,
                     params,
                     active_version_id,
                     writer_key,
                     false,
+                    !defer_side_effects,
                 )
-                .await?;
+                .await?
+            };
             let (settings, sequence_start, functions) = self
                 .prepare_runtime_functions_with_backend(&backend)
                 .await?;
@@ -794,27 +951,55 @@ impl Engine {
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
 
-        if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
-            self.persist_detected_file_domain_changes_in_transaction(
+        if let Some(deferred) = deferred_side_effects {
+            deferred.pending_file_writes.extend(pending_file_writes);
+            deferred
+                .file_cache_invalidation_targets
+                .extend(file_cache_invalidation_targets.iter().cloned());
+            if !plugin_changes_committed {
+                deferred
+                    .detected_file_domain_changes
+                    .extend(detected_file_domain_changes);
+            }
+            deferred
+                .untracked_filesystem_update_domain_changes
+                .extend(untracked_filesystem_update_domain_changes);
+        } else {
+            if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
+                self.persist_detected_file_domain_changes_in_transaction(
+                    transaction,
+                    &detected_file_domain_changes,
+                )
+                .await?;
+            }
+            if !untracked_filesystem_update_domain_changes.is_empty() {
+                self.persist_untracked_file_domain_changes_in_transaction(
+                    transaction,
+                    &untracked_filesystem_update_domain_changes,
+                )
+                .await?;
+            }
+            self.persist_pending_file_data_updates_in_transaction(
                 transaction,
-                &detected_file_domain_changes,
+                &pending_file_writes,
+            )
+            .await?;
+            self.persist_pending_file_path_updates_in_transaction(
+                transaction,
+                &pending_file_writes,
+            )
+            .await?;
+            self.invalidate_file_data_cache_entries_in_transaction(
+                transaction,
+                &file_cache_invalidation_targets,
+            )
+            .await?;
+            self.invalidate_file_path_cache_entries_in_transaction(
+                transaction,
+                &file_cache_invalidation_targets,
             )
             .await?;
         }
-        if !untracked_filesystem_update_domain_changes.is_empty() {
-            self.persist_untracked_file_domain_changes_in_transaction(
-                transaction,
-                &untracked_filesystem_update_domain_changes,
-            )
-            .await?;
-        }
-        self.persist_pending_file_data_updates_in_transaction(transaction, &pending_file_writes)
-            .await?;
-        self.invalidate_file_data_cache_entries_in_transaction(
-            transaction,
-            &file_cache_invalidation_targets,
-        )
-        .await?;
         self.persist_runtime_sequence_with_backend(
             &TransactionBackendAdapter::new(transaction),
             settings,
@@ -939,6 +1124,7 @@ impl Engine {
         active_version_id: &str,
         writer_key: Option<&str>,
         allow_plugin_cache: bool,
+        detect_plugin_file_changes: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes(
@@ -967,13 +1153,16 @@ impl Engine {
                 message: format!("pending file delete collection failed: {}", error.message),
             })?;
 
-        let detected_file_changes_by_statement = self
-            .detect_file_changes_for_pending_writes_by_statement_with_backend(
+        let detected_file_changes_by_statement = if detect_plugin_file_changes {
+            self.detect_file_changes_for_pending_writes_by_statement_with_backend(
                 backend,
                 &pending_file_writes_by_statement,
                 allow_plugin_cache,
             )
-            .await?;
+            .await?
+        } else {
+            vec![Vec::new(); pending_file_writes_by_statement.len()]
+        };
         let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
             .into_iter()
             .map(|changes| {
@@ -1027,6 +1216,83 @@ impl Engine {
             detected_file_domain_changes,
             untracked_filesystem_update_domain_changes,
         })
+    }
+
+    async fn flush_deferred_transaction_side_effects_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        side_effects: &mut DeferredTransactionSideEffects,
+        writer_key: Option<&str>,
+    ) -> Result<(), LixError> {
+        let collapsed_writes =
+            collapse_pending_file_writes_for_transaction(&side_effects.pending_file_writes);
+        side_effects.pending_file_writes = collapsed_writes;
+
+        let mut detected_file_domain_changes =
+            std::mem::take(&mut side_effects.detected_file_domain_changes);
+        if !side_effects.pending_file_writes.is_empty() {
+            let detected_by_statement = {
+                let backend = TransactionBackendAdapter::new(transaction);
+                self.detect_file_changes_for_pending_writes_by_statement_with_backend(
+                    &backend,
+                    &[side_effects.pending_file_writes.clone()],
+                    false,
+                )
+                .await?
+            };
+            if let Some(detected) = detected_by_statement.into_iter().next() {
+                detected_file_domain_changes.extend(
+                    detected_file_domain_changes_from_detected_file_changes(&detected, writer_key),
+                );
+            }
+        }
+        detected_file_domain_changes =
+            dedupe_detected_file_domain_changes(&detected_file_domain_changes);
+        let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
+            &std::mem::take(&mut side_effects.untracked_filesystem_update_domain_changes),
+        );
+        side_effects
+            .file_cache_invalidation_targets
+            .extend(std::mem::take(
+                &mut side_effects.pending_file_delete_targets,
+            ));
+
+        if !detected_file_domain_changes.is_empty() {
+            self.persist_detected_file_domain_changes_in_transaction(
+                transaction,
+                &detected_file_domain_changes,
+            )
+            .await?;
+        }
+        if !untracked_filesystem_update_domain_changes.is_empty() {
+            self.persist_untracked_file_domain_changes_in_transaction(
+                transaction,
+                &untracked_filesystem_update_domain_changes,
+            )
+            .await?;
+        }
+        self.persist_pending_file_data_updates_in_transaction(
+            transaction,
+            &side_effects.pending_file_writes,
+        )
+        .await?;
+        self.persist_pending_file_path_updates_in_transaction(
+            transaction,
+            &side_effects.pending_file_writes,
+        )
+        .await?;
+        self.invalidate_file_data_cache_entries_in_transaction(
+            transaction,
+            &side_effects.file_cache_invalidation_targets,
+        )
+        .await?;
+        self.invalidate_file_path_cache_entries_in_transaction(
+            transaction,
+            &side_effects.file_cache_invalidation_targets,
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn prepare_runtime_functions_with_backend(
@@ -1744,7 +2010,9 @@ impl Engine {
              ) VALUES {}",
             rows.join(", ")
         );
-        transaction.execute(&sql, &params).await?;
+        let backend = TransactionBackendAdapter::new(transaction);
+        let output = preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?;
+        backend.execute(&output.sql, &output.params).await?;
 
         Ok(())
     }
@@ -1811,6 +2079,87 @@ impl Engine {
                 .await?;
         }
 
+        Ok(())
+    }
+
+    async fn persist_pending_file_path_updates(
+        &self,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    ) -> Result<(), LixError> {
+        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for (index, write) in writes.iter().enumerate() {
+            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+        }
+
+        for index in latest_by_key.into_values() {
+            let write = &writes[index];
+            let Some((name, extension)) = file_name_and_extension_from_path(&write.path) else {
+                continue;
+            };
+            self.backend
+                .execute(
+                    "INSERT INTO lix_internal_file_path_cache \
+                     (file_id, version_id, directory_id, name, extension, path) \
+                     VALUES ($1, $2, NULL, $3, $4, $5) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     directory_id = EXCLUDED.directory_id, \
+                     name = EXCLUDED.name, \
+                     extension = EXCLUDED.extension, \
+                     path = EXCLUDED.path",
+                    &[
+                        Value::Text(write.file_id.clone()),
+                        Value::Text(write.version_id.clone()),
+                        Value::Text(name),
+                        match extension {
+                            Some(value) => Value::Text(value),
+                            None => Value::Null,
+                        },
+                        Value::Text(write.path.clone()),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_pending_file_path_updates_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    ) -> Result<(), LixError> {
+        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for (index, write) in writes.iter().enumerate() {
+            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+        }
+
+        for index in latest_by_key.into_values() {
+            let write = &writes[index];
+            let Some((name, extension)) = file_name_and_extension_from_path(&write.path) else {
+                continue;
+            };
+            transaction
+                .execute(
+                    "INSERT INTO lix_internal_file_path_cache \
+                     (file_id, version_id, directory_id, name, extension, path) \
+                     VALUES ($1, $2, NULL, $3, $4, $5) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     directory_id = EXCLUDED.directory_id, \
+                     name = EXCLUDED.name, \
+                     extension = EXCLUDED.extension, \
+                     path = EXCLUDED.path",
+                    &[
+                        Value::Text(write.file_id.clone()),
+                        Value::Text(write.version_id.clone()),
+                        Value::Text(name),
+                        match extension {
+                            Some(value) => Value::Text(value),
+                            None => Value::Null,
+                        },
+                        Value::Text(write.path.clone()),
+                    ],
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -1891,6 +2240,83 @@ impl Engine {
         Ok(())
     }
 
+    async fn invalidate_file_path_cache_entries(
+        &self,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        const PAIRS_PER_CHUNK: usize = 200;
+        let keys = targets.iter().cloned().collect::<Vec<_>>();
+
+        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            let mut predicates = Vec::with_capacity(chunk.len());
+            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
+                let file_param = index * 2 + 1;
+                let version_param = file_param + 1;
+                predicates.push(format!(
+                    "(file_id = ${file_param} AND version_id = ${version_param})"
+                ));
+                params.push(Value::Text(file_id.clone()));
+                params.push(Value::Text(version_id.clone()));
+            }
+
+            self.backend
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_path_cache \
+                         WHERE {}",
+                        predicates.join(" OR ")
+                    ),
+                    &params,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_file_path_cache_entries_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        const PAIRS_PER_CHUNK: usize = 200;
+        let keys = targets.iter().cloned().collect::<Vec<_>>();
+
+        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
+            let mut params = Vec::with_capacity(chunk.len() * 2);
+            let mut predicates = Vec::with_capacity(chunk.len());
+            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
+                let file_param = index * 2 + 1;
+                let version_param = file_param + 1;
+                predicates.push(format!(
+                    "(file_id = ${file_param} AND version_id = ${version_param})"
+                ));
+                params.push(Value::Text(file_id.clone()));
+                params.push(Value::Text(version_id.clone()));
+            }
+
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_path_cache \
+                         WHERE {}",
+                        predicates.join(" OR ")
+                    ),
+                    &params,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn refresh_file_data_for_versions(
         &self,
         targets: BTreeSet<(String, String)>,
@@ -1952,6 +2378,8 @@ impl Engine {
                 params,
                 options,
                 active_version_id,
+                None,
+                false,
             ))
             .await?;
         }
@@ -1983,6 +2411,401 @@ fn should_sequentialize_postprocess_multi_statement(
                 | Statement::Rollback { .. }
         )
     })
+}
+
+fn file_name_and_extension_from_path(path: &str) -> Option<(String, Option<String>)> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let file_name = trimmed.rsplit('/').next()?;
+    if file_name.is_empty() {
+        return None;
+    }
+    let last_dot = file_name.rfind('.');
+    let (name, extension) = match last_dot {
+        Some(index) if index > 0 => {
+            let name = file_name[..index].to_string();
+            let extension = file_name[index + 1..].to_string();
+            let extension = if extension.is_empty() {
+                None
+            } else {
+                Some(extension)
+            };
+            (name, extension)
+        }
+        _ => (file_name.to_string(), None),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, extension))
+}
+
+fn extract_explicit_transaction_script(
+    sql: &str,
+    params: &[Value],
+) -> Result<Option<Vec<Statement>>, LixError> {
+    if !params.is_empty() {
+        return Ok(None);
+    }
+
+    let statements = parse_sql_statements(sql)?;
+    if statements.len() < 2 {
+        return Ok(None);
+    }
+
+    let first_is_begin = matches!(statements.first(), Some(Statement::StartTransaction { .. }));
+    let last_is_commit = matches!(statements.last(), Some(Statement::Commit { .. }));
+    if !first_is_begin || !last_is_commit {
+        return Ok(None);
+    }
+
+    let middle = &statements[1..statements.len() - 1];
+    if middle.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+        )
+    }) {
+        return Err(LixError {
+            message:
+                "nested transaction statements are not supported inside BEGIN ... COMMIT scripts"
+                    .to_string(),
+        });
+    }
+
+    Ok(Some(middle.to_vec()))
+}
+
+#[derive(Debug, Clone)]
+struct LixFileWriteRow {
+    id: String,
+    path_sql: String,
+    data_sql: String,
+}
+
+fn coalesce_lix_file_transaction_statements(
+    statements: &[Statement],
+    dialect: Option<SqlDialect>,
+) -> Option<Vec<String>> {
+    if statements.is_empty() {
+        return Some(Vec::new());
+    }
+    if !matches!(dialect, Some(SqlDialect::Sqlite)) {
+        return None;
+    }
+
+    let mut delete_ids = Vec::new();
+    let mut insert_rows = Vec::new();
+    let mut update_rows = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    let mut saw_update = false;
+
+    for statement in statements {
+        if let Some(ids) = parse_lix_file_delete_ids(statement) {
+            if saw_update {
+                return None;
+            }
+            for id in ids {
+                if !seen_ids.insert(id.clone()) {
+                    return None;
+                }
+                delete_ids.push(id);
+            }
+            continue;
+        }
+        if let Some(rows) = parse_lix_file_insert_rows(statement) {
+            if saw_update {
+                return None;
+            }
+            for row in rows {
+                if !seen_ids.insert(row.id.clone()) {
+                    return None;
+                }
+                insert_rows.push(row);
+            }
+            continue;
+        }
+        if let Some(row) = parse_lix_file_update_row(statement) {
+            if !seen_ids.insert(row.id.clone()) {
+                return None;
+            }
+            saw_update = true;
+            update_rows.push(row);
+            continue;
+        }
+        return None;
+    }
+
+    let mut rewritten = Vec::new();
+
+    if !delete_ids.is_empty() {
+        let id_list = delete_ids
+            .iter()
+            .map(|id| format!("'{}'", escape_sql_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rewritten.push(format!("DELETE FROM lix_file WHERE id IN ({id_list})"));
+    }
+
+    if !insert_rows.is_empty() {
+        let values = insert_rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "('{}', {}, {})",
+                    escape_sql_string(&row.id),
+                    row.path_sql,
+                    row.data_sql
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        rewritten.push(format!(
+            "INSERT INTO lix_file (id, path, data) VALUES {values}"
+        ));
+    }
+
+    if !update_rows.is_empty() {
+        let path_cases = update_rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "WHEN '{}' THEN {}",
+                    escape_sql_string(&row.id),
+                    row.path_sql
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let data_cases = update_rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "WHEN '{}' THEN {}",
+                    escape_sql_string(&row.id),
+                    row.data_sql
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let id_list = update_rows
+            .iter()
+            .map(|row| format!("'{}'", escape_sql_string(&row.id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rewritten.push(format!(
+            "UPDATE lix_file \
+             SET path = CASE id {path_cases} ELSE path END, \
+                 data = CASE id {data_cases} ELSE data END \
+             WHERE id IN ({id_list})"
+        ));
+    }
+
+    Some(rewritten)
+}
+
+fn parse_lix_file_insert_rows(statement: &Statement) -> Option<Vec<LixFileWriteRow>> {
+    let Statement::Insert(insert) = statement else {
+        return None;
+    };
+    if !table_object_targets_table_name(&insert.table, "lix_file") {
+        return None;
+    }
+    if insert.columns.is_empty() {
+        return None;
+    }
+    if !insert.assignments.is_empty() || insert.on.is_some() || insert.returning.is_some() {
+        return None;
+    }
+    let source = insert.source.as_deref()?;
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return None;
+    };
+
+    let id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("id"))?;
+    let path_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("path"))?;
+    let data_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("data"))?;
+
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let id = expr_as_string_literal(row.get(id_index)?)?;
+        let path_sql = row.get(path_index)?.to_string();
+        let data_sql = row.get(data_index)?.to_string();
+        rows.push(LixFileWriteRow {
+            id,
+            path_sql,
+            data_sql,
+        });
+    }
+    Some(rows)
+}
+
+fn parse_lix_file_update_row(statement: &Statement) -> Option<LixFileWriteRow> {
+    let Statement::Update(update) = statement else {
+        return None;
+    };
+    if !table_with_joins_targets_table_name(&update.table, "lix_file") {
+        return None;
+    }
+    if update.from.is_some() || update.returning.is_some() || update.limit.is_some() {
+        return None;
+    }
+
+    let mut path_sql = None;
+    let mut data_sql = None;
+    for assignment in &update.assignments {
+        let AssignmentTarget::ColumnName(target) = &assignment.target else {
+            return None;
+        };
+        let column = object_name_last_ident_value(target)?;
+        if column.eq_ignore_ascii_case("path") {
+            path_sql = Some(assignment.value.to_string());
+        } else if column.eq_ignore_ascii_case("data") {
+            data_sql = Some(assignment.value.to_string());
+        } else {
+            return None;
+        }
+    }
+
+    let id = parse_id_eq_selection(update.selection.as_ref()?)?;
+    Some(LixFileWriteRow {
+        id,
+        path_sql: path_sql?,
+        data_sql: data_sql?,
+    })
+}
+
+fn parse_lix_file_delete_ids(statement: &Statement) -> Option<Vec<String>> {
+    let Statement::Delete(delete) = statement else {
+        return None;
+    };
+    if !delete.tables.is_empty()
+        || delete.using.is_some()
+        || delete.returning.is_some()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+    {
+        return None;
+    }
+
+    let from = match &delete.from {
+        FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from) => from,
+    };
+    if from.len() != 1 || !table_with_joins_targets_table_name(&from[0], "lix_file") {
+        return None;
+    }
+
+    parse_id_selection(delete.selection.as_ref()?)
+}
+
+fn parse_id_selection(selection: &Expr) -> Option<Vec<String>> {
+    match selection {
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if expr_is_column_name(expr, "id") => list.iter().map(expr_as_string_literal).collect(),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if expr_is_column_name(left, "id") {
+                return Some(vec![expr_as_string_literal(right)?]);
+            }
+            if expr_is_column_name(right, "id") {
+                return Some(vec![expr_as_string_literal(left)?]);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_id_eq_selection(selection: &Expr) -> Option<String> {
+    let ids = parse_id_selection(selection)?;
+    if ids.len() == 1 {
+        return ids.into_iter().next();
+    }
+    None
+}
+
+fn expr_as_string_literal(expr: &Expr) -> Option<String> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    match &value.value {
+        sqlparser::ast::Value::SingleQuotedString(text)
+        | sqlparser::ast::Value::DoubleQuotedString(text)
+        | sqlparser::ast::Value::NationalStringLiteral(text)
+        | sqlparser::ast::Value::EscapedStringLiteral(text)
+        | sqlparser::ast::Value::UnicodeStringLiteral(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn expr_is_column_name(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(name),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|ident| ident.value.eq_ignore_ascii_case(name)),
+        Expr::Nested(inner) => expr_is_column_name(inner, name),
+        _ => false,
+    }
+}
+
+fn object_name_last_ident_value(name: &ObjectName) -> Option<&str> {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.as_str())
+}
+
+fn collapse_pending_file_writes_for_transaction(
+    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+) -> Vec<crate::filesystem::pending_file_writes::PendingFileWrite> {
+    let mut collapsed =
+        Vec::<crate::filesystem::pending_file_writes::PendingFileWrite>::with_capacity(
+            writes.len(),
+        );
+    let mut index_by_key = BTreeMap::<(String, String), usize>::new();
+
+    for write in writes {
+        let key = (write.file_id.clone(), write.version_id.clone());
+        if let Some(index) = index_by_key.get(&key).copied() {
+            let existing = &mut collapsed[index];
+            existing.path = write.path.clone();
+            existing.after_data = write.after_data.clone();
+            existing.data_is_authoritative =
+                existing.data_is_authoritative || write.data_is_authoritative;
+            if existing.before_path.is_none() {
+                existing.before_path = write.before_path.clone();
+            }
+            if existing.before_data.is_none() {
+                existing.before_data = write.before_data.clone();
+            }
+            continue;
+        }
+
+        index_by_key.insert(key, collapsed.len());
+        collapsed.push(write.clone());
+    }
+
+    collapsed
 }
 
 fn direct_state_file_cache_refresh_targets(
@@ -3059,10 +3882,10 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         active_version_from_update_validations, active_version_schema_key,
-        advance_placeholder_state_for_statement, boot,
+        advance_placeholder_state_for_statement, boot, coalesce_lix_file_transaction_statements,
         detected_file_domain_changes_from_detected_file_changes,
-        detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
-        file_history_read_materialization_required_for_sql,
+        detected_file_domain_changes_with_writer_key, extract_explicit_transaction_script,
+        file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
         file_read_materialization_scope_for_sql, should_invalidate_installed_plugins_cache_for_sql,
         should_refresh_file_cache_for_sql, BootArgs, ExecuteOptions, FileReadMaterializationScope,
     };
@@ -3599,6 +4422,58 @@ mod tests {
 
         assert_eq!(targets.len(), 1);
         assert!(targets.contains(&("file-a".to_string(), "version-a".to_string())));
+    }
+
+    #[test]
+    fn extract_explicit_transaction_script_parses_begin_commit_wrapper() {
+        let parsed = extract_explicit_transaction_script(
+            "BEGIN; INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a', x'01'); COMMIT;",
+            &[],
+        )
+        .expect("parse transaction script");
+
+        let statements = parsed.expect("expected explicit transaction script");
+        assert_eq!(statements.len(), 1);
+        assert!(matches!(statements[0], Statement::Insert(_)));
+    }
+
+    #[test]
+    fn coalesce_lix_file_transaction_statements_rewrites_replay_shape() {
+        let statements = parse_sql_statements(
+            "DELETE FROM lix_file WHERE id IN ('d1');\
+             INSERT INTO lix_file (id, path, data) VALUES ('i1', '/inserted.txt', x'01');\
+             UPDATE lix_file SET path = '/updated-a.txt', data = x'0A' WHERE id = 'u1';\
+             UPDATE lix_file SET path = '/updated-b.txt', data = x'0B' WHERE id = 'u2';",
+        )
+        .expect("parse");
+
+        let rewritten =
+            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite))
+                .expect("expected coalesced rewrite");
+
+        assert_eq!(rewritten.len(), 3);
+        assert!(rewritten[0].starts_with("DELETE FROM lix_file WHERE id IN ('d1')"));
+        assert!(rewritten[1].starts_with("INSERT INTO lix_file (id, path, data) VALUES "));
+        assert!(rewritten[1].contains("('i1', '/inserted.txt', X'01')"));
+        assert!(rewritten[2].starts_with("UPDATE lix_file SET path = CASE id "));
+        assert!(rewritten[2].contains("WHEN 'u1' THEN '/updated-a.txt'"));
+        assert!(rewritten[2].contains("WHEN 'u2' THEN '/updated-b.txt'"));
+        assert!(rewritten[2].contains("WHEN 'u1' THEN X'0A'"));
+        assert!(rewritten[2].contains("WHEN 'u2' THEN X'0B'"));
+        assert!(rewritten[2].contains("WHERE id IN ('u1', 'u2')"));
+    }
+
+    #[test]
+    fn coalesce_lix_file_transaction_statements_returns_none_for_duplicate_ids() {
+        let statements = parse_sql_statements(
+            "UPDATE lix_file SET path = '/updated-a.txt', data = x'0A' WHERE id = 'u1';\
+             UPDATE lix_file SET path = '/updated-b.txt', data = x'0B' WHERE id = 'u1';",
+        )
+        .expect("parse");
+
+        let rewritten =
+            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
+        assert!(rewritten.is_none());
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {
