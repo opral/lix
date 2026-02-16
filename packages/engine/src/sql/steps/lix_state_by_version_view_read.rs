@@ -101,15 +101,21 @@ fn rewrite_table_factor(
 }
 
 fn build_lix_state_by_version_view_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
+    let (target_version_pushdown, ranked_predicates) = split_ranked_pushdown(pushdown);
     let source_pushdown = if pushdown.source_predicates.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
     };
-    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
+    let ranked_pushdown = if ranked_predicates.is_empty() {
         String::new()
     } else {
-        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
+        format!(" AND {}", ranked_predicates.join(" AND "))
+    };
+    let target_version_filter = if target_version_pushdown.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", target_version_pushdown.join(" AND "))
     };
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
@@ -150,12 +156,16 @@ fn build_lix_state_by_version_view_query(pushdown: &StatePushdown) -> Result<Que
                UNION \
                SELECT DISTINCT version_id FROM {vtable_name} \
              ), \
+             target_versions AS ( \
+               SELECT version_id \
+               FROM all_target_versions{target_version_filter} \
+             ), \
              version_chain(target_version_id, ancestor_version_id, depth) AS ( \
                SELECT \
                  version_id AS target_version_id, \
                  version_id AS ancestor_version_id, \
                  0 AS depth \
-               FROM all_target_versions \
+               FROM target_versions \
                UNION ALL \
                SELECT \
                  vc.target_version_id, \
@@ -237,20 +247,27 @@ fn build_lix_state_by_version_view_query(pushdown: &StatePushdown) -> Result<Que
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         source_pushdown = source_pushdown,
         ranked_pushdown = ranked_pushdown,
+        target_version_filter = target_version_filter,
     );
     parse_single_query(&sql)
 }
 
 fn build_lix_state_by_version_count_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
+    let (target_version_pushdown, ranked_predicates) = split_ranked_pushdown(pushdown);
     let source_pushdown = if pushdown.source_predicates.is_empty() {
         String::new()
     } else {
         format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
     };
-    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
+    let ranked_pushdown = if ranked_predicates.is_empty() {
         String::new()
     } else {
-        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
+        format!(" AND {}", ranked_predicates.join(" AND "))
+    };
+    let target_version_filter = if target_version_pushdown.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", target_version_pushdown.join(" AND "))
     };
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
@@ -277,12 +294,16 @@ fn build_lix_state_by_version_count_query(pushdown: &StatePushdown) -> Result<Qu
                UNION \
                SELECT DISTINCT version_id FROM {vtable_name} \
              ), \
+             target_versions AS ( \
+               SELECT version_id \
+               FROM all_target_versions{target_version_filter} \
+             ), \
              version_chain(target_version_id, ancestor_version_id, depth) AS ( \
                SELECT \
                  version_id AS target_version_id, \
                  version_id AS ancestor_version_id, \
                  0 AS depth \
-               FROM all_target_versions \
+               FROM target_versions \
                UNION ALL \
                SELECT \
                  vc.target_version_id, \
@@ -320,8 +341,22 @@ fn build_lix_state_by_version_count_query(pushdown: &StatePushdown) -> Result<Qu
         vtable_name = VTABLE_NAME,
         source_pushdown = source_pushdown,
         ranked_pushdown = ranked_pushdown,
+        target_version_filter = target_version_filter,
     );
     parse_single_query(&sql)
+}
+
+fn split_ranked_pushdown(pushdown: &StatePushdown) -> (Vec<String>, Vec<String>) {
+    let mut target_version = Vec::new();
+    let mut ranked = Vec::new();
+    for predicate in &pushdown.ranked_predicates {
+        if let Some(stripped) = predicate.strip_prefix("ranked.version_id ") {
+            target_version.push(format!("version_id {stripped}"));
+            continue;
+        }
+        ranked.push(predicate.clone());
+    }
+    (target_version, ranked)
 }
 
 fn default_lix_state_by_version_alias() -> sqlparser::ast::TableAlias {
@@ -385,7 +420,10 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("ranked.version_id = 'bench-v-023'"));
+        assert!(sql.contains(
+            "FROM all_target_versions WHERE version_id = 'bench-v-023'"
+        ));
+        assert!(!sql.contains("ranked.version_id = 'bench-v-023'"));
         assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
     }
 
@@ -403,6 +441,9 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains(
+            "FROM all_target_versions WHERE version_id IN ('bench-v-022', 'bench-v-023')"
+        ));
+        assert!(!sql.contains(
             "ranked.version_id IN ('bench-v-022', 'bench-v-023')"
         ));
         assert!(!sql.contains(
@@ -430,7 +471,10 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("ranked.version_id IN (SELECT"));
+        assert!(sql.contains(
+            "FROM all_target_versions WHERE version_id IN (SELECT"
+        ));
+        assert!(!sql.contains("ranked.version_id IN (SELECT"));
         assert!(sql.contains("FROM lix_internal_state_untracked"));
         assert!(!sql.contains("sv.version_id IN (SELECT"));
     }
@@ -448,7 +492,8 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("ranked.version_id = ?"));
+        assert!(sql.contains("FROM all_target_versions WHERE version_id = ?"));
+        assert!(!sql.contains("ranked.version_id = ?"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id = ?"));
     }
@@ -466,7 +511,10 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("ranked.version_id IN (?, ?)"));
+        assert!(sql.contains(
+            "FROM all_target_versions WHERE version_id IN (?, ?)"
+        ));
+        assert!(!sql.contains("ranked.version_id IN (?, ?)"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id IN (?, ?)"));
     }
