@@ -51,6 +51,7 @@ async function main() {
   const startedAt = new Date().toISOString();
   const replayStarted = performance.now();
 
+  const repoSetupStarted = performance.now();
   const repo = await ensureGitRepo({
     repoPath: CONFIG.repoPath || undefined,
     repoUrl: CONFIG.repoUrl,
@@ -59,12 +60,15 @@ async function main() {
     syncRemote: CONFIG.syncRemote,
     ref: CONFIG.repoRef,
   });
+  const repoSetupMs = performance.now() - repoSetupStarted;
 
+  const commitDiscoveryStarted = performance.now();
   const commits = await listLinearCommits(repo.repoPath, {
     ref: CONFIG.repoRef,
     maxCount: CONFIG.commitLimit,
     firstParent: CONFIG.firstParent,
   });
+  const commitDiscoveryMs = performance.now() - commitDiscoveryStarted;
 
   if (commits.length === 0) {
     throw new Error(`no commits found at ${repo.repoPath} (${CONFIG.repoRef})`);
@@ -76,20 +80,40 @@ async function main() {
     );
   }
 
+  const lixOpenStarted = performance.now();
   const lix = await openLix();
+  const lixOpenMs = performance.now() - lixOpenStarted;
 
   try {
+    let pluginInstallMs = 0;
     if (CONFIG.installTextLinesPlugin) {
       const pluginWasmBytes = await loadTextLinesPluginWasmBytes(CONFIG.showProgress);
+      const pluginInstallStarted = performance.now();
       await lix.installPlugin({
         manifestJson: TEXT_LINES_MANIFEST,
         wasmBytes: pluginWasmBytes,
       });
+      pluginInstallMs = performance.now() - pluginInstallStarted;
     }
 
     const state = createReplayState();
     const commitDurations = [];
+    const phaseDurations = {
+      readPatchSetMs: [],
+      prepareMs: [],
+      buildStatementsMs: [],
+      executeStatementsMs: [],
+      commitTotalMs: [],
+    };
+    const phaseTotalsMs = {
+      readPatchSetMs: 0,
+      prepareMs: 0,
+      buildStatementsMs: 0,
+      executeStatementsMs: 0,
+      commitTotalMs: 0,
+    };
     const slowCommits = [];
+    const slowStatements = [];
 
     let commitsApplied = 0;
     let commitsNoop = 0;
@@ -101,10 +125,22 @@ async function main() {
     let totalUpdates = 0;
     let totalDeletes = 0;
 
+    const commitLoopStarted = performance.now();
     for (let index = 0; index < commits.length; index++) {
       const commitSha = commits[index];
+      const commitStarted = performance.now();
+
+      const patchSetStarted = performance.now();
       const patchSet = await readCommitPatchSet(repo.repoPath, commitSha);
+      const readPatchSetMs = performance.now() - patchSetStarted;
+      phaseDurations.readPatchSetMs.push(readPatchSetMs);
+      phaseTotalsMs.readPatchSetMs += readPatchSetMs;
+
+      const prepareStarted = performance.now();
       const prepared = prepareCommitChanges(state, patchSet.changes, patchSet.blobByOid);
+      const prepareMs = performance.now() - prepareStarted;
+      phaseDurations.prepareMs.push(prepareMs);
+      phaseTotalsMs.prepareMs += prepareMs;
 
       totalChangedPaths += patchSet.changes.length;
       totalBlobBytes += prepared.blobBytes;
@@ -112,28 +148,40 @@ async function main() {
       totalUpdates += prepared.updates.length;
       totalDeletes += prepared.deletes.length;
 
+      const buildStatementsStarted = performance.now();
       const statements = buildReplayCommitStatements(prepared, {
         maxInsertRows: CONFIG.maxInsertRows,
         maxInsertSqlChars: CONFIG.maxInsertSqlChars,
       });
+      const buildStatementsMs = performance.now() - buildStatementsStarted;
+      phaseDurations.buildStatementsMs.push(buildStatementsMs);
+      phaseTotalsMs.buildStatementsMs += buildStatementsMs;
 
       if (statements.length === 0) {
         commitsNoop += 1;
       } else {
-        const commitStarted = performance.now();
+        let executeResult;
         try {
-          await executeStatements(lix, statements);
+          executeResult = await executeStatements(lix, statements);
         } catch (error) {
           throw new Error(
             `failed while replaying commit ${commitSha}: ${String(error?.message ?? error)}`,
           );
         }
-        const commitMs = performance.now() - commitStarted;
+        const commitMs = executeResult.totalMs;
 
         commitsApplied += 1;
         commitDurations.push(commitMs);
+        phaseDurations.executeStatementsMs.push(commitMs);
+        phaseTotalsMs.executeStatementsMs += commitMs;
         totalSqlChars += statementChars(statements);
         totalEngineStatements += statements.length;
+        for (const statement of executeResult.slowestStatements) {
+          pushSlowStatement(slowStatements, {
+            commitSha,
+            ...statement,
+          });
+        }
         pushSlowCommit(slowCommits, {
           commitSha,
           durationMs: commitMs,
@@ -143,6 +191,10 @@ async function main() {
           deletes: prepared.deletes.length,
         });
       }
+
+      const commitTotalMs = performance.now() - commitStarted;
+      phaseDurations.commitTotalMs.push(commitTotalMs);
+      phaseTotalsMs.commitTotalMs += commitTotalMs;
 
       if (
         CONFIG.showProgress &&
@@ -159,10 +211,15 @@ async function main() {
         });
       }
     }
+    const commitLoopMs = performance.now() - commitLoopStarted;
 
     const replayMs = performance.now() - replayStarted;
+    const storageQueryStarted = performance.now();
     const storage = await collectStorageCounters(lix);
+    const storageQueryMs = performance.now() - storageQueryStarted;
+    const snapshotExportStarted = performance.now();
     const snapshotArtifact = await maybeWriteSnapshotArtifact(lix);
+    const snapshotExportMs = performance.now() - snapshotExportStarted;
 
     const report = {
       generatedAt: new Date().toISOString(),
@@ -191,16 +248,40 @@ async function main() {
       },
       timings: {
         replayMs,
+        commitLoopMs,
+        setup: {
+          repoSetupMs,
+          commitDiscoveryMs,
+          lixOpenMs,
+          pluginInstallMs,
+        },
+        postReplay: {
+          storageQueryMs,
+          snapshotExportMs,
+        },
         commit: summarizeSamples(commitDurations),
+        phaseTotalsMs,
+        phase: {
+          readPatchSet: summarizeSamples(phaseDurations.readPatchSetMs),
+          prepare: summarizeSamples(phaseDurations.prepareMs),
+          buildStatements: summarizeSamples(phaseDurations.buildStatementsMs),
+          executeStatements: summarizeSamples(phaseDurations.executeStatementsMs),
+          commitTotal: summarizeSamples(phaseDurations.commitTotalMs),
+        },
+        phaseBreakdown: buildPhaseBreakdown(phaseTotalsMs, replayMs),
       },
       throughput: {
         commitsPerSecond: commitsApplied / Math.max(replayMs / 1000, 0.001),
+        commitsPerSecondCommitLoop: commitsApplied / Math.max(commitLoopMs / 1000, 0.001),
         changedPathsPerSecond: totalChangedPaths / Math.max(replayMs / 1000, 0.001),
         blobMegabytesPerSecond: totalBlobBytes / 1024 / 1024 / Math.max(replayMs / 1000, 0.001),
+        executeStatementsPerSecond:
+          totalEngineStatements / Math.max(phaseTotalsMs.executeStatementsMs / 1000, 0.001),
       },
       storage,
       snapshotArtifact,
       slowestCommits: slowCommits,
+      slowestStatements: slowStatements,
     };
 
     await mkdir(OUTPUT_DIR, { recursive: true });
@@ -219,6 +300,39 @@ function pushSlowCommit(store, candidate) {
   if (store.length > 20) {
     store.length = 20;
   }
+}
+
+function pushSlowStatement(store, candidate) {
+  store.push(candidate);
+  store.sort((left, right) => right.durationMs - left.durationMs);
+  if (store.length > 20) {
+    store.length = 20;
+  }
+}
+
+function buildPhaseBreakdown(phaseTotalsMs, replayMs) {
+  const phases = [
+    ["readPatchSetMs", phaseTotalsMs.readPatchSetMs],
+    ["prepareMs", phaseTotalsMs.prepareMs],
+    ["buildStatementsMs", phaseTotalsMs.buildStatementsMs],
+    ["executeStatementsMs", phaseTotalsMs.executeStatementsMs],
+  ];
+  const accountedMs = phases.reduce((sum, [, value]) => sum + value, 0);
+  const breakdown = phases
+    .map(([phase, totalMs]) => ({
+      phase,
+      totalMs,
+      sharePct: replayMs > 0 ? (totalMs / replayMs) * 100 : 0,
+    }))
+    .sort((left, right) => right.totalMs - left.totalMs);
+
+  breakdown.push({
+    phase: "setupAndOverheadMs",
+    totalMs: Math.max(0, replayMs - accountedMs),
+    sharePct: replayMs > 0 ? Math.max(0, ((replayMs - accountedMs) / replayMs) * 100) : 0,
+  });
+
+  return breakdown.sort((left, right) => right.totalMs - left.totalMs);
 }
 
 async function collectStorageCounters(lix) {
@@ -253,9 +367,35 @@ async function collectStorageCounters(lix) {
 }
 
 async function executeStatements(lix, statements) {
-  for (const sql of statements) {
+  const slowestStatements = [];
+  let totalMs = 0;
+
+  for (let index = 0; index < statements.length; index++) {
+    const sql = statements[index];
+    const statementStarted = performance.now();
     await lix.execute(sql, []);
+    const durationMs = performance.now() - statementStarted;
+    totalMs += durationMs;
+    pushSlowStatement(slowestStatements, {
+      statementIndex: index,
+      durationMs,
+      sqlChars: sql.length,
+      sqlPreview: summarizeSql(sql),
+    });
   }
+
+  return {
+    totalMs,
+    slowestStatements,
+  };
+}
+
+function summarizeSql(sql) {
+  const flattened = String(sql).replace(/\s+/g, " ").trim();
+  if (flattened.length <= 140) {
+    return flattened;
+  }
+  return `${flattened.slice(0, 140)}…`;
 }
 
 function statementChars(statements) {
