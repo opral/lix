@@ -34,3 +34,8 @@ Result: Replay duration `2908.15ms` (from `3349.14ms`, `-13.2%`; from original b
 Hypothesis: detect pipeline still spends significant time loading existing plugin entities from DB even though `plugin_text_lines` already emits full add/remove diff.
 Implementation: For `plugin_text_lines`, bypass the `load_existing_plugin_entities` reconciliation path in detect (keep fallback path for other plugins).
 Result: Replay duration `1990.29ms` (from `2908.15ms`, `-31.6%`; from original baseline `15950.20ms`, `-87.5%`). `cargo test -p lix_engine plugin_install` passed.
+
+## optimize 7: use release wasm artifact for text-lines plugin in benchmark
+Hypothesis: first detect call is dominated by JCO transpiling a large debug wasm artifact (~7.1MB); loading release wasm (~238KB) should significantly reduce one-time component init cost.
+Implementation: Update replay benchmark plugin loader/build to prefer `target/wasm32-wasip2/release/plugin_text_lines.wasm` and build with `cargo build --release` fallback.
+Result: Replay duration `1590.48ms` (from `1990.29ms`, `-20.1%`; from original baseline `15950.20ms`, `-90.0%`), crossing the 10x target on this 25-commit run.

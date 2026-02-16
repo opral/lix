@@ -29,7 +29,7 @@ const CONFIG = {
   cacheDir: process.env.BENCH_REPLAY_CACHE_DIR ?? DEFAULT_CACHE_DIR,
   commitLimit: parseEnvInt("BENCH_REPLAY_COMMITS", 1000),
   firstParent: parseEnvBool("BENCH_REPLAY_FIRST_PARENT", true),
-  syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", true),
+  syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
   showProgress: parseEnvBool("BENCH_REPLAY_PROGRESS", true),
   installTextLinesPlugin: parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", true),
@@ -37,6 +37,7 @@ const CONFIG = {
   exportSnapshotPath: process.env.BENCH_REPLAY_SNAPSHOT_PATH ?? "",
   maxInsertRows: parseEnvInt("BENCH_REPLAY_MAX_INSERT_ROWS", 200),
   maxInsertSqlChars: parseEnvInt("BENCH_REPLAY_MAX_INSERT_SQL_CHARS", 1_500_000),
+  executeMode: parseExecuteMode(process.env.BENCH_REPLAY_EXECUTE_MODE),
 };
 
 const TEXT_LINES_MANIFEST = {
@@ -81,7 +82,13 @@ async function main() {
   }
 
   const lixOpenStarted = performance.now();
-  const lix = await openLix();
+  const lix = await openLix({
+    keyValues: [{
+      key: "lix_deterministic_mode",
+      value: { enabled: true },
+      lixcol_version_id: "global",
+    }],
+  });
   const lixOpenMs = performance.now() - lixOpenStarted;
 
   try {
@@ -162,7 +169,10 @@ async function main() {
       } else {
         let executeResult;
         try {
-          executeResult = await executeStatements(lix, statements);
+          executeResult =
+            CONFIG.executeMode === "transaction-script"
+              ? await executeStatementsAsTransactionScript(lix, statements)
+              : await executeStatements(lix, statements);
         } catch (error) {
           throw new Error(
             `failed while replaying commit ${commitSha}: ${String(error?.message ?? error)}`,
@@ -390,6 +400,22 @@ async function executeStatements(lix, statements) {
   };
 }
 
+async function executeStatementsAsTransactionScript(lix, statements) {
+  const script = ["BEGIN", ...statements, "COMMIT"].join(";\n");
+  const started = performance.now();
+  await lix.execute(script, []);
+  const durationMs = performance.now() - started;
+  return {
+    totalMs: durationMs,
+    slowestStatements: [{
+      statementIndex: -1,
+      durationMs,
+      sqlChars: script.length,
+      sqlPreview: summarizeSql(script),
+    }],
+  };
+}
+
 function summarizeSql(sql) {
   const flattened = String(sql).replace(/\s+/g, " ").trim();
   if (flattened.length <= 140) {
@@ -418,6 +444,22 @@ async function maybeWriteSnapshotArtifact(lix) {
 }
 
 async function loadTextLinesPluginWasmBytes(showProgress) {
+  const packageReleasePath = join(
+    REPO_ROOT,
+    "packages",
+    "plugin-text-lines",
+    "target",
+    "wasm32-wasip2",
+    "release",
+    "plugin_text_lines.wasm",
+  );
+  const workspaceReleasePath = join(
+    REPO_ROOT,
+    "target",
+    "wasm32-wasip2",
+    "release",
+    "plugin_text_lines.wasm",
+  );
   const packageDebugPath = join(
     REPO_ROOT,
     "packages",
@@ -436,16 +478,32 @@ async function loadTextLinesPluginWasmBytes(showProgress) {
   );
 
   try {
-    return await readFile(packageDebugPath);
+    return await readFile(packageReleasePath);
   } catch {
     try {
-      return await readFile(workspaceDebugPath);
+      return await readFile(workspaceReleasePath);
     } catch {
-      await ensureTextLinesPluginWasmBuilt(showProgress);
       try {
         return await readFile(packageDebugPath);
       } catch {
-        return await readFile(workspaceDebugPath);
+        try {
+          return await readFile(workspaceDebugPath);
+        } catch {
+          await ensureTextLinesPluginWasmBuilt(showProgress);
+          try {
+            return await readFile(packageReleasePath);
+          } catch {
+            try {
+              return await readFile(workspaceReleasePath);
+            } catch {
+              try {
+                return await readFile(packageDebugPath);
+              } catch {
+                return await readFile(workspaceDebugPath);
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -455,12 +513,13 @@ async function ensureTextLinesPluginWasmBuilt(showProgress) {
   const manifestPath = join(REPO_ROOT, "packages", "plugin-text-lines", "Cargo.toml");
 
   if (showProgress) {
-    console.log("[progress] building plugin-text-lines wasm (wasm32-wasip2)");
+    console.log("[progress] building plugin-text-lines wasm (wasm32-wasip2, release)");
   }
 
   try {
     await runCommand("cargo", [
       "build",
+      "--release",
       "--manifest-path",
       manifestPath,
       "--target",
@@ -476,6 +535,7 @@ async function ensureTextLinesPluginWasmBuilt(showProgress) {
       await runCommand("rustup", ["target", "add", "wasm32-wasip2"]);
       await runCommand("cargo", [
         "build",
+        "--release",
         "--manifest-path",
         manifestPath,
         "--target",
@@ -559,6 +619,18 @@ function parseEnvBool(name, fallback) {
     return false;
   }
   throw new Error(`${name} must be boolean-like (0/1/true/false), got '${raw}'`);
+}
+
+function parseExecuteMode(raw) {
+  if (!raw) {
+    return "per-statement";
+  }
+  if (raw === "per-statement" || raw === "transaction-script") {
+    return raw;
+  }
+  throw new Error(
+    `BENCH_REPLAY_EXECUTE_MODE must be 'per-statement' or 'transaction-script', got '${raw}'`,
+  );
 }
 
 async function runCommand(command, args) {
