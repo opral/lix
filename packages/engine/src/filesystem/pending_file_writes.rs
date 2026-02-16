@@ -9,10 +9,11 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
-    Assignment, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
+    Assignment, Expr, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
     TableObject, Update,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFileWrite {
@@ -35,6 +36,12 @@ pub(crate) struct PendingFileWriteCollection {
 enum FileWriteTarget {
     ActiveVersion,
     ExplicitVersion,
+}
+
+#[derive(Debug, Clone)]
+struct ExactFileUpdateTarget {
+    file_id: String,
+    explicit_version_id: Option<String>,
 }
 
 pub(crate) async fn collect_pending_file_writes(
@@ -247,18 +254,30 @@ async fn collect_update_writes(
 
     let mut placeholder_state = PlaceholderState::new();
     let mut assigned_after_data: Option<Vec<u8>> = None;
+    let mut assigned_after_data_by_id: Option<BTreeMap<String, Vec<u8>>> = None;
     let mut saw_data_assignment = false;
     let mut next_path: Option<String> = None;
+    let mut next_path_by_id: Option<BTreeMap<String, String>> = None;
     let mut next_file_id: Option<String> = None;
 
     for assignment in &update.assignments {
         let Some(column) = assignment_target_name(assignment) else {
             continue;
         };
-        let resolved =
-            resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
         if column.eq_ignore_ascii_case("data") {
             saw_data_assignment = true;
+            if let Some(case_values) = resolve_case_assignment_text_or_blob_by_id(
+                &assignment.value,
+                "data",
+                params,
+                &mut placeholder_state,
+            )? {
+                assigned_after_data_by_id = Some(case_values);
+                assigned_after_data = None;
+                continue;
+            }
+            let resolved =
+                resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
             assigned_after_data = resolved_cell_blob_or_text_bytes(Some(&resolved));
             if assigned_after_data.is_none() {
                 return Err(LixError {
@@ -269,8 +288,22 @@ async fn collect_update_writes(
                 });
             }
         } else if column.eq_ignore_ascii_case("path") {
+            if let Some(case_values) = resolve_case_assignment_text_by_id(
+                &assignment.value,
+                "path",
+                params,
+                &mut placeholder_state,
+            )? {
+                next_path_by_id = Some(case_values);
+                next_path = None;
+                continue;
+            }
+            let resolved =
+                resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
             next_path = resolved_cell_text(Some(&resolved));
         } else if column.eq_ignore_ascii_case("id") {
+            let resolved =
+                resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
             next_file_id = resolved_cell_text(Some(&resolved));
         }
     }
@@ -279,15 +312,80 @@ async fn collect_update_writes(
         return Ok(());
     }
 
+    if assigned_after_data_by_id.is_none() && next_path_by_id.is_none() && next_file_id.is_none() {
+        let mut fast_path_state = placeholder_state;
+        if let Some(exact_target) = extract_exact_file_update_target(
+            update.selection.as_ref(),
+            params,
+            &mut fast_path_state,
+        )? {
+            let version_id = match target {
+                FileWriteTarget::ActiveVersion => active_version_id.to_string(),
+                FileWriteTarget::ExplicitVersion => {
+                    exact_target.explicit_version_id.clone().unwrap_or_default()
+                }
+            };
+            if !version_id.is_empty() {
+                let key = (exact_target.file_id.clone(), version_id.clone());
+                if let Some(overlay_state) = overlay.get(&key) {
+                    let before_path = overlay_state.path.clone();
+                    let before_data = Some(overlay_state.data.clone());
+                    let path = next_path.clone().unwrap_or_else(|| before_path.clone());
+                    let mut write = PendingFileWrite {
+                        file_id: exact_target.file_id,
+                        version_id,
+                        before_path: Some(before_path),
+                        path,
+                        data_is_authoritative: saw_data_assignment,
+                        before_data,
+                        after_data: assigned_after_data.clone().unwrap_or_default(),
+                    };
+                    if !write.data_is_authoritative {
+                        write.after_data = write.before_data.clone().unwrap_or_default();
+                    }
+                    writes.push(write);
+                    return Ok(());
+                }
+
+                let cache_keys = [key.clone()];
+                let before_paths = load_before_path_from_cache_batch(backend, &cache_keys).await?;
+                if let Some(before_path) = before_paths.get(&key) {
+                    let before_data = load_before_data_from_cache_batch(backend, &cache_keys)
+                        .await?
+                        .get(&key)
+                        .cloned();
+                    let path = next_path.clone().unwrap_or_else(|| before_path.clone());
+                    let mut write = PendingFileWrite {
+                        file_id: exact_target.file_id,
+                        version_id,
+                        before_path: Some(before_path.clone()),
+                        path,
+                        data_is_authoritative: saw_data_assignment,
+                        before_data,
+                        after_data: assigned_after_data.clone().unwrap_or_default(),
+                    };
+                    if !write.data_is_authoritative {
+                        write.after_data = write.before_data.clone().unwrap_or_default();
+                    }
+                    writes.push(write);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let mut query_sql = match target {
         FileWriteTarget::ActiveVersion => format!(
-            "SELECT id, path, data, lixcol_version_id FROM lix_file_by_version \
+            "SELECT id, path, data, lixcol_version_id, \
+                    'pending.collect_update_writes' AS __lix_trace \
+             FROM lix_file_by_version \
              WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
         ),
-        FileWriteTarget::ExplicitVersion => {
-            "SELECT id, path, data, lixcol_version_id FROM lix_file_by_version".to_string()
-        }
+        FileWriteTarget::ExplicitVersion => "SELECT id, path, data, lixcol_version_id, \
+                    'pending.collect_update_writes' AS __lix_trace \
+             FROM lix_file_by_version"
+            .to_string(),
     };
     if let Some(selection) = update.selection.as_ref() {
         query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
@@ -299,15 +397,20 @@ async fn collect_update_writes(
     }
 
     let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
-    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
-        .await
-        .map_err(|error| LixError {
-            message: format!(
-                "pending_file_writes prefetch failed for '{}': {}",
-                bound.sql, error.message
-            ),
-        })?
-        .rows;
+    let rows = execute_prefetch_query(
+        backend,
+        "pending.collect_update_writes",
+        &bound.sql,
+        &bound.params,
+    )
+    .await
+    .map_err(|error| LixError {
+        message: format!(
+            "pending_file_writes prefetch failed for '{}': {}",
+            bound.sql, error.message
+        ),
+    })?
+    .rows;
 
     let mut pending = Vec::with_capacity(rows.len());
     let mut cache_lookup_keys = BTreeSet::<(String, String)>::new();
@@ -320,8 +423,18 @@ async fn collect_update_writes(
             continue;
         };
         let before_path_for_write = before_path.clone();
-        let file_id = next_file_id.clone().unwrap_or(before_file_id);
-        let path = next_path.clone().unwrap_or(before_path);
+        let file_id = next_file_id
+            .clone()
+            .unwrap_or_else(|| before_file_id.clone());
+        let path = if let Some(path_by_id) = &next_path_by_id {
+            path_by_id
+                .get(&before_file_id)
+                .cloned()
+                .or_else(|| next_path.clone())
+                .unwrap_or(before_path)
+        } else {
+            next_path.clone().unwrap_or(before_path)
+        };
         let version_id = match target {
             FileWriteTarget::ActiveVersion => row
                 .get(3)
@@ -337,14 +450,28 @@ async fn collect_update_writes(
             cache_lookup_keys.insert((file_id.clone(), version_id.clone()));
         }
 
+        let (data_is_authoritative, after_data) = if saw_data_assignment {
+            if let Some(data_by_id) = &assigned_after_data_by_id {
+                if let Some(after_data) = data_by_id.get(&before_file_id) {
+                    (true, after_data.clone())
+                } else {
+                    (false, Vec::new())
+                }
+            } else {
+                (true, assigned_after_data.clone().unwrap_or_default())
+            }
+        } else {
+            (false, Vec::new())
+        };
+
         pending.push(PendingFileWrite {
             file_id,
             version_id,
             before_path: Some(before_path_for_write),
             path,
-            data_is_authoritative: saw_data_assignment,
+            data_is_authoritative,
             before_data,
-            after_data: assigned_after_data.clone().unwrap_or_else(|| Vec::new()),
+            after_data,
         });
     }
 
@@ -380,7 +507,7 @@ async fn collect_update_writes(
                 write.path = overlay_state.path.clone();
             }
         }
-        if !saw_data_assignment {
+        if !write.data_is_authoritative {
             write.after_data = write.before_data.clone().unwrap_or_default();
         }
     }
@@ -405,13 +532,16 @@ async fn collect_delete_targets(
 
     let mut query_sql = match target {
         FileWriteTarget::ActiveVersion => format!(
-            "SELECT id, lixcol_version_id FROM lix_file_by_version \
+            "SELECT id, lixcol_version_id, \
+                    'pending.collect_delete_targets' AS __lix_trace \
+             FROM lix_file_by_version \
              WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
         ),
-        FileWriteTarget::ExplicitVersion => {
-            "SELECT id, lixcol_version_id FROM lix_file_by_version".to_string()
-        }
+        FileWriteTarget::ExplicitVersion => "SELECT id, lixcol_version_id, \
+                    'pending.collect_delete_targets' AS __lix_trace \
+             FROM lix_file_by_version"
+            .to_string(),
     };
     if let Some(selection) = delete.selection.as_ref() {
         query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
@@ -428,15 +558,20 @@ async fn collect_delete_targets(
         backend.dialect(),
         PlaceholderState::new(),
     )?;
-    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
-        .await
-        .map_err(|error| LixError {
-            message: format!(
-                "pending_file_writes delete prefetch failed for '{}': {}",
-                bound.sql, error.message
-            ),
-        })?
-        .rows;
+    let rows = execute_prefetch_query(
+        backend,
+        "pending.collect_delete_targets",
+        &bound.sql,
+        &bound.params,
+    )
+    .await
+    .map_err(|error| LixError {
+        message: format!(
+            "pending_file_writes delete prefetch failed for '{}': {}",
+            bound.sql, error.message
+        ),
+    })?
+    .rows;
 
     for row in rows {
         let Some(file_id) = row.first().and_then(value_as_text) else {
@@ -563,15 +698,20 @@ async fn active_version_id_from_lix_active_version_update(
         query_sql.push_str(&selection.to_string());
     }
     let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
-    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
-        .await
-        .map_err(|error| LixError {
-            message: format!(
-                "active version update prefetch failed for '{}': {}",
-                bound.sql, error.message
-            ),
-        })?
-        .rows;
+    let rows = execute_prefetch_query(
+        backend,
+        "pending.active_version_update",
+        &bound.sql,
+        &bound.params,
+    )
+    .await
+    .map_err(|error| LixError {
+        message: format!(
+            "active version update prefetch failed for '{}': {}",
+            bound.sql, error.message
+        ),
+    })?
+    .rows;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -631,15 +771,20 @@ async fn active_version_id_from_internal_state_update(
         query_sql.push(')');
     }
     let bound = bind_sql_with_state(&query_sql, params, backend.dialect(), placeholder_state)?;
-    let rows = execute_prefetch_query(backend, &bound.sql, &bound.params)
-        .await
-        .map_err(|error| LixError {
-            message: format!(
-                "active version internal update prefetch failed for '{}': {}",
-                bound.sql, error.message
-            ),
-        })?
-        .rows;
+    let rows = execute_prefetch_query(
+        backend,
+        "pending.active_version_internal_update",
+        &bound.sql,
+        &bound.params,
+    )
+    .await
+    .map_err(|error| LixError {
+        message: format!(
+            "active version internal update prefetch failed for '{}': {}",
+            bound.sql, error.message
+        ),
+    })?
+    .rows;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -744,6 +889,127 @@ fn active_version_id_from_internal_state_insert(
     Ok(next_active_version_id)
 }
 
+fn extract_exact_file_update_target(
+    selection: Option<&Expr>,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<ExactFileUpdateTarget>, LixError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let mut file_id: Option<String> = None;
+    let mut version_id: Option<String> = None;
+    if !collect_exact_file_update_predicates(
+        selection,
+        params,
+        placeholder_state,
+        &mut file_id,
+        &mut version_id,
+    )? {
+        return Ok(None);
+    }
+    let Some(file_id) = file_id else {
+        return Ok(None);
+    };
+    Ok(Some(ExactFileUpdateTarget {
+        file_id,
+        explicit_version_id: version_id,
+    }))
+}
+
+fn collect_exact_file_update_predicates(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+    file_id: &mut Option<String>,
+    version_id: &mut Option<String>,
+) -> Result<bool, LixError> {
+    match expr {
+        Expr::Nested(inner) => collect_exact_file_update_predicates(
+            inner,
+            params,
+            placeholder_state,
+            file_id,
+            version_id,
+        ),
+        Expr::BinaryOp { left, op, right } => {
+            if op.to_string().eq_ignore_ascii_case("AND") {
+                let left_ok = collect_exact_file_update_predicates(
+                    left,
+                    params,
+                    placeholder_state,
+                    file_id,
+                    version_id,
+                )?;
+                let right_ok = collect_exact_file_update_predicates(
+                    right,
+                    params,
+                    placeholder_state,
+                    file_id,
+                    version_id,
+                )?;
+                return Ok(left_ok && right_ok);
+            }
+            if op.to_string().eq_ignore_ascii_case("=") {
+                if let Some(column) = expr_column_name(left) {
+                    if let Some(value) =
+                        expr_text_literal_or_placeholder(right, params, placeholder_state)?
+                    {
+                        if apply_exact_file_update_predicate(&column, &value, file_id, version_id) {
+                            return Ok(true);
+                        }
+                    } else {
+                        return Ok(false);
+                    }
+                }
+                if let Some(column) = expr_column_name(right) {
+                    if let Some(value) =
+                        expr_text_literal_or_placeholder(left, params, placeholder_state)?
+                    {
+                        if apply_exact_file_update_predicate(&column, &value, file_id, version_id) {
+                            return Ok(true);
+                        }
+                    } else {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn apply_exact_file_update_predicate(
+    column: &str,
+    value: &str,
+    file_id: &mut Option<String>,
+    version_id: &mut Option<String>,
+) -> bool {
+    if column.eq_ignore_ascii_case("id")
+        || column.eq_ignore_ascii_case("lixcol_entity_id")
+        || column.eq_ignore_ascii_case("lixcol_file_id")
+    {
+        if file_id.as_ref().is_some_and(|existing| existing != value) {
+            return false;
+        }
+        *file_id = Some(value.to_string());
+        return true;
+    }
+    if column.eq_ignore_ascii_case("lixcol_version_id") || column.eq_ignore_ascii_case("version_id")
+    {
+        if version_id
+            .as_ref()
+            .is_some_and(|existing| existing != value)
+        {
+            return false;
+        }
+        *version_id = Some(value.to_string());
+        return true;
+    }
+    false
+}
+
 fn active_version_id_from_snapshot_value(value: &Value) -> Option<String> {
     match value {
         Value::Text(text) => parse_active_version_snapshot(text).ok(),
@@ -827,6 +1093,54 @@ async fn load_before_data_from_cache_batch(
     Ok(out)
 }
 
+async fn load_before_path_from_cache_batch(
+    backend: &dyn LixBackend,
+    keys: &[(String, String)],
+) -> Result<BTreeMap<(String, String), String>, LixError> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    const PAIRS_PER_CHUNK: usize = 200;
+    let mut out = BTreeMap::new();
+
+    for chunk in keys.chunks(PAIRS_PER_CHUNK) {
+        let mut params = Vec::with_capacity(chunk.len() * 2);
+        let mut predicates = Vec::with_capacity(chunk.len());
+        for (index, (file_id, version_id)) in chunk.iter().enumerate() {
+            let file_param = index * 2 + 1;
+            let version_param = file_param + 1;
+            predicates.push(format!(
+                "(file_id = ${file_param} AND version_id = ${version_param})"
+            ));
+            params.push(Value::Text(file_id.clone()));
+            params.push(Value::Text(version_id.clone()));
+        }
+
+        let sql = format!(
+            "SELECT file_id, version_id, path \
+             FROM lix_internal_file_path_cache \
+             WHERE {}",
+            predicates.join(" OR ")
+        );
+        let rows = backend.execute(&sql, &params).await?.rows;
+        for row in rows {
+            let Some(file_id) = row.first().and_then(value_as_text) else {
+                continue;
+            };
+            let Some(version_id) = row.get(1).and_then(value_as_text) else {
+                continue;
+            };
+            let Some(path) = row.get(2).and_then(value_as_text) else {
+                continue;
+            };
+            out.insert((file_id, version_id), path);
+        }
+    }
+
+    Ok(out)
+}
+
 fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget> {
     let TableObject::TableName(name) = table else {
         return None;
@@ -888,11 +1202,152 @@ fn assignment_target_name(assignment: &Assignment) -> Option<String> {
         .map(|ident| ident.value.clone())
 }
 
+fn resolve_case_assignment_text_or_blob_by_id(
+    expr: &sqlparser::ast::Expr,
+    else_column_name: &str,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<BTreeMap<String, Vec<u8>>>, LixError> {
+    let Some(case) = expr_as_id_case(expr, else_column_name) else {
+        return Ok(None);
+    };
+    let mut values = BTreeMap::new();
+    for when in case.conditions {
+        let key_cell = resolve_expr_cell_with_state(&when.condition, params, placeholder_state)?;
+        let Some(key) = resolved_cell_text(Some(&key_cell)) else {
+            return Ok(None);
+        };
+        let value_cell = resolve_expr_cell_with_state(&when.result, params, placeholder_state)?;
+        let Some(value) = resolved_cell_blob_or_text_bytes(Some(&value_cell)) else {
+            return Ok(None);
+        };
+        values.insert(key, value);
+    }
+    Ok(Some(values))
+}
+
+fn resolve_case_assignment_text_by_id(
+    expr: &sqlparser::ast::Expr,
+    else_column_name: &str,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<BTreeMap<String, String>>, LixError> {
+    let Some(case) = expr_as_id_case(expr, else_column_name) else {
+        return Ok(None);
+    };
+    let mut values = BTreeMap::new();
+    for when in case.conditions {
+        let key_cell = resolve_expr_cell_with_state(&when.condition, params, placeholder_state)?;
+        let Some(key) = resolved_cell_text(Some(&key_cell)) else {
+            return Ok(None);
+        };
+        let value_cell = resolve_expr_cell_with_state(&when.result, params, placeholder_state)?;
+        let Some(value) = resolved_cell_text(Some(&value_cell)) else {
+            return Ok(None);
+        };
+        values.insert(key, value);
+    }
+    Ok(Some(values))
+}
+
+fn expr_as_id_case<'a>(
+    expr: &'a sqlparser::ast::Expr,
+    else_column_name: &str,
+) -> Option<ExprCase<'a>> {
+    let sqlparser::ast::Expr::Case {
+        operand,
+        conditions,
+        else_result,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if !operand
+        .as_deref()
+        .is_some_and(|operand| expr_is_column_name(operand, "id"))
+    {
+        return None;
+    }
+    if let Some(else_expr) = else_result.as_deref() {
+        if !expr_is_column_name(else_expr, else_column_name) {
+            return None;
+        }
+    }
+
+    Some(ExprCase { conditions })
+}
+
+fn expr_is_column_name(expr: &sqlparser::ast::Expr, column_name: &str) -> bool {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column_name),
+        sqlparser::ast::Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|ident| ident.value.eq_ignore_ascii_case(column_name)),
+        sqlparser::ast::Expr::Nested(inner) => expr_is_column_name(inner, column_name),
+        _ => false,
+    }
+}
+
+struct ExprCase<'a> {
+    conditions: &'a [sqlparser::ast::CaseWhen],
+}
+
 fn object_name_terminal(name: &ObjectName) -> Option<String> {
     name.0
         .last()
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.clone())
+}
+
+fn expr_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.clone()),
+        Expr::Nested(inner) => expr_column_name(inner),
+        _ => None,
+    }
+}
+
+fn expr_text_literal_or_placeholder(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Result<Option<String>, LixError> {
+    if let Expr::Value(value) = expr {
+        return match &value.value {
+            sqlparser::ast::Value::SingleQuotedString(value)
+            | sqlparser::ast::Value::DoubleQuotedString(value)
+            | sqlparser::ast::Value::TripleSingleQuotedString(value)
+            | sqlparser::ast::Value::TripleDoubleQuotedString(value)
+            | sqlparser::ast::Value::EscapedStringLiteral(value)
+            | sqlparser::ast::Value::UnicodeStringLiteral(value)
+            | sqlparser::ast::Value::NationalStringLiteral(value)
+            | sqlparser::ast::Value::HexStringLiteral(value)
+            | sqlparser::ast::Value::SingleQuotedRawStringLiteral(value)
+            | sqlparser::ast::Value::DoubleQuotedRawStringLiteral(value)
+            | sqlparser::ast::Value::TripleSingleQuotedRawStringLiteral(value)
+            | sqlparser::ast::Value::TripleDoubleQuotedRawStringLiteral(value)
+            | sqlparser::ast::Value::SingleQuotedByteStringLiteral(value)
+            | sqlparser::ast::Value::DoubleQuotedByteStringLiteral(value)
+            | sqlparser::ast::Value::TripleSingleQuotedByteStringLiteral(value)
+            | sqlparser::ast::Value::TripleDoubleQuotedByteStringLiteral(value) => {
+                Ok(Some(value.clone()))
+            }
+            sqlparser::ast::Value::DollarQuotedString(value) => Ok(Some(value.value.clone())),
+            sqlparser::ast::Value::Number(value, _) => Ok(Some(value.clone())),
+            sqlparser::ast::Value::Boolean(value) => {
+                Ok(Some(if *value { "1" } else { "0" }.to_string()))
+            }
+            sqlparser::ast::Value::Null => Ok(None),
+            sqlparser::ast::Value::Placeholder(_) => {
+                let resolved = resolve_expr_cell_with_state(expr, params, placeholder_state)?;
+                Ok(resolved_cell_text(Some(&resolved)))
+            }
+        };
+    }
+    let resolved = resolve_expr_cell_with_state(expr, params, placeholder_state)?;
+    Ok(resolved_cell_text(Some(&resolved)))
 }
 
 fn resolved_cell_text(cell: Option<&crate::sql::ResolvedCell>) -> Option<String> {
@@ -924,11 +1379,35 @@ fn value_as_blob_or_text_bytes(value: &Value) -> Option<Vec<u8>> {
 
 async fn execute_prefetch_query(
     backend: &dyn LixBackend,
+    label: &str,
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
+    let trace = file_prefetch_trace_enabled();
     let output = preprocess_sql(backend, &CelEvaluator::new(), sql, params).await?;
-    backend.execute(&output.sql, &output.params).await
+    let result = backend.execute(&output.sql, &output.params).await?;
+    if trace {
+        eprintln!(
+            "[trace][file-prefetch] module=pending_file_writes label={label} source_sql_chars={} rewritten_sql_chars={} rows={}",
+            sql.len(),
+            output.sql.len(),
+            result.rows.len(),
+        );
+    }
+    Ok(result)
+}
+
+fn file_prefetch_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LIX_TRACE_FILE_PREFETCH")
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                normalized == "1" || normalized == "true" || normalized == "yes"
+            })
+            .unwrap_or(false)
+    })
 }
 
 async fn execute_delete_overlay_prefetch_query(
