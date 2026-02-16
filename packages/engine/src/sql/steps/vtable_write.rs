@@ -2680,7 +2680,7 @@ fn snapshot_content_from_assignments(
         }
 
         // Keep placeholder binding state in sync for assignments we skip.
-        let _ = resolve_expr_cell_with_state(&assignment.value, params, &mut state)?;
+        let _ = resolve_assignment_with_placeholder_state(&assignment.value, params, &mut state)?;
     }
     Ok((None, None))
 }
@@ -3412,6 +3412,38 @@ mod tests {
         let rewrite = rewrite_update(
             update,
             &[EngineValue::Text("{\"key\":\"value\"}".to_string())],
+        )
+        .expect("rewrite ok")
+        .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        let validation = planned.validation.expect("validation plan");
+        assert_eq!(validation.snapshot_content, Some(json!({ "key": "value" })));
+    }
+
+    #[test]
+    fn rewrite_tracked_update_advances_placeholder_state_for_skipped_assignment_expressions() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET metadata = ? || '', snapshot_content = CAST(? AS TEXT)
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(
+            update,
+            &[
+                EngineValue::Text("ignored-metadata".to_string()),
+                EngineValue::Text("{\"key\":\"value\"}".to_string()),
+            ],
         )
         .expect("rewrite ok")
         .expect("rewrite applied");
