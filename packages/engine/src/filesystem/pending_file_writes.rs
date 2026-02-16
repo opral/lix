@@ -530,6 +530,44 @@ async fn collect_delete_targets(
     };
     let mut statement_targets = BTreeSet::new();
 
+    let mut exact_placeholder_state = PlaceholderState::new();
+    if let Some(exact_targets) = extract_exact_file_delete_targets(
+        delete.selection.as_ref(),
+        params,
+        &mut exact_placeholder_state,
+        target,
+        active_version_id,
+    )? {
+        for key in exact_targets {
+            statement_targets.insert(key.clone());
+            targets.insert(key);
+        }
+
+        let overlay_rows = execute_delete_overlay_prefetch_query(
+            backend,
+            delete,
+            params,
+            active_version_id,
+            target,
+            overlay,
+        )
+        .await?;
+        for row in overlay_rows {
+            let Some(file_id) = row.first().and_then(value_as_text) else {
+                continue;
+            };
+            let version_id = row
+                .get(1)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string());
+            let key = (file_id, version_id);
+            statement_targets.insert(key.clone());
+            targets.insert(key);
+        }
+
+        return Ok(statement_targets);
+    }
+
     let selection_uses_id_projection_only = delete
         .selection
         .as_ref()
@@ -944,6 +982,187 @@ fn extract_exact_file_update_target(
         file_id,
         explicit_version_id: version_id,
     }))
+}
+
+fn extract_exact_file_delete_targets(
+    selection: Option<&Expr>,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+    target: FileWriteTarget,
+    active_version_id: &str,
+) -> Result<Option<BTreeSet<(String, String)>>, LixError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let mut file_ids: Option<BTreeSet<String>> = None;
+    let mut version_ids: Option<BTreeSet<String>> = None;
+    if !collect_exact_file_delete_predicates(
+        selection,
+        params,
+        placeholder_state,
+        &mut file_ids,
+        &mut version_ids,
+    )? {
+        return Ok(None);
+    }
+    let Some(file_ids) = file_ids else {
+        return Ok(None);
+    };
+
+    let effective_versions = match target {
+        FileWriteTarget::ActiveVersion => {
+            if let Some(ref constrained_versions) = version_ids {
+                if !constrained_versions.contains(active_version_id) {
+                    return Ok(Some(BTreeSet::new()));
+                }
+            }
+            let mut versions = BTreeSet::new();
+            versions.insert(active_version_id.to_string());
+            versions
+        }
+        FileWriteTarget::ExplicitVersion => {
+            let Some(versions) = version_ids else {
+                return Ok(None);
+            };
+            versions
+        }
+    };
+
+    let mut targets = BTreeSet::new();
+    for file_id in &file_ids {
+        for version_id in &effective_versions {
+            targets.insert((file_id.clone(), version_id.clone()));
+        }
+    }
+    Ok(Some(targets))
+}
+
+fn collect_exact_file_delete_predicates(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+    file_ids: &mut Option<BTreeSet<String>>,
+    version_ids: &mut Option<BTreeSet<String>>,
+) -> Result<bool, LixError> {
+    match expr {
+        Expr::Nested(inner) => collect_exact_file_delete_predicates(
+            inner,
+            params,
+            placeholder_state,
+            file_ids,
+            version_ids,
+        ),
+        Expr::BinaryOp { left, op, right } => {
+            if op.to_string().eq_ignore_ascii_case("AND") {
+                let left_ok = collect_exact_file_delete_predicates(
+                    left,
+                    params,
+                    placeholder_state,
+                    file_ids,
+                    version_ids,
+                )?;
+                let right_ok = collect_exact_file_delete_predicates(
+                    right,
+                    params,
+                    placeholder_state,
+                    file_ids,
+                    version_ids,
+                )?;
+                return Ok(left_ok && right_ok);
+            }
+
+            if op.to_string().eq_ignore_ascii_case("=") {
+                if let Some(column) = expr_column_name(left) {
+                    if let Some(value) =
+                        expr_text_literal_or_placeholder(right, params, placeholder_state)?
+                    {
+                        return Ok(apply_exact_file_delete_predicate(
+                            &column,
+                            std::iter::once(value).collect(),
+                            file_ids,
+                            version_ids,
+                        ));
+                    }
+                    return Ok(false);
+                }
+                if let Some(column) = expr_column_name(right) {
+                    if let Some(value) =
+                        expr_text_literal_or_placeholder(left, params, placeholder_state)?
+                    {
+                        return Ok(apply_exact_file_delete_predicate(
+                            &column,
+                            std::iter::once(value).collect(),
+                            file_ids,
+                            version_ids,
+                        ));
+                    }
+                    return Ok(false);
+                }
+            }
+
+            Ok(false)
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let Some(column) = expr_column_name(expr) else {
+                return Ok(false);
+            };
+            let mut values = BTreeSet::new();
+            for candidate in list {
+                let Some(value) =
+                    expr_text_literal_or_placeholder(candidate, params, placeholder_state)?
+                else {
+                    return Ok(false);
+                };
+                values.insert(value);
+            }
+            if values.is_empty() {
+                return Ok(false);
+            }
+            Ok(apply_exact_file_delete_predicate(
+                &column,
+                values,
+                file_ids,
+                version_ids,
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn apply_exact_file_delete_predicate(
+    column: &str,
+    values: BTreeSet<String>,
+    file_ids: &mut Option<BTreeSet<String>>,
+    version_ids: &mut Option<BTreeSet<String>>,
+) -> bool {
+    if column.eq_ignore_ascii_case("id")
+        || column.eq_ignore_ascii_case("lixcol_entity_id")
+        || column.eq_ignore_ascii_case("lixcol_file_id")
+    {
+        merge_exact_delete_constraint_values(file_ids, values);
+        return true;
+    }
+    if column.eq_ignore_ascii_case("lixcol_version_id") || column.eq_ignore_ascii_case("version_id")
+    {
+        merge_exact_delete_constraint_values(version_ids, values);
+        return true;
+    }
+    false
+}
+
+fn merge_exact_delete_constraint_values(
+    slot: &mut Option<BTreeSet<String>>,
+    values: BTreeSet<String>,
+) {
+    if let Some(existing) = slot.as_mut() {
+        existing.retain(|value| values.contains(value));
+        return;
+    }
+    *slot = Some(values);
 }
 
 fn collect_exact_file_update_predicates(
@@ -1482,6 +1701,84 @@ fn value_as_blob_or_text_bytes(value: &Value) -> Option<Vec<u8>> {
         Value::Blob(bytes) => Some(bytes.clone()),
         Value::Text(text) => Some(text.as_bytes().to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_delete(sql: &str) -> sqlparser::ast::Delete {
+        let statements = crate::sql::parse_sql_statements(sql).expect("parse SQL");
+        let statement = statements.into_iter().next().expect("statement");
+        let Statement::Delete(delete) = statement else {
+            panic!("expected delete statement");
+        };
+        delete
+    }
+
+    #[test]
+    fn exact_delete_targets_active_version_id_in_list() {
+        let delete = parse_delete("DELETE FROM lix_file WHERE id IN ('a', 'b')");
+        let mut state = PlaceholderState::new();
+        let targets = extract_exact_file_delete_targets(
+            delete.selection.as_ref(),
+            &[],
+            &mut state,
+            FileWriteTarget::ActiveVersion,
+            "v1",
+        )
+        .expect("extract targets")
+        .expect("exact target");
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                ("a".to_string(), "v1".to_string()),
+                ("b".to_string(), "v1".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn exact_delete_targets_explicit_version_with_id_and_version_in_lists() {
+        let delete = parse_delete(
+            "DELETE FROM lix_file_by_version \
+             WHERE id IN ('a', 'b') AND lixcol_version_id IN ('v1', 'v2')",
+        );
+        let mut state = PlaceholderState::new();
+        let targets = extract_exact_file_delete_targets(
+            delete.selection.as_ref(),
+            &[],
+            &mut state,
+            FileWriteTarget::ExplicitVersion,
+            "ignored",
+        )
+        .expect("extract targets")
+        .expect("exact target");
+        assert_eq!(
+            targets,
+            BTreeSet::from([
+                ("a".to_string(), "v1".to_string()),
+                ("a".to_string(), "v2".to_string()),
+                ("b".to_string(), "v1".to_string()),
+                ("b".to_string(), "v2".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn exact_delete_targets_reject_non_exact_predicates() {
+        let delete = parse_delete("DELETE FROM lix_file WHERE id = 'a' AND path LIKE '/%a%'");
+        let mut state = PlaceholderState::new();
+        let targets = extract_exact_file_delete_targets(
+            delete.selection.as_ref(),
+            &[],
+            &mut state,
+            FileWriteTarget::ActiveVersion,
+            "v1",
+        )
+        .expect("extract targets");
+        assert!(targets.is_none());
     }
 }
 
