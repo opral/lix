@@ -373,6 +373,104 @@ mod tests {
         assert!(sql.contains("sv.file_id = ?"));
     }
 
+    #[test]
+    fn pushes_version_id_eq_into_lix_state_by_version_source() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' AND sv.version_id = 'bench-v-023'",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.version_id = 'bench-v-023'"));
+        assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
+    }
+
+    #[test]
+    fn pushes_version_id_in_list_into_lix_state_by_version_source() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' \
+               AND sv.version_id IN ('bench-v-022', 'bench-v-023')",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains(
+            "s.version_id IN ('bench-v-022', 'bench-v-023')"
+        ));
+        assert!(!sql.contains(
+            "sv.version_id IN ('bench-v-022', 'bench-v-023')"
+        ));
+    }
+
+    #[test]
+    fn pushes_version_id_in_subquery_into_lix_state_by_version_source() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' \
+               AND sv.version_id IN ( \
+                 SELECT lix_json_text(snapshot_content, 'version_id') \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = 'lix_version_pointer' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+               )",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.version_id IN (SELECT"));
+        assert!(sql.contains("FROM lix_internal_state_untracked"));
+        assert!(!sql.contains("sv.version_id IN (SELECT"));
+    }
+
+    #[test]
+    fn pushes_safe_bare_placeholders_for_schema_and_version() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = ? AND sv.version_id = ?",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.schema_key = ?"));
+        assert!(sql.contains("s.version_id = ?"));
+        assert!(!sql.contains("sv.schema_key = ?"));
+        assert!(!sql.contains("sv.version_id = ?"));
+    }
+
+    #[test]
+    fn pushes_safe_bare_placeholders_for_version_in_list() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = ? AND sv.version_id IN (?, ?)",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.schema_key = ?"));
+        assert!(sql.contains("s.version_id IN (?, ?)"));
+        assert!(!sql.contains("sv.schema_key = ?"));
+        assert!(!sql.contains("sv.version_id IN (?, ?)"));
+    }
+
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
         assert_eq!(statements.len(), 1);
