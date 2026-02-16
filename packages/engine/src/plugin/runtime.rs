@@ -5,6 +5,7 @@ use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
@@ -75,11 +76,31 @@ struct DetectChangesRequest {
     after: PluginFile,
 }
 
+#[allow(dead_code)]
 pub(crate) async fn detect_file_changes_with_plugins(
     backend: &dyn LixBackend,
     runtime: &dyn WasmRuntime,
     writes: &[FileChangeDetectionRequest],
     installed_plugins: &[InstalledPlugin],
+) -> Result<Vec<DetectedFileChange>, LixError> {
+    let mut loaded_instances: BTreeMap<String, Arc<dyn crate::WasmComponentInstance>> =
+        BTreeMap::new();
+    detect_file_changes_with_plugins_with_cache(
+        backend,
+        runtime,
+        writes,
+        installed_plugins,
+        &mut loaded_instances,
+    )
+    .await
+}
+
+pub(crate) async fn detect_file_changes_with_plugins_with_cache(
+    backend: &dyn LixBackend,
+    runtime: &dyn WasmRuntime,
+    writes: &[FileChangeDetectionRequest],
+    installed_plugins: &[InstalledPlugin],
+    loaded_instances: &mut BTreeMap<String, Arc<dyn crate::WasmComponentInstance>>,
 ) -> Result<Vec<DetectedFileChange>, LixError> {
     if writes.is_empty() {
         return Ok(Vec::new());
@@ -135,9 +156,15 @@ pub(crate) async fn detect_file_changes_with_plugins(
             .unwrap_or_default()
             != plugin.key.as_str();
 
-        let instance = runtime
-            .init_component(plugin.wasm.clone(), WasmLimits::default())
-            .await?;
+        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
+            existing.clone()
+        } else {
+            let loaded = runtime
+                .init_component(plugin.wasm.clone(), WasmLimits::default())
+                .await?;
+            loaded_instances.insert(plugin.key.clone(), loaded.clone());
+            loaded
+        };
 
         let mut before_data = if plugin_changed || !has_before_context {
             None

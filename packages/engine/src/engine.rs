@@ -44,7 +44,9 @@ use crate::version::{
     version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
 };
 use crate::WasmRuntime;
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use crate::{
+    LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value, WasmComponentInstance,
+};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
@@ -113,6 +115,7 @@ pub struct Engine {
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
+    plugin_component_cache: Mutex<BTreeMap<String, Arc<dyn WasmComponentInstance>>>,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -258,6 +261,7 @@ pub fn boot(args: BootArgs) -> Engine {
         deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
         active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
         installed_plugins_cache: RwLock::new(None),
+        plugin_component_cache: Mutex::new(BTreeMap::new()),
     }
 }
 
@@ -299,6 +303,10 @@ impl Engine {
             message: "installed plugin cache lock poisoned".to_string(),
         })?;
         *guard = None;
+        let mut component_guard = self.plugin_component_cache.lock().map_err(|_| LixError {
+            message: "plugin component cache lock poisoned".to_string(),
+        })?;
+        component_guard.clear();
         Ok(())
     }
 
@@ -1820,6 +1828,14 @@ impl Engine {
             return Ok(vec![Vec::new(); writes_by_statement.len()]);
         }
 
+        let mut loaded_instances = {
+            self.plugin_component_cache
+                .lock()
+                .map_err(|_| LixError {
+                    message: "plugin component cache lock poisoned".to_string(),
+                })?
+                .clone()
+        };
         let mut detected_by_statement = Vec::with_capacity(writes_by_statement.len());
         for writes in writes_by_statement {
             if writes.is_empty() {
@@ -1838,17 +1854,24 @@ impl Engine {
                     after_data: write.after_data.clone(),
                 })
                 .collect::<Vec<_>>();
-            let detected = crate::plugin::runtime::detect_file_changes_with_plugins(
+            let detected = crate::plugin::runtime::detect_file_changes_with_plugins_with_cache(
                 backend,
                 runtime.as_ref(),
                 &requests,
                 &installed_plugins,
+                &mut loaded_instances,
             )
             .await
             .map_err(|error| LixError {
                 message: format!("file detect stage failed: {}", error.message),
             })?;
             detected_by_statement.push(dedupe_detected_file_changes(&detected));
+        }
+        {
+            let mut guard = self.plugin_component_cache.lock().map_err(|_| LixError {
+                message: "plugin component cache lock poisoned".to_string(),
+            })?;
+            *guard = loaded_instances;
         }
 
         Ok(detected_by_statement)

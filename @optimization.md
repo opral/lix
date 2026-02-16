@@ -14,3 +14,18 @@ Result: Replay duration `9827.51ms` (from `15950.20ms`, `-38.4%`), commit throug
 Hypothesis: `pending.collect_update_writes` still dominates after optimize 1 because it expands `lix_file_by_version` for each id-scoped update; using file path/data caches should bypass that expansion for common replay updates.
 Implementation: Add exact-id fast path in `pending_file_writes` that reads before-path from `lix_internal_file_path_cache` and before-data from `lix_internal_file_data_cache`. Populate/maintain path cache in engine postprocess and invalidate on deletes.
 Result: Replay duration `3349.14ms` (from `9827.51ms`, `-65.9%`; from original baseline `15950.20ms`, `-79.0%`). Commit throughput `6.27 commits/s` (`+193%` vs optimize 1). `cargo test -p lix_engine pending_file_writes` passed.
+
+## optimize 3: reuse plugin wasm instances across detect loop
+Hypothesis: detect pipeline still pays heavy non-SQL cost because wasm plugin components are instantiated repeatedly (per write/per statement).
+Implementation: Keep an instance cache by plugin key during detect execution and reuse initialized components across statement-level detect calls.
+Result: Replay duration `3250.95ms` (from `3349.14ms`, `-2.9%`). Below 10% threshold, no commit.
+
+## optimize 4: cache instantiated wasm component in node runtime
+Hypothesis: first-write latency is dominated by host-side wasm component initialization; re-instantiating the same plugin component each execute call is unnecessary.
+Implementation: In `js-sdk` node wasm runtime, cache initialized component instances by wasm hash and reuse for `initComponent` calls.
+Result: Replay duration `3284.56ms` (worse than optimize 3 by `+1.0%`). Reverted.
+
+## optimize 5: engine-lifetime plugin component cache
+Hypothesis: plugin instance reuse only within a single `execute` still re-initializes component instances across statements/commits; promoting cache to engine lifecycle should reduce per-statement fixed cost.
+Implementation: Add engine-owned plugin component cache keyed by plugin key, reuse across detect calls, clear cache when plugin SQL invalidates installed plugin cache.
+Result: Replay duration `2908.15ms` (from `3349.14ms`, `-13.2%`; from original baseline `15950.20ms`, `-81.8%`), confirmed across repeated run (`2918.10ms`).
