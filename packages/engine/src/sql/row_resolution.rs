@@ -292,7 +292,6 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
         | SqlValue::EscapedStringLiteral(text)
         | SqlValue::UnicodeStringLiteral(text)
         | SqlValue::NationalStringLiteral(text)
-        | SqlValue::HexStringLiteral(text)
         | SqlValue::SingleQuotedRawStringLiteral(text)
         | SqlValue::DoubleQuotedRawStringLiteral(text)
         | SqlValue::TripleSingleQuotedRawStringLiteral(text)
@@ -301,11 +300,45 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
         | SqlValue::DoubleQuotedByteStringLiteral(text)
         | SqlValue::TripleSingleQuotedByteStringLiteral(text)
         | SqlValue::TripleDoubleQuotedByteStringLiteral(text) => Ok(Value::Text(text.clone())),
+        SqlValue::HexStringLiteral(text) => Ok(Value::Blob(parse_hex_literal(text)?)),
         SqlValue::DollarQuotedString(text) => Ok(Value::Text(text.value.clone())),
         SqlValue::Boolean(value) => Ok(Value::Integer(if *value { 1 } else { 0 })),
         SqlValue::Null => Ok(Value::Null),
         SqlValue::Placeholder(token) => Err(LixError {
             message: format!("unexpected placeholder '{token}' while resolving row"),
+        }),
+    }
+}
+
+fn parse_hex_literal(text: &str) -> Result<Vec<u8>, LixError> {
+    if text.len() % 2 != 0 {
+        return Err(LixError {
+            message: format!(
+                "hex literal must contain an even number of digits, got {}",
+                text.len()
+            ),
+        });
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = hex_nibble(bytes[index])?;
+        let lo = hex_nibble(bytes[index + 1])?;
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, LixError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(LixError {
+            message: format!("invalid hex digit '{}'", char::from(byte)),
         }),
     }
 }
@@ -404,5 +437,12 @@ mod tests {
             .expect_err("must error");
 
         assert!(err.message.contains("vtable insert requires VALUES rows"));
+    }
+
+    #[test]
+    fn resolves_hex_literal_as_blob() {
+        let rows = parse_values_rows("INSERT INTO t(a) VALUES (X'414243')");
+        let resolved = resolve_values_rows(&rows, &[]).expect("resolve");
+        assert_eq!(resolved[0][0].value, Some(Value::Blob(vec![65, 66, 67])));
     }
 }
