@@ -250,23 +250,23 @@ fn resolve_expr(
     params: &[Value],
     state: &mut PlaceholderState,
 ) -> Result<ResolvedCell, LixError> {
-    let Expr::Value(value) = expr else {
-        return Ok(ResolvedCell {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Placeholder(token) => {
+                let index = resolve_placeholder_index(token, params.len(), state)?;
+                Ok(ResolvedCell {
+                    value: Some(params[index].clone()),
+                    placeholder_index: Some(index),
+                })
+            }
+            other => Ok(ResolvedCell {
+                value: Some(sql_literal_to_engine_value(other)?),
+                placeholder_index: None,
+            }),
+        },
+        Expr::Cast { expr, .. } | Expr::Nested(expr) => resolve_expr(expr, params, state),
+        _ => Ok(ResolvedCell {
             value: None,
-            placeholder_index: None,
-        });
-    };
-
-    match &value.value {
-        SqlValue::Placeholder(token) => {
-            let index = resolve_placeholder_index(token, params.len(), state)?;
-            Ok(ResolvedCell {
-                value: Some(params[index].clone()),
-                placeholder_index: Some(index),
-            })
-        }
-        other => Ok(ResolvedCell {
-            value: Some(sql_literal_to_engine_value(other)?),
             placeholder_index: None,
         }),
     }
@@ -444,5 +444,17 @@ mod tests {
         let rows = parse_values_rows("INSERT INTO t(a) VALUES (X'414243')");
         let resolved = resolve_values_rows(&rows, &[]).expect("resolve");
         assert_eq!(resolved[0][0].value, Some(Value::Blob(vec![65, 66, 67])));
+    }
+
+    #[test]
+    fn resolves_cast_wrapped_placeholders() {
+        let rows = parse_values_rows("INSERT INTO t(a, b) VALUES (CAST(? AS TEXT), (?))");
+        let params = vec![Value::Text("a".to_string()), Value::Text("b".to_string())];
+        let resolved = resolve_values_rows(&rows, &params).expect("resolve");
+
+        assert_eq!(resolved[0][0].placeholder_index, Some(0));
+        assert_eq!(resolved[0][0].value, Some(Value::Text("a".to_string())));
+        assert_eq!(resolved[0][1].placeholder_index, Some(1));
+        assert_eq!(resolved[0][1].value, Some(Value::Text("b".to_string())));
     }
 }

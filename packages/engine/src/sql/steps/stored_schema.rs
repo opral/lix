@@ -335,9 +335,7 @@ fn snapshot_literal(expr: &Expr, cell: Option<&ResolvedCell>) -> Result<String, 
             ..
         }) => Ok(value.clone()),
         _ => Err(LixError {
-            message:
-                "stored schema insert requires literal snapshot_content (prepared statement support TODO)"
-                    .to_string(),
+            message: "stored schema insert requires literal snapshot_content".to_string(),
         }),
     }
 }
@@ -476,6 +474,33 @@ mod tests {
             .table
             .to_string()
             .contains("lix_internal_state_materialized_v1_lix_stored_schema"));
+    }
+
+    #[test]
+    fn rewrite_stored_schema_insert_supports_cast_placeholder_snapshot_content() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', CAST(? AS TEXT))"#;
+        let insert = parse_insert(sql);
+        let rewritten = rewrite_insert(
+            insert,
+            &[EngineValue::Text(
+                "{\"value\":{\"x-lix-key\":\"mock_schema\",\"x-lix-version\":\"1\"}}".to_string(),
+            )],
+        )
+        .expect("rewrite ok")
+        .expect("rewritten");
+        let insert = match rewritten.statement {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+
+        let row = extract_row(&insert);
+        let snapshot_idx = column_index(&insert.columns, "snapshot_content");
+        let entity_idx = column_index(&insert.columns, "entity_id");
+        assert_eq!(
+            expr_string(&row[snapshot_idx]),
+            "{\"value\":{\"x-lix-key\":\"mock_schema\",\"x-lix-version\":\"1\"}}"
+        );
+        assert_eq!(expr_string(&row[entity_idx]), "mock_schema~1");
     }
 
     #[test]
