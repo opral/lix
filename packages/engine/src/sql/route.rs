@@ -593,7 +593,7 @@ where
             Ok(output)
         }
         Statement::Query(query) => {
-            let query = rewrite_read_query_with_backend(backend, *query).await?;
+            let query = rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
             Ok(RewriteOutput {
                 statements: vec![Statement::Query(Box::new(query))],
                 registrations: Vec::new(),
@@ -614,7 +614,7 @@ where
         } => {
             let statement = match *statement {
                 Statement::Query(query) => Statement::Query(Box::new(
-                    rewrite_read_query_with_backend(backend, *query).await?,
+                    rewrite_read_query_with_backend_and_params(backend, *query, params).await?,
                 )),
                 other => other,
             };
@@ -655,7 +655,15 @@ pub(crate) async fn rewrite_read_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
 ) -> Result<Query, LixError> {
-    let query = filesystem_step::rewrite_query(query.clone())?.unwrap_or(query);
+    rewrite_read_query_with_backend_and_params(backend, query, &[]).await
+}
+
+pub(crate) async fn rewrite_read_query_with_backend_and_params(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    let query = filesystem_step::rewrite_query_with_params(query.clone(), params)?.unwrap_or(query);
     let query = entity_view_read::rewrite_query_with_backend(backend, query.clone())
         .await?
         .unwrap_or(query);
