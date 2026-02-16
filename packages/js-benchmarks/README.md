@@ -68,6 +68,7 @@ The JSON benchmark installs:
 - legacy JS plugin (`@lix-js/plugin-json`) in old SDK
 - wasm JSON plugin (`plugin-json-v2`) in new `js-sdk`
 
-If new runtime plugin execution is unavailable, the benchmark prints a warning and reports `plugin rows/file (new): 0.0`.
+The new `js-sdk` benchmark path uses `openLix()` with the SDK-selected runtime. In Node, `js-sdk`
+loads its built-in component runtime and executes installed wasm plugins during inserts.
 
 Set `BENCH_REQUIRE_PLUGIN_EXEC=1` to fail the run when plugin rows are zero.

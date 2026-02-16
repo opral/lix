@@ -16,6 +16,7 @@ pub(crate) use ast_utils::{default_alias, object_name_matches, parse_single_quer
 pub(crate) use escaping::escape_sql_string;
 pub(crate) use lowering::lower_statement;
 pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};
+pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
 #[allow(unused_imports)]
 pub use pipeline::{
     parse_sql_statements, preprocess_sql, preprocess_sql_rewrite_only,

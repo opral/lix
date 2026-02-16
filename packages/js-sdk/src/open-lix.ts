@@ -5,6 +5,7 @@ import init, {
   resolveEngineWasmModuleOrPath,
 } from "./engine-wasm/index.js";
 import { createWasmSqliteBackend } from "./backend/wasm-sqlite.js";
+import type { LixWasmRuntime } from "./engine-wasm/index.js";
 import type { LixBackend } from "./types.js";
 
 export type {
@@ -34,15 +35,26 @@ export type InstallPluginOptions = {
   wasmBytes: Uint8Array | ArrayBuffer;
 };
 
+export type OpenLixKeyValue = {
+  key: string;
+  value: unknown;
+  versionId?: string;
+  version_id?: string;
+  lixcol_version_id?: string;
+};
+
 export type Lix = {
   execute(sql: string, params?: ReadonlyArray<unknown>): Promise<QueryResult>;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
   switchVersion(versionId: string): Promise<void>;
   installPlugin(args: InstallPluginOptions): Promise<void>;
+  /** Exports the current database as SQLite file bytes (portable `.lix` artifact). */
+  exportSnapshot(): Promise<Uint8Array>;
   close(): Promise<void>;
 };
 
 let wasmReady: Promise<void> | null = null;
+let defaultWasmRuntime: Promise<LixWasmRuntime | undefined> | null = null;
 
 async function ensureWasmReady(): Promise<void> {
   if (!wasmReady) {
@@ -56,11 +68,16 @@ async function ensureWasmReady(): Promise<void> {
 export async function openLix(
   args: {
     backend?: LixBackend;
+    keyValues?: ReadonlyArray<OpenLixKeyValue>;
   } = {},
 ): Promise<Lix> {
   await ensureWasmReady();
   const backend = args.backend ?? (await createWasmSqliteBackend());
-  const wasmLix = await openLixWasm(backend);
+  const wasmLix = await openLixWasm(
+    backend,
+    await getDefaultWasmRuntime(),
+    args.keyValues ? [...args.keyValues] : undefined,
+  );
   let closed = false;
 
   const ensureOpen = (methodName: string): void => {
@@ -143,6 +160,21 @@ export async function openLix(
     await (wasmLix as any).installPlugin(manifestJson, wasmBytes);
   };
 
+  const exportSnapshot = async (): Promise<Uint8Array> => {
+    ensureOpen("exportSnapshot");
+    if (typeof (wasmLix as any).exportSnapshot !== "function") {
+      throw new Error("exportSnapshot is not available in this wasm build");
+    }
+    const output = await (wasmLix as any).exportSnapshot();
+    if (output instanceof Uint8Array) {
+      return output;
+    }
+    if (output instanceof ArrayBuffer) {
+      return new Uint8Array(output);
+    }
+    throw new Error("exportSnapshot() must return Uint8Array or ArrayBuffer");
+  };
+
   const close = async (): Promise<void> => {
     if (closed) {
       return;
@@ -180,8 +212,39 @@ export async function openLix(
     createVersion,
     switchVersion,
     installPlugin,
+    exportSnapshot,
     close,
   };
+}
+
+async function getDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+  if (!defaultWasmRuntime) {
+    defaultWasmRuntime = loadDefaultWasmRuntime();
+  }
+  return await defaultWasmRuntime;
+}
+
+async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+  if (!isNodeRuntime()) {
+    return undefined;
+  }
+
+  const module = await import("./wasm-runtime/node.js");
+  if (typeof module.createNodeWasmRuntime !== "function") {
+    throw new Error("js-sdk node runtime module is missing createNodeWasmRuntime()");
+  }
+  return module.createNodeWasmRuntime();
+}
+
+function isNodeRuntime(): boolean {
+  const globalProcess = (globalThis as {
+    process?: { versions?: { node?: string } };
+  }).process;
+  return (
+    typeof globalProcess === "object" &&
+    typeof globalProcess.versions === "object" &&
+    typeof globalProcess.versions?.node === "string"
+  );
 }
 
 function firstRow(result: QueryResult, context: string): unknown[] {

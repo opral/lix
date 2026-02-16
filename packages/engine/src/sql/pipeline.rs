@@ -117,14 +117,16 @@ where
             .get(statement_index)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let output = rewrite_statement_with_backend(
+        // Keep this large async rewrite future on the heap to avoid excessive
+        // stack growth in callers that process many rewrite layers.
+        let output = Box::pin(rewrite_statement_with_backend(
             backend,
             statement,
             params,
             provider,
             statement_detected_file_domain_changes,
             writer_key,
-        )
+        ))
         .await?;
         registrations.extend(output.registrations);
         if let Some(plan) = output.postprocess {
@@ -284,6 +286,37 @@ fn coalesce_vtable_inserts_in_transactions(
                 result.push(statement);
             }
             Statement::Insert(insert) if in_transaction => {
+                if let Some(existing) = pending_insert.as_mut() {
+                    if can_merge_vtable_insert(existing, &insert) {
+                        append_insert_rows(existing, &insert)?;
+                    } else {
+                        flush_pending_insert(&mut result, &mut pending_insert);
+                        pending_insert = Some(insert);
+                    }
+                } else {
+                    pending_insert = Some(insert);
+                }
+            }
+            other => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                result.push(other);
+            }
+        }
+    }
+
+    flush_pending_insert(&mut result, &mut pending_insert);
+    Ok(result)
+}
+
+pub(crate) fn coalesce_vtable_inserts_in_statement_list(
+    statements: Vec<Statement>,
+) -> Result<Vec<Statement>, LixError> {
+    let mut result = Vec::with_capacity(statements.len());
+    let mut pending_insert: Option<Insert> = None;
+
+    for statement in statements {
+        match statement {
+            Statement::Insert(insert) => {
                 if let Some(existing) = pending_insert.as_mut() {
                     if can_merge_vtable_insert(existing, &insert) {
                         append_insert_rows(existing, &insert)?;

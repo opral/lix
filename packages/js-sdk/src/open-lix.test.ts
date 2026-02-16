@@ -50,6 +50,38 @@ test("installPlugin stores plugin metadata", async () => {
   await lix.close();
 });
 
+test("exportSnapshot returns sqlite bytes", async () => {
+  const lix = await openLix();
+  await lix.execute("INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a.txt', x'01')", []);
+  const snapshot = await lix.exportSnapshot();
+  expect(snapshot).toBeInstanceOf(Uint8Array);
+  expect(snapshot.byteLength).toBeGreaterThan(0);
+  await lix.close();
+});
+
+test("openLix seeds keyValues at startup", async () => {
+  const lix = await openLix({
+    keyValues: [
+      {
+        key: "lix_deterministic_mode",
+        value: { enabled: true },
+        lixcol_version_id: "global",
+      },
+    ],
+  });
+  const result = await lix.execute(
+    "SELECT value FROM lix_key_value \
+     WHERE key = 'lix_deterministic_mode' LIMIT 1",
+    [],
+  );
+  expect(result.rows.length).toBe(1);
+  expect(result.rows[0][0]).toEqual({
+    kind: "Text",
+    value: JSON.stringify({ enabled: true }),
+  });
+  await lix.close();
+});
+
 test("close is idempotent and blocks further API calls", async () => {
   const lix = await openLix();
   await lix.close();

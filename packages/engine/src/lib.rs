@@ -16,6 +16,7 @@ mod materialization;
 mod plugin;
 mod schema;
 mod schema_registry;
+mod snapshot;
 mod sql;
 mod types;
 mod validation;
@@ -47,5 +48,6 @@ pub use materialization::{
     StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
     VersionPointerDebugRow,
 };
+pub use snapshot::{SnapshotChunkReader, SnapshotChunkWriter};
 pub use types::{QueryResult, Value};
-pub use wasm_runtime::{LoadWasmComponentRequest, WasmInstance, WasmLimits, WasmRuntime};
+pub use wasm_runtime::{WasmComponentInstance, WasmLimits, WasmRuntime};

@@ -83,7 +83,15 @@ async function main() {
 }
 
 async function runScenario(scenario, wasmBytes) {
-  const lix = await openNewLix();
+  const lix = await openNewLix({
+    keyValues: [
+      {
+        key: "lix_deterministic_mode",
+        value: { enabled: true },
+        lixcol_version_id: "global",
+      },
+    ],
+  });
   try {
     if (scenario.installPlugin) {
       await lix.installPlugin({ manifestJson: MANIFEST, wasmBytes });
@@ -133,7 +141,7 @@ async function runScenario(scenario, wasmBytes) {
       fileRowsTotal: scalarToNumber(fileRowsResult.rows?.[0]?.[0], "file rows total"),
     };
   } finally {
-    // js-sdk currently does not expose close().
+    await lix.close();
   }
 }
 

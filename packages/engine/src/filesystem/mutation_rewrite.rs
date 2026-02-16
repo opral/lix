@@ -1,11 +1,13 @@
 use serde_json::json;
 use sqlparser::ast::{
-    Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan, Values,
+    Assignment, Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan,
+    Values,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
@@ -480,6 +482,7 @@ pub async fn rewrite_update_with_backend(
     reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
+        let original_assignments = update.assignments.clone();
         update.assignments.retain(|assignment| {
             assignment_target_name(assignment)
                 .map(|name| !name.eq_ignore_ascii_case("data"))
@@ -488,7 +491,14 @@ pub async fn rewrite_update_with_backend(
         if update.assignments.is_empty() {
             return Ok(Some(noop_statement()?));
         }
-        rewrite_file_update_assignments_with_backend(backend, &mut update, params, target).await?;
+        rewrite_file_update_assignments_with_backend(
+            backend,
+            &mut update,
+            &original_assignments,
+            params,
+            target,
+        )
+        .await?;
     } else {
         rewrite_directory_update_assignments_with_backend(backend, &mut update, params, target)
             .await?;
@@ -989,12 +999,13 @@ async fn rewrite_directory_insert_columns_with_backend(
 async fn rewrite_file_update_assignments_with_backend(
     backend: &dyn LixBackend,
     update: &mut Update,
+    original_assignments: &[Assignment],
     params: &[EngineValue],
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
     let mut placeholder_state = PlaceholderState::new();
     let mut next_path: Option<String> = None;
-    for assignment in &update.assignments {
+    for assignment in original_assignments {
         let Some(column) = assignment_target_name(assignment) else {
             continue;
         };
@@ -2124,9 +2135,7 @@ fn expr_string_literal_or_placeholder(
         EngineValue::Integer(value) => Ok(Some(value.to_string())),
         EngineValue::Real(value) => Ok(Some(value.to_string())),
         EngineValue::Null => Ok(None),
-        EngineValue::Blob(_) => Err(LixError {
-            message: "version_id predicate expects text-compatible value".to_string(),
-        }),
+        EngineValue::Blob(_) => Ok(None),
     }
 }
 
@@ -2441,6 +2450,13 @@ struct ScopedFileUpdateRow {
     untracked: bool,
 }
 
+#[derive(Debug, Default, Clone)]
+struct ExactFileUpdateSelection {
+    file_id: Option<String>,
+    explicit_version_id: Option<String>,
+    invalid: bool,
+}
+
 async fn file_ids_matching_update(
     backend: &dyn LixBackend,
     update: &Update,
@@ -2448,13 +2464,29 @@ async fn file_ids_matching_update(
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
 ) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
+    let trace = file_prefetch_trace_enabled();
+    if let Some(rows) =
+        try_file_ids_matching_update_fast(backend, update, target, params, placeholder_state)
+            .await?
+    {
+        if trace {
+            eprintln!(
+                "[trace][file-prefetch] module=mutation_rewrite label=file_ids_matching_update mode=fast-id rows={}",
+                rows.len(),
+            );
+        }
+        return Ok(rows);
+    }
+
     let where_clause = update
         .selection
         .as_ref()
         .map(|selection| format!(" WHERE {selection}"))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT id, lixcol_untracked FROM {view_name}{where_clause}",
+        "SELECT id, lixcol_untracked, \
+                'mutation.file_ids_matching_update' AS __lix_trace \
+         FROM {view_name}{where_clause}",
         view_name = target.view_name,
         where_clause = where_clause
     );
@@ -2469,6 +2501,14 @@ async fn file_ids_matching_update(
                 bound.sql, error.message
             ),
         })?;
+    if trace {
+        eprintln!(
+            "[trace][file-prefetch] module=mutation_rewrite label=file_ids_matching_update source_sql_chars={} rewritten_sql_chars={} rows={}",
+            sql.len(),
+            bound.sql.len(),
+            result.rows.len(),
+        );
+    }
 
     let mut out: Vec<ScopedFileUpdateRow> = Vec::new();
     for row in result.rows {
@@ -2494,6 +2534,303 @@ async fn file_ids_matching_update(
     out.sort_by(|left, right| left.id.cmp(&right.id));
     out.dedup_by(|left, right| left.id == right.id);
     Ok(out)
+}
+
+async fn try_file_ids_matching_update_fast(
+    backend: &dyn LixBackend,
+    update: &Update,
+    target: FilesystemTarget,
+    params: &[EngineValue],
+    placeholder_state: PlaceholderState,
+) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
+    let mut selection_state = placeholder_state;
+    let Some(selection) = extract_exact_file_update_selection_with_state(
+        update.selection.as_ref(),
+        params,
+        &mut selection_state,
+        backend.dialect(),
+    )?
+    else {
+        return Ok(None);
+    };
+    if selection.invalid {
+        return Ok(None);
+    }
+    let Some(file_id) = selection.file_id else {
+        return Ok(None);
+    };
+    let version_id = if target.uses_active_version_scope() {
+        load_active_version_id(backend).await?
+    } else if target.requires_explicit_version_scope() {
+        let Some(version_id) = selection.explicit_version_id else {
+            return Ok(None);
+        };
+        version_id
+    } else {
+        return Ok(None);
+    };
+
+    if let Some(rows) =
+        try_exact_file_descriptor_lookup_current_version(backend, &version_id, &file_id).await?
+    {
+        return Ok(Some(rows));
+    }
+
+    let sql = "SELECT entity_id, untracked, \
+                    'mutation.file_ids_matching_update.fast_id' AS __lix_trace \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND snapshot_content IS NOT NULL \
+               AND version_id = $1 \
+               AND entity_id = $2";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[EngineValue::Text(version_id), EngineValue::Text(file_id)],
+        )
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update fast-path prefetch failed for '{}': {}",
+                rewritten_sql, error.message
+            ),
+        })?;
+
+    let mut out = Vec::<ScopedFileUpdateRow>::with_capacity(result.rows.len());
+    for row in result.rows {
+        let Some(id_value) = row.first() else {
+            continue;
+        };
+        let EngineValue::Text(id) = id_value else {
+            return Err(LixError {
+                message: format!("file update id lookup expected text, got {id_value:?}"),
+            });
+        };
+        let untracked = row
+            .get(1)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        out.push(ScopedFileUpdateRow {
+            id: id.clone(),
+            untracked,
+        });
+    }
+    Ok(Some(out))
+}
+
+async fn try_exact_file_descriptor_lookup_current_version(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    file_id: &str,
+) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
+    let sql = "SELECT entity_id, untracked, is_tombstone, \
+                    'mutation.file_ids_matching_update.fast_id.direct' AS __lix_trace \
+             FROM (\
+                 SELECT entity_id, 1 AS untracked, \
+                        CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+                        0 AS source_priority, \
+                        updated_at \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND version_id = $1 \
+                   AND entity_id = $2 \
+                 UNION ALL \
+                 SELECT entity_id, 0 AS untracked, is_tombstone, 1 AS source_priority, updated_at \
+                 FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND version_id = $1 \
+                   AND entity_id = $2 \
+                   AND is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL\
+             ) AS exact_rows \
+             ORDER BY source_priority, updated_at DESC \
+             LIMIT 1";
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let result = backend
+        .execute(
+            &rewritten_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(file_id.to_string()),
+            ],
+        )
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update exact current-version prefetch failed for '{}': {}",
+                rewritten_sql, error.message
+            ),
+        })?;
+
+    parse_exact_file_descriptor_lookup_rows(result.rows)
+}
+
+fn parse_exact_file_descriptor_lookup_rows(
+    rows: Vec<Vec<EngineValue>>,
+) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let Some(id_value) = row.first() else {
+        return Ok(Some(Vec::new()));
+    };
+    let EngineValue::Text(id) = id_value else {
+        return Err(LixError {
+            message: format!("file update id lookup expected text, got {id_value:?}"),
+        });
+    };
+    let untracked = row
+        .get(1)
+        .map(parse_untracked_value)
+        .transpose()?
+        .unwrap_or(false);
+    let is_tombstone = row
+        .get(2)
+        .map(parse_untracked_value)
+        .transpose()?
+        .unwrap_or(false);
+    if is_tombstone {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(vec![ScopedFileUpdateRow {
+        id: id.clone(),
+        untracked,
+    }]))
+}
+
+fn extract_exact_file_update_selection_with_state(
+    selection: Option<&Expr>,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
+) -> Result<Option<ExactFileUpdateSelection>, LixError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let mut out = ExactFileUpdateSelection::default();
+    if !collect_exact_file_update_predicates(
+        selection,
+        params,
+        placeholder_state,
+        dialect,
+        &mut out,
+    )? {
+        return Ok(None);
+    }
+    if out.invalid || out.file_id.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+fn collect_exact_file_update_predicates(
+    selection: &Expr,
+    params: &[EngineValue],
+    placeholder_state: &mut PlaceholderState,
+    dialect: crate::SqlDialect,
+    out: &mut ExactFileUpdateSelection,
+) -> Result<bool, LixError> {
+    match selection {
+        Expr::Nested(inner) => {
+            collect_exact_file_update_predicates(inner, params, placeholder_state, dialect, out)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if op.to_string().eq_ignore_ascii_case("AND") {
+                let left_ok = collect_exact_file_update_predicates(
+                    left,
+                    params,
+                    placeholder_state,
+                    dialect,
+                    out,
+                )?;
+                let right_ok = collect_exact_file_update_predicates(
+                    right,
+                    params,
+                    placeholder_state,
+                    dialect,
+                    out,
+                )?;
+                return Ok(left_ok && right_ok);
+            }
+            if op.to_string().eq_ignore_ascii_case("=") {
+                if let Some(column) = expr_column_name(left) {
+                    if let Some(value) =
+                        expr_string_literal_or_placeholder(right, params, placeholder_state)?
+                    {
+                        if apply_exact_file_update_predicate(&column, &value, out) {
+                            return Ok(true);
+                        }
+                    } else {
+                        return Ok(false);
+                    }
+                }
+                if let Some(column) = expr_column_name(right) {
+                    if let Some(value) =
+                        expr_string_literal_or_placeholder(left, params, placeholder_state)?
+                    {
+                        if apply_exact_file_update_predicate(&column, &value, out) {
+                            return Ok(true);
+                        }
+                    } else {
+                        return Ok(false);
+                    }
+                }
+            }
+            consume_placeholders_in_expr(selection, params, placeholder_state, dialect)?;
+            Ok(false)
+        }
+        _ => {
+            consume_placeholders_in_expr(selection, params, placeholder_state, dialect)?;
+            Ok(false)
+        }
+    }
+}
+
+fn apply_exact_file_update_predicate(
+    column: &str,
+    value: &str,
+    out: &mut ExactFileUpdateSelection,
+) -> bool {
+    if column.eq_ignore_ascii_case("id")
+        || column.eq_ignore_ascii_case("lixcol_entity_id")
+        || column.eq_ignore_ascii_case("lixcol_file_id")
+    {
+        if let Some(existing) = out.file_id.as_ref() {
+            if existing != value {
+                out.invalid = true;
+            }
+        } else {
+            out.file_id = Some(value.to_string());
+        }
+        return true;
+    }
+    if column.eq_ignore_ascii_case("lixcol_version_id") || column.eq_ignore_ascii_case("version_id")
+    {
+        if let Some(existing) = out.explicit_version_id.as_ref() {
+            if existing != value {
+                out.invalid = true;
+            }
+        } else {
+            out.explicit_version_id = Some(value.to_string());
+        }
+        return true;
+    }
+    false
+}
+
+fn file_prefetch_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LIX_TRACE_FILE_PREFETCH")
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                normalized == "1" || normalized == "true" || normalized == "yes"
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
@@ -2761,7 +3098,8 @@ fn noop_statement() -> Result<Statement, LixError> {
 mod tests {
     use super::{
         extract_predicate_string_with_params_and_state, json_text_extract_for_dialect,
-        parse_expression, rewrite_delete, rewrite_insert, rewrite_update,
+        parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
+        rewrite_update,
     };
     use crate::backend::SqlDialect;
     use crate::sql::parse_sql_statements;
@@ -2955,5 +3293,37 @@ mod tests {
         )
         .expect("extract version predicate");
         assert_eq!(extracted.as_deref(), Some("version-target"));
+    }
+
+    #[test]
+    fn exact_file_descriptor_lookup_treats_untracked_tombstone_as_no_match() {
+        let rows = vec![vec![
+            Value::Text("file-a".to_string()),
+            Value::Integer(1),
+            Value::Integer(1),
+        ]];
+        let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
+        assert!(
+            parsed.is_some(),
+            "exact lookup should short-circuit fallback"
+        );
+        assert!(
+            parsed.expect("result").is_empty(),
+            "tombstoned row should not be treated as live match"
+        );
+    }
+
+    #[test]
+    fn exact_file_descriptor_lookup_keeps_live_untracked_row() {
+        let rows = vec![vec![
+            Value::Text("file-b".to_string()),
+            Value::Integer(1),
+            Value::Integer(0),
+        ]];
+        let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
+        let parsed = parsed.expect("live row should exist");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "file-b");
+        assert!(parsed[0].untracked);
     }
 }
