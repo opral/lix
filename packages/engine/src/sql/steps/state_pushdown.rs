@@ -75,9 +75,10 @@ pub(crate) fn take_pushdown_predicates(
     for predicate in split_conjunction(selection_expr) {
         let extracted = extract_pushdown_predicate(&predicate, relation_name, allow_unqualified)
             .and_then(|(column, predicate_sql)| match column.as_str() {
-                "entity_id" | "schema_key" | "file_id" | "version_id" => {
+                "entity_id" | "schema_key" | "file_id" => {
                     Some((PushdownBucket::Source, format!("s.{predicate_sql}")))
                 }
+                "version_id" => Some((PushdownBucket::Ranked, format!("ranked.{predicate_sql}"))),
                 "plugin_key" => {
                     // Keep plugin filtering after winner selection to preserve row-choice semantics.
                     Some((PushdownBucket::Ranked, format!("ranked.{predicate_sql}")))
