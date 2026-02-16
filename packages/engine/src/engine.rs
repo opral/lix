@@ -347,15 +347,24 @@ impl Engine {
         let writer_key = options.writer_key.as_deref();
         self.maybe_materialize_reads_with_backend(self.backend.as_ref(), sql, &active_version_id)
             .await?;
-        let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
+        let read_only_query = is_query_only_sql(sql);
+        let should_refresh_file_cache = !read_only_query && should_refresh_file_cache_for_sql(sql);
         let CollectedExecutionSideEffects {
             pending_file_writes,
             pending_file_delete_targets,
             detected_file_domain_changes_by_statement,
             detected_file_domain_changes,
             untracked_filesystem_update_domain_changes,
-        } = self
-            .collect_execution_side_effects_with_backend(
+        } = if read_only_query {
+            CollectedExecutionSideEffects {
+                pending_file_writes: Vec::new(),
+                pending_file_delete_targets: BTreeSet::new(),
+                detected_file_domain_changes_by_statement: Vec::new(),
+                detected_file_domain_changes: Vec::new(),
+                untracked_filesystem_update_domain_changes: Vec::new(),
+            }
+        } else {
+            self.collect_execution_side_effects_with_backend(
                 self.backend.as_ref(),
                 sql,
                 params,
@@ -364,7 +373,8 @@ impl Engine {
                 true,
                 true,
             )
-            .await?;
+            .await?
+        };
         let (settings, sequence_start, functions) = self
             .prepare_runtime_functions_with_backend(self.backend.as_ref())
             .await?;
@@ -756,7 +766,8 @@ impl Engine {
     ) -> Result<QueryResult, LixError> {
         let writer_key = options.writer_key.as_deref();
         let defer_side_effects = deferred_side_effects.is_some();
-        let should_refresh_file_cache = should_refresh_file_cache_for_sql(sql);
+        let read_only_query = is_query_only_sql(sql);
+        let should_refresh_file_cache = !read_only_query && should_refresh_file_cache_for_sql(sql);
         let (
             pending_file_writes,
             pending_file_delete_targets,
@@ -776,11 +787,11 @@ impl Engine {
                 detected_file_domain_changes_by_statement,
                 detected_file_domain_changes,
                 untracked_filesystem_update_domain_changes,
-            } = if skip_side_effect_collection {
+            } = if skip_side_effect_collection || read_only_query {
                 CollectedExecutionSideEffects {
                     pending_file_writes: Vec::new(),
                     pending_file_delete_targets: BTreeSet::new(),
-                    detected_file_domain_changes_by_statement: vec![Vec::new(); 1],
+                    detected_file_domain_changes_by_statement: Vec::new(),
                     detected_file_domain_changes: Vec::new(),
                     untracked_filesystem_update_domain_changes: Vec::new(),
                 }
@@ -3091,6 +3102,16 @@ fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
         .any(statement_targets_file_cache_refresh_table)
 }
 
+fn is_query_only_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    !statements.is_empty()
+        && statements
+            .iter()
+            .all(|statement| matches!(statement, Statement::Query(_)))
+}
+
 fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
     statement_targets_table_name(statement, "lix_state")
         || statement_targets_table_name(statement, "lix_state_by_version")
@@ -3935,8 +3956,9 @@ mod tests {
         detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, extract_explicit_transaction_script,
         file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
-        file_read_materialization_scope_for_sql, should_invalidate_installed_plugins_cache_for_sql,
-        should_refresh_file_cache_for_sql, BootArgs, ExecuteOptions, FileReadMaterializationScope,
+        file_read_materialization_scope_for_sql, is_query_only_sql,
+        should_invalidate_installed_plugins_cache_for_sql, should_refresh_file_cache_for_sql,
+        BootArgs, ExecuteOptions, FileReadMaterializationScope,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
@@ -4112,6 +4134,22 @@ mod tests {
         assert!(!should_refresh_file_cache_for_sql(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE file_id = 'f'"
         ));
+    }
+
+    #[test]
+    fn query_only_detection_matches_select_statements() {
+        assert!(is_query_only_sql("SELECT path, data FROM lix_file"));
+        assert!(is_query_only_sql(
+            "SELECT path FROM lix_file; SELECT id FROM lix_version"
+        ));
+    }
+
+    #[test]
+    fn query_only_detection_rejects_mutations() {
+        assert!(!is_query_only_sql(
+            "SELECT path FROM lix_file; UPDATE lix_file SET path = '/x' WHERE id = 'f'"
+        ));
+        assert!(!is_query_only_sql("UPDATE lix_file SET path = '/x' WHERE id = 'f'"));
     }
 
     #[test]
