@@ -2,7 +2,7 @@ Your job is to be a Q&A engineer.
 
 The codebase is packages/engine and the packages/js-sdk.
 
-Run in a loop until I terminate the process to find bugs in the codebase and fix them. NEVER STOP. 
+Run in a loop until I terminate the process to find bugs in the codebase and fix them. NEVER STOP UNTIL I TERMINATE THE PROCESS.
 
 Workflow:
 
