@@ -5,11 +5,6 @@ use crate::sql::{
     default_alias, escape_sql_string, parse_single_query, quote_ident,
     rewrite_query_with_select_rewriter, rewrite_table_factors_in_select,
 };
-use crate::version::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    version_descriptor_file_id, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
-};
 use crate::{LixBackend, LixError};
 
 use super::target::{
@@ -87,10 +82,7 @@ fn rewrite_table_factor(
 
 fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError> {
     let (source_sql, extra_predicates) = match target.variant {
-        EntityViewVariant::Base => (
-            base_state_source_sql(target.version_id_override.as_deref()),
-            vec!["1=1".to_string()],
-        ),
+        EntityViewVariant::Base => base_state_source(target.version_id_override.as_deref()),
         EntityViewVariant::ByVersion => {
             ("lix_state_by_version".to_string(), vec!["1=1".to_string()])
         }
@@ -125,101 +117,14 @@ fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError>
     parse_single_query(&sql)
 }
 
-fn base_state_source_sql(version_id_override: Option<&str>) -> String {
-    let descriptor_table = quote_ident(&format!(
-        "lix_internal_state_materialized_v1_{}",
-        version_descriptor_schema_key()
-    ));
-    let active_version_seed_sql = match version_id_override {
-        Some(version_id) => format!(
-            "SELECT '{version_id}' AS version_id",
-            version_id = escape_sql_string(version_id)
+fn base_state_source(version_id_override: Option<&str>) -> (String, Vec<String>) {
+    match version_id_override {
+        Some(version_id) => (
+            "lix_state_by_version".to_string(),
+            vec![format!("version_id = '{}'", escape_sql_string(version_id))],
         ),
-        None => format!(
-            "SELECT lix_json_text(snapshot_content, 'version_id') AS version_id \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = '{active_schema_key}' \
-               AND file_id = '{active_file_id}' \
-               AND version_id = '{active_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
-            active_schema_key = escape_sql_string(active_version_schema_key()),
-            active_file_id = escape_sql_string(active_version_file_id()),
-            active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        ),
-    };
-    format!(
-        "(SELECT \
-             ranked.entity_id AS entity_id, \
-             ranked.schema_key AS schema_key, \
-             ranked.file_id AS file_id, \
-             ranked.version_id AS version_id, \
-             ranked.plugin_key AS plugin_key, \
-             ranked.snapshot_content AS snapshot_content, \
-             ranked.schema_version AS schema_version, \
-             ranked.created_at AS created_at, \
-             ranked.updated_at AS updated_at, \
-             ranked.inherited_from_version_id AS inherited_from_version_id, \
-             ranked.change_id AS change_id, \
-             ranked.untracked AS untracked, \
-             ranked.metadata AS metadata \
-         FROM ( \
-           WITH RECURSIVE active_version AS ( \
-             {active_version_seed_sql} \
-           ), \
-           version_chain(version_id, depth) AS ( \
-             SELECT version_id, 0 AS depth \
-             FROM active_version \
-             UNION ALL \
-             SELECT \
-               lix_json_text(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
-               vc.depth + 1 AS depth \
-             FROM version_chain vc \
-             JOIN {descriptor_table} vd \
-               ON lix_json_text(vd.snapshot_content, 'id') = vc.version_id \
-             WHERE vd.schema_key = '{descriptor_schema_key}' \
-               AND vd.file_id = '{descriptor_file_id}' \
-               AND vd.version_id = '{descriptor_storage_version_id}' \
-               AND vd.is_tombstone = 0 \
-               AND vd.snapshot_content IS NOT NULL \
-               AND lix_json_text(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
-               AND vc.depth < 64 \
-           ) \
-           SELECT \
-             s.entity_id AS entity_id, \
-             s.schema_key AS schema_key, \
-             s.file_id AS file_id, \
-             av.version_id AS version_id, \
-             s.plugin_key AS plugin_key, \
-             s.snapshot_content AS snapshot_content, \
-             s.schema_version AS schema_version, \
-             s.created_at AS created_at, \
-             s.updated_at AS updated_at, \
-             CASE \
-               WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
-               WHEN vc.depth = 0 THEN NULL \
-               ELSE s.version_id \
-             END AS inherited_from_version_id, \
-             s.change_id AS change_id, \
-             s.untracked AS untracked, \
-             s.metadata AS metadata, \
-             ROW_NUMBER() OVER ( \
-               PARTITION BY s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
-             ) AS rn \
-           FROM lix_internal_state_vtable s \
-           JOIN version_chain vc \
-             ON vc.version_id = s.version_id \
-           CROSS JOIN active_version av \
-         ) AS ranked \
-         WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL) AS lix_state_base",
-        active_version_seed_sql = active_version_seed_sql,
-        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
-    )
+        None => ("lix_state".to_string(), vec!["1=1".to_string()]),
+    }
 }
 
 fn override_predicates(target: &EntityViewTarget) -> Vec<String> {
