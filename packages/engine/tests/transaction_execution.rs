@@ -198,6 +198,38 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_script_path_preprocesses_lix_file_statements,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "BEGIN; \
+                 INSERT INTO lix_file (id, path, data) VALUES ('tx-script-preprocess', '/tx-script-preprocess.json', 'before'); \
+                 COMMIT;",
+                &[],
+            )
+            .await
+            .expect("BEGIN/COMMIT script should preprocess lix_file view writes");
+
+        let result = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'tx-script-preprocess'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_blob_text(&result.rows[0][0], "before");
+    }
+);
+
+simulation_test!(
     transaction_path_rolls_back_when_callback_panics,
     simulations = [sqlite, postgres],
     |sim| async move {

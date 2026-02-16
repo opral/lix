@@ -530,15 +530,44 @@ async fn collect_delete_targets(
     };
     let mut statement_targets = BTreeSet::new();
 
-    let mut query_sql = match target {
-        FileWriteTarget::ActiveVersion => format!(
+    let selection_uses_id_projection_only = delete
+        .selection
+        .as_ref()
+        .is_none_or(delete_selection_supports_id_projection);
+    let mut query_sql = match (target, selection_uses_id_projection_only) {
+        (FileWriteTarget::ActiveVersion, true) => format!(
+            "SELECT id, lixcol_version_id, \
+                    'pending.collect_delete_targets.id_projection' AS __lix_trace \
+             FROM (\
+                 SELECT \
+                     lix_json_text(snapshot_content, 'id') AS id, \
+                     version_id AS lixcol_version_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND snapshot_content IS NOT NULL\
+             ) AS file_descriptor_ids \
+             WHERE lixcol_version_id = '{}'",
+            escape_sql_string(active_version_id)
+        ),
+        (FileWriteTarget::ExplicitVersion, true) => "SELECT id, lixcol_version_id, \
+                    'pending.collect_delete_targets.id_projection' AS __lix_trace \
+             FROM (\
+                 SELECT \
+                     lix_json_text(snapshot_content, 'id') AS id, \
+                     version_id AS lixcol_version_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND snapshot_content IS NOT NULL\
+             ) AS file_descriptor_ids"
+            .to_string(),
+        (FileWriteTarget::ActiveVersion, false) => format!(
             "SELECT id, lixcol_version_id, \
                     'pending.collect_delete_targets' AS __lix_trace \
              FROM lix_file_by_version \
              WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
         ),
-        FileWriteTarget::ExplicitVersion => "SELECT id, lixcol_version_id, \
+        (FileWriteTarget::ExplicitVersion, false) => "SELECT id, lixcol_version_id, \
                     'pending.collect_delete_targets' AS __lix_trace \
              FROM lix_file_by_version"
             .to_string(),
@@ -1190,6 +1219,85 @@ fn file_write_target_from_name(table_name: &str) -> Option<FileWriteTarget> {
     } else {
         None
     }
+}
+
+fn delete_selection_supports_id_projection(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => delete_projection_column_allowed(&ident.value),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|ident| delete_projection_column_allowed(&ident.value)),
+        Expr::BinaryOp { left, right, .. } => {
+            delete_selection_supports_id_projection(left)
+                && delete_selection_supports_id_projection(right)
+        }
+        Expr::UnaryOp { expr, .. } => delete_selection_supports_id_projection(expr),
+        Expr::Nested(inner) => delete_selection_supports_id_projection(inner),
+        Expr::InList { expr, list, .. } => {
+            delete_selection_supports_id_projection(expr)
+                && list.iter().all(delete_selection_supports_id_projection)
+        }
+        Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::Exists { .. } => false,
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            delete_selection_supports_id_projection(expr)
+                && delete_selection_supports_id_projection(low)
+                && delete_selection_supports_id_projection(high)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            delete_selection_supports_id_projection(expr)
+                && delete_selection_supports_id_projection(pattern)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            delete_selection_supports_id_projection(inner)
+        }
+        Expr::Cast { expr, .. } => delete_selection_supports_id_projection(expr),
+        Expr::Function(function) => match &function.args {
+            sqlparser::ast::FunctionArguments::List(list) => {
+                list.args.iter().all(|arg| match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) => delete_selection_supports_id_projection(expr),
+                    sqlparser::ast::FunctionArg::Named { arg, .. }
+                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
+                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                            delete_selection_supports_id_projection(expr)
+                        }
+                        _ => true,
+                    },
+                    _ => true,
+                })
+            }
+            _ => false,
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_none_or(|expr| delete_selection_supports_id_projection(expr))
+                && conditions.iter().all(|when| {
+                    delete_selection_supports_id_projection(&when.condition)
+                        && delete_selection_supports_id_projection(&when.result)
+                })
+                && else_result
+                    .as_ref()
+                    .is_none_or(|expr| delete_selection_supports_id_projection(expr))
+        }
+        Expr::Tuple(items) => items.iter().all(delete_selection_supports_id_projection),
+        Expr::Value(_) => true,
+        _ => false,
+    }
+}
+
+fn delete_projection_column_allowed(column: &str) -> bool {
+    column.eq_ignore_ascii_case("id")
+        || column.eq_ignore_ascii_case("lixcol_version_id")
+        || column.eq_ignore_ascii_case("version_id")
 }
 
 fn assignment_target_name(assignment: &Assignment) -> Option<String> {
