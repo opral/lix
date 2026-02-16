@@ -126,8 +126,8 @@ async function main() {
       });
 
       if (index < targetIndex) {
-        for (const sql of statements) {
-          await lix.execute(sql, []);
+        for (const statement of statements) {
+          await lix.execute(statement.sql, statement.params ?? []);
         }
       } else {
         console.log(
@@ -185,9 +185,11 @@ async function profileCommitStatements(
   const traceStart = tracedBackend.trace.length;
 
   for (let index = 0; index < statements.length; index++) {
-    const sql = statements[index];
+    const statement = statements[index];
+    const sql = statement.sql;
+    const params = statement.params ?? [];
     const started = performance.now();
-    await lix.execute(sql, []);
+    await lix.execute(sql, params);
     const durationMs = performance.now() - started;
     commitTotalMs += durationMs;
 

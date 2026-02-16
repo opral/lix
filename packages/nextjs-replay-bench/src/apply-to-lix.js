@@ -90,7 +90,7 @@ export function buildReplayCommitStatements(batch, options = {}) {
       continue;
     }
     statements.push(
-      `DELETE FROM lix_file WHERE id IN (${deleteChunk.map(sqlText).join(", ")})`,
+      replayStatement(`DELETE FROM lix_file WHERE id IN (${deleteChunk.map(sqlText).join(", ")})`),
     );
   }
 
@@ -116,29 +116,32 @@ function appendInsertStatements(statements, rows, options) {
   const prefix = "INSERT INTO lix_file (id, path, data) VALUES ";
 
   let chunk = [];
+  let chunkParams = [];
   let chunkChars = 0;
 
   const flush = () => {
     if (chunk.length === 0) {
       return;
     }
-    statements.push(`${prefix}${chunk.join(", ")}`);
+    statements.push(replayStatement(`${prefix}${chunk.join(", ")}`, chunkParams));
     chunk = [];
+    chunkParams = [];
     chunkChars = 0;
   };
 
   for (const row of rows) {
-    const rowLiteral = `(${sqlText(row.id)}, ${sqlText(row.path)}, ${sqlBlob(row.data)})`;
+    const rowSql = `(${sqlText(row.id)}, ${sqlText(row.path)}, ?)`;
     const wouldOverflowChars =
-      chunk.length > 0 && prefix.length + chunkChars + rowLiteral.length + 2 > maxInsertSqlChars;
+      chunk.length > 0 && prefix.length + chunkChars + rowSql.length + 2 > maxInsertSqlChars;
     const wouldOverflowRows = chunk.length >= maxInsertRows;
 
     if (wouldOverflowChars || wouldOverflowRows) {
       flush();
     }
 
-    chunk.push(rowLiteral);
-    chunkChars += rowLiteral.length + 2;
+    chunk.push(rowSql);
+    chunkParams.push(row.data);
+    chunkChars += rowSql.length + 2;
   }
 
   flush();
@@ -150,10 +153,18 @@ function appendUpdateStatements(statements, rows, options) {
   }
   const _ = options;
   for (const row of rows) {
-    statements.push(
-      `UPDATE lix_file SET path = ${sqlText(row.path)}, data = ${sqlBlob(row.data)} WHERE id = ${sqlText(row.id)}`,
-    );
+    statements.push(replayStatement(
+      `UPDATE lix_file SET path = ${sqlText(row.path)}, data = ? WHERE id = ${sqlText(row.id)}`,
+      [row.data],
+    ));
   }
+}
+
+function replayStatement(sql, params = []) {
+  return {
+    sql,
+    params,
+  };
 }
 
 function normalizeStatus(value) {
@@ -256,10 +267,6 @@ function chunkArray(values, size) {
 
 function sqlText(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function sqlBlob(bytes) {
-  return `x'${Buffer.from(bytes).toString("hex")}'`;
 }
 
 function positiveOrDefault(value, fallback) {

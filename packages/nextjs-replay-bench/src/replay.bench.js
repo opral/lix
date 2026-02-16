@@ -440,9 +440,11 @@ async function executeStatements(lix, statements) {
   let totalMs = 0;
 
   for (let index = 0; index < statements.length; index++) {
-    const sql = statements[index];
+    const statement = statements[index];
+    const sql = statement.sql;
+    const params = statement.params ?? [];
     const statementStarted = performance.now();
-    await lix.execute(sql, []);
+    await lix.execute(sql, params);
     const durationMs = performance.now() - statementStarted;
     totalMs += durationMs;
     pushSlowStatement(slowestStatements, {
@@ -460,7 +462,12 @@ async function executeStatements(lix, statements) {
 }
 
 async function executeStatementsAsTransactionScript(lix, statements) {
-  const script = ["BEGIN", ...statements, "COMMIT"].join(";\n");
+  if (statements.some((statement) => Array.isArray(statement.params) && statement.params.length > 0)) {
+    throw new Error(
+      "transaction-script mode is incompatible with parameterized replay statements; use BENCH_REPLAY_EXECUTE_MODE=per-statement",
+    );
+  }
+  const script = ["BEGIN", ...statements.map((statement) => statement.sql), "COMMIT"].join(";\n");
   const started = performance.now();
   await lix.execute(script, []);
   const durationMs = performance.now() - started;
@@ -484,7 +491,7 @@ function summarizeSql(sql) {
 }
 
 function statementChars(statements) {
-  return statements.reduce((total, sql) => total + sql.length, 0);
+  return statements.reduce((total, statement) => total + statement.sql.length, 0);
 }
 
 async function maybeWriteSnapshotArtifact(lix) {
