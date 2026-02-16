@@ -19,3 +19,4 @@ Tips:
 - It's crucial that you stack the PRs to avoid merge conflicts.
 - Focus on one bug at a time.
 - Before or right after compacting the conversation, read this prompt.md file again to refresh your memory on the workflow and tips.
+- you can use the git parity tests in packages/next-js-replay-bench to find state divergance bugs.
