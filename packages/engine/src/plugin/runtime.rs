@@ -64,6 +64,12 @@ struct PluginEntityChange {
     snapshot_content: Option<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CachedPluginComponent {
+    pub wasm: Vec<u8>,
+    pub instance: Arc<dyn crate::WasmComponentInstance>,
+}
+
 #[derive(Debug, Serialize)]
 struct ApplyChangesRequest {
     file: PluginFile,
@@ -83,8 +89,7 @@ pub(crate) async fn detect_file_changes_with_plugins(
     writes: &[FileChangeDetectionRequest],
     installed_plugins: &[InstalledPlugin],
 ) -> Result<Vec<DetectedFileChange>, LixError> {
-    let mut loaded_instances: BTreeMap<String, Arc<dyn crate::WasmComponentInstance>> =
-        BTreeMap::new();
+    let mut loaded_instances: BTreeMap<String, CachedPluginComponent> = BTreeMap::new();
     detect_file_changes_with_plugins_with_cache(
         backend,
         runtime,
@@ -100,7 +105,7 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
     runtime: &dyn WasmRuntime,
     writes: &[FileChangeDetectionRequest],
     installed_plugins: &[InstalledPlugin],
-    loaded_instances: &mut BTreeMap<String, Arc<dyn crate::WasmComponentInstance>>,
+    loaded_instances: &mut BTreeMap<String, CachedPluginComponent>,
 ) -> Result<Vec<DetectedFileChange>, LixError> {
     if writes.is_empty() {
         return Ok(Vec::new());
@@ -156,15 +161,7 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             .unwrap_or_default()
             != plugin.key.as_str();
 
-        let instance = if let Some(existing) = loaded_instances.get(&plugin.key) {
-            existing.clone()
-        } else {
-            let loaded = runtime
-                .init_component(plugin.wasm.clone(), WasmLimits::default())
-                .await?;
-            loaded_instances.insert(plugin.key.clone(), loaded.clone());
-            loaded
-        };
+        let instance = load_or_init_plugin_component(runtime, loaded_instances, plugin).await?;
 
         let mut before_data = if plugin_changed || !has_before_context {
             None
@@ -220,11 +217,6 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             .iter()
             .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
             .collect::<BTreeSet<_>>();
-        let mut full_after_keys = plugin_changes
-            .iter()
-            .filter(|change| change.snapshot_content.is_some())
-            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
-            .collect::<BTreeSet<_>>();
 
         if has_before_context {
             if plugin_detect_emits_complete_diff(plugin) {
@@ -238,31 +230,11 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
                     &plugin.key,
                 )
                 .await?;
-                full_after_keys.extend(
-                    existing_entities
-                        .iter()
-                        .map(|existing| (existing.schema_key.clone(), existing.entity_id.clone())),
+                append_implicit_tombstones_for_projection(
+                    &mut plugin_changes,
+                    &existing_entities,
+                    &mut plugin_change_keys,
                 );
-                for change in &plugin_changes {
-                    let key = (change.schema_key.clone(), change.entity_id.clone());
-                    if change.snapshot_content.is_some() {
-                        full_after_keys.insert(key);
-                    } else {
-                        full_after_keys.remove(&key);
-                    }
-                }
-
-                for existing in existing_entities {
-                    let key = (existing.schema_key.clone(), existing.entity_id.clone());
-                    if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
-                        plugin_changes.push(PluginEntityChange {
-                            entity_id: existing.entity_id,
-                            schema_key: existing.schema_key,
-                            schema_version: existing.schema_version,
-                            snapshot_content: None,
-                        });
-                    }
-                }
             }
         }
 
@@ -295,6 +267,30 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
     }
 
     Ok(detected)
+}
+
+async fn load_or_init_plugin_component(
+    runtime: &dyn WasmRuntime,
+    loaded_instances: &mut BTreeMap<String, CachedPluginComponent>,
+    plugin: &InstalledPlugin,
+) -> Result<Arc<dyn crate::WasmComponentInstance>, LixError> {
+    if let Some(cached) = loaded_instances.get(&plugin.key) {
+        if cached.wasm == plugin.wasm {
+            return Ok(cached.instance.clone());
+        }
+    }
+
+    let loaded = runtime
+        .init_component(plugin.wasm.clone(), WasmLimits::default())
+        .await?;
+    loaded_instances.insert(
+        plugin.key.clone(),
+        CachedPluginComponent {
+            wasm: plugin.wasm.clone(),
+            instance: loaded.clone(),
+        },
+    );
+    Ok(loaded)
 }
 
 pub(crate) async fn materialize_file_data_with_plugins(
@@ -965,6 +961,39 @@ struct PluginEntityKey {
     schema_version: String,
 }
 
+fn append_implicit_tombstones_for_projection(
+    plugin_changes: &mut Vec<PluginEntityChange>,
+    existing_entities: &[PluginEntityKey],
+    plugin_change_keys: &mut BTreeSet<(String, String)>,
+) {
+    let mut full_after_keys = plugin_changes
+        .iter()
+        .filter(|change| change.snapshot_content.is_some())
+        .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+        .collect::<BTreeSet<_>>();
+
+    for change in plugin_changes.iter() {
+        let key = (change.schema_key.clone(), change.entity_id.clone());
+        if change.snapshot_content.is_some() {
+            full_after_keys.insert(key);
+        } else {
+            full_after_keys.remove(&key);
+        }
+    }
+
+    for existing in existing_entities {
+        let key = (existing.schema_key.clone(), existing.entity_id.clone());
+        if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
+            plugin_changes.push(PluginEntityChange {
+                entity_id: existing.entity_id.clone(),
+                schema_key: existing.schema_key.clone(),
+                schema_version: existing.schema_version.clone(),
+                snapshot_content: None,
+            });
+        }
+    }
+}
+
 async fn load_existing_plugin_entities(
     backend: &dyn LixBackend,
     file_id: &str,
@@ -1185,5 +1214,142 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
                 "plugin materialization: expected blob column '{column}' at index {index}, got {other:?}"
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_implicit_tombstones_for_projection, load_or_init_plugin_component,
+        CachedPluginComponent, PluginEntityChange, PluginEntityKey,
+    };
+    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
+    use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
+    use async_trait::async_trait;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct CountingRuntime {
+        init_calls: Arc<AtomicUsize>,
+    }
+
+    struct NoopComponent;
+
+    #[async_trait(?Send)]
+    impl WasmRuntime for CountingRuntime {
+        async fn init_component(
+            &self,
+            _bytes: Vec<u8>,
+            _limits: WasmLimits,
+        ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+            self.init_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(NoopComponent))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl WasmComponentInstance for NoopComponent {
+        async fn call(&self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn reconciliation_adds_implicit_tombstones_for_missing_existing_entities() {
+        let mut plugin_changes = vec![PluginEntityChange {
+            entity_id: "a".to_string(),
+            schema_key: "json_pointer".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: Some("{\"path\":\"/a\"}".to_string()),
+        }];
+        let existing = vec![
+            PluginEntityKey {
+                entity_id: "a".to_string(),
+                schema_key: "json_pointer".to_string(),
+                schema_version: "1".to_string(),
+            },
+            PluginEntityKey {
+                entity_id: "b".to_string(),
+                schema_key: "json_pointer".to_string(),
+                schema_version: "1".to_string(),
+            },
+        ];
+        let mut keys = plugin_changes
+            .iter()
+            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
+
+        append_implicit_tombstones_for_projection(&mut plugin_changes, &existing, &mut keys);
+
+        let tombstone = plugin_changes
+            .iter()
+            .find(|change| change.entity_id == "b" && change.schema_key == "json_pointer")
+            .expect("missing implicit tombstone for removed entity");
+        assert!(
+            tombstone.snapshot_content.is_none(),
+            "implicit tombstone must be encoded as snapshot_content = None"
+        );
+    }
+
+    #[test]
+    fn reconciliation_does_not_duplicate_explicit_tombstones() {
+        let mut plugin_changes = vec![PluginEntityChange {
+            entity_id: "b".to_string(),
+            schema_key: "json_pointer".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: None,
+        }];
+        let existing = vec![PluginEntityKey {
+            entity_id: "b".to_string(),
+            schema_key: "json_pointer".to_string(),
+            schema_version: "1".to_string(),
+        }];
+        let mut keys = plugin_changes
+            .iter()
+            .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+            .collect::<BTreeSet<_>>();
+
+        append_implicit_tombstones_for_projection(&mut plugin_changes, &existing, &mut keys);
+
+        let tombstones = plugin_changes
+            .iter()
+            .filter(|change| {
+                change.entity_id == "b"
+                    && change.schema_key == "json_pointer"
+                    && change.snapshot_content.is_none()
+            })
+            .count();
+        assert_eq!(tombstones, 1);
+    }
+
+    #[tokio::test]
+    async fn component_cache_reinitializes_when_same_key_wasm_changes() {
+        let runtime = CountingRuntime::default();
+        let mut loaded = std::collections::BTreeMap::<String, CachedPluginComponent>::new();
+        let mut plugin = InstalledPlugin {
+            key: "k".to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            detect_changes_glob: "*.json".to_string(),
+            entry: "plugin.wasm".to_string(),
+            manifest_json: "{}".to_string(),
+            wasm: vec![1],
+        };
+
+        load_or_init_plugin_component(&runtime, &mut loaded, &plugin)
+            .await
+            .expect("first init should succeed");
+        load_or_init_plugin_component(&runtime, &mut loaded, &plugin)
+            .await
+            .expect("second lookup should reuse cache");
+        assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
+
+        plugin.wasm = vec![2];
+        load_or_init_plugin_component(&runtime, &mut loaded, &plugin)
+            .await
+            .expect("changed wasm should reinitialize instance");
+        assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 2);
     }
 }

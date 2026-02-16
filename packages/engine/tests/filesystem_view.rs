@@ -2033,6 +2033,72 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_path_update_ignores_materialized_row_when_untracked_tombstone_exists,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-tombstone-fast-path', '/src/tombstone.md', 'seed')",
+                &[],
+            )
+            .await
+            .expect("seed file should succeed");
+        let version_id = active_version_id(&engine).await.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                        entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                     ) VALUES (\
+                        'file-tombstone-fast-path', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', NULL, '1', 1\
+                     )"
+                ),
+                &[],
+            )
+            .await
+            .expect("seed untracked tombstone should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/docs/should-not-exist.md' \
+                 WHERE id = 'file-tombstone-fast-path'",
+                &[],
+            )
+            .await
+            .expect("update should behave as no-op");
+
+        let file_rows = engine
+            .execute(
+                "SELECT id FROM lix_file WHERE id = 'file-tombstone-fast-path'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert!(
+            file_rows.rows.is_empty(),
+            "tombstoned file must stay hidden after no-op update"
+        );
+
+        let directory_rows = engine
+            .execute("SELECT id FROM lix_directory WHERE path = '/docs/'", &[])
+            .await
+            .expect("directory read should succeed");
+        assert!(
+            directory_rows.rows.is_empty(),
+            "no-op update should not create parent directories for tombstoned rows"
+        );
+    }
+);
+
+simulation_test!(
     file_view_exposes_active_version_commit_id,
     |sim| async move {
         let engine = sim

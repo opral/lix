@@ -364,11 +364,16 @@ async fn collect_update_writes(
                         before_data,
                         after_data: assigned_after_data.clone().unwrap_or_default(),
                     };
-                    if !write.data_is_authoritative {
+                    if !write.data_is_authoritative && write.before_data.is_some() {
                         write.after_data = write.before_data.clone().unwrap_or_default();
                     }
-                    writes.push(write);
-                    return Ok(());
+                    // If this was a non-data update and data cache is missing, we cannot trust
+                    // an empty blob fallback. Continue with the full prefetch path so before_data
+                    // is resolved from state and after_data is preserved.
+                    if write.data_is_authoritative || write.before_data.is_some() {
+                        writes.push(write);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1707,6 +1712,77 @@ fn value_as_blob_or_text_bytes(value: &Value) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct FastPathFallbackBackend {
+        fallback_query_seen: Arc<AtomicBool>,
+    }
+
+    struct UnusedTransaction;
+
+    #[async_trait(?Send)]
+    impl LixBackend for FastPathFallbackBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("FROM lix_internal_file_path_cache") {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("file-1".to_string()),
+                        Value::Text("v1".to_string()),
+                        Value::Text("/src/a.md".to_string()),
+                    ]],
+                });
+            }
+            if sql.contains("FROM lix_internal_file_data_cache") {
+                return Ok(QueryResult { rows: Vec::new() });
+            }
+            if sql.contains("pending.collect_update_writes") {
+                self.fallback_query_seen.store(true, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("file-1".to_string()),
+                        Value::Text("/src/a.md".to_string()),
+                        Value::Blob(b"seed-data".to_vec()),
+                        Value::Text("v1".to_string()),
+                    ]],
+                });
+            }
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(UnusedTransaction))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixTransaction for UnusedTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
 
     fn parse_delete(sql: &str) -> sqlparser::ast::Delete {
         let statements = crate::sql::parse_sql_statements(sql).expect("parse SQL");
@@ -1779,6 +1855,36 @@ mod tests {
         )
         .expect("extract targets");
         assert!(targets.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_update_fast_path_falls_back_when_data_cache_misses() {
+        let fallback_query_seen = Arc::new(AtomicBool::new(false));
+        let backend = FastPathFallbackBackend {
+            fallback_query_seen: Arc::clone(&fallback_query_seen),
+        };
+
+        let writes = collect_pending_file_writes(
+            &backend,
+            "UPDATE lix_file SET path = '/src/b.md' WHERE id = 'file-1'",
+            &[],
+            "v1",
+        )
+        .await
+        .expect("collect_pending_file_writes should succeed");
+
+        assert!(
+            fallback_query_seen.load(Ordering::SeqCst),
+            "cache miss must fall back to full prefetch query instead of early return"
+        );
+        assert_eq!(writes.writes.len(), 1);
+        let write = &writes.writes[0];
+        assert_eq!(write.file_id, "file-1");
+        assert_eq!(write.version_id, "v1");
+        assert_eq!(write.before_path.as_deref(), Some("/src/a.md"));
+        assert_eq!(write.path, "/src/b.md");
+        assert_eq!(write.before_data.as_deref(), Some(b"seed-data".as_slice()));
+        assert_eq!(write.after_data, b"seed-data".to_vec());
     }
 }
 
