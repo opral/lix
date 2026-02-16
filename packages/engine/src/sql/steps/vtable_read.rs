@@ -20,20 +20,10 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     } else {
         Vec::new()
     };
-    let pushdown_predicate = if top_level_targets_vtable && !schema_keys.is_empty() {
-        extract_pushdown_predicate(&query)
-    } else {
-        None
-    };
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(
-        &mut new_query,
-        &schema_keys,
-        pushdown_predicate.as_ref(),
-        &mut changed,
-    )?;
+    rewrite_query_inner(&mut new_query, &schema_keys, &mut changed)?;
 
     if changed {
         Ok(Some(new_query))
@@ -52,12 +42,15 @@ pub async fn rewrite_query_with_backend(
     } else {
         Vec::new()
     };
-    let plugin_keys = if top_level_targets_vtable {
-        extract_plugin_keys_from_query(&query).unwrap_or_default()
-    } else {
-        extract_plugin_keys_from_top_level_derived_subquery(&query).unwrap_or_default()
-    };
+
+    // If no schema-key literal is available, fall back to plugin-key derived
+    // schema resolution and finally to all materialized schema tables.
     if schema_keys.is_empty() {
+        let plugin_keys = if top_level_targets_vtable {
+            extract_plugin_keys_from_query(&query).unwrap_or_default()
+        } else {
+            extract_plugin_keys_from_top_level_derived_subquery(&query).unwrap_or_default()
+        };
         if !plugin_keys.is_empty() {
             schema_keys = fetch_schema_keys_for_plugins(backend, &plugin_keys).await?;
         }
@@ -65,20 +58,10 @@ pub async fn rewrite_query_with_backend(
     if schema_keys.is_empty() {
         schema_keys = fetch_materialized_schema_keys(backend).await?;
     }
-    let pushdown_predicate = if top_level_targets_vtable {
-        extract_pushdown_predicate(&query)
-    } else {
-        None
-    };
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(
-        &mut new_query,
-        &schema_keys,
-        pushdown_predicate.as_ref(),
-        &mut changed,
-    )?;
+    rewrite_query_inner(&mut new_query, &schema_keys, &mut changed)?;
 
     if changed {
         Ok(Some(new_query))
@@ -90,18 +73,25 @@ pub async fn rewrite_query_with_backend(
 fn rewrite_query_inner(
     query: &mut Query,
     schema_keys: &[String],
-    pushdown_predicate: Option<&Expr>,
     changed: &mut bool,
 ) -> Result<(), LixError> {
+    let query_schema_keys = resolve_schema_keys_for_query(query, schema_keys);
+    let top_level_targets_vtable = query_targets_vtable(&query);
+    let pushdown_predicate = if top_level_targets_vtable {
+        extract_pushdown_predicate(&query)
+    } else {
+        None
+    };
+
     if let Some(with) = query.with.as_mut() {
         for cte in &mut with.cte_tables {
-            rewrite_query_inner(&mut cte.query, schema_keys, None, changed)?;
+            rewrite_query_inner(&mut cte.query, &query_schema_keys, changed)?;
         }
     }
     query.body = Box::new(rewrite_set_expr(
         (*query.body).clone(),
-        schema_keys,
-        pushdown_predicate,
+        &query_schema_keys,
+        pushdown_predicate.as_ref(),
         changed,
     )?);
     Ok(())
@@ -121,7 +111,7 @@ fn rewrite_set_expr(
         }
         SetExpr::Query(query) => {
             let mut query = *query;
-            rewrite_query_inner(&mut query, schema_keys, pushdown_predicate, changed)?;
+            rewrite_query_inner(&mut query, schema_keys, changed)?;
             SetExpr::Query(Box::new(query))
         }
         SetExpr::SetOperation {
@@ -199,24 +189,12 @@ fn rewrite_table_factor(
             *changed = true;
         }
         TableFactor::Derived { subquery, .. } => {
-            if schema_keys.is_empty() {
-                if let Some(rewritten) = rewrite_query((**subquery).clone())? {
-                    *subquery = Box::new(rewritten);
-                    *changed = true;
-                }
-            } else {
-                let mut subquery_changed = false;
-                let mut rewritten_subquery = (**subquery).clone();
-                rewrite_query_inner(
-                    &mut rewritten_subquery,
-                    schema_keys,
-                    pushdown_predicate,
-                    &mut subquery_changed,
-                )?;
-                if subquery_changed {
-                    *subquery = Box::new(rewritten_subquery);
-                    *changed = true;
-                }
+            let mut subquery_changed = false;
+            let mut rewritten_subquery = (**subquery).clone();
+            rewrite_query_inner(&mut rewritten_subquery, schema_keys, &mut subquery_changed)?;
+            if subquery_changed {
+                *subquery = Box::new(rewritten_subquery);
+                *changed = true;
             }
         }
         TableFactor::NestedJoin {
@@ -234,15 +212,19 @@ fn build_untracked_union_query(
     pushdown_predicate: Option<&Expr>,
 ) -> Result<Query, LixError> {
     let dialect = GenericDialect {};
-    let schema_list = schema_keys
+    let stripped_predicate = pushdown_predicate.and_then(|expr| strip_qualifiers(expr.clone()));
+    let predicate_sql = stripped_predicate.as_ref().map(ToString::to_string);
+    let predicate_schema_keys = stripped_predicate
+        .as_ref()
+        .and_then(|expr| extract_column_keys_from_expr(expr, expr_is_schema_key_column));
+    let effective_schema_keys = narrow_schema_keys(schema_keys, predicate_schema_keys.as_deref());
+
+    let schema_list = effective_schema_keys
         .iter()
         .map(|key| format!("'{}'", escape_string_literal(key)))
         .collect::<Vec<_>>()
         .join(", ");
-    let predicate_sql = pushdown_predicate
-        .and_then(|expr| strip_qualifiers(expr.clone()))
-        .map(|expr| expr.to_string());
-    let schema_filter = if schema_keys.is_empty() {
+    let schema_filter = if effective_schema_keys.is_empty() {
         None
     } else {
         Some(format!("schema_key IN ({schema_list})"))
@@ -265,7 +247,7 @@ fn build_untracked_union_query(
         untracked = UNTRACKED_TABLE
     ));
 
-    for key in schema_keys {
+    for key in &effective_schema_keys {
         let materialized_table = format!("{MATERIALIZED_PREFIX}{key}");
         let materialized_ident = quote_ident(&materialized_table);
         let materialized_where = predicate_sql
@@ -337,6 +319,69 @@ fn table_factor_is_vtable(relation: &TableFactor) -> bool {
 
 fn extract_schema_keys_from_query(query: &Query) -> Option<Vec<String>> {
     extract_column_keys_from_query(query, expr_is_schema_key_column)
+}
+
+#[cfg(test)]
+fn extract_schema_keys_from_query_deep(query: &Query) -> Vec<String> {
+    let mut keys = Vec::new();
+    collect_schema_keys_from_query(query, &mut keys);
+    dedup_strings(keys)
+}
+
+#[cfg(test)]
+fn collect_schema_keys_from_query(query: &Query, keys: &mut Vec<String>) {
+    if let Some(found) = extract_schema_keys_from_query(query) {
+        keys.extend(found);
+    }
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            collect_schema_keys_from_query(&cte.query, keys);
+        }
+    }
+    collect_schema_keys_from_set_expr(&query.body, keys);
+}
+
+#[cfg(test)]
+fn collect_schema_keys_from_set_expr(expr: &SetExpr, keys: &mut Vec<String>) {
+    match expr {
+        SetExpr::Select(select) => collect_schema_keys_from_select(select, keys),
+        SetExpr::Query(query) => collect_schema_keys_from_query(query, keys),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_schema_keys_from_set_expr(left, keys);
+            collect_schema_keys_from_set_expr(right, keys);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+fn collect_schema_keys_from_select(select: &Select, keys: &mut Vec<String>) {
+    for table in &select.from {
+        collect_schema_keys_from_table_factor(&table.relation, keys);
+        for join in &table.joins {
+            collect_schema_keys_from_table_factor(&join.relation, keys);
+        }
+    }
+}
+
+#[cfg(test)]
+fn collect_schema_keys_from_table_factor(relation: &TableFactor, keys: &mut Vec<String>) {
+    match relation {
+        TableFactor::Derived { subquery, .. } => collect_schema_keys_from_query(subquery, keys),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_schema_keys_from_table_factor(&table_with_joins.relation, keys);
+            for join in &table_with_joins.joins {
+                collect_schema_keys_from_table_factor(&join.relation, keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_schema_keys_for_query(query: &Query, inherited_schema_keys: &[String]) -> Vec<String> {
+    extract_schema_keys_from_query(query).unwrap_or_else(|| inherited_schema_keys.to_vec())
 }
 
 fn extract_plugin_keys_from_query(query: &Query) -> Option<Vec<String>> {
@@ -703,6 +748,24 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
     out
 }
 
+fn narrow_schema_keys(
+    schema_keys: &[String],
+    predicate_schema_keys: Option<&[String]>,
+) -> Vec<String> {
+    let Some(predicate_schema_keys) = predicate_schema_keys else {
+        return schema_keys.to_vec();
+    };
+    if schema_keys.is_empty() {
+        return predicate_schema_keys.to_vec();
+    }
+    let intersection = intersect_strings(schema_keys, predicate_schema_keys);
+    if intersection.is_empty() {
+        schema_keys.to_vec()
+    } else {
+        intersection
+    }
+}
+
 fn default_vtable_alias() -> TableAlias {
     TableAlias {
         explicit: false,
@@ -807,7 +870,9 @@ fn numbered_placeholders(start: usize, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_plugin_keys_from_query, extract_plugin_keys_from_top_level_derived_subquery,
+        build_untracked_union_query, extract_plugin_keys_from_query,
+        extract_plugin_keys_from_top_level_derived_subquery, extract_pushdown_predicate,
+        extract_schema_keys_from_query_deep,
     };
     use crate::sql::preprocess_sql_rewrite_only as preprocess_sql;
     use sqlparser::ast::{Query, Statement};
@@ -1121,6 +1186,39 @@ mod tests {
             extract_plugin_keys_from_query(&query).is_none(),
             "mixed OR should not produce a plugin-only key set"
         );
+    }
+
+    #[test]
+    fn extracts_schema_keys_from_nested_derived_subquery_filter() {
+        let query = parse_query(
+            "SELECT COUNT(*) \
+             FROM (SELECT * FROM lix_internal_state_vtable WHERE schema_key = 'schema_a') AS ranked",
+        );
+        let keys = extract_schema_keys_from_query_deep(&query);
+        assert_eq!(keys, vec!["schema_a".to_string()]);
+    }
+
+    #[test]
+    fn narrows_materialized_union_to_schema_predicate_intersection() {
+        let query = parse_query(
+            "SELECT * FROM lix_internal_state_vtable \
+             WHERE schema_key = 'schema_a' AND entity_id = 'entity-1'",
+        );
+        let predicate = extract_pushdown_predicate(&query).expect("predicate");
+        let derived = build_untracked_union_query(
+            &[
+                "schema_a".to_string(),
+                "schema_b".to_string(),
+                "schema_c".to_string(),
+            ],
+            Some(&predicate),
+        )
+        .expect("derived query");
+        let compact = compact_sql(&derived.to_string());
+
+        assert!(compact.contains(r#"lix_internal_state_materialized_v1_schema_a"#));
+        assert!(!compact.contains(r#"lix_internal_state_materialized_v1_schema_b"#));
+        assert!(!compact.contains(r#"lix_internal_state_materialized_v1_schema_c"#));
     }
 
     fn parse_query(sql: &str) -> Query {
