@@ -11,8 +11,8 @@ Workflow:
 3. Fix the bug.
 4. Run the engine tests to ensure that the bug is fixed and that no other tests are broken.
 5. Commit, push and open a pull request against the `next` branch. Use the github access token provided in the .env file.
-6. Wait for Cursor Bugbot CI/CD check to finish (you can poll every 2 minutes). Read the comments. Either fix them or reply why the comment is wrong.
-7. Create a new branch from the existing branch (stacked PRs) for the next bug and repeat the process.
+6. Wait for Cursor Bugbot CI/CD check to finish (you can poll every 2 minutes). Read the comments of cursor bugbot. Either fix them or reply why the comment is wrong.
+7. Once all bugs that cursor bug bot has found are fixed, and all comments are resolved, create a new branch from the existing branch (stacked PRs) for the next bug and repeat the process.
 
 Tips:
 
