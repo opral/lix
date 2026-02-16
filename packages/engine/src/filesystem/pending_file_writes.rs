@@ -1883,61 +1883,86 @@ mod tests {
         assert!(targets.is_none());
     }
 
-    #[tokio::test]
-    async fn exact_update_fast_path_falls_back_when_data_cache_misses() {
-        let fallback_query_seen = Arc::new(AtomicBool::new(false));
-        let backend = FastPathFallbackBackend {
-            fallback_query_seen: Arc::clone(&fallback_query_seen),
-        };
-
-        let writes = collect_pending_file_writes(
-            &backend,
-            "UPDATE lix_file SET path = '/src/b.md' WHERE id = 'file-1'",
-            &[],
-            "v1",
-        )
-        .await
-        .expect("collect_pending_file_writes should succeed");
-
-        assert!(
-            fallback_query_seen.load(Ordering::SeqCst),
-            "cache miss must fall back to full prefetch query instead of early return"
-        );
-        assert_eq!(writes.writes.len(), 1);
-        let write = &writes.writes[0];
-        assert_eq!(write.file_id, "file-1");
-        assert_eq!(write.version_id, "v1");
-        assert_eq!(write.before_path.as_deref(), Some("/src/a.md"));
-        assert_eq!(write.path, "/src/b.md");
-        assert_eq!(write.before_data.as_deref(), Some(b"seed-data".as_slice()));
-        assert_eq!(write.after_data, b"seed-data".to_vec());
+    fn run_async_test_with_large_stack(test: impl FnOnce() + Send + 'static) {
+        let handle = std::thread::Builder::new()
+            .name("pending-file-writes-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn test thread");
+        handle.join().expect("test thread panicked");
     }
 
-    #[tokio::test]
-    async fn case_path_update_keeps_case_selected_path_with_overlay() {
-        let writes = collect_pending_file_writes(
-            &CasePathOverlayBackend,
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/seed.md', 'seed'); \
-             UPDATE lix_file \
-             SET path = CASE id WHEN 'file-1' THEN '/next.md' ELSE path END \
-             WHERE id = 'file-1'",
-            &[],
-            "v1",
-        )
-        .await
-        .expect("collect_pending_file_writes should succeed");
+    #[test]
+    fn exact_update_fast_path_falls_back_when_data_cache_misses() {
+        run_async_test_with_large_stack(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            runtime.block_on(async {
+                let fallback_query_seen = Arc::new(AtomicBool::new(false));
+                let backend = FastPathFallbackBackend {
+                    fallback_query_seen: Arc::clone(&fallback_query_seen),
+                };
 
-        assert_eq!(writes.writes_by_statement.len(), 2);
-        assert_eq!(writes.writes_by_statement[0].len(), 1);
-        assert_eq!(writes.writes_by_statement[1].len(), 1);
+                let writes = collect_pending_file_writes(
+                    &backend,
+                    "UPDATE lix_file SET path = '/src/b.md' WHERE id = 'file-1'",
+                    &[],
+                    "v1",
+                )
+                .await
+                .expect("collect_pending_file_writes should succeed");
 
-        let second = &writes.writes_by_statement[1][0];
-        assert_eq!(second.file_id, "file-1");
-        assert_eq!(second.version_id, "v1");
-        assert_eq!(second.before_path.as_deref(), Some("/seed.md"));
-        assert_eq!(second.path, "/next.md");
-        assert_eq!(second.before_data.as_deref(), Some(b"seed".as_slice()));
-        assert_eq!(second.after_data, b"seed".to_vec());
+                assert!(
+                    fallback_query_seen.load(Ordering::SeqCst),
+                    "cache miss must fall back to full prefetch query instead of early return"
+                );
+                assert_eq!(writes.writes.len(), 1);
+                let write = &writes.writes[0];
+                assert_eq!(write.file_id, "file-1");
+                assert_eq!(write.version_id, "v1");
+                assert_eq!(write.before_path.as_deref(), Some("/src/a.md"));
+                assert_eq!(write.path, "/src/b.md");
+                assert_eq!(write.before_data.as_deref(), Some(b"seed-data".as_slice()));
+                assert_eq!(write.after_data, b"seed-data".to_vec());
+            });
+        });
+    }
+
+    #[test]
+    fn case_path_update_keeps_case_selected_path_with_overlay() {
+        run_async_test_with_large_stack(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            runtime.block_on(async {
+                let writes = collect_pending_file_writes(
+                    &CasePathOverlayBackend,
+                    "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/seed.md', 'seed'); \
+                     UPDATE lix_file \
+                     SET path = CASE id WHEN 'file-1' THEN '/next.md' ELSE path END \
+                     WHERE id = 'file-1'",
+                    &[],
+                    "v1",
+                )
+                .await
+                .expect("collect_pending_file_writes should succeed");
+
+                assert_eq!(writes.writes_by_statement.len(), 2);
+                assert_eq!(writes.writes_by_statement[0].len(), 1);
+                assert_eq!(writes.writes_by_statement[1].len(), 1);
+
+                let second = &writes.writes_by_statement[1][0];
+                assert_eq!(second.file_id, "file-1");
+                assert_eq!(second.version_id, "v1");
+                assert_eq!(second.before_path.as_deref(), Some("/seed.md"));
+                assert_eq!(second.path, "/next.md");
+                assert_eq!(second.before_data.as_deref(), Some(b"seed".as_slice()));
+                assert_eq!(second.after_data, b"seed".to_vec());
+            });
+        });
     }
 }
 
