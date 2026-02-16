@@ -308,7 +308,7 @@ async fn collect_update_writes(
         }
     }
 
-    if !saw_data_assignment && next_path.is_none() {
+    if !saw_data_assignment && next_path.is_none() && next_path_by_id.is_none() {
         return Ok(());
     }
 
@@ -508,7 +508,7 @@ async fn collect_update_writes(
         {
             write.before_data = Some(overlay_state.data.clone());
             write.before_path = Some(overlay_state.path.clone());
-            if next_path.is_none() {
+            if next_path.is_none() && next_path_by_id.is_none() {
                 write.path = overlay_state.path.clone();
             }
         }
@@ -1722,6 +1722,7 @@ mod tests {
     }
 
     struct UnusedTransaction;
+    struct CasePathOverlayBackend;
 
     #[async_trait(?Send)]
     impl LixBackend for FastPathFallbackBackend {
@@ -1781,6 +1782,31 @@ mod tests {
 
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for CasePathOverlayBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("pending.collect_update_writes") {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("file-1".to_string()),
+                        Value::Text("/seed.md".to_string()),
+                        Value::Blob(b"seed".to_vec()),
+                        Value::Text("v1".to_string()),
+                    ]],
+                });
+            }
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(UnusedTransaction))
         }
     }
 
@@ -1885,6 +1911,33 @@ mod tests {
         assert_eq!(write.path, "/src/b.md");
         assert_eq!(write.before_data.as_deref(), Some(b"seed-data".as_slice()));
         assert_eq!(write.after_data, b"seed-data".to_vec());
+    }
+
+    #[tokio::test]
+    async fn case_path_update_keeps_case_selected_path_with_overlay() {
+        let writes = collect_pending_file_writes(
+            &CasePathOverlayBackend,
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/seed.md', 'seed'); \
+             UPDATE lix_file \
+             SET path = CASE id WHEN 'file-1' THEN '/next.md' ELSE path END \
+             WHERE id = 'file-1'",
+            &[],
+            "v1",
+        )
+        .await
+        .expect("collect_pending_file_writes should succeed");
+
+        assert_eq!(writes.writes_by_statement.len(), 2);
+        assert_eq!(writes.writes_by_statement[0].len(), 1);
+        assert_eq!(writes.writes_by_statement[1].len(), 1);
+
+        let second = &writes.writes_by_statement[1][0];
+        assert_eq!(second.file_id, "file-1");
+        assert_eq!(second.version_id, "v1");
+        assert_eq!(second.before_path.as_deref(), Some("/seed.md"));
+        assert_eq!(second.path, "/next.md");
+        assert_eq!(second.before_data.as_deref(), Some(b"seed".as_slice()));
+        assert_eq!(second.after_data, b"seed".to_vec());
     }
 }
 

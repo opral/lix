@@ -966,10 +966,12 @@ fn append_implicit_tombstones_for_projection(
     existing_entities: &[PluginEntityKey],
     plugin_change_keys: &mut BTreeSet<(String, String)>,
 ) {
-    let mut full_after_keys = plugin_changes
+    // Treat non-complete detect output as a delta by default.
+    // Seed from existing entities so unchanged rows are preserved, then apply explicit
+    // upserts/tombstones from plugin output.
+    let mut full_after_keys = existing_entities
         .iter()
-        .filter(|change| change.snapshot_content.is_some())
-        .map(|change| (change.schema_key.clone(), change.entity_id.clone()))
+        .map(|existing| (existing.schema_key.clone(), existing.entity_id.clone()))
         .collect::<BTreeSet<_>>();
 
     for change in plugin_changes.iter() {
@@ -1257,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_adds_implicit_tombstones_for_missing_existing_entities() {
+    fn reconciliation_preserves_unchanged_entities_for_delta_output() {
         let mut plugin_changes = vec![PluginEntityChange {
             entity_id: "a".to_string(),
             schema_key: "json_pointer".to_string(),
@@ -1285,11 +1287,10 @@ mod tests {
 
         let tombstone = plugin_changes
             .iter()
-            .find(|change| change.entity_id == "b" && change.schema_key == "json_pointer")
-            .expect("missing implicit tombstone for removed entity");
+            .find(|change| change.entity_id == "b" && change.schema_key == "json_pointer");
         assert!(
-            tombstone.snapshot_content.is_none(),
-            "implicit tombstone must be encoded as snapshot_content = None"
+            tombstone.is_none(),
+            "delta output must not infer tombstones for unchanged entities"
         );
     }
 
