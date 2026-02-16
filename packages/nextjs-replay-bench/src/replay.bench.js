@@ -28,7 +28,7 @@ const CONFIG = {
   repoRef: process.env.BENCH_REPLAY_REF ?? "HEAD",
   cacheDir: process.env.BENCH_REPLAY_CACHE_DIR ?? DEFAULT_CACHE_DIR,
   commitLimit: parseEnvInt("BENCH_REPLAY_COMMITS", 1000),
-  warmupCommitCount: parseEnvNonNegativeInt("BENCH_REPLAY_WARMUP_COMMITS", 0),
+  warmupCommitCount: parseEnvNonNegativeInt("BENCH_REPLAY_WARMUP_COMMITS", 5),
   firstParent: parseEnvBool("BENCH_REPLAY_FIRST_PARENT", true),
   syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
