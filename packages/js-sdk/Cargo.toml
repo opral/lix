@@ -14,3 +14,4 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 async-trait = "0.1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
+serde_json = "1"
