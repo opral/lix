@@ -2666,17 +2666,41 @@ fn snapshot_content_from_assignments(
 ) -> Result<(Option<JsonValue>, Option<BTreeMap<String, JsonValue>>), LixError> {
     let mut state = PlaceholderState::new();
     for assignment in assignments {
-        let value = resolve_expr_cell_with_state(&assignment.value, params, &mut state)?;
         if assignment_target_is_column(&assignment.target, "snapshot_content") {
-            if value.value.is_none() {
+            let value = resolve_snapshot_assignment_value(&assignment.value, params, &mut state)?;
+            if value.is_none() {
                 if let Some(patch) = extract_snapshot_patch_from_expr(&assignment.value)? {
                     return Ok((None, Some(patch)));
                 }
+                return Err(LixError {
+                    message: "vtable update requires literal snapshot_content".to_string(),
+                });
             }
-            return Ok((resolved_snapshot_json_value(value.value)?, None));
+            return Ok((resolved_snapshot_json_value(value)?, None));
         }
+
+        // Keep placeholder binding state in sync for assignments we skip.
+        let _ = resolve_expr_cell_with_state(&assignment.value, params, &mut state)?;
     }
     Ok((None, None))
+}
+
+fn resolve_snapshot_assignment_value(
+    expr: &Expr,
+    params: &[EngineValue],
+    state: &mut PlaceholderState,
+) -> Result<Option<EngineValue>, LixError> {
+    let resolved = resolve_expr_cell_with_state(expr, params, state)?;
+    if resolved.value.is_some() {
+        return Ok(resolved.value);
+    }
+
+    match expr {
+        Expr::Cast { expr, .. } | Expr::Nested(expr) => {
+            resolve_snapshot_assignment_value(expr, params, state)
+        }
+        _ => Ok(None),
+    }
 }
 
 fn resolved_snapshot_json_value(value: Option<EngineValue>) -> Result<Option<JsonValue>, LixError> {
