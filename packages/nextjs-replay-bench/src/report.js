@@ -25,6 +25,7 @@ export function summarizeSamples(samples) {
 
 export function printProgress(state) {
   const {
+    label,
     index,
     total,
     commitSha,
@@ -35,25 +36,49 @@ export function printProgress(state) {
   } = state;
   const pct = ((index / total) * 100).toFixed(1);
   const elapsedSec = (elapsedMs / 1000).toFixed(1);
+  const phase = label ? `:${label}` : "";
 
   console.log(
     color(
-      `[progress] ${index}/${total} (${pct}%) commit=${commitSha.slice(0, 12)} changed_paths=${changedPaths} applied=${commitsApplied} noop=${commitsNoop} elapsed=${elapsedSec}s`,
+      `[progress${phase}] ${index}/${total} (${pct}%) commit=${commitSha.slice(0, 12)} changed_paths=${changedPaths} applied=${commitsApplied} noop=${commitsNoop} elapsed=${elapsedSec}s`,
       "dim",
     ),
   );
 }
 
 export function printSummary(report) {
+  const warmupRequested = Number(report.commitTotals.warmupRequested ?? 0);
+  const warmupUsed = Number(report.commitTotals.warmupUsed ?? 0);
+  const warmupApplied = Number(report.commitTotals.warmupApplied ?? 0);
+  const warmupNoop = Number(report.commitTotals.warmupNoop ?? 0);
+  const measuredDiscovered = Number(
+    report.commitTotals.measuredDiscovered ?? report.commitTotals.discovered,
+  );
+
   console.log("");
   console.log(color("Next.js Replay Benchmark", "bold"));
-  console.log(color(`Commits requested: ${report.config.commitLimit}`, "dim"));
-  console.log(color(`Commits discovered: ${report.commitTotals.discovered}`, "dim"));
-  console.log(color(`Commits applied: ${report.commitTotals.applied}`, "dim"));
-  console.log(color(`Commits skipped (no file changes): ${report.commitTotals.noop}`, "dim"));
-  console.log(color(`Replay duration: ${formatMs(report.timings.replayMs)}`, "dim"));
+  console.log(color(`Commits requested (measured): ${report.config.commitLimit}`, "dim"));
+  if (warmupUsed > 0 || warmupRequested > 0) {
+    console.log(color(`Commits requested (warmup): ${warmupRequested}`, "dim"));
+    console.log(color(`Commits used (warmup): ${warmupUsed}`, "dim"));
+  }
+  console.log(color(`Commits discovered (total): ${report.commitTotals.discovered}`, "dim"));
+  console.log(color(`Commits discovered (measured): ${measuredDiscovered}`, "dim"));
+  if (warmupUsed > 0) {
+    console.log(color(`Warmup applied: ${warmupApplied}`, "dim"));
+    console.log(color(`Warmup skipped (no file changes): ${warmupNoop}`, "dim"));
+  }
+  console.log(color(`Commits applied (measured): ${report.commitTotals.applied}`, "dim"));
+  console.log(color(`Commits skipped (measured, no file changes): ${report.commitTotals.noop}`, "dim"));
+  if (Number(report.timings.warmupMs ?? 0) > 0) {
+    console.log(color(`Warmup duration: ${formatMs(report.timings.warmupMs)}`, "dim"));
+  }
+  console.log(color(`Replay duration (measured): ${formatMs(report.timings.replayMs)}`, "dim"));
+  if (typeof report.timings.overallReplayMs === "number") {
+    console.log(color(`Replay duration (overall): ${formatMs(report.timings.overallReplayMs)}`, "dim"));
+  }
   if (typeof report.timings.commitLoopMs === "number") {
-    console.log(color(`Commit loop duration: ${formatMs(report.timings.commitLoopMs)}`, "dim"));
+    console.log(color(`Commit loop duration (measured): ${formatMs(report.timings.commitLoopMs)}`, "dim"));
   }
 
   console.log("");
