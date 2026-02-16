@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use lix_engine::{
     LixError, MaterializationDebugMode, MaterializationRequest, MaterializationScope, Value,
-    WasmLimits, WasmComponentInstance, WasmRuntime,
+    WasmComponentInstance, WasmLimits, WasmRuntime,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;

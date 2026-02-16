@@ -5,7 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use lix_engine::{LixError, WasmLimits, WasmComponentInstance, WasmRuntime};
+use lix_engine::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
