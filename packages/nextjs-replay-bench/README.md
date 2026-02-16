@@ -29,6 +29,9 @@ pnpm -C packages/nextjs-replay-bench bench:git-files:100   # git file-write + gi
 - `BENCH_REPLAY_SNAPSHOT_PATH` custom output path for snapshot artifact (`.lix` recommended)
 - `BENCH_REPLAY_PROGRESS_EVERY` progress cadence (default: `25`)
 - `BENCH_GIT_FILES_REPORT_PATH` custom output path for git file-replay report
+- `BENCH_GIT_FILES_DISABLE_MAINTENANCE` disable git auto maintenance/gc in target replay repo (default: `1`)
+- `BENCH_GIT_TRACE2_PERF` set to `1` to enable git Trace2 performance logging for the git baseline replay
+- `BENCH_GIT_TRACE2_PERF_PATH` output path for trace2 log (default: `packages/nextjs-replay-bench/results/nextjs-replay.git-files.trace2.perf.log`)
 
 Determinism:
 

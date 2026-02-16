@@ -1806,6 +1806,7 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "lix_engine",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]

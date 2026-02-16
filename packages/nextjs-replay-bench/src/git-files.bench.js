@@ -23,6 +23,11 @@ const CONFIG = {
   syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
   showProgress: parseEnvBool("BENCH_REPLAY_PROGRESS", true),
+  disableGitMaintenance: parseEnvBool("BENCH_GIT_FILES_DISABLE_MAINTENANCE", true),
+  trace2PerfEnabled: parseEnvBool("BENCH_GIT_TRACE2_PERF", false),
+  trace2PerfPath:
+    process.env.BENCH_GIT_TRACE2_PERF_PATH ??
+    join(OUTPUT_DIR, "nextjs-replay.git-files.trace2.perf.log"),
   reportPath: process.env.BENCH_GIT_FILES_REPORT_PATH ?? OUTPUT_PATH,
 };
 
@@ -64,10 +69,28 @@ async function main() {
 
   const tempRoot = await mkdtemp(join(tmpdir(), "nextjs-git-files-replay-"));
   const gitRepoPath = join(tempRoot, "repo");
+  const gitCommandEnv = await resolveGitCommandEnv();
   await mkdir(gitRepoPath, { recursive: true });
-  await runCommand("git", ["init", "-q"], { cwd: gitRepoPath });
-  await runCommand("git", ["config", "user.email", "bench@example.com"], { cwd: gitRepoPath });
-  await runCommand("git", ["config", "user.name", "nextjs-replay-bench"], { cwd: gitRepoPath });
+  await runCommand("git", ["init", "-q"], { cwd: gitRepoPath, env: gitCommandEnv });
+  await runCommand("git", ["config", "user.email", "bench@example.com"], {
+    cwd: gitRepoPath,
+    env: gitCommandEnv,
+  });
+  await runCommand("git", ["config", "user.name", "nextjs-replay-bench"], {
+    cwd: gitRepoPath,
+    env: gitCommandEnv,
+  });
+  if (CONFIG.disableGitMaintenance) {
+    await runCommand("git", ["config", "gc.auto", "0"], { cwd: gitRepoPath, env: gitCommandEnv });
+    await runCommand("git", ["config", "maintenance.auto", "false"], {
+      cwd: gitRepoPath,
+      env: gitCommandEnv,
+    });
+    await runCommand("git", ["config", "gc.autoDetach", "false"], {
+      cwd: gitRepoPath,
+      env: gitCommandEnv,
+    });
+  }
 
   if (CONFIG.showProgress) {
     console.log(
@@ -145,11 +168,11 @@ async function main() {
     const applyFilesMs = performance.now() - applyFilesStarted;
 
     const gitStageCommitStarted = performance.now();
-    await runCommand("git", ["add", "-A"], { cwd: gitRepoPath });
+    await runCommand("git", ["add", "-A"], { cwd: gitRepoPath, env: gitCommandEnv });
     await runCommand(
       "git",
       ["commit", "-q", "--allow-empty", "-m", `replay ${commitSha.slice(0, 12)}`],
-      { cwd: gitRepoPath },
+      { cwd: gitRepoPath, env: gitCommandEnv },
     );
     const gitStageCommitMs = performance.now() - gitStageCommitStarted;
 
@@ -214,6 +237,7 @@ async function main() {
     targetRepo: {
       path: gitRepoPath,
       kind: "fresh-git-working-tree",
+      maintenanceDisabled: CONFIG.disableGitMaintenance,
     },
     commitTotals: {
       requested: totalRequestedCommits,
@@ -434,6 +458,9 @@ function printSummary(report) {
 
   console.log("");
   console.log(`Target git repo: ${report.targetRepo.path}`);
+  if (report.config.trace2PerfEnabled) {
+    console.log(`Trace2 perf log: ${report.config.trace2PerfPath}`);
+  }
 }
 
 function formatMs(value) {
@@ -485,6 +512,7 @@ async function runCommand(command, args, options = {}) {
   return await new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
+      env: options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -507,6 +535,17 @@ async function runCommand(command, args, options = {}) {
     });
     child.stdin.end();
   });
+}
+
+async function resolveGitCommandEnv() {
+  if (!CONFIG.trace2PerfEnabled) {
+    return process.env;
+  }
+  await mkdir(dirname(CONFIG.trace2PerfPath), { recursive: true });
+  return {
+    ...process.env,
+    GIT_TRACE2_PERF: CONFIG.trace2PerfPath,
+  };
 }
 
 main().catch((error) => {

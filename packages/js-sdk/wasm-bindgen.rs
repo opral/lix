@@ -189,7 +189,8 @@ export type LixBootKeyValue = {
             }
 
             let key = read_required_string_property(&entry, "key", "openLix keyValues entry")?;
-            let value = Reflect::get(&entry, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+            let value =
+                Reflect::get(&entry, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
             let value = js_to_json_value(value, &format!("openLix keyValues[{key}].value"))?;
 
             let version_id = read_optional_string_property(&entry, "versionId")?
@@ -221,7 +222,10 @@ export type LixBootKeyValue = {
         Ok(text)
     }
 
-    fn read_optional_string_property(object: &JsValue, key: &str) -> Result<Option<String>, LixError> {
+    fn read_optional_string_property(
+        object: &JsValue,
+        key: &str,
+    ) -> Result<Option<String>, LixError> {
         let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
         if value.is_null() || value.is_undefined() {
             return Ok(None);
@@ -289,8 +293,7 @@ export type LixBootKeyValue = {
             let resolved = JsBackend::await_if_promise(result).await?;
             if resolved.is_null() || resolved.is_undefined() {
                 return Err(LixError {
-                    message: "wasmRuntime.initComponent returned no component instance"
-                        .to_string(),
+                    message: "wasmRuntime.initComponent returned no component instance".to_string(),
                 });
             }
 
@@ -308,15 +311,18 @@ export type LixBootKeyValue = {
             let input_arg = Uint8Array::new_with_length(input.len() as u32);
             input_arg.copy_from(input);
             let result = call_method
-                .call2(&self.component, &JsValue::from_str(export), &input_arg.into())
+                .call2(
+                    &self.component,
+                    &JsValue::from_str(export),
+                    &input_arg.into(),
+                )
                 .map_err(js_to_lix_error)?;
             let resolved = JsBackend::await_if_promise(result).await?;
             js_bytes_from_value(resolved, "wasmComponentInstance.call result")
         }
 
         async fn close(&self) -> Result<(), LixError> {
-            let Some(close_method) =
-                JsBackend::get_optional_method(&self.component, "close")?
+            let Some(close_method) = JsBackend::get_optional_method(&self.component, "close")?
             else {
                 return Ok(());
             };
@@ -516,12 +522,10 @@ export type LixBootKeyValue = {
             &self,
             writer: &mut dyn SnapshotChunkWriter,
         ) -> Result<(), LixError> {
-            let export_snapshot =
-                Self::get_optional_method(&self.backend, "exportSnapshot")?
-                    .ok_or_else(|| LixError {
-                        message: "backend.exportSnapshot is required for export_snapshot"
-                            .to_string(),
-                    })?;
+            let export_snapshot = Self::get_optional_method(&self.backend, "exportSnapshot")?
+                .ok_or_else(|| LixError {
+                    message: "backend.exportSnapshot is required for export_snapshot".to_string(),
+                })?;
             let result = export_snapshot
                 .call0(&self.backend)
                 .map_err(js_to_lix_error)?;

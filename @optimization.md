@@ -39,3 +39,23 @@ Result: Replay duration `1990.29ms` (from `2908.15ms`, `-31.6%`; from original b
 Hypothesis: first detect call is dominated by JCO transpiling a large debug wasm artifact (~7.1MB); loading release wasm (~238KB) should significantly reduce one-time component init cost.
 Implementation: Update replay benchmark plugin loader/build to prefer `target/wasm32-wasip2/release/plugin_text_lines.wasm` and build with `cargo build --release` fallback.
 Result: Replay duration `1590.48ms` (from `1990.29ms`, `-20.1%`; from original baseline `15950.20ms`, `-90.0%`), crossing the 10x target on this 25-commit run.
+
+## optimize 8: profile slowest commit with raw backend trace + EXPLAIN
+Hypothesis: remaining replay gap is likely in engine SQL path; tracing should show if missing indexes or expensive queries still dominate.
+Implementation: Run `packages/nextjs-replay-bench/src/profile-slowest-commit.js` on current slowest commit and inspect generated `results/nextjs-replay.slowest-commit.explain.txt`.
+Result: target commit wall-time `415.00ms`, but traced backend SQL totaled only `17.08ms` (largest SQL: plugin lookup `13.55ms`). Remaining time is host-side wasm/component overhead (JCO path), not an index/planner bottleneck in engine SQL for this commit.
+
+## optimize 9: persistent node transpile cache (attempt, reverted)
+Hypothesis: persisting JCO transpile output to disk across process runs should reduce first-commit latency.
+Implementation: Add node runtime cache file keyed by wasm hash (`packages/js-sdk/src/wasm-runtime/node.js`) and load transpiled files from disk before calling `transpile()`.
+Result: No meaningful win (`1728.99ms` first run, `1668.69ms` second run; still around current range). Indicates current bottleneck is mostly component instantiation/call path, not transpile output generation. Reverted.
+
+## optimize 10: id-only projection for delete prefetch
+Hypothesis: `pending.collect_delete_targets` still uses `lix_file_by_version` expansion even when delete predicates only need `id/lixcol_version_id`, causing unnecessary directory/path/file data work.
+Implementation: In `pending_file_writes`, detect delete predicates that only reference `id`/version columns and run prefetch against an id-only projection from `lix_state_by_version` (`schema_key='lix_file_descriptor'`) instead of `lix_file_by_version`.
+Result: Warm bench (`25 measured + 5 warmup`) improved from `1222.62ms` to `1142.19ms` (`-6.6%`). Outlier statement dropped (`88b01... stmt0` from `44.18ms` to `18.74ms`). Below 10% threshold, no commit yet.
+
+## optimize 11: iterative writer-key rewrite routing (stack safety)
+Hypothesis: stack overflow risk is from recursive SQL rewrite routing; switching tail-recursive routing to an iterative pass loop should reduce stack growth and catch rewrite cycles.
+Implementation: Refactor `rewrite_statement_with_writer_key` in `sql/route.rs` from self-recursive rewrites to a bounded iterative loop (`MAX_REWRITE_PASSES=32`) with explicit `continue` transitions.
+Result: Plugin cache invalidation tests pass on default stack again; replay throughput unchanged within noise (`~1376ms` measured for 25 commits vs previous `~1351ms`). Safety/maintainability win, no >10% speedup.
