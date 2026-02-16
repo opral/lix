@@ -13,6 +13,7 @@ Warm vs cold quick commands:
 ```bash
 pnpm -C packages/nextjs-replay-bench bench:25        # warm (5 warmup + 25 measured)
 pnpm -C packages/nextjs-replay-bench bench:25:cold   # cold (0 warmup + 25 measured)
+pnpm -C packages/nextjs-replay-bench bench:git-files:100   # git file-write + git commit baseline
 ```
 
 ## Useful env vars
@@ -21,12 +22,13 @@ pnpm -C packages/nextjs-replay-bench bench:25:cold   # cold (0 warmup + 25 measu
 - `BENCH_REPLAY_REPO_URL` remote clone URL (default: `https://github.com/vercel/next.js.git`)
 - `BENCH_REPLAY_REF` git ref to replay from (default: `HEAD`)
 - `BENCH_REPLAY_COMMITS` number of measured commits to replay (default: `1000`)
-- `BENCH_REPLAY_WARMUP_COMMITS` number of warmup commits to replay first (excluded from measured stats, default: `0`)
+- `BENCH_REPLAY_WARMUP_COMMITS` number of warmup commits to replay first (excluded from measured stats, default: `5`)
 - `BENCH_REPLAY_FETCH` set to `1` to fetch remote updates (default: `0`)
 - `BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN` set to `0` to disable plugin install
 - `BENCH_REPLAY_EXPORT_SNAPSHOT` set to `1` to export a sqlite snapshot artifact
 - `BENCH_REPLAY_SNAPSHOT_PATH` custom output path for snapshot artifact (`.lix` recommended)
 - `BENCH_REPLAY_PROGRESS_EVERY` progress cadence (default: `25`)
+- `BENCH_GIT_FILES_REPORT_PATH` custom output path for git file-replay report
 
 Determinism:
 
@@ -36,4 +38,5 @@ Determinism:
 Output report:
 
 - `packages/nextjs-replay-bench/results/nextjs-replay.bench.json`
+- `packages/nextjs-replay-bench/results/nextjs-replay.git-files.bench.json`
 - `packages/nextjs-replay-bench/results/nextjs-replay.snapshot.lix` (when snapshot export enabled)
