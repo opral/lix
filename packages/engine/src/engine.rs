@@ -26,8 +26,9 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
-    bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
-    expr_references_column_name, parse_sql_statements, preprocess_sql,
+    bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql,
+    coalesce_vtable_inserts_in_statement_list, escape_sql_string, expr_references_column_name,
+    parse_sql_statements, preprocess_sql,
     preprocess_sql_with_provider_and_detected_file_domain_changes, ColumnReferenceOptions,
     DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState, PostprocessPlan,
     UpdateValidationPlan,
@@ -587,11 +588,14 @@ impl Engine {
         let mut active_version_id = self.active_version_id.read().unwrap().clone();
         let mut active_version_changed = false;
         let mut installed_plugins_cache_invalidation_pending = false;
-        let coalesced_statements =
-            coalesce_lix_file_transaction_statements(&statements, Some(transaction.dialect()));
+        let original_statements = statements;
+        let coalesced_statements = coalesce_lix_file_transaction_statements(
+            &original_statements,
+            Some(transaction.dialect()),
+        );
         let can_defer_side_effects = self.wasm_runtime.is_none() && coalesced_statements.is_some();
         let mut deferred_side_effects = if can_defer_side_effects {
-            let original_sql = statements
+            let original_sql = original_statements
                 .iter()
                 .map(Statement::to_string)
                 .collect::<Vec<_>>()
@@ -625,10 +629,14 @@ impl Engine {
         } else {
             None
         };
-        let sql_statements = statements
-            .into_iter()
-            .map(|statement| statement.to_string())
-            .collect::<Vec<_>>();
+        let sql_statements = if let Some(coalesced) = coalesced_statements {
+            coalesced
+        } else {
+            coalesce_vtable_inserts_in_statement_list(original_statements)?
+                .into_iter()
+                .map(|statement| statement.to_string())
+                .collect::<Vec<_>>()
+        };
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 
         for sql in sql_statements {
