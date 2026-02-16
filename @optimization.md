@@ -29,3 +29,8 @@ Result: Replay duration `3284.56ms` (worse than optimize 3 by `+1.0%`). Reverted
 Hypothesis: plugin instance reuse only within a single `execute` still re-initializes component instances across statements/commits; promoting cache to engine lifecycle should reduce per-statement fixed cost.
 Implementation: Add engine-owned plugin component cache keyed by plugin key, reuse across detect calls, clear cache when plugin SQL invalidates installed plugin cache.
 Result: Replay duration `2908.15ms` (from `3349.14ms`, `-13.2%`; from original baseline `15950.20ms`, `-81.8%`), confirmed across repeated run (`2918.10ms`).
+
+## optimize 6: skip existing-entity reconciliation for text-lines detect
+Hypothesis: detect pipeline still spends significant time loading existing plugin entities from DB even though `plugin_text_lines` already emits full add/remove diff.
+Implementation: For `plugin_text_lines`, bypass the `load_existing_plugin_entities` reconciliation path in detect (keep fallback path for other plugins).
+Result: Replay duration `1990.29ms` (from `2908.15ms`, `-31.6%`; from original baseline `15950.20ms`, `-87.5%`). `cargo test -p lix_engine plugin_install` passed.

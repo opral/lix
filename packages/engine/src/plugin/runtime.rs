@@ -227,36 +227,41 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             .collect::<BTreeSet<_>>();
 
         if has_before_context {
-            let existing_entities = load_existing_plugin_entities(
-                backend,
-                &write.file_id,
-                &write.version_id,
-                &plugin.key,
-            )
-            .await?;
-            full_after_keys.extend(
-                existing_entities
-                    .iter()
-                    .map(|existing| (existing.schema_key.clone(), existing.entity_id.clone())),
-            );
-            for change in &plugin_changes {
-                let key = (change.schema_key.clone(), change.entity_id.clone());
-                if change.snapshot_content.is_some() {
-                    full_after_keys.insert(key);
-                } else {
-                    full_after_keys.remove(&key);
+            if plugin_detect_emits_complete_diff(plugin) {
+                // This plugin computes explicit add/remove changes from before/after file bytes,
+                // so no DB reconciliation is needed for missing tombstones.
+            } else {
+                let existing_entities = load_existing_plugin_entities(
+                    backend,
+                    &write.file_id,
+                    &write.version_id,
+                    &plugin.key,
+                )
+                .await?;
+                full_after_keys.extend(
+                    existing_entities
+                        .iter()
+                        .map(|existing| (existing.schema_key.clone(), existing.entity_id.clone())),
+                );
+                for change in &plugin_changes {
+                    let key = (change.schema_key.clone(), change.entity_id.clone());
+                    if change.snapshot_content.is_some() {
+                        full_after_keys.insert(key);
+                    } else {
+                        full_after_keys.remove(&key);
+                    }
                 }
-            }
 
-            for existing in existing_entities {
-                let key = (existing.schema_key.clone(), existing.entity_id.clone());
-                if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
-                    plugin_changes.push(PluginEntityChange {
-                        entity_id: existing.entity_id,
-                        schema_key: existing.schema_key,
-                        schema_version: existing.schema_version,
-                        snapshot_content: None,
-                    });
+                for existing in existing_entities {
+                    let key = (existing.schema_key.clone(), existing.entity_id.clone());
+                    if !full_after_keys.contains(&key) && plugin_change_keys.insert(key) {
+                        plugin_changes.push(PluginEntityChange {
+                            entity_id: existing.entity_id,
+                            schema_key: existing.schema_key,
+                            schema_version: existing.schema_version,
+                            snapshot_content: None,
+                        });
+                    }
                 }
             }
         }
@@ -626,6 +631,10 @@ fn glob_matches_extension(glob: &str, extension: Option<&str>) -> bool {
     }
 
     false
+}
+
+fn plugin_detect_emits_complete_diff(plugin: &InstalledPlugin) -> bool {
+    plugin.key == "plugin_text_lines"
 }
 
 async fn call_apply_changes(
