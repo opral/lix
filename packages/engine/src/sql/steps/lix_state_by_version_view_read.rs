@@ -385,7 +385,7 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.version_id = 'bench-v-023'"));
+        assert!(sql.contains("ranked.version_id = 'bench-v-023'"));
         assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
     }
 
@@ -403,7 +403,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains(
-            "s.version_id IN ('bench-v-022', 'bench-v-023')"
+            "ranked.version_id IN ('bench-v-022', 'bench-v-023')"
         ));
         assert!(!sql.contains(
             "sv.version_id IN ('bench-v-022', 'bench-v-023')"
@@ -430,7 +430,7 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.version_id IN (SELECT"));
+        assert!(sql.contains("ranked.version_id IN (SELECT"));
         assert!(sql.contains("FROM lix_internal_state_untracked"));
         assert!(!sql.contains("sv.version_id IN (SELECT"));
     }
@@ -448,7 +448,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("s.version_id = ?"));
+        assert!(sql.contains("ranked.version_id = ?"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id = ?"));
     }
@@ -466,7 +466,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("s.version_id IN (?, ?)"));
+        assert!(sql.contains("ranked.version_id IN (?, ?)"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id IN (?, ?)"));
     }
