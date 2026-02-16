@@ -2658,18 +2658,35 @@ fn parse_lix_file_insert_rows(statement: &Statement) -> Option<Vec<LixFileWriteR
         return None;
     };
 
-    let id_index = insert
-        .columns
-        .iter()
-        .position(|column| column.value.eq_ignore_ascii_case("id"))?;
-    let path_index = insert
-        .columns
-        .iter()
-        .position(|column| column.value.eq_ignore_ascii_case("path"))?;
-    let data_index = insert
-        .columns
-        .iter()
-        .position(|column| column.value.eq_ignore_ascii_case("data"))?;
+    if insert.columns.len() != 3 {
+        return None;
+    }
+
+    let mut id_index = None;
+    let mut path_index = None;
+    let mut data_index = None;
+    for (index, column) in insert.columns.iter().enumerate() {
+        if column.value.eq_ignore_ascii_case("id") {
+            if id_index.replace(index).is_some() {
+                return None;
+            }
+        } else if column.value.eq_ignore_ascii_case("path") {
+            if path_index.replace(index).is_some() {
+                return None;
+            }
+        } else if column.value.eq_ignore_ascii_case("data") {
+            if data_index.replace(index).is_some() {
+                return None;
+            }
+        } else {
+            // Coalescer only supports replay-shape inserts with exactly id/path/data.
+            // Any extra column must fall back to normal statement execution.
+            return None;
+        }
+    }
+    let id_index = id_index?;
+    let path_index = path_index?;
+    let data_index = data_index?;
 
     let mut rows = Vec::with_capacity(values.rows.len());
     for row in &values.rows {
@@ -4634,6 +4651,22 @@ mod tests {
         let rewritten =
             coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
         assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn coalesce_lix_file_transaction_statements_returns_none_for_insert_with_extra_columns() {
+        let statements = parse_sql_statements(
+            "INSERT INTO lix_file (id, path, data, metadata) \
+             VALUES ('i1', '/inserted.txt', x'01', '{\"owner\":\"sam\"}');",
+        )
+        .expect("parse");
+
+        let rewritten =
+            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
+        assert!(
+            rewritten.is_none(),
+            "coalescer must not drop non-replay columns from lix_file inserts"
+        );
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {
