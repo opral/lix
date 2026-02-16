@@ -2625,17 +2625,19 @@ async fn try_exact_file_descriptor_lookup_current_version(
     version_id: &str,
     file_id: &str,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
-    let sql = "SELECT entity_id, untracked, \
+    let sql = "SELECT entity_id, untracked, is_tombstone, \
                     'mutation.file_ids_matching_update.fast_id.direct' AS __lix_trace \
              FROM (\
-                 SELECT entity_id, 1 AS untracked, 0 AS source_priority \
+                 SELECT entity_id, 1 AS untracked, \
+                        CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
+                        0 AS source_priority, \
+                        updated_at \
                  FROM lix_internal_state_untracked \
                  WHERE schema_key = 'lix_file_descriptor' \
                    AND version_id = $1 \
                    AND entity_id = $2 \
-                   AND snapshot_content IS NOT NULL \
                  UNION ALL \
-                 SELECT entity_id, 0 AS untracked, 1 AS source_priority \
+                 SELECT entity_id, 0 AS untracked, is_tombstone, 1 AS source_priority, updated_at \
                  FROM lix_internal_state_materialized_v1_lix_file_descriptor \
                  WHERE schema_key = 'lix_file_descriptor' \
                    AND version_id = $1 \
@@ -2643,7 +2645,7 @@ async fn try_exact_file_descriptor_lookup_current_version(
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL\
              ) AS exact_rows \
-             ORDER BY source_priority \
+             ORDER BY source_priority, updated_at DESC \
              LIMIT 1";
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
     let result = backend
@@ -2662,32 +2664,40 @@ async fn try_exact_file_descriptor_lookup_current_version(
             ),
         })?;
 
-    if result.rows.is_empty() {
+    parse_exact_file_descriptor_lookup_rows(result.rows)
+}
+
+fn parse_exact_file_descriptor_lookup_rows(
+    rows: Vec<Vec<EngineValue>>,
+) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
+    let Some(row) = rows.first() else {
         return Ok(None);
-    }
-
-    let mut out = Vec::<ScopedFileUpdateRow>::with_capacity(result.rows.len());
-    for row in result.rows {
-        let Some(id_value) = row.first() else {
-            continue;
-        };
-        let EngineValue::Text(id) = id_value else {
-            return Err(LixError {
-                message: format!("file update id lookup expected text, got {id_value:?}"),
-            });
-        };
-        let untracked = row
-            .get(1)
-            .map(parse_untracked_value)
-            .transpose()?
-            .unwrap_or(false);
-        out.push(ScopedFileUpdateRow {
-            id: id.clone(),
-            untracked,
+    };
+    let Some(id_value) = row.first() else {
+        return Ok(Some(Vec::new()));
+    };
+    let EngineValue::Text(id) = id_value else {
+        return Err(LixError {
+            message: format!("file update id lookup expected text, got {id_value:?}"),
         });
+    };
+    let untracked = row
+        .get(1)
+        .map(parse_untracked_value)
+        .transpose()?
+        .unwrap_or(false);
+    let is_tombstone = row
+        .get(2)
+        .map(parse_untracked_value)
+        .transpose()?
+        .unwrap_or(false);
+    if is_tombstone {
+        return Ok(Some(Vec::new()));
     }
-
-    Ok(Some(out))
+    Ok(Some(vec![ScopedFileUpdateRow {
+        id: id.clone(),
+        untracked,
+    }]))
 }
 
 fn extract_exact_file_update_selection_with_state(
@@ -3088,7 +3098,8 @@ fn noop_statement() -> Result<Statement, LixError> {
 mod tests {
     use super::{
         extract_predicate_string_with_params_and_state, json_text_extract_for_dialect,
-        parse_expression, rewrite_delete, rewrite_insert, rewrite_update,
+        parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
+        rewrite_update,
     };
     use crate::backend::SqlDialect;
     use crate::sql::parse_sql_statements;
@@ -3282,5 +3293,37 @@ mod tests {
         )
         .expect("extract version predicate");
         assert_eq!(extracted.as_deref(), Some("version-target"));
+    }
+
+    #[test]
+    fn exact_file_descriptor_lookup_treats_untracked_tombstone_as_no_match() {
+        let rows = vec![vec![
+            Value::Text("file-a".to_string()),
+            Value::Integer(1),
+            Value::Integer(1),
+        ]];
+        let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
+        assert!(
+            parsed.is_some(),
+            "exact lookup should short-circuit fallback"
+        );
+        assert!(
+            parsed.expect("result").is_empty(),
+            "tombstoned row should not be treated as live match"
+        );
+    }
+
+    #[test]
+    fn exact_file_descriptor_lookup_keeps_live_untracked_row() {
+        let rows = vec![vec![
+            Value::Text("file-b".to_string()),
+            Value::Integer(1),
+            Value::Integer(0),
+        ]];
+        let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
+        let parsed = parsed.expect("live row should exist");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "file-b");
+        assert!(parsed[0].untracked);
     }
 }

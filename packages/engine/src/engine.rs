@@ -45,9 +45,7 @@ use crate::version::{
     version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
 };
 use crate::WasmRuntime;
-use crate::{
-    LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value, WasmComponentInstance,
-};
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
@@ -116,7 +114,7 @@ pub struct Engine {
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
-    plugin_component_cache: Mutex<BTreeMap<String, Arc<dyn WasmComponentInstance>>>,
+    plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -1058,7 +1056,10 @@ impl Engine {
         &self,
         reader: &mut dyn crate::SnapshotChunkReader,
     ) -> Result<(), LixError> {
-        self.backend.restore_from_snapshot(reader).await
+        self.backend.restore_from_snapshot(reader).await?;
+        self.load_and_cache_active_version().await?;
+        self.invalidate_installed_plugins_cache()?;
+        Ok(())
     }
 
     pub async fn materialization_plan(
@@ -3921,24 +3922,36 @@ mod tests {
         should_refresh_file_cache_for_sql, BootArgs, ExecuteOptions, FileReadMaterializationScope,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::sql::{
         bind_sql_with_state, parse_sql_statements, MutationOperation, MutationRow, PlaceholderState,
     };
     use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
-    use crate::{LixError, QueryResult, Value};
+    use crate::{LixError, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance};
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     struct TestBackend {
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
+        active_version_snapshot: Arc<RwLock<String>>,
+        restored_active_version_snapshot: String,
     }
 
     struct TestTransaction {
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
+    }
+
+    #[derive(Default)]
+    struct EmptySnapshotReader;
+
+    struct NoopWasmComponentInstance;
+
+    fn active_version_snapshot_json(version_id: &str) -> String {
+        serde_json::json!({ "id": "main", "version_id": version_id }).to_string()
     }
 
     #[async_trait(?Send)]
@@ -3947,7 +3960,19 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("FROM lix_internal_state_untracked")
+                && sql.contains("SELECT snapshot_content")
+            {
+                let snapshot = self
+                    .active_version_snapshot
+                    .read()
+                    .expect("active_version_snapshot lock")
+                    .clone();
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Text(snapshot)]],
+                });
+            }
             Ok(QueryResult { rows: Vec::new() })
         }
 
@@ -3956,6 +3981,19 @@ mod tests {
                 commit_called: Arc::clone(&self.commit_called),
                 rollback_called: Arc::clone(&self.rollback_called),
             }))
+        }
+
+        async fn restore_from_snapshot(
+            &self,
+            reader: &mut dyn SnapshotChunkReader,
+        ) -> Result<(), LixError> {
+            while reader.read_chunk().await?.is_some() {}
+            let mut guard = self
+                .active_version_snapshot
+                .write()
+                .expect("active_version_snapshot lock");
+            *guard = self.restored_active_version_snapshot.clone();
+            Ok(())
         }
     }
 
@@ -3981,6 +4019,20 @@ mod tests {
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             self.rollback_called.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SnapshotChunkReader for EmptySnapshotReader {
+        async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl WasmComponentInstance for NoopWasmComponentInstance {
+        async fn call(&self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
+            Ok(Vec::new())
         }
     }
 
@@ -4068,6 +4120,8 @@ mod tests {
         let engine = boot(BootArgs::new(Box::new(TestBackend {
             commit_called: Arc::clone(&commit_called),
             rollback_called: Arc::clone(&rollback_called),
+            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
+            restored_active_version_snapshot: active_version_snapshot_json("global"),
         })));
 
         {
@@ -4118,6 +4172,8 @@ mod tests {
         let engine = boot(BootArgs::new(Box::new(TestBackend {
             commit_called: Arc::clone(&commit_called),
             rollback_called: Arc::clone(&rollback_called),
+            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
+            restored_active_version_snapshot: active_version_snapshot_json("global"),
         })));
 
         {
@@ -4149,6 +4205,79 @@ mod tests {
                 .expect("installed plugins cache lock")
                 .is_some(),
             "cache should remain populated after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_from_snapshot_refreshes_active_version_and_plugin_caches() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let active_version_snapshot = Arc::new(RwLock::new(active_version_snapshot_json("before")));
+        let engine = boot(BootArgs::new(Box::new(TestBackend {
+            commit_called,
+            rollback_called,
+            active_version_snapshot: Arc::clone(&active_version_snapshot),
+            restored_active_version_snapshot: active_version_snapshot_json("after"),
+        })));
+
+        {
+            let mut cache = engine
+                .installed_plugins_cache
+                .write()
+                .expect("installed plugins cache lock");
+            *cache = Some(vec![InstalledPlugin {
+                key: "k".to_string(),
+                runtime: PluginRuntime::WasmComponentV1,
+                api_version: "0.1.0".to_string(),
+                detect_changes_glob: "*.json".to_string(),
+                entry: "plugin.wasm".to_string(),
+                manifest_json: "{}".to_string(),
+                wasm: vec![0],
+            }]);
+        }
+        {
+            let mut components = engine
+                .plugin_component_cache
+                .lock()
+                .expect("plugin component cache lock");
+            components.insert(
+                "k".to_string(),
+                crate::plugin::runtime::CachedPluginComponent {
+                    wasm: vec![0],
+                    instance: Arc::new(NoopWasmComponentInstance) as Arc<dyn WasmComponentInstance>,
+                },
+            );
+        }
+
+        let mut reader = EmptySnapshotReader;
+        engine
+            .restore_from_snapshot(&mut reader)
+            .await
+            .expect("restore_from_snapshot should succeed");
+
+        assert_eq!(
+            engine
+                .active_version_id
+                .read()
+                .expect("active_version_id lock")
+                .as_str(),
+            "after"
+        );
+        assert!(
+            engine
+                .installed_plugins_cache
+                .read()
+                .expect("installed plugins cache lock")
+                .is_none(),
+            "installed plugin cache should be invalidated after restore"
+        );
+        assert!(
+            engine
+                .plugin_component_cache
+                .lock()
+                .expect("plugin component cache lock")
+                .is_empty(),
+            "plugin component cache should be cleared after restore"
         );
     }
 
