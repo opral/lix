@@ -1,0 +1,26 @@
+{
+  "name": "nextjs-replay-bench",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Replay benchmark for linear git history into js-sdk/engine",
+  "scripts": {
+    "bench": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm run bench:run",
+    "bench:run": "node ./src/replay.bench.js",
+    "bench:parity": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && node ./src/state-parity.js",
+    "bench:git-files": "node ./src/git-files.bench.js",
+    "bench:profile-slowest": "node ./src/profile-slowest-commit.js",
+    "bench:25:cold": "BENCH_REPLAY_COMMITS=25 BENCH_REPLAY_WARMUP_COMMITS=0 pnpm run bench",
+    "bench:25": "BENCH_REPLAY_COMMITS=25 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
+    "bench:100": "BENCH_REPLAY_COMMITS=100 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
+    "bench:500": "BENCH_REPLAY_COMMITS=500 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
+    "bench:1000": "BENCH_REPLAY_COMMITS=1000 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench",
+    "bench:git-files:25": "BENCH_REPLAY_COMMITS=25 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench:git-files",
+    "bench:git-files:100": "BENCH_REPLAY_COMMITS=100 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench:git-files",
+    "bench:git-files:1000": "BENCH_REPLAY_COMMITS=1000 BENCH_REPLAY_WARMUP_COMMITS=5 pnpm run bench:git-files",
+    "bench:parity:25": "BENCH_REPLAY_COMMITS=25 BENCH_PARITY_EVERY=1 pnpm run bench:parity"
+  },
+  "dependencies": {
+    "js-sdk": "workspace:*"
+  }
+}

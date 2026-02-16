@@ -3,5 +3,6 @@ resolver = "2"
 members = [
   "packages/engine",
   "packages/js-sdk",
+  "packages/plugin-text-lines",
   "packages/rs-sdk",
 ]

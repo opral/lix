@@ -10,4 +10,9 @@ export type LixBackend = WasmLixBackend & {
   close?: () => Promise<void> | void;
 };
 
-export type { LixQueryResultLike, LixSqlDialect, LixTransaction, LixValueLike };
+export type {
+  LixQueryResultLike,
+  LixSqlDialect,
+  LixTransaction,
+  LixValueLike,
+};

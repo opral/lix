@@ -13,6 +13,8 @@ use support::test_json_plugin::{
 };
 
 const JSON_LEAF_COUNT: usize = 120;
+const HISTORY_FILE_ID: &str = "bench-history-file";
+const HISTORY_SEED_UPDATES: usize = 1_500;
 
 fn bench_lix_file_insert_no_plugin(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to build tokio runtime");
@@ -30,6 +32,49 @@ fn bench_lix_file_insert_plugin_json(c: &mut Criterion) {
         .expect("failed to seed engine for plugin bench");
 
     run_file_insert_bench(c, &runtime, &engine, "lix_file_insert_plugin_json", true);
+}
+
+fn bench_lix_file_exact_delete_missing_ids(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to build tokio runtime");
+    let engine = runtime
+        .block_on(seed_engine_with_history())
+        .expect("failed to seed engine for exact-delete bench");
+
+    c.bench_function("lix_file_exact_delete_missing_ids", |b| {
+        b.iter(|| {
+            let result = runtime
+                .block_on(engine.execute(
+                    "DELETE FROM lix_file \
+                     WHERE id IN ('bench-missing-delete-a', 'bench-missing-delete-b')",
+                    &[],
+                    ExecuteOptions::default(),
+                ))
+                .expect("delete should succeed");
+            black_box(result.rows.len());
+        });
+    });
+}
+
+fn bench_lix_file_exact_update_missing_id(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to build tokio runtime");
+    let engine = runtime
+        .block_on(seed_engine_with_history())
+        .expect("failed to seed engine for exact-update bench");
+
+    c.bench_function("lix_file_exact_update_missing_id", |b| {
+        b.iter(|| {
+            let result = runtime
+                .block_on(engine.execute(
+                    "UPDATE lix_file \
+                     SET path = '/bench/missing-update.txt', data = x'01' \
+                     WHERE id = 'bench-missing-update-id'",
+                    &[],
+                    ExecuteOptions::default(),
+                ))
+                .expect("update should succeed");
+            black_box(result.rows.len());
+        });
+    });
 }
 
 fn run_file_insert_bench(
@@ -118,6 +163,37 @@ async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> 
     Ok(engine)
 }
 
+async fn seed_engine_with_history() -> Result<lix_engine::Engine, LixError> {
+    let engine = seed_engine(false).await?;
+
+    engine
+        .execute(
+            "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
+            &[
+                Value::Text(HISTORY_FILE_ID.to_string()),
+                Value::Text("/bench/history-seed-0.txt".to_string()),
+                Value::Blob(vec![0]),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+    for seq in 0..HISTORY_SEED_UPDATES {
+        let path = format!("/bench/history-seed-{}.txt", seq % 32);
+        let data = vec![(seq % 251) as u8, (seq % 127) as u8, (seq % 63) as u8];
+        let data_hex = bytes_to_hex(&data);
+        let sql = format!(
+            "UPDATE lix_file SET path = '{}', data = x'{}' WHERE id = '{}'",
+            escape_sql_literal(&path),
+            data_hex,
+            escape_sql_literal(HISTORY_FILE_ID),
+        );
+        engine.execute(&sql, &[], ExecuteOptions::default()).await?;
+    }
+
+    Ok(engine)
+}
+
 fn scalar_count(result: &lix_engine::QueryResult) -> Result<i64, LixError> {
     let value = result
         .rows
@@ -148,9 +224,24 @@ fn json_bytes(seed: u64, leaf_count: usize) -> Vec<u8> {
         .expect("json payload serialization should succeed")
 }
 
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 criterion_group!(
     benches,
     bench_lix_file_insert_no_plugin,
-    bench_lix_file_insert_plugin_json
+    bench_lix_file_insert_plugin_json,
+    bench_lix_file_exact_delete_missing_ids,
+    bench_lix_file_exact_update_missing_id
 );
 criterion_main!(benches);

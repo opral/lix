@@ -52,7 +52,7 @@ async function main() {
     }
     if (newResult.pluginRows.meanPerFile <= 0) {
       warnings.push(
-        "New js-sdk adapter produced 0 plugin rows/file. Wasm plugin execution is currently not active in this runtime (install works, execution does not).",
+        "New js-sdk adapter produced 0 plugin rows/file. Plugin execution did not produce state rows.",
       );
     }
 
@@ -132,7 +132,15 @@ async function setupOldAdapter() {
 }
 
 async function setupNewAdapter() {
-  const lix = await openNewLix();
+  const lix = await openNewLix({
+    keyValues: [
+      {
+        key: "lix_deterministic_mode",
+        value: { enabled: true },
+        lixcol_version_id: "global",
+      },
+    ],
+  });
   const wasmBytes = await loadPluginJsonV2WasmBytes();
 
   await lix.installPlugin({
@@ -161,7 +169,7 @@ async function setupNewAdapter() {
       return scalarToNumber(countResult.rows?.[0]?.[0], "lix_state plugin row count");
     },
     async close() {
-      // js-sdk currently does not expose close().
+      await lix.close();
     },
   };
 }

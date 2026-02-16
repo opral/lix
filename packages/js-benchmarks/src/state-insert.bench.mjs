@@ -156,12 +156,15 @@ async function setupOldAdapter() {
 }
 
 async function setupNewAdapter() {
-  const lix = await openNewLix();
-
-  await lix.execute(
-    "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
-    ["lix_deterministic_mode", "{\"enabled\":true}"],
-  );
+  const lix = await openNewLix({
+    keyValues: [
+      {
+        key: "lix_deterministic_mode",
+        value: { enabled: true },
+        lixcol_version_id: "global",
+      },
+    ],
+  });
 
   await lix.execute(
     "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES ('lix_stored_schema', ?)",
@@ -191,7 +194,7 @@ async function setupNewAdapter() {
       });
     },
     async close() {
-      // js-sdk currently does not expose close().
+      await lix.close();
     },
   };
 }

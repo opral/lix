@@ -31,236 +31,232 @@ pub(crate) fn rewrite_statement_with_writer_key<P: LixFunctionProvider>(
     functions: &mut P,
     writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError> {
-    match statement {
-        Statement::Insert(insert) => {
-            lix_state_history_view_write::reject_insert(&insert)?;
-            if let Some(rewritten) = filesystem_step::rewrite_insert(insert.clone())? {
-                return rewrite_statement_with_writer_key(
-                    Statement::Insert(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                );
-            }
-            if let Some(version_inserts) =
-                lix_version_view_write::rewrite_insert(insert.clone(), params)?
-            {
-                return rewrite_vtable_inserts(version_inserts, params, functions, writer_key);
-            }
-            if let Some(active_account_inserts) =
-                lix_active_account_view_write::rewrite_insert(insert.clone(), params)?
-            {
-                return rewrite_vtable_inserts(
-                    active_account_inserts,
-                    params,
-                    functions,
-                    writer_key,
-                );
-            }
-            if let Some(rewritten) = entity_view_write::rewrite_insert(insert.clone(), params)? {
-                return rewrite_statement_with_writer_key(
-                    Statement::Insert(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                );
-            }
+    const MAX_REWRITE_PASSES: usize = 32;
+    let mut current = statement;
 
-            let mut current = Statement::Insert(insert);
-            if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) =
-                    lix_state_by_version_view_write::rewrite_insert(inner.clone())?
+    for _ in 0..MAX_REWRITE_PASSES {
+        match current {
+            Statement::Insert(insert) => {
+                lix_state_history_view_write::reject_insert(&insert)?;
+                if let Some(rewritten) = filesystem_step::rewrite_insert(insert.clone())? {
+                    current = Statement::Insert(rewritten);
+                    continue;
+                }
+                if let Some(version_inserts) =
+                    lix_version_view_write::rewrite_insert(insert.clone(), params)?
+                {
+                    return rewrite_vtable_inserts(version_inserts, params, functions, writer_key);
+                }
+                if let Some(active_account_inserts) =
+                    lix_active_account_view_write::rewrite_insert(insert.clone(), params)?
+                {
+                    return rewrite_vtable_inserts(
+                        active_account_inserts,
+                        params,
+                        functions,
+                        writer_key,
+                    );
+                }
+                if let Some(rewritten) = entity_view_write::rewrite_insert(insert.clone(), params)?
                 {
                     current = Statement::Insert(rewritten);
+                    continue;
                 }
-            }
-            let mut registrations: Vec<SchemaRegistration> = Vec::new();
-            let mut statements: Vec<Statement> = Vec::new();
-            let mut mutations: Vec<MutationRow> = Vec::new();
-            let update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
-            if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) = stored_schema::rewrite_insert(inner.clone(), params)? {
-                    registrations.push(rewritten.registration);
-                    mutations.push(rewritten.mutation);
-                    current = rewritten.statement;
+                let mut current_insert = Statement::Insert(insert);
+                if let Statement::Insert(inner) = &current_insert {
+                    if let Some(rewritten) =
+                        lix_state_by_version_view_write::rewrite_insert(inner.clone())?
+                    {
+                        current_insert = Statement::Insert(rewritten);
+                    }
                 }
-            }
-            if let Statement::Insert(inner) = &current {
-                if let Some(rewritten) = vtable_write::rewrite_insert_with_writer_key(
-                    inner.clone(),
-                    params,
-                    writer_key,
-                    functions,
-                )? {
-                    registrations.extend(rewritten.registrations);
-                    statements = rewritten.statements;
-                    mutations = rewritten.mutations;
+                let mut registrations: Vec<SchemaRegistration> = Vec::new();
+                let mut statements: Vec<Statement> = Vec::new();
+                let mut mutations: Vec<MutationRow> = Vec::new();
+                let update_validations: Vec<UpdateValidationPlan> = Vec::new();
+
+                if let Statement::Insert(inner) = &current_insert {
+                    if let Some(rewritten) = stored_schema::rewrite_insert(inner.clone(), params)? {
+                        registrations.push(rewritten.registration);
+                        mutations.push(rewritten.mutation);
+                        current_insert = rewritten.statement;
+                    }
                 }
-            }
+                if let Statement::Insert(inner) = &current_insert {
+                    if let Some(rewritten) = vtable_write::rewrite_insert_with_writer_key(
+                        inner.clone(),
+                        params,
+                        writer_key,
+                        functions,
+                    )? {
+                        registrations.extend(rewritten.registrations);
+                        statements = rewritten.statements;
+                        mutations = rewritten.mutations;
+                    }
+                }
 
-            if statements.is_empty() {
-                statements.push(current);
-            }
+                if statements.is_empty() {
+                    statements.push(current_insert);
+                }
 
-            Ok(RewriteOutput {
-                statements,
-                registrations,
-                postprocess: None,
-                mutations,
-                update_validations,
-            })
-        }
-        Statement::Update(update) => {
-            lix_state_history_view_write::reject_update(&update)?;
-            if let Some(rewritten) = filesystem_step::rewrite_update(update.clone())? {
-                return rewrite_statement_with_writer_key(rewritten, params, functions, writer_key);
-            }
-            if let Some(rewritten) = entity_view_write::rewrite_update(update.clone(), params)? {
-                return rewrite_statement_with_writer_key(
-                    Statement::Update(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                );
-            }
-            let update = if let Some(rewritten) =
-                lix_state_by_version_view_write::rewrite_update(update.clone())?
-            {
-                rewritten
-            } else {
-                update
-            };
-            let rewritten = vtable_write::rewrite_update(update.clone(), params)?;
-            match rewritten {
-                Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
-                    statements: vec![rewrite.statement],
-                    registrations: Vec::new(),
+                return Ok(RewriteOutput {
+                    statements,
+                    registrations,
                     postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: rewrite.validation.into_iter().collect(),
-                }),
-                Some(vtable_write::UpdateRewrite::Planned(rewrite)) => Ok(RewriteOutput {
-                    statements: vec![rewrite.statement],
-                    registrations: Vec::new(),
-                    postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
-                    mutations: Vec::new(),
-                    update_validations: rewrite.validation.into_iter().collect(),
-                }),
-                None => Ok(RewriteOutput {
-                    statements: vec![Statement::Update(update)],
+                    mutations,
+                    update_validations,
+                });
+            }
+            Statement::Update(update) => {
+                lix_state_history_view_write::reject_update(&update)?;
+                if let Some(rewritten) = filesystem_step::rewrite_update(update.clone())? {
+                    current = rewritten;
+                    continue;
+                }
+                if let Some(rewritten) = entity_view_write::rewrite_update(update.clone(), params)?
+                {
+                    current = Statement::Update(rewritten);
+                    continue;
+                }
+                let update = if let Some(rewritten) =
+                    lix_state_by_version_view_write::rewrite_update(update.clone())?
+                {
+                    rewritten
+                } else {
+                    update
+                };
+                let rewritten = vtable_write::rewrite_update(update.clone(), params)?;
+                return match rewritten {
+                    Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
+                        statements: vec![rewrite.statement],
+                        registrations: Vec::new(),
+                        postprocess: None,
+                        mutations: Vec::new(),
+                        update_validations: rewrite.validation.into_iter().collect(),
+                    }),
+                    Some(vtable_write::UpdateRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+                        statements: vec![rewrite.statement],
+                        registrations: Vec::new(),
+                        postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
+                        mutations: Vec::new(),
+                        update_validations: rewrite.validation.into_iter().collect(),
+                    }),
+                    None => Ok(RewriteOutput {
+                        statements: vec![Statement::Update(update)],
+                        registrations: Vec::new(),
+                        postprocess: None,
+                        mutations: Vec::new(),
+                        update_validations: Vec::new(),
+                    }),
+                };
+            }
+            Statement::Delete(delete) => {
+                lix_state_history_view_write::reject_delete(&delete)?;
+                if let Some(rewritten) = filesystem_step::rewrite_delete(delete.clone())? {
+                    current = Statement::Delete(rewritten);
+                    continue;
+                }
+                if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
+                    current = Statement::Delete(rewritten);
+                    continue;
+                }
+                let mut effective_scope_fallback = false;
+                let delete = if let Some(rewritten) =
+                    lix_state_by_version_view_write::rewrite_delete(delete.clone())?
+                {
+                    effective_scope_fallback = true;
+                    rewritten
+                } else {
+                    delete
+                };
+                let rewritten = if effective_scope_fallback {
+                    vtable_write::rewrite_delete_with_options(delete.clone(), true)?
+                } else {
+                    vtable_write::rewrite_delete(delete.clone())?
+                };
+                return match rewritten {
+                    Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
+                        statements: vec![statement],
+                        registrations: Vec::new(),
+                        postprocess: None,
+                        mutations: Vec::new(),
+                        update_validations: Vec::new(),
+                    }),
+                    Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+                        statements: vec![rewrite.statement],
+                        registrations: Vec::new(),
+                        postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
+                        mutations: Vec::new(),
+                        update_validations: Vec::new(),
+                    }),
+                    None => Ok(RewriteOutput {
+                        statements: vec![Statement::Delete(delete)],
+                        registrations: Vec::new(),
+                        postprocess: None,
+                        mutations: Vec::new(),
+                        update_validations: Vec::new(),
+                    }),
+                };
+            }
+            Statement::Query(query) => {
+                let query = rewrite_read_query(*query)?;
+                return Ok(RewriteOutput {
+                    statements: vec![Statement::Query(Box::new(query))],
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
                     update_validations: Vec::new(),
-                }),
+                });
             }
-        }
-        Statement::Delete(delete) => {
-            lix_state_history_view_write::reject_delete(&delete)?;
-            if let Some(rewritten) = filesystem_step::rewrite_delete(delete.clone())? {
-                return rewrite_statement_with_writer_key(
-                    Statement::Delete(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                );
-            }
-            if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
-                return rewrite_statement_with_writer_key(
-                    Statement::Delete(rewritten),
-                    params,
-                    functions,
-                    writer_key,
-                );
-            }
-            let mut effective_scope_fallback = false;
-            let delete = if let Some(rewritten) =
-                lix_state_by_version_view_write::rewrite_delete(delete.clone())?
-            {
-                effective_scope_fallback = true;
-                rewritten
-            } else {
-                delete
-            };
-            let rewritten = if effective_scope_fallback {
-                vtable_write::rewrite_delete_with_options(delete.clone(), true)?
-            } else {
-                vtable_write::rewrite_delete(delete.clone())?
-            };
-            match rewritten {
-                Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
-                    statements: vec![statement],
+            Statement::Explain {
+                describe_alias,
+                analyze,
+                verbose,
+                query_plan,
+                estimate,
+                statement,
+                format,
+                options,
+            } => {
+                let statement = match *statement {
+                    Statement::Query(query) => {
+                        Statement::Query(Box::new(rewrite_read_query(*query)?))
+                    }
+                    other => other,
+                };
+                return Ok(RewriteOutput {
+                    statements: vec![Statement::Explain {
+                        describe_alias,
+                        analyze,
+                        verbose,
+                        query_plan,
+                        estimate,
+                        statement: Box::new(statement),
+                        format,
+                        options,
+                    }],
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
                     update_validations: Vec::new(),
-                }),
-                Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
-                    statements: vec![rewrite.statement],
-                    registrations: Vec::new(),
-                    postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }),
-                None => Ok(RewriteOutput {
-                    statements: vec![Statement::Delete(delete)],
+                });
+            }
+            other => {
+                return Ok(RewriteOutput {
+                    statements: vec![other],
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
                     update_validations: Vec::new(),
-                }),
+                });
             }
         }
-        Statement::Query(query) => {
-            let query = rewrite_read_query(*query)?;
-            Ok(RewriteOutput {
-                statements: vec![Statement::Query(Box::new(query))],
-                registrations: Vec::new(),
-                postprocess: None,
-                mutations: Vec::new(),
-                update_validations: Vec::new(),
-            })
-        }
-        Statement::Explain {
-            describe_alias,
-            analyze,
-            verbose,
-            query_plan,
-            estimate,
-            statement,
-            format,
-            options,
-        } => {
-            let statement = match *statement {
-                Statement::Query(query) => Statement::Query(Box::new(rewrite_read_query(*query)?)),
-                other => other,
-            };
-            Ok(RewriteOutput {
-                statements: vec![Statement::Explain {
-                    describe_alias,
-                    analyze,
-                    verbose,
-                    query_plan,
-                    estimate,
-                    statement: Box::new(statement),
-                    format,
-                    options,
-                }],
-                registrations: Vec::new(),
-                postprocess: None,
-                mutations: Vec::new(),
-                update_validations: Vec::new(),
-            })
-        }
-        other => Ok(RewriteOutput {
-            statements: vec![other],
-            registrations: Vec::new(),
-            postprocess: None,
-            mutations: Vec::new(),
-            update_validations: Vec::new(),
-        }),
     }
+
+    Err(LixError {
+        message: "statement rewrite exceeded maximum pass count".to_string(),
+    })
 }
 
 pub async fn rewrite_statement_with_backend<P>(

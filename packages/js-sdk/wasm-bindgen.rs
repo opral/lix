@@ -1,13 +1,12 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use async_trait::async_trait;
-    use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
+    use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, BootArgs, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        LoadWasmComponentRequest, QueryResult as EngineQueryResult, SqlDialect,
-        Value as EngineValue, WasmInstance, WasmRuntime,
+        boot, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError, LixTransaction,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
+        WasmComponentInstance, WasmLimits, WasmRuntime,
     };
-    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -45,6 +44,37 @@ export type LixBackend = {
     params: LixValueLike[],
   ): Promise<LixQueryResultLike> | LixQueryResultLike;
   beginTransaction?: () => Promise<LixTransaction> | LixTransaction;
+  // Should return a SQLite database file payload.
+  exportSnapshot?: () => Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
+};
+
+export type LixWasmLimits = {
+  maxMemoryBytes?: number;
+  maxFuel?: number;
+  timeoutMs?: number;
+};
+
+export type LixWasmComponentInstance = {
+  call(
+    exportName: string,
+    input: Uint8Array,
+  ): Promise<Uint8Array | ArrayBuffer> | Uint8Array | ArrayBuffer;
+  close?: () => Promise<void> | void;
+};
+
+export type LixWasmRuntime = {
+  initComponent(
+    bytes: Uint8Array,
+    limits?: LixWasmLimits,
+  ): Promise<LixWasmComponentInstance> | LixWasmComponentInstance;
+};
+
+export type LixBootKeyValue = {
+  key: string;
+  value: unknown;
+  versionId?: string;
+  version_id?: string;
+  lixcol_version_id?: string;
 };
 "#;
 
@@ -52,6 +82,8 @@ export type LixBackend = {
     extern "C" {
         #[wasm_bindgen(typescript_type = "LixBackend")]
         pub type JsLixBackend;
+        #[wasm_bindgen(typescript_type = "LixWasmRuntime")]
+        pub type JsLixWasmRuntime;
     }
 
     #[wasm_bindgen]
@@ -89,159 +121,270 @@ export type LixBackend = {
                 .await
                 .map_err(js_error)
         }
+
+        #[wasm_bindgen(js_name = exportSnapshot)]
+        pub async fn export_snapshot(&self) -> Result<Uint8Array, JsValue> {
+            let mut writer = VecSnapshotWriter::default();
+            self.engine
+                .export_snapshot(&mut writer)
+                .await
+                .map_err(js_error)?;
+            Ok(Uint8Array::from(writer.bytes.as_slice()))
+        }
+    }
+
+    #[derive(Default)]
+    struct VecSnapshotWriter {
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait(?Send)]
+    impl SnapshotChunkWriter for VecSnapshotWriter {
+        async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
+            self.bytes.extend_from_slice(chunk);
+            Ok(())
+        }
     }
 
     #[wasm_bindgen(js_name = openLix)]
-    pub async fn open_lix(backend: JsLixBackend) -> Result<Lix, JsValue> {
+    pub async fn open_lix(
+        backend: JsLixBackend,
+        wasm_runtime: Option<JsLixWasmRuntime>,
+        boot_key_values: Option<JsValue>,
+    ) -> Result<Lix, JsValue> {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
         });
         let mut boot_args = BootArgs::new(backend);
-        boot_args.wasm_runtime = Some(Arc::new(JsBuiltinWasmRuntime));
+        boot_args.wasm_runtime = wasm_runtime.map(|runtime| {
+            Arc::new(JsHostWasmRuntime {
+                runtime: runtime.into(),
+            }) as Arc<dyn WasmRuntime>
+        });
+        if let Some(raw_key_values) = boot_key_values {
+            boot_args.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
+        }
         let engine = boot(boot_args);
         engine.init().await.map_err(js_error)?;
         Ok(Lix { engine })
     }
 
-    #[derive(Debug, Deserialize)]
-    struct RuntimePluginFile {
-        id: String,
-        path: String,
-        data: Vec<u8>,
+    fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
+        if input.is_null() || input.is_undefined() {
+            return Ok(Vec::new());
+        }
+        if !Array::is_array(&input) {
+            return Err(LixError {
+                message: "openLix keyValues must be an array".to_string(),
+            });
+        }
+
+        let values = Array::from(&input);
+        let mut parsed = Vec::with_capacity(values.length() as usize);
+        for entry in values.iter() {
+            if !entry.is_object() {
+                return Err(LixError {
+                    message: "openLix keyValues entries must be objects".to_string(),
+                });
+            }
+
+            let key = read_required_string_property(&entry, "key", "openLix keyValues entry")?;
+            let value =
+                Reflect::get(&entry, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+            let value = js_to_json_value(value, &format!("openLix keyValues[{key}].value"))?;
+
+            let version_id = read_optional_string_property(&entry, "versionId")?
+                .or(read_optional_string_property(&entry, "version_id")?)
+                .or(read_optional_string_property(&entry, "lixcol_version_id")?);
+
+            parsed.push(BootKeyValue {
+                key,
+                value,
+                version_id,
+            });
+        }
+
+        Ok(parsed)
     }
 
-    #[derive(Debug, Deserialize)]
-    struct RuntimePluginEntityChange {
-        entity_id: String,
-        schema_key: String,
-        schema_version: String,
-        snapshot_content: Option<String>,
+    fn read_required_string_property(
+        object: &JsValue,
+        key: &str,
+        context: &str,
+    ) -> Result<String, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        let text = value.as_string().unwrap_or_default();
+        if text.is_empty() {
+            return Err(LixError {
+                message: format!("{context}.{key} must be a non-empty string"),
+            });
+        }
+        Ok(text)
     }
 
-    #[derive(Debug, Deserialize)]
-    struct RuntimeDetectChangesRequest {
-        before: Option<RuntimePluginFile>,
-        after: RuntimePluginFile,
+    fn read_optional_string_property(
+        object: &JsValue,
+        key: &str,
+    ) -> Result<Option<String>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        let text = value.as_string().ok_or_else(|| LixError {
+            message: format!("openLix keyValues entry '{key}' must be a string"),
+        })?;
+        if text.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text))
     }
 
-    #[derive(Debug, Deserialize)]
-    struct RuntimeApplyChangesRequest {
-        file: RuntimePluginFile,
-        changes: Vec<RuntimePluginEntityChange>,
+    fn js_to_json_value(value: JsValue, context: &str) -> Result<serde_json::Value, LixError> {
+        if value.is_undefined() {
+            return Ok(serde_json::Value::Null);
+        }
+        let stringified = js_sys::JSON::stringify(&value).map_err(js_to_lix_error)?;
+        let Some(json_text) = stringified.as_string() else {
+            return Err(LixError {
+                message: format!("{context} must be JSON-serializable"),
+            });
+        };
+        serde_json::from_str(&json_text).map_err(|error| LixError {
+            message: format!("{context} invalid JSON value: {error}"),
+        })
     }
 
-    #[derive(Debug, Serialize)]
-    struct RuntimePluginEntityChangeResponse {
-        entity_id: String,
-        schema_key: String,
-        schema_version: String,
-        snapshot_content: Option<String>,
+    struct JsHostWasmRuntime {
+        runtime: JsValue,
     }
 
-    struct JsBuiltinWasmRuntime;
-    struct JsonPluginV2Instance;
+    struct JsHostWasmComponentInstance {
+        component: JsValue,
+    }
+
+    // WASM is single-threaded by default; this avoids Send/Sync bounds in the engine.
+    unsafe impl Send for JsHostWasmRuntime {}
+    unsafe impl Sync for JsHostWasmRuntime {}
+    unsafe impl Send for JsHostWasmComponentInstance {}
+    unsafe impl Sync for JsHostWasmComponentInstance {}
 
     #[async_trait(?Send)]
-    impl WasmRuntime for JsBuiltinWasmRuntime {
-        async fn load_component(
+    impl WasmRuntime for JsHostWasmRuntime {
+        async fn init_component(
             &self,
-            request: LoadWasmComponentRequest,
-        ) -> Result<Arc<dyn WasmInstance>, LixError> {
-            if request.world != "lix:plugin/plugin@0.1.0" {
+            bytes: Vec<u8>,
+            limits: WasmLimits,
+        ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+            if bytes.is_empty() {
                 return Err(LixError {
-                    message: format!("unsupported plugin world '{}'", request.world),
+                    message: "plugin wasm bytes are empty".to_string(),
                 });
             }
-            if request.bytes.is_empty() {
+
+            let init_component =
+                required_method(&self.runtime, "initComponent", "wasmRuntime.initComponent")?;
+            let bytes_arg = Uint8Array::new_with_length(bytes.len() as u32);
+            bytes_arg.copy_from(&bytes);
+            let limits_arg = wasm_limits_to_js(limits)?;
+
+            let result = init_component
+                .call2(&self.runtime, &bytes_arg.into(), &limits_arg)
+                .map_err(js_to_lix_error)?;
+            let resolved = JsBackend::await_if_promise(result).await?;
+            if resolved.is_null() || resolved.is_undefined() {
                 return Err(LixError {
-                    message: format!("plugin '{}' has empty wasm bytes", request.key),
+                    message: "wasmRuntime.initComponent returned no component instance".to_string(),
                 });
             }
-            match request.key.as_str() {
-                // Current js-sdk runtime supports plugin-json-v2 execution directly.
-                "plugin_json" | "json" => Ok(Arc::new(JsonPluginV2Instance)),
-                other => Err(LixError {
-                    message: format!(
-                        "plugin runtime for key '{other}' is not available in js-sdk yet"
-                    ),
-                }),
-            }
+
+            Ok(Arc::new(JsHostWasmComponentInstance {
+                component: resolved,
+            }))
         }
     }
 
     #[async_trait(?Send)]
-    impl WasmInstance for JsonPluginV2Instance {
+    impl WasmComponentInstance for JsHostWasmComponentInstance {
         async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
-            match export {
-                "detect-changes" | "api#detect-changes" => {
-                    let request: RuntimeDetectChangesRequest = serde_json::from_slice(input)
-                        .map_err(|error| LixError {
-                            message: format!(
-                                "plugin-json-v2 detect-changes payload decode failed: {error}"
-                            ),
-                        })?;
-                    let before = request.before.map(to_plugin_file);
-                    let after = to_plugin_file(request.after);
-                    let changes = plugin_json_v2::detect_changes(before, after)
-                        .map_err(plugin_error_to_lix_error)?;
-                    let output = changes
-                        .into_iter()
-                        .map(|change| RuntimePluginEntityChangeResponse {
-                            entity_id: change.entity_id,
-                            schema_key: change.schema_key,
-                            schema_version: change.schema_version,
-                            snapshot_content: change.snapshot_content,
-                        })
-                        .collect::<Vec<_>>();
-                    serde_json::to_vec(&output).map_err(|error| LixError {
-                        message: format!(
-                            "plugin-json-v2 detect-changes response encode failed: {error}"
-                        ),
-                    })
-                }
-                "apply-changes" | "api#apply-changes" => {
-                    let request: RuntimeApplyChangesRequest = serde_json::from_slice(input)
-                        .map_err(|error| LixError {
-                            message: format!(
-                                "plugin-json-v2 apply-changes payload decode failed: {error}"
-                            ),
-                        })?;
-                    let file = to_plugin_file(request.file);
-                    let changes = request
-                        .changes
-                        .into_iter()
-                        .map(to_plugin_change)
-                        .collect::<Vec<_>>();
-                    plugin_json_v2::apply_changes(file, changes).map_err(plugin_error_to_lix_error)
-                }
-                other => Err(LixError {
-                    message: format!("unsupported plugin export '{other}'"),
-                }),
-            }
+            let call_method =
+                required_method(&self.component, "call", "wasmComponentInstance.call")?;
+            let input_arg = Uint8Array::new_with_length(input.len() as u32);
+            input_arg.copy_from(input);
+            let result = call_method
+                .call2(
+                    &self.component,
+                    &JsValue::from_str(export),
+                    &input_arg.into(),
+                )
+                .map_err(js_to_lix_error)?;
+            let resolved = JsBackend::await_if_promise(result).await?;
+            js_bytes_from_value(resolved, "wasmComponentInstance.call result")
+        }
+
+        async fn close(&self) -> Result<(), LixError> {
+            let Some(close_method) = JsBackend::get_optional_method(&self.component, "close")?
+            else {
+                return Ok(());
+            };
+            let result = close_method
+                .call0(&self.component)
+                .map_err(js_to_lix_error)?;
+            let _ = JsBackend::await_if_promise(result).await?;
+            Ok(())
         }
     }
 
-    fn to_plugin_file(file: RuntimePluginFile) -> plugin_json_v2::PluginFile {
-        plugin_json_v2::PluginFile {
-            id: file.id,
-            path: file.path,
-            data: file.data,
-        }
+    fn required_method(target: &JsValue, name: &str, context: &str) -> Result<Function, LixError> {
+        JsBackend::get_optional_method(target, name)?.ok_or_else(|| LixError {
+            message: format!("{context} is required"),
+        })
     }
 
-    fn to_plugin_change(change: RuntimePluginEntityChange) -> plugin_json_v2::PluginEntityChange {
-        plugin_json_v2::PluginEntityChange {
-            entity_id: change.entity_id,
-            schema_key: change.schema_key,
-            schema_version: change.schema_version,
-            snapshot_content: change.snapshot_content,
+    fn wasm_limits_to_js(limits: WasmLimits) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        Reflect::set(
+            &object,
+            &JsValue::from_str("maxMemoryBytes"),
+            &JsValue::from_f64(limits.max_memory_bytes as f64),
+        )
+        .map_err(js_to_lix_error)?;
+        if let Some(max_fuel) = limits.max_fuel {
+            Reflect::set(
+                &object,
+                &JsValue::from_str("maxFuel"),
+                &JsValue::from_f64(max_fuel as f64),
+            )
+            .map_err(js_to_lix_error)?;
         }
+        if let Some(timeout_ms) = limits.timeout_ms {
+            Reflect::set(
+                &object,
+                &JsValue::from_str("timeoutMs"),
+                &JsValue::from_f64(timeout_ms as f64),
+            )
+            .map_err(js_to_lix_error)?;
+        }
+        Ok(object.into())
     }
 
-    fn plugin_error_to_lix_error(error: plugin_json_v2::PluginApiError) -> LixError {
-        LixError {
-            message: format!("{error:?}"),
+    fn js_bytes_from_value(value: JsValue, context: &str) -> Result<Vec<u8>, LixError> {
+        if value.is_instance_of::<Uint8Array>() {
+            let array = value.unchecked_into::<Uint8Array>();
+            let mut bytes = vec![0u8; array.length() as usize];
+            array.copy_to(&mut bytes);
+            return Ok(bytes);
         }
+
+        if value.is_instance_of::<ArrayBuffer>() {
+            let array = Uint8Array::new(&value);
+            let mut bytes = vec![0u8; array.length() as usize];
+            array.copy_to(&mut bytes);
+            return Ok(bytes);
+        }
+
+        Err(LixError {
+            message: format!("{context} must be Uint8Array or ArrayBuffer"),
+        })
     }
 
     struct JsBackend {
@@ -373,6 +516,23 @@ export type LixBackend = {
                 kind: JsTransactionKind::Sql,
                 closed: false,
             }))
+        }
+
+        async fn export_snapshot(
+            &self,
+            writer: &mut dyn SnapshotChunkWriter,
+        ) -> Result<(), LixError> {
+            let export_snapshot = Self::get_optional_method(&self.backend, "exportSnapshot")?
+                .ok_or_else(|| LixError {
+                    message: "backend.exportSnapshot is required for export_snapshot".to_string(),
+                })?;
+            let result = export_snapshot
+                .call0(&self.backend)
+                .map_err(js_to_lix_error)?;
+            let resolved = Self::await_if_promise(result).await?;
+            let bytes = js_bytes_from_value(resolved, "backend.exportSnapshot result")?;
+            writer.write_chunk(&bytes).await?;
+            writer.finish().await
         }
     }
 
@@ -640,7 +800,7 @@ export type LixBackend = {
 mod wasm {
     pub struct Lix;
 
-    pub fn open_lix(_: ()) -> Result<Lix, String> {
+    pub fn open_lix(_: (), _: Option<()>, _: Option<()>) -> Result<Lix, String> {
         Err("engine-wasm is only available for wasm32 targets".to_string())
     }
 }
