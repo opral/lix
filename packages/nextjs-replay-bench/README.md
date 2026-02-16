@@ -14,6 +14,7 @@ Warm vs cold quick commands:
 pnpm -C packages/nextjs-replay-bench bench:25        # warm (5 warmup + 25 measured)
 pnpm -C packages/nextjs-replay-bench bench:25:cold   # cold (0 warmup + 25 measured)
 pnpm -C packages/nextjs-replay-bench bench:git-files:100   # git file-write + git commit baseline
+pnpm -C packages/nextjs-replay-bench bench:parity:25   # replay + git-vs-lix state parity checks
 ```
 
 ## Useful env vars
@@ -28,6 +29,10 @@ pnpm -C packages/nextjs-replay-bench bench:git-files:100   # git file-write + gi
 - `BENCH_REPLAY_EXPORT_SNAPSHOT` set to `1` to export a sqlite snapshot artifact
 - `BENCH_REPLAY_SNAPSHOT_PATH` custom output path for snapshot artifact (`.lix` recommended)
 - `BENCH_REPLAY_PROGRESS_EVERY` progress cadence (default: `25`)
+- `BENCH_PARITY_EVERY` run full git-vs-lix parity every N replayed commits (default: `1`)
+- `BENCH_PARITY_FAIL_FAST` stop on first mismatch (`1`/`0`, default: `1`)
+- `BENCH_PARITY_MAX_MISMATCH_SAMPLES` max example paths captured per mismatch bucket (default: `20`)
+- `BENCH_PARITY_REPORT_PATH` custom output path for parity report
 - `BENCH_GIT_FILES_REPORT_PATH` custom output path for git file-replay report
 - `BENCH_GIT_FILES_DISABLE_MAINTENANCE` disable git auto maintenance/gc in target replay repo (default: `1`)
 - `BENCH_GIT_TRACE2_PERF` set to `1` to enable git Trace2 performance logging for the git baseline replay
@@ -42,4 +47,5 @@ Output report:
 
 - `packages/nextjs-replay-bench/results/nextjs-replay.bench.json`
 - `packages/nextjs-replay-bench/results/nextjs-replay.git-files.bench.json`
+- `packages/nextjs-replay-bench/results/nextjs-replay.parity.json`
 - `packages/nextjs-replay-bench/results/nextjs-replay.snapshot.lix` (when snapshot export enabled)
