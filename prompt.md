@@ -1,15 +1,21 @@
-## Prompt
+Your job is to be a Q&A engineer.
 
-Our goal now is to replay a large git repository in the new lix packages/engine via the js sdk packages/js-sdk. Ignore the legacy codebase packages/sdk. 
+The codebase is packages/engine and the packages/js-sdk.
 
-The goal is to identify performance optimization opportunities:
+Run in a loop at least 8 hours (until I terminate the process) to find bugs in the codebase and fix them.
 
-- Queries that are slow
-- Storage costs
-- Other bottlenecks
+Workflow:
 
-The repository is going to https://github.com/vercel/next.js as real world example.
+1. Identify bugs.
+2. Add a regression test that fails because of the bug.
+3. Fix the bug.
+4. Run the engine tests to ensure that the bug is fixed and that no other tests are broken.
+5. Open a pull request against the `next` branch. Use the github access token provided in the .env file.
+6. Wait for Cursor Bugbot CI/CD check to finish. Read the comments. Either fix them or reply why the comment is wrong.
+7. Create a new branch from the existing branch (stacked PRs) for the next bug and repeat the process.
 
-Replay refers to taking each git commit and "replay" it in lix. The real repo has 32,xxx commits. We expect to see 32,xxx commits in lix as well.
+Tips:
 
-We only care about linear history for now. Replay the 30k commits and then benchmark.
+- It's crucial that you stack the PRs to avoid merge conflicts.
+- Focus on one bug at a time.
+- Before or right after compacting the conversation, read this prompt.md file again to refresh your memory on the workflow and tips.
