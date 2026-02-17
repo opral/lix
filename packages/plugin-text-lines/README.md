@@ -10,3 +10,11 @@ Rust/WASM component plugin that models files as line entities for the Lix engine
 
 This plugin is byte-safe (works with non-UTF-8 files) by storing line content as hex in
 snapshot payloads.
+
+## Benchmarks
+
+Run plugin micro-benchmarks for `detect_changes`:
+
+```bash
+cargo bench -p plugin_text_lines --bench detect_changes
+```

@@ -550,4 +550,5 @@ pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, 
     <TextLinesPlugin as Guest>::apply_changes(file, changes)
 }
 
+#[cfg(target_arch = "wasm32")]
 export!(TextLinesPlugin);
