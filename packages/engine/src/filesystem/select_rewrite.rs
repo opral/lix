@@ -9,7 +9,7 @@ use crate::sql::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
 };
-use crate::LixError;
+use crate::{LixError, Value};
 
 const FILE_VIEW: &str = "lix_file";
 const FILE_BY_VERSION_VIEW: &str = "lix_file_by_version";
@@ -19,6 +19,13 @@ const DIRECTORY_BY_VERSION_VIEW: &str = "lix_directory_by_version";
 const DIRECTORY_HISTORY_VIEW: &str = "lix_directory_history";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
+    rewrite_query_with_params(query, &[])
+}
+
+pub fn rewrite_query_with_params(
+    query: Query,
+    _params: &[Value],
+) -> Result<Option<Query>, LixError> {
     let mut changed = false;
     let mut new_query = query.clone();
     new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
@@ -119,7 +126,8 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     version_id AS lixcol_version_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
-                   AND snapshot_content IS NOT NULL\
+                   AND snapshot_content IS NOT NULL \
+                   AND {active_version_scope_descriptor}\
              ), \
              directory_paths AS (\
                  SELECT \
@@ -161,7 +169,8 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     metadata AS lixcol_metadata \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_file_descriptor' \
-                   AND snapshot_content IS NOT NULL\
+                   AND snapshot_content IS NOT NULL \
+                   AND {active_version_scope_descriptor}\
              ) \
              SELECT \
                 f.id, \
@@ -207,7 +216,8 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                ON fd.file_id = f.id \
               AND fd.version_id = f.lixcol_version_id \
              WHERE {active_version_scope}",
-            active_version_scope = active_version_scope_predicate("f.lixcol_version_id")
+            active_version_scope = active_version_scope_predicate("f.lixcol_version_id"),
+            active_version_scope_descriptor = active_version_scope_predicate("version_id")
         ),
         FILE_BY_VERSION_VIEW => "WITH RECURSIVE directory_descriptor_rows AS (\
                  SELECT \
@@ -819,8 +829,9 @@ fn default_alias(view_name: &str) -> TableAlias {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_query;
+    use super::{rewrite_query, rewrite_query_with_params};
     use crate::sql::parse_sql_statements;
+    use crate::Value;
 
     #[test]
     fn rewrites_file_view_reads_to_descriptor_projection() {
@@ -839,6 +850,47 @@ mod tests {
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("FROM lix_internal_state_untracked"));
+    }
+
+    #[test]
+    fn rewrites_simple_file_path_data_query_to_projection() {
+        let sql = "SELECT path, data FROM lix_file ORDER BY path";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let query = match statements.into_iter().next().expect("statement") {
+            sqlparser::ast::Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        };
+        let rewritten = rewrite_query(query)
+            .expect("rewrite")
+            .expect("query should be rewritten")
+            .to_string();
+
+        assert!(rewritten.contains("COALESCE(fd.data, lix_empty_blob()) AS data"));
+        assert!(rewritten.contains("FROM lix_state_by_version"));
+        assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
+        assert!(rewritten.contains("LEFT JOIN lix_version v"));
+    }
+
+    #[test]
+    fn rewrites_simple_file_path_data_point_query_with_param() {
+        let sql = "SELECT path, data FROM lix_file WHERE path = ?";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let query = match statements.into_iter().next().expect("statement") {
+            sqlparser::ast::Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        };
+        let rewritten = rewrite_query_with_params(
+            query,
+            &[Value::Text("/bench/read/07/file-00007.txt".to_string())],
+        )
+        .expect("rewrite")
+        .expect("query should be rewritten")
+        .to_string();
+
+        assert!(rewritten.contains("WHERE path = ?"));
+        assert!(rewritten.contains("directory_paths"));
+        assert!(!rewritten.contains("dir_level_0"));
+        assert!(!rewritten.contains("dir_level_1"));
     }
 
     #[test]

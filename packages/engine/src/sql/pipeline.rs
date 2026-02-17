@@ -10,13 +10,20 @@ use crate::sql::bind_sql;
 use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::object_name_matches;
-use crate::sql::route::{
-    rewrite_statement, rewrite_statement_with_backend, rewrite_statement_with_writer_key,
-};
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreprocessOutput, SchemaRegistration};
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
+
+pub(crate) mod context;
+pub(crate) mod query_engine;
+pub(crate) mod registry;
+pub(crate) mod rules;
+pub(crate) mod statement_pipeline;
+pub(crate) mod validator;
+pub(crate) mod walker;
+
+use self::statement_pipeline::StatementPipeline;
 
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     let dialect = GenericDialect {};
@@ -50,17 +57,14 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     dialect: SqlDialect,
     writer_key: Option<&str>,
 ) -> Result<PreprocessOutput, LixError> {
+    let statement_pipeline = StatementPipeline::new(params, writer_key);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut mutations = Vec::new();
     let mut update_validations = Vec::new();
     for statement in statements {
-        let output = if writer_key.is_some() {
-            rewrite_statement_with_writer_key(statement, params, provider, writer_key)?
-        } else {
-            rewrite_statement(statement, params, provider)?
-        };
+        let output = statement_pipeline.rewrite_statement(statement, provider)?;
         registrations.extend(output.registrations);
         if let Some(plan) = output.postprocess {
             if postprocess.is_some() {
@@ -107,6 +111,7 @@ async fn preprocess_statements_with_provider_and_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
+    let statement_pipeline = StatementPipeline::new(params, writer_key);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
@@ -119,13 +124,11 @@ where
             .unwrap_or(&[]);
         // Keep this large async rewrite future on the heap to avoid excessive
         // stack growth in callers that process many rewrite layers.
-        let output = Box::pin(rewrite_statement_with_backend(
+        let output = Box::pin(statement_pipeline.rewrite_statement_with_backend(
             backend,
             statement,
-            params,
             provider,
             statement_detected_file_domain_changes,
-            writer_key,
         ))
         .await?;
         registrations.extend(output.registrations);
@@ -209,8 +212,34 @@ pub async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: Li
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+        backend,
+        evaluator,
+        parse_sql_statements(sql)?,
+        params,
+        functions,
+        detected_file_domain_changes_by_statement,
+        writer_key,
+    )
+    .await
+}
+
+pub async fn preprocess_parsed_statements_with_provider_and_detected_file_domain_changes<
+    P: LixFunctionProvider,
+>(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    statements: Vec<Statement>,
+    params: &[Value],
+    functions: SharedFunctionProvider<P>,
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    writer_key: Option<&str>,
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let params = params.to_vec();
-    let mut statements = coalesce_vtable_inserts_in_transactions(parse_sql_statements(sql)?)?;
+    let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
     apply_vtable_insert_defaults(
         backend,
@@ -488,6 +517,27 @@ mod tests {
         assert!(
             rewritten.sql.contains("jsonb_extract_path_text("),
             "postgres lowering should emit jsonb_extract_path_text()"
+        );
+    }
+
+    #[test]
+    fn rewrite_only_rewrites_lix_active_version_in_nested_subquery() {
+        let rewritten = preprocess_sql_rewrite_only(
+            "SELECT COUNT(*) \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'bench_schema' \
+               AND version_id IN (SELECT version_id FROM lix_active_version) \
+               AND snapshot_content IS NOT NULL",
+        )
+        .expect("rewrite should succeed");
+
+        assert!(
+            !rewritten.sql.contains("FROM lix_active_version"),
+            "nested lix_active_version should be rewritten"
+        );
+        assert!(
+            rewritten.sql.contains("lix_internal_state_vtable"),
+            "rewritten query should route through vtable reads"
         );
     }
 }

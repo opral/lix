@@ -7,7 +7,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
@@ -17,14 +17,15 @@ use crate::filesystem::path::{
 use crate::sql::escape_sql_string;
 use crate::sql::{
     bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
-    rewrite_read_query_with_backend, DetectedFileDomainChange, PlaceholderState, ResolvedCell,
+    rewrite_read_query_with_backend_and_params_in_session, DetectedFileDomainChange,
+    PlaceholderState, ReadRewriteSession, ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
     version_descriptor_storage_version_id,
 };
-use crate::{LixBackend, LixError, SqlDialect, Value as EngineValue};
+use crate::{LixBackend, LixError, Value as EngineValue};
 
 const FILE_VIEW: &str = "lix_file";
 const FILE_BY_VERSION_VIEW: &str = "lix_file_by_version";
@@ -35,12 +36,14 @@ const DIRECTORY_HISTORY_VIEW: &str = "lix_directory_history";
 
 const FILE_DESCRIPTOR_VIEW: &str = "lix_file_descriptor";
 const FILE_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_file_descriptor_by_version";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_VIEW: &str = "lix_directory_descriptor";
 const DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_directory_descriptor_by_version";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const INTERNAL_DESCRIPTOR_FILE_ID: &str = "lix";
 const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
+static REWRITTEN_HELPER_SQL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub type ResolvedDirectoryIdMap = BTreeMap<(String, String), String>;
 
@@ -129,6 +132,7 @@ pub async fn insert_side_effect_statements_with_backend(
     if target.read_only {
         return Ok(FilesystemInsertSideEffects::default());
     }
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     let source = match &insert.source {
         Some(source) => source,
@@ -262,7 +266,10 @@ pub async fn insert_side_effect_statements_with_backend(
             continue;
         }
 
-        if let Some(existing_id) = find_directory_id_by_path(backend, &version_id, &path).await? {
+        if let Some(existing_id) =
+            find_directory_id_by_path(backend, &version_id, &path, &mut read_rewrite_session)
+                .await?
+        {
             known_ids.insert(key, existing_id);
             continue;
         }
@@ -272,8 +279,13 @@ pub async fn insert_side_effect_statements_with_backend(
                 let parent_key = (version_id.clone(), parent_path.clone());
                 if let Some(parent_id) = known_ids.get(&parent_key) {
                     Some(parent_id.clone())
-                } else if let Some(existing_parent_id) =
-                    find_directory_id_by_path(backend, &version_id, &parent_path).await?
+                } else if let Some(existing_parent_id) = find_directory_id_by_path(
+                    backend,
+                    &version_id,
+                    &parent_path,
+                    &mut read_rewrite_session,
+                )
+                .await?
                 {
                     known_ids.insert(parent_key, existing_parent_id.clone());
                     Some(existing_parent_id)
@@ -374,6 +386,7 @@ pub async fn update_side_effects_with_backend(
     if target.read_only || !target.is_file {
         return Ok(FilesystemUpdateSideEffects::default());
     }
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     let mut statement_placeholder_state = statement_start_state;
     let mut next_path: Option<String> = None;
@@ -405,9 +418,15 @@ pub async fn update_side_effects_with_backend(
         &mut version_predicate_state,
     )
     .await?;
-    let matching_file_ids =
-        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
-            .await?;
+    let matching_file_ids = file_ids_matching_update(
+        backend,
+        update,
+        target,
+        params,
+        selection_placeholder_state,
+        &mut read_rewrite_session,
+    )
+    .await?;
     if matching_file_ids.is_empty() {
         return Ok(FilesystemUpdateSideEffects::default());
     }
@@ -551,10 +570,19 @@ pub async fn rewrite_delete_with_backend(
             });
         }
     }
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     if target.is_directory() {
-        let selected = directory_rows_matching_delete(backend, &delete, target, params).await?;
-        let expanded = expand_directory_descendants(backend, &selected).await?;
+        let selected = directory_rows_matching_delete(
+            backend,
+            &delete,
+            target,
+            params,
+            &mut read_rewrite_session,
+        )
+        .await?;
+        let expanded =
+            expand_directory_descendants(backend, &selected, &mut read_rewrite_session).await?;
         if !expanded.is_empty() {
             let predicate = build_directory_delete_selection(&expanded, target)?;
             delete.selection = Some(parse_expression(&predicate)?);
@@ -671,6 +699,7 @@ async fn rewrite_file_insert_columns_with_backend(
     resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
     active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let id_index = insert
         .columns
         .iter()
@@ -748,8 +777,13 @@ async fn rewrite_file_insert_columns_with_backend(
                 .cloned()
             {
                 Some(existing_id)
-            } else if let Some(existing_id) =
-                find_directory_id_by_path(backend, &version_id, directory_path).await?
+            } else if let Some(existing_id) = find_directory_id_by_path(
+                backend,
+                &version_id,
+                directory_path,
+                &mut read_rewrite_session,
+            )
+            .await?
             {
                 Some(existing_id)
             } else {
@@ -768,6 +802,7 @@ async fn rewrite_file_insert_columns_with_backend(
             &version_id,
             directory_id.as_deref(),
             &candidate_name,
+            &mut read_rewrite_session,
         )
         .await?
         .is_some()
@@ -786,6 +821,7 @@ async fn rewrite_file_insert_columns_with_backend(
             directory_id.as_deref(),
             &parsed.name,
             parsed.extension.as_deref(),
+            &mut read_rewrite_session,
         )
         .await?
         {
@@ -814,6 +850,7 @@ async fn rewrite_directory_insert_columns_with_backend(
     target: FilesystemTarget,
     active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let path_index = insert
         .columns
         .iter()
@@ -921,8 +958,13 @@ async fn rewrite_directory_insert_columns_with_backend(
                 let parent_path = parent_directory_path(&normalized_path);
                 let derived_parent_id = match parent_path {
                     Some(ref parent_path) => {
-                        if let Some(existing_parent_id) =
-                            find_directory_id_by_path(backend, &version_id, parent_path).await?
+                        if let Some(existing_parent_id) = find_directory_id_by_path(
+                            backend,
+                            &version_id,
+                            parent_path,
+                            &mut read_rewrite_session,
+                        )
+                        .await?
                         {
                             Some(existing_parent_id)
                         } else {
@@ -963,19 +1005,29 @@ async fn rewrite_directory_insert_columns_with_backend(
                 }
                 let name = normalize_path_segment(&raw_name)?;
                 let parent_path = match explicit_parent_id.as_deref() {
-                    Some(parent_id) => read_directory_path_by_id(backend, &version_id, parent_id)
-                        .await?
-                        .ok_or_else(|| LixError {
-                            message: format!("Parent directory does not exist for id {parent_id}"),
-                        })?,
+                    Some(parent_id) => read_directory_path_by_id(
+                        backend,
+                        &version_id,
+                        parent_id,
+                        &mut read_rewrite_session,
+                    )
+                    .await?
+                    .ok_or_else(|| LixError {
+                        message: format!("Parent directory does not exist for id {parent_id}"),
+                    })?,
                     None => "/".to_string(),
                 };
                 let computed_path = compose_directory_path(parent_path.as_str(), &name)?;
                 (explicit_parent_id, name, computed_path)
             };
 
-        if let Some(existing_id) =
-            find_directory_id_by_path(backend, &version_id, &computed_path).await?
+        if let Some(existing_id) = find_directory_id_by_path(
+            backend,
+            &version_id,
+            &computed_path,
+            &mut read_rewrite_session,
+        )
+        .await?
         {
             let same_id = explicit_id
                 .as_deref()
@@ -986,7 +1038,13 @@ async fn rewrite_directory_insert_columns_with_backend(
             }
         }
 
-        assert_no_file_at_directory_path(backend, &version_id, &computed_path).await?;
+        assert_no_file_at_directory_path(
+            backend,
+            &version_id,
+            &computed_path,
+            &mut read_rewrite_session,
+        )
+        .await?;
 
         row[ensured_parent_index] = optional_string_literal_expr(computed_parent_id.as_deref());
         row[ensured_name_index] = string_literal_expr(&computed_name);
@@ -1003,6 +1061,7 @@ async fn rewrite_file_update_assignments_with_backend(
     params: &[EngineValue],
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let mut placeholder_state = PlaceholderState::new();
     let mut next_path: Option<String> = None;
     for assignment in original_assignments {
@@ -1030,10 +1089,22 @@ async fn rewrite_file_update_assignments_with_backend(
     )
     .await?;
     let parsed = parse_file_path(&raw_path)?;
-    assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
-    let matching_file_ids =
-        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
-            .await?;
+    assert_no_directory_at_file_path(
+        backend,
+        &version_id,
+        &parsed.normalized_path,
+        &mut read_rewrite_session,
+    )
+    .await?;
+    let matching_file_ids = file_ids_matching_update(
+        backend,
+        update,
+        target,
+        params,
+        selection_placeholder_state,
+        &mut read_rewrite_session,
+    )
+    .await?;
     let matching_file_ids = matching_file_ids
         .into_iter()
         .map(|row| row.id)
@@ -1042,8 +1113,13 @@ async fn rewrite_file_update_assignments_with_backend(
         return Err(file_unique_error(&parsed.normalized_path, &version_id));
     }
     if !matching_file_ids.is_empty() {
-        if let Some(existing_id) =
-            find_file_id_by_path(backend, &version_id, &parsed.normalized_path).await?
+        if let Some(existing_id) = find_file_id_by_path(
+            backend,
+            &version_id,
+            &parsed.normalized_path,
+            &mut read_rewrite_session,
+        )
+        .await?
         {
             let touches_existing = matching_file_ids.iter().any(|id| id == &existing_id);
             let touches_other = matching_file_ids.iter().any(|id| id != &existing_id);
@@ -1055,9 +1131,14 @@ async fn rewrite_file_update_assignments_with_backend(
 
     let directory_id = if let Some(directory_path) = &parsed.directory_path {
         Some(
-            find_directory_id_by_path(backend, &version_id, directory_path)
-                .await?
-                .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
+            find_directory_id_by_path(
+                backend,
+                &version_id,
+                directory_path,
+                &mut read_rewrite_session,
+            )
+            .await?
+            .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
         )
     } else {
         None
@@ -1094,12 +1175,15 @@ async fn tracked_missing_directory_changes(
 
     let mut known_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut tracked_directory_changes = Vec::new();
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     for path in ancestor_paths {
         if known_ids.contains_key(path) {
             continue;
         }
-        if let Some(existing_id) = find_directory_id_by_path(backend, version_id, path).await? {
+        if let Some(existing_id) =
+            find_directory_id_by_path(backend, version_id, path, &mut read_rewrite_session).await?
+        {
             known_ids.insert(path.clone(), existing_id);
             continue;
         }
@@ -1108,8 +1192,13 @@ async fn tracked_missing_directory_changes(
             Some(parent_path) => {
                 if let Some(parent_id) = known_ids.get(&parent_path) {
                     Some(parent_id.clone())
-                } else if let Some(existing_parent_id) =
-                    find_directory_id_by_path(backend, version_id, &parent_path).await?
+                } else if let Some(existing_parent_id) = find_directory_id_by_path(
+                    backend,
+                    version_id,
+                    &parent_path,
+                    &mut read_rewrite_session,
+                )
+                .await?
                 {
                     known_ids.insert(parent_path, existing_parent_id.clone());
                     Some(existing_parent_id)
@@ -1152,6 +1241,7 @@ async fn rewrite_directory_update_assignments_with_backend(
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
     let mut placeholder_state = PlaceholderState::new();
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let mut next_path: Option<String> = None;
     let mut next_parent_id: Option<Option<String>> = None;
     let mut next_name: Option<String> = None;
@@ -1191,11 +1281,16 @@ async fn rewrite_directory_update_assignments_with_backend(
         });
     };
 
-    let existing = read_directory_descriptor_by_id(backend, &version_id, &current_directory_id)
-        .await?
-        .ok_or_else(|| LixError {
-            message: format!("Directory does not exist for id {}", current_directory_id),
-        })?;
+    let existing = read_directory_descriptor_by_id(
+        backend,
+        &version_id,
+        &current_directory_id,
+        &mut read_rewrite_session,
+    )
+    .await?
+    .ok_or_else(|| LixError {
+        message: format!("Directory does not exist for id {}", current_directory_id),
+    })?;
 
     let (resolved_parent_id, resolved_name, resolved_path) = if let Some(raw_path) = next_path {
         let normalized_path = normalize_directory_path(&raw_path)?;
@@ -1203,11 +1298,16 @@ async fn rewrite_directory_update_assignments_with_backend(
             message: "Directory name must be provided".to_string(),
         })?;
         let parent_id = match parent_directory_path(&normalized_path) {
-            Some(parent_path) => find_directory_id_by_path(backend, &version_id, &parent_path)
-                .await?
-                .ok_or_else(|| LixError {
-                    message: format!("Parent directory does not exist for path {}", parent_path),
-                })?,
+            Some(parent_path) => find_directory_id_by_path(
+                backend,
+                &version_id,
+                &parent_path,
+                &mut read_rewrite_session,
+            )
+            .await?
+            .ok_or_else(|| LixError {
+                message: format!("Parent directory does not exist for path {}", parent_path),
+            })?,
             None => String::new(),
         };
         let parent_id_opt = if parent_id.is_empty() {
@@ -1226,7 +1326,7 @@ async fn rewrite_directory_update_assignments_with_backend(
             });
         }
         let parent_path = if let Some(parent_id) = parent_id.as_deref() {
-            read_directory_path_by_id(backend, &version_id, parent_id)
+            read_directory_path_by_id(backend, &version_id, parent_id, &mut read_rewrite_session)
                 .await?
                 .ok_or_else(|| LixError {
                     message: format!("Parent directory does not exist for id {}", parent_id),
@@ -1249,17 +1349,29 @@ async fn rewrite_directory_update_assignments_with_backend(
             &version_id,
             current_directory_id.as_str(),
             parent_id,
+            &mut read_rewrite_session,
         )
         .await?;
     }
-    if let Some(existing_id) =
-        find_directory_id_by_path(backend, &version_id, &resolved_path).await?
+    if let Some(existing_id) = find_directory_id_by_path(
+        backend,
+        &version_id,
+        &resolved_path,
+        &mut read_rewrite_session,
+    )
+    .await?
     {
         if existing_id != current_directory_id {
             return Err(directory_unique_error(&resolved_path, &version_id));
         }
     }
-    assert_no_file_at_directory_path(backend, &version_id, &resolved_path).await?;
+    assert_no_file_at_directory_path(
+        backend,
+        &version_id,
+        &resolved_path,
+        &mut read_rewrite_session,
+    )
+    .await?;
 
     update.assignments.retain(|assignment| {
         assignment_target_name(assignment)
@@ -1447,6 +1559,7 @@ async fn find_directory_id_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let normalized_path = normalize_directory_path(path)?;
     let trimmed = normalized_path.trim_matches('/');
@@ -1456,9 +1569,14 @@ async fn find_directory_id_by_path(
 
     let mut current_parent: Option<String> = None;
     for segment in trimmed.split('/') {
-        let Some(next_id) =
-            find_directory_child_id(backend, version_id, current_parent.as_deref(), segment)
-                .await?
+        let Some(next_id) = find_directory_child_id(
+            backend,
+            version_id,
+            current_parent.as_deref(),
+            segment,
+            read_rewrite_session,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -1473,108 +1591,77 @@ async fn find_directory_child_id(
     version_id: &str,
     parent_id: Option<&str>,
     name: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
-    let dialect = backend.dialect();
-    let version_id_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "id");
-    let inherits_expr =
-        json_text_extract_for_dialect(dialect, "snapshot_content", "inherits_from_version_id");
-    let name_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "name");
-    let parent_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "parent_id");
-
-    let mut params = vec![
-        EngineValue::Text(version_id.to_string()),
-        EngineValue::Text(name.to_string()),
-    ];
+    let name_expr = json_text_expr_sql(backend.dialect(), "name");
+    let parent_expr = json_text_expr_sql(backend.dialect(), "parent_id");
+    let version_chain = load_version_chain_ids(backend, version_id, read_rewrite_session).await?;
+    if version_chain.is_empty() {
+        return Ok(None);
+    }
+    let mut params = version_chain
+        .iter()
+        .map(|value| EngineValue::Text(value.clone()))
+        .collect::<Vec<_>>();
+    let version_predicate = placeholder_range(1, version_chain.len());
+    let name_index = params.len() + 1;
+    params.push(EngineValue::Text(name.to_string()));
     let parent_predicate = if let Some(parent_id) = parent_id {
+        let parent_index = params.len() + 1;
         params.push(EngineValue::Text(parent_id.to_string()));
-        format!("{parent_expr} = $3")
+        format!("{parent_expr} = ${parent_index}")
     } else {
         format!("{parent_expr} IS NULL")
     };
     let lookup_sql = format!(
-        "WITH RECURSIVE \
-           version_descriptor AS ( \
-             SELECT \
-               {version_id_expr} AS version_id, \
-               {inherits_expr} AS inherits_from_version_id \
-             FROM lix_internal_state_materialized_v1_lix_version_descriptor \
-             WHERE schema_key = '{version_descriptor_schema_key}' \
-               AND file_id = '{version_descriptor_file_id}' \
-               AND version_id = '{version_descriptor_storage_version_id}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           version_chain(ancestor_version_id, depth) AS ( \
-             SELECT $1 AS ancestor_version_id, 0 AS depth \
-             UNION ALL \
-             SELECT vd.inherits_from_version_id, vc.depth + 1 \
-             FROM version_chain vc \
-             JOIN version_descriptor vd \
-               ON vd.version_id = vc.ancestor_version_id \
-             WHERE vd.inherits_from_version_id IS NOT NULL \
-               AND vc.depth < 64 \
-           ), \
-           descriptor_rows AS ( \
-             SELECT entity_id, version_id, snapshot_content, is_tombstone, 2 AS priority \
-             FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
-             UNION ALL \
-             SELECT entity_id, version_id, snapshot_content, 0 AS is_tombstone, 1 AS priority \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = 'lix_directory_descriptor' \
-           ), \
-           ranked AS ( \
-             SELECT \
-               d.entity_id AS entity_id, \
-               d.snapshot_content AS snapshot_content, \
-               d.is_tombstone AS is_tombstone, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY d.entity_id \
-                 ORDER BY vc.depth ASC, d.priority ASC \
-               ) AS rn \
-             FROM descriptor_rows d \
-             JOIN version_chain vc \
-               ON vc.ancestor_version_id = d.version_id \
-           ) \
-         SELECT entity_id \
-         FROM ranked \
-         WHERE rn = 1 \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-           AND {name_expr} = $2 \
-           AND {parent_predicate} \
-         LIMIT 1",
-        version_id_expr = version_id_expr,
-        inherits_expr = inherits_expr,
-        version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        version_descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        version_descriptor_storage_version_id =
-            escape_sql_string(version_descriptor_storage_version_id()),
+        "SELECT entity_id, version_id, untracked \
+         FROM ( \
+           SELECT entity_id, version_id, 1 AS untracked \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {parent_predicate} \
+           UNION ALL \
+           SELECT entity_id, version_id, 0 AS untracked \
+           FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND is_tombstone = 0 \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {parent_predicate} \
+         ) candidates",
+        schema_key = DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        version_predicate = version_predicate,
+        name_index = name_index,
         name_expr = name_expr,
         parent_predicate = parent_predicate,
     );
     let result = backend.execute(&lookup_sql, &params).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(value) = row.first() else {
-        return Ok(None);
-    };
-    let EngineValue::Text(id) = value else {
-        return Err(LixError {
-            message: format!("directory lookup expected text id, got {value:?}"),
-        });
-    };
-    Ok(Some(id.clone()))
+    let candidate = select_effective_entity_id(&result.rows, &version_chain)?;
+    ensure_effective_entity_visible_in_chain(
+        backend,
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        "lix_internal_state_materialized_v1_lix_directory_descriptor",
+        &version_chain,
+        candidate,
+    )
+    .await
 }
 
 async fn find_file_id_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let parsed = parse_file_path(path)?;
     let directory_id = if let Some(directory_path) = parsed.directory_path.as_deref() {
-        let resolved = find_directory_id_by_path(backend, version_id, directory_path).await?;
+        let resolved =
+            find_directory_id_by_path(backend, version_id, directory_path, read_rewrite_session)
+                .await?;
         let Some(directory_id) = resolved else {
             return Ok(None);
         };
@@ -1589,6 +1676,7 @@ async fn find_file_id_by_path(
         directory_id.as_deref(),
         &parsed.name,
         parsed.extension.as_deref(),
+        read_rewrite_session,
     )
     .await
 }
@@ -1599,22 +1687,26 @@ async fn find_file_id_by_components(
     directory_id: Option<&str>,
     name: &str,
     extension: Option<&str>,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
-    let dialect = backend.dialect();
-    let version_id_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "id");
-    let inherits_expr =
-        json_text_extract_for_dialect(dialect, "snapshot_content", "inherits_from_version_id");
-    let name_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "name");
-    let directory_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "directory_id");
-    let extension_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "extension");
-
-    let mut params = vec![
-        EngineValue::Text(version_id.to_string()),
-        EngineValue::Text(name.to_string()),
-    ];
+    let name_expr = json_text_expr_sql(backend.dialect(), "name");
+    let directory_expr = json_text_expr_sql(backend.dialect(), "directory_id");
+    let extension_expr = json_text_expr_sql(backend.dialect(), "extension");
+    let version_chain = load_version_chain_ids(backend, version_id, read_rewrite_session).await?;
+    if version_chain.is_empty() {
+        return Ok(None);
+    }
+    let mut params = version_chain
+        .iter()
+        .map(|value| EngineValue::Text(value.clone()))
+        .collect::<Vec<_>>();
+    let version_predicate = placeholder_range(1, version_chain.len());
+    let name_index = params.len() + 1;
+    params.push(EngineValue::Text(name.to_string()));
     let directory_predicate = if let Some(directory_id) = directory_id {
+        let directory_index = params.len() + 1;
         params.push(EngineValue::Text(directory_id.to_string()));
-        format!("{directory_expr} = $3")
+        format!("{directory_expr} = ${directory_index}")
     } else {
         format!("{directory_expr} IS NULL")
     };
@@ -1626,88 +1718,282 @@ async fn find_file_id_by_components(
         format!("{extension_expr} IS NULL")
     };
     let lookup_sql = format!(
-        "WITH RECURSIVE \
-           version_descriptor AS ( \
-             SELECT \
-               {version_id_expr} AS version_id, \
-               {inherits_expr} AS inherits_from_version_id \
-             FROM lix_internal_state_materialized_v1_lix_version_descriptor \
-             WHERE schema_key = '{version_descriptor_schema_key}' \
-               AND file_id = '{version_descriptor_file_id}' \
-               AND version_id = '{version_descriptor_storage_version_id}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           version_chain(ancestor_version_id, depth) AS ( \
-             SELECT $1 AS ancestor_version_id, 0 AS depth \
-             UNION ALL \
-             SELECT vd.inherits_from_version_id, vc.depth + 1 \
-             FROM version_chain vc \
-             JOIN version_descriptor vd \
-               ON vd.version_id = vc.ancestor_version_id \
-             WHERE vd.inherits_from_version_id IS NOT NULL \
-               AND vc.depth < 64 \
-           ), \
-           descriptor_rows AS ( \
-             SELECT entity_id, version_id, snapshot_content, is_tombstone, 2 AS priority \
-             FROM lix_internal_state_materialized_v1_lix_file_descriptor \
-             UNION ALL \
-             SELECT entity_id, version_id, snapshot_content, 0 AS is_tombstone, 1 AS priority \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = 'lix_file_descriptor' \
-           ), \
-           ranked AS ( \
-             SELECT \
-               d.entity_id AS entity_id, \
-               d.snapshot_content AS snapshot_content, \
-               d.is_tombstone AS is_tombstone, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY d.entity_id \
-                 ORDER BY vc.depth ASC, d.priority ASC \
-               ) AS rn \
-             FROM descriptor_rows d \
-             JOIN version_chain vc \
-               ON vc.ancestor_version_id = d.version_id \
-           ) \
-         SELECT entity_id \
-         FROM ranked \
-         WHERE rn = 1 \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-           AND {name_expr} = $2 \
-           AND {directory_predicate} \
-           AND {extension_predicate} \
-         LIMIT 1",
-        version_id_expr = version_id_expr,
-        inherits_expr = inherits_expr,
-        version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        version_descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        version_descriptor_storage_version_id =
-            escape_sql_string(version_descriptor_storage_version_id()),
+        "SELECT entity_id, version_id, untracked \
+         FROM ( \
+           SELECT entity_id, version_id, 1 AS untracked \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {directory_predicate} \
+             AND {extension_predicate} \
+           UNION ALL \
+           SELECT entity_id, version_id, 0 AS untracked \
+           FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND is_tombstone = 0 \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {directory_predicate} \
+             AND {extension_predicate} \
+         ) candidates",
+        schema_key = FILE_DESCRIPTOR_SCHEMA_KEY,
+        version_predicate = version_predicate,
+        name_index = name_index,
         name_expr = name_expr,
         directory_predicate = directory_predicate,
         extension_predicate = extension_predicate,
     );
     let result = backend.execute(&lookup_sql, &params).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(value) = row.first() else {
-        return Ok(None);
-    };
-    let EngineValue::Text(id) = value else {
-        return Err(LixError {
-            message: format!("file lookup expected text id, got {value:?}"),
-        });
-    };
-    Ok(Some(id.clone()))
+    let candidate = select_effective_entity_id(&result.rows, &version_chain)?;
+    ensure_effective_entity_visible_in_chain(
+        backend,
+        FILE_DESCRIPTOR_SCHEMA_KEY,
+        "lix_internal_state_materialized_v1_lix_file_descriptor",
+        &version_chain,
+        candidate,
+    )
+    .await
 }
 
-fn json_text_extract_for_dialect(dialect: SqlDialect, value_expr: &str, key: &str) -> String {
+async fn ensure_effective_entity_visible_in_chain(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+    materialized_table: &str,
+    version_chain: &[String],
+    candidate: Option<String>,
+) -> Result<Option<String>, LixError> {
+    let Some(candidate_id) = candidate else {
+        return Ok(None);
+    };
+    if !effective_entity_is_tombstoned_in_chain(
+        backend,
+        schema_key,
+        materialized_table,
+        version_chain,
+        &candidate_id,
+    )
+    .await?
+    {
+        return Ok(Some(candidate_id));
+    }
+    Ok(None)
+}
+
+async fn effective_entity_is_tombstoned_in_chain(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+    materialized_table: &str,
+    version_chain: &[String],
+    entity_id: &str,
+) -> Result<bool, LixError> {
+    if version_chain.is_empty() {
+        return Ok(false);
+    }
+    let mut params = version_chain
+        .iter()
+        .map(|value| EngineValue::Text(value.clone()))
+        .collect::<Vec<_>>();
+    let version_predicate = placeholder_range(1, version_chain.len());
+    let entity_index = params.len() + 1;
+    params.push(EngineValue::Text(entity_id.to_string()));
+    let sql = format!(
+        "SELECT version_id, untracked, tombstone \
+         FROM ( \
+           SELECT version_id, 1 AS untracked, \
+                  CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS tombstone \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND entity_id = ${entity_index} \
+           UNION ALL \
+           SELECT version_id, 0 AS untracked, \
+                  CASE WHEN is_tombstone = 1 OR snapshot_content IS NULL THEN 1 ELSE 0 END AS tombstone \
+           FROM {materialized_table} \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND entity_id = ${entity_index} \
+         ) candidates",
+        schema_key = escape_sql_string(schema_key),
+        version_predicate = version_predicate,
+        entity_index = entity_index,
+        materialized_table = materialized_table,
+    );
+    let result = backend.execute(&sql, &params).await?;
+    let Some(tombstoned) = select_effective_entity_tombstone_state(&result.rows, version_chain)?
+    else {
+        return Ok(false);
+    };
+    Ok(tombstoned)
+}
+
+fn placeholder_range(start: usize, len: usize) -> String {
+    (start..start + len)
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn load_version_chain_ids(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
+) -> Result<Vec<String>, LixError> {
+    if let Some(cached) = read_rewrite_session.cached_version_chain(version_id) {
+        return Ok(cached.to_vec());
+    }
+
+    let inherits_expr = json_text_expr_sql(backend.dialect(), "inherits_from_version_id");
+    let sql = format!(
+        "WITH RECURSIVE version_chain(version_id, depth) AS ( \
+           SELECT $1 AS version_id, 0 AS depth \
+           UNION ALL \
+           SELECT \
+             COALESCE( \
+               (SELECT {inherits_expr} \
+                FROM lix_internal_state_untracked \
+                WHERE schema_key = '{schema_key}' \
+                  AND file_id = '{file_id}' \
+                  AND version_id = '{storage_version_id}' \
+                  AND entity_id = vc.version_id \
+                  AND snapshot_content IS NOT NULL \
+                LIMIT 1), \
+               (SELECT {inherits_expr} \
+                FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+                WHERE schema_key = '{schema_key}' \
+                  AND version_id = '{storage_version_id}' \
+                  AND entity_id = vc.version_id \
+                  AND is_tombstone = 0 \
+                  AND snapshot_content IS NOT NULL \
+                LIMIT 1) \
+             ) AS version_id, \
+             vc.depth + 1 AS depth \
+           FROM version_chain vc \
+           WHERE vc.version_id IS NOT NULL \
+             AND vc.depth < 64 \
+         ) \
+         SELECT version_id \
+         FROM version_chain \
+         WHERE version_id IS NOT NULL",
+        inherits_expr = inherits_expr,
+        schema_key = escape_sql_string(version_descriptor_schema_key()),
+        file_id = escape_sql_string(version_descriptor_file_id()),
+        storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
+    );
+    let result = backend
+        .execute(&sql, &[EngineValue::Text(version_id.to_string())])
+        .await?;
+
+    let mut chain = Vec::new();
+    for row in &result.rows {
+        let Some(value) = row.first() else {
+            continue;
+        };
+        let EngineValue::Text(version_id) = value else {
+            continue;
+        };
+        if chain.iter().any(|existing| existing == version_id) {
+            continue;
+        }
+        chain.push(version_id.clone());
+    }
+    if chain.is_empty() {
+        chain.push(version_id.to_string());
+    }
+
+    read_rewrite_session.cache_version_chain(version_id.to_string(), chain.clone());
+    Ok(chain)
+}
+
+fn select_effective_entity_id(
+    rows: &[Vec<EngineValue>],
+    version_chain: &[String],
+) -> Result<Option<String>, LixError> {
+    let depth_by_version = version_chain
+        .iter()
+        .enumerate()
+        .map(|(depth, version_id)| (version_id.clone(), depth))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut best: Option<(usize, usize, String)> = None;
+    for row in rows {
+        let Some(EngineValue::Text(entity_id)) = row.first() else {
+            continue;
+        };
+        let Some(EngineValue::Text(version_id)) = row.get(1) else {
+            continue;
+        };
+        let untracked = row
+            .get(2)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        let depth = *depth_by_version.get(version_id).unwrap_or(&usize::MAX);
+        let priority = if untracked { 0 } else { 1 };
+        let candidate = (depth, priority, entity_id.clone());
+        if best
+            .as_ref()
+            .map(|current| candidate < *current)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best.map(|(_, _, entity_id)| entity_id))
+}
+
+fn select_effective_entity_tombstone_state(
+    rows: &[Vec<EngineValue>],
+    version_chain: &[String],
+) -> Result<Option<bool>, LixError> {
+    let depth_by_version = version_chain
+        .iter()
+        .enumerate()
+        .map(|(depth, version_id)| (version_id.clone(), depth))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut best_rank: Option<(usize, usize)> = None;
+    let mut best_tombstone: Option<bool> = None;
+    for row in rows {
+        let Some(EngineValue::Text(version_id)) = row.first() else {
+            continue;
+        };
+        let untracked = row
+            .get(1)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        let tombstone = row
+            .get(2)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        let depth = *depth_by_version.get(version_id).unwrap_or(&usize::MAX);
+        let priority = if untracked { 0 } else { 1 };
+        let candidate_rank = (depth, priority);
+        if best_rank
+            .as_ref()
+            .map(|current| candidate_rank < *current)
+            .unwrap_or(true)
+        {
+            best_rank = Some(candidate_rank);
+            best_tombstone = Some(tombstone);
+        }
+    }
+
+    Ok(best_tombstone)
+}
+
+fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> String {
     match dialect {
-        SqlDialect::Sqlite => format!("json_extract({value_expr}, '$.{key}')"),
-        SqlDialect::Postgres => {
-            format!("jsonb_extract_path_text(CAST({value_expr} AS JSONB), '{key}')")
+        crate::backend::SqlDialect::Sqlite => {
+            format!("json_extract(snapshot_content, '$.\"{field}\"')")
+        }
+        crate::backend::SqlDialect::Postgres => {
+            format!("jsonb_extract_path_text(CAST(snapshot_content AS JSONB), '{field}')")
         }
     }
 }
@@ -1715,7 +2001,24 @@ fn json_text_extract_for_dialect(dialect: SqlDialect, value_expr: &str, key: &st
 async fn rewrite_single_read_query_for_backend(
     backend: &dyn LixBackend,
     sql: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<String, LixError> {
+    let cache_key = {
+        let dialect = match backend.dialect() {
+            crate::backend::SqlDialect::Sqlite => "sqlite",
+            crate::backend::SqlDialect::Postgres => "postgres",
+        };
+        format!("{dialect}\n{sql}")
+    };
+    if let Some(cached) = helper_sql_cache()
+        .lock()
+        .expect("helper sql cache mutex poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         message: error.to_string(),
     })?;
@@ -1730,9 +2033,27 @@ async fn rewrite_single_read_query_for_backend(
             message: "expected SELECT statement".to_string(),
         });
     };
-    let rewritten = rewrite_read_query_with_backend(backend, *query).await?;
+    let rewritten = rewrite_read_query_with_backend_and_params_in_session(
+        backend,
+        *query,
+        &[],
+        read_rewrite_session,
+    )
+    .await?;
     let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
-    Ok(lowered.to_string())
+    let lowered_sql = lowered.to_string();
+    let mut cache = helper_sql_cache()
+        .lock()
+        .expect("helper sql cache mutex poisoned");
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(cache_key, lowered_sql.clone());
+    Ok(lowered_sql)
+}
+
+fn helper_sql_cache() -> &'static Mutex<BTreeMap<String, String>> {
+    REWRITTEN_HELPER_SQL_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn resolve_text_expr(
@@ -2208,9 +2529,10 @@ async fn assert_no_directory_at_file_path(
     backend: &dyn LixBackend,
     version_id: &str,
     file_path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<(), LixError> {
     let directory_path = format!("{file_path}/");
-    if find_directory_id_by_path(backend, version_id, &directory_path)
+    if find_directory_id_by_path(backend, version_id, &directory_path, read_rewrite_session)
         .await?
         .is_none()
     {
@@ -2225,9 +2547,10 @@ async fn assert_no_file_at_directory_path(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<(), LixError> {
     let file_path = directory_path.trim_end_matches('/').to_string();
-    if find_file_id_by_path(backend, version_id, &file_path)
+    if find_file_id_by_path(backend, version_id, &file_path, read_rewrite_session)
         .await?
         .is_none()
     {
@@ -2242,12 +2565,14 @@ async fn read_directory_path_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let sql = "SELECT path \
          FROM lix_directory_by_version \
          WHERE lixcol_version_id = $1 AND id = $2 \
          LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -2275,6 +2600,7 @@ async fn read_directory_descriptor_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<DirectoryDescriptorSnapshot>, LixError> {
     let sql = "SELECT \
          lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
@@ -2285,7 +2611,8 @@ async fn read_directory_descriptor_by_id(
            AND version_id = $1 \
            AND lix_json_text(snapshot_content, 'id') = $2 \
          LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -2330,6 +2657,7 @@ async fn assert_no_directory_cycle(
     version_id: &str,
     directory_id: &str,
     parent_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<(), LixError> {
     let mut safety = 0usize;
     let mut current_parent: Option<String> = Some(parent_id.to_string());
@@ -2347,7 +2675,8 @@ async fn assert_no_directory_cycle(
         safety += 1;
 
         let Some(snapshot) =
-            read_directory_descriptor_by_id(backend, version_id, &parent_id).await?
+            read_directory_descriptor_by_id(backend, version_id, &parent_id, read_rewrite_session)
+                .await?
         else {
             return Err(LixError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
@@ -2363,6 +2692,7 @@ async fn directory_rows_matching_delete(
     delete: &Delete,
     target: FilesystemTarget,
     params: &[EngineValue],
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedDirectoryId>, LixError> {
     let where_clause = delete
         .selection
@@ -2387,7 +2717,8 @@ async fn directory_rows_matching_delete(
             where_clause = where_clause
         )
     };
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
     let result = backend
         .execute(&rewritten_sql, params)
         .await
@@ -2463,11 +2794,18 @@ async fn file_ids_matching_update(
     target: FilesystemTarget,
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
     let trace = file_prefetch_trace_enabled();
-    if let Some(rows) =
-        try_file_ids_matching_update_fast(backend, update, target, params, placeholder_state)
-            .await?
+    if let Some(rows) = try_file_ids_matching_update_fast(
+        backend,
+        update,
+        target,
+        params,
+        placeholder_state,
+        read_rewrite_session,
+    )
+    .await?
     {
         if trace {
             eprintln!(
@@ -2490,7 +2828,8 @@ async fn file_ids_matching_update(
         view_name = target.view_name,
         where_clause = where_clause
     );
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
     let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
     let result = backend
         .execute(&bound.sql, &bound.params)
@@ -2542,6 +2881,7 @@ async fn try_file_ids_matching_update_fast(
     target: FilesystemTarget,
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
     let mut selection_state = placeholder_state;
     let Some(selection) = extract_exact_file_update_selection_with_state(
@@ -2583,7 +2923,8 @@ async fn try_file_ids_matching_update_fast(
                AND snapshot_content IS NOT NULL \
                AND version_id = $1 \
                AND entity_id = $2";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -2625,32 +2966,16 @@ async fn try_exact_file_descriptor_lookup_current_version(
     version_id: &str,
     file_id: &str,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
-    let sql = "SELECT entity_id, untracked, is_tombstone, \
-                    'mutation.file_ids_matching_update.fast_id.direct' AS __lix_trace \
-             FROM (\
-                 SELECT entity_id, 1 AS untracked, \
-                        CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
-                        0 AS source_priority, \
-                        updated_at \
-                 FROM lix_internal_state_untracked \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND version_id = $1 \
-                   AND entity_id = $2 \
-                 UNION ALL \
-                 SELECT entity_id, 0 AS untracked, is_tombstone, 1 AS source_priority, updated_at \
-                 FROM lix_internal_state_materialized_v1_lix_file_descriptor \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND version_id = $1 \
-                   AND entity_id = $2 \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL\
-             ) AS exact_rows \
-             ORDER BY source_priority, updated_at DESC \
-             LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
-    let result = backend
+    let untracked_sql = "SELECT entity_id, 1 AS untracked, snapshot_content, \
+                              'mutation.file_ids_matching_update.fast_id.untracked' AS __lix_trace \
+                       FROM lix_internal_state_untracked \
+                       WHERE schema_key = 'lix_file_descriptor' \
+                         AND version_id = $1 \
+                         AND entity_id = $2 \
+                       LIMIT 1";
+    let untracked_result = backend
         .execute(
-            &rewritten_sql,
+            untracked_sql,
             &[
                 EngineValue::Text(version_id.to_string()),
                 EngineValue::Text(file_id.to_string()),
@@ -2660,11 +2985,39 @@ async fn try_exact_file_descriptor_lookup_current_version(
         .map_err(|error| LixError {
             message: format!(
                 "file update exact current-version prefetch failed for '{}': {}",
-                rewritten_sql, error.message
+                untracked_sql, error.message
+            ),
+        })?;
+    if let Some(parsed) = parse_exact_file_descriptor_lookup_rows(untracked_result.rows)? {
+        return Ok(Some(parsed));
+    }
+
+    let materialized_sql = "SELECT entity_id, 0 AS untracked, snapshot_content, \
+                                 'mutation.file_ids_matching_update.fast_id.materialized' AS __lix_trace \
+                          FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                          WHERE schema_key = 'lix_file_descriptor' \
+                            AND version_id = $1 \
+                            AND entity_id = $2 \
+                            AND is_tombstone = 0 \
+                            AND snapshot_content IS NOT NULL \
+                          LIMIT 1";
+    let materialized_result = backend
+        .execute(
+            materialized_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(file_id.to_string()),
+            ],
+        )
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update exact current-version prefetch failed for '{}': {}",
+                materialized_sql, error.message
             ),
         })?;
 
-    parse_exact_file_descriptor_lookup_rows(result.rows)
+    parse_exact_file_descriptor_lookup_rows(materialized_result.rows)
 }
 
 fn parse_exact_file_descriptor_lookup_rows(
@@ -2688,9 +3041,7 @@ fn parse_exact_file_descriptor_lookup_rows(
         .unwrap_or(false);
     let is_tombstone = row
         .get(2)
-        .map(parse_untracked_value)
-        .transpose()?
-        .unwrap_or(false);
+        .is_none_or(|value| matches!(value, EngineValue::Null));
     if is_tombstone {
         return Ok(Some(Vec::new()));
     }
@@ -2860,10 +3211,17 @@ fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
 async fn expand_directory_descendants(
     backend: &dyn LixBackend,
     selected: &[ScopedDirectoryId],
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedDirectoryId>, LixError> {
     let mut out: BTreeSet<ScopedDirectoryId> = BTreeSet::new();
     for scoped in selected {
-        let ids = load_directory_descendants(backend, &scoped.version_id, &scoped.id).await?;
+        let ids = load_directory_descendants(
+            backend,
+            &scoped.version_id,
+            &scoped.id,
+            read_rewrite_session,
+        )
+        .await?;
         for id in ids {
             out.insert(ScopedDirectoryId {
                 id,
@@ -2878,6 +3236,7 @@ async fn load_directory_descendants(
     backend: &dyn LixBackend,
     version_id: &str,
     root_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<String>, LixError> {
     let sql = "WITH RECURSIVE directory_rows AS (\
          SELECT \
@@ -2898,7 +3257,8 @@ async fn load_directory_descendants(
            WHERE child.version_id = $1\
          ) \
          SELECT id FROM descendants";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -3097,29 +3457,26 @@ fn noop_statement() -> Result<Statement, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_predicate_string_with_params_and_state, json_text_extract_for_dialect,
+        extract_predicate_string_with_params_and_state, json_text_expr_sql,
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
-        rewrite_update,
+        rewrite_update, select_effective_entity_tombstone_state,
     };
-    use crate::backend::SqlDialect;
     use crate::sql::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
     use crate::sql::PlaceholderState;
+    use crate::SqlDialect;
     use crate::Value;
     use sqlparser::ast::Statement;
 
     #[test]
-    fn sqlite_json_extract_expression_matches_schema_registry_index_shape() {
-        let expr = json_text_extract_for_dialect(SqlDialect::Sqlite, "snapshot_content", "name");
-        assert_eq!(expr, "json_extract(snapshot_content, '$.name')");
-    }
-
-    #[test]
-    fn postgres_json_extract_expression_uses_jsonb_extract_path_text() {
-        let expr = json_text_extract_for_dialect(SqlDialect::Postgres, "snapshot_content", "name");
+    fn json_text_expr_sql_uses_backend_specific_expression() {
         assert_eq!(
-            expr,
-            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'name')"
+            json_text_expr_sql(SqlDialect::Sqlite, "inherits_from_version_id"),
+            "json_extract(snapshot_content, '$.\"inherits_from_version_id\"')"
+        );
+        assert_eq!(
+            json_text_expr_sql(SqlDialect::Postgres, "inherits_from_version_id"),
+            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'inherits_from_version_id')"
         );
     }
 
@@ -3300,7 +3657,7 @@ mod tests {
         let rows = vec![vec![
             Value::Text("file-a".to_string()),
             Value::Integer(1),
-            Value::Integer(1),
+            Value::Null,
         ]];
         let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
         assert!(
@@ -3318,12 +3675,72 @@ mod tests {
         let rows = vec![vec![
             Value::Text("file-b".to_string()),
             Value::Integer(1),
-            Value::Integer(0),
+            Value::Text("{\"path\":\"/bench/file-b.txt\"}".to_string()),
         ]];
         let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
         let parsed = parsed.expect("live row should exist");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "file-b");
         assert!(parsed[0].untracked);
+    }
+
+    #[test]
+    fn effective_entity_tombstone_state_prefers_newer_tombstone() {
+        let rows = vec![
+            vec![
+                Value::Text("v1".to_string()),
+                Value::Integer(0),
+                Value::Integer(0),
+            ],
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(0),
+                Value::Integer(1),
+            ],
+        ];
+        let chain = vec!["v2".to_string(), "v1".to_string()];
+        let tombstone =
+            select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
+        assert_eq!(tombstone, Some(true));
+    }
+
+    #[test]
+    fn effective_entity_tombstone_state_respects_untracked_overlay_priority() {
+        let rows = vec![
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(0),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(1),
+                Value::Integer(0),
+            ],
+        ];
+        let chain = vec!["v2".to_string(), "v1".to_string()];
+        let tombstone =
+            select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
+        assert_eq!(tombstone, Some(false));
+    }
+
+    #[test]
+    fn effective_entity_tombstone_state_tie_does_not_use_tombstone_as_tiebreaker() {
+        let rows = vec![
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(1),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(1),
+                Value::Integer(0),
+            ],
+        ];
+        let chain = vec!["v2".to_string(), "v1".to_string()];
+        let tombstone =
+            select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
+        assert_eq!(tombstone, Some(true));
     }
 }

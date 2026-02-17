@@ -31,3 +31,11 @@ harness = false
 [[bench]]
 name = "lix_file"
 harness = false
+
+[[bench]]
+name = "lix_state_by_version"
+harness = false
+
+[[bench]]
+name = "lix_state_history"
+harness = false

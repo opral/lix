@@ -36,6 +36,7 @@ const CONFIG = {
   installTextLinesPlugin: parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", true),
   exportSnapshot: parseEnvBool("BENCH_REPLAY_EXPORT_SNAPSHOT", false),
   exportSnapshotPath: process.env.BENCH_REPLAY_SNAPSHOT_PATH ?? "",
+  collectStorageCounters: parseEnvBool("BENCH_REPLAY_STORAGE_COUNTERS", true),
   maxInsertRows: parseEnvInt("BENCH_REPLAY_MAX_INSERT_ROWS", 200),
   maxInsertSqlChars: parseEnvInt("BENCH_REPLAY_MAX_INSERT_SQL_CHARS", 1_500_000),
   executeMode: parseExecuteMode(process.env.BENCH_REPLAY_EXECUTE_MODE),
@@ -275,9 +276,24 @@ async function main() {
 
     const replayMs = commitLoopMs;
     const overallReplayMs = performance.now() - replayStarted;
+
+    let storage = {
+      fileRows: 0,
+      internalChangeRows: 0,
+      internalSnapshotRows: 0,
+      topSchemaCounts: [],
+    };
     const storageQueryStarted = performance.now();
-    const storage = await collectStorageCounters(lix);
-    const storageQueryMs = performance.now() - storageQueryStarted;
+    let storageQueryMs = 0;
+    if (CONFIG.collectStorageCounters) {
+      if (CONFIG.showProgress) {
+        console.log("[progress:post-replay] collecting storage counters");
+      }
+      storage = await collectStorageCounters(lix);
+      storageQueryMs = performance.now() - storageQueryStarted;
+    } else if (CONFIG.showProgress) {
+      console.log("[progress:post-replay] skipping storage counters (set BENCH_REPLAY_STORAGE_COUNTERS=1 to enable)");
+    }
     const snapshotExportStarted = performance.now();
     const snapshotArtifact = await maybeWriteSnapshotArtifact(lix);
     const snapshotExportMs = performance.now() - snapshotExportStarted;

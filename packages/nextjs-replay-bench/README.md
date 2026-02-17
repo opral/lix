@@ -8,6 +8,8 @@ One-off benchmark package to replay linear git history into `js-sdk`/engine.
 pnpm --filter nextjs-replay-bench run bench:1000
 ```
 
+`bench:350` defaults storage-counter collection off for faster completion; set `BENCH_REPLAY_STORAGE_COUNTERS=1` if you need full post-replay counters.
+
 Warm vs cold quick commands:
 
 ```bash
@@ -28,6 +30,7 @@ pnpm -C packages/nextjs-replay-bench bench:parity:25   # replay + git-vs-lix sta
 - `BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN` set to `0` to disable plugin install
 - `BENCH_REPLAY_EXPORT_SNAPSHOT` set to `1` to export a sqlite snapshot artifact
 - `BENCH_REPLAY_SNAPSHOT_PATH` custom output path for snapshot artifact (`.lix` recommended)
+- `BENCH_REPLAY_STORAGE_COUNTERS` set to `0` to skip post-replay storage counter queries (faster tail) and `1` to collect them
 - `BENCH_REPLAY_PROGRESS_EVERY` progress cadence (default: `25`)
 - `BENCH_PARITY_EVERY` run full git-vs-lix parity every N replayed commits (default: `1`)
 - `BENCH_PARITY_FAIL_FAST` stop on first mismatch (`1`/`0`, default: `1`)

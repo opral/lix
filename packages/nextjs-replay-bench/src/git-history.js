@@ -71,6 +71,8 @@ export async function readCommitPatchSet(repoPath, commitSha) {
     "--raw",
     "-r",
     "-z",
+    "-m",
+    "--first-parent",
     "--find-renames",
     "--no-commit-id",
     commitSha,
