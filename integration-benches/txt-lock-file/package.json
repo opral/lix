@@ -1,5 +1,5 @@
 {
-  "name": "text-lines-repro-bench",
+  "name": "txt-lock-file-bench",
   "private": true,
   "type": "module",
   "version": "0.1.0",

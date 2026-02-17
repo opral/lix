@@ -1,4 +1,4 @@
-# text-lines-repro-bench
+# txt-lock-file bench
 
 Minimal reproduction benchmark for text-lines plugin overhead on large `lix_file` updates.
 
@@ -7,7 +7,7 @@ By default it benchmarks the `yarn.lock` update from commit `29c226771ce8...` in
 ## Run
 
 ```bash
-pnpm -C packages/text-lines-repro-bench bench
+pnpm -C integration-benches/txt-lock-file bench
 ```
 
 ## Useful environment variables
