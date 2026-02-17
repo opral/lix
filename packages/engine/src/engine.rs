@@ -28,10 +28,10 @@ use crate::schema_registry::{register_schema, register_schema_sql_statements};
 use crate::sql::{
     bind_sql_with_state, build_delete_followup_sql, build_update_followup_sql,
     coalesce_vtable_inserts_in_statement_list, escape_sql_string, expr_references_column_name,
-    parse_sql_statements, preprocess_sql,
-    preprocess_sql_with_provider_and_detected_file_domain_changes, ColumnReferenceOptions,
-    DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState, PostprocessPlan,
-    UpdateValidationPlan,
+    parse_sql_statements,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
+    ColumnReferenceOptions, DetectedFileDomainChange, MutationOperation, MutationRow,
+    PlaceholderState, PostprocessPlan, UpdateValidationPlan,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -337,7 +337,10 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
-        if let Some(statements) = extract_explicit_transaction_script(sql, params)? {
+        let parsed_statements = parse_sql_statements(sql)?;
+        if let Some(statements) =
+            extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
+        {
             return self
                 .execute_transaction_script_with_options(statements, options)
                 .await;
@@ -345,10 +348,15 @@ impl Engine {
 
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
-        self.maybe_materialize_reads_with_backend(self.backend.as_ref(), sql, &active_version_id)
-            .await?;
-        let read_only_query = is_query_only_sql(sql);
-        let should_refresh_file_cache = !read_only_query && should_refresh_file_cache_for_sql(sql);
+        self.maybe_materialize_reads_with_backend_from_statements(
+            self.backend.as_ref(),
+            &parsed_statements,
+            &active_version_id,
+        )
+        .await?;
+        let read_only_query = is_query_only_statements(&parsed_statements);
+        let should_refresh_file_cache =
+            !read_only_query && should_refresh_file_cache_for_statements(&parsed_statements);
         let CollectedExecutionSideEffects {
             pending_file_writes,
             pending_file_delete_targets,
@@ -364,9 +372,9 @@ impl Engine {
                 untracked_filesystem_update_domain_changes: Vec::new(),
             }
         } else {
-            self.collect_execution_side_effects_with_backend(
+            self.collect_execution_side_effects_with_backend_from_statements(
                 self.backend.as_ref(),
-                sql,
+                &parsed_statements,
                 params,
                 &active_version_id,
                 writer_key,
@@ -379,25 +387,32 @@ impl Engine {
             .prepare_runtime_functions_with_backend(self.backend.as_ref())
             .await?;
 
-        let output = match preprocess_sql_with_provider_and_detected_file_domain_changes(
-            self.backend.as_ref(),
-            &self.cel_evaluator,
-            sql,
-            params,
-            functions.clone(),
-            &detected_file_domain_changes_by_statement,
-            writer_key,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(error) if should_sequentialize_postprocess_multi_statement(sql, params, &error) => {
-                return self
-                    .execute_multi_statement_sequential_with_options(sql, params, &options)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
+        let output =
+            match preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+                self.backend.as_ref(),
+                &self.cel_evaluator,
+                parsed_statements.clone(),
+                params,
+                functions.clone(),
+                &detected_file_domain_changes_by_statement,
+                writer_key,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error)
+                    if should_sequentialize_postprocess_multi_statement_with_statements(
+                        &parsed_statements,
+                        params,
+                        &error,
+                    ) =>
+                {
+                    return self
+                        .execute_multi_statement_sequential_with_options(sql, params, &options)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            };
         let next_active_version_id_from_mutations =
             active_version_from_mutations(&output.mutations)?;
         let next_active_version_id_from_updates =
@@ -579,7 +594,7 @@ impl Engine {
             self.refresh_file_data_for_versions(file_cache_refresh_targets)
                 .await?;
         }
-        if should_invalidate_installed_plugins_cache_for_sql(sql) {
+        if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
             self.invalidate_installed_plugins_cache()?;
         }
 
@@ -604,10 +619,8 @@ impl Engine {
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.active_version_id.read().unwrap().clone();
         let starting_active_version_id = active_version_id.clone();
-        let installed_plugins_cache_invalidation_pending = statements
-            .iter()
-            .map(Statement::to_string)
-            .any(|sql| should_invalidate_installed_plugins_cache_for_sql(&sql));
+        let installed_plugins_cache_invalidation_pending =
+            should_invalidate_installed_plugins_cache_for_statements(&statements);
         let result = self
             .execute_statement_script_with_options_in_transaction(
                 transaction.as_mut(),
@@ -654,11 +667,6 @@ impl Engine {
         let can_defer_side_effects =
             params.is_empty() && self.wasm_runtime.is_none() && coalesced_statements.is_some();
         let mut deferred_side_effects = if can_defer_side_effects {
-            let original_sql = original_statements
-                .iter()
-                .map(Statement::to_string)
-                .collect::<Vec<_>>()
-                .join(";\n");
             let CollectedExecutionSideEffects {
                 pending_file_writes,
                 pending_file_delete_targets,
@@ -667,9 +675,9 @@ impl Engine {
                 ..
             } = {
                 let backend = TransactionBackendAdapter::new(transaction);
-                self.collect_execution_side_effects_with_backend(
+                self.collect_execution_side_effects_with_backend_from_statements(
                     &backend,
-                    &original_sql,
+                    &original_statements,
                     params,
                     active_version_id,
                     options.writer_key.as_deref(),
@@ -799,10 +807,12 @@ impl Engine {
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
     ) -> Result<QueryResult, LixError> {
+        let parsed_statements = parse_sql_statements(sql)?;
         let writer_key = options.writer_key.as_deref();
         let defer_side_effects = deferred_side_effects.is_some();
-        let read_only_query = is_query_only_sql(sql);
-        let should_refresh_file_cache = !read_only_query && should_refresh_file_cache_for_sql(sql);
+        let read_only_query = is_query_only_statements(&parsed_statements);
+        let should_refresh_file_cache =
+            !read_only_query && should_refresh_file_cache_for_statements(&parsed_statements);
         let (
             pending_file_writes,
             pending_file_delete_targets,
@@ -814,8 +824,12 @@ impl Engine {
             output,
         ) = {
             let backend = TransactionBackendAdapter::new(transaction);
-            self.maybe_materialize_reads_with_backend(&backend, sql, active_version_id)
-                .await?;
+            self.maybe_materialize_reads_with_backend_from_statements(
+                &backend,
+                &parsed_statements,
+                active_version_id,
+            )
+            .await?;
             let CollectedExecutionSideEffects {
                 pending_file_writes,
                 pending_file_delete_targets,
@@ -831,9 +845,9 @@ impl Engine {
                     untracked_filesystem_update_domain_changes: Vec::new(),
                 }
             } else {
-                self.collect_execution_side_effects_with_backend(
+                self.collect_execution_side_effects_with_backend_from_statements(
                     &backend,
-                    sql,
+                    &parsed_statements,
                     params,
                     active_version_id,
                     writer_key,
@@ -845,34 +859,39 @@ impl Engine {
             let (settings, sequence_start, functions) = self
                 .prepare_runtime_functions_with_backend(&backend)
                 .await?;
-            let output = match preprocess_sql_with_provider_and_detected_file_domain_changes(
-                &backend,
-                &self.cel_evaluator,
-                sql,
-                params,
-                functions.clone(),
-                &detected_file_domain_changes_by_statement,
-                writer_key,
-            )
-            .await
-            {
-                Ok(output) => output,
-                Err(error)
-                    if should_sequentialize_postprocess_multi_statement(sql, params, &error) =>
+            let output =
+                match preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+                    &backend,
+                    &self.cel_evaluator,
+                    parsed_statements.clone(),
+                    params,
+                    functions.clone(),
+                    &detected_file_domain_changes_by_statement,
+                    writer_key,
+                )
+                .await
                 {
-                    return Box::pin(
-                        self.execute_multi_statement_sequential_with_options_in_transaction(
-                            transaction,
-                            sql,
+                    Ok(output) => output,
+                    Err(error)
+                        if should_sequentialize_postprocess_multi_statement_with_statements(
+                            &parsed_statements,
                             params,
-                            options,
-                            active_version_id,
-                        ),
-                    )
-                    .await;
-                }
-                Err(error) => return Err(error),
-            };
+                            &error,
+                        ) =>
+                    {
+                        return Box::pin(
+                            self.execute_multi_statement_sequential_with_options_in_transaction(
+                                transaction,
+                                sql,
+                                params,
+                                options,
+                                active_version_id,
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(error) => return Err(error),
+                };
             if !output.mutations.is_empty() {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }
@@ -1143,17 +1162,17 @@ impl Engine {
         Ok(MaterializationReport { plan, apply })
     }
 
-    async fn maybe_materialize_reads_with_backend(
+    async fn maybe_materialize_reads_with_backend_from_statements(
         &self,
         backend: &dyn LixBackend,
-        sql: &str,
+        statements: &[Statement],
         active_version_id: &str,
     ) -> Result<(), LixError> {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(());
         };
 
-        if let Some(scope) = file_read_materialization_scope_for_sql(sql) {
+        if let Some(scope) = file_read_materialization_scope_for_statements(statements) {
             let versions = match scope {
                 FileReadMaterializationScope::ActiveVersionOnly => {
                     let mut set = BTreeSet::new();
@@ -1169,7 +1188,7 @@ impl Engine {
             )
             .await?;
         }
-        if file_history_read_materialization_required_for_sql(sql) {
+        if file_history_read_materialization_required_for_statements(statements) {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
                 runtime.as_ref(),
@@ -1179,10 +1198,10 @@ impl Engine {
         Ok(())
     }
 
-    async fn collect_execution_side_effects_with_backend(
+    async fn collect_execution_side_effects_with_backend_from_statements(
         &self,
         backend: &dyn LixBackend,
-        sql: &str,
+        statements: &[Statement],
         params: &[Value],
         active_version_id: &str,
         writer_key: Option<&str>,
@@ -1190,9 +1209,9 @@ impl Engine {
         detect_plugin_file_changes: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
-            crate::filesystem::pending_file_writes::collect_pending_file_writes(
+            crate::filesystem::pending_file_writes::collect_pending_file_writes_from_statements(
                 backend,
-                sql,
+                statements,
                 params,
                 active_version_id,
             )
@@ -1205,9 +1224,9 @@ impl Engine {
             writes_by_statement: pending_file_writes_by_statement,
         } = pending_file_write_collection;
         let pending_file_delete_targets =
-            crate::filesystem::pending_file_writes::collect_pending_file_delete_targets(
+            crate::filesystem::pending_file_writes::collect_pending_file_delete_targets_from_statements(
                 backend,
-                sql,
+                statements,
                 params,
                 active_version_id,
             )
@@ -1234,14 +1253,16 @@ impl Engine {
             .collect::<Vec<_>>();
 
         let filesystem_update_domain_changes =
-            collect_filesystem_update_detected_file_domain_changes(backend, sql, params)
-                .await
-                .map_err(|error| LixError {
-                    message: format!(
-                        "filesystem update side-effect detection failed: {}",
-                        error.message
-                    ),
-                })?;
+            collect_filesystem_update_detected_file_domain_changes_from_statements(
+                backend, statements, params,
+            )
+            .await
+            .map_err(|error| LixError {
+                message: format!(
+                    "filesystem update side-effect detection failed: {}",
+                    error.message
+                ),
+            })?;
         let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
             .tracked_changes_by_statement
             .iter()
@@ -2455,18 +2476,26 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
 fn should_sequentialize_postprocess_multi_statement(
     sql: &str,
+    params: &[Value],
+    error: &LixError,
+) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    should_sequentialize_postprocess_multi_statement_with_statements(&statements, params, error)
+}
+
+fn should_sequentialize_postprocess_multi_statement_with_statements(
+    statements: &[Statement],
     params: &[Value],
     error: &LixError,
 ) -> bool {
     if !params.is_empty() || !is_postprocess_multi_statement_error(&error.message) {
         return false;
     }
-
-    let Ok(statements) = parse_sql_statements(sql) else {
-        return false;
-    };
     if statements.len() <= 1 {
         return false;
     }
@@ -2518,15 +2547,22 @@ fn file_name_and_extension_from_path(path: &str) -> Option<(String, Option<Strin
     Some((name, extension))
 }
 
+#[cfg(test)]
 fn extract_explicit_transaction_script(
     sql: &str,
+    params: &[Value],
+) -> Result<Option<Vec<Statement>>, LixError> {
+    let statements = parse_sql_statements(sql)?;
+    extract_explicit_transaction_script_from_statements(&statements, params)
+}
+
+fn extract_explicit_transaction_script_from_statements(
+    statements: &[Statement],
     params: &[Value],
 ) -> Result<Option<Vec<Statement>>, LixError> {
     if !params.is_empty() {
         return Ok(None);
     }
-
-    let statements = parse_sql_statements(sql)?;
     if statements.len() < 2 {
         return Ok(None);
     }
@@ -3059,12 +3095,11 @@ fn detected_file_domain_changes_with_writer_key(
         .collect()
 }
 
-async fn collect_filesystem_update_detected_file_domain_changes(
+async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
     backend: &dyn LixBackend,
-    sql: &str,
+    statements: &[Statement],
     params: &[Value],
 ) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let statements = parse_sql_statements(sql)?;
     let mut placeholder_state = PlaceholderState::new();
     let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
     let mut untracked_changes = Vec::new();
@@ -3126,19 +3161,29 @@ fn advance_placeholder_state_for_statement(
     Ok(())
 }
 
+#[cfg(test)]
 fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql_statements(sql) else {
         return false;
     };
+    should_refresh_file_cache_for_statements(&statements)
+}
+
+fn should_refresh_file_cache_for_statements(statements: &[Statement]) -> bool {
     statements
         .iter()
         .any(statement_targets_file_cache_refresh_table)
 }
 
+#[cfg(test)]
 fn is_query_only_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql_statements(sql) else {
         return false;
     };
+    is_query_only_statements(&statements)
+}
+
+fn is_query_only_statements(statements: &[Statement]) -> bool {
     !statements.is_empty()
         && statements
             .iter()
@@ -3154,6 +3199,10 @@ fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql_statements(sql) else {
         return false;
     };
+    should_invalidate_installed_plugins_cache_for_statements(&statements)
+}
+
+fn should_invalidate_installed_plugins_cache_for_statements(statements: &[Statement]) -> bool {
     statements
         .iter()
         .any(|statement| statement_targets_table_name(statement, "lix_internal_plugin"))
@@ -3203,13 +3252,19 @@ enum FileReadMaterializationScope {
     AllVersions,
 }
 
+#[cfg(test)]
 fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterializationScope> {
     let Ok(statements) = parse_sql_statements(sql) else {
         return None;
     };
+    file_read_materialization_scope_for_statements(&statements)
+}
 
+fn file_read_materialization_scope_for_statements(
+    statements: &[Statement],
+) -> Option<FileReadMaterializationScope> {
     let mut scope = None;
-    for statement in &statements {
+    for statement in statements {
         let Some(statement_scope) = file_read_materialization_scope_for_statement(statement) else {
             continue;
         };
@@ -3225,10 +3280,15 @@ fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterial
     scope
 }
 
+#[cfg(test)]
 fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql_statements(sql) else {
         return false;
     };
+    file_history_read_materialization_required_for_statements(&statements)
+}
+
+fn file_history_read_materialization_required_for_statements(statements: &[Statement]) -> bool {
     statements
         .iter()
         .any(file_history_read_materialization_required_for_statement)

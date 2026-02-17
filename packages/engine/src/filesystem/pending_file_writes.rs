@@ -1,7 +1,9 @@
 use crate::cel::CelEvaluator;
+#[cfg(test)]
+use crate::sql::parse_sql_statements;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, parse_sql_statements, preprocess_sql,
-    resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
+    bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_expr_cell_with_state,
+    resolve_values_rows, PlaceholderState,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -44,6 +46,7 @@ struct ExactFileUpdateTarget {
     explicit_version_id: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) async fn collect_pending_file_writes(
     backend: &dyn LixBackend,
     sql: &str,
@@ -51,6 +54,16 @@ pub(crate) async fn collect_pending_file_writes(
     active_version_id: &str,
 ) -> Result<PendingFileWriteCollection, LixError> {
     let statements = parse_sql_statements(sql)?;
+    collect_pending_file_writes_from_statements(backend, &statements, params, active_version_id)
+        .await
+}
+
+pub(crate) async fn collect_pending_file_writes_from_statements(
+    backend: &dyn LixBackend,
+    statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+) -> Result<PendingFileWriteCollection, LixError> {
     let mut writes = Vec::new();
     let mut writes_by_statement = Vec::with_capacity(statements.len());
     let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
@@ -95,13 +108,12 @@ pub(crate) async fn collect_pending_file_writes(
     })
 }
 
-pub(crate) async fn collect_pending_file_delete_targets(
+pub(crate) async fn collect_pending_file_delete_targets_from_statements(
     backend: &dyn LixBackend,
-    sql: &str,
+    statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
 ) -> Result<BTreeSet<(String, String)>, LixError> {
-    let statements = parse_sql_statements(sql)?;
     let mut targets = BTreeSet::new();
     let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
     let mut writes = Vec::new();
