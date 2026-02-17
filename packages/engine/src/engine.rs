@@ -2395,11 +2395,48 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
+        let mut transaction = self.backend.begin_transaction().await?;
         let statements = parse_sql_statements(sql)?;
         let mut last_result = QueryResult { rows: Vec::new() };
+        let mut active_version_id = self.active_version_id.read().unwrap().clone();
+        let mut active_version_changed = false;
+        let mut installed_plugins_cache_invalidation_pending = false;
         for statement in statements {
-            last_result =
-                Box::pin(self.execute(&statement.to_string(), params, options.clone())).await?;
+            let statement_sql = statement.to_string();
+            let previous_active_version_id = active_version_id.clone();
+            let result = self
+                .execute_with_options_in_transaction(
+                    transaction.as_mut(),
+                    &statement_sql,
+                    params,
+                    options,
+                    &mut active_version_id,
+                    None,
+                    false,
+                )
+                .await;
+            match result {
+                Ok(query_result) => {
+                    last_result = query_result;
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            }
+            if active_version_id != previous_active_version_id {
+                active_version_changed = true;
+            }
+            if should_invalidate_installed_plugins_cache_for_sql(&statement_sql) {
+                installed_plugins_cache_invalidation_pending = true;
+            }
+        }
+        transaction.commit().await?;
+        if active_version_changed {
+            self.set_active_version_id(active_version_id);
+        }
+        if installed_plugins_cache_invalidation_pending {
+            self.invalidate_installed_plugins_cache()?;
         }
         Ok(last_result)
     }
@@ -2435,7 +2472,7 @@ fn should_sequentialize_postprocess_multi_statement(
     params: &[Value],
     error: &LixError,
 ) -> bool {
-    if !params.is_empty() || error.message != "postprocess rewrites require a single statement" {
+    if !params.is_empty() || !is_postprocess_multi_statement_error(&error.message) {
         return false;
     }
 
@@ -2454,6 +2491,14 @@ fn should_sequentialize_postprocess_multi_statement(
                 | Statement::Rollback { .. }
         )
     })
+}
+
+fn is_postprocess_multi_statement_error(message: &str) -> bool {
+    matches!(
+        message,
+        "postprocess rewrites require a single statement"
+            | "only one postprocess rewrite is supported per query"
+    )
 }
 
 fn file_name_and_extension_from_path(path: &str) -> Option<(String, Option<String>)> {
@@ -3958,7 +4003,8 @@ mod tests {
         file_descriptor_cache_eviction_targets, file_history_read_materialization_required_for_sql,
         file_read_materialization_scope_for_sql, is_query_only_sql,
         should_invalidate_installed_plugins_cache_for_sql, should_refresh_file_cache_for_sql,
-        BootArgs, ExecuteOptions, FileReadMaterializationScope,
+        should_sequentialize_postprocess_multi_statement, BootArgs, ExecuteOptions,
+        FileReadMaterializationScope,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
@@ -4168,6 +4214,66 @@ mod tests {
         assert!(!should_invalidate_installed_plugins_cache_for_sql(
             "SELECT * FROM lix_internal_plugin WHERE key = 'k'"
         ));
+    }
+
+    #[test]
+    fn sequentialize_postprocess_multi_statement_detects_both_pipeline_errors() {
+        let sql =
+            "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'";
+        for message in [
+            "postprocess rewrites require a single statement",
+            "only one postprocess rewrite is supported per query",
+        ] {
+            let error = LixError {
+                message: message.to_string(),
+            };
+            assert!(
+                should_sequentialize_postprocess_multi_statement(sql, &[], &error),
+                "expected sequentialization for error message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequentialize_postprocess_multi_statement_rejects_params_and_explicit_transaction_wrappers()
+    {
+        let error = LixError {
+            message: "only one postprocess rewrite is supported per query".to_string(),
+        };
+        assert!(!should_sequentialize_postprocess_multi_statement(
+            "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'",
+            &[Value::Text("f1".to_string())],
+            &error,
+        ));
+        assert!(!should_sequentialize_postprocess_multi_statement(
+            "BEGIN; UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; COMMIT;",
+            &[],
+            &error,
+        ));
+    }
+
+    #[tokio::test]
+    async fn sequential_multi_statement_fallback_executes_inside_single_transaction() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(Box::new(TestBackend {
+            commit_called: Arc::clone(&commit_called),
+            rollback_called: Arc::clone(&rollback_called),
+            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
+            restored_active_version_snapshot: active_version_snapshot_json("global"),
+        })));
+
+        engine
+            .execute_multi_statement_sequential_with_options(
+                "SELECT 1; SELECT 2;",
+                &[],
+                &ExecuteOptions::default(),
+            )
+            .await
+            .expect("sequential multi-statement execution should succeed");
+
+        assert!(commit_called.load(Ordering::SeqCst));
+        assert!(!rollback_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -267,13 +267,8 @@ pub async fn insert_side_effect_statements_with_backend(
         }
 
         if let Some(existing_id) =
-            find_directory_id_by_path(
-                backend,
-                &version_id,
-                &path,
-                &mut read_rewrite_session,
-            )
-            .await?
+            find_directory_id_by_path(backend, &version_id, &path, &mut read_rewrite_session)
+                .await?
         {
             known_ids.insert(key, existing_id);
             continue;
@@ -1016,10 +1011,10 @@ async fn rewrite_directory_insert_columns_with_backend(
                         parent_id,
                         &mut read_rewrite_session,
                     )
-                        .await?
-                        .ok_or_else(|| LixError {
-                            message: format!("Parent directory does not exist for id {parent_id}"),
-                        })?,
+                    .await?
+                    .ok_or_else(|| LixError {
+                        message: format!("Parent directory does not exist for id {parent_id}"),
+                    })?,
                     None => "/".to_string(),
                 };
                 let computed_path = compose_directory_path(parent_path.as_str(), &name)?;
@@ -1142,8 +1137,8 @@ async fn rewrite_file_update_assignments_with_backend(
                 directory_path,
                 &mut read_rewrite_session,
             )
-                .await?
-                .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
+            .await?
+            .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
         )
     } else {
         None
@@ -1187,8 +1182,7 @@ async fn tracked_missing_directory_changes(
             continue;
         }
         if let Some(existing_id) =
-            find_directory_id_by_path(backend, version_id, path, &mut read_rewrite_session)
-                .await?
+            find_directory_id_by_path(backend, version_id, path, &mut read_rewrite_session).await?
         {
             known_ids.insert(path.clone(), existing_id);
             continue;
@@ -1293,10 +1287,10 @@ async fn rewrite_directory_update_assignments_with_backend(
         &current_directory_id,
         &mut read_rewrite_session,
     )
-        .await?
-        .ok_or_else(|| LixError {
-            message: format!("Directory does not exist for id {}", current_directory_id),
-        })?;
+    .await?
+    .ok_or_else(|| LixError {
+        message: format!("Directory does not exist for id {}", current_directory_id),
+    })?;
 
     let (resolved_parent_id, resolved_name, resolved_path) = if let Some(raw_path) = next_path {
         let normalized_path = normalize_directory_path(&raw_path)?;
@@ -1310,10 +1304,10 @@ async fn rewrite_directory_update_assignments_with_backend(
                 &parent_path,
                 &mut read_rewrite_session,
             )
-                .await?
-                .ok_or_else(|| LixError {
-                    message: format!("Parent directory does not exist for path {}", parent_path),
-                })?,
+            .await?
+            .ok_or_else(|| LixError {
+                message: format!("Parent directory does not exist for path {}", parent_path),
+            })?,
             None => String::new(),
         };
         let parent_id_opt = if parent_id.is_empty() {
@@ -1332,12 +1326,7 @@ async fn rewrite_directory_update_assignments_with_backend(
             });
         }
         let parent_path = if let Some(parent_id) = parent_id.as_deref() {
-            read_directory_path_by_id(
-                backend,
-                &version_id,
-                parent_id,
-                &mut read_rewrite_session,
-            )
+            read_directory_path_by_id(backend, &version_id, parent_id, &mut read_rewrite_session)
                 .await?
                 .ok_or_else(|| LixError {
                     message: format!("Parent directory does not exist for id {}", parent_id),
@@ -1364,14 +1353,13 @@ async fn rewrite_directory_update_assignments_with_backend(
         )
         .await?;
     }
-    if let Some(existing_id) =
-        find_directory_id_by_path(
-            backend,
-            &version_id,
-            &resolved_path,
-            &mut read_rewrite_session,
-        )
-        .await?
+    if let Some(existing_id) = find_directory_id_by_path(
+        backend,
+        &version_id,
+        &resolved_path,
+        &mut read_rewrite_session,
+    )
+    .await?
     {
         if existing_id != current_directory_id {
             return Err(directory_unique_error(&resolved_path, &version_id));
@@ -1581,15 +1569,14 @@ async fn find_directory_id_by_path(
 
     let mut current_parent: Option<String> = None;
     for segment in trimmed.split('/') {
-        let Some(next_id) =
-            find_directory_child_id(
-                backend,
-                version_id,
-                current_parent.as_deref(),
-                segment,
-                read_rewrite_session,
-            )
-            .await?
+        let Some(next_id) = find_directory_child_id(
+            backend,
+            version_id,
+            current_parent.as_deref(),
+            segment,
+            read_rewrite_session,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -1877,7 +1864,7 @@ fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> Strin
             format!("json_extract(snapshot_content, '$.\"{field}\"')")
         }
         crate::backend::SqlDialect::Postgres => {
-            format!("lix_json_text(snapshot_content, '{field}')")
+            format!("jsonb_extract_path_text(CAST(snapshot_content AS JSONB), '{field}')")
         }
     }
 }
@@ -2559,13 +2546,8 @@ async fn assert_no_directory_cycle(
         safety += 1;
 
         let Some(snapshot) =
-            read_directory_descriptor_by_id(
-                backend,
-                version_id,
-                &parent_id,
-                read_rewrite_session,
-            )
-            .await?
+            read_directory_descriptor_by_id(backend, version_id, &parent_id, read_rewrite_session)
+                .await?
         else {
             return Err(LixError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
@@ -2686,16 +2668,15 @@ async fn file_ids_matching_update(
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
     let trace = file_prefetch_trace_enabled();
-    if let Some(rows) =
-        try_file_ids_matching_update_fast(
-            backend,
-            update,
-            target,
-            params,
-            placeholder_state,
-            read_rewrite_session,
-        )
-        .await?
+    if let Some(rows) = try_file_ids_matching_update_fast(
+        backend,
+        update,
+        target,
+        params,
+        placeholder_state,
+        read_rewrite_session,
+    )
+    .await?
     {
         if trace {
             eprintln!(
@@ -3347,8 +3328,9 @@ fn noop_statement() -> Result<Statement, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_predicate_string_with_params_and_state, parse_exact_file_descriptor_lookup_rows,
-        parse_expression, rewrite_delete, rewrite_insert, rewrite_update,
+        extract_predicate_string_with_params_and_state, json_text_expr_sql,
+        parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
+        rewrite_update,
     };
     use crate::sql::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
@@ -3356,6 +3338,18 @@ mod tests {
     use crate::SqlDialect;
     use crate::Value;
     use sqlparser::ast::Statement;
+
+    #[test]
+    fn json_text_expr_sql_uses_backend_specific_expression() {
+        assert_eq!(
+            json_text_expr_sql(SqlDialect::Sqlite, "inherits_from_version_id"),
+            "json_extract(snapshot_content, '$.\"inherits_from_version_id\"')"
+        );
+        assert_eq!(
+            json_text_expr_sql(SqlDialect::Postgres, "inherits_from_version_id"),
+            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'inherits_from_version_id')"
+        );
+    }
 
     #[test]
     fn rewrites_file_insert_and_drops_data_column() {
