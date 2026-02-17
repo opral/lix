@@ -327,13 +327,13 @@ fn parse_lines_with_ids(data: &[u8]) -> Vec<ParsedLine> {
 }
 
 fn parse_lines_with_ids_from_split(split: Vec<(Vec<u8>, LineEnding)>) -> Vec<ParsedLine> {
-    let mut occurrence_by_key = HashMap::<Vec<u8>, u32>::new();
+    let mut occurrence_by_key = HashMap::<[u8; 20], u32>::new();
     let mut lines = Vec::with_capacity(split.len());
 
     for (content, ending) in split {
-        let key = line_key_bytes(&content, ending);
-        let occurrence = occurrence_by_key.entry(key.clone()).or_insert(0);
-        let entity_id = format!("line:{}:{}", sha1_hex(&key), occurrence);
+        let fingerprint = line_fingerprint(&content, ending);
+        let occurrence = occurrence_by_key.entry(fingerprint).or_insert(0);
+        let entity_id = format!("line:{}:{}", bytes_to_hex(&fingerprint), occurrence);
         *occurrence += 1;
 
         lines.push(ParsedLine {
@@ -364,19 +364,23 @@ fn parse_after_lines_with_histogram_matching(
         .iter()
         .map(|line| line.entity_id.clone())
         .collect::<HashSet<_>>();
-    let mut occurrence_by_key = HashMap::<Vec<u8>, u32>::new();
+    let mut occurrence_by_key = HashMap::<[u8; 20], u32>::new();
     let mut after_lines = Vec::with_capacity(after_split.len());
 
     for (after_index, (content, ending)) in after_split.into_iter().enumerate() {
-        let key = line_key_bytes(&content, ending);
-        let occurrence = occurrence_by_key.entry(key.clone()).or_insert(0);
+        let fingerprint = line_fingerprint(&content, ending);
+        let occurrence = occurrence_by_key.entry(fingerprint).or_insert(0);
         let canonical_occurrence = *occurrence;
         *occurrence += 1;
 
         let entity_id = if let Some(before_index) = matched_after_to_before.get(&after_index) {
             before_lines[*before_index].entity_id.clone()
         } else {
-            let canonical_entity_id = format!("line:{}:{}", sha1_hex(&key), canonical_occurrence);
+            let canonical_entity_id = format!(
+                "line:{}:{}",
+                bytes_to_hex(&fingerprint),
+                canonical_occurrence
+            );
             allocate_inserted_line_id(&canonical_entity_id, &used_ids)
         };
         used_ids.insert(entity_id.clone());
@@ -468,17 +472,14 @@ fn split_lines(data: &[u8]) -> Vec<(Vec<u8>, LineEnding)> {
     lines
 }
 
-fn line_key_bytes(content: &[u8], ending: LineEnding) -> Vec<u8> {
-    let mut key = Vec::with_capacity(content.len() + 2);
-    key.extend_from_slice(content);
-    key.push(0xff);
-    key.push(ending.marker_byte());
-    key
-}
-
-fn sha1_hex(bytes: &[u8]) -> String {
-    let digest = Sha1::digest(bytes);
-    bytes_to_hex(&digest)
+fn line_fingerprint(content: &[u8], ending: LineEnding) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(content);
+    hasher.update([0xff, ending.marker_byte()]);
+    let digest = hasher.finalize();
+    let mut fingerprint = [0u8; 20];
+    fingerprint.copy_from_slice(&digest);
+    fingerprint
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
