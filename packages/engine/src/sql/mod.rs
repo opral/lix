@@ -28,7 +28,10 @@ pub use pipeline::{
     preprocess_statements, preprocess_statements_with_provider,
     preprocess_statements_with_provider_and_writer_key,
 };
-pub(crate) use read_pipeline::rewrite_read_query_with_backend;
+pub(crate) use read_pipeline::{
+    rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
+    ReadRewriteSession,
+};
 pub(crate) use row_resolution::{
     insert_values_rows_mut, materialize_vtable_insert_select_sources, resolve_expr_cell_with_state,
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
