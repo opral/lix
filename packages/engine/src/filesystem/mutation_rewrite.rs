@@ -1606,90 +1606,54 @@ async fn find_directory_child_id(
     name: &str,
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
-    let mut params = vec![
-        EngineValue::Text(version_id.to_string()),
-        EngineValue::Text(name.to_string()),
-    ];
+    let name_expr = json_text_expr_sql(backend.dialect(), "name");
+    let parent_expr = json_text_expr_sql(backend.dialect(), "parent_id");
+    let version_chain = load_version_chain_ids(backend, version_id, read_rewrite_session).await?;
+    if version_chain.is_empty() {
+        return Ok(None);
+    }
+    let mut params = version_chain
+        .iter()
+        .map(|value| EngineValue::Text(value.clone()))
+        .collect::<Vec<_>>();
+    let version_predicate = placeholder_range(1, version_chain.len());
+    let name_index = params.len() + 1;
+    params.push(EngineValue::Text(name.to_string()));
     let parent_predicate = if let Some(parent_id) = parent_id {
+        let parent_index = params.len() + 1;
         params.push(EngineValue::Text(parent_id.to_string()));
-        "lix_json_text(snapshot_content, 'parent_id') = $3".to_string()
+        format!("{parent_expr} = ${parent_index}")
     } else {
-        "lix_json_text(snapshot_content, 'parent_id') IS NULL".to_string()
+        format!("{parent_expr} IS NULL")
     };
     let lookup_sql = format!(
-        "WITH RECURSIVE \
-           version_descriptor AS ( \
-             SELECT \
-               lix_json_text(snapshot_content, 'id') AS version_id, \
-               lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = '{version_descriptor_schema_key}' \
-               AND file_id = '{version_descriptor_file_id}' \
-               AND version_id = '{version_descriptor_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           version_chain(ancestor_version_id, depth) AS ( \
-             SELECT $1 AS ancestor_version_id, 0 AS depth \
-             UNION ALL \
-             SELECT vd.inherits_from_version_id, vc.depth + 1 \
-             FROM version_chain vc \
-             JOIN version_descriptor vd \
-               ON vd.version_id = vc.ancestor_version_id \
-             WHERE vd.inherits_from_version_id IS NOT NULL \
-               AND vc.depth < 64 \
-           ), \
-           candidate_entities AS ( \
-             SELECT DISTINCT entity_id \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = '{schema_key}' \
-               AND snapshot_content IS NOT NULL \
-               AND lix_json_text(snapshot_content, 'name') = $2 \
-               AND {parent_predicate} \
-           ), \
-           ranked AS ( \
-             SELECT \
-               d.entity_id AS entity_id, \
-               d.snapshot_content AS snapshot_content, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY d.entity_id \
-                 ORDER BY vc.depth ASC \
-               ) AS rn \
-             FROM lix_internal_state_vtable d \
-             JOIN version_chain vc \
-               ON vc.ancestor_version_id = d.version_id \
-             JOIN candidate_entities c \
-               ON c.entity_id = d.entity_id \
-             WHERE d.schema_key = '{schema_key}' \
-           ) \
-         SELECT entity_id \
-         FROM ranked \
-         WHERE rn = 1 \
-           AND snapshot_content IS NOT NULL \
-           AND lix_json_text(snapshot_content, 'name') = $2 \
-           AND {parent_predicate} \
-         LIMIT 1",
-        version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        version_descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        version_descriptor_storage_version_id =
-            escape_sql_string(version_descriptor_storage_version_id()),
+        "SELECT entity_id, version_id, untracked \
+         FROM ( \
+           SELECT entity_id, version_id, 1 AS untracked \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {parent_predicate} \
+           UNION ALL \
+           SELECT entity_id, version_id, 0 AS untracked \
+           FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND is_tombstone = 0 \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {parent_predicate} \
+         ) candidates",
         schema_key = DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        version_predicate = version_predicate,
+        name_index = name_index,
+        name_expr = name_expr,
         parent_predicate = parent_predicate,
     );
-    let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &lookup_sql, read_rewrite_session).await?;
-    let result = backend.execute(&rewritten_sql, &params).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(value) = row.first() else {
-        return Ok(None);
-    };
-    let EngineValue::Text(id) = value else {
-        return Err(LixError {
-            message: format!("directory lookup expected text id, got {value:?}"),
-        });
-    };
-    Ok(Some(id.clone()))
+    let result = backend.execute(&lookup_sql, &params).await?;
+    select_effective_entity_id(&result.rows, &version_chain)
 }
 
 async fn find_file_id_by_path(
@@ -1730,100 +1694,192 @@ async fn find_file_id_by_components(
     extension: Option<&str>,
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
-    let mut params = vec![
-        EngineValue::Text(version_id.to_string()),
-        EngineValue::Text(name.to_string()),
-    ];
+    let name_expr = json_text_expr_sql(backend.dialect(), "name");
+    let directory_expr = json_text_expr_sql(backend.dialect(), "directory_id");
+    let extension_expr = json_text_expr_sql(backend.dialect(), "extension");
+    let version_chain = load_version_chain_ids(backend, version_id, read_rewrite_session).await?;
+    if version_chain.is_empty() {
+        return Ok(None);
+    }
+    let mut params = version_chain
+        .iter()
+        .map(|value| EngineValue::Text(value.clone()))
+        .collect::<Vec<_>>();
+    let version_predicate = placeholder_range(1, version_chain.len());
+    let name_index = params.len() + 1;
+    params.push(EngineValue::Text(name.to_string()));
     let directory_predicate = if let Some(directory_id) = directory_id {
+        let directory_index = params.len() + 1;
         params.push(EngineValue::Text(directory_id.to_string()));
-        "lix_json_text(snapshot_content, 'directory_id') = $3".to_string()
+        format!("{directory_expr} = ${directory_index}")
     } else {
-        "lix_json_text(snapshot_content, 'directory_id') IS NULL".to_string()
+        format!("{directory_expr} IS NULL")
     };
     let extension_predicate = if let Some(extension) = extension {
         let index = params.len() + 1;
         params.push(EngineValue::Text(extension.to_string()));
-        format!("lix_json_text(snapshot_content, 'extension') = ${index}")
+        format!("{extension_expr} = ${index}")
     } else {
-        "lix_json_text(snapshot_content, 'extension') IS NULL".to_string()
+        format!("{extension_expr} IS NULL")
     };
     let lookup_sql = format!(
-        "WITH RECURSIVE \
-           version_descriptor AS ( \
-             SELECT \
-               lix_json_text(snapshot_content, 'id') AS version_id, \
-               lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = '{version_descriptor_schema_key}' \
-               AND file_id = '{version_descriptor_file_id}' \
-               AND version_id = '{version_descriptor_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           version_chain(ancestor_version_id, depth) AS ( \
-             SELECT $1 AS ancestor_version_id, 0 AS depth \
-             UNION ALL \
-             SELECT vd.inherits_from_version_id, vc.depth + 1 \
-             FROM version_chain vc \
-             JOIN version_descriptor vd \
-               ON vd.version_id = vc.ancestor_version_id \
-             WHERE vd.inherits_from_version_id IS NOT NULL \
-               AND vc.depth < 64 \
-           ), \
-           candidate_entities AS ( \
-             SELECT DISTINCT entity_id \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = '{schema_key}' \
-               AND snapshot_content IS NOT NULL \
-               AND lix_json_text(snapshot_content, 'name') = $2 \
-               AND {directory_predicate} \
-               AND {extension_predicate} \
-           ), \
-           ranked AS ( \
-             SELECT \
-               d.entity_id AS entity_id, \
-               d.snapshot_content AS snapshot_content, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY d.entity_id \
-                 ORDER BY vc.depth ASC \
-               ) AS rn \
-             FROM lix_internal_state_vtable d \
-             JOIN version_chain vc \
-               ON vc.ancestor_version_id = d.version_id \
-             JOIN candidate_entities c \
-               ON c.entity_id = d.entity_id \
-             WHERE d.schema_key = '{schema_key}' \
-           ) \
-         SELECT entity_id \
-         FROM ranked \
-         WHERE rn = 1 \
-           AND snapshot_content IS NOT NULL \
-           AND lix_json_text(snapshot_content, 'name') = $2 \
-           AND {directory_predicate} \
-           AND {extension_predicate} \
-         LIMIT 1",
-        version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        version_descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        version_descriptor_storage_version_id =
-            escape_sql_string(version_descriptor_storage_version_id()),
+        "SELECT entity_id, version_id, untracked \
+         FROM ( \
+           SELECT entity_id, version_id, 1 AS untracked \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {directory_predicate} \
+             AND {extension_predicate} \
+           UNION ALL \
+           SELECT entity_id, version_id, 0 AS untracked \
+           FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND is_tombstone = 0 \
+             AND snapshot_content IS NOT NULL \
+             AND {name_expr} = ${name_index} \
+             AND {directory_predicate} \
+             AND {extension_predicate} \
+         ) candidates",
         schema_key = FILE_DESCRIPTOR_SCHEMA_KEY,
+        version_predicate = version_predicate,
+        name_index = name_index,
+        name_expr = name_expr,
         directory_predicate = directory_predicate,
         extension_predicate = extension_predicate,
     );
-    let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &lookup_sql, read_rewrite_session).await?;
-    let result = backend.execute(&rewritten_sql, &params).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(value) = row.first() else {
-        return Ok(None);
-    };
-    let EngineValue::Text(id) = value else {
-        return Err(LixError {
-            message: format!("file lookup expected text id, got {value:?}"),
-        });
-    };
-    Ok(Some(id.clone()))
+    let result = backend.execute(&lookup_sql, &params).await?;
+    select_effective_entity_id(&result.rows, &version_chain)
+}
+
+fn placeholder_range(start: usize, len: usize) -> String {
+    (start..start + len)
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn load_version_chain_ids(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
+) -> Result<Vec<String>, LixError> {
+    if let Some(cached) = read_rewrite_session.cached_version_chain(version_id) {
+        return Ok(cached.to_vec());
+    }
+
+    let inherits_expr = json_text_expr_sql(backend.dialect(), "inherits_from_version_id");
+    let sql = format!(
+        "WITH RECURSIVE version_chain(version_id, depth) AS ( \
+           SELECT $1 AS version_id, 0 AS depth \
+           UNION ALL \
+           SELECT \
+             COALESCE( \
+               (SELECT {inherits_expr} \
+                FROM lix_internal_state_untracked \
+                WHERE schema_key = '{schema_key}' \
+                  AND file_id = '{file_id}' \
+                  AND version_id = '{storage_version_id}' \
+                  AND entity_id = vc.version_id \
+                  AND snapshot_content IS NOT NULL \
+                LIMIT 1), \
+               (SELECT {inherits_expr} \
+                FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+                WHERE schema_key = '{schema_key}' \
+                  AND version_id = '{storage_version_id}' \
+                  AND entity_id = vc.version_id \
+                  AND is_tombstone = 0 \
+                  AND snapshot_content IS NOT NULL \
+                LIMIT 1) \
+             ) AS version_id, \
+             vc.depth + 1 AS depth \
+           FROM version_chain vc \
+           WHERE vc.version_id IS NOT NULL \
+             AND vc.depth < 64 \
+         ) \
+         SELECT version_id \
+         FROM version_chain \
+         WHERE version_id IS NOT NULL",
+        inherits_expr = inherits_expr,
+        schema_key = escape_sql_string(version_descriptor_schema_key()),
+        file_id = escape_sql_string(version_descriptor_file_id()),
+        storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
+    );
+    let result = backend
+        .execute(&sql, &[EngineValue::Text(version_id.to_string())])
+        .await?;
+
+    let mut chain = Vec::new();
+    for row in &result.rows {
+        let Some(value) = row.first() else {
+            continue;
+        };
+        let EngineValue::Text(version_id) = value else {
+            continue;
+        };
+        if chain.iter().any(|existing| existing == version_id) {
+            continue;
+        }
+        chain.push(version_id.clone());
+    }
+    if chain.is_empty() {
+        chain.push(version_id.to_string());
+    }
+
+    read_rewrite_session.cache_version_chain(version_id.to_string(), chain.clone());
+    Ok(chain)
+}
+
+fn select_effective_entity_id(
+    rows: &[Vec<EngineValue>],
+    version_chain: &[String],
+) -> Result<Option<String>, LixError> {
+    let depth_by_version = version_chain
+        .iter()
+        .enumerate()
+        .map(|(depth, version_id)| (version_id.clone(), depth))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut best: Option<(usize, usize, String)> = None;
+    for row in rows {
+        let Some(EngineValue::Text(entity_id)) = row.first() else {
+            continue;
+        };
+        let Some(EngineValue::Text(version_id)) = row.get(1) else {
+            continue;
+        };
+        let untracked = row
+            .get(2)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        let depth = *depth_by_version.get(version_id).unwrap_or(&usize::MAX);
+        let priority = if untracked { 0 } else { 1 };
+        let candidate = (depth, priority, entity_id.clone());
+        if best
+            .as_ref()
+            .map(|current| candidate < *current)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best.map(|(_, _, entity_id)| entity_id))
+}
+
+fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> String {
+    match dialect {
+        crate::backend::SqlDialect::Sqlite => {
+            format!("json_extract(snapshot_content, '$.\"{field}\"')")
+        }
+        crate::backend::SqlDialect::Postgres => {
+            format!("lix_json_text(snapshot_content, '{field}')")
+        }
+    }
 }
 
 async fn rewrite_single_read_query_for_backend(
