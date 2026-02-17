@@ -14,6 +14,9 @@ use crate::filesystem::path::{
     file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
     normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
 };
+use crate::filesystem::planner::write::{
+    extract_exact_file_update_selection, UnsupportedPredicateBehavior,
+};
 use crate::sql::escape_sql_string;
 use crate::sql::{
     bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
@@ -2450,13 +2453,6 @@ struct ScopedFileUpdateRow {
     untracked: bool,
 }
 
-#[derive(Debug, Default, Clone)]
-struct ExactFileUpdateSelection {
-    file_id: Option<String>,
-    explicit_version_id: Option<String>,
-    invalid: bool,
-}
-
 async fn file_ids_matching_update(
     backend: &dyn LixBackend,
     update: &Update,
@@ -2544,18 +2540,17 @@ async fn try_file_ids_matching_update_fast(
     placeholder_state: PlaceholderState,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
     let mut selection_state = placeholder_state;
-    let Some(selection) = extract_exact_file_update_selection_with_state(
+    let Some(selection) = extract_exact_file_update_selection(
         update.selection.as_ref(),
         params,
         &mut selection_state,
-        backend.dialect(),
+        UnsupportedPredicateBehavior::ConsumePlaceholders {
+            dialect: backend.dialect(),
+        },
     )?
     else {
         return Ok(None);
     };
-    if selection.invalid {
-        return Ok(None);
-    }
     let Some(file_id) = selection.file_id else {
         return Ok(None);
     };
@@ -2698,126 +2693,6 @@ fn parse_exact_file_descriptor_lookup_rows(
         id: id.clone(),
         untracked,
     }]))
-}
-
-fn extract_exact_file_update_selection_with_state(
-    selection: Option<&Expr>,
-    params: &[EngineValue],
-    placeholder_state: &mut PlaceholderState,
-    dialect: crate::SqlDialect,
-) -> Result<Option<ExactFileUpdateSelection>, LixError> {
-    let Some(selection) = selection else {
-        return Ok(None);
-    };
-    let mut out = ExactFileUpdateSelection::default();
-    if !collect_exact_file_update_predicates(
-        selection,
-        params,
-        placeholder_state,
-        dialect,
-        &mut out,
-    )? {
-        return Ok(None);
-    }
-    if out.invalid || out.file_id.is_none() {
-        return Ok(None);
-    }
-    Ok(Some(out))
-}
-
-fn collect_exact_file_update_predicates(
-    selection: &Expr,
-    params: &[EngineValue],
-    placeholder_state: &mut PlaceholderState,
-    dialect: crate::SqlDialect,
-    out: &mut ExactFileUpdateSelection,
-) -> Result<bool, LixError> {
-    match selection {
-        Expr::Nested(inner) => {
-            collect_exact_file_update_predicates(inner, params, placeholder_state, dialect, out)
-        }
-        Expr::BinaryOp { left, op, right } => {
-            if op.to_string().eq_ignore_ascii_case("AND") {
-                let left_ok = collect_exact_file_update_predicates(
-                    left,
-                    params,
-                    placeholder_state,
-                    dialect,
-                    out,
-                )?;
-                let right_ok = collect_exact_file_update_predicates(
-                    right,
-                    params,
-                    placeholder_state,
-                    dialect,
-                    out,
-                )?;
-                return Ok(left_ok && right_ok);
-            }
-            if op.to_string().eq_ignore_ascii_case("=") {
-                if let Some(column) = expr_column_name(left) {
-                    if let Some(value) =
-                        expr_string_literal_or_placeholder(right, params, placeholder_state)?
-                    {
-                        if apply_exact_file_update_predicate(&column, &value, out) {
-                            return Ok(true);
-                        }
-                    } else {
-                        return Ok(false);
-                    }
-                }
-                if let Some(column) = expr_column_name(right) {
-                    if let Some(value) =
-                        expr_string_literal_or_placeholder(left, params, placeholder_state)?
-                    {
-                        if apply_exact_file_update_predicate(&column, &value, out) {
-                            return Ok(true);
-                        }
-                    } else {
-                        return Ok(false);
-                    }
-                }
-            }
-            consume_placeholders_in_expr(selection, params, placeholder_state, dialect)?;
-            Ok(false)
-        }
-        _ => {
-            consume_placeholders_in_expr(selection, params, placeholder_state, dialect)?;
-            Ok(false)
-        }
-    }
-}
-
-fn apply_exact_file_update_predicate(
-    column: &str,
-    value: &str,
-    out: &mut ExactFileUpdateSelection,
-) -> bool {
-    if column.eq_ignore_ascii_case("id")
-        || column.eq_ignore_ascii_case("lixcol_entity_id")
-        || column.eq_ignore_ascii_case("lixcol_file_id")
-    {
-        if let Some(existing) = out.file_id.as_ref() {
-            if existing != value {
-                out.invalid = true;
-            }
-        } else {
-            out.file_id = Some(value.to_string());
-        }
-        return true;
-    }
-    if column.eq_ignore_ascii_case("lixcol_version_id") || column.eq_ignore_ascii_case("version_id")
-    {
-        if let Some(existing) = out.explicit_version_id.as_ref() {
-            if existing != value {
-                out.invalid = true;
-            }
-        } else {
-            out.explicit_version_id = Some(value.to_string());
-        }
-        return true;
-    }
-    false
 }
 
 fn file_prefetch_trace_enabled() -> bool {

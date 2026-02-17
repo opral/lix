@@ -1,4 +1,9 @@
 use crate::cel::CelEvaluator;
+use crate::filesystem::planner::write::{
+    extract_exact_file_update_selection, infer_file_write_scope_from_delete,
+    infer_file_write_scope_from_table_object, infer_file_write_scope_from_update, FileWriteScope,
+    UnsupportedPredicateBehavior,
+};
 use crate::sql::{
     bind_sql_with_state, escape_sql_string, parse_sql_statements, preprocess_sql,
     resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
@@ -9,8 +14,8 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
-    Assignment, Expr, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
-    TableObject, Update,
+    Assignment, Expr, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor, TableObject,
+    Update,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -30,18 +35,6 @@ pub(crate) struct PendingFileWrite {
 pub(crate) struct PendingFileWriteCollection {
     pub(crate) writes: Vec<PendingFileWrite>,
     pub(crate) writes_by_statement: Vec<Vec<PendingFileWrite>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileWriteTarget {
-    ActiveVersion,
-    ExplicitVersion,
-}
-
-#[derive(Debug, Clone)]
-struct ExactFileUpdateTarget {
-    file_id: String,
-    explicit_version_id: Option<String>,
 }
 
 pub(crate) async fn collect_pending_file_writes(
@@ -163,7 +156,7 @@ fn collect_insert_writes(
     active_version_id: &str,
     writes: &mut Vec<PendingFileWrite>,
 ) -> Result<(), LixError> {
-    let Some(target) = file_write_target_from_insert(&insert.table) else {
+    let Some(target) = infer_file_write_scope_from_table_object(&insert.table) else {
         return Ok(());
     };
 
@@ -214,8 +207,8 @@ fn collect_insert_writes(
         };
 
         let version_id = match target {
-            FileWriteTarget::ActiveVersion => active_version_id.to_string(),
-            FileWriteTarget::ExplicitVersion => {
+            FileWriteScope::ActiveVersion => active_version_id.to_string(),
+            FileWriteScope::ExplicitVersion => {
                 let Some(version_index) = version_index else {
                     continue;
                 };
@@ -248,7 +241,7 @@ async fn collect_update_writes(
     overlay: &BTreeMap<(String, String), OverlayWriteState>,
     writes: &mut Vec<PendingFileWrite>,
 ) -> Result<(), LixError> {
-    let Some(target) = file_write_target_from_update(update) else {
+    let Some(target) = infer_file_write_scope_from_update(update) else {
         return Ok(());
     };
 
@@ -314,65 +307,69 @@ async fn collect_update_writes(
 
     if assigned_after_data_by_id.is_none() && next_path_by_id.is_none() && next_file_id.is_none() {
         let mut fast_path_state = placeholder_state;
-        if let Some(exact_target) = extract_exact_file_update_target(
+        if let Some(exact_target) = extract_exact_file_update_selection(
             update.selection.as_ref(),
             params,
             &mut fast_path_state,
+            UnsupportedPredicateBehavior::Ignore,
         )? {
-            let version_id = match target {
-                FileWriteTarget::ActiveVersion => active_version_id.to_string(),
-                FileWriteTarget::ExplicitVersion => {
-                    exact_target.explicit_version_id.clone().unwrap_or_default()
-                }
-            };
-            if !version_id.is_empty() {
-                let key = (exact_target.file_id.clone(), version_id.clone());
-                if let Some(overlay_state) = overlay.get(&key) {
-                    let before_path = overlay_state.path.clone();
-                    let before_data = Some(overlay_state.data.clone());
-                    let path = next_path.clone().unwrap_or_else(|| before_path.clone());
-                    let mut write = PendingFileWrite {
-                        file_id: exact_target.file_id,
-                        version_id,
-                        before_path: Some(before_path),
-                        path,
-                        data_is_authoritative: saw_data_assignment,
-                        before_data,
-                        after_data: assigned_after_data.clone().unwrap_or_default(),
-                    };
-                    if !write.data_is_authoritative {
-                        write.after_data = write.before_data.clone().unwrap_or_default();
+            if let Some(file_id) = exact_target.file_id {
+                let version_id = match target {
+                    FileWriteScope::ActiveVersion => active_version_id.to_string(),
+                    FileWriteScope::ExplicitVersion => {
+                        exact_target.explicit_version_id.clone().unwrap_or_default()
                     }
-                    writes.push(write);
-                    return Ok(());
-                }
-
-                let cache_keys = [key.clone()];
-                let before_paths = load_before_path_from_cache_batch(backend, &cache_keys).await?;
-                if let Some(before_path) = before_paths.get(&key) {
-                    let before_data = load_before_data_from_cache_batch(backend, &cache_keys)
-                        .await?
-                        .get(&key)
-                        .cloned();
-                    let path = next_path.clone().unwrap_or_else(|| before_path.clone());
-                    let mut write = PendingFileWrite {
-                        file_id: exact_target.file_id,
-                        version_id,
-                        before_path: Some(before_path.clone()),
-                        path,
-                        data_is_authoritative: saw_data_assignment,
-                        before_data,
-                        after_data: assigned_after_data.clone().unwrap_or_default(),
-                    };
-                    if !write.data_is_authoritative && write.before_data.is_some() {
-                        write.after_data = write.before_data.clone().unwrap_or_default();
-                    }
-                    // If this was a non-data update and data cache is missing, we cannot trust
-                    // an empty blob fallback. Continue with the full prefetch path so before_data
-                    // is resolved from state and after_data is preserved.
-                    if write.data_is_authoritative || write.before_data.is_some() {
+                };
+                if !version_id.is_empty() {
+                    let key = (file_id.clone(), version_id.clone());
+                    if let Some(overlay_state) = overlay.get(&key) {
+                        let before_path = overlay_state.path.clone();
+                        let before_data = Some(overlay_state.data.clone());
+                        let path = next_path.clone().unwrap_or_else(|| before_path.clone());
+                        let mut write = PendingFileWrite {
+                            file_id: file_id.clone(),
+                            version_id,
+                            before_path: Some(before_path),
+                            path,
+                            data_is_authoritative: saw_data_assignment,
+                            before_data,
+                            after_data: assigned_after_data.clone().unwrap_or_default(),
+                        };
+                        if !write.data_is_authoritative {
+                            write.after_data = write.before_data.clone().unwrap_or_default();
+                        }
                         writes.push(write);
                         return Ok(());
+                    }
+
+                    let cache_keys = [key.clone()];
+                    let before_paths =
+                        load_before_path_from_cache_batch(backend, &cache_keys).await?;
+                    if let Some(before_path) = before_paths.get(&key) {
+                        let before_data = load_before_data_from_cache_batch(backend, &cache_keys)
+                            .await?
+                            .get(&key)
+                            .cloned();
+                        let path = next_path.clone().unwrap_or_else(|| before_path.clone());
+                        let mut write = PendingFileWrite {
+                            file_id,
+                            version_id,
+                            before_path: Some(before_path.clone()),
+                            path,
+                            data_is_authoritative: saw_data_assignment,
+                            before_data,
+                            after_data: assigned_after_data.clone().unwrap_or_default(),
+                        };
+                        if !write.data_is_authoritative && write.before_data.is_some() {
+                            write.after_data = write.before_data.clone().unwrap_or_default();
+                        }
+                        // If this was a non-data update and data cache is missing, we cannot trust
+                        // an empty blob fallback. Continue with the full prefetch path so before_data
+                        // is resolved from state and after_data is preserved.
+                        if write.data_is_authoritative || write.before_data.is_some() {
+                            writes.push(write);
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -380,20 +377,20 @@ async fn collect_update_writes(
     }
 
     let mut query_sql = match target {
-        FileWriteTarget::ActiveVersion => format!(
+        FileWriteScope::ActiveVersion => format!(
             "SELECT id, path, data, lixcol_version_id, \
                     'pending.collect_update_writes' AS __lix_trace \
              FROM lix_file_by_version \
              WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
         ),
-        FileWriteTarget::ExplicitVersion => "SELECT id, path, data, lixcol_version_id, \
+        FileWriteScope::ExplicitVersion => "SELECT id, path, data, lixcol_version_id, \
                     'pending.collect_update_writes' AS __lix_trace \
              FROM lix_file_by_version"
             .to_string(),
     };
     if let Some(selection) = update.selection.as_ref() {
-        query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
+        query_sql.push_str(if matches!(target, FileWriteScope::ActiveVersion) {
             " AND "
         } else {
             " WHERE "
@@ -441,11 +438,11 @@ async fn collect_update_writes(
             next_path.clone().unwrap_or(before_path)
         };
         let version_id = match target {
-            FileWriteTarget::ActiveVersion => row
+            FileWriteScope::ActiveVersion => row
                 .get(3)
                 .and_then(value_as_text)
                 .unwrap_or_else(|| active_version_id.to_string()),
-            FileWriteTarget::ExplicitVersion => row
+            FileWriteScope::ExplicitVersion => row
                 .get(3)
                 .and_then(value_as_text)
                 .unwrap_or_else(|| active_version_id.to_string()),
@@ -530,7 +527,7 @@ async fn collect_delete_targets(
     overlay: &BTreeMap<(String, String), OverlayWriteState>,
     targets: &mut BTreeSet<(String, String)>,
 ) -> Result<BTreeSet<(String, String)>, LixError> {
-    let Some(target) = file_write_target_from_delete(delete) else {
+    let Some(target) = infer_file_write_scope_from_delete(delete) else {
         return Ok(BTreeSet::new());
     };
     let mut statement_targets = BTreeSet::new();
@@ -578,7 +575,7 @@ async fn collect_delete_targets(
         .as_ref()
         .is_none_or(delete_selection_supports_id_projection);
     let mut query_sql = match (target, selection_uses_id_projection_only) {
-        (FileWriteTarget::ActiveVersion, true) => format!(
+        (FileWriteScope::ActiveVersion, true) => format!(
             "SELECT id, lixcol_version_id, \
                     'pending.collect_delete_targets.id_projection' AS __lix_trace \
              FROM (\
@@ -592,7 +589,7 @@ async fn collect_delete_targets(
              WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
         ),
-        (FileWriteTarget::ExplicitVersion, true) => "SELECT id, lixcol_version_id, \
+        (FileWriteScope::ExplicitVersion, true) => "SELECT id, lixcol_version_id, \
                     'pending.collect_delete_targets.id_projection' AS __lix_trace \
              FROM (\
                  SELECT \
@@ -603,20 +600,20 @@ async fn collect_delete_targets(
                    AND snapshot_content IS NOT NULL\
              ) AS file_descriptor_ids"
             .to_string(),
-        (FileWriteTarget::ActiveVersion, false) => format!(
+        (FileWriteScope::ActiveVersion, false) => format!(
             "SELECT id, lixcol_version_id, \
                     'pending.collect_delete_targets' AS __lix_trace \
              FROM lix_file_by_version \
              WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
         ),
-        (FileWriteTarget::ExplicitVersion, false) => "SELECT id, lixcol_version_id, \
+        (FileWriteScope::ExplicitVersion, false) => "SELECT id, lixcol_version_id, \
                     'pending.collect_delete_targets' AS __lix_trace \
              FROM lix_file_by_version"
             .to_string(),
     };
     if let Some(selection) = delete.selection.as_ref() {
-        query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
+        query_sql.push_str(if matches!(target, FileWriteScope::ActiveVersion) {
             " AND "
         } else {
             " WHERE "
@@ -650,11 +647,11 @@ async fn collect_delete_targets(
             continue;
         };
         let version_id = match target {
-            FileWriteTarget::ActiveVersion => row
+            FileWriteScope::ActiveVersion => row
                 .get(1)
                 .and_then(value_as_text)
                 .unwrap_or_else(|| active_version_id.to_string()),
-            FileWriteTarget::ExplicitVersion => row
+            FileWriteScope::ExplicitVersion => row
                 .get(1)
                 .and_then(value_as_text)
                 .unwrap_or_else(|| active_version_id.to_string()),
@@ -961,39 +958,11 @@ fn active_version_id_from_internal_state_insert(
     Ok(next_active_version_id)
 }
 
-fn extract_exact_file_update_target(
-    selection: Option<&Expr>,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Result<Option<ExactFileUpdateTarget>, LixError> {
-    let Some(selection) = selection else {
-        return Ok(None);
-    };
-    let mut file_id: Option<String> = None;
-    let mut version_id: Option<String> = None;
-    if !collect_exact_file_update_predicates(
-        selection,
-        params,
-        placeholder_state,
-        &mut file_id,
-        &mut version_id,
-    )? {
-        return Ok(None);
-    }
-    let Some(file_id) = file_id else {
-        return Ok(None);
-    };
-    Ok(Some(ExactFileUpdateTarget {
-        file_id,
-        explicit_version_id: version_id,
-    }))
-}
-
 fn extract_exact_file_delete_targets(
     selection: Option<&Expr>,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
-    target: FileWriteTarget,
+    target: FileWriteScope,
     active_version_id: &str,
 ) -> Result<Option<BTreeSet<(String, String)>>, LixError> {
     let Some(selection) = selection else {
@@ -1015,7 +984,7 @@ fn extract_exact_file_delete_targets(
     };
 
     let effective_versions = match target {
-        FileWriteTarget::ActiveVersion => {
+        FileWriteScope::ActiveVersion => {
             if let Some(ref constrained_versions) = version_ids {
                 if !constrained_versions.contains(active_version_id) {
                     return Ok(Some(BTreeSet::new()));
@@ -1025,7 +994,7 @@ fn extract_exact_file_delete_targets(
             versions.insert(active_version_id.to_string());
             versions
         }
-        FileWriteTarget::ExplicitVersion => {
+        FileWriteScope::ExplicitVersion => {
             let Some(versions) = version_ids else {
                 return Ok(None);
             };
@@ -1170,99 +1139,6 @@ fn merge_exact_delete_constraint_values(
     *slot = Some(values);
 }
 
-fn collect_exact_file_update_predicates(
-    expr: &Expr,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-    file_id: &mut Option<String>,
-    version_id: &mut Option<String>,
-) -> Result<bool, LixError> {
-    match expr {
-        Expr::Nested(inner) => collect_exact_file_update_predicates(
-            inner,
-            params,
-            placeholder_state,
-            file_id,
-            version_id,
-        ),
-        Expr::BinaryOp { left, op, right } => {
-            if op.to_string().eq_ignore_ascii_case("AND") {
-                let left_ok = collect_exact_file_update_predicates(
-                    left,
-                    params,
-                    placeholder_state,
-                    file_id,
-                    version_id,
-                )?;
-                let right_ok = collect_exact_file_update_predicates(
-                    right,
-                    params,
-                    placeholder_state,
-                    file_id,
-                    version_id,
-                )?;
-                return Ok(left_ok && right_ok);
-            }
-            if op.to_string().eq_ignore_ascii_case("=") {
-                if let Some(column) = expr_column_name(left) {
-                    if let Some(value) =
-                        expr_text_literal_or_placeholder(right, params, placeholder_state)?
-                    {
-                        if apply_exact_file_update_predicate(&column, &value, file_id, version_id) {
-                            return Ok(true);
-                        }
-                    } else {
-                        return Ok(false);
-                    }
-                }
-                if let Some(column) = expr_column_name(right) {
-                    if let Some(value) =
-                        expr_text_literal_or_placeholder(left, params, placeholder_state)?
-                    {
-                        if apply_exact_file_update_predicate(&column, &value, file_id, version_id) {
-                            return Ok(true);
-                        }
-                    } else {
-                        return Ok(false);
-                    }
-                }
-            }
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
-fn apply_exact_file_update_predicate(
-    column: &str,
-    value: &str,
-    file_id: &mut Option<String>,
-    version_id: &mut Option<String>,
-) -> bool {
-    if column.eq_ignore_ascii_case("id")
-        || column.eq_ignore_ascii_case("lixcol_entity_id")
-        || column.eq_ignore_ascii_case("lixcol_file_id")
-    {
-        if file_id.as_ref().is_some_and(|existing| existing != value) {
-            return false;
-        }
-        *file_id = Some(value.to_string());
-        return true;
-    }
-    if column.eq_ignore_ascii_case("lixcol_version_id") || column.eq_ignore_ascii_case("version_id")
-    {
-        if version_id
-            .as_ref()
-            .is_some_and(|existing| existing != value)
-        {
-            return false;
-        }
-        *version_id = Some(value.to_string());
-        return true;
-    }
-    false
-}
-
 fn active_version_id_from_snapshot_value(value: &Value) -> Option<String> {
     match value {
         Value::Text(text) => parse_active_version_snapshot(text).ok(),
@@ -1392,57 +1268,6 @@ async fn load_before_path_from_cache_batch(
     }
 
     Ok(out)
-}
-
-fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget> {
-    let TableObject::TableName(name) = table else {
-        return None;
-    };
-
-    let table_name = object_name_terminal(name)?;
-    file_write_target_from_name(&table_name)
-}
-
-fn file_write_target_from_update(update: &Update) -> Option<FileWriteTarget> {
-    if !update.table.joins.is_empty() {
-        return None;
-    }
-    let TableFactor::Table { name, .. } = &update.table.relation else {
-        return None;
-    };
-
-    let table_name = object_name_terminal(name)?;
-    file_write_target_from_name(&table_name)
-}
-
-fn file_write_target_from_delete(delete: &sqlparser::ast::Delete) -> Option<FileWriteTarget> {
-    let tables = match &delete.from {
-        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-    };
-    if tables.len() != 1 {
-        return None;
-    }
-
-    let table = &tables[0];
-    if !table.joins.is_empty() {
-        return None;
-    }
-    let TableFactor::Table { name, .. } = &table.relation else {
-        return None;
-    };
-
-    let table_name = object_name_terminal(name)?;
-    file_write_target_from_name(&table_name)
-}
-
-fn file_write_target_from_name(table_name: &str) -> Option<FileWriteTarget> {
-    if table_name.eq_ignore_ascii_case("lix_file") {
-        Some(FileWriteTarget::ActiveVersion)
-    } else if table_name.eq_ignore_ascii_case("lix_file_by_version") {
-        Some(FileWriteTarget::ExplicitVersion)
-    } else {
-        None
-    }
 }
 
 fn delete_selection_supports_id_projection(expr: &Expr) -> bool {
@@ -1827,7 +1652,7 @@ mod tests {
             delete.selection.as_ref(),
             &[],
             &mut state,
-            FileWriteTarget::ActiveVersion,
+            FileWriteScope::ActiveVersion,
             "v1",
         )
         .expect("extract targets")
@@ -1852,7 +1677,7 @@ mod tests {
             delete.selection.as_ref(),
             &[],
             &mut state,
-            FileWriteTarget::ExplicitVersion,
+            FileWriteScope::ExplicitVersion,
             "ignored",
         )
         .expect("extract targets")
@@ -1876,7 +1701,7 @@ mod tests {
             delete.selection.as_ref(),
             &[],
             &mut state,
-            FileWriteTarget::ActiveVersion,
+            FileWriteScope::ActiveVersion,
             "v1",
         )
         .expect("extract targets");
@@ -1981,7 +1806,7 @@ async fn execute_delete_overlay_prefetch_query(
     delete: &sqlparser::ast::Delete,
     params: &[Value],
     active_version_id: &str,
-    target: FileWriteTarget,
+    target: FileWriteScope,
     overlay: &BTreeMap<(String, String), OverlayWriteState>,
 ) -> Result<Vec<Vec<Value>>, LixError> {
     let overlay_rows = overlay_rows_for_target(overlay, active_version_id, target);
@@ -1990,8 +1815,8 @@ async fn execute_delete_overlay_prefetch_query(
     }
 
     let alias = match target {
-        FileWriteTarget::ActiveVersion => "lix_file",
-        FileWriteTarget::ExplicitVersion => "lix_file_by_version",
+        FileWriteScope::ActiveVersion => "lix_file",
+        FileWriteScope::ExplicitVersion => "lix_file_by_version",
     };
     let mut query_sql = format!(
         "WITH {alias}(\
@@ -2038,12 +1863,12 @@ async fn execute_delete_overlay_prefetch_query(
 fn overlay_rows_for_target(
     overlay: &BTreeMap<(String, String), OverlayWriteState>,
     active_version_id: &str,
-    target: FileWriteTarget,
+    target: FileWriteScope,
 ) -> Vec<(String, String, String)> {
     overlay
         .iter()
         .filter_map(|((file_id, version_id), state)| {
-            if matches!(target, FileWriteTarget::ActiveVersion) && version_id != active_version_id {
+            if matches!(target, FileWriteScope::ActiveVersion) && version_id != active_version_id {
                 return None;
             }
             Some((file_id.clone(), state.path.clone(), version_id.clone()))

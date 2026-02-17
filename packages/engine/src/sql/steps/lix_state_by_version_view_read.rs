@@ -1,7 +1,9 @@
 use sqlparser::ast::{Expr, Query, Select, TableFactor, TableWithJoins};
 
-use crate::sql::steps::state_pushdown::{select_supports_count_fast_path, take_pushdown_predicates};
-use crate::sql::steps::vtable_read::build_effective_state_by_version_query;
+use crate::sql::planner::effective_state_read::build_effective_state_by_version_query;
+use crate::sql::steps::state_pushdown::{
+    select_supports_count_fast_path, take_pushdown_predicates,
+};
 use crate::sql::{default_alias, object_name_matches, rewrite_query_with_select_rewriter};
 use crate::LixError;
 
@@ -62,8 +64,10 @@ fn rewrite_table_factor(
                 .map(|value| value.name.value.clone())
                 .unwrap_or_else(|| LIX_STATE_BY_VERSION_VIEW_NAME.to_string());
             let pushdown = take_pushdown_predicates(selection, &relation_name, allow_unqualified);
-            let derived_query =
-                build_effective_state_by_version_query(&pushdown, count_fast_path && selection.is_none())?;
+            let derived_query = build_effective_state_by_version_query(
+                &pushdown,
+                count_fast_path && selection.is_none(),
+            )?;
             let derived_alias = alias
                 .clone()
                 .or_else(|| Some(default_lix_state_by_version_alias()));
@@ -149,12 +153,8 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains(
-            "FROM version_descriptor WHERE version_id = 'bench-v-023'"
-        ));
-        assert!(sql.contains(
-            "FROM lix_internal_state_vtable WHERE version_id = 'bench-v-023'"
-        ));
+        assert!(sql.contains("FROM version_descriptor WHERE version_id = 'bench-v-023'"));
+        assert!(sql.contains("FROM lix_internal_state_vtable WHERE version_id = 'bench-v-023'"));
         assert!(!sql.contains("FROM all_target_versions"));
         assert!(!sql.contains("ranked.version_id = 'bench-v-023'"));
         assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
@@ -180,12 +180,8 @@ mod tests {
             "FROM lix_internal_state_vtable WHERE version_id IN ('bench-v-022', 'bench-v-023')"
         ));
         assert!(!sql.contains("FROM all_target_versions"));
-        assert!(!sql.contains(
-            "ranked.version_id IN ('bench-v-022', 'bench-v-023')"
-        ));
-        assert!(!sql.contains(
-            "sv.version_id IN ('bench-v-022', 'bench-v-023')"
-        ));
+        assert!(!sql.contains("ranked.version_id IN ('bench-v-022', 'bench-v-023')"));
+        assert!(!sql.contains("sv.version_id IN ('bench-v-022', 'bench-v-023')"));
     }
 
     #[test]
@@ -208,9 +204,7 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains(
-            "FROM all_target_versions WHERE version_id IN (SELECT"
-        ));
+        assert!(sql.contains("FROM all_target_versions WHERE version_id IN (SELECT"));
         assert!(!sql.contains("ranked.version_id IN (SELECT"));
         assert!(sql.contains("FROM lix_internal_state_untracked"));
         assert!(!sql.contains("sv.version_id IN (SELECT"));

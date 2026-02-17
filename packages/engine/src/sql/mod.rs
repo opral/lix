@@ -5,6 +5,7 @@ mod escaping;
 mod lowering;
 mod params;
 mod pipeline;
+mod planner;
 mod query_rewriter;
 mod route;
 mod row_resolution;

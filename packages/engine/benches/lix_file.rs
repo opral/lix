@@ -85,7 +85,10 @@ fn bench_lix_file_exact_update_missing_id(c: &mut Criterion) {
 fn bench_lix_file_read_scan_no_plugin(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to build tokio runtime");
     let engine = runtime
-        .block_on(seed_engine_with_read_dataset(false, READ_SCAN_FILE_COUNT_NO_PLUGIN))
+        .block_on(seed_engine_with_read_dataset(
+            false,
+            READ_SCAN_FILE_COUNT_NO_PLUGIN,
+        ))
         .expect("failed to seed engine for read-scan no-plugin bench");
 
     let warmup = runtime
@@ -115,7 +118,10 @@ fn bench_lix_file_read_scan_no_plugin(c: &mut Criterion) {
 fn bench_lix_file_read_scan_plugin_json(c: &mut Criterion) {
     let runtime = Runtime::new().expect("failed to build tokio runtime");
     let engine = runtime
-        .block_on(seed_engine_with_read_dataset(true, READ_SCAN_FILE_COUNT_PLUGIN))
+        .block_on(seed_engine_with_read_dataset(
+            true,
+            READ_SCAN_FILE_COUNT_PLUGIN,
+        ))
         .expect("failed to seed engine for read-scan plugin bench");
 
     let warmup = runtime
@@ -360,10 +366,7 @@ async fn seed_engine_with_read_dataset(
 
 fn read_dataset_path(index: usize, plugin_active: bool) -> String {
     let extension = if plugin_active { "json" } else { "txt" };
-    format!(
-        "/bench/read/{:02}/file-{index:05}.{extension}",
-        index % 32
-    )
+    format!("/bench/read/{:02}/file-{index:05}.{extension}", index % 32)
 }
 
 fn scalar_count(result: &lix_engine::QueryResult) -> Result<i64, LixError> {

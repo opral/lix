@@ -1,7 +1,9 @@
 use sqlparser::ast::{Expr, Query, Select, TableFactor, TableWithJoins};
 
-use crate::sql::steps::state_pushdown::{select_supports_count_fast_path, take_pushdown_predicates};
-use crate::sql::steps::vtable_read::build_effective_state_active_query;
+use crate::sql::planner::effective_state_read::build_effective_state_active_query;
+use crate::sql::steps::state_pushdown::{
+    select_supports_count_fast_path, take_pushdown_predicates,
+};
 use crate::sql::{default_alias, object_name_matches, rewrite_query_with_select_rewriter};
 use crate::LixError;
 
@@ -62,8 +64,10 @@ fn rewrite_table_factor(
                 .map(|value| value.name.value.clone())
                 .unwrap_or_else(|| LIX_STATE_VIEW_NAME.to_string());
             let pushdown = take_pushdown_predicates(selection, &relation_name, allow_unqualified);
-            let derived_query =
-                build_effective_state_active_query(&pushdown, count_fast_path && selection.is_none())?;
+            let derived_query = build_effective_state_active_query(
+                &pushdown,
+                count_fast_path && selection.is_none(),
+            )?;
             let derived_alias = alias.clone().or_else(|| Some(default_lix_state_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,
