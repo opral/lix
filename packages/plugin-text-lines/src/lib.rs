@@ -2,7 +2,7 @@ use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
 use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 
 wit_bindgen::generate!({
     path: "../engine/wit",
@@ -114,23 +114,24 @@ impl Guest for TextLinesPlugin {
             .map(|line| line.entity_id.clone())
             .collect::<Vec<_>>();
 
-        let before_id_set = before_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let after_id_set = after_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let before_id_set = before_ids.iter().cloned().collect::<HashSet<_>>();
+        let after_id_set = after_ids.iter().cloned().collect::<HashSet<_>>();
         let mut changes = Vec::new();
 
         if before.is_some() {
-            for removed in before_lines
-                .iter()
-                .filter(|line| !after_id_set.contains(&line.entity_id))
-                .map(|line| line.entity_id.clone())
-                .collect::<BTreeSet<_>>()
-            {
-                changes.push(EntityChange {
-                    entity_id: removed,
-                    schema_key: LINE_SCHEMA_KEY.to_string(),
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    snapshot_content: None,
-                });
+            let mut removed_ids = HashSet::<String>::with_capacity(before_lines.len());
+            for line in &before_lines {
+                if after_id_set.contains(&line.entity_id) {
+                    continue;
+                }
+                if removed_ids.insert(line.entity_id.clone()) {
+                    changes.push(EntityChange {
+                        entity_id: line.entity_id.clone(),
+                        schema_key: LINE_SCHEMA_KEY.to_string(),
+                        schema_version: SCHEMA_VERSION.to_string(),
+                        snapshot_content: None,
+                    });
+                }
             }
         }
 
@@ -170,8 +171,8 @@ impl Guest for TextLinesPlugin {
         let mut line_by_id = parse_lines_with_ids(&file.data)
             .into_iter()
             .map(|line| (line.entity_id.clone(), line))
-            .collect::<BTreeMap<_, _>>();
-        let mut seen_line_change_ids = BTreeSet::<String>::new();
+            .collect::<HashMap<_, _>>();
+        let mut seen_line_change_ids = HashSet::<String>::new();
 
         for change in changes {
             if change.schema_key == LINE_SCHEMA_KEY {
@@ -274,7 +275,7 @@ fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginErr
         PluginError::InvalidInput(format!("invalid text_document snapshot_content: {error}"))
     })?;
 
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     for line_id in &parsed.line_ids {
         if line_id.is_empty() {
             return Err(PluginError::InvalidInput(
@@ -362,7 +363,7 @@ fn parse_after_lines_with_histogram_matching(
     let mut used_ids = before_lines
         .iter()
         .map(|line| line.entity_id.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<HashSet<_>>();
     let mut occurrence_by_key = HashMap::<Vec<u8>, u32>::new();
     let mut after_lines = Vec::with_capacity(after_split.len());
 
@@ -424,7 +425,7 @@ fn compute_histogram_line_matching_pairs(before_data: &[u8], after_data: &[u8]) 
     pairs
 }
 
-fn allocate_inserted_line_id(base: &str, used_ids: &BTreeSet<String>) -> String {
+fn allocate_inserted_line_id(base: &str, used_ids: &HashSet<String>) -> String {
     if !used_ids.contains(base) {
         return base.to_string();
     }
