@@ -16,18 +16,17 @@ pub(crate) enum RewritePhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryRule {
     AnalyzeRelationDiscovery,
-    FilesystemViews,
-    EntityViews,
-    LixVersion,
-    LixActiveAccount,
-    LixActiveVersion,
-
-    LixState,
-    LixStateByVersion,
-    LixStateHistory,
+    CanonicalLogicalViews,
     Pushdown,
     ProjectionCleanup,
     VtableRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueryRuleOutcome {
+    NotApplicable,
+    NoChange,
+    Changed(Query),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,16 +39,7 @@ pub(crate) enum StatementRule {
 
 const ANALYZE_RULES: &[QueryRule] = &[QueryRule::AnalyzeRelationDiscovery];
 
-const CANONICALIZE_RULES: &[QueryRule] = &[
-    QueryRule::FilesystemViews,
-    QueryRule::EntityViews,
-    QueryRule::LixVersion,
-    QueryRule::LixActiveAccount,
-    QueryRule::LixActiveVersion,
-    QueryRule::LixState,
-    QueryRule::LixStateByVersion,
-    QueryRule::LixStateHistory,
-];
+const CANONICALIZE_RULES: &[QueryRule] = &[QueryRule::CanonicalLogicalViews];
 
 const OPTIMIZE_RULES: &[QueryRule] = &[QueryRule::Pushdown, QueryRule::ProjectionCleanup];
 
@@ -75,18 +65,21 @@ pub(crate) fn statement_rules() -> &'static [StatementRule] {
     STATEMENT_RULES
 }
 
+impl QueryRuleOutcome {
+    fn from_option(rewritten: Option<Query>) -> Self {
+        if let Some(query) = rewritten {
+            Self::Changed(query)
+        } else {
+            Self::NoChange
+        }
+    }
+}
+
 impl QueryRule {
     pub(crate) fn matches_context(self, context: &AnalysisContext) -> bool {
         match self {
             Self::AnalyzeRelationDiscovery => true,
-            Self::FilesystemViews => context.references_any_filesystem_view(),
-            Self::EntityViews => context.references_entity_views(),
-            Self::LixVersion => context.references_relation("lix_version"),
-            Self::LixActiveAccount => context.references_relation("lix_active_account"),
-            Self::LixActiveVersion => context.references_relation("lix_active_version"),
-            Self::LixState => context.references_relation("lix_state"),
-            Self::LixStateByVersion => context.references_relation("lix_state_by_version"),
-            Self::LixStateHistory => context.references_relation("lix_state_history"),
+            Self::CanonicalLogicalViews => context.references_any_logical_read_view(),
             Self::Pushdown => context.references_state_views(),
             Self::ProjectionCleanup => context.has_nested_query_shapes(),
             Self::VtableRead => context.references_relation("lix_internal_state_vtable"),
@@ -97,23 +90,27 @@ impl QueryRule {
         self,
         query: Query,
         params: &[Value],
-    ) -> Result<Option<Query>, LixError> {
+        context: &AnalysisContext,
+    ) -> Result<QueryRuleOutcome, LixError> {
+        if !self.matches_context(context) {
+            return Ok(QueryRuleOutcome::NotApplicable);
+        }
+
         match self {
             Self::AnalyzeRelationDiscovery => {
                 analyze::relation_discovery::validate_relation_discovery_consistency(&query)?;
-                Ok(None)
+                Ok(QueryRuleOutcome::NoChange)
             }
-            Self::FilesystemViews => canonical::filesystem_views::rewrite_query(query, params),
-            Self::EntityViews => canonical::entity_views::rewrite_query(query),
-            Self::LixVersion => canonical::lix_version::rewrite_query(query),
-            Self::LixActiveAccount => canonical::lix_active_account::rewrite_query(query),
-            Self::LixActiveVersion => canonical::lix_active_version::rewrite_query(query),
-            Self::LixState => canonical::lix_state::rewrite_query(query),
-            Self::LixStateByVersion => canonical::lix_state_by_version::rewrite_query(query),
-            Self::LixStateHistory => canonical::lix_state_history::rewrite_query(query),
-            Self::Pushdown => optimize::pushdown::rewrite_query(query),
-            Self::ProjectionCleanup => optimize::projection_cleanup::rewrite_query(query),
-            Self::VtableRead => lower::vtable_read::rewrite_query(query),
+            Self::CanonicalLogicalViews => canonical::logical_views::rewrite_query(query, params),
+            Self::Pushdown => Ok(QueryRuleOutcome::from_option(
+                optimize::pushdown::rewrite_query(query)?,
+            )),
+            Self::ProjectionCleanup => Ok(QueryRuleOutcome::from_option(
+                optimize::projection_cleanup::rewrite_query(query)?,
+            )),
+            Self::VtableRead => Ok(QueryRuleOutcome::from_option(
+                lower::vtable_read::rewrite_query(query)?,
+            )),
         }
     }
 
@@ -122,27 +119,29 @@ impl QueryRule {
         backend: &dyn LixBackend,
         query: Query,
         params: &[Value],
-    ) -> Result<Option<Query>, LixError> {
+        context: &AnalysisContext,
+    ) -> Result<QueryRuleOutcome, LixError> {
+        if !self.matches_context(context) {
+            return Ok(QueryRuleOutcome::NotApplicable);
+        }
+
         match self {
             Self::AnalyzeRelationDiscovery => {
                 analyze::relation_discovery::validate_relation_discovery_consistency(&query)?;
-                Ok(None)
+                Ok(QueryRuleOutcome::NoChange)
             }
-            Self::FilesystemViews => canonical::filesystem_views::rewrite_query(query, params),
-            Self::EntityViews => {
-                canonical::entity_views::rewrite_query_with_backend(backend, query).await
+            Self::CanonicalLogicalViews => {
+                canonical::logical_views::rewrite_query_with_backend(backend, query, params).await
             }
-            Self::LixVersion => canonical::lix_version::rewrite_query(query),
-            Self::LixActiveAccount => canonical::lix_active_account::rewrite_query(query),
-            Self::LixActiveVersion => canonical::lix_active_version::rewrite_query(query),
-            Self::LixState => canonical::lix_state::rewrite_query(query),
-            Self::LixStateByVersion => canonical::lix_state_by_version::rewrite_query(query),
-            Self::LixStateHistory => canonical::lix_state_history::rewrite_query(query),
-            Self::Pushdown => optimize::pushdown::rewrite_query(query),
-            Self::ProjectionCleanup => optimize::projection_cleanup::rewrite_query(query),
-            Self::VtableRead => {
-                lower::vtable_read::rewrite_query_with_backend(backend, query).await
-            }
+            Self::Pushdown => Ok(QueryRuleOutcome::from_option(
+                optimize::pushdown::rewrite_query(query)?,
+            )),
+            Self::ProjectionCleanup => Ok(QueryRuleOutcome::from_option(
+                optimize::projection_cleanup::rewrite_query(query)?,
+            )),
+            Self::VtableRead => Ok(QueryRuleOutcome::from_option(
+                lower::vtable_read::rewrite_query_with_backend(backend, query).await?,
+            )),
         }
     }
 }

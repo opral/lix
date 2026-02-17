@@ -2,8 +2,9 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Select, TableFactor};
 
 use crate::sql::{
-    default_alias, escape_sql_string, parse_single_query, quote_ident,
-    rewrite_query_with_select_rewriter, rewrite_table_factors_in_select,
+    default_alias, escape_sql_string, parse_single_query, quote_ident, rewrite_query_selects,
+    rewrite_table_factors_in_select_decision, visit_query_selects, visit_table_factors_in_select,
+    RewriteDecision,
 };
 use crate::{LixBackend, LixError};
 
@@ -38,31 +39,26 @@ fn rewrite_query_with_resolver(
     query: Query,
     resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
 ) -> Result<Option<Query>, LixError> {
-    let mut rewrite_select_with_resolver =
-        |select: &mut Select, changed: &mut bool| rewrite_select(select, resolver, changed);
-    rewrite_query_with_select_rewriter(query, &mut rewrite_select_with_resolver)
+    let mut rewrite_select_with_resolver = |select: &mut Select| rewrite_select(select, resolver);
+    rewrite_query_selects(query, &mut rewrite_select_with_resolver)
 }
 
 fn rewrite_select(
     select: &mut Select,
     resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    let mut rewrite_factor = |relation: &mut TableFactor, changed: &mut bool| {
-        rewrite_table_factor(relation, resolver, changed)
-    };
-    rewrite_table_factors_in_select(select, &mut rewrite_factor, changed)
+) -> Result<RewriteDecision, LixError> {
+    let mut rewrite_factor = |relation: &mut TableFactor| rewrite_table_factor(relation, resolver);
+    rewrite_table_factors_in_select_decision(select, &mut rewrite_factor)
 }
 
 fn rewrite_table_factor(
     relation: &mut TableFactor,
     resolver: &mut dyn FnMut(&ObjectName) -> Result<Option<EntityViewTarget>, LixError>,
-    changed: &mut bool,
-) -> Result<(), LixError> {
+) -> Result<RewriteDecision, LixError> {
     match relation {
         TableFactor::Table { name, alias, .. } => {
             let Some(target) = resolver(name)? else {
-                return Ok(());
+                return Ok(RewriteDecision::Unchanged);
             };
             let derived_query = build_entity_view_query(&target)?;
             let derived_alias = alias
@@ -73,11 +69,10 @@ fn rewrite_table_factor(
                 subquery: Box::new(derived_query),
                 alias: derived_alias,
             };
-            *changed = true;
+            Ok(RewriteDecision::Changed)
         }
-        _ => {}
+        _ => Ok(RewriteDecision::Unchanged),
     }
-    Ok(())
 }
 
 fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError> {
@@ -219,25 +214,17 @@ fn lixcol_aliases_for_variant(
 
 fn collect_table_view_names(query: &Query) -> Vec<String> {
     let mut view_names = Vec::new();
-    let mut collect_from_select =
-        |select: &mut Select, _changed: &mut bool| -> Result<(), LixError> {
-            let mut ignored = false;
-            rewrite_table_factors_in_select(
-                select,
-                &mut |relation, _changed| {
-                    let TableFactor::Table { name, .. } = relation else {
-                        return Ok(());
-                    };
-                    if let Some(view_name) = object_name_terminal(name) {
-                        view_names.push(view_name);
-                    }
-                    Ok(())
-                },
-                &mut ignored,
-            )?;
+    let _ = visit_query_selects(query, &mut |select| {
+        visit_table_factors_in_select(select, &mut |relation| {
+            let TableFactor::Table { name, .. } = relation else {
+                return Ok(());
+            };
+            if let Some(view_name) = object_name_terminal(name) {
+                view_names.push(view_name);
+            }
             Ok(())
-        };
-    let _ = rewrite_query_with_select_rewriter(query.clone(), &mut collect_from_select);
+        })
+    });
     view_names
 }
 

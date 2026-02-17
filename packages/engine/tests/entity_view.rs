@@ -79,10 +79,7 @@ async fn install_version_override_schema_with_version(
          )",
         snapshot = snapshot.to_string().replace('\'', "''"),
     );
-    engine
-        .execute(&sql, &[])
-        .await
-        .unwrap();
+    engine.execute(&sql, &[]).await.unwrap();
 }
 
 async fn install_version_override_schema(engine: &support::simulation_test::SimulationEngine) {
