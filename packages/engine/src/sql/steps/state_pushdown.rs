@@ -73,17 +73,15 @@ pub(crate) fn take_pushdown_predicates(
 
     let mut parts = Vec::new();
     for predicate in split_conjunction(selection_expr) {
-        let extracted = extract_pushdown_comparison(&predicate, relation_name, allow_unqualified)
-            .and_then(|(column, value_sql)| match column.as_str() {
+        let extracted = extract_pushdown_predicate(&predicate, relation_name, allow_unqualified)
+            .and_then(|(column, predicate_sql)| match column.as_str() {
                 "entity_id" | "schema_key" | "file_id" => {
-                    Some((PushdownBucket::Source, format!("s.{column} = {value_sql}")))
+                    Some((PushdownBucket::Source, format!("s.{predicate_sql}")))
                 }
+                "version_id" => Some((PushdownBucket::Ranked, format!("ranked.{predicate_sql}"))),
                 "plugin_key" => {
                     // Keep plugin filtering after winner selection to preserve row-choice semantics.
-                    Some((
-                        PushdownBucket::Ranked,
-                        format!("ranked.{column} = {value_sql}"),
-                    ))
+                    Some((PushdownBucket::Ranked, format!("ranked.{predicate_sql}")))
                 }
                 _ => None,
             });
@@ -169,27 +167,44 @@ fn join_conjunction(mut predicates: Vec<Expr>) -> Option<Expr> {
     Some(current)
 }
 
-fn extract_pushdown_comparison(
+fn extract_pushdown_predicate(
     predicate: &Expr,
     relation_name: &str,
     allow_unqualified: bool,
 ) -> Option<(String, String)> {
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = predicate
-    else {
-        return None;
-    };
-
-    if let Some(column) = extract_target_column(left, relation_name, allow_unqualified) {
-        return Some((column, right.to_string()));
+    match predicate {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if let Some(column) = extract_target_column(left, relation_name, allow_unqualified) {
+                return Some((column.clone(), format!("{column} = {}", right)));
+            }
+            if let Some(column) = extract_target_column(right, relation_name, allow_unqualified) {
+                return Some((column.clone(), format!("{column} = {}", left)));
+            }
+            None
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let column = extract_target_column(expr, relation_name, allow_unqualified)?;
+            let list_sql = render_in_list_sql(list);
+            Some((column.clone(), format!("{column} IN ({list_sql})")))
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated: false,
+        } => {
+            let column = extract_target_column(expr, relation_name, allow_unqualified)?;
+            Some((column.clone(), format!("{column} IN ({subquery})")))
+        }
+        _ => None,
     }
-    if let Some(column) = extract_target_column(right, relation_name, allow_unqualified) {
-        return Some((column, left.to_string()));
-    }
-    None
 }
 
 fn extract_target_column(
@@ -217,9 +232,17 @@ fn normalize_state_column(raw: &str) -> Option<String> {
         "entity_id" | "lixcol_entity_id" => Some("entity_id".to_string()),
         "schema_key" | "lixcol_schema_key" => Some("schema_key".to_string()),
         "file_id" | "lixcol_file_id" => Some("file_id".to_string()),
+        "version_id" | "lixcol_version_id" => Some("version_id".to_string()),
         "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
         _ => None,
     }
+}
+
+fn render_in_list_sql(list: &[Expr]) -> String {
+    list.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn expr_contains_bare_placeholder(expr: &Expr) -> bool {

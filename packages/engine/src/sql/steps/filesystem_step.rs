@@ -8,6 +8,13 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     select_rewrite::rewrite_query(query)
 }
 
+pub fn rewrite_query_with_params(
+    query: Query,
+    params: &[EngineValue],
+) -> Result<Option<Query>, LixError> {
+    select_rewrite::rewrite_query_with_params(query, params)
+}
+
 pub fn rewrite_insert(insert: Insert) -> Result<Option<Insert>, LixError> {
     mutation_rewrite::rewrite_insert(insert)
 }

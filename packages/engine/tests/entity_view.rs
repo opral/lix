@@ -1,7 +1,7 @@
 mod support;
 
 use lix_engine::Value;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -49,17 +49,53 @@ async fn seed_key_value_row(
     engine.execute(&sql, &[]).await.unwrap();
 }
 
+async fn install_version_override_schema_with_version(
+    engine: &support::simulation_test::SimulationEngine,
+    schema_key: &str,
+    version_id: &str,
+) {
+    let snapshot = json!({
+        "value": {
+            "x-lix-key": schema_key,
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "\"lix\"",
+                "lixcol_plugin_key": "\"lix\"",
+                "lixcol_version_id": format!("\"{version_id}\""),
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+            },
+            "required": ["id"],
+            "additionalProperties": false,
+        }
+    });
+    let sql = format!(
+        "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+         'lix_stored_schema', '{snapshot}'\
+         )",
+        snapshot = snapshot.to_string().replace('\'', "''"),
+    );
+    engine.execute(&sql, &[]).await.unwrap();
+}
+
 async fn install_version_override_schema(engine: &support::simulation_test::SimulationEngine) {
-    engine
-        .execute(
-            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_version_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
-        .await
-        .unwrap();
+    install_version_override_schema_with_version(engine, "lix_version_override_schema", "global")
+        .await;
+}
+
+async fn install_child_version_override_schema(
+    engine: &support::simulation_test::SimulationEngine,
+) {
+    install_version_override_schema_with_version(
+        engine,
+        "lix_version_override_child_schema",
+        "version-child",
+    )
+    .await;
 }
 
 async fn install_select_override_schema(engine: &support::simulation_test::SimulationEngine) {
@@ -551,6 +587,57 @@ simulation_test!(
         let main_name = snapshot_field(&rows.rows[1][1], "name");
         assert_eq!(main_name, "Main");
         sim.assert_deterministic(vec![vec![Value::Text(global_name), Value::Text(main_name)]]);
+    }
+);
+
+simulation_test!(
+    lix_entity_view_base_select_with_lixcol_version_id_override_inherits_parent_state,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+        install_child_version_override_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_version (\
+                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                 ) VALUES (\
+                 'version-child', 'version-child', 'global', 0, 'commit-child', 'working-child'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'ovr-inherit-1', 'lix_version_override_child_schema', 'lix', 'global', 'lix', '{\"id\":\"ovr-inherit-1\",\"name\":\"Global\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT id, name, lixcol_inherited_from_version_id \
+                 FROM lix_version_override_child_schema \
+                 WHERE id = 'ovr-inherit-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.rows.clone());
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "ovr-inherit-1");
+        assert_text(&rows.rows[0][1], "Global");
+        assert_text(&rows.rows[0][2], "global");
     }
 );
 
