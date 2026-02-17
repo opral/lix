@@ -351,7 +351,6 @@ fn parse_after_lines_with_histogram_matching(
     after_data: &[u8],
 ) -> Vec<ParsedLine> {
     let after_split = split_lines(after_data);
-    let canonical_after_lines = parse_lines_with_ids_from_split(after_split.clone());
 
     let matching_pairs = compute_histogram_line_matching_pairs(before_data, after_data);
 
@@ -364,13 +363,20 @@ fn parse_after_lines_with_histogram_matching(
         .iter()
         .map(|line| line.entity_id.clone())
         .collect::<BTreeSet<_>>();
+    let mut occurrence_by_key = HashMap::<Vec<u8>, u32>::new();
     let mut after_lines = Vec::with_capacity(after_split.len());
 
     for (after_index, (content, ending)) in after_split.into_iter().enumerate() {
+        let key = line_key_bytes(&content, ending);
+        let occurrence = occurrence_by_key.entry(key.clone()).or_insert(0);
+        let canonical_occurrence = *occurrence;
+        *occurrence += 1;
+
         let entity_id = if let Some(before_index) = matched_after_to_before.get(&after_index) {
             before_lines[*before_index].entity_id.clone()
         } else {
-            allocate_inserted_line_id(&canonical_after_lines[after_index].entity_id, &used_ids)
+            let canonical_entity_id = format!("line:{}:{}", sha1_hex(&key), canonical_occurrence);
+            allocate_inserted_line_id(&canonical_entity_id, &used_ids)
         };
         used_ids.insert(entity_id.clone());
 
