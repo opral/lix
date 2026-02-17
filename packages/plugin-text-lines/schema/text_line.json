@@ -1,0 +1,29 @@
+{
+  "x-lix-key": "text_line",
+  "x-lix-version": "1",
+  "x-lix-override-lixcols": {
+    "lixcol_plugin_key": "'plugin_text_lines'"
+  },
+  "type": "object",
+  "properties": {
+    "content_hex": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*$",
+      "description": "Hex-encoded line bytes. Empty string represents an empty line body."
+    },
+    "ending": {
+      "type": "string",
+      "enum": [
+        "",
+        "\n",
+        "\r\n"
+      ],
+      "description": "Original line ending bytes."
+    }
+  },
+  "required": [
+    "content_hex",
+    "ending"
+  ],
+  "additionalProperties": false
+}

@@ -1,8 +1,10 @@
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
 use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 wit_bindgen::generate!({
     path: "../engine/wit",
@@ -13,6 +15,12 @@ pub const LINE_SCHEMA_KEY: &str = "text_line";
 pub const DOCUMENT_SCHEMA_KEY: &str = "text_document";
 pub const SCHEMA_VERSION: &str = "1";
 pub const DOCUMENT_ENTITY_ID: &str = "__document__";
+const MANIFEST_JSON: &str = include_str!("../manifest.json");
+const LINE_SCHEMA_JSON: &str = include_str!("../schema/text_line.json");
+const DOCUMENT_SCHEMA_JSON: &str = include_str!("../schema/text_document.json");
+
+static LINE_SCHEMA: OnceLock<Value> = OnceLock::new();
+static DOCUMENT_SCHEMA: OnceLock<Value> = OnceLock::new();
 
 pub use crate::exports::lix::plugin::api::{
     EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
@@ -142,13 +150,18 @@ impl Guest for TextLinesPlugin {
     }
 
     fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+        let expected_line_changes = changes
+            .iter()
+            .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
+            .count();
         let mut document_snapshot: Option<DocumentSnapshotOwned> = None;
         let mut document_tombstoned = false;
         let mut line_by_id = parse_lines_with_ids(&file.data)
             .into_iter()
             .map(|line| (line.entity_id.clone(), line))
             .collect::<HashMap<_, _>>();
-        let mut seen_line_change_ids = HashSet::<String>::new();
+        line_by_id.reserve(expected_line_changes);
+        let mut seen_line_change_ids = HashSet::<String>::with_capacity(expected_line_changes);
 
         for change in changes {
             if change.schema_key == LINE_SCHEMA_KEY {
@@ -563,6 +576,29 @@ pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityCha
 
 pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
     <TextLinesPlugin as Guest>::apply_changes(file, changes)
+}
+
+pub fn manifest_json() -> &'static str {
+    MANIFEST_JSON
+}
+
+pub fn line_schema_json() -> &'static str {
+    LINE_SCHEMA_JSON
+}
+
+pub fn line_schema_definition() -> &'static Value {
+    LINE_SCHEMA
+        .get_or_init(|| serde_json::from_str(LINE_SCHEMA_JSON).expect("text line schema must parse"))
+}
+
+pub fn document_schema_json() -> &'static str {
+    DOCUMENT_SCHEMA_JSON
+}
+
+pub fn document_schema_definition() -> &'static Value {
+    DOCUMENT_SCHEMA.get_or_init(|| {
+        serde_json::from_str(DOCUMENT_SCHEMA_JSON).expect("text document schema must parse")
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
