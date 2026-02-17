@@ -1,4 +1,5 @@
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
+use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -98,8 +99,8 @@ impl Guest for TextLinesPlugin {
             .as_ref()
             .map(|file| parse_lines_with_ids(&file.data))
             .unwrap_or_default();
-        let after_lines = if before.is_some() {
-            parse_after_lines_with_git_matching(&before_lines, &after.data)
+        let after_lines = if let Some(before_file) = before.as_ref() {
+            parse_after_lines_with_histogram_matching(&before_lines, &before_file.data, &after.data)
         } else {
             parse_lines_with_ids(&after.data)
         };
@@ -163,19 +164,28 @@ impl Guest for TextLinesPlugin {
         Ok(changes)
     }
 
-    fn apply_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+    fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
         let mut document_snapshot: Option<DocumentSnapshotOwned> = None;
         let mut document_tombstoned = false;
-        let mut line_by_id = BTreeMap::<String, ParsedLine>::new();
+        let mut line_by_id = parse_lines_with_ids(&file.data)
+            .into_iter()
+            .map(|line| (line.entity_id.clone(), line))
+            .collect::<BTreeMap<_, _>>();
+        let mut seen_line_change_ids = BTreeSet::<String>::new();
 
         for change in changes {
             if change.schema_key == LINE_SCHEMA_KEY {
                 validate_schema_version(&change.schema_version, LINE_SCHEMA_KEY)?;
+                if !seen_line_change_ids.insert(change.entity_id.clone()) {
+                    return Err(PluginError::InvalidInput(
+                        "duplicate text_line snapshot in apply_changes input".to_string(),
+                    ));
+                }
 
                 match change.snapshot_content {
                     Some(snapshot_raw) => {
                         let snapshot = parse_line_snapshot(&snapshot_raw, &change.entity_id)?;
-                        let replaced = line_by_id.insert(
+                        line_by_id.insert(
                             change.entity_id.clone(),
                             ParsedLine {
                                 entity_id: change.entity_id,
@@ -183,11 +193,6 @@ impl Guest for TextLinesPlugin {
                                 ending: snapshot.ending,
                             },
                         );
-                        if replaced.is_some() {
-                            return Err(PluginError::InvalidInput(
-                                "duplicate text_line snapshot in apply_changes input".to_string(),
-                            ));
-                        }
                     }
                     None => {
                         line_by_id.remove(&change.entity_id);
@@ -340,25 +345,18 @@ fn parse_lines_with_ids_from_split(split: Vec<(Vec<u8>, LineEnding)>) -> Vec<Par
     lines
 }
 
-fn parse_after_lines_with_git_matching(
+fn parse_after_lines_with_histogram_matching(
     before_lines: &[ParsedLine],
+    before_data: &[u8],
     after_data: &[u8],
 ) -> Vec<ParsedLine> {
     let after_split = split_lines(after_data);
     let canonical_after_lines = parse_lines_with_ids_from_split(after_split.clone());
 
-    let before_keys = before_lines
-        .iter()
-        .map(|line| line_key_bytes(&line.content, line.ending))
-        .collect::<Vec<_>>();
-    let after_keys = after_split
-        .iter()
-        .map(|(content, ending)| line_key_bytes(content, *ending))
-        .collect::<Vec<_>>();
-    let lcs_pairs = longest_common_subsequence_pairs(&before_keys, &after_keys);
+    let matching_pairs = compute_histogram_line_matching_pairs(before_data, after_data);
 
     let mut matched_after_to_before = HashMap::<usize, usize>::new();
-    for (before_index, after_index) in lcs_pairs {
+    for (before_index, after_index) in matching_pairs {
         matched_after_to_before.insert(after_index, before_index);
     }
 
@@ -386,6 +384,40 @@ fn parse_after_lines_with_git_matching(
     after_lines
 }
 
+fn compute_histogram_line_matching_pairs(before_data: &[u8], after_data: &[u8]) -> Vec<(usize, usize)> {
+    let input = InternedInput::new(before_data, after_data);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+
+    let mut pairs = Vec::new();
+    let mut before_pos = 0usize;
+    let mut after_pos = 0usize;
+
+    for hunk in diff.hunks() {
+        let hunk_before_start = hunk.before.start as usize;
+        let hunk_after_start = hunk.after.start as usize;
+        let unchanged_before_len = hunk_before_start.saturating_sub(before_pos);
+        let unchanged_after_len = hunk_after_start.saturating_sub(after_pos);
+        let unchanged_len = unchanged_before_len.min(unchanged_after_len);
+
+        for offset in 0..unchanged_len {
+            pairs.push((before_pos + offset, after_pos + offset));
+        }
+
+        before_pos = hunk.before.end as usize;
+        after_pos = hunk.after.end as usize;
+    }
+
+    let before_tail = input.before.len().saturating_sub(before_pos);
+    let after_tail = input.after.len().saturating_sub(after_pos);
+    let tail_len = before_tail.min(after_tail);
+    for offset in 0..tail_len {
+        pairs.push((before_pos + offset, after_pos + offset));
+    }
+
+    pairs
+}
+
 fn allocate_inserted_line_id(base: &str, used_ids: &BTreeSet<String>) -> String {
     if !used_ids.contains(base) {
         return base.to_string();
@@ -399,51 +431,6 @@ fn allocate_inserted_line_id(base: &str, used_ids: &BTreeSet<String>) -> String 
         }
         suffix += 1;
     }
-}
-
-fn longest_common_subsequence_pairs(
-    before_keys: &[Vec<u8>],
-    after_keys: &[Vec<u8>],
-) -> Vec<(usize, usize)> {
-    let before_len = before_keys.len();
-    let after_len = after_keys.len();
-    if before_len == 0 || after_len == 0 {
-        return Vec::new();
-    }
-
-    let mut lengths = vec![vec![0u32; after_len + 1]; before_len + 1];
-    for before_index in (0..before_len).rev() {
-        for after_index in (0..after_len).rev() {
-            lengths[before_index][after_index] = if before_keys[before_index]
-                == after_keys[after_index]
-            {
-                lengths[before_index + 1][after_index + 1] + 1
-            } else {
-                lengths[before_index + 1][after_index].max(lengths[before_index][after_index + 1])
-            };
-        }
-    }
-
-    let mut pairs = Vec::new();
-    let mut before_index = 0usize;
-    let mut after_index = 0usize;
-
-    while before_index < before_len && after_index < after_len {
-        if before_keys[before_index] == after_keys[after_index] {
-            pairs.push((before_index, after_index));
-            before_index += 1;
-            after_index += 1;
-            continue;
-        }
-
-        if lengths[before_index + 1][after_index] >= lengths[before_index][after_index + 1] {
-            before_index += 1;
-        } else {
-            after_index += 1;
-        }
-    }
-
-    pairs
 }
 
 fn split_lines(data: &[u8]) -> Vec<(Vec<u8>, LineEnding)> {

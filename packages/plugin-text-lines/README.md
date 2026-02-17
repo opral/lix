@@ -13,8 +13,9 @@ snapshot payloads.
 
 ## Benchmarks
 
-Run plugin micro-benchmarks for `detect_changes`:
+Run plugin micro-benchmarks:
 
 ```bash
 cargo bench -p plugin_text_lines --bench detect_changes
+cargo bench -p plugin_text_lines --bench apply_changes
 ```
