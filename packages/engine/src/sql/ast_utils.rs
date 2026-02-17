@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Select, Statement, TableAlias, TableFactor,
+    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
 };
 use sqlparser::ast::{VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
@@ -90,13 +90,26 @@ impl VisitorMut for SelectRewriteVisitor<'_> {
     type Break = LixError;
 
     fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-            return ControlFlow::Continue(());
-        };
-        match (self.rewrite_select)(select.as_mut(), self.changed) {
+        match rewrite_selects_in_set_expr(query.body.as_mut(), self.rewrite_select, self.changed) {
             Ok(()) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }
+    }
+}
+
+fn rewrite_selects_in_set_expr(
+    set_expr: &mut SetExpr,
+    rewrite_select: &mut dyn FnMut(&mut Select, &mut bool) -> Result<(), LixError>,
+    changed: &mut bool,
+) -> Result<(), LixError> {
+    match set_expr {
+        SetExpr::Select(select) => rewrite_select(select.as_mut(), changed),
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_selects_in_set_expr(left.as_mut(), rewrite_select, changed)?;
+            rewrite_selects_in_set_expr(right.as_mut(), rewrite_select, changed)
+        }
+        // Nested Query bodies are visited as their own Query nodes by VisitorMut.
+        _ => Ok(()),
     }
 }
 
@@ -201,6 +214,18 @@ mod tests {
             "WITH c AS (SELECT id FROM foo) \
              SELECT * FROM c JOIN foo ON 1 = 1",
         );
+        let rewritten = rewrite_query_with_select_rewriter(query, &mut rewrite_foo)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(!sql.contains("FROM foo"));
+        assert_eq!(sql.matches("SELECT 1 AS id").count(), 2);
+    }
+
+    #[test]
+    fn rewrites_table_in_set_operation_branches() {
+        let query = parse_query("SELECT id FROM foo UNION SELECT id FROM foo");
         let rewritten = rewrite_query_with_select_rewriter(query, &mut rewrite_foo)
             .expect("rewrite should succeed")
             .expect("query should be rewritten");
