@@ -3,6 +3,10 @@
 Rust/WASM component plugin that models files as line entities for the Lix engine.
 
 - Uses `packages/engine/wit/lix-plugin.wit`.
+- Provides `manifest.json` for install metadata (`plugin_text_lines`).
+- Provides Lix schema docs:
+  - `schema/text_line.json`
+  - `schema/text_document.json`
 - `detect-changes` emits:
   - `text_line` rows for inserted/deleted lines (order-preserving line matching, Git-style)
   - one `text_document` row with ordered `line_ids`
