@@ -591,17 +591,68 @@ impl Engine {
         statements: Vec<Statement>,
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
+        self.execute_statement_script_with_options(statements, &[], &options)
+            .await
+    }
+
+    async fn execute_statement_script_with_options(
+        &self,
+        statements: Vec<Statement>,
+        params: &[Value],
+        options: &ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
         let mut transaction = self.backend.begin_transaction().await?;
-        let mut last_result = QueryResult { rows: Vec::new() };
         let mut active_version_id = self.active_version_id.read().unwrap().clone();
-        let mut active_version_changed = false;
-        let mut installed_plugins_cache_invalidation_pending = false;
-        let original_statements = statements;
-        let coalesced_statements = coalesce_lix_file_transaction_statements(
-            &original_statements,
-            Some(transaction.dialect()),
-        );
-        let can_defer_side_effects = self.wasm_runtime.is_none() && coalesced_statements.is_some();
+        let starting_active_version_id = active_version_id.clone();
+        let installed_plugins_cache_invalidation_pending = statements
+            .iter()
+            .map(Statement::to_string)
+            .any(|sql| should_invalidate_installed_plugins_cache_for_sql(&sql));
+        let result = self
+            .execute_statement_script_with_options_in_transaction(
+                transaction.as_mut(),
+                statements,
+                params,
+                options,
+                &mut active_version_id,
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        transaction.commit().await?;
+        if active_version_id != starting_active_version_id {
+            self.set_active_version_id(active_version_id);
+        }
+        if installed_plugins_cache_invalidation_pending {
+            self.invalidate_installed_plugins_cache()?;
+        }
+        Ok(result)
+    }
+
+    async fn execute_statement_script_with_options_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        original_statements: Vec<Statement>,
+        params: &[Value],
+        options: &ExecuteOptions,
+        active_version_id: &mut String,
+    ) -> Result<QueryResult, LixError> {
+        let coalesced_statements = if params.is_empty() {
+            coalesce_lix_file_transaction_statements(
+                &original_statements,
+                Some(transaction.dialect()),
+            )
+        } else {
+            None
+        };
+        let can_defer_side_effects =
+            params.is_empty() && self.wasm_runtime.is_none() && coalesced_statements.is_some();
         let mut deferred_side_effects = if can_defer_side_effects {
             let original_sql = original_statements
                 .iter()
@@ -615,12 +666,12 @@ impl Engine {
                 untracked_filesystem_update_domain_changes,
                 ..
             } = {
-                let backend = TransactionBackendAdapter::new(transaction.as_mut());
+                let backend = TransactionBackendAdapter::new(transaction);
                 self.collect_execution_side_effects_with_backend(
                     &backend,
                     &original_sql,
-                    &[],
-                    &active_version_id,
+                    params,
+                    active_version_id,
                     options.writer_key.as_deref(),
                     false,
                     false,
@@ -639,34 +690,39 @@ impl Engine {
         };
         let sql_statements = if let Some(coalesced) = coalesced_statements {
             coalesced
-        } else {
+        } else if params.is_empty() {
             coalesce_vtable_inserts_in_statement_list(original_statements)?
+                .into_iter()
+                .map(|statement| statement.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            original_statements
                 .into_iter()
                 .map(|statement| statement.to_string())
                 .collect::<Vec<_>>()
         };
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 
+        let mut last_result = QueryResult { rows: Vec::new() };
         for sql in sql_statements {
-            let previous_active_version_id = active_version_id.clone();
             let result = if skip_statement_side_effect_collection {
                 self.execute_with_options_in_transaction(
-                    transaction.as_mut(),
+                    transaction,
                     &sql,
-                    &[],
-                    &options,
-                    &mut active_version_id,
+                    params,
+                    options,
+                    active_version_id,
                     deferred_side_effects.as_mut(),
                     true,
                 )
                 .await
             } else {
                 self.execute_with_options_in_transaction(
-                    transaction.as_mut(),
+                    transaction,
                     &sql,
-                    &[],
-                    &options,
-                    &mut active_version_id,
+                    params,
+                    options,
+                    active_version_id,
                     None,
                     false,
                 )
@@ -678,39 +734,18 @@ impl Engine {
                     last_result = query_result;
                 }
                 Err(error) => {
-                    let _ = transaction.rollback().await;
                     return Err(error);
                 }
-            }
-
-            if active_version_id != previous_active_version_id {
-                active_version_changed = true;
-            }
-            if should_invalidate_installed_plugins_cache_for_sql(&sql) {
-                installed_plugins_cache_invalidation_pending = true;
             }
         }
 
         if let Some(side_effects) = deferred_side_effects.as_mut() {
-            if let Err(error) = self
-                .flush_deferred_transaction_side_effects_in_transaction(
-                    transaction.as_mut(),
-                    side_effects,
-                    options.writer_key.as_deref(),
-                )
-                .await
-            {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        }
-
-        transaction.commit().await?;
-        if active_version_changed {
-            self.set_active_version_id(active_version_id);
-        }
-        if installed_plugins_cache_invalidation_pending {
-            self.invalidate_installed_plugins_cache()?;
+            self.flush_deferred_transaction_side_effects_in_transaction(
+                transaction,
+                side_effects,
+                options.writer_key.as_deref(),
+            )
+            .await?;
         }
         Ok(last_result)
     }
@@ -2395,50 +2430,9 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
-        let mut transaction = self.backend.begin_transaction().await?;
         let statements = parse_sql_statements(sql)?;
-        let mut last_result = QueryResult { rows: Vec::new() };
-        let mut active_version_id = self.active_version_id.read().unwrap().clone();
-        let mut active_version_changed = false;
-        let mut installed_plugins_cache_invalidation_pending = false;
-        for statement in statements {
-            let statement_sql = statement.to_string();
-            let previous_active_version_id = active_version_id.clone();
-            let result = self
-                .execute_with_options_in_transaction(
-                    transaction.as_mut(),
-                    &statement_sql,
-                    params,
-                    options,
-                    &mut active_version_id,
-                    None,
-                    false,
-                )
-                .await;
-            match result {
-                Ok(query_result) => {
-                    last_result = query_result;
-                }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            }
-            if active_version_id != previous_active_version_id {
-                active_version_changed = true;
-            }
-            if should_invalidate_installed_plugins_cache_for_sql(&statement_sql) {
-                installed_plugins_cache_invalidation_pending = true;
-            }
-        }
-        transaction.commit().await?;
-        if active_version_changed {
-            self.set_active_version_id(active_version_id);
-        }
-        if installed_plugins_cache_invalidation_pending {
-            self.invalidate_installed_plugins_cache()?;
-        }
-        Ok(last_result)
+        self.execute_statement_script_with_options(statements, params, options)
+            .await
     }
 
     async fn execute_multi_statement_sequential_with_options_in_transaction(
@@ -2450,20 +2444,14 @@ impl Engine {
         active_version_id: &mut String,
     ) -> Result<QueryResult, LixError> {
         let statements = parse_sql_statements(sql)?;
-        let mut last_result = QueryResult { rows: Vec::new() };
-        for statement in statements {
-            last_result = Box::pin(self.execute_with_options_in_transaction(
-                transaction,
-                &statement.to_string(),
-                params,
-                options,
-                active_version_id,
-                None,
-                false,
-            ))
-            .await?;
-        }
-        Ok(last_result)
+        self.execute_statement_script_with_options_in_transaction(
+            transaction,
+            statements,
+            params,
+            options,
+            active_version_id,
+        )
+        .await
     }
 }
 
