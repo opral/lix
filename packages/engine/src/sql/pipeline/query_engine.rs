@@ -14,6 +14,25 @@ const PHASE_ORDER: [RewritePhase; 4] = [
     RewritePhase::Lower,
 ];
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ReadRewriteSession {
+    materialized_schema_keys_cache: Option<Vec<String>>,
+}
+
+impl ReadRewriteSession {
+    fn seed_context(&self, context: &mut AnalysisContext) {
+        if let Some(keys) = &self.materialized_schema_keys_cache {
+            context.set_materialized_schema_keys_cache(keys.clone());
+        }
+    }
+
+    fn absorb_context(&mut self, context: &AnalysisContext) {
+        if let Some(keys) = context.materialized_schema_keys_cache() {
+            self.materialized_schema_keys_cache = Some(keys.to_vec());
+        }
+    }
+}
+
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
     run_query_engine_sync(query, &[])
 }
@@ -22,7 +41,7 @@ pub(crate) async fn rewrite_read_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
 ) -> Result<Query, LixError> {
-    run_query_engine_with_backend_and_params(backend, query, &[]).await
+    run_query_engine_with_backend_and_params(backend, query, &[], None).await
 }
 
 pub(crate) async fn rewrite_read_query_with_backend_and_params(
@@ -30,7 +49,16 @@ pub(crate) async fn rewrite_read_query_with_backend_and_params(
     query: Query,
     params: &[Value],
 ) -> Result<Query, LixError> {
-    run_query_engine_with_backend_and_params(backend, query, params).await
+    run_query_engine_with_backend_and_params(backend, query, params, None).await
+}
+
+pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+    session: &mut ReadRewriteSession,
+) -> Result<Query, LixError> {
+    run_query_engine_with_backend_and_params(backend, query, params, Some(session)).await
 }
 
 fn run_query_engine_sync(mut query: Query, params: &[Value]) -> Result<Query, LixError> {
@@ -53,7 +81,7 @@ fn run_phase_sync(
     for _ in 0..MAX_PASSES_PER_PHASE {
         let changed = apply_rules_for_phase_sync(phase, query, params, context)?;
 
-        *context = AnalysisContext::from_query(query);
+        context.refresh_from_query(query);
         validate_phase_invariants(phase, query, context)?;
         if !changed {
             return Ok(());
@@ -81,7 +109,7 @@ fn apply_rules_for_phase_sync(
             QueryRuleOutcome::Changed(rewritten) => {
                 *query = rewritten;
                 changed = true;
-                *context = AnalysisContext::from_query(query);
+                context.refresh_from_query(query);
             }
         }
     }
@@ -93,13 +121,20 @@ async fn run_query_engine_with_backend_and_params(
     backend: &dyn LixBackend,
     mut query: Query,
     params: &[Value],
+    mut session: Option<&mut ReadRewriteSession>,
 ) -> Result<Query, LixError> {
     let mut context = AnalysisContext::from_query(&query);
+    if let Some(session) = session.as_mut() {
+        session.seed_context(&mut context);
+    }
 
     for phase in PHASE_ORDER {
         run_phase_with_backend(phase, backend, &mut query, params, &mut context).await?;
     }
 
+    if let Some(session) = session.as_mut() {
+        session.absorb_context(&context);
+    }
     validate_final_read_query(&query)?;
     Ok(query)
 }
@@ -115,7 +150,7 @@ async fn run_phase_with_backend(
         let changed =
             apply_rules_for_phase_with_backend(phase, backend, query, params, context).await?;
 
-        *context = AnalysisContext::from_query(query);
+        context.refresh_from_query(query);
         validate_phase_invariants(phase, query, context)?;
         if !changed {
             return Ok(());
@@ -147,7 +182,7 @@ async fn apply_rules_for_phase_with_backend(
             QueryRuleOutcome::Changed(rewritten) => {
                 *query = rewritten;
                 changed = true;
-                *context = AnalysisContext::from_query(query);
+                context.refresh_from_query(query);
             }
         }
     }

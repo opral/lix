@@ -7,7 +7,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
@@ -17,7 +17,8 @@ use crate::filesystem::path::{
 use crate::sql::escape_sql_string;
 use crate::sql::{
     bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
-    rewrite_read_query_with_backend, DetectedFileDomainChange, PlaceholderState, ResolvedCell,
+    rewrite_read_query_with_backend_and_params_in_session, DetectedFileDomainChange,
+    PlaceholderState, ReadRewriteSession, ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -42,6 +43,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const INTERNAL_DESCRIPTOR_FILE_ID: &str = "lix";
 const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
+static REWRITTEN_HELPER_SQL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub type ResolvedDirectoryIdMap = BTreeMap<(String, String), String>;
 
@@ -130,6 +132,7 @@ pub async fn insert_side_effect_statements_with_backend(
     if target.read_only {
         return Ok(FilesystemInsertSideEffects::default());
     }
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     let source = match &insert.source {
         Some(source) => source,
@@ -263,7 +266,15 @@ pub async fn insert_side_effect_statements_with_backend(
             continue;
         }
 
-        if let Some(existing_id) = find_directory_id_by_path(backend, &version_id, &path).await? {
+        if let Some(existing_id) =
+            find_directory_id_by_path(
+                backend,
+                &version_id,
+                &path,
+                &mut read_rewrite_session,
+            )
+            .await?
+        {
             known_ids.insert(key, existing_id);
             continue;
         }
@@ -273,8 +284,13 @@ pub async fn insert_side_effect_statements_with_backend(
                 let parent_key = (version_id.clone(), parent_path.clone());
                 if let Some(parent_id) = known_ids.get(&parent_key) {
                     Some(parent_id.clone())
-                } else if let Some(existing_parent_id) =
-                    find_directory_id_by_path(backend, &version_id, &parent_path).await?
+                } else if let Some(existing_parent_id) = find_directory_id_by_path(
+                    backend,
+                    &version_id,
+                    &parent_path,
+                    &mut read_rewrite_session,
+                )
+                .await?
                 {
                     known_ids.insert(parent_key, existing_parent_id.clone());
                     Some(existing_parent_id)
@@ -375,6 +391,7 @@ pub async fn update_side_effects_with_backend(
     if target.read_only || !target.is_file {
         return Ok(FilesystemUpdateSideEffects::default());
     }
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     let mut statement_placeholder_state = statement_start_state;
     let mut next_path: Option<String> = None;
@@ -406,9 +423,15 @@ pub async fn update_side_effects_with_backend(
         &mut version_predicate_state,
     )
     .await?;
-    let matching_file_ids =
-        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
-            .await?;
+    let matching_file_ids = file_ids_matching_update(
+        backend,
+        update,
+        target,
+        params,
+        selection_placeholder_state,
+        &mut read_rewrite_session,
+    )
+    .await?;
     if matching_file_ids.is_empty() {
         return Ok(FilesystemUpdateSideEffects::default());
     }
@@ -552,10 +575,19 @@ pub async fn rewrite_delete_with_backend(
             });
         }
     }
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     if target.is_directory() {
-        let selected = directory_rows_matching_delete(backend, &delete, target, params).await?;
-        let expanded = expand_directory_descendants(backend, &selected).await?;
+        let selected = directory_rows_matching_delete(
+            backend,
+            &delete,
+            target,
+            params,
+            &mut read_rewrite_session,
+        )
+        .await?;
+        let expanded =
+            expand_directory_descendants(backend, &selected, &mut read_rewrite_session).await?;
         if !expanded.is_empty() {
             let predicate = build_directory_delete_selection(&expanded, target)?;
             delete.selection = Some(parse_expression(&predicate)?);
@@ -672,6 +704,7 @@ async fn rewrite_file_insert_columns_with_backend(
     resolved_directory_ids: Option<&ResolvedDirectoryIdMap>,
     active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let id_index = insert
         .columns
         .iter()
@@ -749,8 +782,13 @@ async fn rewrite_file_insert_columns_with_backend(
                 .cloned()
             {
                 Some(existing_id)
-            } else if let Some(existing_id) =
-                find_directory_id_by_path(backend, &version_id, directory_path).await?
+            } else if let Some(existing_id) = find_directory_id_by_path(
+                backend,
+                &version_id,
+                directory_path,
+                &mut read_rewrite_session,
+            )
+            .await?
             {
                 Some(existing_id)
             } else {
@@ -769,6 +807,7 @@ async fn rewrite_file_insert_columns_with_backend(
             &version_id,
             directory_id.as_deref(),
             &candidate_name,
+            &mut read_rewrite_session,
         )
         .await?
         .is_some()
@@ -787,6 +826,7 @@ async fn rewrite_file_insert_columns_with_backend(
             directory_id.as_deref(),
             &parsed.name,
             parsed.extension.as_deref(),
+            &mut read_rewrite_session,
         )
         .await?
         {
@@ -815,6 +855,7 @@ async fn rewrite_directory_insert_columns_with_backend(
     target: FilesystemTarget,
     active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let path_index = insert
         .columns
         .iter()
@@ -922,8 +963,13 @@ async fn rewrite_directory_insert_columns_with_backend(
                 let parent_path = parent_directory_path(&normalized_path);
                 let derived_parent_id = match parent_path {
                     Some(ref parent_path) => {
-                        if let Some(existing_parent_id) =
-                            find_directory_id_by_path(backend, &version_id, parent_path).await?
+                        if let Some(existing_parent_id) = find_directory_id_by_path(
+                            backend,
+                            &version_id,
+                            parent_path,
+                            &mut read_rewrite_session,
+                        )
+                        .await?
                         {
                             Some(existing_parent_id)
                         } else {
@@ -964,7 +1010,12 @@ async fn rewrite_directory_insert_columns_with_backend(
                 }
                 let name = normalize_path_segment(&raw_name)?;
                 let parent_path = match explicit_parent_id.as_deref() {
-                    Some(parent_id) => read_directory_path_by_id(backend, &version_id, parent_id)
+                    Some(parent_id) => read_directory_path_by_id(
+                        backend,
+                        &version_id,
+                        parent_id,
+                        &mut read_rewrite_session,
+                    )
                         .await?
                         .ok_or_else(|| LixError {
                             message: format!("Parent directory does not exist for id {parent_id}"),
@@ -975,8 +1026,13 @@ async fn rewrite_directory_insert_columns_with_backend(
                 (explicit_parent_id, name, computed_path)
             };
 
-        if let Some(existing_id) =
-            find_directory_id_by_path(backend, &version_id, &computed_path).await?
+        if let Some(existing_id) = find_directory_id_by_path(
+            backend,
+            &version_id,
+            &computed_path,
+            &mut read_rewrite_session,
+        )
+        .await?
         {
             let same_id = explicit_id
                 .as_deref()
@@ -987,7 +1043,13 @@ async fn rewrite_directory_insert_columns_with_backend(
             }
         }
 
-        assert_no_file_at_directory_path(backend, &version_id, &computed_path).await?;
+        assert_no_file_at_directory_path(
+            backend,
+            &version_id,
+            &computed_path,
+            &mut read_rewrite_session,
+        )
+        .await?;
 
         row[ensured_parent_index] = optional_string_literal_expr(computed_parent_id.as_deref());
         row[ensured_name_index] = string_literal_expr(&computed_name);
@@ -1004,6 +1066,7 @@ async fn rewrite_file_update_assignments_with_backend(
     params: &[EngineValue],
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let mut placeholder_state = PlaceholderState::new();
     let mut next_path: Option<String> = None;
     for assignment in original_assignments {
@@ -1031,10 +1094,22 @@ async fn rewrite_file_update_assignments_with_backend(
     )
     .await?;
     let parsed = parse_file_path(&raw_path)?;
-    assert_no_directory_at_file_path(backend, &version_id, &parsed.normalized_path).await?;
-    let matching_file_ids =
-        file_ids_matching_update(backend, update, target, params, selection_placeholder_state)
-            .await?;
+    assert_no_directory_at_file_path(
+        backend,
+        &version_id,
+        &parsed.normalized_path,
+        &mut read_rewrite_session,
+    )
+    .await?;
+    let matching_file_ids = file_ids_matching_update(
+        backend,
+        update,
+        target,
+        params,
+        selection_placeholder_state,
+        &mut read_rewrite_session,
+    )
+    .await?;
     let matching_file_ids = matching_file_ids
         .into_iter()
         .map(|row| row.id)
@@ -1043,8 +1118,13 @@ async fn rewrite_file_update_assignments_with_backend(
         return Err(file_unique_error(&parsed.normalized_path, &version_id));
     }
     if !matching_file_ids.is_empty() {
-        if let Some(existing_id) =
-            find_file_id_by_path(backend, &version_id, &parsed.normalized_path).await?
+        if let Some(existing_id) = find_file_id_by_path(
+            backend,
+            &version_id,
+            &parsed.normalized_path,
+            &mut read_rewrite_session,
+        )
+        .await?
         {
             let touches_existing = matching_file_ids.iter().any(|id| id == &existing_id);
             let touches_other = matching_file_ids.iter().any(|id| id != &existing_id);
@@ -1056,7 +1136,12 @@ async fn rewrite_file_update_assignments_with_backend(
 
     let directory_id = if let Some(directory_path) = &parsed.directory_path {
         Some(
-            find_directory_id_by_path(backend, &version_id, directory_path)
+            find_directory_id_by_path(
+                backend,
+                &version_id,
+                directory_path,
+                &mut read_rewrite_session,
+            )
                 .await?
                 .unwrap_or_else(|| auto_directory_id(&version_id, directory_path)),
         )
@@ -1095,12 +1180,16 @@ async fn tracked_missing_directory_changes(
 
     let mut known_ids: BTreeMap<String, String> = BTreeMap::new();
     let mut tracked_directory_changes = Vec::new();
+    let mut read_rewrite_session = ReadRewriteSession::default();
 
     for path in ancestor_paths {
         if known_ids.contains_key(path) {
             continue;
         }
-        if let Some(existing_id) = find_directory_id_by_path(backend, version_id, path).await? {
+        if let Some(existing_id) =
+            find_directory_id_by_path(backend, version_id, path, &mut read_rewrite_session)
+                .await?
+        {
             known_ids.insert(path.clone(), existing_id);
             continue;
         }
@@ -1109,8 +1198,13 @@ async fn tracked_missing_directory_changes(
             Some(parent_path) => {
                 if let Some(parent_id) = known_ids.get(&parent_path) {
                     Some(parent_id.clone())
-                } else if let Some(existing_parent_id) =
-                    find_directory_id_by_path(backend, version_id, &parent_path).await?
+                } else if let Some(existing_parent_id) = find_directory_id_by_path(
+                    backend,
+                    version_id,
+                    &parent_path,
+                    &mut read_rewrite_session,
+                )
+                .await?
                 {
                     known_ids.insert(parent_path, existing_parent_id.clone());
                     Some(existing_parent_id)
@@ -1153,6 +1247,7 @@ async fn rewrite_directory_update_assignments_with_backend(
     target: FilesystemTarget,
 ) -> Result<(), LixError> {
     let mut placeholder_state = PlaceholderState::new();
+    let mut read_rewrite_session = ReadRewriteSession::default();
     let mut next_path: Option<String> = None;
     let mut next_parent_id: Option<Option<String>> = None;
     let mut next_name: Option<String> = None;
@@ -1192,7 +1287,12 @@ async fn rewrite_directory_update_assignments_with_backend(
         });
     };
 
-    let existing = read_directory_descriptor_by_id(backend, &version_id, &current_directory_id)
+    let existing = read_directory_descriptor_by_id(
+        backend,
+        &version_id,
+        &current_directory_id,
+        &mut read_rewrite_session,
+    )
         .await?
         .ok_or_else(|| LixError {
             message: format!("Directory does not exist for id {}", current_directory_id),
@@ -1204,7 +1304,12 @@ async fn rewrite_directory_update_assignments_with_backend(
             message: "Directory name must be provided".to_string(),
         })?;
         let parent_id = match parent_directory_path(&normalized_path) {
-            Some(parent_path) => find_directory_id_by_path(backend, &version_id, &parent_path)
+            Some(parent_path) => find_directory_id_by_path(
+                backend,
+                &version_id,
+                &parent_path,
+                &mut read_rewrite_session,
+            )
                 .await?
                 .ok_or_else(|| LixError {
                     message: format!("Parent directory does not exist for path {}", parent_path),
@@ -1227,7 +1332,12 @@ async fn rewrite_directory_update_assignments_with_backend(
             });
         }
         let parent_path = if let Some(parent_id) = parent_id.as_deref() {
-            read_directory_path_by_id(backend, &version_id, parent_id)
+            read_directory_path_by_id(
+                backend,
+                &version_id,
+                parent_id,
+                &mut read_rewrite_session,
+            )
                 .await?
                 .ok_or_else(|| LixError {
                     message: format!("Parent directory does not exist for id {}", parent_id),
@@ -1250,17 +1360,30 @@ async fn rewrite_directory_update_assignments_with_backend(
             &version_id,
             current_directory_id.as_str(),
             parent_id,
+            &mut read_rewrite_session,
         )
         .await?;
     }
     if let Some(existing_id) =
-        find_directory_id_by_path(backend, &version_id, &resolved_path).await?
+        find_directory_id_by_path(
+            backend,
+            &version_id,
+            &resolved_path,
+            &mut read_rewrite_session,
+        )
+        .await?
     {
         if existing_id != current_directory_id {
             return Err(directory_unique_error(&resolved_path, &version_id));
         }
     }
-    assert_no_file_at_directory_path(backend, &version_id, &resolved_path).await?;
+    assert_no_file_at_directory_path(
+        backend,
+        &version_id,
+        &resolved_path,
+        &mut read_rewrite_session,
+    )
+    .await?;
 
     update.assignments.retain(|assignment| {
         assignment_target_name(assignment)
@@ -1448,6 +1571,7 @@ async fn find_directory_id_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let normalized_path = normalize_directory_path(path)?;
     let trimmed = normalized_path.trim_matches('/');
@@ -1458,8 +1582,14 @@ async fn find_directory_id_by_path(
     let mut current_parent: Option<String> = None;
     for segment in trimmed.split('/') {
         let Some(next_id) =
-            find_directory_child_id(backend, version_id, current_parent.as_deref(), segment)
-                .await?
+            find_directory_child_id(
+                backend,
+                version_id,
+                current_parent.as_deref(),
+                segment,
+                read_rewrite_session,
+            )
+            .await?
         else {
             return Ok(None);
         };
@@ -1474,6 +1604,7 @@ async fn find_directory_child_id(
     version_id: &str,
     parent_id: Option<&str>,
     name: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let mut params = vec![
         EngineValue::Text(version_id.to_string()),
@@ -1544,7 +1675,8 @@ async fn find_directory_child_id(
         schema_key = DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
         parent_predicate = parent_predicate,
     );
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &lookup_sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &lookup_sql, read_rewrite_session).await?;
     let result = backend.execute(&rewritten_sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
@@ -1564,10 +1696,13 @@ async fn find_file_id_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let parsed = parse_file_path(path)?;
     let directory_id = if let Some(directory_path) = parsed.directory_path.as_deref() {
-        let resolved = find_directory_id_by_path(backend, version_id, directory_path).await?;
+        let resolved =
+            find_directory_id_by_path(backend, version_id, directory_path, read_rewrite_session)
+                .await?;
         let Some(directory_id) = resolved else {
             return Ok(None);
         };
@@ -1582,6 +1717,7 @@ async fn find_file_id_by_path(
         directory_id.as_deref(),
         &parsed.name,
         parsed.extension.as_deref(),
+        read_rewrite_session,
     )
     .await
 }
@@ -1592,6 +1728,7 @@ async fn find_file_id_by_components(
     directory_id: Option<&str>,
     name: &str,
     extension: Option<&str>,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let mut params = vec![
         EngineValue::Text(version_id.to_string()),
@@ -1672,7 +1809,8 @@ async fn find_file_id_by_components(
         directory_predicate = directory_predicate,
         extension_predicate = extension_predicate,
     );
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &lookup_sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &lookup_sql, read_rewrite_session).await?;
     let result = backend.execute(&rewritten_sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
@@ -1691,7 +1829,24 @@ async fn find_file_id_by_components(
 async fn rewrite_single_read_query_for_backend(
     backend: &dyn LixBackend,
     sql: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<String, LixError> {
+    let cache_key = {
+        let dialect = match backend.dialect() {
+            crate::backend::SqlDialect::Sqlite => "sqlite",
+            crate::backend::SqlDialect::Postgres => "postgres",
+        };
+        format!("{dialect}\n{sql}")
+    };
+    if let Some(cached) = helper_sql_cache()
+        .lock()
+        .expect("helper sql cache mutex poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         message: error.to_string(),
     })?;
@@ -1706,9 +1861,27 @@ async fn rewrite_single_read_query_for_backend(
             message: "expected SELECT statement".to_string(),
         });
     };
-    let rewritten = rewrite_read_query_with_backend(backend, *query).await?;
+    let rewritten = rewrite_read_query_with_backend_and_params_in_session(
+        backend,
+        *query,
+        &[],
+        read_rewrite_session,
+    )
+    .await?;
     let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
-    Ok(lowered.to_string())
+    let lowered_sql = lowered.to_string();
+    let mut cache = helper_sql_cache()
+        .lock()
+        .expect("helper sql cache mutex poisoned");
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(cache_key, lowered_sql.clone());
+    Ok(lowered_sql)
+}
+
+fn helper_sql_cache() -> &'static Mutex<BTreeMap<String, String>> {
+    REWRITTEN_HELPER_SQL_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn resolve_text_expr(
@@ -2184,9 +2357,10 @@ async fn assert_no_directory_at_file_path(
     backend: &dyn LixBackend,
     version_id: &str,
     file_path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<(), LixError> {
     let directory_path = format!("{file_path}/");
-    if find_directory_id_by_path(backend, version_id, &directory_path)
+    if find_directory_id_by_path(backend, version_id, &directory_path, read_rewrite_session)
         .await?
         .is_none()
     {
@@ -2201,9 +2375,10 @@ async fn assert_no_file_at_directory_path(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_path: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<(), LixError> {
     let file_path = directory_path.trim_end_matches('/').to_string();
-    if find_file_id_by_path(backend, version_id, &file_path)
+    if find_file_id_by_path(backend, version_id, &file_path, read_rewrite_session)
         .await?
         .is_none()
     {
@@ -2218,12 +2393,14 @@ async fn read_directory_path_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<String>, LixError> {
     let sql = "SELECT path \
          FROM lix_directory_by_version \
          WHERE lixcol_version_id = $1 AND id = $2 \
          LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -2251,6 +2428,7 @@ async fn read_directory_descriptor_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<DirectoryDescriptorSnapshot>, LixError> {
     let sql = "SELECT \
          lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
@@ -2261,7 +2439,8 @@ async fn read_directory_descriptor_by_id(
            AND version_id = $1 \
            AND lix_json_text(snapshot_content, 'id') = $2 \
          LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -2306,6 +2485,7 @@ async fn assert_no_directory_cycle(
     version_id: &str,
     directory_id: &str,
     parent_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<(), LixError> {
     let mut safety = 0usize;
     let mut current_parent: Option<String> = Some(parent_id.to_string());
@@ -2323,7 +2503,13 @@ async fn assert_no_directory_cycle(
         safety += 1;
 
         let Some(snapshot) =
-            read_directory_descriptor_by_id(backend, version_id, &parent_id).await?
+            read_directory_descriptor_by_id(
+                backend,
+                version_id,
+                &parent_id,
+                read_rewrite_session,
+            )
+            .await?
         else {
             return Err(LixError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
@@ -2339,6 +2525,7 @@ async fn directory_rows_matching_delete(
     delete: &Delete,
     target: FilesystemTarget,
     params: &[EngineValue],
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedDirectoryId>, LixError> {
     let where_clause = delete
         .selection
@@ -2363,7 +2550,8 @@ async fn directory_rows_matching_delete(
             where_clause = where_clause
         )
     };
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
     let result = backend
         .execute(&rewritten_sql, params)
         .await
@@ -2439,11 +2627,19 @@ async fn file_ids_matching_update(
     target: FilesystemTarget,
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
     let trace = file_prefetch_trace_enabled();
     if let Some(rows) =
-        try_file_ids_matching_update_fast(backend, update, target, params, placeholder_state)
-            .await?
+        try_file_ids_matching_update_fast(
+            backend,
+            update,
+            target,
+            params,
+            placeholder_state,
+            read_rewrite_session,
+        )
+        .await?
     {
         if trace {
             eprintln!(
@@ -2466,7 +2662,8 @@ async fn file_ids_matching_update(
         view_name = target.view_name,
         where_clause = where_clause
     );
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
     let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
     let result = backend
         .execute(&bound.sql, &bound.params)
@@ -2518,6 +2715,7 @@ async fn try_file_ids_matching_update_fast(
     target: FilesystemTarget,
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
     let mut selection_state = placeholder_state;
     let Some(selection) = extract_exact_file_update_selection_with_state(
@@ -2559,7 +2757,8 @@ async fn try_file_ids_matching_update_fast(
                AND snapshot_content IS NOT NULL \
                AND version_id = $1 \
                AND entity_id = $2";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
@@ -2601,17 +2800,16 @@ async fn try_exact_file_descriptor_lookup_current_version(
     version_id: &str,
     file_id: &str,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
-    let sql = "SELECT entity_id, untracked, snapshot_content, \
-                    'mutation.file_ids_matching_update.fast_id.vtable' AS __lix_trace \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_file_descriptor' \
-               AND version_id = $1 \
-               AND entity_id = $2 \
-             LIMIT 1";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
-    let result = backend
+    let untracked_sql = "SELECT entity_id, 1 AS untracked, snapshot_content, \
+                              'mutation.file_ids_matching_update.fast_id.untracked' AS __lix_trace \
+                       FROM lix_internal_state_untracked \
+                       WHERE schema_key = 'lix_file_descriptor' \
+                         AND version_id = $1 \
+                         AND entity_id = $2 \
+                       LIMIT 1";
+    let untracked_result = backend
         .execute(
-            &rewritten_sql,
+            untracked_sql,
             &[
                 EngineValue::Text(version_id.to_string()),
                 EngineValue::Text(file_id.to_string()),
@@ -2621,11 +2819,39 @@ async fn try_exact_file_descriptor_lookup_current_version(
         .map_err(|error| LixError {
             message: format!(
                 "file update exact current-version prefetch failed for '{}': {}",
-                rewritten_sql, error.message
+                untracked_sql, error.message
+            ),
+        })?;
+    if let Some(parsed) = parse_exact_file_descriptor_lookup_rows(untracked_result.rows)? {
+        return Ok(Some(parsed));
+    }
+
+    let materialized_sql = "SELECT entity_id, 0 AS untracked, snapshot_content, \
+                                 'mutation.file_ids_matching_update.fast_id.materialized' AS __lix_trace \
+                          FROM lix_internal_state_materialized_v1_lix_file_descriptor \
+                          WHERE schema_key = 'lix_file_descriptor' \
+                            AND version_id = $1 \
+                            AND entity_id = $2 \
+                            AND is_tombstone = 0 \
+                            AND snapshot_content IS NOT NULL \
+                          LIMIT 1";
+    let materialized_result = backend
+        .execute(
+            materialized_sql,
+            &[
+                EngineValue::Text(version_id.to_string()),
+                EngineValue::Text(file_id.to_string()),
+            ],
+        )
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file update exact current-version prefetch failed for '{}': {}",
+                materialized_sql, error.message
             ),
         })?;
 
-    parse_exact_file_descriptor_lookup_rows(result.rows)
+    parse_exact_file_descriptor_lookup_rows(materialized_result.rows)
 }
 
 fn parse_exact_file_descriptor_lookup_rows(
@@ -2819,10 +3045,17 @@ fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
 async fn expand_directory_descendants(
     backend: &dyn LixBackend,
     selected: &[ScopedDirectoryId],
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<ScopedDirectoryId>, LixError> {
     let mut out: BTreeSet<ScopedDirectoryId> = BTreeSet::new();
     for scoped in selected {
-        let ids = load_directory_descendants(backend, &scoped.version_id, &scoped.id).await?;
+        let ids = load_directory_descendants(
+            backend,
+            &scoped.version_id,
+            &scoped.id,
+            read_rewrite_session,
+        )
+        .await?;
         for id in ids {
             out.insert(ScopedDirectoryId {
                 id,
@@ -2837,6 +3070,7 @@ async fn load_directory_descendants(
     backend: &dyn LixBackend,
     version_id: &str,
     root_id: &str,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<String>, LixError> {
     let sql = "WITH RECURSIVE directory_rows AS (\
          SELECT \
@@ -2857,7 +3091,8 @@ async fn load_directory_descendants(
            WHERE child.version_id = $1\
          ) \
          SELECT id FROM descendants";
-    let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
     let result = backend
         .execute(
             &rewritten_sql,
