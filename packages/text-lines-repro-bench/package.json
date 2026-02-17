@@ -1,0 +1,14 @@
+{
+  "name": "text-lines-repro-bench",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Focused reproduction benchmark for text-lines plugin write-path cost",
+  "scripts": {
+    "bench": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm run bench:run",
+    "bench:run": "node ./src/repro.bench.js"
+  },
+  "dependencies": {
+    "js-sdk": "workspace:*"
+  }
+}
