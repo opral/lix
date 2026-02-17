@@ -12,35 +12,7 @@ use crate::LixError;
 const LIX_ACTIVE_ACCOUNT_VIEW_NAME: &str = "lix_active_account";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    if !top_level_select_targets_lix_active_account(&query) {
-        return Ok(None);
-    }
     rewrite_query_with_select_rewriter(query, &mut rewrite_select)
-}
-
-fn top_level_select_targets_lix_active_account(query: &Query) -> bool {
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    select
-        .from
-        .iter()
-        .any(table_with_joins_targets_lix_active_account)
-}
-
-fn table_with_joins_targets_lix_active_account(table: &sqlparser::ast::TableWithJoins) -> bool {
-    table_factor_is_lix_active_account(&table.relation)
-        || table
-            .joins
-            .iter()
-            .any(|join| table_factor_is_lix_active_account(&join.relation))
-}
-
-fn table_factor_is_lix_active_account(relation: &TableFactor) -> bool {
-    matches!(
-        relation,
-        TableFactor::Table { name, .. } if object_name_matches(name, LIX_ACTIVE_ACCOUNT_VIEW_NAME)
-    )
 }
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
@@ -96,4 +68,37 @@ fn build_lix_active_account_view_query() -> Result<Query, LixError> {
 
 fn default_lix_active_account_alias() -> sqlparser::ast::TableAlias {
     default_alias(LIX_ACTIVE_ACCOUNT_VIEW_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_query;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        assert_eq!(statements.len(), 1);
+        match statements.remove(0) {
+            sqlparser::ast::Statement::Query(query) => *query,
+            other => panic!("expected query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrites_lix_active_account_inside_exists_subquery() {
+        let query = parse_query(
+            "SELECT 1 \
+             WHERE EXISTS (SELECT 1 FROM lix_active_account WHERE account_id = 'a')",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(!sql.contains("FROM lix_active_account"));
+        assert!(sql.contains("lix_internal_state_vtable"));
+        assert!(sql.contains("untracked = 1"));
+    }
 }

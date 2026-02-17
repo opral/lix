@@ -3,13 +3,12 @@ use sqlparser::ast::{Insert, Query, Statement};
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::sql::entity_views::{read as entity_view_read, write as entity_view_write};
+use crate::sql::entity_views::write as entity_view_write;
+use crate::sql::read_pipeline;
 use crate::sql::steps::{
-    filesystem_step, lix_active_account_view_read, lix_active_account_view_write,
-    lix_active_version_view_read, lix_active_version_view_write, lix_state_by_version_view_read,
-    lix_state_by_version_view_write, lix_state_history_view_read, lix_state_history_view_write,
-    lix_state_view_read, lix_state_view_write, lix_version_view_read, lix_version_view_write,
-    stored_schema, vtable_read, vtable_write,
+    filesystem_step, lix_active_account_view_write, lix_active_version_view_write,
+    lix_state_by_version_view_write, lix_state_history_view_write, lix_state_view_write,
+    lix_version_view_write, stored_schema, vtable_write,
 };
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
@@ -640,22 +639,14 @@ where
 }
 
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
-    let query = filesystem_step::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = entity_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    Ok(vtable_read::rewrite_query(query.clone())?.unwrap_or(query))
+    read_pipeline::rewrite_read_query(query)
 }
 
 pub(crate) async fn rewrite_read_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
 ) -> Result<Query, LixError> {
-    rewrite_read_query_with_backend_and_params(backend, query, &[]).await
+    read_pipeline::rewrite_read_query_with_backend(backend, query).await
 }
 
 pub(crate) async fn rewrite_read_query_with_backend_and_params(
@@ -663,21 +654,7 @@ pub(crate) async fn rewrite_read_query_with_backend_and_params(
     query: Query,
     params: &[Value],
 ) -> Result<Query, LixError> {
-    let query = filesystem_step::rewrite_query_with_params(query.clone(), params)?.unwrap_or(query);
-    let query = entity_view_read::rewrite_query_with_backend(backend, query.clone())
-        .await?
-        .unwrap_or(query);
-    let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    Ok(
-        vtable_read::rewrite_query_with_backend(backend, query.clone())
-            .await?
-            .unwrap_or(query),
-    )
+    read_pipeline::rewrite_read_query_with_backend_and_params(backend, query, params).await
 }
 
 fn selection_mentions_inherited_from_version_id(selection: Option<&sqlparser::ast::Expr>) -> bool {

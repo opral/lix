@@ -1,5 +1,5 @@
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Select, SetExpr, TableFactor};
+use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Select, TableFactor};
 
 use crate::sql::{
     default_alias, escape_sql_string, parse_single_query, quote_ident,
@@ -214,50 +214,27 @@ fn lixcol_aliases_for_variant(
 }
 
 fn collect_table_view_names(query: &Query) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_set_expr_view_names(query.body.as_ref(), &mut out);
-    out
-}
-
-fn collect_set_expr_view_names(expr: &SetExpr, out: &mut Vec<String>) {
-    match expr {
-        SetExpr::Select(select) => {
-            for table in &select.from {
-                collect_table_factor_view_names(&table.relation, out);
-                for join in &table.joins {
-                    collect_table_factor_view_names(&join.relation, out);
-                }
-            }
-        }
-        SetExpr::Query(query) => collect_set_expr_view_names(query.body.as_ref(), out),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_set_expr_view_names(left.as_ref(), out);
-            collect_set_expr_view_names(right.as_ref(), out);
-        }
-        _ => {}
-    }
-}
-
-fn collect_table_factor_view_names(relation: &TableFactor, out: &mut Vec<String>) {
-    match relation {
-        TableFactor::Table { name, .. } => {
-            if let Some(view_name) = object_name_terminal(name) {
-                out.push(view_name);
-            }
-        }
-        TableFactor::Derived { subquery, .. } => {
-            collect_set_expr_view_names(subquery.body.as_ref(), out);
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            collect_table_factor_view_names(&table_with_joins.relation, out);
-            for join in &table_with_joins.joins {
-                collect_table_factor_view_names(&join.relation, out);
-            }
-        }
-        _ => {}
-    }
+    let mut view_names = Vec::new();
+    let mut collect_from_select =
+        |select: &mut Select, _changed: &mut bool| -> Result<(), LixError> {
+            let mut ignored = false;
+            rewrite_table_factors_in_select(
+                select,
+                &mut |relation, _changed| {
+                    let TableFactor::Table { name, .. } = relation else {
+                        return Ok(());
+                    };
+                    if let Some(view_name) = object_name_terminal(name) {
+                        view_names.push(view_name);
+                    }
+                    Ok(())
+                },
+                &mut ignored,
+            )?;
+            Ok(())
+        };
+    let _ = rewrite_query_with_select_rewriter(query.clone(), &mut collect_from_select);
+    view_names
 }
 
 fn object_name_terminal(name: &ObjectName) -> Option<String> {

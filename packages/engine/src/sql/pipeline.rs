@@ -490,4 +490,25 @@ mod tests {
             "postgres lowering should emit jsonb_extract_path_text()"
         );
     }
+
+    #[test]
+    fn rewrite_only_rewrites_lix_active_version_in_nested_subquery() {
+        let rewritten = preprocess_sql_rewrite_only(
+            "SELECT COUNT(*) \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'bench_schema' \
+               AND version_id IN (SELECT version_id FROM lix_active_version) \
+               AND snapshot_content IS NOT NULL",
+        )
+        .expect("rewrite should succeed");
+
+        assert!(
+            !rewritten.sql.contains("FROM lix_active_version"),
+            "nested lix_active_version should be rewritten"
+        );
+        assert!(
+            rewritten.sql.contains("lix_internal_state_vtable"),
+            "rewritten query should route through vtable reads"
+        );
+    }
 }
