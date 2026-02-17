@@ -1640,7 +1640,15 @@ async fn find_directory_child_id(
         parent_predicate = parent_predicate,
     );
     let result = backend.execute(&lookup_sql, &params).await?;
-    select_effective_entity_id(&result.rows, &version_chain)
+    let candidate = select_effective_entity_id(&result.rows, &version_chain)?;
+    ensure_effective_entity_visible_in_chain(
+        backend,
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        "lix_internal_state_materialized_v1_lix_directory_descriptor",
+        &version_chain,
+        candidate,
+    )
+    .await
 }
 
 async fn find_file_id_by_path(
@@ -1739,7 +1747,86 @@ async fn find_file_id_by_components(
         extension_predicate = extension_predicate,
     );
     let result = backend.execute(&lookup_sql, &params).await?;
-    select_effective_entity_id(&result.rows, &version_chain)
+    let candidate = select_effective_entity_id(&result.rows, &version_chain)?;
+    ensure_effective_entity_visible_in_chain(
+        backend,
+        FILE_DESCRIPTOR_SCHEMA_KEY,
+        "lix_internal_state_materialized_v1_lix_file_descriptor",
+        &version_chain,
+        candidate,
+    )
+    .await
+}
+
+async fn ensure_effective_entity_visible_in_chain(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+    materialized_table: &str,
+    version_chain: &[String],
+    candidate: Option<String>,
+) -> Result<Option<String>, LixError> {
+    let Some(candidate_id) = candidate else {
+        return Ok(None);
+    };
+    if !effective_entity_is_tombstoned_in_chain(
+        backend,
+        schema_key,
+        materialized_table,
+        version_chain,
+        &candidate_id,
+    )
+    .await?
+    {
+        return Ok(Some(candidate_id));
+    }
+    Ok(None)
+}
+
+async fn effective_entity_is_tombstoned_in_chain(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+    materialized_table: &str,
+    version_chain: &[String],
+    entity_id: &str,
+) -> Result<bool, LixError> {
+    if version_chain.is_empty() {
+        return Ok(false);
+    }
+    let mut params = version_chain
+        .iter()
+        .map(|value| EngineValue::Text(value.clone()))
+        .collect::<Vec<_>>();
+    let version_predicate = placeholder_range(1, version_chain.len());
+    let entity_index = params.len() + 1;
+    params.push(EngineValue::Text(entity_id.to_string()));
+    let sql = format!(
+        "SELECT version_id, untracked, tombstone \
+         FROM ( \
+           SELECT version_id, 1 AS untracked, \
+                  CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS tombstone \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND entity_id = ${entity_index} \
+           UNION ALL \
+           SELECT version_id, 0 AS untracked, \
+                  CASE WHEN is_tombstone = 1 OR snapshot_content IS NULL THEN 1 ELSE 0 END AS tombstone \
+           FROM {materialized_table} \
+           WHERE schema_key = '{schema_key}' \
+             AND version_id IN ({version_predicate}) \
+             AND entity_id = ${entity_index} \
+         ) candidates",
+        schema_key = escape_sql_string(schema_key),
+        version_predicate = version_predicate,
+        entity_index = entity_index,
+        materialized_table = materialized_table,
+    );
+    let result = backend.execute(&sql, &params).await?;
+    let Some(tombstoned) = select_effective_entity_tombstone_state(&result.rows, version_chain)?
+    else {
+        return Ok(false);
+    };
+    Ok(tombstoned)
 }
 
 fn placeholder_range(start: usize, len: usize) -> String {
@@ -1856,6 +1943,46 @@ fn select_effective_entity_id(
     }
 
     Ok(best.map(|(_, _, entity_id)| entity_id))
+}
+
+fn select_effective_entity_tombstone_state(
+    rows: &[Vec<EngineValue>],
+    version_chain: &[String],
+) -> Result<Option<bool>, LixError> {
+    let depth_by_version = version_chain
+        .iter()
+        .enumerate()
+        .map(|(depth, version_id)| (version_id.clone(), depth))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut best: Option<(usize, usize, bool)> = None;
+    for row in rows {
+        let Some(EngineValue::Text(version_id)) = row.first() else {
+            continue;
+        };
+        let untracked = row
+            .get(1)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        let tombstone = row
+            .get(2)
+            .map(parse_untracked_value)
+            .transpose()?
+            .unwrap_or(false);
+        let depth = *depth_by_version.get(version_id).unwrap_or(&usize::MAX);
+        let priority = if untracked { 0 } else { 1 };
+        let candidate = (depth, priority, tombstone);
+        if best
+            .as_ref()
+            .map(|current| candidate < *current)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    Ok(best.map(|(_, _, tombstone)| tombstone))
 }
 
 fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> String {
@@ -3330,7 +3457,7 @@ mod tests {
     use super::{
         extract_predicate_string_with_params_and_state, json_text_expr_sql,
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
-        rewrite_update,
+        rewrite_update, select_effective_entity_tombstone_state,
     };
     use crate::sql::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
@@ -3553,5 +3680,45 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "file-b");
         assert!(parsed[0].untracked);
+    }
+
+    #[test]
+    fn effective_entity_tombstone_state_prefers_newer_tombstone() {
+        let rows = vec![
+            vec![
+                Value::Text("v1".to_string()),
+                Value::Integer(0),
+                Value::Integer(0),
+            ],
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(0),
+                Value::Integer(1),
+            ],
+        ];
+        let chain = vec!["v2".to_string(), "v1".to_string()];
+        let tombstone =
+            select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
+        assert_eq!(tombstone, Some(true));
+    }
+
+    #[test]
+    fn effective_entity_tombstone_state_respects_untracked_overlay_priority() {
+        let rows = vec![
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(0),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(1),
+                Value::Integer(0),
+            ],
+        ];
+        let chain = vec!["v2".to_string(), "v1".to_string()];
+        let tombstone =
+            select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
+        assert_eq!(tombstone, Some(false));
     }
 }
