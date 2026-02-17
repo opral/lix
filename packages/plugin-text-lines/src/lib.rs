@@ -36,17 +36,6 @@ impl LineEnding {
         }
     }
 
-    fn from_str(value: &str) -> Result<Self, PluginError> {
-        match value {
-            "" => Ok(Self::None),
-            "\n" => Ok(Self::Lf),
-            "\r\n" => Ok(Self::Crlf),
-            _ => Err(PluginError::InvalidInput(format!(
-                "unsupported line ending '{value}', expected one of '', '\\n', '\\r\\n'"
-            ))),
-        }
-    }
-
     fn marker_byte(self) -> u8 {
         match self {
             Self::None => 0,
@@ -72,19 +61,6 @@ struct DocumentSnapshot<'a> {
 #[serde(deny_unknown_fields)]
 struct DocumentSnapshotOwned {
     line_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct LineSnapshot<'a> {
-    content_hex: &'a str,
-    ending: &'a str,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LineSnapshotOwned {
-    content_hex: String,
-    ending: String,
 }
 
 impl Guest for TextLinesPlugin {
@@ -293,18 +269,22 @@ fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginErr
 }
 
 fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginError> {
-    let parsed: LineSnapshotOwned = serde_json::from_str(raw).map_err(|error| {
+    let (content_hex, ending) = parse_line_snapshot_fields(raw).map_err(|error| {
         PluginError::InvalidInput(format!(
             "invalid text_line snapshot_content for entity_id '{entity_id}': {error}"
         ))
     })?;
 
-    let content = hex_to_bytes(&parsed.content_hex).map_err(|error| {
+    let content = hex_to_bytes(content_hex).map_err(|error| {
         PluginError::InvalidInput(format!(
             "invalid text_line.content_hex for entity_id '{entity_id}': {error}"
         ))
     })?;
-    let ending = LineEnding::from_str(&parsed.ending)?;
+    let ending = parse_line_ending_literal(ending).map_err(|error| {
+        PluginError::InvalidInput(format!(
+            "invalid text_line.ending for entity_id '{entity_id}': {error}"
+        ))
+    })?;
 
     Ok(ParsedLine {
         entity_id: entity_id.to_string(),
@@ -315,11 +295,20 @@ fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginE
 
 fn serialize_line_snapshot(line: &ParsedLine) -> Result<String, PluginError> {
     let content_hex = bytes_to_hex(&line.content);
-    serde_json::to_string(&LineSnapshot {
-        content_hex: &content_hex,
-        ending: line.ending.as_str(),
-    })
-    .map_err(|error| PluginError::Internal(format!("failed to encode text_line snapshot: {error}")))
+    let ending = line_ending_json_literal(line.ending);
+    let mut encoded = String::with_capacity(
+        LINE_SNAPSHOT_PREFIX.len()
+            + content_hex.len()
+            + LINE_SNAPSHOT_SEPARATOR.len()
+            + ending.len()
+            + LINE_SNAPSHOT_SUFFIX.len(),
+    );
+    encoded.push_str(LINE_SNAPSHOT_PREFIX);
+    encoded.push_str(&content_hex);
+    encoded.push_str(LINE_SNAPSHOT_SEPARATOR);
+    encoded.push_str(ending);
+    encoded.push_str(LINE_SNAPSHOT_SUFFIX);
+    Ok(encoded)
 }
 
 fn parse_lines_with_ids(data: &[u8]) -> Vec<ParsedLine> {
@@ -480,6 +469,37 @@ fn line_fingerprint(content: &[u8], ending: LineEnding) -> [u8; 20] {
     let mut fingerprint = [0u8; 20];
     fingerprint.copy_from_slice(&digest);
     fingerprint
+}
+
+const LINE_SNAPSHOT_PREFIX: &str = "{\"content_hex\":\"";
+const LINE_SNAPSHOT_SEPARATOR: &str = "\",\"ending\":\"";
+const LINE_SNAPSHOT_SUFFIX: &str = "\"}";
+
+fn parse_line_snapshot_fields(raw: &str) -> Result<(&str, &str), String> {
+    let inner = raw
+        .strip_prefix(LINE_SNAPSHOT_PREFIX)
+        .and_then(|value| value.strip_suffix(LINE_SNAPSHOT_SUFFIX))
+        .ok_or_else(|| "expected {\"content_hex\":\"...\",\"ending\":\"...\"}".to_string())?;
+    inner
+        .split_once(LINE_SNAPSHOT_SEPARATOR)
+        .ok_or_else(|| "missing content_hex or ending field".to_string())
+}
+
+fn line_ending_json_literal(ending: LineEnding) -> &'static str {
+    match ending {
+        LineEnding::None => "",
+        LineEnding::Lf => "\\n",
+        LineEnding::Crlf => "\\r\\n",
+    }
+}
+
+fn parse_line_ending_literal(value: &str) -> Result<LineEnding, String> {
+    match value {
+        "" => Ok(LineEnding::None),
+        "\\n" => Ok(LineEnding::Lf),
+        "\\r\\n" => Ok(LineEnding::Crlf),
+        _ => Err("unsupported ending literal; expected \"\", \"\\\\n\", or \"\\\\r\\\\n\"".to_string()),
+    }
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {

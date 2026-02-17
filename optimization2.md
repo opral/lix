@@ -153,3 +153,39 @@ This log records each optimization trial with baseline vs candidate benchmark re
 ### Decision
 
 - Keep. Detect path clears >10% with strong significance on core lockfile-heavy scenarios.
+
+## Trial 6: Manual line-snapshot codec (replace serde JSON encode/decode for `text_line`)
+
+- Status: Kept
+- Scope:
+  - `serialize_line_snapshot`: manual fixed-shape JSON string construction.
+  - `parse_line_snapshot`: manual fixed-shape field extraction + explicit ending literal parsing.
+- Gate: keep only if >=10% statistically significant improvement.
+
+### Baseline (`opt2_trial6_before_detect`, `opt2_trial6_before_apply`)
+
+- `detect_changes/small_single_line_edit`: `[4.4692 µs 4.7584 µs 5.1401 µs]`
+- `detect_changes/lockfile_large_create`: `[3.9347 ms 3.9776 ms 4.0459 ms]`
+- `detect_changes/lockfile_large_patch`: `[9.4057 ms 9.7089 ms 10.122 ms]`
+- `detect_changes/lockfile_large_block_move_and_patch`: `[11.919 ms 12.038 ms 12.146 ms]`
+- `apply_changes/small_projection_from_empty`: `[1.7957 µs 1.8082 µs 1.8231 µs]`
+- `apply_changes/small_delta_on_base`: `[2.5264 µs 2.6428 µs 2.8122 µs]`
+- `apply_changes/lockfile_projection_from_empty`: `[6.2112 ms 6.3086 ms 6.4214 ms]`
+- `apply_changes/lockfile_delta_patch_on_base`: `[5.4396 ms 5.5035 ms 5.6065 ms]`
+- `apply_changes/lockfile_delta_move_patch_on_base`: `[7.2386 ms 7.5865 ms 7.9813 ms]`
+
+### Candidate (after change, compared with baseline)
+
+- `detect_changes/small_single_line_edit`: change `[-20.885% -14.844% -8.6747%]`, `p=0.00`
+- `detect_changes/lockfile_large_create`: change `[-18.873% -15.105% -11.701%]`, `p=0.00`
+- `detect_changes/lockfile_large_patch`: change `[-12.667% -8.2534% -3.9221%]`, `p=0.00`
+- `detect_changes/lockfile_large_block_move_and_patch`: no significant change
+- `apply_changes/small_projection_from_empty`: change `[-14.398% -13.119% -11.585%]`, `p=0.00`
+- `apply_changes/small_delta_on_base`: change `[-20.005% -14.303% -9.5417%]`, `p=0.00`
+- `apply_changes/lockfile_projection_from_empty`: change `[-14.331% -12.842% -11.359%]`, `p=0.00`
+- `apply_changes/lockfile_delta_patch_on_base`: change within noise threshold
+- `apply_changes/lockfile_delta_move_patch_on_base`: no significant change
+
+### Decision
+
+- Keep. This gives clear >10% wins on several detect/apply paths with strong statistical significance.
