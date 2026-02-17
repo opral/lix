@@ -2647,7 +2647,9 @@ fn parse_exact_file_descriptor_lookup_rows(
         .map(parse_untracked_value)
         .transpose()?
         .unwrap_or(false);
-    let is_tombstone = row.get(2).is_none_or(|value| matches!(value, EngineValue::Null));
+    let is_tombstone = row
+        .get(2)
+        .is_none_or(|value| matches!(value, EngineValue::Null));
     if is_tombstone {
         return Ok(Some(Vec::new()));
     }
@@ -3057,10 +3059,10 @@ mod tests {
         extract_predicate_string_with_params_and_state, parse_exact_file_descriptor_lookup_rows,
         parse_expression, rewrite_delete, rewrite_insert, rewrite_update,
     };
-    use crate::SqlDialect;
     use crate::sql::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
     use crate::sql::PlaceholderState;
+    use crate::SqlDialect;
     use crate::Value;
     use sqlparser::ast::Statement;
 
@@ -3267,5 +3269,4 @@ mod tests {
         assert_eq!(parsed[0].id, "file-b");
         assert!(parsed[0].untracked);
     }
-
 }

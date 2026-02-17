@@ -138,7 +138,11 @@ fn select_requires_commit_mapping(select: &Select) -> bool {
         GroupByExpr::All(_) => return true,
     }
 
-    if select.projection.iter().any(select_item_requires_commit_mapping) {
+    if select
+        .projection
+        .iter()
+        .any(select_item_requires_commit_mapping)
+    {
         return true;
     }
 

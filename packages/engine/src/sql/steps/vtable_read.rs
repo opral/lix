@@ -615,12 +615,7 @@ fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<
 }
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    let top_level_targets_vtable = query_targets_vtable(&query);
-    let schema_keys = if top_level_targets_vtable {
-        extract_schema_keys_from_query(&query).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
 
     let mut changed = false;
     let mut new_query = query.clone();
@@ -637,21 +632,14 @@ pub async fn rewrite_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
 ) -> Result<Option<Query>, LixError> {
-    let top_level_targets_vtable = query_targets_vtable(&query);
-    let mut schema_keys = if top_level_targets_vtable {
-        extract_schema_keys_from_query(&query).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let mut schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
 
     // If no schema-key literal is available, fall back to plugin-key derived
     // schema resolution and finally to all materialized schema tables.
     if schema_keys.is_empty() {
-        let plugin_keys = if top_level_targets_vtable {
-            extract_plugin_keys_from_query(&query).unwrap_or_default()
-        } else {
-            extract_plugin_keys_from_top_level_derived_subquery(&query).unwrap_or_default()
-        };
+        let plugin_keys = extract_plugin_keys_from_query(&query)
+            .or_else(|| extract_plugin_keys_from_top_level_derived_subquery(&query))
+            .unwrap_or_default();
         if !plugin_keys.is_empty() {
             schema_keys = fetch_schema_keys_for_plugins(backend, &plugin_keys).await?;
         }
