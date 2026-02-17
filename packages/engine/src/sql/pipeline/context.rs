@@ -55,6 +55,17 @@ impl AnalysisContext {
     pub(crate) fn has_nested_query_shapes(&self) -> bool {
         self.has_cte || self.has_derived_tables || self.has_expression_subqueries
     }
+
+    pub(crate) fn references_any_logical_read_view(&self) -> bool {
+        self.references_any_filesystem_view()
+            || self.references_entity_views()
+            || self.references_relation("lix_version")
+            || self.references_relation("lix_active_version")
+            || self.references_relation("lix_active_account")
+            || self.references_relation("lix_state")
+            || self.references_relation("lix_state_by_version")
+            || self.references_relation("lix_state_history")
+    }
 }
 
 fn is_physical_internal_relation(name: &str) -> bool {

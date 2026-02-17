@@ -6,7 +6,7 @@ use sqlparser::ast::Query;
 use sqlparser::ast::{ObjectNamePart, TableFactor};
 
 #[cfg(debug_assertions)]
-use crate::sql::{rewrite_query_with_select_rewriter, rewrite_table_factors_in_select};
+use crate::sql::{visit_query_selects, visit_table_factors_in_select};
 use crate::LixError;
 
 #[cfg(debug_assertions)]
@@ -20,48 +20,39 @@ pub(crate) fn validate_relation_discovery_consistency(_query: &Query) -> Result<
 #[cfg(debug_assertions)]
 pub(crate) fn validate_relation_discovery_consistency(query: &Query) -> Result<(), LixError> {
     let walker_relations = walk_query(query).relation_names;
-    let select_rewriter_relations = collect_relation_names_via_select_rewriter(query)?;
+    let select_visit_relations = collect_relation_names_via_select_visit(query)?;
 
-    if select_rewriter_relations.is_subset(&walker_relations) {
+    if select_visit_relations.is_subset(&walker_relations) {
         return Ok(());
     }
 
-    let missing_from_walker: BTreeSet<_> = select_rewriter_relations
+    let missing_from_walker: BTreeSet<_> = select_visit_relations
         .difference(&walker_relations)
         .cloned()
         .collect();
 
     Err(LixError {
         message: format!(
-            "analyze phase relation discovery mismatch: walker missing {:?} (walker={:?} select_rewriter={:?})",
-            missing_from_walker, walker_relations, select_rewriter_relations
+            "analyze phase relation discovery mismatch: walker missing {:?} (walker={:?} select_visit={:?})",
+            missing_from_walker, walker_relations, select_visit_relations
         ),
     })
 }
 
 #[cfg(debug_assertions)]
-fn collect_relation_names_via_select_rewriter(query: &Query) -> Result<BTreeSet<String>, LixError> {
+fn collect_relation_names_via_select_visit(query: &Query) -> Result<BTreeSet<String>, LixError> {
     let mut names = BTreeSet::new();
-    let mut inspect_select =
-        |select: &mut sqlparser::ast::Select, _changed: &mut bool| -> Result<(), LixError> {
-            let mut ignored = false;
-            rewrite_table_factors_in_select(
-                select,
-                &mut |relation, _changed| {
-                    let TableFactor::Table { name, .. } = relation else {
-                        return Ok(());
-                    };
-                    if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
-                        names.insert(identifier.value.to_ascii_lowercase());
-                    }
-                    Ok(())
-                },
-                &mut ignored,
-            )?;
+    visit_query_selects(query, &mut |select| {
+        visit_table_factors_in_select(select, &mut |relation| {
+            let TableFactor::Table { name, .. } = relation else {
+                return Ok(());
+            };
+            if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
+                names.insert(identifier.value.to_ascii_lowercase());
+            }
             Ok(())
-        };
-
-    let _ = rewrite_query_with_select_rewriter(query.clone(), &mut inspect_select)?;
+        })
+    })?;
     Ok(names)
 }
 

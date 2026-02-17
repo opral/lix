@@ -4,9 +4,7 @@ use sqlparser::ast::Query;
 
 use crate::sql::types::RewriteOutput;
 use crate::sql::PostprocessPlan;
-use crate::sql::{
-    object_name_matches, rewrite_query_with_select_rewriter, rewrite_table_factors_in_select,
-};
+use crate::sql::{object_name_matches, visit_query_selects, visit_table_factors_in_select};
 use crate::LixError;
 
 use super::context::AnalysisContext;
@@ -114,31 +112,22 @@ pub(crate) fn validate_no_unresolved_logical_read_views_except(
 ) -> Result<(), LixError> {
     let allowed: BTreeSet<&str> = allowed.iter().copied().collect();
     let mut unresolved = BTreeSet::new();
-    let mut inspect_select =
-        |select: &mut sqlparser::ast::Select, _changed: &mut bool| -> Result<(), LixError> {
-            let mut ignored = false;
-            rewrite_table_factors_in_select(
-                select,
-                &mut |relation, _changed| {
-                    let sqlparser::ast::TableFactor::Table { name, .. } = relation else {
-                        return Ok(());
-                    };
-                    for candidate in LOGICAL_READ_VIEW_NAMES {
-                        if object_name_matches(name, candidate) {
-                            if allowed.contains(candidate) {
-                                continue;
-                            }
-                            unresolved.insert((*candidate).to_string());
-                        }
+    visit_query_selects(query, &mut |select| {
+        visit_table_factors_in_select(select, &mut |relation| {
+            let sqlparser::ast::TableFactor::Table { name, .. } = relation else {
+                return Ok(());
+            };
+            for candidate in LOGICAL_READ_VIEW_NAMES {
+                if object_name_matches(name, candidate) {
+                    if allowed.contains(candidate) {
+                        continue;
                     }
-                    Ok(())
-                },
-                &mut ignored,
-            )?;
+                    unresolved.insert((*candidate).to_string());
+                }
+            }
             Ok(())
-        };
-
-    let _ = rewrite_query_with_select_rewriter(query.clone(), &mut inspect_select)?;
+        })
+    })?;
 
     if unresolved.is_empty() {
         return Ok(());

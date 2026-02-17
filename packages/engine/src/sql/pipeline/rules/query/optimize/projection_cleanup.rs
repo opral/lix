@@ -1,13 +1,14 @@
 use sqlparser::ast::{Expr, Query, Select, SelectItem};
 
-use crate::sql::rewrite_query_with_select_rewriter;
+use crate::sql::{rewrite_query_selects, RewriteDecision};
 use crate::LixError;
 
 pub(crate) fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    rewrite_query_with_select_rewriter(query, &mut rewrite_select)
+    rewrite_query_selects(query, &mut rewrite_select)
 }
 
-fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
+fn rewrite_select(select: &mut Select) -> Result<RewriteDecision, LixError> {
+    let mut changed = false;
     for item in &mut select.projection {
         let SelectItem::ExprWithAlias { expr, alias } = item else {
             continue;
@@ -30,11 +31,15 @@ fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixErro
 
         if removable {
             *item = SelectItem::UnnamedExpr(expr.clone());
-            *changed = true;
+            changed = true;
         }
     }
 
-    Ok(())
+    if changed {
+        Ok(RewriteDecision::Changed)
+    } else {
+        Ok(RewriteDecision::Unchanged)
+    }
 }
 
 #[cfg(test)]
