@@ -23,10 +23,11 @@ pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};
 pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
 #[allow(unused_imports)]
 pub use pipeline::{
-    parse_sql_statements, preprocess_sql, preprocess_sql_rewrite_only,
-    preprocess_sql_with_provider, preprocess_sql_with_provider_and_detected_file_domain_changes,
-    preprocess_statements, preprocess_statements_with_provider,
-    preprocess_statements_with_provider_and_writer_key,
+    parse_sql_statements,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
+    preprocess_sql_rewrite_only, preprocess_sql_with_provider,
+    preprocess_sql_with_provider_and_detected_file_domain_changes, preprocess_statements,
+    preprocess_statements_with_provider, preprocess_statements_with_provider_and_writer_key,
 };
 pub(crate) use read_pipeline::{
     rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,

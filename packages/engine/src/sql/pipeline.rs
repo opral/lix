@@ -212,8 +212,34 @@ pub async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: Li
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+        backend,
+        evaluator,
+        parse_sql_statements(sql)?,
+        params,
+        functions,
+        detected_file_domain_changes_by_statement,
+        writer_key,
+    )
+    .await
+}
+
+pub async fn preprocess_parsed_statements_with_provider_and_detected_file_domain_changes<
+    P: LixFunctionProvider,
+>(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    statements: Vec<Statement>,
+    params: &[Value],
+    functions: SharedFunctionProvider<P>,
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    writer_key: Option<&str>,
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let params = params.to_vec();
-    let mut statements = coalesce_vtable_inserts_in_transactions(parse_sql_statements(sql)?)?;
+    let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
     apply_vtable_insert_defaults(
         backend,
