@@ -4149,7 +4149,9 @@ mod tests {
         assert!(!is_query_only_sql(
             "SELECT path FROM lix_file; UPDATE lix_file SET path = '/x' WHERE id = 'f'"
         ));
-        assert!(!is_query_only_sql("UPDATE lix_file SET path = '/x' WHERE id = 'f'"));
+        assert!(!is_query_only_sql(
+            "UPDATE lix_file SET path = '/x' WHERE id = 'f'"
+        ));
     }
 
     #[test]

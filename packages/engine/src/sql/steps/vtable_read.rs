@@ -10,8 +10,8 @@ use crate::sql::steps::state_pushdown::StatePushdown;
 use crate::sql::{escape_sql_string, object_name_matches, parse_single_query, quote_ident};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    version_descriptor_file_id, version_descriptor_schema_key, version_descriptor_storage_version_id,
-    GLOBAL_VERSION_ID,
+    version_descriptor_file_id, version_descriptor_schema_key,
+    version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, Value as LixValue};
 
@@ -22,26 +22,31 @@ const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 pub(crate) fn build_effective_state_by_version_query(
     pushdown: &StatePushdown,
     count_only: bool,
+    include_commit_mapping: bool,
 ) -> Result<Query, LixError> {
     if count_only {
         build_effective_state_by_version_count_query(pushdown)
     } else {
-        build_effective_state_by_version_view_query(pushdown)
+        build_effective_state_by_version_view_query(pushdown, include_commit_mapping)
     }
 }
 
 pub(crate) fn build_effective_state_active_query(
     pushdown: &StatePushdown,
     count_only: bool,
+    include_commit_mapping: bool,
 ) -> Result<Query, LixError> {
     if count_only {
         build_effective_state_active_count_query(pushdown)
     } else {
-        build_effective_state_active_view_query(pushdown)
+        build_effective_state_active_view_query(pushdown, include_commit_mapping)
     }
 }
 
-fn build_effective_state_by_version_view_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
+fn build_effective_state_by_version_view_query(
+    pushdown: &StatePushdown,
+    include_commit_mapping: bool,
+) -> Result<Query, LixError> {
     let (target_version_pushdown, ranked_predicates) =
         split_effective_by_version_ranked_pushdown(pushdown);
     let source_pushdown = if pushdown.source_predicates.is_empty() {
@@ -60,6 +65,57 @@ fn build_effective_state_by_version_view_query(pushdown: &StatePushdown) -> Resu
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
     ));
+    let commit_ctes = if include_commit_mapping {
+        format!(
+            ", \
+             commit_by_version AS ( \
+               SELECT \
+                 COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
+                 lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+               FROM {vtable_name} \
+               WHERE schema_key = 'lix_commit' \
+                 AND version_id = '{global_version}' \
+                 AND snapshot_content IS NOT NULL \
+             ), \
+             change_set_element_by_version AS ( \
+               SELECT \
+                 lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+                 lix_json_text(snapshot_content, 'change_id') AS change_id \
+               FROM {vtable_name} \
+               WHERE schema_key = 'lix_change_set_element' \
+                 AND version_id = '{global_version}' \
+                 AND snapshot_content IS NOT NULL \
+             ), \
+             change_commit_by_change_id AS ( \
+               SELECT \
+                 cse.change_id AS change_id, \
+                 MAX(cbv.commit_id) AS commit_id \
+               FROM change_set_element_by_version cse \
+               JOIN commit_by_version cbv \
+                 ON cbv.change_set_id = cse.change_set_id \
+               WHERE cse.change_id IS NOT NULL \
+               GROUP BY cse.change_id \
+             )",
+            vtable_name = VTABLE_NAME,
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        )
+    } else {
+        String::new()
+    };
+    let commit_join = if include_commit_mapping {
+        "LEFT JOIN change_commit_by_change_id cc \
+             ON cc.change_id = s.change_id"
+            .to_string()
+    } else {
+        String::new()
+    };
+    let commit_expr = if include_commit_mapping {
+        "COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) \
+             AS commit_id"
+            .to_string()
+    } else {
+        "CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END AS commit_id".to_string()
+    };
     let sql = format!(
         "SELECT \
              ranked.entity_id AS entity_id, \
@@ -107,35 +163,8 @@ fn build_effective_state_by_version_view_query(pushdown: &StatePushdown) -> Resu
                  ON vd.version_id = vc.ancestor_version_id \
                WHERE vd.inherits_from_version_id IS NOT NULL \
                  AND vc.depth < 64 \
-             ), \
-             commit_by_version AS ( \
-               SELECT \
-                 COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
-                 lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
-               FROM {vtable_name} \
-               WHERE schema_key = 'lix_commit' \
-                 AND version_id = '{global_version}' \
-                 AND snapshot_content IS NOT NULL \
-             ), \
-             change_set_element_by_version AS ( \
-               SELECT \
-                 lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-                 lix_json_text(snapshot_content, 'change_id') AS change_id \
-               FROM {vtable_name} \
-               WHERE schema_key = 'lix_change_set_element' \
-                 AND version_id = '{global_version}' \
-                 AND snapshot_content IS NOT NULL \
-             ), \
-             change_commit_by_change_id AS ( \
-               SELECT \
-                 cse.change_id AS change_id, \
-                 MAX(cbv.commit_id) AS commit_id \
-               FROM change_set_element_by_version cse \
-               JOIN commit_by_version cbv \
-                 ON cbv.change_set_id = cse.change_set_id \
-               WHERE cse.change_id IS NOT NULL \
-               GROUP BY cse.change_id \
              ) \
+             {commit_ctes} \
            SELECT \
              s.entity_id AS entity_id, \
              s.schema_key AS schema_key, \
@@ -152,7 +181,7 @@ fn build_effective_state_by_version_view_query(pushdown: &StatePushdown) -> Resu
                ELSE s.version_id \
              END AS inherited_from_version_id, \
              s.change_id AS change_id, \
-             COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) AS commit_id, \
+             {commit_expr}, \
              s.untracked AS untracked, \
              s.writer_key AS writer_key, \
              s.metadata AS metadata, \
@@ -163,8 +192,7 @@ fn build_effective_state_by_version_view_query(pushdown: &StatePushdown) -> Resu
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.ancestor_version_id = s.version_id \
-           LEFT JOIN change_commit_by_change_id cc \
-             ON cc.change_id = s.change_id \
+           {commit_join} \
            {source_pushdown} \
          ) AS ranked \
          WHERE ranked.rn = 1 \
@@ -175,15 +203,19 @@ fn build_effective_state_by_version_view_query(pushdown: &StatePushdown) -> Resu
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         vtable_name = VTABLE_NAME,
-        global_version = escape_sql_string(GLOBAL_VERSION_ID),
         source_pushdown = source_pushdown,
         ranked_pushdown = ranked_pushdown,
         target_versions_cte = target_versions_cte,
+        commit_ctes = commit_ctes,
+        commit_expr = commit_expr,
+        commit_join = commit_join,
     );
     parse_single_query(&sql)
 }
 
-fn build_effective_state_by_version_count_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
+fn build_effective_state_by_version_count_query(
+    pushdown: &StatePushdown,
+) -> Result<Query, LixError> {
     let (target_version_pushdown, ranked_predicates) =
         split_effective_by_version_ranked_pushdown(pushdown);
     let source_pushdown = if pushdown.source_predicates.is_empty() {
@@ -287,10 +319,9 @@ fn build_effective_state_target_versions_cte(
     }
 
     let target_version_filter = target_version_pushdown.join(" AND ");
-    if target_version_pushdown
-        .iter()
-        .any(|predicate| predicate.contains('?') || predicate.to_ascii_lowercase().contains("select"))
-    {
+    if target_version_pushdown.iter().any(|predicate| {
+        predicate.contains('?') || predicate.to_ascii_lowercase().contains("select")
+    }) {
         return format!(
             "all_target_versions AS ( \
                SELECT version_id FROM version_descriptor \
@@ -322,7 +353,9 @@ fn build_effective_state_target_versions_cte(
     )
 }
 
-fn split_effective_by_version_ranked_pushdown(pushdown: &StatePushdown) -> (Vec<String>, Vec<String>) {
+fn split_effective_by_version_ranked_pushdown(
+    pushdown: &StatePushdown,
+) -> (Vec<String>, Vec<String>) {
     let mut target_version = Vec::new();
     let mut ranked = Vec::new();
     for predicate in &pushdown.ranked_predicates {
@@ -335,7 +368,10 @@ fn split_effective_by_version_ranked_pushdown(pushdown: &StatePushdown) -> (Vec<
     (target_version, ranked)
 }
 
-fn build_effective_state_active_view_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
+fn build_effective_state_active_view_query(
+    pushdown: &StatePushdown,
+    include_commit_mapping: bool,
+) -> Result<Query, LixError> {
     let source_pushdown = if pushdown.source_predicates.is_empty() {
         String::new()
     } else {
@@ -350,6 +386,57 @@ fn build_effective_state_active_view_query(pushdown: &StatePushdown) -> Result<Q
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
     ));
+    let commit_ctes = if include_commit_mapping {
+        format!(
+            ", \
+           commit_by_version AS ( \
+             SELECT \
+               COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
+               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+             FROM {vtable_name} \
+             WHERE schema_key = 'lix_commit' \
+               AND version_id = '{global_version}' \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_set_element_by_version AS ( \
+             SELECT \
+               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_text(snapshot_content, 'change_id') AS change_id \
+             FROM {vtable_name} \
+             WHERE schema_key = 'lix_change_set_element' \
+               AND version_id = '{global_version}' \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_commit_by_change_id AS ( \
+             SELECT \
+               cse.change_id AS change_id, \
+               MAX(cbv.commit_id) AS commit_id \
+             FROM change_set_element_by_version cse \
+             JOIN commit_by_version cbv \
+               ON cbv.change_set_id = cse.change_set_id \
+             WHERE cse.change_id IS NOT NULL \
+             GROUP BY cse.change_id \
+           )",
+            vtable_name = VTABLE_NAME,
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        )
+    } else {
+        String::new()
+    };
+    let commit_join = if include_commit_mapping {
+        "LEFT JOIN change_commit_by_change_id cc \
+             ON cc.change_id = s.change_id"
+            .to_string()
+    } else {
+        String::new()
+    };
+    let commit_expr = if include_commit_mapping {
+        "COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) \
+             AS commit_id"
+            .to_string()
+    } else {
+        "CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END AS commit_id".to_string()
+    };
     let sql = format!(
         "SELECT \
              ranked.entity_id AS entity_id, \
@@ -395,35 +482,8 @@ fn build_effective_state_active_view_query(pushdown: &StatePushdown) -> Result<Q
                AND vd.snapshot_content IS NOT NULL \
                AND lix_json_text(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
                AND vc.depth < 64 \
-           ), \
-           commit_by_version AS ( \
-             SELECT \
-               COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM {vtable_name} \
-             WHERE schema_key = 'lix_commit' \
-               AND version_id = '{global_version}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           change_set_element_by_version AS ( \
-             SELECT \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_text(snapshot_content, 'change_id') AS change_id \
-             FROM {vtable_name} \
-             WHERE schema_key = 'lix_change_set_element' \
-               AND version_id = '{global_version}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           change_commit_by_change_id AS ( \
-             SELECT \
-               cse.change_id AS change_id, \
-               MAX(cbv.commit_id) AS commit_id \
-             FROM change_set_element_by_version cse \
-             JOIN commit_by_version cbv \
-               ON cbv.change_set_id = cse.change_set_id \
-             WHERE cse.change_id IS NOT NULL \
-             GROUP BY cse.change_id \
            ) \
+           {commit_ctes} \
            SELECT \
              s.entity_id AS entity_id, \
              s.schema_key AS schema_key, \
@@ -440,7 +500,7 @@ fn build_effective_state_active_view_query(pushdown: &StatePushdown) -> Result<Q
                ELSE s.version_id \
              END AS inherited_from_version_id, \
              s.change_id AS change_id, \
-             COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) AS commit_id, \
+             {commit_expr}, \
              s.untracked AS untracked, \
              s.writer_key AS writer_key, \
              s.metadata AS metadata, \
@@ -451,8 +511,7 @@ fn build_effective_state_active_view_query(pushdown: &StatePushdown) -> Result<Q
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.version_id = s.version_id \
-           LEFT JOIN change_commit_by_change_id cc \
-             ON cc.change_id = s.change_id \
+           {commit_join} \
            CROSS JOIN active_version av \
            {source_pushdown} \
          ) AS ranked \
@@ -466,9 +525,11 @@ fn build_effective_state_active_view_query(pushdown: &StatePushdown) -> Result<Q
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         vtable_name = VTABLE_NAME,
-        global_version = escape_sql_string(GLOBAL_VERSION_ID),
         source_pushdown = source_pushdown,
         ranked_pushdown = ranked_pushdown,
+        commit_ctes = commit_ctes,
+        commit_expr = commit_expr,
+        commit_join = commit_join,
     );
     parse_single_query(&sql)
 }

@@ -174,9 +174,7 @@ async fn apply_history_updates(engine: &lix_engine::Engine) -> Result<(), LixErr
             escape_sql_literal(SCHEMA_KEY),
             escape_sql_literal(FILE_ID),
         );
-        engine
-            .execute(&sql, &[], ExecuteOptions::default())
-            .await?;
+        engine.execute(&sql, &[], ExecuteOptions::default()).await?;
     }
     Ok(())
 }
