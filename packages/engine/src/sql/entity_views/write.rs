@@ -14,7 +14,7 @@ use sqlparser::parser::Parser;
 use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::sql::route::{rewrite_read_query, rewrite_read_query_with_backend};
+use crate::sql::read_pipeline::{rewrite_read_query, rewrite_read_query_with_backend};
 use crate::sql::row_resolution::resolve_values_rows;
 use crate::sql::{resolve_expr_cell_with_state, PlaceholderState, ResolvedCell};
 use crate::{LixBackend, LixError, Value as EngineValue};
