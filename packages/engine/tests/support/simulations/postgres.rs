@@ -50,6 +50,9 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
                 }
                 let _ = std::fs::remove_dir_all(pg.settings().data_dir.clone());
             }
+            if pg.settings().password_file.exists() {
+                let _ = std::fs::remove_file(pg.settings().password_file.clone());
+            }
             std::fs::create_dir_all(pg.settings().data_dir.clone()).map_err(|err| LixError {
                 message: err.to_string(),
             })?;
@@ -448,5 +451,44 @@ fn cleanup_stale_embedded_postgres_processes() -> Result<(), LixError> {
         }
     }
 
+    cleanup_stale_embedded_postgres_artifacts();
+
     Ok(())
+}
+
+fn cleanup_stale_embedded_postgres_artifacts() {
+    let temp_dir = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(temp_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+
+        let Some(pid) = embedded_postgres_owner_pid(file_name) else {
+            continue;
+        };
+
+        if is_pid_alive(pid) {
+            continue;
+        }
+
+        let path = entry.path();
+        if let Ok(file_type) = entry.file_type() {
+            if file_type.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn embedded_postgres_owner_pid(file_name: &str) -> Option<u32> {
+    let suffix = file_name.strip_prefix("lix-embedded-postgres-")?;
+    let suffix = suffix.strip_suffix(".pgpass").unwrap_or(suffix);
+    suffix.parse::<u32>().ok()
 }
