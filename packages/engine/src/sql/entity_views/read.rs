@@ -82,7 +82,9 @@ fn rewrite_table_factor(
 
 fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError> {
     let (source_sql, extra_predicates) = match target.variant {
-        EntityViewVariant::Base => base_state_source(target.version_id_override.as_deref()),
+        EntityViewVariant::Base => {
+            base_effective_state_source(target.version_id_override.as_deref())
+        }
         EntityViewVariant::ByVersion => {
             ("lix_state_by_version".to_string(), vec!["1=1".to_string()])
         }
@@ -117,8 +119,10 @@ fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError>
     parse_single_query(&sql)
 }
 
-fn base_state_source(version_id_override: Option<&str>) -> (String, Vec<String>) {
+fn base_effective_state_source(version_id_override: Option<&str>) -> (String, Vec<String>) {
     match version_id_override {
+        // Base views represent effective state. With an explicit version override, the
+        // effective-state source is still `lix_state_by_version`, scoped to that version.
         Some(version_id) => (
             "lix_state_by_version".to_string(),
             vec![format!("version_id = '{}'", escape_sql_string(version_id))],
