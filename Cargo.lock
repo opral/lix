@@ -1588,6 +1588,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "imara-diff"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f01d462f766df78ab820dd06f5eb700233c51f0f4c2e846520eaf4ba6aa5c5c"
+dependencies = [
+ "hashbrown 0.15.5",
+ "memchr",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2363,6 +2373,7 @@ name = "plugin_text_lines"
 version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
+ "imara-diff",
  "serde",
  "serde_json",
  "sha1",
