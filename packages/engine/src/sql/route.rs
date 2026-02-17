@@ -4,12 +4,12 @@ use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::entity_views::{read as entity_view_read, write as entity_view_write};
+use crate::sql::planner::{effective_state_read, state_history_read};
 use crate::sql::steps::{
     filesystem_step, lix_active_account_view_read, lix_active_account_view_write,
-    lix_active_version_view_read, lix_active_version_view_write, lix_state_by_version_view_read,
-    lix_state_by_version_view_write, lix_state_history_view_read, lix_state_history_view_write,
-    lix_state_view_read, lix_state_view_write, lix_version_view_read, lix_version_view_write,
-    stored_schema, vtable_read, vtable_write,
+    lix_active_version_view_read, lix_active_version_view_write, lix_state_by_version_view_write,
+    lix_state_history_view_write, lix_state_view_write, lix_version_view_read,
+    lix_version_view_write, stored_schema, vtable_read, vtable_write,
 };
 use crate::sql::types::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
@@ -640,15 +640,11 @@ where
 }
 
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
-    let query = filesystem_step::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = entity_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    Ok(vtable_read::rewrite_query(query.clone())?.unwrap_or(query))
+    let mut current = query;
+    for pass in READ_NORMALIZATION_PASSES {
+        current = apply_read_normalization_pass_sync(current, *pass)?;
+    }
+    apply_final_read_planners_sync(current)
 }
 
 pub(crate) async fn rewrite_read_query_with_backend(
@@ -663,16 +659,99 @@ pub(crate) async fn rewrite_read_query_with_backend_and_params(
     query: Query,
     params: &[Value],
 ) -> Result<Query, LixError> {
-    let query = filesystem_step::rewrite_query_with_params(query.clone(), params)?.unwrap_or(query);
-    let query = entity_view_read::rewrite_query_with_backend(backend, query.clone())
-        .await?
-        .unwrap_or(query);
-    let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_by_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = lix_state_history_view_read::rewrite_query(query.clone())?.unwrap_or(query);
+    let mut current = query;
+    for pass in READ_NORMALIZATION_PASSES {
+        current =
+            apply_read_normalization_pass_with_backend(backend, current, *pass, params).await?;
+    }
+    apply_final_read_planners_with_backend(backend, current).await
+}
+
+#[derive(Clone, Copy)]
+enum ReadNormalizationPass {
+    Filesystem,
+    EntityView,
+    LixVersion,
+    LixActiveAccount,
+    LixActiveVersion,
+}
+
+const READ_NORMALIZATION_PASSES: &[ReadNormalizationPass] = &[
+    ReadNormalizationPass::Filesystem,
+    ReadNormalizationPass::EntityView,
+    ReadNormalizationPass::LixVersion,
+    ReadNormalizationPass::LixActiveAccount,
+    ReadNormalizationPass::LixActiveVersion,
+];
+
+fn apply_read_normalization_pass_sync(
+    query: Query,
+    pass: ReadNormalizationPass,
+) -> Result<Query, LixError> {
+    Ok(match pass {
+        ReadNormalizationPass::Filesystem => {
+            filesystem_step::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+        ReadNormalizationPass::EntityView => {
+            entity_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+        ReadNormalizationPass::LixVersion => {
+            lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+        ReadNormalizationPass::LixActiveAccount => {
+            lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+        ReadNormalizationPass::LixActiveVersion => {
+            lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+    })
+}
+
+async fn apply_read_normalization_pass_with_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+    pass: ReadNormalizationPass,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    Ok(match pass {
+        ReadNormalizationPass::Filesystem => {
+            filesystem_step::rewrite_query_with_params(query.clone(), params)?.unwrap_or(query)
+        }
+        ReadNormalizationPass::EntityView => {
+            entity_view_read::rewrite_query_with_backend(backend, query.clone())
+                .await?
+                .unwrap_or(query)
+        }
+        ReadNormalizationPass::LixVersion => {
+            lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+        ReadNormalizationPass::LixActiveAccount => {
+            lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+        ReadNormalizationPass::LixActiveVersion => {
+            lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query)
+        }
+    })
+}
+
+fn apply_final_read_planners_sync(query: Query) -> Result<Query, LixError> {
+    let query =
+        effective_state_read::rewrite_lix_state_by_version_query(query.clone())?.unwrap_or(query);
+    let query = effective_state_read::rewrite_lix_state_query(query.clone())?.unwrap_or(query);
+    let query =
+        state_history_read::rewrite_lix_state_history_query(query.clone())?.unwrap_or(query);
+    Ok(vtable_read::rewrite_query(query.clone())?.unwrap_or(query))
+}
+
+async fn apply_final_read_planners_with_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+) -> Result<Query, LixError> {
+    let query =
+        effective_state_read::rewrite_lix_state_by_version_query(query.clone())?.unwrap_or(query);
+    let query = effective_state_read::rewrite_lix_state_query(query.clone())?.unwrap_or(query);
+    let query =
+        state_history_read::rewrite_lix_state_history_query(query.clone())?.unwrap_or(query);
     Ok(
         vtable_read::rewrite_query_with_backend(backend, query.clone())
             .await?

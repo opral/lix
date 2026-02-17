@@ -1,5 +1,6 @@
 use sqlparser::ast::Query;
 
+use crate::filesystem::path::parse_file_path;
 use crate::sql::{escape_sql_string, parse_single_query};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -42,6 +43,217 @@ pub(crate) fn build_filesystem_projection_query(
         return Ok(None);
     };
     Ok(Some(build_projection_query(op)?))
+}
+
+pub(crate) fn build_lix_file_path_data_fast_query(
+    order_by_sql: Option<String>,
+) -> Result<Query, LixError> {
+    let mut sql = format!(
+        "WITH RECURSIVE directory_descriptor_rows AS (\
+             SELECT \
+                lix_json_text(snapshot_content, 'id') AS id, \
+                lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
+                lix_json_text(snapshot_content, 'name') AS name, \
+                version_id AS lixcol_version_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_directory_descriptor' \
+               AND snapshot_content IS NOT NULL \
+               AND {active_version_scope_descriptor}\
+         ), \
+         directory_paths AS (\
+             SELECT \
+                d.id, \
+                d.lixcol_version_id, \
+                '/' || d.name || '/' AS path \
+             FROM directory_descriptor_rows d \
+             WHERE d.parent_id IS NULL \
+             UNION ALL \
+             SELECT \
+                child.id, \
+                child.lixcol_version_id, \
+                parent.path || child.name || '/' AS path \
+             FROM directory_descriptor_rows child \
+             JOIN directory_paths parent \
+               ON parent.id = child.parent_id \
+              AND parent.lixcol_version_id = child.lixcol_version_id\
+         ), \
+         file_descriptor_rows AS (\
+             SELECT \
+                lix_json_text(snapshot_content, 'id') AS id, \
+                lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
+                lix_json_text(snapshot_content, 'name') AS name, \
+                lix_json_text(snapshot_content, 'extension') AS extension, \
+                version_id AS lixcol_version_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND snapshot_content IS NOT NULL \
+               AND {active_version_scope_descriptor}\
+         ) \
+         SELECT \
+            CASE \
+                WHEN f.directory_id IS NULL THEN \
+                    CASE \
+                        WHEN f.extension IS NULL OR f.extension = '' THEN '/' || f.name \
+                        ELSE '/' || f.name || '.' || f.extension \
+                    END \
+                WHEN dp.path IS NULL THEN NULL \
+                ELSE \
+                    CASE \
+                        WHEN f.extension IS NULL OR f.extension = '' THEN dp.path || f.name \
+                        ELSE dp.path || f.name || '.' || f.extension \
+                    END \
+            END AS path, \
+            COALESCE(fd.data, lix_empty_blob()) AS data \
+         FROM file_descriptor_rows f \
+         LEFT JOIN directory_paths dp \
+           ON dp.id = f.directory_id \
+          AND dp.lixcol_version_id = f.lixcol_version_id \
+         LEFT JOIN lix_internal_file_data_cache fd \
+           ON fd.file_id = f.id \
+          AND fd.version_id = f.lixcol_version_id \
+         WHERE {active_version_scope}",
+        active_version_scope = active_version_scope_predicate("f.lixcol_version_id"),
+        active_version_scope_descriptor = active_version_scope_predicate("version_id")
+    );
+    if let Some(order_by) = order_by_sql {
+        sql.push(' ');
+        sql.push_str(&order_by);
+    }
+    parse_single_query(&sql)
+}
+
+pub(crate) fn build_lix_file_path_data_point_query(
+    normalized_path: &str,
+    order_by_sql: Option<String>,
+) -> Result<Query, LixError> {
+    let parsed = parse_file_path(normalized_path)?;
+    let mut ctes = Vec::new();
+
+    if let Some(directory_path) = parsed.directory_path.as_ref() {
+        let segments = directory_path
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            return Err(LixError {
+                message: "invalid directory path for point filesystem fast-path".to_string(),
+            });
+        }
+
+        ctes.push(format!(
+            "directory_descriptor_rows AS (\
+                 SELECT \
+                    lix_json_text(snapshot_content, 'id') AS id, \
+                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_text(snapshot_content, 'name') AS name, \
+                    version_id AS lixcol_version_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_directory_descriptor' \
+                   AND snapshot_content IS NOT NULL \
+                   AND {active_version_scope_descriptor}\
+             )",
+            active_version_scope_descriptor = active_version_scope_predicate("version_id")
+        ));
+
+        for (depth, segment) in segments.iter().enumerate() {
+            let segment = escape_sql_string(segment);
+            let cte = if depth == 0 {
+                format!(
+                    "dir_level_0 AS (\
+                         SELECT id, lixcol_version_id \
+                         FROM directory_descriptor_rows \
+                         WHERE parent_id IS NULL \
+                           AND name = '{segment}'\
+                     )",
+                )
+            } else {
+                format!(
+                    "dir_level_{depth} AS (\
+                         SELECT child.id, child.lixcol_version_id \
+                         FROM directory_descriptor_rows child \
+                         JOIN dir_level_{parent_depth} parent \
+                           ON parent.id = child.parent_id \
+                          AND parent.lixcol_version_id = child.lixcol_version_id \
+                         WHERE child.name = '{segment}'\
+                     )",
+                    parent_depth = depth - 1
+                )
+            };
+            ctes.push(cte);
+        }
+    }
+
+    let extension_predicate = if let Some(extension) = parsed.extension.as_ref() {
+        format!(
+            "lix_json_text(snapshot_content, 'extension') = '{}'",
+            escape_sql_string(extension)
+        )
+    } else {
+        "lix_json_text(snapshot_content, 'extension') IS NULL".to_string()
+    };
+
+    let directory_predicate = if parsed.directory_path.is_some() {
+        let directory_depth = parsed
+            .directory_path
+            .as_ref()
+            .map(|path| {
+                path.trim_matches('/')
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .count()
+            })
+            .unwrap_or(0);
+        format!(
+            "EXISTS (\
+                 SELECT 1 \
+                 FROM dir_level_{target_depth} target_dir \
+                 WHERE target_dir.id = lix_json_text(snapshot_content, 'directory_id') \
+                   AND target_dir.lixcol_version_id = version_id\
+             )",
+            target_depth = directory_depth - 1
+        )
+    } else {
+        "lix_json_text(snapshot_content, 'directory_id') IS NULL".to_string()
+    };
+
+    ctes.push(format!(
+        "file_descriptor_rows AS (\
+             SELECT \
+                lix_json_text(snapshot_content, 'id') AS id, \
+                version_id AS lixcol_version_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND snapshot_content IS NOT NULL \
+               AND {active_version_scope_descriptor} \
+               AND lix_json_text(snapshot_content, 'name') = '{name}' \
+               AND {extension_predicate} \
+               AND {directory_predicate}\
+         )",
+        active_version_scope_descriptor = active_version_scope_predicate("version_id"),
+        name = escape_sql_string(&parsed.name),
+        extension_predicate = extension_predicate,
+        directory_predicate = directory_predicate
+    ));
+
+    let mut sql = format!(
+        "WITH {ctes} \
+         SELECT \
+            '{path}' AS path, \
+            COALESCE(fd.data, lix_empty_blob()) AS data \
+         FROM file_descriptor_rows f \
+         LEFT JOIN lix_internal_file_data_cache fd \
+           ON fd.file_id = f.id \
+          AND fd.version_id = f.lixcol_version_id",
+        ctes = ctes.join(", "),
+        path = escape_sql_string(&parsed.normalized_path)
+    );
+    if let Some(order_by) = order_by_sql {
+        sql.push(' ');
+        sql.push_str(&order_by);
+    }
+
+    parse_single_query(&sql)
 }
 
 fn build_projection_query(op: FilesystemReadOp) -> Result<Query, LixError> {
