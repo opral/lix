@@ -2625,27 +2625,12 @@ async fn try_exact_file_descriptor_lookup_current_version(
     version_id: &str,
     file_id: &str,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
-    let sql = "SELECT entity_id, untracked, is_tombstone, \
-                    'mutation.file_ids_matching_update.fast_id.direct' AS __lix_trace \
-             FROM (\
-                 SELECT entity_id, 1 AS untracked, \
-                        CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS is_tombstone, \
-                        0 AS source_priority, \
-                        updated_at \
-                 FROM lix_internal_state_untracked \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND version_id = $1 \
-                   AND entity_id = $2 \
-                 UNION ALL \
-                 SELECT entity_id, 0 AS untracked, is_tombstone, 1 AS source_priority, updated_at \
-                 FROM lix_internal_state_materialized_v1_lix_file_descriptor \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND version_id = $1 \
-                   AND entity_id = $2 \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL\
-             ) AS exact_rows \
-             ORDER BY source_priority, updated_at DESC \
+    let sql = "SELECT entity_id, untracked, snapshot_content, \
+                    'mutation.file_ids_matching_update.fast_id.vtable' AS __lix_trace \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND version_id = $1 \
+               AND entity_id = $2 \
              LIMIT 1";
     let rewritten_sql = rewrite_single_read_query_for_backend(backend, sql).await?;
     let result = backend
@@ -2686,11 +2671,7 @@ fn parse_exact_file_descriptor_lookup_rows(
         .map(parse_untracked_value)
         .transpose()?
         .unwrap_or(false);
-    let is_tombstone = row
-        .get(2)
-        .map(parse_untracked_value)
-        .transpose()?
-        .unwrap_or(false);
+    let is_tombstone = row.get(2).is_none_or(|value| matches!(value, EngineValue::Null));
     if is_tombstone {
         return Ok(Some(Vec::new()));
     }
@@ -3300,7 +3281,7 @@ mod tests {
         let rows = vec![vec![
             Value::Text("file-a".to_string()),
             Value::Integer(1),
-            Value::Integer(1),
+            Value::Null,
         ]];
         let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
         assert!(
@@ -3318,7 +3299,7 @@ mod tests {
         let rows = vec![vec![
             Value::Text("file-b".to_string()),
             Value::Integer(1),
-            Value::Integer(0),
+            Value::Text("{\"path\":\"/bench/file-b.txt\"}".to_string()),
         ]];
         let parsed = parse_exact_file_descriptor_lookup_rows(rows).expect("parse rows");
         let parsed = parsed.expect("live row should exist");
@@ -3326,4 +3307,5 @@ mod tests {
         assert_eq!(parsed[0].id, "file-b");
         assert!(parsed[0].untracked);
     }
+
 }
