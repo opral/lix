@@ -1955,7 +1955,8 @@ fn select_effective_entity_tombstone_state(
         .map(|(depth, version_id)| (version_id.clone(), depth))
         .collect::<BTreeMap<_, _>>();
 
-    let mut best: Option<(usize, usize, bool)> = None;
+    let mut best_rank: Option<(usize, usize)> = None;
+    let mut best_tombstone: Option<bool> = None;
     for row in rows {
         let Some(EngineValue::Text(version_id)) = row.first() else {
             continue;
@@ -1972,17 +1973,18 @@ fn select_effective_entity_tombstone_state(
             .unwrap_or(false);
         let depth = *depth_by_version.get(version_id).unwrap_or(&usize::MAX);
         let priority = if untracked { 0 } else { 1 };
-        let candidate = (depth, priority, tombstone);
-        if best
+        let candidate_rank = (depth, priority);
+        if best_rank
             .as_ref()
-            .map(|current| candidate < *current)
+            .map(|current| candidate_rank < *current)
             .unwrap_or(true)
         {
-            best = Some(candidate);
+            best_rank = Some(candidate_rank);
+            best_tombstone = Some(tombstone);
         }
     }
 
-    Ok(best.map(|(_, _, tombstone)| tombstone))
+    Ok(best_tombstone)
 }
 
 fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> String {
@@ -3720,5 +3722,25 @@ mod tests {
         let tombstone =
             select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
         assert_eq!(tombstone, Some(false));
+    }
+
+    #[test]
+    fn effective_entity_tombstone_state_tie_does_not_use_tombstone_as_tiebreaker() {
+        let rows = vec![
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(1),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Text("v2".to_string()),
+                Value::Integer(1),
+                Value::Integer(0),
+            ],
+        ];
+        let chain = vec!["v2".to_string(), "v1".to_string()];
+        let tombstone =
+            select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
+        assert_eq!(tombstone, Some(true));
     }
 }
