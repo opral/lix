@@ -24,7 +24,7 @@ use crate::version::{
     parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
     version_descriptor_storage_version_id,
 };
-use crate::{LixBackend, LixError, SqlDialect, Value as EngineValue};
+use crate::{LixBackend, LixError, Value as EngineValue};
 
 const FILE_VIEW: &str = "lix_file";
 const FILE_BY_VERSION_VIEW: &str = "lix_file_by_version";
@@ -35,6 +35,7 @@ const DIRECTORY_HISTORY_VIEW: &str = "lix_directory_history";
 
 const FILE_DESCRIPTOR_VIEW: &str = "lix_file_descriptor";
 const FILE_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_file_descriptor_by_version";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_VIEW: &str = "lix_directory_descriptor";
 const DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW: &str = "lix_directory_descriptor_by_version";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -1474,34 +1475,26 @@ async fn find_directory_child_id(
     parent_id: Option<&str>,
     name: &str,
 ) -> Result<Option<String>, LixError> {
-    let dialect = backend.dialect();
-    let version_id_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "id");
-    let inherits_expr =
-        json_text_extract_for_dialect(dialect, "snapshot_content", "inherits_from_version_id");
-    let name_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "name");
-    let parent_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "parent_id");
-
     let mut params = vec![
         EngineValue::Text(version_id.to_string()),
         EngineValue::Text(name.to_string()),
     ];
     let parent_predicate = if let Some(parent_id) = parent_id {
         params.push(EngineValue::Text(parent_id.to_string()));
-        format!("{parent_expr} = $3")
+        "lix_json_text(snapshot_content, 'parent_id') = $3".to_string()
     } else {
-        format!("{parent_expr} IS NULL")
+        "lix_json_text(snapshot_content, 'parent_id') IS NULL".to_string()
     };
     let lookup_sql = format!(
         "WITH RECURSIVE \
            version_descriptor AS ( \
              SELECT \
-               {version_id_expr} AS version_id, \
-               {inherits_expr} AS inherits_from_version_id \
-             FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+               lix_json_text(snapshot_content, 'id') AS version_id, \
+               lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+             FROM lix_internal_state_vtable \
              WHERE schema_key = '{version_descriptor_schema_key}' \
                AND file_id = '{version_descriptor_file_id}' \
                AND version_id = '{version_descriptor_storage_version_id}' \
-               AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
            version_chain(ancestor_version_id, depth) AS ( \
@@ -1514,45 +1507,45 @@ async fn find_directory_child_id(
              WHERE vd.inherits_from_version_id IS NOT NULL \
                AND vc.depth < 64 \
            ), \
-           descriptor_rows AS ( \
-             SELECT entity_id, version_id, snapshot_content, is_tombstone, 2 AS priority \
-             FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
-             UNION ALL \
-             SELECT entity_id, version_id, snapshot_content, 0 AS is_tombstone, 1 AS priority \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = 'lix_directory_descriptor' \
+           candidate_entities AS ( \
+             SELECT DISTINCT entity_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = '{schema_key}' \
+               AND snapshot_content IS NOT NULL \
+               AND lix_json_text(snapshot_content, 'name') = $2 \
+               AND {parent_predicate} \
            ), \
            ranked AS ( \
              SELECT \
                d.entity_id AS entity_id, \
                d.snapshot_content AS snapshot_content, \
-               d.is_tombstone AS is_tombstone, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY d.entity_id \
-                 ORDER BY vc.depth ASC, d.priority ASC \
+                 ORDER BY vc.depth ASC \
                ) AS rn \
-             FROM descriptor_rows d \
+             FROM lix_internal_state_vtable d \
              JOIN version_chain vc \
                ON vc.ancestor_version_id = d.version_id \
+             JOIN candidate_entities c \
+               ON c.entity_id = d.entity_id \
+             WHERE d.schema_key = '{schema_key}' \
            ) \
          SELECT entity_id \
          FROM ranked \
          WHERE rn = 1 \
-           AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL \
-           AND {name_expr} = $2 \
+           AND lix_json_text(snapshot_content, 'name') = $2 \
            AND {parent_predicate} \
          LIMIT 1",
-        version_id_expr = version_id_expr,
-        inherits_expr = inherits_expr,
         version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         version_descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         version_descriptor_storage_version_id =
             escape_sql_string(version_descriptor_storage_version_id()),
-        name_expr = name_expr,
+        schema_key = DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
         parent_predicate = parent_predicate,
     );
-    let result = backend.execute(&lookup_sql, &params).await?;
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &lookup_sql).await?;
+    let result = backend.execute(&rewritten_sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -1600,42 +1593,33 @@ async fn find_file_id_by_components(
     name: &str,
     extension: Option<&str>,
 ) -> Result<Option<String>, LixError> {
-    let dialect = backend.dialect();
-    let version_id_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "id");
-    let inherits_expr =
-        json_text_extract_for_dialect(dialect, "snapshot_content", "inherits_from_version_id");
-    let name_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "name");
-    let directory_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "directory_id");
-    let extension_expr = json_text_extract_for_dialect(dialect, "snapshot_content", "extension");
-
     let mut params = vec![
         EngineValue::Text(version_id.to_string()),
         EngineValue::Text(name.to_string()),
     ];
     let directory_predicate = if let Some(directory_id) = directory_id {
         params.push(EngineValue::Text(directory_id.to_string()));
-        format!("{directory_expr} = $3")
+        "lix_json_text(snapshot_content, 'directory_id') = $3".to_string()
     } else {
-        format!("{directory_expr} IS NULL")
+        "lix_json_text(snapshot_content, 'directory_id') IS NULL".to_string()
     };
     let extension_predicate = if let Some(extension) = extension {
         let index = params.len() + 1;
         params.push(EngineValue::Text(extension.to_string()));
-        format!("{extension_expr} = ${index}")
+        format!("lix_json_text(snapshot_content, 'extension') = ${index}")
     } else {
-        format!("{extension_expr} IS NULL")
+        "lix_json_text(snapshot_content, 'extension') IS NULL".to_string()
     };
     let lookup_sql = format!(
         "WITH RECURSIVE \
            version_descriptor AS ( \
              SELECT \
-               {version_id_expr} AS version_id, \
-               {inherits_expr} AS inherits_from_version_id \
-             FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+               lix_json_text(snapshot_content, 'id') AS version_id, \
+               lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+             FROM lix_internal_state_vtable \
              WHERE schema_key = '{version_descriptor_schema_key}' \
                AND file_id = '{version_descriptor_file_id}' \
                AND version_id = '{version_descriptor_storage_version_id}' \
-               AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
            version_chain(ancestor_version_id, depth) AS ( \
@@ -1648,47 +1632,48 @@ async fn find_file_id_by_components(
              WHERE vd.inherits_from_version_id IS NOT NULL \
                AND vc.depth < 64 \
            ), \
-           descriptor_rows AS ( \
-             SELECT entity_id, version_id, snapshot_content, is_tombstone, 2 AS priority \
-             FROM lix_internal_state_materialized_v1_lix_file_descriptor \
-             UNION ALL \
-             SELECT entity_id, version_id, snapshot_content, 0 AS is_tombstone, 1 AS priority \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = 'lix_file_descriptor' \
+           candidate_entities AS ( \
+             SELECT DISTINCT entity_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = '{schema_key}' \
+               AND snapshot_content IS NOT NULL \
+               AND lix_json_text(snapshot_content, 'name') = $2 \
+               AND {directory_predicate} \
+               AND {extension_predicate} \
            ), \
            ranked AS ( \
              SELECT \
                d.entity_id AS entity_id, \
                d.snapshot_content AS snapshot_content, \
-               d.is_tombstone AS is_tombstone, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY d.entity_id \
-                 ORDER BY vc.depth ASC, d.priority ASC \
+                 ORDER BY vc.depth ASC \
                ) AS rn \
-             FROM descriptor_rows d \
+             FROM lix_internal_state_vtable d \
              JOIN version_chain vc \
                ON vc.ancestor_version_id = d.version_id \
+             JOIN candidate_entities c \
+               ON c.entity_id = d.entity_id \
+             WHERE d.schema_key = '{schema_key}' \
            ) \
          SELECT entity_id \
          FROM ranked \
          WHERE rn = 1 \
-           AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL \
-           AND {name_expr} = $2 \
+           AND lix_json_text(snapshot_content, 'name') = $2 \
            AND {directory_predicate} \
            AND {extension_predicate} \
          LIMIT 1",
-        version_id_expr = version_id_expr,
-        inherits_expr = inherits_expr,
         version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         version_descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         version_descriptor_storage_version_id =
             escape_sql_string(version_descriptor_storage_version_id()),
-        name_expr = name_expr,
+        schema_key = FILE_DESCRIPTOR_SCHEMA_KEY,
         directory_predicate = directory_predicate,
         extension_predicate = extension_predicate,
     );
-    let result = backend.execute(&lookup_sql, &params).await?;
+    let rewritten_sql = rewrite_single_read_query_for_backend(backend, &lookup_sql).await?;
+    let result = backend.execute(&rewritten_sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -1701,15 +1686,6 @@ async fn find_file_id_by_components(
         });
     };
     Ok(Some(id.clone()))
-}
-
-fn json_text_extract_for_dialect(dialect: SqlDialect, value_expr: &str, key: &str) -> String {
-    match dialect {
-        SqlDialect::Sqlite => format!("json_extract({value_expr}, '$.{key}')"),
-        SqlDialect::Postgres => {
-            format!("jsonb_extract_path_text(CAST({value_expr} AS JSONB), '{key}')")
-        }
-    }
 }
 
 async fn rewrite_single_read_query_for_backend(
@@ -3078,31 +3054,15 @@ fn noop_statement() -> Result<Statement, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_predicate_string_with_params_and_state, json_text_extract_for_dialect,
-        parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
-        rewrite_update,
+        extract_predicate_string_with_params_and_state, parse_exact_file_descriptor_lookup_rows,
+        parse_expression, rewrite_delete, rewrite_insert, rewrite_update,
     };
-    use crate::backend::SqlDialect;
+    use crate::SqlDialect;
     use crate::sql::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
     use crate::sql::PlaceholderState;
     use crate::Value;
     use sqlparser::ast::Statement;
-
-    #[test]
-    fn sqlite_json_extract_expression_matches_schema_registry_index_shape() {
-        let expr = json_text_extract_for_dialect(SqlDialect::Sqlite, "snapshot_content", "name");
-        assert_eq!(expr, "json_extract(snapshot_content, '$.name')");
-    }
-
-    #[test]
-    fn postgres_json_extract_expression_uses_jsonb_extract_path_text() {
-        let expr = json_text_extract_for_dialect(SqlDialect::Postgres, "snapshot_content", "name");
-        assert_eq!(
-            expr,
-            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'name')"
-        );
-    }
 
     #[test]
     fn rewrites_file_insert_and_drops_data_column() {
