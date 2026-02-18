@@ -55,51 +55,7 @@ struct ObserveState {
 
 impl ObserveEvents<'_> {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
-        if self.state.closed {
-            return Ok(None);
-        }
-
-        if !self.state.emitted_initial {
-            self.state.emitted_initial = true;
-            let rows = self
-                .engine
-                .execute(
-                    &self.state.query.sql,
-                    &self.state.query.params,
-                    ExecuteOptions::default(),
-                )
-                .await?;
-            self.state.last_result = Some(rows.clone());
-            return Ok(Some(self.state.make_event(rows, None)));
-        }
-
-        loop {
-            let Some(batch) = self.state.state_commits.next().await else {
-                self.state.closed = true;
-                return Ok(None);
-            };
-
-            let rows = self
-                .engine
-                .execute(
-                    &self.state.query.sql,
-                    &self.state.query.params,
-                    ExecuteOptions::default(),
-                )
-                .await?;
-
-            if self
-                .state
-                .last_result
-                .as_ref()
-                .is_some_and(|previous| *previous == rows)
-            {
-                continue;
-            }
-
-            self.state.last_result = Some(rows.clone());
-            return Ok(Some(self.state.make_event(rows, Some(batch.sequence))));
-        }
+        self.state.next_with_engine(self.engine).await
     }
 
     pub fn close(&mut self) {
@@ -115,51 +71,7 @@ impl Drop for ObserveEvents<'_> {
 
 impl ObserveEventsOwned {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
-        if self.state.closed {
-            return Ok(None);
-        }
-
-        if !self.state.emitted_initial {
-            self.state.emitted_initial = true;
-            let rows = self
-                .engine
-                .execute(
-                    &self.state.query.sql,
-                    &self.state.query.params,
-                    ExecuteOptions::default(),
-                )
-                .await?;
-            self.state.last_result = Some(rows.clone());
-            return Ok(Some(self.state.make_event(rows, None)));
-        }
-
-        loop {
-            let Some(batch) = self.state.state_commits.next().await else {
-                self.state.closed = true;
-                return Ok(None);
-            };
-
-            let rows = self
-                .engine
-                .execute(
-                    &self.state.query.sql,
-                    &self.state.query.params,
-                    ExecuteOptions::default(),
-                )
-                .await?;
-
-            if self
-                .state
-                .last_result
-                .as_ref()
-                .is_some_and(|previous| *previous == rows)
-            {
-                continue;
-            }
-
-            self.state.last_result = Some(rows.clone());
-            return Ok(Some(self.state.make_event(rows, Some(batch.sequence))));
-        }
+        self.state.next_with_engine(self.engine.as_ref()).await
     }
 
     pub fn close(&mut self) {
@@ -174,6 +86,42 @@ impl Drop for ObserveEventsOwned {
 }
 
 impl ObserveState {
+    async fn next_with_engine(
+        &mut self,
+        engine: &Engine,
+    ) -> Result<Option<ObserveEvent>, LixError> {
+        if self.closed {
+            return Ok(None);
+        }
+
+        if !self.emitted_initial {
+            self.emitted_initial = true;
+            let rows = execute_observe_query(engine, &self.query).await?;
+            self.last_result = Some(rows.clone());
+            return Ok(Some(self.make_event(rows, None)));
+        }
+
+        loop {
+            let Some(batch) = self.state_commits.next().await else {
+                self.closed = true;
+                return Ok(None);
+            };
+
+            let rows = execute_observe_query(engine, &self.query).await?;
+
+            if self
+                .last_result
+                .as_ref()
+                .is_some_and(|previous| *previous == rows)
+            {
+                continue;
+            }
+
+            self.last_result = Some(rows.clone());
+            return Ok(Some(self.make_event(rows, Some(batch.sequence))));
+        }
+    }
+
     fn make_event(
         &mut self,
         rows: QueryResult,
@@ -195,6 +143,15 @@ impl ObserveState {
         self.closed = true;
         self.state_commits.close();
     }
+}
+
+async fn execute_observe_query(
+    engine: &Engine,
+    query: &ObserveQuery,
+) -> Result<QueryResult, LixError> {
+    engine
+        .execute(&query.sql, &query.params, ExecuteOptions::default())
+        .await
 }
 
 impl Engine {
