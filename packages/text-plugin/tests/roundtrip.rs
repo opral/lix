@@ -1,7 +1,7 @@
 mod common;
 
 use common::file_from_bytes;
-use plugin_text_lines::{apply_changes, detect_changes, PluginEntityChange};
+use text_plugin::{apply_changes, detect_changes, PluginEntityChange};
 use std::collections::BTreeMap;
 
 #[test]

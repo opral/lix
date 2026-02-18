@@ -33,7 +33,7 @@ const CONFIG = {
   syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
   showProgress: parseEnvBool("BENCH_REPLAY_PROGRESS", true),
-  installTextLinesPlugin: parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", true),
+  installTextPlugin: parseTextPluginInstallFlag(true),
   maxInsertRows: parseEnvInt("BENCH_REPLAY_MAX_INSERT_ROWS", 200),
   maxInsertSqlChars: parseEnvInt("BENCH_REPLAY_MAX_INSERT_SQL_CHARS", 1_500_000),
   parityEveryCommits: parseEnvInt("BENCH_PARITY_EVERY", 1),
@@ -42,8 +42,8 @@ const CONFIG = {
   outputPath: process.env.BENCH_PARITY_REPORT_PATH ?? DEFAULT_OUTPUT_PATH,
 };
 
-const TEXT_LINES_MANIFEST = {
-  key: "plugin_text_lines",
+const TEXT_PLUGIN_MANIFEST = {
+  key: "text_plugin",
   runtime: "wasm-component-v1",
   api_version: "0.1.0",
   detect_changes_glob: "**/*",
@@ -97,11 +97,11 @@ async function main() {
 
   try {
     let pluginInstallMs = 0;
-    if (CONFIG.installTextLinesPlugin) {
-      const pluginWasmBytes = await loadTextLinesPluginWasmBytes();
+    if (CONFIG.installTextPlugin) {
+      const pluginWasmBytes = await loadTextPluginWasmBytes();
       const installStarted = performance.now();
       await lix.installPlugin({
-        manifestJson: TEXT_LINES_MANIFEST,
+        manifestJson: TEXT_PLUGIN_MANIFEST,
         wasmBytes: pluginWasmBytes,
       });
       pluginInstallMs = performance.now() - installStarted;
@@ -523,22 +523,29 @@ function parseEnvBool(name, fallback) {
   return fallback;
 }
 
-async function loadTextLinesPluginWasmBytes() {
+function parseTextPluginInstallFlag(fallback) {
+  if (process.env.BENCH_REPLAY_INSTALL_TEXT_PLUGIN !== undefined) {
+    return parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_PLUGIN", fallback);
+  }
+  return parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", fallback);
+}
+
+async function loadTextPluginWasmBytes() {
   const packageReleasePath = join(
     REPO_ROOT,
     "packages",
-    "plugin-text-lines",
+    "text-plugin",
     "target",
     "wasm32-wasip2",
     "release",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
   const workspaceReleasePath = join(
     REPO_ROOT,
     "target",
     "wasm32-wasip2",
     "release",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
 
   try {

@@ -2369,19 +2369,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin_text_lines"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "criterion 0.5.1",
- "imara-diff",
- "serde",
- "serde_json",
- "sha1",
- "wit-bindgen 0.40.0",
-]
-
-[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3542,6 +3529,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "text_plugin"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "criterion 0.5.1",
+ "imara-diff",
+ "serde",
+ "serde_json",
+ "sha1",
+ "wit-bindgen 0.40.0",
 ]
 
 [[package]]

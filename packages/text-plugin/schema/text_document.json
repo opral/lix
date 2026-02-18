@@ -2,7 +2,7 @@
   "x-lix-key": "text_document",
   "x-lix-version": "1",
   "x-lix-override-lixcols": {
-    "lixcol_plugin_key": "'plugin_text_lines'"
+    "lixcol_plugin_key": "'text_plugin'"
   },
   "type": "object",
   "properties": {
