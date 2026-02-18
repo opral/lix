@@ -1,7 +1,5 @@
 packages:
   - packages/**/*
-  - integration-benches/**/*
   - '!packages/**/dist'
-  - '!integration-benches/**/dist'
 onlyBuiltDependencies:
   - '@tailwindcss/oxide'

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_bytes, parse_document_snapshot};
-use plugin_text_lines::{
+use text_plugin::{
     detect_changes, DOCUMENT_ENTITY_ID, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, SCHEMA_VERSION,
 };
 

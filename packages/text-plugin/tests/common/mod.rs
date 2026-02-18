@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use plugin_text_lines::{PluginEntityChange, PluginFile};
+use text_plugin::{PluginEntityChange, PluginFile};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]

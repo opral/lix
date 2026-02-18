@@ -27,7 +27,7 @@ pnpm -C packages/nextjs-replay-bench bench:parity:25   # replay + git-vs-lix sta
 - `BENCH_REPLAY_COMMITS` number of measured commits to replay (default: `1000`)
 - `BENCH_REPLAY_WARMUP_COMMITS` number of warmup commits to replay first (excluded from measured stats, default: `5`)
 - `BENCH_REPLAY_FETCH` set to `1` to fetch remote updates (default: `0`)
-- `BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN` set to `0` to disable plugin install
+- `BENCH_REPLAY_INSTALL_TEXT_PLUGIN` set to `0` to disable plugin install
 - `BENCH_REPLAY_EXPORT_SNAPSHOT` set to `1` to export a sqlite snapshot artifact
 - `BENCH_REPLAY_SNAPSHOT_PATH` custom output path for snapshot artifact (`.lix` recommended)
 - `BENCH_REPLAY_STORAGE_COUNTERS` set to `0` to skip post-replay storage counter queries (faster tail) and `1` to collect them

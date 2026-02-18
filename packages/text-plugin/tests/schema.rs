@@ -1,4 +1,4 @@
-use plugin_text_lines::{
+use text_plugin::{
     document_schema_definition, document_schema_json, line_schema_definition, line_schema_json,
     manifest_json, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, SCHEMA_VERSION,
 };
@@ -60,7 +60,7 @@ fn manifest_json_has_expected_plugin_identity() {
             .get("key")
             .and_then(serde_json::Value::as_str)
             .expect("manifest.key must be string"),
-        "plugin_text_lines"
+        "text_plugin"
     );
     assert_eq!(
         manifest

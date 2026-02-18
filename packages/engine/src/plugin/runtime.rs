@@ -630,7 +630,7 @@ fn glob_matches_extension(glob: &str, extension: Option<&str>) -> bool {
 }
 
 fn plugin_detect_emits_complete_diff(plugin: &InstalledPlugin) -> bool {
-    plugin.key == "plugin_text_lines"
+    plugin.key == "text_plugin"
 }
 
 async fn call_apply_changes(

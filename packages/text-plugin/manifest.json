@@ -1,5 +1,5 @@
 {
-  "key": "plugin_text_lines",
+  "key": "text_plugin",
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
   "detect_changes_glob": "*",
