@@ -13,6 +13,7 @@ pub(crate) struct StatementContext<'a> {
     pub(crate) detected_file_domain_changes: &'a [DetectedFileDomainChange],
     pub(crate) side_effects: Vec<Statement>,
     pub(crate) registrations: Vec<SchemaRegistration>,
+    pub(crate) generated_params: Vec<Value>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
     pub(crate) postprocess: Option<PostprocessPlan>,
@@ -27,6 +28,7 @@ impl<'a> StatementContext<'a> {
             detected_file_domain_changes: &[],
             side_effects: Vec::new(),
             registrations: Vec::new(),
+            generated_params: Vec::new(),
             mutations: Vec::new(),
             update_validations: Vec::new(),
             postprocess: None,
@@ -46,6 +48,7 @@ impl<'a> StatementContext<'a> {
             detected_file_domain_changes,
             side_effects: Vec::new(),
             registrations: Vec::new(),
+            generated_params: Vec::new(),
             mutations: Vec::new(),
             update_validations: Vec::new(),
             postprocess: None,
@@ -55,6 +58,7 @@ impl<'a> StatementContext<'a> {
     pub(crate) fn take_output(&mut self, statements: Vec<Statement>) -> RewriteOutput {
         RewriteOutput {
             statements,
+            params: std::mem::take(&mut self.generated_params),
             registrations: std::mem::take(&mut self.registrations),
             postprocess: self.postprocess.take(),
             mutations: std::mem::take(&mut self.mutations),
