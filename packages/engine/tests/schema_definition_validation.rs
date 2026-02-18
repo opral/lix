@@ -670,7 +670,7 @@ fn x_lix_foreign_keys_with_composite_key() {
             {
                 "properties": ["/entity_id", "/schema_key", "/file_id"],
                 "references": {
-                    "schemaKey": "state",
+                    "schemaKey": "lix_state",
                     "properties": ["/entity_id", "/schema_key", "/file_id"]
                 }
             },
@@ -693,6 +693,33 @@ fn x_lix_foreign_keys_with_composite_key() {
     });
 
     assert!(validate_lix_schema_definition(&schema).is_ok());
+}
+
+#[test]
+fn x_lix_foreign_keys_rejects_unaliased_lix_table_reference() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "entity_label",
+        "x-lix-version": "1",
+        "x-lix-foreign-keys": [
+            {
+                "properties": ["/entity_id", "/schema_key", "/file_id"],
+                "references": {
+                    "schemaKey": "state",
+                    "properties": ["/entity_id", "/schema_key", "/file_id"]
+                }
+            }
+        ],
+        "properties": {
+            "entity_id": { "type": "string" },
+            "schema_key": { "type": "string" },
+            "file_id": { "type": "string" }
+        },
+        "required": ["entity_id", "schema_key", "file_id"],
+        "additionalProperties": false
+    });
+
+    assert!(validate_lix_schema_definition(&schema).is_err());
 }
 
 #[test]
