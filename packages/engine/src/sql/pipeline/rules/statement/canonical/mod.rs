@@ -66,6 +66,7 @@ where
     let mut queue = VecDeque::from([Pending::Statement(statement)]);
     let mut final_output = RewriteOutput {
         statements: Vec::new(),
+        params: Vec::new(),
         registrations: Vec::new(),
         postprocess: None,
         mutations: Vec::new(),
@@ -192,6 +193,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     functions,
                 )? {
                     context.registrations.extend(rewritten.registrations);
+                    context.generated_params.extend(rewritten.params);
                     context.mutations.extend(rewritten.mutations);
                     statements = rewritten.statements;
                 }
@@ -255,6 +257,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 let query = crate::sql::pipeline::query_engine::rewrite_read_query(*query)?;
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![Statement::Query(Box::new(query))],
+                    params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
@@ -288,6 +291,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                         format,
                         options,
                     }],
+                    params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
@@ -297,6 +301,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![other],
+                    params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
@@ -447,6 +452,7 @@ where
                     backend,
                     current_insert.clone(),
                     context.params,
+                    context.generated_params.len(),
                     &insert_detected_file_domain_changes,
                     context.writer_key,
                     functions,
@@ -454,6 +460,7 @@ where
                 .await?
                 {
                     context.registrations.extend(rewritten.registrations);
+                    context.generated_params.extend(rewritten.params);
                     context.mutations.extend(rewritten.mutations);
                     statements = rewritten.statements;
                 }
@@ -634,6 +641,7 @@ where
                         .await?;
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![Statement::Query(Box::new(query))],
+                    params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
@@ -668,6 +676,7 @@ where
                         format,
                         options,
                     }],
+                    params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
@@ -677,6 +686,7 @@ where
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![other],
+                    params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
                     mutations: Vec::new(),
