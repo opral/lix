@@ -1,0 +1,30 @@
+{
+  "x-lix-key": "text_line",
+  "x-lix-version": "1",
+  "x-lix-override-lixcols": {
+    "lixcol_plugin_key": "'plugin_text_lines'"
+  },
+  "type": "object",
+  "properties": {
+    "content_base64": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "contentMediaType": "application/octet-stream",
+      "description": "Base64-encoded line bytes. Empty string represents an empty line body."
+    },
+    "ending": {
+      "type": "string",
+      "enum": [
+        "",
+        "\n",
+        "\r\n"
+      ],
+      "description": "Original line ending bytes."
+    }
+  },
+  "required": [
+    "content_base64",
+    "ending"
+  ],
+  "additionalProperties": false
+}

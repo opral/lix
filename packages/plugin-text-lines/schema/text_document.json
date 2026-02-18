@@ -1,0 +1,23 @@
+{
+  "x-lix-key": "text_document",
+  "x-lix-version": "1",
+  "x-lix-override-lixcols": {
+    "lixcol_plugin_key": "'plugin_text_lines'"
+  },
+  "type": "object",
+  "properties": {
+    "line_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true,
+      "description": "Ordered line entity ids for the projected document."
+    }
+  },
+  "required": [
+    "line_ids"
+  ],
+  "additionalProperties": false
+}

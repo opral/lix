@@ -346,6 +346,7 @@ impl Engine {
                 .await;
         }
 
+        let read_only_query = is_query_only_statements(&parsed_statements);
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
         self.maybe_materialize_reads_with_backend_from_statements(
@@ -354,7 +355,6 @@ impl Engine {
             &active_version_id,
         )
         .await?;
-        let read_only_query = is_query_only_statements(&parsed_statements);
         let should_refresh_file_cache =
             !read_only_query && should_refresh_file_cache_for_statements(&parsed_statements);
         let CollectedExecutionSideEffects {
