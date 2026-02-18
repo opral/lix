@@ -253,10 +253,21 @@ fn assign_ids_with_existing_state(
         let Some(before_ids) = before_exact.get(&key) else {
             continue;
         };
-        let limit = before_ids.len().min(after_indexes.len());
-        for offset in 0..limit {
-            let before_id = before_ids[offset].clone();
-            let after_idx = after_indexes[offset];
+        let pair_count = before_ids.len().min(after_indexes.len());
+        let before_positions = if before_ids.len() > after_indexes.len() {
+            sampled_positions(before_ids.len(), pair_count)
+        } else {
+            (0..pair_count).collect::<Vec<_>>()
+        };
+        let after_positions = if after_indexes.len() > before_ids.len() {
+            sampled_positions(after_indexes.len(), pair_count)
+        } else {
+            (0..pair_count).collect::<Vec<_>>()
+        };
+
+        for offset in 0..pair_count {
+            let before_id = before_ids[before_positions[offset]].clone();
+            let after_idx = after_indexes[after_positions[offset]];
             if assigned_ids[after_idx].is_none() {
                 assigned_ids[after_idx] = Some(before_id.clone());
                 matched_before_ids.insert(before_id);
@@ -316,7 +327,7 @@ fn assign_ids_with_existing_state(
                 None => true,
                 Some((_, second_similarity, second_score)) => {
                     top.1 >= 0.55
-                        || top.2 >= 0.65
+                        || top.2 >= 0.60
                         || (top.1 >= 0.35
                             && (top.1 - second_similarity) >= 0.15
                             && (top.2 - second_score) >= 0.08)
@@ -337,6 +348,26 @@ fn assign_ids_with_existing_state(
     }
 
     assign_missing_ids(candidates, assigned_ids)
+}
+
+fn sampled_positions(total: usize, picks: usize) -> Vec<usize> {
+    if picks == 0 || total == 0 {
+        return Vec::new();
+    }
+    if picks == 1 {
+        return vec![0];
+    }
+
+    let mut positions = Vec::with_capacity(picks);
+    for index in 0..picks {
+        let ratio = index as f64 / (picks - 1) as f64;
+        let target = (ratio * (total - 1) as f64).round() as usize;
+        let min_allowed = positions.last().copied().unwrap_or(0);
+        let max_allowed = total - (picks - index);
+        positions.push(target.clamp(min_allowed, max_allowed));
+    }
+
+    positions
 }
 
 fn assign_content_based_ids(candidates: Vec<ParsedBlockCandidate>) -> Vec<ParsedBlock> {
