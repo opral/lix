@@ -1,14 +1,21 @@
 use crate::sql::{MutationOperation, MutationRow};
+use futures_util::future::poll_fn;
+use futures_util::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 const MAX_PENDING_BATCHES_PER_LISTENER: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateCommitEventFilter {
+    // Matching semantics:
+    // - OR within each field list (e.g. schema_keys = ["a", "b"] matches a OR b)
+    // - AND across non-empty fields (e.g. schema_keys + entity_ids must both match)
+    // - Empty field means "no constraint" for that dimension
     pub schema_keys: Vec<String>,
     pub entity_ids: Vec<String>,
     pub file_ids: Vec<String>,
@@ -61,15 +68,34 @@ pub struct StateCommitEventBatch {
 
 pub struct StateCommitEvents {
     listener_id: u64,
-    queue: Arc<Mutex<VecDeque<StateCommitEventBatch>>>,
+    queue: Arc<ListenerQueue>,
     bus: Arc<StateCommitEventBus>,
     closed: AtomicBool,
 }
 
 impl StateCommitEvents {
     pub fn try_next(&self) -> Option<StateCommitEventBatch> {
-        let mut queue = self.queue.lock().unwrap();
-        queue.pop_front()
+        self.queue.try_pop()
+    }
+
+    pub async fn next(&self) -> Option<StateCommitEventBatch> {
+        poll_fn(|cx| {
+            if let Some(batch) = self.queue.try_pop() {
+                return Poll::Ready(Some(batch));
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(None);
+            }
+            self.queue.waker.register(cx.waker());
+            if let Some(batch) = self.queue.try_pop() {
+                return Poll::Ready(Some(batch));
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(None);
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     pub fn close(&self) {
@@ -77,6 +103,7 @@ impl StateCommitEvents {
             return;
         }
         self.bus.unsubscribe(self.listener_id);
+        self.queue.waker.wake();
     }
 }
 
@@ -94,7 +121,7 @@ pub(crate) struct StateCommitEventBus {
 impl StateCommitEventBus {
     pub(crate) fn subscribe(self: &Arc<Self>, filter: StateCommitEventFilter) -> StateCommitEvents {
         let compiled_filter = CompiledStateCommitEventFilter::new(filter);
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue = Arc::new(ListenerQueue::default());
 
         let mut inner = self.inner.lock().unwrap();
         let listener_id = inner.next_listener_id;
@@ -255,7 +282,20 @@ struct StateCommitEventBusInner {
 #[derive(Clone)]
 struct ListenerEntry {
     filter: CompiledStateCommitEventFilter,
-    queue: Arc<Mutex<VecDeque<StateCommitEventBatch>>>,
+    queue: Arc<ListenerQueue>,
+}
+
+#[derive(Default)]
+struct ListenerQueue {
+    queue: Mutex<VecDeque<StateCommitEventBatch>>,
+    waker: AtomicWaker,
+}
+
+impl ListenerQueue {
+    fn try_pop(&self) -> Option<StateCommitEventBatch> {
+        let mut queue = self.queue.lock().unwrap();
+        queue.pop_front()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -403,12 +443,14 @@ fn extend_candidates<'a>(
     }
 }
 
-fn enqueue_batch(queue: &Mutex<VecDeque<StateCommitEventBatch>>, batch: StateCommitEventBatch) {
-    let mut queue = queue.lock().unwrap();
-    if queue.len() >= MAX_PENDING_BATCHES_PER_LISTENER {
-        queue.pop_front();
+fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitEventBatch) {
+    let mut queue_guard = queue.queue.lock().unwrap();
+    if queue_guard.len() >= MAX_PENDING_BATCHES_PER_LISTENER {
+        queue_guard.pop_front();
     }
-    queue.push_back(batch);
+    queue_guard.push_back(batch);
+    drop(queue_guard);
+    queue.waker.wake();
 }
 
 pub(crate) fn state_commit_event_changes_from_mutations(
