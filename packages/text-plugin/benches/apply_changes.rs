@@ -2,8 +2,8 @@ mod common;
 
 use common::{apply_scenarios, file_from_bytes};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use text_plugin::apply_changes;
 use std::time::Duration;
+use text_plugin::apply_changes;
 
 fn bench_apply_changes(c: &mut Criterion) {
     let scenarios = apply_scenarios();
@@ -22,8 +22,8 @@ fn bench_apply_changes(c: &mut Criterion) {
                     )
                 },
                 |(base, changes)| {
-                    let reconstructed =
-                        apply_changes(base, changes).expect("apply_changes benchmark should succeed");
+                    let reconstructed = apply_changes(base, changes)
+                        .expect("apply_changes benchmark should succeed");
                     black_box(reconstructed);
                 },
                 BatchSize::SmallInput,

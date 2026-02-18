@@ -13,11 +13,13 @@ mod init;
 mod json_truthiness;
 mod key_value;
 mod materialization;
+mod observe;
 mod plugin;
 mod schema;
 mod schema_registry;
 mod snapshot;
 mod sql;
+mod state_commit_events;
 mod types;
 mod validation;
 mod version;
@@ -48,6 +50,11 @@ pub use materialization::{
     StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
     VersionPointerDebugRow,
 };
+pub use observe::{observe_owned, ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use snapshot::{SnapshotChunkReader, SnapshotChunkWriter};
+pub use state_commit_events::{
+    StateCommitEventBatch, StateCommitEventChange, StateCommitEventFilter,
+    StateCommitEventOperation, StateCommitEvents,
+};
 pub use types::{QueryResult, Value};
 pub use wasm_runtime::{WasmComponentInstance, WasmLimits, WasmRuntime};
