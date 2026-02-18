@@ -1,0 +1,31 @@
+{
+  "x-lix-key": "markdown_v2_block",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node": {
+      "type": "object"
+    },
+    "markdown": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "type",
+    "node",
+    "markdown"
+  ],
+  "additionalProperties": false
+}
