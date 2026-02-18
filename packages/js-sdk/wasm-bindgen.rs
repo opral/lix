@@ -3,12 +3,15 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError, LixTransaction,
+        boot, observe_owned, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError,
+        LixTransaction, ObserveEvent as EngineObserveEvent,
+        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
         QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, StateCommitEventBatch,
         StateCommitEventChange, StateCommitEventFilter, StateCommitEventOperation,
         StateCommitEvents as EngineStateCommitEvents, Value as EngineValue, WasmComponentInstance,
         WasmLimits, WasmRuntime,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -113,6 +116,22 @@ export type LixStateCommitEvents = {
   tryNext(): StateCommitEventBatch | undefined;
   close(): void;
 };
+
+export type ObserveQuery = {
+  sql: string;
+  params?: LixValueLike[];
+};
+
+export type ObserveEvent = {
+  sequence: number;
+  rows: LixQueryResultLike;
+  stateCommitSequence: number | null;
+};
+
+export type LixObserveEvents = {
+  next(): Promise<ObserveEvent | undefined>;
+  close(): void;
+};
 "#;
 
     #[wasm_bindgen]
@@ -125,12 +144,18 @@ export type LixStateCommitEvents = {
 
     #[wasm_bindgen]
     pub struct Lix {
-        engine: lix_engine::Engine,
+        engine: Arc<lix_engine::Engine>,
     }
 
     #[wasm_bindgen(js_name = StateCommitEvents)]
     pub struct JsStateCommitEvents {
         inner: std::sync::Mutex<Option<EngineStateCommitEvents>>,
+    }
+
+    #[wasm_bindgen(js_name = ObserveEvents)]
+    pub struct JsObserveEvents {
+        inner: std::sync::Mutex<Option<EngineObserveEvents>>,
+        closed: AtomicBool,
     }
 
     #[wasm_bindgen]
@@ -182,6 +207,16 @@ export type LixStateCommitEvents = {
                 inner: std::sync::Mutex::new(Some(events)),
             })
         }
+
+        #[wasm_bindgen(js_name = observe)]
+        pub fn observe(&self, query: JsValue) -> Result<JsObserveEvents, JsValue> {
+            let query = parse_observe_query(query).map_err(js_error)?;
+            let events = observe_owned(Arc::clone(&self.engine), query).map_err(js_error)?;
+            Ok(JsObserveEvents {
+                inner: std::sync::Mutex::new(Some(events)),
+                closed: AtomicBool::new(false),
+            })
+        }
     }
 
     #[wasm_bindgen(js_class = StateCommitEvents)]
@@ -210,6 +245,65 @@ export type LixStateCommitEvents = {
                 })
             })?;
             if let Some(events) = guard.take() {
+                events.close();
+            }
+            Ok(())
+        }
+    }
+
+    #[wasm_bindgen(js_class = ObserveEvents)]
+    impl JsObserveEvents {
+        #[wasm_bindgen(js_name = next)]
+        pub async fn next(&self) -> Result<JsValue, JsValue> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(JsValue::UNDEFINED);
+            }
+
+            let mut events = {
+                let mut guard = self.inner.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events lock poisoned".to_string(),
+                    })
+                })?;
+                guard.take()
+            };
+            let Some(mut events) = events.take() else {
+                return Ok(JsValue::UNDEFINED);
+            };
+
+            let next = events.next().await.map_err(js_error)?;
+            if self.closed.load(Ordering::SeqCst) || next.is_none() {
+                events.close();
+                return Ok(JsValue::UNDEFINED);
+            }
+
+            {
+                let mut guard = self.inner.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events lock poisoned".to_string(),
+                    })
+                })?;
+                if self.closed.load(Ordering::SeqCst) {
+                    events.close();
+                    return Ok(JsValue::UNDEFINED);
+                }
+                *guard = Some(events);
+            }
+
+            Ok(observe_event_to_js(next.expect("checked is_some")).into())
+        }
+
+        #[wasm_bindgen(js_name = close)]
+        pub fn close(&self) -> Result<(), JsValue> {
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            let mut guard = self.inner.lock().map_err(|_| {
+                js_error(LixError {
+                    message: "observe events lock poisoned".to_string(),
+                })
+            })?;
+            if let Some(mut events) = guard.take() {
                 events.close();
             }
             Ok(())
@@ -249,7 +343,9 @@ export type LixStateCommitEvents = {
         }
         let engine = boot(boot_args);
         engine.init().await.map_err(js_error)?;
-        Ok(Lix { engine })
+        Ok(Lix {
+            engine: Arc::new(engine),
+        })
     }
 
     fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
@@ -317,6 +413,30 @@ export type LixStateCommitEvents = {
         })
     }
 
+    fn parse_observe_query(input: JsValue) -> Result<EngineObserveQuery, LixError> {
+        if input.is_null() || input.is_undefined() || !input.is_object() {
+            return Err(LixError {
+                message: "observe query must be an object".to_string(),
+            });
+        }
+        let sql = read_required_string_property(&input, "sql", "observe query")?;
+        let params = Reflect::get(&input, &JsValue::from_str("params")).map_err(js_to_lix_error)?;
+        let params = if params.is_null() || params.is_undefined() {
+            Vec::new()
+        } else if Array::is_array(&params) {
+            let mut values = Vec::new();
+            for value in Array::from(&params).iter() {
+                values.push(value_from_js(value)?);
+            }
+            values
+        } else {
+            return Err(LixError {
+                message: "observe query.params must be an array".to_string(),
+            });
+        };
+        Ok(EngineObserveQuery { sql, params })
+    }
+
     fn read_optional_string_array_property(
         object: &JsValue,
         key: &str,
@@ -348,9 +468,12 @@ export type LixStateCommitEvents = {
         if value.is_null() || value.is_undefined() {
             return Ok(None);
         }
-        value.as_bool().ok_or_else(|| LixError {
-            message: format!("stateCommitEvents filter '{key}' must be a boolean"),
-        }).map(Some)
+        value
+            .as_bool()
+            .ok_or_else(|| LixError {
+                message: format!("stateCommitEvents filter '{key}' must be a boolean"),
+            })
+            .map(Some)
     }
 
     fn state_commit_event_batch_to_js(batch: StateCommitEventBatch) -> Object {
@@ -429,6 +552,30 @@ export type LixStateCommitEvents = {
             None => JsValue::NULL,
         };
         let _ = Reflect::set(&object, &JsValue::from_str("writerKey"), &writer_key);
+        object
+    }
+
+    fn observe_event_to_js(event: EngineObserveEvent) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("sequence"),
+            &JsValue::from_f64(event.sequence as f64),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("rows"),
+            &query_result_to_js(event.rows),
+        );
+        let state_commit_sequence = match event.state_commit_sequence {
+            Some(value) => JsValue::from_f64(value as f64),
+            None => JsValue::NULL,
+        };
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("stateCommitSequence"),
+            &state_commit_sequence,
+        );
         object
     }
 

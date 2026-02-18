@@ -70,6 +70,22 @@ export type StateCommitEvents = {
   close(): void;
 };
 
+export type ObserveQuery = {
+  sql: string;
+  params?: ReadonlyArray<unknown>;
+};
+
+export type ObserveEvent = {
+  sequence: number;
+  rows: QueryResult;
+  stateCommitSequence: number | null;
+};
+
+export type ObserveEvents = {
+  next(): Promise<ObserveEvent | undefined>;
+  close(): void;
+};
+
 export type OpenLixKeyValue = {
   key: string;
   value: unknown;
@@ -81,6 +97,7 @@ export type OpenLixKeyValue = {
 export type Lix = {
   execute(sql: string, params?: ReadonlyArray<unknown>): Promise<QueryResult>;
   stateCommitEvents(filter?: StateCommitEventFilter): StateCommitEvents;
+  observe(query: ObserveQuery): ObserveEvents;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
   switchVersion(versionId: string): Promise<void>;
   installPlugin(args: InstallPluginOptions): Promise<void>;
@@ -116,6 +133,9 @@ export async function openLix(
   );
   let closed = false;
   const openStateCommitEventHandles = new Set<{
+    close?: () => void;
+  }>();
+  const openObserveHandles = new Set<{
     close?: () => void;
   }>();
 
@@ -158,6 +178,40 @@ export async function openLix(
         const next = rawEvents.tryNext();
         if (next === undefined || next === null) return undefined;
         return next as StateCommitEventBatch;
+      },
+      close,
+    };
+  };
+
+  const observe = (query: ObserveQuery): ObserveEvents => {
+    ensureOpen("observe");
+    if (!query || typeof query.sql !== "string" || query.sql.trim().length === 0) {
+      throw new Error("observe requires a non-empty sql string");
+    }
+    const rawEvents = (wasmLix as any).observe({
+      sql: query.sql,
+      params: (query.params ?? []).map((param) => Value.from(param)),
+    });
+    if (!rawEvents || typeof rawEvents.next !== "function") {
+      throw new Error("observe is not available in this wasm build");
+    }
+    let localClosed = false;
+    const close = () => {
+      if (localClosed) return;
+      localClosed = true;
+      openObserveHandles.delete(rawEvents);
+      if (typeof rawEvents.close === "function") {
+        rawEvents.close();
+      }
+    };
+    openObserveHandles.add(rawEvents);
+
+    return {
+      async next(): Promise<ObserveEvent | undefined> {
+        if (localClosed) return undefined;
+        const next = await rawEvents.next();
+        if (next === undefined || next === null) return undefined;
+        return next as ObserveEvent;
       },
       close,
     };
@@ -257,6 +311,14 @@ export async function openLix(
       }
     }
     openStateCommitEventHandles.clear();
+    for (const handle of openObserveHandles) {
+      try {
+        handle.close?.();
+      } catch {
+        // ignore close errors from individual observe handles
+      }
+    }
+    openObserveHandles.clear();
 
     let firstError: unknown;
     try {
@@ -287,6 +349,7 @@ export async function openLix(
   return {
     execute,
     stateCommitEvents,
+    observe,
     createVersion,
     switchVersion,
     installPlugin,
