@@ -19,7 +19,7 @@ mod schema;
 mod schema_registry;
 mod snapshot;
 mod sql;
-mod state_commit_events;
+mod state_commit_stream;
 mod types;
 mod validation;
 mod version;
@@ -52,9 +52,9 @@ pub use materialization::{
 };
 pub use observe::{observe_owned, ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use snapshot::{SnapshotChunkReader, SnapshotChunkWriter};
-pub use state_commit_events::{
-    StateCommitEventBatch, StateCommitEventChange, StateCommitEventFilter,
-    StateCommitEventOperation, StateCommitEvents,
+pub use state_commit_stream::{
+    StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,
+    StateCommitStreamOperation,
 };
 pub use types::{QueryResult, Value};
 pub use wasm_runtime::{WasmComponentInstance, WasmLimits, WasmRuntime};

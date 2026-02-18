@@ -92,9 +92,9 @@ test("close is idempotent and blocks further API calls", async () => {
   await expect(lix.switchVersion("v1")).rejects.toThrow("lix is closed");
 });
 
-test("stateCommitEvents emits filtered commit events", async () => {
+test("stateCommitStream emits filtered commit batches", async () => {
   const lix = await openLix();
-  const events = lix.stateCommitEvents({ schemaKeys: ["lix_key_value"] });
+  const events = lix.stateCommitStream({ schemaKeys: ["lix_key_value"] });
 
   await lix.execute(
     "INSERT INTO lix_internal_state_vtable (\
