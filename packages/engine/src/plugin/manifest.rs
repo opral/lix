@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use globset::Glob;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
@@ -20,6 +21,7 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
         serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
             message: format!("Plugin manifest does not match expected shape: {error}"),
         })?;
+    validate_detect_changes_glob(&manifest.detect_changes_glob)?;
 
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
         message: format!("Failed to normalize plugin manifest JSON: {error}"),
@@ -29,6 +31,13 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
         manifest,
         normalized_json,
     })
+}
+
+fn validate_detect_changes_glob(glob: &str) -> Result<(), LixError> {
+    Glob::new(glob).map_err(|error| LixError {
+        message: format!("Invalid plugin manifest: detect_changes_glob is invalid: {error}"),
+    })?;
+    Ok(())
 }
 
 fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
@@ -90,6 +99,7 @@ fn format_validation_errors<'a>(
 #[cfg(test)]
 mod tests {
     use super::parse_plugin_manifest_json;
+    use crate::plugin::types::StateContextColumn;
 
     #[test]
     fn parses_valid_manifest() {
@@ -121,5 +131,170 @@ mod tests {
 
         assert!(err.message.contains("Invalid plugin manifest"));
         assert!(err.message.contains("key"));
+    }
+
+    #[test]
+    fn rejects_invalid_detect_changes_glob() {
+        let err = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.{md,mdx"
+            }"#,
+        )
+        .expect_err("invalid glob should fail");
+
+        assert!(err.message.contains("detect_changes_glob"));
+    }
+
+    #[test]
+    fn parses_manifest_with_active_state_columns() {
+        let validated = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.{md,mdx}",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": true,
+                        "columns": ["entity_id", "schema_key", "snapshot_content"]
+                    }
+                }
+            }"#,
+        )
+        .expect("manifest should parse");
+
+        let state_context = validated
+            .manifest
+            .detect_changes
+            .expect("detect_changes should be present")
+            .state_context
+            .expect("state_context should be present");
+
+        assert_eq!(state_context.include_active_state, Some(true));
+        assert_eq!(
+            state_context.columns,
+            Some(vec![
+                StateContextColumn::EntityId,
+                StateContextColumn::SchemaKey,
+                StateContextColumn::SnapshotContent
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_manifest_with_active_state_and_default_columns() {
+        let validated = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": true
+                    }
+                }
+            }"#,
+        )
+        .expect("manifest should parse");
+
+        let state_context = validated
+            .manifest
+            .detect_changes
+            .expect("detect_changes should be present")
+            .state_context
+            .expect("state_context should be present");
+
+        assert_eq!(state_context.include_active_state, Some(true));
+        assert_eq!(state_context.columns, None);
+    }
+
+    #[test]
+    fn rejects_state_columns_when_include_active_state_is_missing() {
+        let err = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "columns": ["entity_id", "schema_key"]
+                    }
+                }
+            }"#,
+        )
+        .expect_err("manifest should be invalid");
+
+        assert!(err.message.contains("detect_changes/state_context"));
+        assert!(err.message.contains("columns"));
+    }
+
+    #[test]
+    fn rejects_state_columns_when_include_active_state_is_false() {
+        let err = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": false,
+                        "columns": ["entity_id", "schema_key"]
+                    }
+                }
+            }"#,
+        )
+        .expect_err("manifest should be invalid");
+
+        assert!(err.message.contains("detect_changes/state_context"));
+        assert!(err.message.contains("columns"));
+    }
+
+    #[test]
+    fn rejects_state_columns_without_entity_id() {
+        let err = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": true,
+                        "columns": ["schema_key", "snapshot_content"]
+                    }
+                }
+            }"#,
+        )
+        .expect_err("manifest should be invalid");
+
+        assert!(err.message.contains("columns"));
+        assert!(err.message.contains("Invalid plugin manifest"));
+    }
+
+    #[test]
+    fn rejects_unknown_state_column() {
+        let err = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": true,
+                        "columns": ["entity_id", "unknown_column"]
+                    }
+                }
+            }"#,
+        )
+        .expect_err("manifest should be invalid");
+
+        assert!(err.message.contains("unknown_column"));
     }
 }

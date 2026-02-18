@@ -1,0 +1,18 @@
+{
+  "key": "plugin_md_v2",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "detect_changes_glob": "*.{md,mdx}",
+  "detect_changes": {
+    "state_context": {
+      "include_active_state": true,
+      "columns": [
+        "entity_id",
+        "schema_key",
+        "schema_version",
+        "snapshot_content"
+      ]
+    }
+  },
+  "entry": "plugin.wasm"
+}

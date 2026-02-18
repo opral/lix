@@ -1,0 +1,26 @@
+{
+  "x-lix-key": "markdown_v2_document",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "const": "root"
+    },
+    "order": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "required": [
+    "id",
+    "order"
+  ],
+  "additionalProperties": false
+}
