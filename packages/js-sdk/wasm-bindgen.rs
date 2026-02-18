@@ -299,7 +299,20 @@ export type LixObserveEvents = {
             }
 
             let next = match next {
-                Ok(next) => next.map_err(js_error)?,
+                Ok(Ok(next)) => next,
+                Ok(Err(error)) => {
+                    let mut guard = self.inner.lock().map_err(|_| {
+                        js_error(LixError {
+                            message: "observe events lock poisoned".to_string(),
+                        })
+                    })?;
+                    if self.closed.load(Ordering::SeqCst) {
+                        events.close();
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                    *guard = Some(events);
+                    return Err(js_error(error));
+                }
                 Err(_) => {
                     events.close();
                     return Ok(JsValue::UNDEFINED);
