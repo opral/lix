@@ -37,8 +37,8 @@ impl Guest for MarkdownPlugin {
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    let state_context = project_state_context_from_before(before.clone())?;
-    <MarkdownPlugin as Guest>::detect_changes(before, after, Some(state_context))
+    let state_context = project_state_context_from_before(before)?;
+    <MarkdownPlugin as Guest>::detect_changes(None, after, Some(state_context))
 }
 
 pub fn detect_changes_with_state_context(
