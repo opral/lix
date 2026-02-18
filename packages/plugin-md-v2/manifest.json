@@ -1,0 +1,7 @@
+{
+  "key": "plugin_md_v2",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "detect_changes_glob": "*.{md,mdx}",
+  "entry": "plugin.wasm"
+}
