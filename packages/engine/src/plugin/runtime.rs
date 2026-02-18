@@ -3,6 +3,7 @@ use crate::materialization::{MaterializationPlan, MaterializationWrite, Material
 use crate::plugin::types::{InstalledPlugin, PluginRuntime};
 use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -37,7 +38,6 @@ struct FileDescriptorRow {
     file_id: String,
     version_id: String,
     path: String,
-    extension: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,7 +332,6 @@ pub(crate) async fn materialize_file_data_with_plugins(
             FileDescriptorRow {
                 file_id,
                 version_id,
-                extension: file_extension_from_path(&path),
                 path,
             },
         );
@@ -588,7 +587,7 @@ fn select_plugin_for_file<'a>(
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
     plugins.iter().find(|plugin| {
-        glob_matches_extension(&plugin.detect_changes_glob, descriptor.extension.as_deref())
+        glob_matches_path(&plugin.detect_changes_glob, &descriptor.path)
     })
 }
 
@@ -596,37 +595,27 @@ fn select_plugin_for_path<'a>(
     path: &str,
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
-    let extension = file_extension_from_path(path);
     plugins
         .iter()
-        .find(|plugin| glob_matches_extension(&plugin.detect_changes_glob, extension.as_deref()))
+        .find(|plugin| glob_matches_path(&plugin.detect_changes_glob, path))
 }
 
-fn file_extension_from_path(path: &str) -> Option<String> {
-    let file_name = path.rsplit('/').next().unwrap_or(path);
-    let extension = file_name.rsplit_once('.').map(|(_, ext)| ext.to_string());
-    normalize_extension(extension)
-}
-
-fn normalize_extension(value: Option<String>) -> Option<String> {
-    value
-        .map(|entry| entry.trim().trim_start_matches('.').to_ascii_lowercase())
-        .filter(|entry| !entry.is_empty())
-}
-
-fn glob_matches_extension(glob: &str, extension: Option<&str>) -> bool {
-    let normalized = glob.trim().to_ascii_lowercase();
-    if normalized == "*" || normalized == "**/*" {
+fn glob_matches_path(glob: &str, path: &str) -> bool {
+    let normalized_glob = glob.trim();
+    let normalized_path = path.trim();
+    if normalized_glob.is_empty() || normalized_path.is_empty() {
+        return false;
+    }
+    if normalized_glob == "*" || normalized_glob == "**/*" {
         return true;
     }
 
-    if let Some(ext) = normalized.strip_prefix("*.") {
-        return extension
-            .map(|value| value.eq_ignore_ascii_case(ext))
-            .unwrap_or(false);
-    }
-
-    false
+    GlobBuilder::new(normalized_glob)
+        .literal_separator(false)
+        .case_insensitive(true)
+        .build()
+        .map(|compiled| compiled.compile_matcher().is_match(normalized_path))
+        .unwrap_or(false)
 }
 
 fn plugin_detect_emits_complete_diff(plugin: &InstalledPlugin) -> bool {
@@ -791,7 +780,6 @@ async fn load_missing_file_descriptors(
             FileDescriptorRow {
                 file_id,
                 version_id,
-                extension: file_extension_from_path(&path),
                 path,
             },
         );
@@ -1222,8 +1210,8 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 #[cfg(test)]
 mod tests {
     use super::{
-        append_implicit_tombstones_for_projection, load_or_init_plugin_component,
-        CachedPluginComponent, PluginEntityChange, PluginEntityKey,
+        append_implicit_tombstones_for_projection, glob_matches_path,
+        load_or_init_plugin_component, CachedPluginComponent, PluginEntityChange, PluginEntityKey,
     };
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
@@ -1323,6 +1311,21 @@ mod tests {
             })
             .count();
         assert_eq!(tombstones, 1);
+    }
+
+    #[test]
+    fn detect_changes_glob_matches_paths() {
+        assert!(glob_matches_path("*.{md,mdx}", "/notes.md"));
+        assert!(glob_matches_path("*.{md,mdx}", "/notes.MDX"));
+        assert!(glob_matches_path("docs/**/*.md", "docs/nested/readme.md"));
+        assert!(glob_matches_path("**/*.mdx", "/docs/nested/readme.mdx"));
+        assert!(!glob_matches_path("*.{md,mdx}", "/notes.json"));
+        assert!(!glob_matches_path("docs/**/*.md", "notes/readme.md"));
+    }
+
+    #[test]
+    fn detect_changes_glob_invalid_pattern_does_not_match() {
+        assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
     }
 
     #[tokio::test]

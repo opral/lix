@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use globset::Glob;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
@@ -20,6 +21,7 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
         serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
             message: format!("Plugin manifest does not match expected shape: {error}"),
         })?;
+    validate_detect_changes_glob(&manifest.detect_changes_glob)?;
 
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
         message: format!("Failed to normalize plugin manifest JSON: {error}"),
@@ -29,6 +31,13 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
         manifest,
         normalized_json,
     })
+}
+
+fn validate_detect_changes_glob(glob: &str) -> Result<(), LixError> {
+    Glob::new(glob).map_err(|error| LixError {
+        message: format!("Invalid plugin manifest: detect_changes_glob is invalid: {error}"),
+    })?;
+    Ok(())
 }
 
 fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
@@ -121,5 +130,20 @@ mod tests {
 
         assert!(err.message.contains("Invalid plugin manifest"));
         assert!(err.message.contains("key"));
+    }
+
+    #[test]
+    fn rejects_invalid_detect_changes_glob() {
+        let err = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_markdown",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.{md,mdx"
+            }"#,
+        )
+        .expect_err("invalid glob should fail");
+
+        assert!(err.message.contains("detect_changes_glob"));
     }
 }
