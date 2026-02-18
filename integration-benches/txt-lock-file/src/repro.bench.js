@@ -47,7 +47,11 @@ async function main() {
   await assertRepoExists(config.repoPath);
 
   const parentCommit = (
-    await runGit(config.repoPath, ["rev-parse", `${config.targetCommit}^`], "utf8")
+    await runGit(
+      config.repoPath,
+      ["rev-parse", `${config.targetCommit}^`],
+      "utf8",
+    )
   ).trim();
   const beforeBytes = await runGit(
     config.repoPath,
@@ -95,15 +99,16 @@ async function main() {
 
 async function runScenario({ scenario, beforeBytes, afterBytes, config }) {
   const backend = await createWasmSqliteBackend();
+  const bootKeyValues = [
+    {
+      key: "lix_deterministic_mode",
+      value: { enabled: true },
+      lixcol_version_id: "global",
+    },
+  ];
   const lix = await openLix({
     backend,
-    keyValues: [
-      {
-        key: "lix_deterministic_mode",
-        value: { enabled: true },
-        lixcol_version_id: "global",
-      },
-    ],
+    keyValues: bootKeyValues,
   });
 
   try {
@@ -327,7 +332,11 @@ function scalarToNumber(value, context) {
   if (typeof value === "bigint") return Number(value);
   if (typeof value === "string") return Number(value);
   if (typeof value === "object") {
-    if (value.kind === "Integer" || value.kind === "Real" || value.kind === "Text") {
+    if (
+      value.kind === "Integer" ||
+      value.kind === "Real" ||
+      value.kind === "Text"
+    ) {
       return Number(value.value);
     }
   }
@@ -348,7 +357,9 @@ function countLines(bytes) {
 function printSummary(report) {
   console.log("");
   console.log("Text-Lines Repro Benchmark");
-  console.log(`target: ${report.config.targetCommit.slice(0, 12)} ${report.config.filePath}`);
+  console.log(
+    `target: ${report.config.targetCommit.slice(0, 12)} ${report.config.filePath}`,
+  );
   console.log(
     `blob sizes: before=${report.config.beforeBytes}B after=${report.config.afterBytes}B`,
   );
