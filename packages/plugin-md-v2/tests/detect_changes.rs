@@ -1,7 +1,14 @@
 mod common;
 
-use common::{assert_invalid_input, file_from_markdown, is_block_change, is_document_change};
-use plugin_md_v2::{detect_changes, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, SCHEMA_VERSION};
+use common::{
+    assert_invalid_input, file_from_markdown, is_block_change, is_document_change,
+    parse_document_order,
+};
+use plugin_md_v2::{
+    detect_changes, detect_changes_with_state_context, PluginDetectStateContext, BLOCK_SCHEMA_KEY,
+    DOCUMENT_SCHEMA_KEY, SCHEMA_VERSION,
+};
+use std::collections::BTreeSet;
 
 fn count_tombstones(changes: &[plugin_md_v2::PluginEntityChange]) -> usize {
     changes
@@ -56,6 +63,63 @@ fn upsert_markdowns(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String>
                 .to_string()
         })
         .collect()
+}
+
+fn bootstrap_order(markdown: &str) -> Vec<String> {
+    let bootstrap = detect_changes(None, file_from_markdown("bootstrap", "/notes.md", markdown))
+        .expect("bootstrap detect_changes should succeed");
+    let document = bootstrap
+        .iter()
+        .find(|change| is_document_change(change))
+        .expect("bootstrap should include document row");
+    parse_document_order(document)
+}
+
+fn document_order_from_changes(
+    changes: &[plugin_md_v2::PluginEntityChange],
+) -> Option<Vec<String>> {
+    changes
+        .iter()
+        .find(|change| is_document_change(change))
+        .map(parse_document_order)
+}
+
+fn tombstone_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_none())
+        .map(|change| change.entity_id.clone())
+        .collect()
+}
+
+fn upsert_ids(changes: &[plugin_md_v2::PluginEntityChange]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|change| change.schema_key == BLOCK_SCHEMA_KEY && change.snapshot_content.is_some())
+        .map(|change| change.entity_id.clone())
+        .collect()
+}
+
+fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginDetectStateContext {
+    PluginDetectStateContext {
+        active_state: Some(
+            rows.iter()
+                .map(|row| plugin_md_v2::PluginActiveStateRow {
+                    entity_id: row.entity_id.clone(),
+                    schema_key: Some(row.schema_key.clone()),
+                    schema_version: Some(row.schema_version.clone()),
+                    snapshot_content: row.snapshot_content.clone(),
+                    file_id: None,
+                    plugin_key: None,
+                    version_id: None,
+                    change_id: None,
+                    metadata: None,
+                    created_at: None,
+                    updated_at: None,
+                })
+                .collect::<Vec<_>>(),
+        ),
+    }
 }
 
 #[test]
@@ -585,4 +649,613 @@ fn large_mixed_duplicates_and_move_with_one_edit_emits_targeted_replace() {
     assert!(upsert_markdowns(&changes)
         .iter()
         .any(|markdown| markdown.contains("U10 x")));
+}
+
+#[test]
+fn id_stability_pure_reorder_preserves_existing_ids() {
+    let before_markdown = "First\n\nSecond\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "Second\n\nFirst\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 0);
+    assert_eq!(count_upserts(&changes), 0);
+    assert_eq!(count_document_rows(&changes), 1);
+
+    let after_order =
+        document_order_from_changes(&changes).expect("reorder should include document row");
+    assert_eq!(
+        after_order,
+        vec![before_order[1].clone(), before_order[0].clone()]
+    );
+}
+
+#[test]
+fn id_stability_insert_between_keeps_neighbors_and_mints_new_id() {
+    let before_markdown = "A\n\nC\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "A\n\nB\n\nC\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 0);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+
+    let after_order =
+        document_order_from_changes(&changes).expect("insert should include document row");
+    assert_eq!(after_order[0], before_order[0]);
+    assert_eq!(after_order[2], before_order[1]);
+    assert_ne!(after_order[1], before_order[0]);
+    assert_ne!(after_order[1], before_order[1]);
+    assert_eq!(upsert_ids(&changes), vec![after_order[1].clone()]);
+}
+
+#[test]
+fn id_stability_delete_keeps_survivor_id_and_tombstones_deleted() {
+    let before_markdown = "Keep me\n\nDelete me\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "Keep me\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 0);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[1].clone()]);
+    assert_eq!(
+        document_order_from_changes(&changes).expect("delete should include document row"),
+        vec![before_order[0].clone()]
+    );
+}
+
+#[test]
+fn id_stability_paragraph_edit_replaces_edited_block_id_only() {
+    let before_markdown = "First\n\nSecond\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "First updated\n\nSecond\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let after_order =
+        document_order_from_changes(&changes).expect("edit should include document row");
+    assert_eq!(after_order[1], before_order[1]);
+    assert_ne!(after_order[0], before_order[0]);
+    assert_eq!(upsert_ids(&changes), vec![after_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_heading_edit_replaces_heading_id_but_keeps_paragraph_id() {
+    let before_markdown = "# Hello\n\nBody\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "# Hello World\n\nBody\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["heading".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("edit should include doc row");
+    assert_ne!(after_order[0], before_order[0]);
+    assert_eq!(after_order[1], before_order[1]);
+}
+
+#[test]
+fn id_stability_move_and_edit_replaces_edited_block_and_reorders() {
+    let before_markdown = "Alpha\n\nBeta\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "Beta plus\n\nAlpha\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[1].clone()]);
+
+    let after_order =
+        document_order_from_changes(&changes).expect("move+edit should include document row");
+    assert_eq!(after_order[1], before_order[0]);
+    assert_ne!(after_order[0], before_order[1]);
+    assert_eq!(upsert_ids(&changes), vec![after_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_move_section_with_heading_edit_replaces_only_heading_id() {
+    let before_markdown = "# A\n\nPara A\n\n# B\n\nPara B\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 4);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "# B plus\n\nPara B\n\n# A\n\nPara A\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["heading".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[2].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_ne!(after_order[0], before_order[2]);
+    assert_eq!(after_order[1], before_order[3]);
+    assert_eq!(after_order[2], before_order[0]);
+    assert_eq!(after_order[3], before_order[1]);
+}
+
+#[test]
+fn id_stability_cross_type_does_not_reuse_old_id() {
+    let before_markdown = "Hello\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "# Hello\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let upserts = upsert_ids(&changes);
+    assert_eq!(upserts.len(), 1);
+    assert_ne!(upserts[0], before_order[0]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_eq!(after_order, upserts);
+}
+
+#[test]
+fn id_stability_duplicate_edit_second_keeps_first_id() {
+    let before_markdown = "Same\n\nSame\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 2);
+    assert_ne!(before_order[0], before_order[1]);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "Same\n\nSame updated\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[1].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_eq!(after_order[0], before_order[0]);
+    assert_ne!(after_order[1], before_order[1]);
+}
+
+#[test]
+fn id_stability_duplicate_edit_uses_occurrence_matching_not_original_position() {
+    let before_markdown = "Same\n\nSame\n\nSame\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 3);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "Same\n\nChanged\n\nSame\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[2].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_eq!(after_order[0], before_order[0]);
+    assert_ne!(after_order[1], before_order[1]);
+    assert_eq!(after_order[2], before_order[1]);
+}
+
+#[test]
+fn id_stability_list_item_edit_replaces_list_block_id() {
+    let before_markdown = "- one\n- two\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "- one\n- two changed\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["list".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_ne!(after_order[0], before_order[0]);
+}
+
+#[test]
+fn id_stability_table_cell_edit_replaces_table_block_id() {
+    let before_markdown = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "| a | b |\n| - | - |\n| 1 | 3 |\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["table".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_ne!(after_order[0], before_order[0]);
+}
+
+#[test]
+fn id_stability_code_edit_replaces_code_block_id() {
+    let before_markdown = "```js\nconsole.log(1)\n```\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "```js\nconsole.log(2)\n```\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["code".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_ne!(after_order[0], before_order[0]);
+}
+
+#[test]
+fn id_stability_link_text_edit_replaces_paragraph_block_id() {
+    let before_markdown = "[text](https://example.com)\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "[new](https://example.com)\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["paragraph".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_html_tweak_replaces_top_level_block_id() {
+    let before_markdown = "<div>Hello</div>\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "<div>Hello world</div>\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include doc row");
+    assert_ne!(after_order[0], before_order[0]);
+}
+
+#[test]
+fn id_stability_list_reorder_replaces_list_block_id() {
+    let before_markdown = "- one\n- two\n- three\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "- three\n- one\n- two\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["list".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_list_add_item_replaces_list_block_id() {
+    let before_markdown = "- one\n- two\n";
+    let before_order = bootstrap_order(before_markdown);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "- one\n- two\n- three\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["list".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_list_remove_item_replaces_list_block_id() {
+    let before_markdown = "- one\n- two\n- three\n";
+    let before_order = bootstrap_order(before_markdown);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "- one\n- three\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["list".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_table_add_row_replaces_table_block_id() {
+    let before_markdown = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown(
+            "f1",
+            "/notes.md",
+            "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n",
+        ),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["table".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_table_remove_row_replaces_table_block_id() {
+    let before_markdown = "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "| a | b |\n| - | - |\n| 1 | 2 |\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["table".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_code_language_edit_replaces_code_block_id() {
+    let before_markdown = "```js\nconsole.log(1)\n```\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "```ts\nconsole.log(1)\n```\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["code".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_link_url_edit_replaces_paragraph_block_id() {
+    let before_markdown = "[text](https://example.com)\n";
+    let before_order = bootstrap_order(before_markdown);
+    assert_eq!(before_order.len(), 1);
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", before_markdown)),
+        file_from_markdown("f1", "/notes.md", "[text](https://example.org)\n"),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_types(&changes), vec!["paragraph".to_string()]);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn id_stability_large_pure_shuffle_preserves_id_set() {
+    let paragraphs = (1..=500).map(|idx| format!("P{idx}")).collect::<Vec<_>>();
+    let before_markdown = paragraphs.join("\n\n") + "\n";
+    let before_order = bootstrap_order(&before_markdown);
+    assert_eq!(before_order.len(), 500);
+
+    let mut after = paragraphs.clone();
+    after.rotate_left(123);
+    let after_markdown = after.join("\n\n") + "\n";
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", &before_markdown)),
+        file_from_markdown("f1", "/notes.md", &after_markdown),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 0);
+    assert_eq!(count_upserts(&changes), 0);
+    assert_eq!(count_document_rows(&changes), 1);
+
+    let after_order = document_order_from_changes(&changes).expect("shuffle should include doc");
+    let before_set = before_order.into_iter().collect::<BTreeSet<_>>();
+    let after_set = after_order.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(before_set, after_set);
+}
+
+#[test]
+fn id_stability_large_duplicates_edit_350_uses_occurrence_matching() {
+    let paragraphs = (0..500).map(|_| "Same".to_string()).collect::<Vec<_>>();
+    let before_markdown = paragraphs.join("\n\n") + "\n";
+    let before_order = bootstrap_order(&before_markdown);
+    assert_eq!(before_order.len(), 500);
+
+    let mut after = paragraphs;
+    after[349] = "Same updated".to_string();
+    let after_markdown = after.join("\n\n") + "\n";
+
+    let changes = detect_changes(
+        Some(file_from_markdown("f1", "/notes.md", &before_markdown)),
+        file_from_markdown("f1", "/notes.md", &after_markdown),
+    )
+    .expect("detect_changes should succeed");
+
+    assert_eq!(count_tombstones(&changes), 1);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(tombstone_ids(&changes), vec![before_order[499].clone()]);
+
+    let after_order = document_order_from_changes(&changes).expect("should include document row");
+    assert_eq!(after_order[0], before_order[0]);
+    assert_eq!(after_order[348], before_order[348]);
+    assert_eq!(after_order[350], before_order[349]);
+}
+
+#[test]
+fn with_state_context_paragraph_edit_reuses_existing_id_without_tombstone() {
+    let before = file_from_markdown("f1", "/notes.md", "Hello\n\nWorld\n");
+    let bootstrap =
+        detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
+    let before_order = bootstrap_order("Hello\n\nWorld\n");
+    let state_context = state_context_from_rows(&bootstrap);
+
+    let changes = detect_changes_with_state_context(
+        Some(before),
+        file_from_markdown("f1", "/notes.md", "Hello updated\n\nWorld\n"),
+        Some(state_context),
+    )
+    .expect("detect_changes_with_state_context should succeed");
+
+    assert_eq!(count_tombstones(&changes), 0);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 0);
+    assert_eq!(upsert_ids(&changes), vec![before_order[0].clone()]);
+}
+
+#[test]
+fn with_state_context_move_and_edit_reuses_existing_id_and_updates_order() {
+    let before_markdown = "Alpha\n\nBeta\n";
+    let before = file_from_markdown("f1", "/notes.md", before_markdown);
+    let bootstrap =
+        detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
+    let before_order = bootstrap_order(before_markdown);
+    let state_context = state_context_from_rows(&bootstrap);
+
+    let changes = detect_changes_with_state_context(
+        Some(before),
+        file_from_markdown("f1", "/notes.md", "Beta plus\n\nAlpha\n"),
+        Some(state_context),
+    )
+    .expect("detect_changes_with_state_context should succeed");
+
+    assert_eq!(count_tombstones(&changes), 0);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+    assert_eq!(upsert_ids(&changes), vec![before_order[1].clone()]);
+    assert_eq!(
+        document_order_from_changes(&changes).expect("document row should be present"),
+        vec![before_order[1].clone(), before_order[0].clone()]
+    );
+}
+
+#[test]
+fn with_state_context_insert_between_preserves_neighbor_ids_and_mints_new_id() {
+    let before_markdown = "A\n\nC\n";
+    let before = file_from_markdown("f1", "/notes.md", before_markdown);
+    let bootstrap =
+        detect_changes(None, before.clone()).expect("bootstrap detect_changes should succeed");
+    let before_order = bootstrap_order(before_markdown);
+    let state_context = state_context_from_rows(&bootstrap);
+
+    let changes = detect_changes_with_state_context(
+        Some(before),
+        file_from_markdown("f1", "/notes.md", "A\n\nB\n\nC\n"),
+        Some(state_context),
+    )
+    .expect("detect_changes_with_state_context should succeed");
+
+    assert_eq!(count_tombstones(&changes), 0);
+    assert_eq!(count_upserts(&changes), 1);
+    assert_eq!(count_document_rows(&changes), 1);
+
+    let order = document_order_from_changes(&changes).expect("document row should be present");
+    assert_eq!(order[0], before_order[0]);
+    assert_eq!(order[2], before_order[1]);
+    assert_ne!(order[1], before_order[0]);
+    assert_ne!(order[1], before_order[1]);
+    assert_eq!(upsert_ids(&changes), vec![order[1].clone()]);
 }

@@ -24,13 +24,35 @@ interface api {
     snapshot-content: option<string>,
   }
 
+  /// Optional active-state row payload passed to detect-changes when requested
+  /// by the plugin manifest. Omitted fields are represented as `none`.
+  ///
+  /// Scope is implicit and engine-defined: same plugin + same file + active rows.
+  record active-state-row {
+    entity-id: string,
+    schema-key: option<string>,
+    schema-version: option<string>,
+    snapshot-content: option<string>,
+    file-id: option<string>,
+    plugin-key: option<string>,
+    version-id: option<string>,
+    change-id: option<string>,
+    metadata: option<string>,
+    created-at: option<string>,
+    updated-at: option<string>,
+  }
+
+  record detect-state-context {
+    active-state: option<list<active-state-row>>,
+  }
+
   variant plugin-error {
     invalid-input(string),
     internal(string),
   }
 
   /// Computes row-level state transitions between two file payloads.
-  detect-changes: func(before: option<file>, after: file) -> result<list<entity-change>, plugin-error>;
+  detect-changes: func(before: option<file>, after: file, state-context: option<detect-state-context>) -> result<list<entity-change>, plugin-error>;
   /// Rebuilds file bytes from the unordered latest-state row set.
   apply-changes: func(file: file, changes: list<entity-change>) -> result<list<u8>, plugin-error>;
 }

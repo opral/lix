@@ -74,7 +74,11 @@ struct DocumentSnapshotOwned {
 }
 
 impl Guest for TextLinesPlugin {
-    fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
+    fn detect_changes(
+        before: Option<File>,
+        after: File,
+        _state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+    ) -> Result<Vec<EntityChange>, PluginError> {
         if let Some(previous) = before.as_ref() {
             if previous.data == after.data {
                 return Ok(Vec::new());
@@ -399,7 +403,10 @@ fn parse_after_lines_with_histogram_matching(
     after_lines
 }
 
-fn compute_histogram_line_matching_pairs(before_data: &[u8], after_data: &[u8]) -> Vec<(usize, usize)> {
+fn compute_histogram_line_matching_pairs(
+    before_data: &[u8],
+    after_data: &[u8],
+) -> Vec<(usize, usize)> {
     let input = InternedInput::new(before_data, after_data);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
@@ -513,7 +520,9 @@ fn parse_line_ending_literal(value: &str) -> Result<LineEnding, String> {
         "" => Ok(LineEnding::None),
         "\\n" => Ok(LineEnding::Lf),
         "\\r\\n" => Ok(LineEnding::Crlf),
-        _ => Err("unsupported ending literal; expected \"\", \"\\\\n\", or \"\\\\r\\\\n\"".to_string()),
+        _ => Err(
+            "unsupported ending literal; expected \"\", \"\\\\n\", or \"\\\\r\\\\n\"".to_string(),
+        ),
     }
 }
 
@@ -545,7 +554,15 @@ fn base64_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    <TextLinesPlugin as Guest>::detect_changes(before, after)
+    <TextLinesPlugin as Guest>::detect_changes(before, after, None)
+}
+
+pub fn detect_changes_with_state_context(
+    before: Option<File>,
+    after: File,
+    state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+) -> Result<Vec<EntityChange>, PluginError> {
+    <TextLinesPlugin as Guest>::detect_changes(before, after, state_context)
 }
 
 pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
@@ -561,8 +578,9 @@ pub fn line_schema_json() -> &'static str {
 }
 
 pub fn line_schema_definition() -> &'static Value {
-    LINE_SCHEMA
-        .get_or_init(|| serde_json::from_str(LINE_SCHEMA_JSON).expect("text line schema must parse"))
+    LINE_SCHEMA.get_or_init(|| {
+        serde_json::from_str(LINE_SCHEMA_JSON).expect("text line schema must parse")
+    })
 }
 
 pub fn document_schema_json() -> &'static str {

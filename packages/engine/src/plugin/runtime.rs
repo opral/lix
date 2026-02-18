@@ -1,6 +1,6 @@
 use crate::cel::CelEvaluator;
 use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
-use crate::plugin::types::{InstalledPlugin, PluginRuntime};
+use crate::plugin::types::{InstalledPlugin, PluginManifest, PluginRuntime, StateContextColumn};
 use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use globset::GlobBuilder;
@@ -80,6 +80,39 @@ struct ApplyChangesRequest {
 struct DetectChangesRequest {
     before: Option<PluginFile>,
     after: PluginFile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_context: Option<DetectStateContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DetectStateContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_state: Option<Vec<PluginActiveStateRow>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PluginActiveStateRow {
+    entity_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -115,6 +148,8 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
     }
 
     let mut detected = Vec::new();
+    let mut state_context_columns_by_plugin: BTreeMap<String, Option<Vec<StateContextColumn>>> =
+        BTreeMap::new();
     for write in writes {
         let has_before_context = write.before_path.is_some() || write.before_data.is_some();
         let before_path = write.before_path.as_deref().unwrap_or(write.path.as_str());
@@ -197,9 +232,35 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             data: write.after_data.clone(),
         };
 
+        let selected_state_columns =
+            if let Some(cached) = state_context_columns_by_plugin.get(&plugin.key).cloned() {
+                cached
+            } else {
+                let resolved = resolve_state_context_columns(plugin)?;
+                state_context_columns_by_plugin.insert(plugin.key.clone(), resolved.clone());
+                resolved
+            };
+        let state_context = match selected_state_columns {
+            Some(columns) => {
+                let rows = load_active_state_context_rows(
+                    backend,
+                    &write.file_id,
+                    &write.version_id,
+                    &plugin.key,
+                    &columns,
+                )
+                .await?;
+                Some(DetectStateContext {
+                    active_state: Some(rows),
+                })
+            }
+            None => None,
+        };
+
         let detect_payload = serde_json::to_vec(&DetectChangesRequest {
             before: before.clone(),
             after: after.clone(),
+            state_context,
         })
         .map_err(|error| LixError {
             message: format!("plugin detect-changes: failed to encode request payload: {error}"),
@@ -586,9 +647,9 @@ fn select_plugin_for_file<'a>(
     descriptor: &FileDescriptorRow,
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
-    plugins.iter().find(|plugin| {
-        glob_matches_path(&plugin.detect_changes_glob, &descriptor.path)
-    })
+    plugins
+        .iter()
+        .find(|plugin| glob_matches_path(&plugin.detect_changes_glob, &descriptor.path))
 }
 
 fn select_plugin_for_path<'a>(
@@ -732,6 +793,153 @@ async fn load_plugin_state_changes_for_file(
         });
     }
     Ok(changes)
+}
+
+fn resolve_state_context_columns(
+    plugin: &InstalledPlugin,
+) -> Result<Option<Vec<StateContextColumn>>, LixError> {
+    let manifest: PluginManifest =
+        serde_json::from_str(&plugin.manifest_json).map_err(|error| LixError {
+            message: format!(
+                "plugin detect-changes: invalid stored manifest_json for plugin '{}': {error}",
+                plugin.key
+            ),
+        })?;
+
+    let Some(state_context) = manifest
+        .detect_changes
+        .as_ref()
+        .and_then(|config| config.state_context.as_ref())
+    else {
+        return Ok(None);
+    };
+
+    if !state_context.includes_active_state() {
+        return Ok(None);
+    }
+
+    let mut columns = state_context
+        .resolved_columns_or_default()
+        .unwrap_or_else(|| StateContextColumn::default_active_state_columns().to_vec());
+
+    if !columns.contains(&StateContextColumn::EntityId) {
+        columns.insert(0, StateContextColumn::EntityId);
+    }
+
+    let mut deduped = Vec::new();
+    for column in columns {
+        if !deduped.contains(&column) {
+            deduped.push(column);
+        }
+    }
+
+    Ok(Some(deduped))
+}
+
+async fn load_active_state_context_rows(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+    plugin_key: &str,
+    columns: &[StateContextColumn],
+) -> Result<Vec<PluginActiveStateRow>, LixError> {
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let select_columns = columns
+        .iter()
+        .map(|column| state_context_column_sql_name(*column))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT {select_columns} \
+         FROM lix_state_by_version \
+         WHERE file_id = $1 \
+           AND version_id = $2 \
+           AND plugin_key = $3 \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY entity_id"
+    );
+
+    let params = vec![
+        Value::Text(file_id.to_string()),
+        Value::Text(version_id.to_string()),
+        Value::Text(plugin_key.to_string()),
+    ];
+
+    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
+    let rows = backend
+        .execute(&preprocessed.sql, &preprocessed.params)
+        .await?;
+
+    let mut result = Vec::with_capacity(rows.rows.len());
+    for row in rows.rows {
+        let mut payload = PluginActiveStateRow::default();
+        for (index, column) in columns.iter().enumerate() {
+            match column {
+                StateContextColumn::EntityId => {
+                    payload.entity_id = text_required(&row, index, "entity_id")?;
+                }
+                StateContextColumn::SchemaKey => {
+                    payload.schema_key = nullable_text(&row, index, "schema_key")?;
+                }
+                StateContextColumn::SchemaVersion => {
+                    payload.schema_version = nullable_text(&row, index, "schema_version")?;
+                }
+                StateContextColumn::SnapshotContent => {
+                    payload.snapshot_content = nullable_text(&row, index, "snapshot_content")?;
+                }
+                StateContextColumn::FileId => {
+                    payload.file_id = nullable_text(&row, index, "file_id")?;
+                }
+                StateContextColumn::PluginKey => {
+                    payload.plugin_key = nullable_text(&row, index, "plugin_key")?;
+                }
+                StateContextColumn::VersionId => {
+                    payload.version_id = nullable_text(&row, index, "version_id")?;
+                }
+                StateContextColumn::ChangeId => {
+                    payload.change_id = nullable_text(&row, index, "change_id")?;
+                }
+                StateContextColumn::Metadata => {
+                    payload.metadata = nullable_text(&row, index, "metadata")?;
+                }
+                StateContextColumn::CreatedAt => {
+                    payload.created_at = nullable_text(&row, index, "created_at")?;
+                }
+                StateContextColumn::UpdatedAt => {
+                    payload.updated_at = nullable_text(&row, index, "updated_at")?;
+                }
+            }
+        }
+        if payload.entity_id.is_empty() {
+            return Err(LixError {
+                message: "plugin detect-changes: state_context row is missing required entity_id"
+                    .to_string(),
+            });
+        }
+        result.push(payload);
+    }
+
+    Ok(result)
+}
+
+fn state_context_column_sql_name(column: StateContextColumn) -> &'static str {
+    match column {
+        StateContextColumn::EntityId => "entity_id",
+        StateContextColumn::SchemaKey => "schema_key",
+        StateContextColumn::SchemaVersion => "schema_version",
+        StateContextColumn::SnapshotContent => "snapshot_content",
+        StateContextColumn::FileId => "file_id",
+        StateContextColumn::PluginKey => "plugin_key",
+        StateContextColumn::VersionId => "version_id",
+        StateContextColumn::ChangeId => "change_id",
+        StateContextColumn::Metadata => "metadata",
+        StateContextColumn::CreatedAt => "created_at",
+        StateContextColumn::UpdatedAt => "updated_at",
+    }
 }
 
 async fn load_missing_file_descriptors(
@@ -1211,9 +1419,10 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 mod tests {
     use super::{
         append_implicit_tombstones_for_projection, glob_matches_path,
-        load_or_init_plugin_component, CachedPluginComponent, PluginEntityChange, PluginEntityKey,
+        load_or_init_plugin_component, resolve_state_context_columns, CachedPluginComponent,
+        PluginEntityChange, PluginEntityKey,
     };
-    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
+    use crate::plugin::types::{InstalledPlugin, PluginRuntime, StateContextColumn};
     use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
@@ -1326,6 +1535,97 @@ mod tests {
     #[test]
     fn detect_changes_glob_invalid_pattern_does_not_match() {
         assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
+    }
+
+    #[test]
+    fn state_context_columns_disabled_by_default() {
+        let plugin = InstalledPlugin {
+            key: "k".to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            detect_changes_glob: "*.md".to_string(),
+            entry: "plugin.wasm".to_string(),
+            manifest_json: r#"{
+                "key":"k",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md"
+            }"#
+            .to_string(),
+            wasm: vec![1],
+        };
+
+        let resolved = resolve_state_context_columns(&plugin).expect("resolution should succeed");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn state_context_columns_default_to_core_set() {
+        let plugin = InstalledPlugin {
+            key: "k".to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            detect_changes_glob: "*.md".to_string(),
+            entry: "plugin.wasm".to_string(),
+            manifest_json: r#"{
+                "key":"k",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": true
+                    }
+                }
+            }"#
+            .to_string(),
+            wasm: vec![1],
+        };
+
+        let resolved = resolve_state_context_columns(&plugin).expect("resolution should succeed");
+        assert_eq!(
+            resolved,
+            Some(vec![
+                StateContextColumn::EntityId,
+                StateContextColumn::SchemaKey,
+                StateContextColumn::SchemaVersion,
+                StateContextColumn::SnapshotContent
+            ])
+        );
+    }
+
+    #[test]
+    fn state_context_columns_respect_explicit_manifest_selection() {
+        let plugin = InstalledPlugin {
+            key: "k".to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            detect_changes_glob: "*.md".to_string(),
+            entry: "plugin.wasm".to_string(),
+            manifest_json: r#"{
+                "key":"k",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "detect_changes_glob":"*.md",
+                "detect_changes": {
+                    "state_context": {
+                        "include_active_state": true,
+                        "columns": ["entity_id", "snapshot_content"]
+                    }
+                }
+            }"#
+            .to_string(),
+            wasm: vec![1],
+        };
+
+        let resolved = resolve_state_context_columns(&plugin).expect("resolution should succeed");
+        assert_eq!(
+            resolved,
+            Some(vec![
+                StateContextColumn::EntityId,
+                StateContextColumn::SnapshotContent
+            ])
+        );
     }
 
     #[tokio::test]

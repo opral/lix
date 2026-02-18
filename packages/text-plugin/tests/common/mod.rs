@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use text_plugin::{PluginEntityChange, PluginFile};
 use serde::Deserialize;
+use text_plugin::{PluginEntityChange, PluginFile};
 
 #[derive(Debug, Deserialize)]
 pub struct LineSnapshot {
