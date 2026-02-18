@@ -2,8 +2,8 @@ mod common;
 
 use common::{detect_scenarios, file_from_bytes};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use text_plugin::detect_changes;
 use std::time::Duration;
+use text_plugin::detect_changes;
 
 fn bench_detect_changes(c: &mut Criterion) {
     let scenarios = detect_scenarios();

@@ -1,12 +1,18 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use async_trait::async_trait;
+    use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
-        WasmComponentInstance, WasmLimits, WasmRuntime,
+        boot, observe_owned, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError,
+        LixTransaction, ObserveEvent as EngineObserveEvent,
+        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, StateCommitEventBatch,
+        StateCommitEventChange, StateCommitEventFilter, StateCommitEventOperation,
+        StateCommitEvents as EngineStateCommitEvents, Value as EngineValue, WasmComponentInstance,
+        WasmLimits, WasmRuntime,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -76,6 +82,57 @@ export type LixBootKeyValue = {
   version_id?: string;
   lixcol_version_id?: string;
 };
+
+export type StateCommitEventFilter = {
+  schemaKeys?: string[];
+  entityIds?: string[];
+  fileIds?: string[];
+  versionIds?: string[];
+  writerKeys?: string[];
+  excludeWriterKeys?: string[];
+  includeUntracked?: boolean;
+};
+
+export type StateCommitEventOperation = "Insert" | "Update" | "Delete";
+
+export type StateCommitEventChange = {
+  operation: StateCommitEventOperation;
+  entityId: string;
+  schemaKey: string;
+  schemaVersion: string;
+  fileId: string;
+  versionId: string;
+  pluginKey: string;
+  snapshotContent: unknown | null;
+  untracked: boolean;
+  writerKey: string | null;
+};
+
+export type StateCommitEventBatch = {
+  sequence: number;
+  changes: StateCommitEventChange[];
+};
+
+export type LixStateCommitEvents = {
+  tryNext(): StateCommitEventBatch | undefined;
+  close(): void;
+};
+
+export type ObserveQuery = {
+  sql: string;
+  params?: LixValueLike[];
+};
+
+export type ObserveEvent = {
+  sequence: number;
+  rows: LixQueryResultLike;
+  stateCommitSequence: number | null;
+};
+
+export type LixObserveEvents = {
+  next(): Promise<ObserveEvent | undefined>;
+  close(): void;
+};
 "#;
 
     #[wasm_bindgen]
@@ -88,7 +145,19 @@ export type LixBootKeyValue = {
 
     #[wasm_bindgen]
     pub struct Lix {
-        engine: lix_engine::Engine,
+        engine: Arc<lix_engine::Engine>,
+    }
+
+    #[wasm_bindgen(js_name = StateCommitEvents)]
+    pub struct JsStateCommitEvents {
+        inner: std::sync::Mutex<Option<EngineStateCommitEvents>>,
+    }
+
+    #[wasm_bindgen(js_name = ObserveEvents)]
+    pub struct JsObserveEvents {
+        inner: std::sync::Mutex<Option<EngineObserveEvents>>,
+        in_flight_next_abort: std::sync::Mutex<Option<AbortHandle>>,
+        closed: AtomicBool,
     }
 
     #[wasm_bindgen]
@@ -131,6 +200,158 @@ export type LixBootKeyValue = {
                 .map_err(js_error)?;
             Ok(Uint8Array::from(writer.bytes.as_slice()))
         }
+
+        #[wasm_bindgen(js_name = stateCommitEvents)]
+        pub fn state_commit_events(&self, filter: JsValue) -> Result<JsStateCommitEvents, JsValue> {
+            let filter = parse_state_commit_event_filter(filter).map_err(js_error)?;
+            let events = self.engine.state_commit_events(filter);
+            Ok(JsStateCommitEvents {
+                inner: std::sync::Mutex::new(Some(events)),
+            })
+        }
+
+        #[wasm_bindgen(js_name = observe)]
+        pub fn observe(&self, query: JsValue) -> Result<JsObserveEvents, JsValue> {
+            let query = parse_observe_query(query).map_err(js_error)?;
+            let events = observe_owned(Arc::clone(&self.engine), query).map_err(js_error)?;
+            Ok(JsObserveEvents {
+                inner: std::sync::Mutex::new(Some(events)),
+                in_flight_next_abort: std::sync::Mutex::new(None),
+                closed: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[wasm_bindgen(js_class = StateCommitEvents)]
+    impl JsStateCommitEvents {
+        #[wasm_bindgen(js_name = tryNext)]
+        pub fn try_next(&self) -> Result<JsValue, JsValue> {
+            let guard = self.inner.lock().map_err(|_| {
+                js_error(LixError {
+                    message: "state commit events lock poisoned".to_string(),
+                })
+            })?;
+            let Some(events) = guard.as_ref() else {
+                return Ok(JsValue::UNDEFINED);
+            };
+            match events.try_next() {
+                Some(batch) => Ok(state_commit_event_batch_to_js(batch).into()),
+                None => Ok(JsValue::UNDEFINED),
+            }
+        }
+
+        #[wasm_bindgen(js_name = close)]
+        pub fn close(&self) -> Result<(), JsValue> {
+            let mut guard = self.inner.lock().map_err(|_| {
+                js_error(LixError {
+                    message: "state commit events lock poisoned".to_string(),
+                })
+            })?;
+            if let Some(events) = guard.take() {
+                events.close();
+            }
+            Ok(())
+        }
+    }
+
+    #[wasm_bindgen(js_class = ObserveEvents)]
+    impl JsObserveEvents {
+        #[wasm_bindgen(js_name = next)]
+        pub async fn next(&self) -> Result<JsValue, JsValue> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(JsValue::UNDEFINED);
+            }
+
+            let events = {
+                let mut guard = self.inner.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events lock poisoned".to_string(),
+                    })
+                })?;
+                guard.take()
+            };
+            let Some(mut events) = events else {
+                return Ok(JsValue::UNDEFINED);
+            };
+
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            {
+                let mut guard = self.in_flight_next_abort.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events abort lock poisoned".to_string(),
+                    })
+                })?;
+                if self.closed.load(Ordering::SeqCst) {
+                    events.close();
+                    return Ok(JsValue::UNDEFINED);
+                }
+                *guard = Some(abort_handle);
+            }
+
+            let next = Abortable::new(events.next(), abort_registration).await;
+            {
+                let mut guard = self.in_flight_next_abort.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events abort lock poisoned".to_string(),
+                    })
+                })?;
+                guard.take();
+            }
+
+            let next = match next {
+                Ok(next) => next.map_err(js_error)?,
+                Err(_) => {
+                    events.close();
+                    return Ok(JsValue::UNDEFINED);
+                }
+            };
+
+            if self.closed.load(Ordering::SeqCst) || next.is_none() {
+                events.close();
+                return Ok(JsValue::UNDEFINED);
+            }
+
+            {
+                let mut guard = self.inner.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events lock poisoned".to_string(),
+                    })
+                })?;
+                if self.closed.load(Ordering::SeqCst) {
+                    events.close();
+                    return Ok(JsValue::UNDEFINED);
+                }
+                *guard = Some(events);
+            }
+
+            Ok(observe_event_to_js(next.expect("checked is_some")).into())
+        }
+
+        #[wasm_bindgen(js_name = close)]
+        pub fn close(&self) -> Result<(), JsValue> {
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            {
+                let mut guard = self.in_flight_next_abort.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events abort lock poisoned".to_string(),
+                    })
+                })?;
+                if let Some(abort) = guard.take() {
+                    abort.abort();
+                }
+            }
+            let mut guard = self.inner.lock().map_err(|_| {
+                js_error(LixError {
+                    message: "observe events lock poisoned".to_string(),
+                })
+            })?;
+            if let Some(mut events) = guard.take() {
+                events.close();
+            }
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -166,7 +387,9 @@ export type LixBootKeyValue = {
         }
         let engine = boot(boot_args);
         engine.init().await.map_err(js_error)?;
-        Ok(Lix { engine })
+        Ok(Lix {
+            engine: Arc::new(engine),
+        })
     }
 
     fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
@@ -205,6 +428,199 @@ export type LixBootKeyValue = {
         }
 
         Ok(parsed)
+    }
+
+    fn parse_state_commit_event_filter(input: JsValue) -> Result<StateCommitEventFilter, LixError> {
+        if input.is_null() || input.is_undefined() {
+            return Ok(StateCommitEventFilter::default());
+        }
+        if !input.is_object() {
+            return Err(LixError {
+                message: "stateCommitEvents filter must be an object".to_string(),
+            });
+        }
+
+        Ok(StateCommitEventFilter {
+            schema_keys: read_optional_string_array_property(&input, "schemaKeys")?
+                .unwrap_or_default(),
+            entity_ids: read_optional_string_array_property(&input, "entityIds")?
+                .unwrap_or_default(),
+            file_ids: read_optional_string_array_property(&input, "fileIds")?.unwrap_or_default(),
+            version_ids: read_optional_string_array_property(&input, "versionIds")?
+                .unwrap_or_default(),
+            writer_keys: read_optional_string_array_property(&input, "writerKeys")?
+                .unwrap_or_default(),
+            exclude_writer_keys: read_optional_string_array_property(&input, "excludeWriterKeys")?
+                .unwrap_or_default(),
+            include_untracked: read_optional_bool_property(&input, "includeUntracked")?
+                .unwrap_or(true),
+        })
+    }
+
+    fn parse_observe_query(input: JsValue) -> Result<EngineObserveQuery, LixError> {
+        if input.is_null() || input.is_undefined() || !input.is_object() {
+            return Err(LixError {
+                message: "observe query must be an object".to_string(),
+            });
+        }
+        let sql = read_required_string_property(&input, "sql", "observe query")?;
+        let params = Reflect::get(&input, &JsValue::from_str("params")).map_err(js_to_lix_error)?;
+        let params = if params.is_null() || params.is_undefined() {
+            Vec::new()
+        } else if Array::is_array(&params) {
+            let mut values = Vec::new();
+            for value in Array::from(&params).iter() {
+                values.push(value_from_js(value)?);
+            }
+            values
+        } else {
+            return Err(LixError {
+                message: "observe query.params must be an array".to_string(),
+            });
+        };
+        Ok(EngineObserveQuery { sql, params })
+    }
+
+    fn read_optional_string_array_property(
+        object: &JsValue,
+        key: &str,
+    ) -> Result<Option<Vec<String>>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        if !Array::is_array(&value) {
+            return Err(LixError {
+                message: format!("stateCommitEvents filter '{key}' must be an array of strings"),
+            });
+        }
+        let values = Array::from(&value);
+        let mut out = Vec::with_capacity(values.length() as usize);
+        for item in values.iter() {
+            let text = item.as_string().ok_or_else(|| LixError {
+                message: format!("stateCommitEvents filter '{key}' must be an array of strings"),
+            })?;
+            if !text.trim().is_empty() {
+                out.push(text);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    fn read_optional_bool_property(object: &JsValue, key: &str) -> Result<Option<bool>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        value
+            .as_bool()
+            .ok_or_else(|| LixError {
+                message: format!("stateCommitEvents filter '{key}' must be a boolean"),
+            })
+            .map(Some)
+    }
+
+    fn state_commit_event_batch_to_js(batch: StateCommitEventBatch) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("sequence"),
+            &JsValue::from_f64(batch.sequence as f64),
+        );
+        let changes = Array::new();
+        for change in batch.changes {
+            changes.push(&state_commit_event_change_to_js(change).into());
+        }
+        let _ = Reflect::set(&object, &JsValue::from_str("changes"), &changes);
+        object
+    }
+
+    fn state_commit_event_change_to_js(change: StateCommitEventChange) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("operation"),
+            &JsValue::from_str(match change.operation {
+                StateCommitEventOperation::Insert => "Insert",
+                StateCommitEventOperation::Update => "Update",
+                StateCommitEventOperation::Delete => "Delete",
+            }),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("entityId"),
+            &JsValue::from_str(&change.entity_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("schemaKey"),
+            &JsValue::from_str(&change.schema_key),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("schemaVersion"),
+            &JsValue::from_str(&change.schema_version),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("fileId"),
+            &JsValue::from_str(&change.file_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("versionId"),
+            &JsValue::from_str(&change.version_id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("pluginKey"),
+            &JsValue::from_str(&change.plugin_key),
+        );
+        let snapshot_content = change
+            .snapshot_content
+            .and_then(|value| serde_json::to_string(&value).ok())
+            .and_then(|text| js_sys::JSON::parse(&text).ok())
+            .unwrap_or(JsValue::NULL);
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("snapshotContent"),
+            &snapshot_content,
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("untracked"),
+            &JsValue::from_bool(change.untracked),
+        );
+        let writer_key = match change.writer_key {
+            Some(value) => JsValue::from_str(&value),
+            None => JsValue::NULL,
+        };
+        let _ = Reflect::set(&object, &JsValue::from_str("writerKey"), &writer_key);
+        object
+    }
+
+    fn observe_event_to_js(event: EngineObserveEvent) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("sequence"),
+            &JsValue::from_f64(event.sequence as f64),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("rows"),
+            &query_result_to_js(event.rows),
+        );
+        let state_commit_sequence = match event.state_commit_sequence {
+            Some(value) => JsValue::from_f64(value as f64),
+            None => JsValue::NULL,
+        };
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("stateCommitSequence"),
+            &state_commit_sequence,
+        );
+        object
     }
 
     fn read_required_string_property(

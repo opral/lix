@@ -91,3 +91,145 @@ test("close is idempotent and blocks further API calls", async () => {
   await expect(lix.createVersion()).rejects.toThrow("lix is closed");
   await expect(lix.switchVersion("v1")).rejects.toThrow("lix is closed");
 });
+
+test("stateCommitEvents emits filtered commit events", async () => {
+  const lix = await openLix();
+  const events = lix.stateCommitEvents({ schemaKeys: ["lix_key_value"] });
+
+  await lix.execute(
+    "INSERT INTO lix_internal_state_vtable (\
+     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+     ) VALUES (\
+     'state-commit-events-js', 'lix_key_value', 'lix', 'global', 'lix',\
+     '{\"key\":\"state-commit-events-js\",\"value\":\"ok\"}', '1'\
+     )",
+    [],
+  );
+
+  const batch = await waitForBatch(events);
+  expect(batch).toBeDefined();
+  expect(batch!.changes.length).toBeGreaterThan(0);
+  expect(
+    batch!.changes.some(
+      (change) =>
+        change.schemaKey === "lix_key_value" &&
+        change.entityId === "state-commit-events-js",
+    ),
+  ).toBe(true);
+
+  events.close();
+  await lix.close();
+});
+
+test("observe emits initial and follow-up query results", async () => {
+  const lix = await openLix();
+  const events = lix.observe({
+    sql: "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
+    params: ["observe-js"],
+  });
+
+  const initial = await events.next();
+  expect(initial).toBeDefined();
+  expect(initial!.sequence).toBe(0);
+  expect(initial!.rows.rows).toEqual([]);
+  expect(initial!.stateCommitSequence).toBeNull();
+
+  const nextPromise = events.next();
+  await lix.execute(
+    "INSERT INTO lix_internal_state_vtable (\
+     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+     ) VALUES (\
+     'observe-js', 'lix_key_value', 'lix', 'global', 'lix',\
+     '{\"key\":\"observe-js\",\"value\":\"ok\"}', '1'\
+     )",
+    [],
+  );
+
+  const followUp = await nextPromise;
+  expect(followUp).toBeDefined();
+  expect(followUp!.sequence).toBe(1);
+  expect(followUp!.stateCommitSequence).not.toBeNull();
+  expect(followUp!.rows.rows.length).toBe(1);
+
+  events.close();
+  await expect(events.next()).resolves.toBeUndefined();
+  await lix.close();
+});
+
+test("observe on _by_version view emits follow-up results", async () => {
+  const lix = await openLix();
+  const events = lix.observe({
+    sql: "SELECT key FROM lix_key_value_by_version WHERE key = ?1",
+    params: ["observe-by-version"],
+  });
+
+  const initial = await events.next();
+  expect(initial).toBeDefined();
+  expect(initial!.sequence).toBe(0);
+  expect(initial!.rows.rows).toEqual([]);
+
+  const nextPromise = events.next();
+  await lix.execute(
+    "INSERT INTO lix_internal_state_vtable (\
+     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+     ) VALUES (\
+     'observe-by-version', 'lix_key_value', 'lix', 'global', 'lix',\
+     '{\"key\":\"observe-by-version\",\"value\":\"ok\"}', '1'\
+     )",
+    [],
+  );
+
+  const followUp = await withTimeout(nextPromise, 1500);
+  expect(followUp).not.toBe(TIMEOUT);
+  if (followUp === TIMEOUT || followUp === undefined) {
+    throw new Error("observe follow-up did not arrive for _by_version query");
+  }
+  expect(followUp.sequence).toBe(1);
+
+  events.close();
+  await lix.close();
+});
+
+test("observe next resolves when closed while waiting", async () => {
+  const lix = await openLix();
+  const events = lix.observe({
+    sql: "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
+    params: ["observe-close"],
+  });
+
+  const initial = await events.next();
+  expect(initial).toBeDefined();
+  expect(initial!.sequence).toBe(0);
+
+  const pendingNext = events.next();
+  events.close();
+
+  const result = await withTimeout(pendingNext, 1500);
+  expect(result).not.toBe(TIMEOUT);
+  expect(result).toBeUndefined();
+
+  await lix.close();
+});
+
+const TIMEOUT = Symbol("timeout");
+
+async function waitForBatch(events: { tryNext(): unknown }): Promise<any | undefined> {
+  const timeoutMs = 1000;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const next = events.tryNext();
+    if (next !== undefined) return next;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return undefined;
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T | typeof TIMEOUT> {
+  const timeoutPromise = new Promise<typeof TIMEOUT>((resolve) => {
+    setTimeout(() => resolve(TIMEOUT), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]);
+}

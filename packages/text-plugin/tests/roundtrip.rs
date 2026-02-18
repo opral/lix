@@ -1,8 +1,8 @@
 mod common;
 
 use common::file_from_bytes;
-use text_plugin::{apply_changes, detect_changes, PluginEntityChange};
 use std::collections::BTreeMap;
+use text_plugin::{apply_changes, detect_changes, PluginEntityChange};
 
 #[test]
 fn detect_then_apply_roundtrips_exact_bytes() {
@@ -50,9 +50,7 @@ fn projected_change_log_reconstructs_from_empty_base() {
     assert_eq!(reconstructed, after_payload);
 }
 
-fn collapse_to_latest_projection(
-    batches: [Vec<PluginEntityChange>; 2],
-) -> Vec<PluginEntityChange> {
+fn collapse_to_latest_projection(batches: [Vec<PluginEntityChange>; 2]) -> Vec<PluginEntityChange> {
     let mut latest = BTreeMap::<(String, String), PluginEntityChange>::new();
     for batch in batches {
         for change in batch {
