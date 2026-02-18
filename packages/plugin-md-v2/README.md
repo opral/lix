@@ -2,12 +2,10 @@
 
 Rust/WASM component Markdown plugin for the Lix engine.
 
-## Scope
-
-Minimal v2 implementation:
+## Current scope
 
 - `detect-changes` parses markdown with `markdown-rs` using GFM + MDX + math + frontmatter options.
-- Emits a single root row (`entity_id = "root"`) when parsed AST changes.
-- `apply-changes` materializes file bytes from that root row snapshot.
+- Emits block-level rows (`markdown_v2_block`) plus a document order row (`markdown_v2_document`).
+- `apply-changes` materializes markdown from the latest block snapshots and document order.
 
-This is intentionally minimal to establish test and benchmark baselines.
+This establishes a deterministic block-level projection baseline with unit tests and benchmarks.

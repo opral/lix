@@ -8,10 +8,12 @@ wit_bindgen::generate!({
 mod apply_changes;
 mod common;
 mod detect_changes;
+pub mod schemas;
 
-pub const SCHEMA_KEY: &str = "markdown_source";
-pub const SCHEMA_VERSION: &str = "1";
 pub const ROOT_ENTITY_ID: &str = "root";
+pub const DOCUMENT_SCHEMA_KEY: &str = schemas::DOCUMENT_SCHEMA_KEY;
+pub const BLOCK_SCHEMA_KEY: &str = schemas::BLOCK_SCHEMA_KEY;
+pub const SCHEMA_VERSION: &str = schemas::ENTITY_SCHEMA_VERSION;
 
 pub use crate::exports::lix::plugin::api::{
     EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
