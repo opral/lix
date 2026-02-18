@@ -29,6 +29,67 @@
       "type": "string",
       "minLength": 1
     },
+    "detect_changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state_context": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "include_active_state": {
+              "type": "boolean"
+            },
+            "columns": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "entity_id",
+                  "schema_key",
+                  "schema_version",
+                  "snapshot_content",
+                  "file_id",
+                  "plugin_key",
+                  "version_id",
+                  "change_id",
+                  "metadata",
+                  "created_at",
+                  "updated_at"
+                ]
+              },
+              "contains": {
+                "const": "entity_id"
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "include_active_state": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "include_active_state"
+                ]
+              },
+              "then": {},
+              "else": {
+                "not": {
+                  "required": [
+                    "columns"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
     "entry": {
       "type": "string",
       "minLength": 1,

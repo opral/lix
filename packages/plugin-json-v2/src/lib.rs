@@ -82,7 +82,11 @@ struct ProjectionTreeNode {
 }
 
 impl Guest for JsonPlugin {
-    fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
+    fn detect_changes(
+        before: Option<File>,
+        after: File,
+        _state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+    ) -> Result<Vec<EntityChange>, PluginError> {
         let before_json = before
             .as_ref()
             .map(|file| parse_json_bytes(&file.data))
@@ -832,7 +836,15 @@ fn materialize_projection_node(
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    <JsonPlugin as Guest>::detect_changes(before, after)
+    <JsonPlugin as Guest>::detect_changes(before, after, None)
+}
+
+pub fn detect_changes_with_state_context(
+    before: Option<File>,
+    after: File,
+    state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+) -> Result<Vec<EntityChange>, PluginError> {
+    <JsonPlugin as Guest>::detect_changes(before, after, state_context)
 }
 
 pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {

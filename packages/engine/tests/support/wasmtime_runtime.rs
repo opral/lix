@@ -28,6 +28,27 @@ struct WirePluginFile {
 struct WireDetectChangesRequest {
     before: Option<WirePluginFile>,
     after: WirePluginFile,
+    state_context: Option<WireDetectStateContext>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireDetectStateContext {
+    active_state: Option<Vec<WireActiveStateRow>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireActiveStateRow {
+    entity_id: String,
+    schema_key: Option<String>,
+    schema_version: Option<String>,
+    snapshot_content: Option<String>,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
+    version_id: Option<String>,
+    change_id: Option<String>,
+    metadata: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -195,10 +216,16 @@ impl WasmComponentInstance for TestWasmtimeInstance {
 
                 let before = request.before.map(wire_file_to_binding);
                 let after = wire_file_to_binding(request.after);
+                let state_context = request.state_context.map(wire_state_context_to_binding);
 
                 let result = bindings
                     .lix_plugin_api()
-                    .call_detect_changes(&mut store, before.as_ref(), &after)
+                    .call_detect_changes(
+                        &mut store,
+                        before.as_ref(),
+                        &after,
+                        state_context.as_ref(),
+                    )
                     .map_err(|error| LixError {
                         message: format!("Wasm call failed for export '{export}': {error}"),
                     })?;
@@ -277,6 +304,36 @@ fn wire_change_to_binding(
         schema_key: change.schema_key,
         schema_version: change.schema_version,
         snapshot_content: change.snapshot_content,
+    }
+}
+
+fn wire_state_context_to_binding(
+    context: WireDetectStateContext,
+) -> plugin_bindings::exports::lix::plugin::api::DetectStateContext {
+    plugin_bindings::exports::lix::plugin::api::DetectStateContext {
+        active_state: context.active_state.map(|rows| {
+            rows.into_iter()
+                .map(wire_active_state_row_to_binding)
+                .collect::<Vec<_>>()
+        }),
+    }
+}
+
+fn wire_active_state_row_to_binding(
+    row: WireActiveStateRow,
+) -> plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
+    plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        schema_version: row.schema_version,
+        snapshot_content: row.snapshot_content,
+        file_id: row.file_id,
+        plugin_key: row.plugin_key,
+        version_id: row.version_id,
+        change_id: row.change_id,
+        metadata: row.metadata,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
     }
 }
 
