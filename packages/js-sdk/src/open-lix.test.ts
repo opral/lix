@@ -211,6 +211,60 @@ test("observe next resolves when closed while waiting", async () => {
   await lix.close();
 });
 
+test("observe stream remains usable after query error", async () => {
+  const lix = await openLix();
+  await lix.execute("CREATE TABLE observe_recover (value TEXT)", []);
+  await lix.execute("INSERT INTO observe_recover (value) VALUES ('ok-0')", []);
+
+  const events = lix.observe({
+    sql: "SELECT value FROM observe_recover ORDER BY value",
+  });
+
+  const initial = await events.next();
+  expect(initial).toBeDefined();
+  expect(initial!.rows.rows.length).toBe(1);
+
+  await lix.execute("DROP TABLE observe_recover", []);
+  const failingNext = events.next();
+  await lix.execute(
+    "INSERT INTO lix_internal_state_vtable (\
+     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+     ) VALUES (\
+     'observe-recover-trigger-1', 'lix_key_value', 'lix', 'global', 'lix',\
+     '{\"key\":\"observe-recover-trigger-1\",\"value\":\"x\"}', '1'\
+     )",
+    [],
+  );
+
+  await expect(failingNext).rejects.toThrow(
+    /observe_recover|no such table|does not exist/i,
+  );
+
+  await lix.execute("CREATE TABLE observe_recover (value TEXT)", []);
+  await lix.execute("INSERT INTO observe_recover (value) VALUES ('ok-1')", []);
+
+  const recoveredNext = events.next();
+  await lix.execute(
+    "INSERT INTO lix_internal_state_vtable (\
+     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+     ) VALUES (\
+     'observe-recover-trigger-2', 'lix_key_value', 'lix', 'global', 'lix',\
+     '{\"key\":\"observe-recover-trigger-2\",\"value\":\"x\"}', '1'\
+     )",
+    [],
+  );
+
+  const recovered = await withTimeout(recoveredNext, 1500);
+  expect(recovered).not.toBe(TIMEOUT);
+  if (recovered === TIMEOUT || recovered === undefined) {
+    throw new Error("observe did not recover after transient query error");
+  }
+  expect(recovered.rows.rows.length).toBe(1);
+
+  events.close();
+  await lix.close();
+});
+
 const TIMEOUT = Symbol("timeout");
 
 async function waitForBatch(events: { tryNext(): unknown }): Promise<any | undefined> {
