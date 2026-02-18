@@ -9,6 +9,8 @@ const LIX_STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
 const LIX_ACTIVE_ACCOUNT_SCHEMA_KEY: &str = "lix_active_account";
+const LIX_LABEL_SCHEMA_KEY: &str = "lix_label";
+const LIX_ENTITY_LABEL_SCHEMA_KEY: &str = "lix_entity_label";
 const LIX_CHANGE_SCHEMA_KEY: &str = "lix_change";
 const LIX_CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const LIX_CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
@@ -25,6 +27,8 @@ const LIX_STORED_SCHEMA_JSON: &str = include_str!("lix_stored_schema.json");
 const LIX_KEY_VALUE_SCHEMA_JSON: &str = include_str!("lix_key_value.json");
 const LIX_ACCOUNT_SCHEMA_JSON: &str = include_str!("lix_account.json");
 const LIX_ACTIVE_ACCOUNT_SCHEMA_JSON: &str = include_str!("lix_active_account.json");
+const LIX_LABEL_SCHEMA_JSON: &str = include_str!("lix_label.json");
+const LIX_ENTITY_LABEL_SCHEMA_JSON: &str = include_str!("lix_entity_label.json");
 const LIX_CHANGE_SCHEMA_JSON: &str = include_str!("lix_change.json");
 const LIX_CHANGE_AUTHOR_SCHEMA_JSON: &str = include_str!("lix_change_author.json");
 const LIX_CHANGE_SET_SCHEMA_JSON: &str = include_str!("lix_change_set.json");
@@ -41,6 +45,8 @@ static LIX_STORED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_KEY_VALUE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_ACCOUNT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_ACTIVE_ACCOUNT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_LABEL_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_ENTITY_LABEL_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_AUTHOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SET_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -58,6 +64,8 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_KEY_VALUE_SCHEMA_KEY,
     LIX_ACCOUNT_SCHEMA_KEY,
     LIX_ACTIVE_ACCOUNT_SCHEMA_KEY,
+    LIX_LABEL_SCHEMA_KEY,
+    LIX_ENTITY_LABEL_SCHEMA_KEY,
     LIX_CHANGE_SCHEMA_KEY,
     LIX_CHANGE_AUTHOR_SCHEMA_KEY,
     LIX_CHANGE_SET_SCHEMA_KEY,
@@ -91,6 +99,13 @@ pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static Jso
         ),
         LIX_ACTIVE_ACCOUNT_SCHEMA_KEY => Some(LIX_ACTIVE_ACCOUNT_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_active_account.json", LIX_ACTIVE_ACCOUNT_SCHEMA_JSON)
+        })),
+        LIX_LABEL_SCHEMA_KEY => Some(
+            LIX_LABEL_SCHEMA
+                .get_or_init(|| parse_builtin_schema("lix_label.json", LIX_LABEL_SCHEMA_JSON)),
+        ),
+        LIX_ENTITY_LABEL_SCHEMA_KEY => Some(LIX_ENTITY_LABEL_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_entity_label.json", LIX_ENTITY_LABEL_SCHEMA_JSON)
         })),
         LIX_CHANGE_SCHEMA_KEY => Some(
             LIX_CHANGE_SCHEMA
@@ -153,6 +168,8 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
         LIX_KEY_VALUE_SCHEMA_KEY => Some(LIX_KEY_VALUE_SCHEMA_JSON),
         LIX_ACCOUNT_SCHEMA_KEY => Some(LIX_ACCOUNT_SCHEMA_JSON),
         LIX_ACTIVE_ACCOUNT_SCHEMA_KEY => Some(LIX_ACTIVE_ACCOUNT_SCHEMA_JSON),
+        LIX_LABEL_SCHEMA_KEY => Some(LIX_LABEL_SCHEMA_JSON),
+        LIX_ENTITY_LABEL_SCHEMA_KEY => Some(LIX_ENTITY_LABEL_SCHEMA_JSON),
         LIX_CHANGE_SCHEMA_KEY => Some(LIX_CHANGE_SCHEMA_JSON),
         LIX_CHANGE_AUTHOR_SCHEMA_KEY => Some(LIX_CHANGE_AUTHOR_SCHEMA_JSON),
         LIX_CHANGE_SET_SCHEMA_KEY => Some(LIX_CHANGE_SET_SCHEMA_JSON),
