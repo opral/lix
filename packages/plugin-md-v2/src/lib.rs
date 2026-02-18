@@ -37,7 +37,8 @@ impl Guest for MarkdownPlugin {
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    <MarkdownPlugin as Guest>::detect_changes(before, after, None)
+    let state_context = project_state_context_from_before(before.clone())?;
+    <MarkdownPlugin as Guest>::detect_changes(before, after, Some(state_context))
 }
 
 pub fn detect_changes_with_state_context(
@@ -50,6 +51,46 @@ pub fn detect_changes_with_state_context(
 
 pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
     <MarkdownPlugin as Guest>::apply_changes(file, changes)
+}
+
+fn empty_state_context() -> PluginDetectStateContext {
+    PluginDetectStateContext {
+        active_state: Some(Vec::new()),
+    }
+}
+
+fn project_state_context_from_before(
+    before: Option<File>,
+) -> Result<PluginDetectStateContext, PluginError> {
+    let Some(before_file) = before else {
+        return Ok(empty_state_context());
+    };
+
+    // Compatibility helper for tests/callers using detect_changes(before, after):
+    // bootstrap a projected active-state from `before`.
+    let bootstrap =
+        <MarkdownPlugin as Guest>::detect_changes(None, before_file, Some(empty_state_context()))?;
+
+    Ok(PluginDetectStateContext {
+        active_state: Some(
+            bootstrap
+                .into_iter()
+                .map(|row| PluginActiveStateRow {
+                    entity_id: row.entity_id,
+                    schema_key: Some(row.schema_key),
+                    schema_version: Some(row.schema_version),
+                    snapshot_content: row.snapshot_content,
+                    file_id: None,
+                    plugin_key: None,
+                    version_id: None,
+                    change_id: None,
+                    metadata: None,
+                    created_at: None,
+                    updated_at: None,
+                })
+                .collect(),
+        ),
+    })
 }
 
 export!(MarkdownPlugin);

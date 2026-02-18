@@ -5,7 +5,7 @@ use crate::ROOT_ENTITY_ID;
 use markdown::mdast::{Node, Root};
 use markdown::{to_mdast, Constructs, ParseOptions};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use strsim::normalized_levenshtein;
 use unicode_normalization::UnicodeNormalization;
 
@@ -34,26 +34,21 @@ struct BeforeProjection {
 }
 
 pub(crate) fn detect_changes(
-    before: Option<File>,
+    _before: Option<File>,
     after: File,
     state_context: Option<DetectStateContext>,
 ) -> Result<Vec<EntityChange>, PluginError> {
-    let (before_projection, use_existing_id_matching) =
-        match parse_state_context_projection(state_context.as_ref())? {
-            Some(context_projection) => (context_projection, true),
-            None => (before_projection_from_file(before.as_ref())?, false),
-        };
+    let before_projection = parse_state_context_projection(state_context.as_ref())?;
 
-    let before_order = before_projection.order.clone();
-    let before_by_id = before_projection.blocks_by_id;
+    let BeforeProjection {
+        order: before_order,
+        blocks_by_id: before_by_id,
+    } = before_projection;
 
     let after_markdown = decode_markdown_bytes(&after.data)?;
     let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
-    let after_blocks = if use_existing_id_matching {
-        assign_ids_with_existing_state(after_candidates, &before_order, &before_by_id)
-    } else {
-        assign_content_based_ids(after_candidates)
-    };
+    let after_blocks =
+        assign_ids_with_existing_state(after_candidates, &before_order, &before_by_id);
     let after_order = after_blocks
         .iter()
         .map(|block| block.id.clone())
@@ -109,16 +104,17 @@ pub(crate) fn detect_changes(
 
 fn parse_state_context_projection(
     state_context: Option<&DetectStateContext>,
-) -> Result<Option<BeforeProjection>, PluginError> {
+) -> Result<BeforeProjection, PluginError> {
     let Some(state_context) = state_context else {
-        return Ok(None);
+        return Err(PluginError::InvalidInput(
+            "state_context is required for markdown detect_changes".to_string(),
+        ));
     };
-    let Some(rows) = state_context.active_state.as_ref() else {
-        return Ok(None);
-    };
-    if rows.is_empty() {
-        return Ok(None);
-    }
+    let rows = state_context.active_state.as_ref().ok_or_else(|| {
+        PluginError::InvalidInput(
+            "state_context.active_state is required for markdown detect_changes".to_string(),
+        )
+    })?;
 
     let mut document_order = None::<Vec<String>>;
     let mut blocks_by_id = BTreeMap::<String, ParsedBlock>::new();
@@ -164,43 +160,19 @@ fn parse_state_context_projection(
         blocks_by_id.insert(block.id.clone(), block);
     }
 
-    if blocks_by_id.is_empty() {
-        return Ok(None);
-    }
-
     let mut order = document_order.unwrap_or_default();
     order.retain(|id| blocks_by_id.contains_key(id));
 
     if order.len() != blocks_by_id.len() {
+        let order_set = order.iter().cloned().collect::<HashSet<_>>();
         let remaining = blocks_by_id
             .keys()
-            .filter(|id| !order.contains(id))
+            .filter(|id| !order_set.contains(*id))
             .cloned()
             .collect::<Vec<_>>();
         order.extend(remaining);
     }
 
-    Ok(Some(BeforeProjection {
-        order,
-        blocks_by_id,
-    }))
-}
-
-fn before_projection_from_file(before: Option<&File>) -> Result<BeforeProjection, PluginError> {
-    let before_blocks = before
-        .map(|file| {
-            let markdown = decode_markdown_bytes(&file.data)?;
-            let candidates = parse_top_level_block_candidates(&markdown)?;
-            Ok::<_, PluginError>(assign_content_based_ids(candidates))
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    let order = before_blocks
-        .iter()
-        .map(|block| block.id.clone())
-        .collect::<Vec<_>>();
-    let blocks_by_id = to_block_map(before_blocks)?;
     Ok(BeforeProjection {
         order,
         blocks_by_id,
@@ -221,14 +193,16 @@ fn assign_ids_with_existing_state(
         .filter(|id| before_by_id.contains_key(*id))
         .cloned()
         .collect::<Vec<_>>();
+    let mut ordered_before_id_set = ordered_before_ids.iter().cloned().collect::<HashSet<_>>();
     for id in before_by_id.keys() {
-        if !ordered_before_ids.contains(id) {
+        if !ordered_before_id_set.contains(id) {
             ordered_before_ids.push(id.clone());
+            ordered_before_id_set.insert(id.clone());
         }
     }
 
     let mut assigned_ids = vec![None::<String>; candidates.len()];
-    let mut matched_before_ids = BTreeSet::<String>::new();
+    let mut matched_before_ids = HashSet::<String>::new();
 
     let mut before_exact = BTreeMap::<(String, String), Vec<String>>::new();
     for id in &ordered_before_ids {
@@ -275,25 +249,73 @@ fn assign_ids_with_existing_state(
         }
     }
 
+    // Fast-path: if lengths are equal, reuse same-index IDs for unmatched candidates
+    // when node types align. This avoids O(n^2) fuzzy scoring for in-place edits.
+    if candidates.len() == ordered_before_ids.len() {
+        for (after_idx, after) in candidates.iter().enumerate() {
+            if assigned_ids[after_idx].is_some() {
+                continue;
+            }
+            let Some(before_id) = ordered_before_ids.get(after_idx) else {
+                continue;
+            };
+            if matched_before_ids.contains(before_id) {
+                continue;
+            }
+            let Some(before_block) = before_by_id.get(before_id) else {
+                continue;
+            };
+            if before_block.node_type == after.node_type {
+                assigned_ids[after_idx] = Some(before_id.clone());
+                matched_before_ids.insert(before_id.clone());
+            }
+        }
+    }
+
     let before_positions = ordered_before_ids
         .iter()
         .enumerate()
         .map(|(idx, id)| (id.clone(), idx))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<HashMap<_, _>>();
+
+    let before_normalized_text = ordered_before_ids
+        .iter()
+        .filter_map(|id| {
+            before_by_id
+                .get(id)
+                .map(|before| (id.clone(), normalize_text_for_fingerprint(&before.markdown)))
+        })
+        .collect::<HashMap<_, _>>();
+    let after_normalized_text = candidates
+        .iter()
+        .map(|after| normalize_text_for_fingerprint(&after.markdown))
+        .collect::<Vec<_>>();
+
+    let mut before_ids_by_type = HashMap::<String, Vec<String>>::new();
+    for id in &ordered_before_ids {
+        let before = before_by_id
+            .get(id)
+            .expect("ordered_before_ids are sourced from before_by_id");
+        before_ids_by_type
+            .entry(before.node_type.clone())
+            .or_default()
+            .push(id.clone());
+    }
 
     for (after_idx, after) in candidates.iter().enumerate() {
         if assigned_ids[after_idx].is_some() {
             continue;
         }
 
-        let mut pool = ordered_before_ids
-            .iter()
-            .filter(|id| !matched_before_ids.contains(*id))
+        let mut pool = before_ids_by_type
+            .get(&after.node_type)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
             .filter_map(|id| {
-                let before = before_by_id.get(id)?;
-                if before.node_type != after.node_type {
+                if matched_before_ids.contains(id) {
                     return None;
                 }
+                let before = before_by_id.get(id)?;
                 let before_idx = *before_positions.get(id).unwrap_or(&0);
                 Some((id.clone(), before, before_idx))
             })
@@ -306,12 +328,15 @@ fn assign_ids_with_existing_state(
         let chosen = if pool.len() == 1 {
             Some(pool.swap_remove(0).0)
         } else {
-            let after_text = normalize_text_for_fingerprint(&after.markdown);
+            let after_text = &after_normalized_text[after_idx];
             let total = candidates.len().max(ordered_before_ids.len()).max(1) as f64;
             let mut scored = pool
                 .iter()
                 .map(|(id, before, before_idx)| {
-                    let before_text = normalize_text_for_fingerprint(&before.markdown);
+                    let before_text = before_normalized_text
+                        .get(id)
+                        .map(String::as_str)
+                        .unwrap_or(&before.markdown);
                     let similarity = normalized_levenshtein(&before_text, &after_text);
                     let position = 1.0 - ((after_idx as f64 - *before_idx as f64).abs() / total);
                     let score = similarity * 0.75 + position * 0.25;
@@ -370,11 +395,6 @@ fn sampled_positions(total: usize, picks: usize) -> Vec<usize> {
     positions
 }
 
-fn assign_content_based_ids(candidates: Vec<ParsedBlockCandidate>) -> Vec<ParsedBlock> {
-    let assigned_ids = vec![None; candidates.len()];
-    assign_missing_ids(candidates, assigned_ids)
-}
-
 fn assign_missing_ids(
     candidates: Vec<ParsedBlockCandidate>,
     assigned_ids: Vec<Option<String>>,
@@ -383,7 +403,7 @@ fn assign_missing_ids(
     let mut used_ids = assigned_ids
         .iter()
         .filter_map(|id| id.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<HashSet<_>>();
 
     candidates
         .into_iter()
@@ -597,11 +617,13 @@ fn fnv1a64(input: &[u8]) -> u64 {
 }
 
 fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, PluginError> {
-    String::from_utf8(bytes.to_vec()).map_err(|error| {
-        PluginError::InvalidInput(format!(
-            "file.data must be valid UTF-8 markdown bytes: {error}"
-        ))
-    })
+    std::str::from_utf8(bytes)
+        .map(|markdown| markdown.to_owned())
+        .map_err(|error| {
+            PluginError::InvalidInput(format!(
+                "file.data must be valid UTF-8 markdown bytes: {error}"
+            ))
+        })
 }
 
 fn parse_options_all_extensions() -> ParseOptions {
