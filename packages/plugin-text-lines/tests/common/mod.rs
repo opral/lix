@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct LineSnapshot {
-    pub content_hex: String,
+    pub content_base64: String,
     pub ending: String,
 }
 

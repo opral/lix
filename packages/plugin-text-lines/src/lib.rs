@@ -1,4 +1,6 @@
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -282,15 +284,15 @@ fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginErr
 }
 
 fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginError> {
-    let (content_hex, ending) = parse_line_snapshot_fields(raw).map_err(|error| {
+    let (content_base64, ending) = parse_line_snapshot_fields(raw).map_err(|error| {
         PluginError::InvalidInput(format!(
             "invalid text_line snapshot_content for entity_id '{entity_id}': {error}"
         ))
     })?;
 
-    let content = hex_to_bytes(content_hex).map_err(|error| {
+    let content = base64_to_bytes(content_base64).map_err(|error| {
         PluginError::InvalidInput(format!(
-            "invalid text_line.content_hex for entity_id '{entity_id}': {error}"
+            "invalid text_line.content_base64 for entity_id '{entity_id}': {error}"
         ))
     })?;
     let ending = parse_line_ending_literal(ending).map_err(|error| {
@@ -307,17 +309,17 @@ fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginE
 }
 
 fn serialize_line_snapshot(line: &ParsedLine) -> Result<String, PluginError> {
-    let content_hex = bytes_to_hex(&line.content);
+    let content_base64 = bytes_to_base64(&line.content);
     let ending = line_ending_json_literal(line.ending);
     let mut encoded = String::with_capacity(
         LINE_SNAPSHOT_PREFIX.len()
-            + content_hex.len()
+            + content_base64.len()
             + LINE_SNAPSHOT_SEPARATOR.len()
             + ending.len()
             + LINE_SNAPSHOT_SUFFIX.len(),
     );
     encoded.push_str(LINE_SNAPSHOT_PREFIX);
-    encoded.push_str(&content_hex);
+    encoded.push_str(&content_base64);
     encoded.push_str(LINE_SNAPSHOT_SEPARATOR);
     encoded.push_str(ending);
     encoded.push_str(LINE_SNAPSHOT_SUFFIX);
@@ -484,7 +486,7 @@ fn line_fingerprint(content: &[u8], ending: LineEnding) -> [u8; 20] {
     fingerprint
 }
 
-const LINE_SNAPSHOT_PREFIX: &str = "{\"content_hex\":\"";
+const LINE_SNAPSHOT_PREFIX: &str = "{\"content_base64\":\"";
 const LINE_SNAPSHOT_SEPARATOR: &str = "\",\"ending\":\"";
 const LINE_SNAPSHOT_SUFFIX: &str = "\"}";
 
@@ -492,10 +494,10 @@ fn parse_line_snapshot_fields(raw: &str) -> Result<(&str, &str), String> {
     let inner = raw
         .strip_prefix(LINE_SNAPSHOT_PREFIX)
         .and_then(|value| value.strip_suffix(LINE_SNAPSHOT_SUFFIX))
-        .ok_or_else(|| "expected {\"content_hex\":\"...\",\"ending\":\"...\"}".to_string())?;
+        .ok_or_else(|| "expected {\"content_base64\":\"...\",\"ending\":\"...\"}".to_string())?;
     inner
         .split_once(LINE_SNAPSHOT_SEPARATOR)
-        .ok_or_else(|| "missing content_hex or ending field".to_string())
+        .ok_or_else(|| "missing content_base64 or ending field".to_string())
 }
 
 fn line_ending_json_literal(ending: LineEnding) -> &'static str {
@@ -532,42 +534,14 @@ fn hex_char(value: u8) -> char {
     }
 }
 
-fn hex_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
-    if raw.len() % 2 != 0 {
-        return Err("expected even-length hex string".to_string());
-    }
-
-    let mut out = Vec::with_capacity(raw.len() / 2);
-    let bytes = raw.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let high = from_hex_nibble(bytes[index]).ok_or_else(|| {
-            format!(
-                "invalid hex character '{}' at index {}",
-                bytes[index] as char, index
-            )
-        })?;
-        let low = from_hex_nibble(bytes[index + 1]).ok_or_else(|| {
-            format!(
-                "invalid hex character '{}' at index {}",
-                bytes[index + 1] as char,
-                index + 1
-            )
-        })?;
-        out.push((high << 4) | low);
-        index += 2;
-    }
-
-    Ok(out)
+fn bytes_to_base64(bytes: &[u8]) -> String {
+    BASE64_STANDARD.encode(bytes)
 }
 
-fn from_hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+fn base64_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    BASE64_STANDARD
+        .decode(raw)
+        .map_err(|error| format!("invalid base64: {error}"))
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
