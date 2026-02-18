@@ -6,10 +6,11 @@
   },
   "type": "object",
   "properties": {
-    "content_hex": {
+    "content_base64": {
       "type": "string",
-      "pattern": "^(?:[0-9a-f]{2})*$",
-      "description": "Hex-encoded line bytes. Empty string represents an empty line body."
+      "contentEncoding": "base64",
+      "contentMediaType": "application/octet-stream",
+      "description": "Base64-encoded line bytes. Empty string represents an empty line body."
     },
     "ending": {
       "type": "string",
@@ -22,7 +23,7 @@
     }
   },
   "required": [
-    "content_hex",
+    "content_base64",
     "ending"
   ],
   "additionalProperties": false
