@@ -19,6 +19,7 @@ pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
     insert: Insert,
     params: &[Value],
+    generated_param_offset: usize,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut P,
@@ -27,6 +28,7 @@ pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
         backend,
         insert,
         params,
+        generated_param_offset,
         detected_file_domain_changes,
         writer_key,
         functions,
@@ -39,6 +41,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
     match rewritten {
         Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -46,6 +49,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
         }),
         Some(vtable_write::UpdateRewrite::Planned(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
             mutations: Vec::new(),
@@ -53,6 +57,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
         }),
         None => Ok(RewriteOutput {
             statements: vec![Statement::Update(update)],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -74,6 +79,7 @@ pub(crate) fn rewrite_delete(
     match rewritten {
         Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
             statements: vec![statement],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -81,6 +87,7 @@ pub(crate) fn rewrite_delete(
         }),
         Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
             mutations: Vec::new(),
@@ -88,6 +95,7 @@ pub(crate) fn rewrite_delete(
         }),
         None => Ok(RewriteOutput {
             statements: vec![Statement::Delete(delete)],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),

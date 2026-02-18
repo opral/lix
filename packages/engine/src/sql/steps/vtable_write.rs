@@ -25,7 +25,8 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, lowering::lower_statement, object_name_matches,
+    bind_sql, bind_sql_with_state, escape_sql_string, lowering::lower_statement,
+    object_name_matches,
     quote_ident, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::version::{
@@ -106,6 +107,7 @@ impl SqlExecutor for TransactionExecutor<'_> {
 
 pub struct VtableWriteRewrite {
     pub statements: Vec<Statement>,
+    pub params: Vec<EngineValue>,
     pub registrations: Vec<SchemaRegistration>,
     pub mutations: Vec<MutationRow>,
 }
@@ -190,6 +192,7 @@ pub fn rewrite_insert_with_writer_key(
     let untracked_rows = split_rows.untracked;
 
     let mut statements: Vec<Statement> = Vec::new();
+    let generated_params: Vec<EngineValue> = Vec::new();
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
 
@@ -212,6 +215,7 @@ pub fn rewrite_insert_with_writer_key(
 
     Ok(Some(VtableWriteRewrite {
         statements,
+        params: generated_params,
         registrations,
         mutations,
     }))
@@ -221,6 +225,7 @@ pub async fn rewrite_insert_with_backend(
     backend: &dyn LixBackend,
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
+    generated_param_offset: usize,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -246,6 +251,7 @@ pub async fn rewrite_insert_with_backend(
     let untracked_rows = split_rows.untracked;
 
     let mut statements: Vec<Statement> = Vec::new();
+    let mut generated_params: Vec<EngineValue> = Vec::new();
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut mutations: Vec<MutationRow> = Vec::new();
 
@@ -257,11 +263,13 @@ pub async fn rewrite_insert_with_backend(
             &mut registrations,
             &mut mutations,
             detected_file_domain_changes,
+            params.len() + generated_param_offset,
             writer_key,
             functions,
         )
         .await?;
-        statements.extend(tracked);
+        statements.extend(tracked.statements);
+        generated_params.extend(tracked.params);
     }
 
     if !untracked_rows.is_empty() {
@@ -271,6 +279,7 @@ pub async fn rewrite_insert_with_backend(
 
     Ok(Some(VtableWriteRewrite {
         statements,
+        params: generated_params,
         registrations,
         mutations,
     }))
@@ -500,9 +509,9 @@ pub async fn build_update_followup_sql(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<String, LixError> {
+) -> Result<Vec<crate::sql::types::PreparedStatement>, LixError> {
     let mut executor = TransactionExecutor { transaction };
-    let statements = build_update_followup_statements(
+    let batch = build_update_followup_statements(
         &mut executor,
         plan,
         rows,
@@ -511,11 +520,7 @@ pub async fn build_update_followup_sql(
         functions,
     )
     .await?;
-    Ok(statements
-        .into_iter()
-        .map(|statement| statement.to_string())
-        .collect::<Vec<_>>()
-        .join("; "))
+    bind_statement_batch_for_dialect(batch, executor.dialect())
 }
 
 pub async fn build_delete_followup_sql(
@@ -526,9 +531,9 @@ pub async fn build_delete_followup_sql(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<String, LixError> {
+) -> Result<Vec<crate::sql::types::PreparedStatement>, LixError> {
     let mut executor = TransactionExecutor { transaction };
-    let statements = build_delete_followup_statements(
+    let batch = build_delete_followup_statements(
         &mut executor,
         plan,
         rows,
@@ -538,11 +543,22 @@ pub async fn build_delete_followup_sql(
         functions,
     )
     .await?;
-    Ok(statements
-        .into_iter()
-        .map(|statement| statement.to_string())
-        .collect::<Vec<_>>()
-        .join("; "))
+    bind_statement_batch_for_dialect(batch, executor.dialect())
+}
+
+fn bind_statement_batch_for_dialect(
+    batch: StatementBatch,
+    dialect: SqlDialect,
+) -> Result<Vec<crate::sql::types::PreparedStatement>, LixError> {
+    let mut prepared = Vec::with_capacity(batch.statements.len());
+    for statement in batch.statements {
+        let bound = bind_sql(&statement.to_string(), &batch.params, dialect)?;
+        prepared.push(crate::sql::types::PreparedStatement {
+            sql: bound.sql,
+            params: bound.params,
+        });
+    }
+    Ok(prepared)
 }
 
 fn build_untracked_on_conflict() -> OnInsert {
@@ -957,9 +973,10 @@ async fn rewrite_tracked_rows_with_backend(
     registrations: &mut Vec<SchemaRegistration>,
     mutations: &mut Vec<MutationRow>,
     detected_file_domain_changes: &[DetectedFileDomainChange],
+    placeholder_offset: usize,
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<StatementBatch, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
     let schema_idx = required_column_index(&insert.columns, "schema_key")?;
     let file_idx = required_column_index(&insert.columns, "file_id")?;
@@ -1073,7 +1090,10 @@ async fn rewrite_tracked_rows_with_backend(
     }
 
     if domain_changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StatementBatch {
+            statements: Vec::new(),
+            params: Vec::new(),
+        });
     }
 
     let mut executor = BackendExecutor { backend };
@@ -1093,7 +1113,7 @@ async fn rewrite_tracked_rows_with_backend(
         ensure_registration(registrations, &row.schema_key);
     }
 
-    build_statements_from_generate_commit_result(commit_result, functions)
+    build_statements_from_generate_commit_result(commit_result, functions, placeholder_offset)
 }
 
 fn ensure_registration(registrations: &mut Vec<SchemaRegistration>, schema_key: &str) {
@@ -1411,9 +1431,12 @@ async fn build_update_followup_statements(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<StatementBatch, LixError> {
     if rows.is_empty() && detected_file_domain_changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StatementBatch {
+            statements: Vec::new(),
+            params: Vec::new(),
+        });
     }
 
     let timestamp = functions.timestamp();
@@ -1491,7 +1514,7 @@ async fn build_update_followup_statements(
         },
         || functions.uuid_v7(),
     )?;
-    build_statements_from_generate_commit_result(commit_result, functions)
+    build_statements_from_generate_commit_result(commit_result, functions, 0)
 }
 
 async fn build_delete_followup_statements(
@@ -1502,7 +1525,7 @@ async fn build_delete_followup_statements(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<Statement>, LixError> {
+) -> Result<StatementBatch, LixError> {
     let timestamp = functions.timestamp();
     let mut domain_changes = Vec::new();
     let mut affected_versions = BTreeSet::new();
@@ -1615,7 +1638,10 @@ async fn build_delete_followup_statements(
     }
 
     if domain_changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StatementBatch {
+            statements: Vec::new(),
+            params: Vec::new(),
+        });
     }
 
     let versions = load_version_info_for_versions(executor, &affected_versions).await?;
@@ -1629,7 +1655,7 @@ async fn build_delete_followup_statements(
         },
         || functions.uuid_v7(),
     )?;
-    build_statements_from_generate_commit_result(commit_result, functions)
+    build_statements_from_generate_commit_result(commit_result, functions, 0)
 }
 
 struct EffectiveScopeDeleteRow {
@@ -1639,6 +1665,11 @@ struct EffectiveScopeDeleteRow {
     plugin_key: String,
     schema_version: String,
     metadata: Option<String>,
+}
+
+struct StatementBatch {
+    statements: Vec<Statement>,
+    params: Vec<EngineValue>,
 }
 
 async fn load_effective_scope_delete_rows(
@@ -1977,9 +2008,12 @@ fn lix_timestamp_expr() -> Expr {
 fn build_statements_from_generate_commit_result(
     commit_result: GenerateCommitResult,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<Statement>, LixError> {
+    placeholder_offset: usize,
+) -> Result<StatementBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
+    let mut snapshot_params = Vec::new();
+    let mut next_placeholder = placeholder_offset + 1;
     let mut change_rows = Vec::new();
     let mut materialized_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
 
@@ -1987,7 +2021,16 @@ fn build_statements_from_generate_commit_result(
         let snapshot_id = match &change.snapshot_content {
             Some(content) => {
                 let id = functions.uuid_v7();
-                snapshot_rows.push(vec![string_expr(&id), string_expr(content)]);
+                let id_placeholder = next_placeholder;
+                next_placeholder += 1;
+                snapshot_params.push(EngineValue::Text(id.clone()));
+                let content_placeholder = next_placeholder;
+                next_placeholder += 1;
+                snapshot_params.push(EngineValue::Text(content.clone()));
+                snapshot_rows.push(vec![
+                    placeholder_expr(id_placeholder),
+                    placeholder_expr(content_placeholder),
+                ]);
                 id
             }
             None => {
@@ -2084,7 +2127,10 @@ fn build_statements_from_generate_commit_result(
         ));
     }
 
-    Ok(statements)
+    Ok(StatementBatch {
+        statements,
+        params: snapshot_params,
+    })
 }
 
 fn table_with_joins_for(table: &str) -> TableWithJoins {
@@ -2372,6 +2418,10 @@ fn resolved_expr_or_original(
 
 fn string_expr(value: &str) -> Expr {
     Expr::Value(Value::SingleQuotedString(value.to_string()).into())
+}
+
+fn placeholder_expr(index_1_based: usize) -> Expr {
+    Expr::Value(Value::Placeholder(format!("${index_1_based}")).into())
 }
 
 fn number_expr(value: &str) -> Expr {
@@ -3101,9 +3151,12 @@ fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
+        bind_statement_batch_for_dialect, build_statements_from_generate_commit_result,
         rewrite_delete, rewrite_insert, rewrite_update, DeleteRewrite, UpdateRewrite,
         UPDATE_RETURNING_COLUMNS,
     };
+    use crate::backend::SqlDialect;
+    use crate::commit::{ChangeRow, GenerateCommitResult};
     use crate::functions::SystemFunctionProvider;
     use crate::Value as EngineValue;
     use serde_json::json;
@@ -3174,6 +3227,108 @@ mod tests {
         let snapshot_stmt = find_insert(&rewrite.statements, "lix_internal_snapshot");
         let ensured_id = extract_string_value(snapshot_stmt, "id");
         assert_eq!(ensured_id, "no-content");
+    }
+
+    #[test]
+    fn commit_result_snapshot_statement_is_parameterized() {
+        let mut provider = SystemFunctionProvider;
+        let snapshot_content =
+            "{\"wordPattern\":\"[^\\\\/\\\\?\\\\s]+\",\"quote\":\"''\"}".to_string();
+        let batch = build_statements_from_generate_commit_result(
+            GenerateCommitResult {
+                changes: vec![ChangeRow {
+                    id: "change-1".to_string(),
+                    entity_id: "entity-1".to_string(),
+                    schema_key: "schema-1".to_string(),
+                    schema_version: "1".to_string(),
+                    file_id: "file-1".to_string(),
+                    plugin_key: "plugin-md-v2".to_string(),
+                    snapshot_content: Some(snapshot_content.clone()),
+                    metadata: None,
+                    created_at: "2025-01-01T00:00:00.000Z".to_string(),
+                }],
+                materialized_state: Vec::new(),
+            },
+            &mut provider,
+            0,
+        )
+        .expect("build statements");
+
+        assert_eq!(batch.params.len(), 2);
+        assert!(matches!(batch.params[1], EngineValue::Text(ref value) if value == &snapshot_content));
+
+        let snapshot_stmt = find_insert(&batch.statements, "lix_internal_snapshot");
+        let (columns, rows) = insert_values(snapshot_stmt);
+        let id_idx = columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("id"))
+            .expect("id column");
+        let content_idx = columns
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case("content"))
+            .expect("content column");
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0][id_idx],
+            Expr::Value(ValueWithSpan {
+                value: Value::Placeholder(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            rows[0][content_idx],
+            Expr::Value(ValueWithSpan {
+                value: Value::Placeholder(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn snapshot_binding_treats_question_mark_content_as_data() {
+        let mut provider = SystemFunctionProvider;
+        let snapshot_content = "{\"md\":\"[link](x)? y\",\"quote\":\"''\"}".to_string();
+        let batch = build_statements_from_generate_commit_result(
+            GenerateCommitResult {
+                changes: vec![ChangeRow {
+                    id: "change-1".to_string(),
+                    entity_id: "entity-1".to_string(),
+                    schema_key: "schema-1".to_string(),
+                    schema_version: "1".to_string(),
+                    file_id: "file-1".to_string(),
+                    plugin_key: "plugin-md-v2".to_string(),
+                    snapshot_content: Some(snapshot_content.clone()),
+                    metadata: None,
+                    created_at: "2025-01-01T00:00:00.000Z".to_string(),
+                }],
+                materialized_state: Vec::new(),
+            },
+            &mut provider,
+            0,
+        )
+        .expect("build statements");
+
+        let prepared = bind_statement_batch_for_dialect(batch, SqlDialect::Sqlite)
+            .expect("bind generated statements");
+        let snapshot = prepared
+            .iter()
+            .find(|statement| statement.sql.contains("INSERT INTO lix_internal_snapshot"))
+            .expect("snapshot insert statement");
+
+        assert!(
+            !snapshot.sql.contains(&snapshot_content),
+            "snapshot content must not be interpolated into SQL text"
+        );
+        assert!(
+            snapshot.sql.contains('?') || snapshot.sql.contains("$1"),
+            "snapshot insert should use placeholders"
+        );
+        assert_eq!(snapshot.params.len(), 2);
+        assert!(matches!(
+            snapshot.params[1],
+            EngineValue::Text(ref value) if value == &snapshot_content
+        ));
     }
 
     #[test]

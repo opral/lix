@@ -1,4 +1,10 @@
 use std::collections::HashMap;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{Statement, Value as SqlValue};
+use sqlparser::ast::{VisitMut, VisitorMut};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
 use crate::{LixError, Value};
@@ -35,116 +41,60 @@ pub(crate) fn bind_sql_with_state(
     dialect: SqlDialect,
     mut state: PlaceholderState,
 ) -> Result<BoundSql, LixError> {
-    let mut output = String::with_capacity(sql.len());
+    let mut statements = parse_sql_statements(sql)?;
     let mut used_source_indices = Vec::new();
     let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
 
-    let bytes = sql.as_bytes();
-    let mut index = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-
-        if in_single_quote {
-            if byte == b'\'' {
-                output.push('\'');
-                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    output.push('\'');
-                    index += 2;
-                    continue;
-                }
-                in_single_quote = false;
-                index += 1;
-                continue;
-            }
-            let (ch, next_index) = next_char(sql, index);
-            output.push(ch);
-            index = next_index;
-            continue;
+    for statement in &mut statements {
+        let mut visitor = PlaceholderBinder {
+            params_len: params.len(),
+            dialect,
+            state: &mut state,
+            source_to_dense: &mut source_to_dense,
+            used_source_indices: &mut used_source_indices,
+        };
+        if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
+            return Err(error);
         }
-
-        if in_double_quote {
-            if byte == b'"' {
-                output.push('"');
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    output.push('"');
-                    index += 2;
-                    continue;
-                }
-                in_double_quote = false;
-                index += 1;
-                continue;
-            }
-            let (ch, next_index) = next_char(sql, index);
-            output.push(ch);
-            index = next_index;
-            continue;
-        }
-
-        if byte == b'\'' {
-            in_single_quote = true;
-            output.push('\'');
-            index += 1;
-            continue;
-        }
-        if byte == b'"' {
-            in_double_quote = true;
-            output.push('"');
-            index += 1;
-            continue;
-        }
-
-        if byte == b'?' {
-            let start = index;
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
-            }
-            let token = &sql[start..index];
-            let source_index = resolve_placeholder_index(token, params.len(), &mut state)?;
-            let dense_index = dense_index_for_source(
-                source_index,
-                &mut source_to_dense,
-                &mut used_source_indices,
-            );
-            output.push_str(&placeholder_for_dialect(dialect, dense_index + 1));
-            continue;
-        }
-
-        if byte == b'$' && index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() {
-            let start = index;
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
-            }
-            let token = &sql[start..index];
-            let source_index = resolve_placeholder_index(token, params.len(), &mut state)?;
-            let dense_index = dense_index_for_source(
-                source_index,
-                &mut source_to_dense,
-                &mut used_source_indices,
-            );
-            output.push_str(&placeholder_for_dialect(dialect, dense_index + 1));
-            continue;
-        }
-
-        let (ch, next_index) = next_char(sql, index);
-        output.push(ch);
-        index = next_index;
     }
 
     let bound_params = used_source_indices
         .into_iter()
         .map(|source_index| params[source_index].clone())
         .collect();
+    let sql = statements_to_sql(&statements);
 
     Ok(BoundSql {
-        sql: output,
+        sql,
         params: bound_params,
         state,
     })
+}
+
+struct PlaceholderBinder<'a> {
+    params_len: usize,
+    dialect: SqlDialect,
+    state: &'a mut PlaceholderState,
+    source_to_dense: &'a mut HashMap<usize, usize>,
+    used_source_indices: &'a mut Vec<usize>,
+}
+
+impl VisitorMut for PlaceholderBinder<'_> {
+    type Break = LixError;
+
+    fn pre_visit_value(&mut self, value: &mut SqlValue) -> ControlFlow<Self::Break> {
+        let SqlValue::Placeholder(token) = value else {
+            return ControlFlow::Continue(());
+        };
+        let source_index = match resolve_placeholder_index(token, self.params_len, self.state) {
+            Ok(index) => index,
+            Err(error) => return ControlFlow::Break(error),
+        };
+        let dense_index =
+            dense_index_for_source(source_index, self.source_to_dense, self.used_source_indices);
+        *value = SqlValue::Placeholder(placeholder_for_dialect(self.dialect, dense_index + 1));
+        ControlFlow::Continue(())
+    }
 }
 
 pub(crate) fn resolve_placeholder_index(
@@ -218,12 +168,18 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     Ok(parsed)
 }
 
-fn next_char(input: &str, index: usize) -> (char, usize) {
-    let ch = input[index..]
-        .chars()
-        .next()
-        .expect("bind_sql_with_state index must remain on char boundaries");
-    (ch, index + ch.len_utf8())
+fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
+    Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })
+}
+
+fn statements_to_sql(statements: &[Statement]) -> String {
+    statements
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]
@@ -308,6 +264,14 @@ mod tests {
 
         assert_eq!(bound.sql, "SELECT '$1', \"?\", $1 FROM t WHERE x = '$2'");
         assert_eq!(bound.params, vec![Value::Integer(5)]);
+    }
+
+    #[test]
+    fn ignores_question_mark_inside_markdown_json_literal() {
+        let sql = "INSERT INTO lix_internal_snapshot (id, content) VALUES ('s1', '{\"wordPattern\":\"[^\\\\\\\\/\\\\\\\\?\\\\\\\\s]+\",\"quote\":\"''\"}')";
+        let bound = bind_sql(sql, &[], SqlDialect::Sqlite).expect("bind should succeed");
+        assert!(bound.sql.contains("wordPattern"));
+        assert!(bound.params.is_empty());
     }
 
     #[test]
