@@ -1,7 +1,12 @@
 use crate::exports::lix::plugin::api::{EntityChange, File, Guest, PluginError};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use imara_diff::{Algorithm, Diff, InternedInput};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 wit_bindgen::generate!({
     path: "../engine/wit",
@@ -12,6 +17,12 @@ pub const LINE_SCHEMA_KEY: &str = "text_line";
 pub const DOCUMENT_SCHEMA_KEY: &str = "text_document";
 pub const SCHEMA_VERSION: &str = "1";
 pub const DOCUMENT_ENTITY_ID: &str = "__document__";
+const MANIFEST_JSON: &str = include_str!("../manifest.json");
+const LINE_SCHEMA_JSON: &str = include_str!("../schema/text_line.json");
+const DOCUMENT_SCHEMA_JSON: &str = include_str!("../schema/text_document.json");
+
+static LINE_SCHEMA: OnceLock<Value> = OnceLock::new();
+static DOCUMENT_SCHEMA: OnceLock<Value> = OnceLock::new();
 
 pub use crate::exports::lix::plugin::api::{
     EntityChange as PluginEntityChange, File as PluginFile, PluginError as PluginApiError,
@@ -32,17 +43,6 @@ impl LineEnding {
             Self::None => "",
             Self::Lf => "\n",
             Self::Crlf => "\r\n",
-        }
-    }
-
-    fn from_str(value: &str) -> Result<Self, PluginError> {
-        match value {
-            "" => Ok(Self::None),
-            "\n" => Ok(Self::Lf),
-            "\r\n" => Ok(Self::Crlf),
-            _ => Err(PluginError::InvalidInput(format!(
-                "unsupported line ending '{value}', expected one of '', '\\n', '\\r\\n'"
-            ))),
         }
     }
 
@@ -73,19 +73,6 @@ struct DocumentSnapshotOwned {
     line_ids: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct LineSnapshot<'a> {
-    content_hex: &'a str,
-    ending: &'a str,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LineSnapshotOwned {
-    content_hex: String,
-    ending: String,
-}
-
 impl Guest for TextLinesPlugin {
     fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
         if let Some(previous) = before.as_ref() {
@@ -98,8 +85,8 @@ impl Guest for TextLinesPlugin {
             .as_ref()
             .map(|file| parse_lines_with_ids(&file.data))
             .unwrap_or_default();
-        let after_lines = if before.is_some() {
-            parse_after_lines_with_git_matching(&before_lines, &after.data)
+        let after_lines = if let Some(before_file) = before.as_ref() {
+            parse_after_lines_with_histogram_matching(&before_lines, &before_file.data, &after.data)
         } else {
             parse_lines_with_ids(&after.data)
         };
@@ -113,23 +100,24 @@ impl Guest for TextLinesPlugin {
             .map(|line| line.entity_id.clone())
             .collect::<Vec<_>>();
 
-        let before_id_set = before_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let after_id_set = after_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let before_id_set = before_ids.iter().cloned().collect::<HashSet<_>>();
+        let after_id_set = after_ids.iter().cloned().collect::<HashSet<_>>();
         let mut changes = Vec::new();
 
         if before.is_some() {
-            for removed in before_lines
-                .iter()
-                .filter(|line| !after_id_set.contains(&line.entity_id))
-                .map(|line| line.entity_id.clone())
-                .collect::<BTreeSet<_>>()
-            {
-                changes.push(EntityChange {
-                    entity_id: removed,
-                    schema_key: LINE_SCHEMA_KEY.to_string(),
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    snapshot_content: None,
-                });
+            let mut removed_ids = HashSet::<String>::with_capacity(before_lines.len());
+            for line in &before_lines {
+                if after_id_set.contains(&line.entity_id) {
+                    continue;
+                }
+                if removed_ids.insert(line.entity_id.clone()) {
+                    changes.push(EntityChange {
+                        entity_id: line.entity_id.clone(),
+                        schema_key: LINE_SCHEMA_KEY.to_string(),
+                        schema_version: SCHEMA_VERSION.to_string(),
+                        snapshot_content: None,
+                    });
+                }
             }
         }
 
@@ -163,19 +151,33 @@ impl Guest for TextLinesPlugin {
         Ok(changes)
     }
 
-    fn apply_changes(_file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+    fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
+        let expected_line_changes = changes
+            .iter()
+            .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
+            .count();
         let mut document_snapshot: Option<DocumentSnapshotOwned> = None;
         let mut document_tombstoned = false;
-        let mut line_by_id = BTreeMap::<String, ParsedLine>::new();
+        let mut line_by_id = parse_lines_with_ids(&file.data)
+            .into_iter()
+            .map(|line| (line.entity_id.clone(), line))
+            .collect::<HashMap<_, _>>();
+        line_by_id.reserve(expected_line_changes);
+        let mut seen_line_change_ids = HashSet::<String>::with_capacity(expected_line_changes);
 
         for change in changes {
             if change.schema_key == LINE_SCHEMA_KEY {
                 validate_schema_version(&change.schema_version, LINE_SCHEMA_KEY)?;
+                if !seen_line_change_ids.insert(change.entity_id.clone()) {
+                    return Err(PluginError::InvalidInput(
+                        "duplicate text_line snapshot in apply_changes input".to_string(),
+                    ));
+                }
 
                 match change.snapshot_content {
                     Some(snapshot_raw) => {
                         let snapshot = parse_line_snapshot(&snapshot_raw, &change.entity_id)?;
-                        let replaced = line_by_id.insert(
+                        line_by_id.insert(
                             change.entity_id.clone(),
                             ParsedLine {
                                 entity_id: change.entity_id,
@@ -183,11 +185,6 @@ impl Guest for TextLinesPlugin {
                                 ending: snapshot.ending,
                             },
                         );
-                        if replaced.is_some() {
-                            return Err(PluginError::InvalidInput(
-                                "duplicate text_line snapshot in apply_changes input".to_string(),
-                            ));
-                        }
                     }
                     None => {
                         line_by_id.remove(&change.entity_id);
@@ -269,7 +266,7 @@ fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginErr
         PluginError::InvalidInput(format!("invalid text_document snapshot_content: {error}"))
     })?;
 
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     for line_id in &parsed.line_ids {
         if line_id.is_empty() {
             return Err(PluginError::InvalidInput(
@@ -287,18 +284,22 @@ fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginErr
 }
 
 fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginError> {
-    let parsed: LineSnapshotOwned = serde_json::from_str(raw).map_err(|error| {
+    let (content_base64, ending) = parse_line_snapshot_fields(raw).map_err(|error| {
         PluginError::InvalidInput(format!(
             "invalid text_line snapshot_content for entity_id '{entity_id}': {error}"
         ))
     })?;
 
-    let content = hex_to_bytes(&parsed.content_hex).map_err(|error| {
+    let content = base64_to_bytes(content_base64).map_err(|error| {
         PluginError::InvalidInput(format!(
-            "invalid text_line.content_hex for entity_id '{entity_id}': {error}"
+            "invalid text_line.content_base64 for entity_id '{entity_id}': {error}"
         ))
     })?;
-    let ending = LineEnding::from_str(&parsed.ending)?;
+    let ending = parse_line_ending_literal(ending).map_err(|error| {
+        PluginError::InvalidInput(format!(
+            "invalid text_line.ending for entity_id '{entity_id}': {error}"
+        ))
+    })?;
 
     Ok(ParsedLine {
         entity_id: entity_id.to_string(),
@@ -308,12 +309,21 @@ fn parse_line_snapshot(raw: &str, entity_id: &str) -> Result<ParsedLine, PluginE
 }
 
 fn serialize_line_snapshot(line: &ParsedLine) -> Result<String, PluginError> {
-    let content_hex = bytes_to_hex(&line.content);
-    serde_json::to_string(&LineSnapshot {
-        content_hex: &content_hex,
-        ending: line.ending.as_str(),
-    })
-    .map_err(|error| PluginError::Internal(format!("failed to encode text_line snapshot: {error}")))
+    let content_base64 = bytes_to_base64(&line.content);
+    let ending = line_ending_json_literal(line.ending);
+    let mut encoded = String::with_capacity(
+        LINE_SNAPSHOT_PREFIX.len()
+            + content_base64.len()
+            + LINE_SNAPSHOT_SEPARATOR.len()
+            + ending.len()
+            + LINE_SNAPSHOT_SUFFIX.len(),
+    );
+    encoded.push_str(LINE_SNAPSHOT_PREFIX);
+    encoded.push_str(&content_base64);
+    encoded.push_str(LINE_SNAPSHOT_SEPARATOR);
+    encoded.push_str(ending);
+    encoded.push_str(LINE_SNAPSHOT_SUFFIX);
+    Ok(encoded)
 }
 
 fn parse_lines_with_ids(data: &[u8]) -> Vec<ParsedLine> {
@@ -321,13 +331,13 @@ fn parse_lines_with_ids(data: &[u8]) -> Vec<ParsedLine> {
 }
 
 fn parse_lines_with_ids_from_split(split: Vec<(Vec<u8>, LineEnding)>) -> Vec<ParsedLine> {
-    let mut occurrence_by_key = HashMap::<Vec<u8>, u32>::new();
+    let mut occurrence_by_key = HashMap::<[u8; 20], u32>::new();
     let mut lines = Vec::with_capacity(split.len());
 
     for (content, ending) in split {
-        let key = line_key_bytes(&content, ending);
-        let occurrence = occurrence_by_key.entry(key.clone()).or_insert(0);
-        let entity_id = format!("line:{}:{}", sha1_hex(&key), occurrence);
+        let fingerprint = line_fingerprint(&content, ending);
+        let occurrence = occurrence_by_key.entry(fingerprint).or_insert(0);
+        let entity_id = format!("line:{}:{}", bytes_to_hex(&fingerprint), occurrence);
         *occurrence += 1;
 
         lines.push(ParsedLine {
@@ -340,39 +350,42 @@ fn parse_lines_with_ids_from_split(split: Vec<(Vec<u8>, LineEnding)>) -> Vec<Par
     lines
 }
 
-fn parse_after_lines_with_git_matching(
+fn parse_after_lines_with_histogram_matching(
     before_lines: &[ParsedLine],
+    before_data: &[u8],
     after_data: &[u8],
 ) -> Vec<ParsedLine> {
     let after_split = split_lines(after_data);
-    let canonical_after_lines = parse_lines_with_ids_from_split(after_split.clone());
 
-    let before_keys = before_lines
-        .iter()
-        .map(|line| line_key_bytes(&line.content, line.ending))
-        .collect::<Vec<_>>();
-    let after_keys = after_split
-        .iter()
-        .map(|(content, ending)| line_key_bytes(content, *ending))
-        .collect::<Vec<_>>();
-    let lcs_pairs = longest_common_subsequence_pairs(&before_keys, &after_keys);
+    let matching_pairs = compute_histogram_line_matching_pairs(before_data, after_data);
 
     let mut matched_after_to_before = HashMap::<usize, usize>::new();
-    for (before_index, after_index) in lcs_pairs {
+    for (before_index, after_index) in matching_pairs {
         matched_after_to_before.insert(after_index, before_index);
     }
 
     let mut used_ids = before_lines
         .iter()
         .map(|line| line.entity_id.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<HashSet<_>>();
+    let mut occurrence_by_key = HashMap::<[u8; 20], u32>::new();
     let mut after_lines = Vec::with_capacity(after_split.len());
 
     for (after_index, (content, ending)) in after_split.into_iter().enumerate() {
+        let fingerprint = line_fingerprint(&content, ending);
+        let occurrence = occurrence_by_key.entry(fingerprint).or_insert(0);
+        let canonical_occurrence = *occurrence;
+        *occurrence += 1;
+
         let entity_id = if let Some(before_index) = matched_after_to_before.get(&after_index) {
             before_lines[*before_index].entity_id.clone()
         } else {
-            allocate_inserted_line_id(&canonical_after_lines[after_index].entity_id, &used_ids)
+            let canonical_entity_id = format!(
+                "line:{}:{}",
+                bytes_to_hex(&fingerprint),
+                canonical_occurrence
+            );
+            allocate_inserted_line_id(&canonical_entity_id, &used_ids)
         };
         used_ids.insert(entity_id.clone());
 
@@ -386,7 +399,41 @@ fn parse_after_lines_with_git_matching(
     after_lines
 }
 
-fn allocate_inserted_line_id(base: &str, used_ids: &BTreeSet<String>) -> String {
+fn compute_histogram_line_matching_pairs(before_data: &[u8], after_data: &[u8]) -> Vec<(usize, usize)> {
+    let input = InternedInput::new(before_data, after_data);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+
+    let mut pairs = Vec::new();
+    let mut before_pos = 0usize;
+    let mut after_pos = 0usize;
+
+    for hunk in diff.hunks() {
+        let hunk_before_start = hunk.before.start as usize;
+        let hunk_after_start = hunk.after.start as usize;
+        let unchanged_before_len = hunk_before_start.saturating_sub(before_pos);
+        let unchanged_after_len = hunk_after_start.saturating_sub(after_pos);
+        let unchanged_len = unchanged_before_len.min(unchanged_after_len);
+
+        for offset in 0..unchanged_len {
+            pairs.push((before_pos + offset, after_pos + offset));
+        }
+
+        before_pos = hunk.before.end as usize;
+        after_pos = hunk.after.end as usize;
+    }
+
+    let before_tail = input.before.len().saturating_sub(before_pos);
+    let after_tail = input.after.len().saturating_sub(after_pos);
+    let tail_len = before_tail.min(after_tail);
+    for offset in 0..tail_len {
+        pairs.push((before_pos + offset, after_pos + offset));
+    }
+
+    pairs
+}
+
+fn allocate_inserted_line_id(base: &str, used_ids: &HashSet<String>) -> String {
     if !used_ids.contains(base) {
         return base.to_string();
     }
@@ -399,51 +446,6 @@ fn allocate_inserted_line_id(base: &str, used_ids: &BTreeSet<String>) -> String 
         }
         suffix += 1;
     }
-}
-
-fn longest_common_subsequence_pairs(
-    before_keys: &[Vec<u8>],
-    after_keys: &[Vec<u8>],
-) -> Vec<(usize, usize)> {
-    let before_len = before_keys.len();
-    let after_len = after_keys.len();
-    if before_len == 0 || after_len == 0 {
-        return Vec::new();
-    }
-
-    let mut lengths = vec![vec![0u32; after_len + 1]; before_len + 1];
-    for before_index in (0..before_len).rev() {
-        for after_index in (0..after_len).rev() {
-            lengths[before_index][after_index] = if before_keys[before_index]
-                == after_keys[after_index]
-            {
-                lengths[before_index + 1][after_index + 1] + 1
-            } else {
-                lengths[before_index + 1][after_index].max(lengths[before_index][after_index + 1])
-            };
-        }
-    }
-
-    let mut pairs = Vec::new();
-    let mut before_index = 0usize;
-    let mut after_index = 0usize;
-
-    while before_index < before_len && after_index < after_len {
-        if before_keys[before_index] == after_keys[after_index] {
-            pairs.push((before_index, after_index));
-            before_index += 1;
-            after_index += 1;
-            continue;
-        }
-
-        if lengths[before_index + 1][after_index] >= lengths[before_index][after_index + 1] {
-            before_index += 1;
-        } else {
-            after_index += 1;
-        }
-    }
-
-    pairs
 }
 
 fn split_lines(data: &[u8]) -> Vec<(Vec<u8>, LineEnding)> {
@@ -474,17 +476,45 @@ fn split_lines(data: &[u8]) -> Vec<(Vec<u8>, LineEnding)> {
     lines
 }
 
-fn line_key_bytes(content: &[u8], ending: LineEnding) -> Vec<u8> {
-    let mut key = Vec::with_capacity(content.len() + 2);
-    key.extend_from_slice(content);
-    key.push(0xff);
-    key.push(ending.marker_byte());
-    key
+fn line_fingerprint(content: &[u8], ending: LineEnding) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(content);
+    hasher.update([0xff, ending.marker_byte()]);
+    let digest = hasher.finalize();
+    let mut fingerprint = [0u8; 20];
+    fingerprint.copy_from_slice(&digest);
+    fingerprint
 }
 
-fn sha1_hex(bytes: &[u8]) -> String {
-    let digest = Sha1::digest(bytes);
-    bytes_to_hex(&digest)
+const LINE_SNAPSHOT_PREFIX: &str = "{\"content_base64\":\"";
+const LINE_SNAPSHOT_SEPARATOR: &str = "\",\"ending\":\"";
+const LINE_SNAPSHOT_SUFFIX: &str = "\"}";
+
+fn parse_line_snapshot_fields(raw: &str) -> Result<(&str, &str), String> {
+    let inner = raw
+        .strip_prefix(LINE_SNAPSHOT_PREFIX)
+        .and_then(|value| value.strip_suffix(LINE_SNAPSHOT_SUFFIX))
+        .ok_or_else(|| "expected {\"content_base64\":\"...\",\"ending\":\"...\"}".to_string())?;
+    inner
+        .split_once(LINE_SNAPSHOT_SEPARATOR)
+        .ok_or_else(|| "missing content_base64 or ending field".to_string())
+}
+
+fn line_ending_json_literal(ending: LineEnding) -> &'static str {
+    match ending {
+        LineEnding::None => "",
+        LineEnding::Lf => "\\n",
+        LineEnding::Crlf => "\\r\\n",
+    }
+}
+
+fn parse_line_ending_literal(value: &str) -> Result<LineEnding, String> {
+    match value {
+        "" => Ok(LineEnding::None),
+        "\\n" => Ok(LineEnding::Lf),
+        "\\r\\n" => Ok(LineEnding::Crlf),
+        _ => Err("unsupported ending literal; expected \"\", \"\\\\n\", or \"\\\\r\\\\n\"".to_string()),
+    }
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -504,42 +534,14 @@ fn hex_char(value: u8) -> char {
     }
 }
 
-fn hex_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
-    if raw.len() % 2 != 0 {
-        return Err("expected even-length hex string".to_string());
-    }
-
-    let mut out = Vec::with_capacity(raw.len() / 2);
-    let bytes = raw.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let high = from_hex_nibble(bytes[index]).ok_or_else(|| {
-            format!(
-                "invalid hex character '{}' at index {}",
-                bytes[index] as char, index
-            )
-        })?;
-        let low = from_hex_nibble(bytes[index + 1]).ok_or_else(|| {
-            format!(
-                "invalid hex character '{}' at index {}",
-                bytes[index + 1] as char,
-                index + 1
-            )
-        })?;
-        out.push((high << 4) | low);
-        index += 2;
-    }
-
-    Ok(out)
+fn bytes_to_base64(bytes: &[u8]) -> String {
+    BASE64_STANDARD.encode(bytes)
 }
 
-fn from_hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+fn base64_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    BASE64_STANDARD
+        .decode(raw)
+        .map_err(|error| format!("invalid base64: {error}"))
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
@@ -550,4 +552,28 @@ pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, 
     <TextLinesPlugin as Guest>::apply_changes(file, changes)
 }
 
+pub fn manifest_json() -> &'static str {
+    MANIFEST_JSON
+}
+
+pub fn line_schema_json() -> &'static str {
+    LINE_SCHEMA_JSON
+}
+
+pub fn line_schema_definition() -> &'static Value {
+    LINE_SCHEMA
+        .get_or_init(|| serde_json::from_str(LINE_SCHEMA_JSON).expect("text line schema must parse"))
+}
+
+pub fn document_schema_json() -> &'static str {
+    DOCUMENT_SCHEMA_JSON
+}
+
+pub fn document_schema_definition() -> &'static Value {
+    DOCUMENT_SCHEMA.get_or_init(|| {
+        serde_json::from_str(DOCUMENT_SCHEMA_JSON).expect("text document schema must parse")
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
 export!(TextLinesPlugin);

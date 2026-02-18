@@ -36,7 +36,7 @@ fn rejects_missing_document_snapshot() {
         entity_id: "line:abc:0".to_string(),
         schema_key: LINE_SCHEMA_KEY.to_string(),
         schema_version: "1".to_string(),
-        snapshot_content: Some(r#"{"content_hex":"61","ending":"\n"}"#.to_string()),
+        snapshot_content: Some(r#"{"content_base64":"YQ==","ending":"\n"}"#.to_string()),
     }];
 
     let error = apply_changes(file_from_bytes("f1", "/doc.txt", b""), changes)
