@@ -11,7 +11,7 @@ use std::task::Poll;
 const MAX_PENDING_BATCHES_PER_LISTENER: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StateCommitEventFilter {
+pub struct StateCommitStreamFilter {
     // Matching semantics:
     // - OR within each field list (e.g. schema_keys = ["a", "b"] matches a OR b)
     // - AND across non-empty fields (e.g. schema_keys + entity_ids must both match)
@@ -25,7 +25,7 @@ pub struct StateCommitEventFilter {
     pub include_untracked: bool,
 }
 
-impl Default for StateCommitEventFilter {
+impl Default for StateCommitStreamFilter {
     fn default() -> Self {
         Self {
             schema_keys: Vec::new(),
@@ -40,15 +40,15 @@ impl Default for StateCommitEventFilter {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StateCommitEventOperation {
+pub enum StateCommitStreamOperation {
     Insert,
     Update,
     Delete,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StateCommitEventChange {
-    pub operation: StateCommitEventOperation,
+pub struct StateCommitStreamChange {
+    pub operation: StateCommitStreamOperation,
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
@@ -61,24 +61,24 @@ pub struct StateCommitEventChange {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StateCommitEventBatch {
+pub struct StateCommitStreamBatch {
     pub sequence: u64,
-    pub changes: Vec<StateCommitEventChange>,
+    pub changes: Vec<StateCommitStreamChange>,
 }
 
-pub struct StateCommitEvents {
+pub struct StateCommitStream {
     listener_id: u64,
     queue: Arc<ListenerQueue>,
-    bus: Arc<StateCommitEventBus>,
+    bus: Arc<StateCommitStreamBus>,
     closed: AtomicBool,
 }
 
-impl StateCommitEvents {
-    pub fn try_next(&self) -> Option<StateCommitEventBatch> {
+impl StateCommitStream {
+    pub fn try_next(&self) -> Option<StateCommitStreamBatch> {
         self.queue.try_pop()
     }
 
-    pub async fn next(&self) -> Option<StateCommitEventBatch> {
+    pub async fn next(&self) -> Option<StateCommitStreamBatch> {
         poll_fn(|cx| {
             if let Some(batch) = self.queue.try_pop() {
                 return Poll::Ready(Some(batch));
@@ -107,20 +107,23 @@ impl StateCommitEvents {
     }
 }
 
-impl Drop for StateCommitEvents {
+impl Drop for StateCommitStream {
     fn drop(&mut self) {
         self.close();
     }
 }
 
 #[derive(Default)]
-pub(crate) struct StateCommitEventBus {
-    inner: Mutex<StateCommitEventBusInner>,
+pub(crate) struct StateCommitStreamBus {
+    inner: Mutex<StateCommitStreamBusInner>,
 }
 
-impl StateCommitEventBus {
-    pub(crate) fn subscribe(self: &Arc<Self>, filter: StateCommitEventFilter) -> StateCommitEvents {
-        let compiled_filter = CompiledStateCommitEventFilter::new(filter);
+impl StateCommitStreamBus {
+    pub(crate) fn subscribe(
+        self: &Arc<Self>,
+        filter: StateCommitStreamFilter,
+    ) -> StateCommitStream {
+        let compiled_filter = CompiledStateCommitStreamFilter::new(filter);
         let queue = Arc::new(ListenerQueue::default());
 
         let mut inner = self.inner.lock().unwrap();
@@ -162,7 +165,7 @@ impl StateCommitEventBus {
             listener_id,
         );
 
-        StateCommitEvents {
+        StateCommitStream {
             listener_id,
             queue,
             bus: Arc::clone(self),
@@ -170,7 +173,7 @@ impl StateCommitEventBus {
         }
     }
 
-    pub(crate) fn emit(&self, changes: Vec<StateCommitEventChange>) {
+    pub(crate) fn emit(&self, changes: Vec<StateCommitStreamChange>) {
         if changes.is_empty() {
             return;
         }
@@ -213,7 +216,7 @@ impl StateCommitEventBus {
 
             let sequence = inner.next_sequence;
             inner.next_sequence = inner.next_sequence.saturating_add(1);
-            let batch = StateCommitEventBatch { sequence, changes };
+            let batch = StateCommitStreamBatch { sequence, changes };
 
             let listeners = candidate_ids
                 .into_iter()
@@ -267,7 +270,7 @@ impl StateCommitEventBus {
 }
 
 #[derive(Default)]
-struct StateCommitEventBusInner {
+struct StateCommitStreamBusInner {
     next_listener_id: u64,
     next_sequence: u64,
     listeners: HashMap<u64, ListenerEntry>,
@@ -281,25 +284,25 @@ struct StateCommitEventBusInner {
 
 #[derive(Clone)]
 struct ListenerEntry {
-    filter: CompiledStateCommitEventFilter,
+    filter: CompiledStateCommitStreamFilter,
     queue: Arc<ListenerQueue>,
 }
 
 #[derive(Default)]
 struct ListenerQueue {
-    queue: Mutex<VecDeque<StateCommitEventBatch>>,
+    queue: Mutex<VecDeque<StateCommitStreamBatch>>,
     waker: AtomicWaker,
 }
 
 impl ListenerQueue {
-    fn try_pop(&self) -> Option<StateCommitEventBatch> {
+    fn try_pop(&self) -> Option<StateCommitStreamBatch> {
         let mut queue = self.queue.lock().unwrap();
         queue.pop_front()
     }
 }
 
 #[derive(Debug, Clone)]
-struct CompiledStateCommitEventFilter {
+struct CompiledStateCommitStreamFilter {
     schema_keys: HashSet<String>,
     entity_ids: HashSet<String>,
     file_ids: HashSet<String>,
@@ -309,8 +312,8 @@ struct CompiledStateCommitEventFilter {
     include_untracked: bool,
 }
 
-impl CompiledStateCommitEventFilter {
-    fn new(filter: StateCommitEventFilter) -> Self {
+impl CompiledStateCommitStreamFilter {
+    fn new(filter: StateCommitStreamFilter) -> Self {
         Self {
             schema_keys: normalize_filter_values(filter.schema_keys),
             entity_ids: normalize_filter_values(filter.entity_ids),
@@ -330,14 +333,14 @@ impl CompiledStateCommitEventFilter {
             && self.writer_keys.is_empty()
     }
 
-    fn matches_batch(&self, batch: &StateCommitEventBatch) -> bool {
+    fn matches_batch(&self, batch: &StateCommitStreamBatch) -> bool {
         batch
             .changes
             .iter()
             .any(|change| self.matches_change(change))
     }
 
-    fn matches_change(&self, change: &StateCommitEventChange) -> bool {
+    fn matches_change(&self, change: &StateCommitStreamChange) -> bool {
         if !self.include_untracked && change.untracked {
             return false;
         }
@@ -380,7 +383,7 @@ struct TouchedFields {
 }
 
 impl TouchedFields {
-    fn from_changes(changes: &[StateCommitEventChange]) -> Self {
+    fn from_changes(changes: &[StateCommitStreamChange]) -> Self {
         let mut touched = Self::default();
         for change in changes {
             touched.schema_keys.insert(change.schema_key.clone());
@@ -443,7 +446,7 @@ fn extend_candidates<'a>(
     }
 }
 
-fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitEventBatch) {
+fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitStreamBatch) {
     let mut queue_guard = queue.queue.lock().unwrap();
     if queue_guard.len() >= MAX_PENDING_BATCHES_PER_LISTENER {
         queue_guard.pop_front();
@@ -453,10 +456,10 @@ fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitEventBatch) {
     queue.waker.wake();
 }
 
-pub(crate) fn state_commit_event_changes_from_mutations(
+pub(crate) fn state_commit_stream_changes_from_mutations(
     mutations: &[MutationRow],
     writer_key: Option<&str>,
-) -> Vec<StateCommitEventChange> {
+) -> Vec<StateCommitStreamChange> {
     if mutations.is_empty() {
         return Vec::new();
     }
@@ -465,7 +468,7 @@ pub(crate) fn state_commit_event_changes_from_mutations(
 
     mutations
         .iter()
-        .map(|mutation| StateCommitEventChange {
+        .map(|mutation| StateCommitStreamChange {
             operation: map_mutation_operation(&mutation.operation),
             entity_id: mutation.entity_id.clone(),
             schema_key: mutation.schema_key.clone(),
@@ -480,10 +483,10 @@ pub(crate) fn state_commit_event_changes_from_mutations(
         .collect()
 }
 
-fn map_mutation_operation(operation: &MutationOperation) -> StateCommitEventOperation {
+fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
     match operation {
-        MutationOperation::Insert => StateCommitEventOperation::Insert,
-        MutationOperation::Update => StateCommitEventOperation::Update,
-        MutationOperation::Delete => StateCommitEventOperation::Delete,
+        MutationOperation::Insert => StateCommitStreamOperation::Insert,
+        MutationOperation::Update => StateCommitStreamOperation::Update,
+        MutationOperation::Delete => StateCommitStreamOperation::Delete,
     }
 }

@@ -33,9 +33,9 @@ use crate::sql::{
     ColumnReferenceOptions, DetectedFileDomainChange, MutationOperation, MutationRow,
     PlaceholderState, PostprocessPlan, UpdateValidationPlan,
 };
-use crate::state_commit_events::{
-    state_commit_event_changes_from_mutations, StateCommitEventBus, StateCommitEventChange,
-    StateCommitEventFilter, StateCommitEvents,
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,
+    StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
@@ -119,7 +119,7 @@ pub struct Engine {
     active_version_id: RwLock<String>,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
-    state_commit_event_bus: Arc<StateCommitEventBus>,
+    state_commit_stream_bus: Arc<StateCommitStreamBus>,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -130,7 +130,7 @@ pub struct EngineTransaction<'a> {
     active_version_id: String,
     active_version_changed: bool,
     installed_plugins_cache_invalidation_pending: bool,
-    pending_state_commit_event_changes: Vec<StateCommitEventChange>,
+    pending_state_commit_stream_changes: Vec<StateCommitStreamChange>,
 }
 
 impl<'a> EngineTransaction<'a> {
@@ -149,7 +149,7 @@ impl<'a> EngineTransaction<'a> {
                 &mut self.active_version_id,
                 None,
                 false,
-                &mut self.pending_state_commit_event_changes,
+                &mut self.pending_state_commit_stream_changes,
             )
             .await?;
         if self.active_version_id != previous_active_version_id {
@@ -173,8 +173,8 @@ impl<'a> EngineTransaction<'a> {
         if self.installed_plugins_cache_invalidation_pending {
             self.engine.invalidate_installed_plugins_cache()?;
         }
-        self.engine.emit_state_commit_event_changes(std::mem::take(
-            &mut self.pending_state_commit_event_changes,
+        self.engine.emit_state_commit_stream_changes(std::mem::take(
+            &mut self.pending_state_commit_stream_changes,
         ));
         Ok(())
     }
@@ -271,7 +271,7 @@ pub fn boot(args: BootArgs) -> Engine {
         active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
         installed_plugins_cache: RwLock::new(None),
         plugin_component_cache: Mutex::new(BTreeMap::new()),
-        state_commit_event_bus: Arc::new(StateCommitEventBus::default()),
+        state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
     }
 }
 
@@ -280,12 +280,12 @@ impl Engine {
         self.wasm_runtime.clone()
     }
 
-    pub fn state_commit_events(&self, filter: StateCommitEventFilter) -> StateCommitEvents {
-        self.state_commit_event_bus.subscribe(filter)
+    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
+        self.state_commit_stream_bus.subscribe(filter)
     }
 
-    fn emit_state_commit_event_changes(&self, changes: Vec<StateCommitEventChange>) {
-        self.state_commit_event_bus.emit(changes);
+    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
+        self.state_commit_stream_bus.emit(changes);
     }
 
     async fn load_installed_plugins_with_backend(
@@ -432,8 +432,8 @@ impl Engine {
                 }
                 Err(error) => return Err(error),
             };
-        let state_commit_event_changes =
-            state_commit_event_changes_from_mutations(&output.mutations, writer_key);
+        let state_commit_stream_changes =
+            state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
         let next_active_version_id_from_mutations =
             active_version_from_mutations(&output.mutations)?;
         let next_active_version_id_from_updates =
@@ -618,7 +618,7 @@ impl Engine {
         if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
             self.invalidate_installed_plugins_cache()?;
         }
-        self.emit_state_commit_event_changes(state_commit_event_changes);
+        self.emit_state_commit_stream_changes(state_commit_stream_changes);
 
         Ok(result)
     }
@@ -641,7 +641,7 @@ impl Engine {
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.active_version_id.read().unwrap().clone();
         let starting_active_version_id = active_version_id.clone();
-        let mut pending_state_commit_event_changes = Vec::new();
+        let mut pending_state_commit_stream_changes = Vec::new();
         let installed_plugins_cache_invalidation_pending =
             should_invalidate_installed_plugins_cache_for_statements(&statements);
         let result = self
@@ -651,7 +651,7 @@ impl Engine {
                 params,
                 options,
                 &mut active_version_id,
-                &mut pending_state_commit_event_changes,
+                &mut pending_state_commit_stream_changes,
             )
             .await;
         let result = match result {
@@ -669,7 +669,7 @@ impl Engine {
         if installed_plugins_cache_invalidation_pending {
             self.invalidate_installed_plugins_cache()?;
         }
-        self.emit_state_commit_event_changes(pending_state_commit_event_changes);
+        self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
         Ok(result)
     }
 
@@ -680,7 +680,7 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
         active_version_id: &mut String,
-        pending_state_commit_event_changes: &mut Vec<StateCommitEventChange>,
+        pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<QueryResult, LixError> {
         let coalesced_statements = if params.is_empty() {
             coalesce_lix_file_transaction_statements(
@@ -748,7 +748,7 @@ impl Engine {
                     active_version_id,
                     deferred_side_effects.as_mut(),
                     true,
-                    pending_state_commit_event_changes,
+                    pending_state_commit_stream_changes,
                 )
                 .await
             } else {
@@ -760,7 +760,7 @@ impl Engine {
                     active_version_id,
                     None,
                     false,
-                    pending_state_commit_event_changes,
+                    pending_state_commit_stream_changes,
                 )
                 .await
             };
@@ -798,7 +798,7 @@ impl Engine {
             active_version_id: self.active_version_id.read().unwrap().clone(),
             active_version_changed: false,
             installed_plugins_cache_invalidation_pending: false,
-            pending_state_commit_event_changes: Vec::new(),
+            pending_state_commit_stream_changes: Vec::new(),
         })
     }
 
@@ -835,7 +835,7 @@ impl Engine {
         active_version_id: &mut String,
         deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
         skip_side_effect_collection: bool,
-        pending_state_commit_event_changes: &mut Vec<StateCommitEventChange>,
+        pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql_statements(sql)?;
         let writer_key = options.writer_key.as_deref();
@@ -916,7 +916,7 @@ impl Engine {
                                 params,
                                 options,
                                 active_version_id,
-                                pending_state_commit_event_changes,
+                                pending_state_commit_stream_changes,
                             ),
                         )
                         .await;
@@ -947,8 +947,8 @@ impl Engine {
                 output,
             )
         };
-        let state_commit_event_changes =
-            state_commit_event_changes_from_mutations(&output.mutations, writer_key);
+        let state_commit_stream_changes =
+            state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
 
         let next_active_version_id_from_mutations =
             active_version_from_mutations(&output.mutations)?;
@@ -1120,7 +1120,7 @@ impl Engine {
         )
         .await?;
 
-        pending_state_commit_event_changes.extend(state_commit_event_changes);
+        pending_state_commit_stream_changes.extend(state_commit_stream_changes);
         Ok(result)
     }
 
@@ -2498,7 +2498,7 @@ impl Engine {
         params: &[Value],
         options: &ExecuteOptions,
         active_version_id: &mut String,
-        pending_state_commit_event_changes: &mut Vec<StateCommitEventChange>,
+        pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<QueryResult, LixError> {
         let statements = parse_sql_statements(sql)?;
         self.execute_statement_script_with_options_in_transaction(
@@ -2507,7 +2507,7 @@ impl Engine {
             params,
             options,
             active_version_id,
-            pending_state_commit_event_changes,
+            pending_state_commit_stream_changes,
         )
         .await
     }

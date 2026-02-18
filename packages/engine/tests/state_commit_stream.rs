@@ -1,6 +1,6 @@
 mod support;
 
-use lix_engine::{ExecuteOptions, LixError, StateCommitEventFilter};
+use lix_engine::{ExecuteOptions, LixError, StateCommitStreamFilter};
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
@@ -13,7 +13,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
 }
 
 simulation_test!(
-    state_commit_events_emits_matching_batches,
+    state_commit_stream_emits_matching_batches,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -24,9 +24,9 @@ simulation_test!(
 
         let events = engine
             .raw_engine()
-            .state_commit_events(StateCommitEventFilter {
+            .state_commit_stream(StateCommitStreamFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                ..StateCommitEventFilter::default()
+                ..StateCommitStreamFilter::default()
             });
 
         engine
@@ -57,7 +57,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    state_commit_events_respects_excluded_writer_keys,
+    state_commit_stream_respects_excluded_writer_keys,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -68,10 +68,10 @@ simulation_test!(
 
         let events = engine
             .raw_engine()
-            .state_commit_events(StateCommitEventFilter {
+            .state_commit_stream(StateCommitStreamFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 exclude_writer_keys: vec!["ui-writer".to_string()],
-                ..StateCommitEventFilter::default()
+                ..StateCommitStreamFilter::default()
             });
 
         engine
@@ -106,7 +106,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    state_commit_events_aggregates_changes_per_transaction_commit,
+    state_commit_stream_aggregates_changes_per_transaction_commit,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -117,9 +117,9 @@ simulation_test!(
 
         let events = engine
             .raw_engine()
-            .state_commit_events(StateCommitEventFilter {
+            .state_commit_stream(StateCommitStreamFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                ..StateCommitEventFilter::default()
+                ..StateCommitStreamFilter::default()
             });
 
         engine
