@@ -1875,6 +1875,7 @@ name = "lix_engine_wasm_bindgen"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "getrandom 0.3.4",
  "js-sys",
  "lix_engine",

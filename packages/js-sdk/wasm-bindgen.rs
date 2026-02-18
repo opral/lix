@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use async_trait::async_trait;
+    use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
         boot, observe_owned, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError,
@@ -155,6 +156,7 @@ export type LixObserveEvents = {
     #[wasm_bindgen(js_name = ObserveEvents)]
     pub struct JsObserveEvents {
         inner: std::sync::Mutex<Option<EngineObserveEvents>>,
+        in_flight_next_abort: std::sync::Mutex<Option<AbortHandle>>,
         closed: AtomicBool,
     }
 
@@ -214,6 +216,7 @@ export type LixObserveEvents = {
             let events = observe_owned(Arc::clone(&self.engine), query).map_err(js_error)?;
             Ok(JsObserveEvents {
                 inner: std::sync::Mutex::new(Some(events)),
+                in_flight_next_abort: std::sync::Mutex::new(None),
                 closed: AtomicBool::new(false),
             })
         }
@@ -259,7 +262,7 @@ export type LixObserveEvents = {
                 return Ok(JsValue::UNDEFINED);
             }
 
-            let mut events = {
+            let events = {
                 let mut guard = self.inner.lock().map_err(|_| {
                     js_error(LixError {
                         message: "observe events lock poisoned".to_string(),
@@ -267,11 +270,42 @@ export type LixObserveEvents = {
                 })?;
                 guard.take()
             };
-            let Some(mut events) = events.take() else {
+            let Some(mut events) = events else {
                 return Ok(JsValue::UNDEFINED);
             };
 
-            let next = events.next().await.map_err(js_error)?;
+            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+            {
+                let mut guard = self.in_flight_next_abort.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events abort lock poisoned".to_string(),
+                    })
+                })?;
+                if self.closed.load(Ordering::SeqCst) {
+                    events.close();
+                    return Ok(JsValue::UNDEFINED);
+                }
+                *guard = Some(abort_handle);
+            }
+
+            let next = Abortable::new(events.next(), abort_registration).await;
+            {
+                let mut guard = self.in_flight_next_abort.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events abort lock poisoned".to_string(),
+                    })
+                })?;
+                guard.take();
+            }
+
+            let next = match next {
+                Ok(next) => next.map_err(js_error)?,
+                Err(_) => {
+                    events.close();
+                    return Ok(JsValue::UNDEFINED);
+                }
+            };
+
             if self.closed.load(Ordering::SeqCst) || next.is_none() {
                 events.close();
                 return Ok(JsValue::UNDEFINED);
@@ -297,6 +331,16 @@ export type LixObserveEvents = {
         pub fn close(&self) -> Result<(), JsValue> {
             if self.closed.swap(true, Ordering::SeqCst) {
                 return Ok(());
+            }
+            {
+                let mut guard = self.in_flight_next_abort.lock().map_err(|_| {
+                    js_error(LixError {
+                        message: "observe events abort lock poisoned".to_string(),
+                    })
+                })?;
+                if let Some(abort) = guard.take() {
+                    abort.abort();
+                }
             }
             let mut guard = self.inner.lock().map_err(|_| {
                 js_error(LixError {
