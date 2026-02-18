@@ -341,7 +341,7 @@ fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommi
             }
             _ => {
                 if relation.starts_with("lix_") && !relation.starts_with("lix_internal_") {
-                    schema_keys.insert(relation.clone());
+                    schema_keys.insert(normalize_relation_schema_key(relation));
                 }
             }
         }
@@ -358,6 +358,15 @@ fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommi
         version_ids: derived.version_ids.into_iter().collect(),
         ..StateCommitEventFilter::default()
     }
+}
+
+fn normalize_relation_schema_key(relation: &str) -> String {
+    relation
+        .strip_suffix("_by_version")
+        .or_else(|| relation.strip_suffix("_history"))
+        .filter(|base| !base.is_empty())
+        .unwrap_or(relation)
+        .to_string()
 }
 
 fn collect_relation_names_from_query(query: &Query, relation_names: &mut BTreeSet<String>) {
@@ -632,6 +641,18 @@ mod tests {
     fn derive_filter_maps_direct_schema_view_reads() {
         let statements =
             parse_sql_statements("SELECT entity_id FROM lix_key_value LIMIT 1").expect("parse sql");
+
+        let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
+        assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
+    }
+
+    #[test]
+    fn derive_filter_maps_versioned_and_history_entity_views_to_base_schema_key() {
+        let statements = parse_sql_statements(
+            "SELECT entity_id FROM lix_key_value_by_version WHERE key = 'a'; \
+             SELECT entity_id FROM lix_key_value_history WHERE key = 'a'",
+        )
+        .expect("parse sql");
 
         let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
