@@ -91,3 +91,43 @@ test("close is idempotent and blocks further API calls", async () => {
   await expect(lix.createVersion()).rejects.toThrow("lix is closed");
   await expect(lix.switchVersion("v1")).rejects.toThrow("lix is closed");
 });
+
+test("stateCommitEvents emits filtered commit events", async () => {
+  const lix = await openLix();
+  const events = lix.stateCommitEvents({ schemaKeys: ["lix_key_value"] });
+
+  await lix.execute(
+    "INSERT INTO lix_internal_state_vtable (\
+     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+     ) VALUES (\
+     'state-commit-events-js', 'lix_key_value', 'lix', 'global', 'lix',\
+     '{\"key\":\"state-commit-events-js\",\"value\":\"ok\"}', '1'\
+     )",
+    [],
+  );
+
+  const batch = await waitForBatch(events);
+  expect(batch).toBeDefined();
+  expect(batch!.changes.length).toBeGreaterThan(0);
+  expect(
+    batch!.changes.some(
+      (change) =>
+        change.schemaKey === "lix_key_value" &&
+        change.entityId === "state-commit-events-js",
+    ),
+  ).toBe(true);
+
+  events.close();
+  await lix.close();
+});
+
+async function waitForBatch(events: { tryNext(): unknown }): Promise<any | undefined> {
+  const timeoutMs = 1000;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const next = events.tryNext();
+    if (next !== undefined) return next;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return undefined;
+}
