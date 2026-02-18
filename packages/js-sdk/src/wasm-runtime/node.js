@@ -81,6 +81,90 @@ function toPluginEntityChange(change) {
   return normalized;
 }
 
+function toPluginActiveStateRow(row) {
+  const normalized = {
+    entityId: String(row?.entity_id ?? row?.entityId ?? ""),
+  };
+
+  const schemaKey =
+    row?.schema_key !== undefined ? row.schema_key : row?.schemaKey;
+  if (schemaKey !== null && schemaKey !== undefined) {
+    normalized.schemaKey = String(schemaKey);
+  }
+
+  const schemaVersion =
+    row?.schema_version !== undefined ? row.schema_version : row?.schemaVersion;
+  if (schemaVersion !== null && schemaVersion !== undefined) {
+    normalized.schemaVersion = String(schemaVersion);
+  }
+
+  const snapshotContent =
+    row?.snapshot_content !== undefined
+      ? row.snapshot_content
+      : row?.snapshotContent;
+  if (snapshotContent !== null && snapshotContent !== undefined) {
+    normalized.snapshotContent = String(snapshotContent);
+  }
+
+  const fileId = row?.file_id !== undefined ? row.file_id : row?.fileId;
+  if (fileId !== null && fileId !== undefined) {
+    normalized.fileId = String(fileId);
+  }
+
+  const pluginKey =
+    row?.plugin_key !== undefined ? row.plugin_key : row?.pluginKey;
+  if (pluginKey !== null && pluginKey !== undefined) {
+    normalized.pluginKey = String(pluginKey);
+  }
+
+  const versionId =
+    row?.version_id !== undefined ? row.version_id : row?.versionId;
+  if (versionId !== null && versionId !== undefined) {
+    normalized.versionId = String(versionId);
+  }
+
+  const changeId = row?.change_id !== undefined ? row.change_id : row?.changeId;
+  if (changeId !== null && changeId !== undefined) {
+    normalized.changeId = String(changeId);
+  }
+
+  if (row?.metadata !== null && row?.metadata !== undefined) {
+    normalized.metadata = String(row.metadata);
+  }
+
+  const createdAt =
+    row?.created_at !== undefined ? row.created_at : row?.createdAt;
+  if (createdAt !== null && createdAt !== undefined) {
+    normalized.createdAt = String(createdAt);
+  }
+
+  const updatedAt =
+    row?.updated_at !== undefined ? row.updated_at : row?.updatedAt;
+  if (updatedAt !== null && updatedAt !== undefined) {
+    normalized.updatedAt = String(updatedAt);
+  }
+
+  return normalized;
+}
+
+function toPluginDetectStateContext(stateContext) {
+  if (stateContext === null || stateContext === undefined) {
+    return undefined;
+  }
+
+  const normalized = {};
+  const activeState =
+    stateContext?.active_state !== undefined
+      ? stateContext.active_state
+      : stateContext?.activeState;
+
+  if (Array.isArray(activeState)) {
+    normalized.activeState = activeState.map(toPluginActiveStateRow);
+  }
+
+  return normalized;
+}
+
 function hashComponentBytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -169,7 +253,14 @@ function createModuleInstance(componentApi) {
           ? normalizeWireFile(request.before)
           : undefined;
         const after = normalizeWireFile(request.after);
-        const rawChanges = await componentApi.detectChanges(before, after);
+        const stateContext = toPluginDetectStateContext(
+          request.state_context ?? request.stateContext,
+        );
+        const rawChanges = await componentApi.detectChanges(
+          before,
+          after,
+          stateContext,
+        );
         const normalized = Array.isArray(rawChanges)
           ? rawChanges.map(normalizeWireEntityChange)
           : [];
