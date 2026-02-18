@@ -74,7 +74,11 @@ struct DocumentSnapshotOwned {
 }
 
 impl Guest for TextLinesPlugin {
-    fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
+    fn detect_changes(
+        before: Option<File>,
+        after: File,
+        _state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+    ) -> Result<Vec<EntityChange>, PluginError> {
         if let Some(previous) = before.as_ref() {
             if previous.data == after.data {
                 return Ok(Vec::new());
@@ -550,7 +554,15 @@ fn base64_to_bytes(raw: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn detect_changes(before: Option<File>, after: File) -> Result<Vec<EntityChange>, PluginError> {
-    <TextLinesPlugin as Guest>::detect_changes(before, after)
+    <TextLinesPlugin as Guest>::detect_changes(before, after, None)
+}
+
+pub fn detect_changes_with_state_context(
+    before: Option<File>,
+    after: File,
+    state_context: Option<crate::exports::lix::plugin::api::DetectStateContext>,
+) -> Result<Vec<EntityChange>, PluginError> {
+    <TextLinesPlugin as Guest>::detect_changes(before, after, state_context)
 }
 
 pub fn apply_changes(file: File, changes: Vec<EntityChange>) -> Result<Vec<u8>, PluginError> {
