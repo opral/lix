@@ -33,7 +33,7 @@ const CONFIG = {
   syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
   progressEvery: parseEnvInt("BENCH_REPLAY_PROGRESS_EVERY", 25),
   showProgress: parseEnvBool("BENCH_REPLAY_PROGRESS", true),
-  installTextLinesPlugin: parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", true),
+  installTextPlugin: parseTextPluginInstallFlag(true),
   exportSnapshot: parseEnvBool("BENCH_REPLAY_EXPORT_SNAPSHOT", false),
   exportSnapshotPath: process.env.BENCH_REPLAY_SNAPSHOT_PATH ?? "",
   collectStorageCounters: parseEnvBool("BENCH_REPLAY_STORAGE_COUNTERS", true),
@@ -42,8 +42,8 @@ const CONFIG = {
   executeMode: parseExecuteMode(process.env.BENCH_REPLAY_EXECUTE_MODE),
 };
 
-const TEXT_LINES_MANIFEST = {
-  key: "plugin_text_lines",
+const TEXT_PLUGIN_MANIFEST = {
+  key: "text_plugin",
   runtime: "wasm-component-v1",
   api_version: "0.1.0",
   detect_changes_glob: "**/*",
@@ -104,11 +104,11 @@ async function main() {
 
   try {
     let pluginInstallMs = 0;
-    if (CONFIG.installTextLinesPlugin) {
-      const pluginWasmBytes = await loadTextLinesPluginWasmBytes(CONFIG.showProgress);
+    if (CONFIG.installTextPlugin) {
+      const pluginWasmBytes = await loadTextPluginWasmBytes(CONFIG.showProgress);
       const pluginInstallStarted = performance.now();
       await lix.installPlugin({
-        manifestJson: TEXT_LINES_MANIFEST,
+        manifestJson: TEXT_PLUGIN_MANIFEST,
         wasmBytes: pluginWasmBytes,
       });
       pluginInstallMs = performance.now() - pluginInstallStarted;
@@ -525,38 +525,38 @@ async function maybeWriteSnapshotArtifact(lix) {
   };
 }
 
-async function loadTextLinesPluginWasmBytes(showProgress) {
+async function loadTextPluginWasmBytes(showProgress) {
   const packageReleasePath = join(
     REPO_ROOT,
     "packages",
-    "plugin-text-lines",
+    "text-plugin",
     "target",
     "wasm32-wasip2",
     "release",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
   const workspaceReleasePath = join(
     REPO_ROOT,
     "target",
     "wasm32-wasip2",
     "release",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
   const packageDebugPath = join(
     REPO_ROOT,
     "packages",
-    "plugin-text-lines",
+    "text-plugin",
     "target",
     "wasm32-wasip2",
     "debug",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
   const workspaceDebugPath = join(
     REPO_ROOT,
     "target",
     "wasm32-wasip2",
     "debug",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
 
   try {
@@ -571,7 +571,7 @@ async function loadTextLinesPluginWasmBytes(showProgress) {
         try {
           return await readFile(workspaceDebugPath);
         } catch {
-          await ensureTextLinesPluginWasmBuilt(showProgress);
+          await ensureTextPluginWasmBuilt(showProgress);
           try {
             return await readFile(packageReleasePath);
           } catch {
@@ -591,11 +591,11 @@ async function loadTextLinesPluginWasmBytes(showProgress) {
   }
 }
 
-async function ensureTextLinesPluginWasmBuilt(showProgress) {
-  const manifestPath = join(REPO_ROOT, "packages", "plugin-text-lines", "Cargo.toml");
+async function ensureTextPluginWasmBuilt(showProgress) {
+  const manifestPath = join(REPO_ROOT, "packages", "text-plugin", "Cargo.toml");
 
   if (showProgress) {
-    console.log("[progress] building plugin-text-lines wasm (wasm32-wasip2, release)");
+    console.log("[progress] building text-plugin wasm (wasm32-wasip2, release)");
   }
 
   try {
@@ -629,7 +629,7 @@ async function ensureTextLinesPluginWasmBuilt(showProgress) {
   }
 
   if (showProgress) {
-    console.log("[progress] plugin-text-lines wasm build done");
+    console.log("[progress] text-plugin wasm build done");
   }
 }
 
@@ -713,6 +713,13 @@ function parseEnvBool(name, fallback) {
     return false;
   }
   throw new Error(`${name} must be boolean-like (0/1/true/false), got '${raw}'`);
+}
+
+function parseTextPluginInstallFlag(fallback) {
+  if (process.env.BENCH_REPLAY_INSTALL_TEXT_PLUGIN !== undefined) {
+    return parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_PLUGIN", fallback);
+  }
+  return parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", fallback);
 }
 
 function parseExecuteMode(raw) {

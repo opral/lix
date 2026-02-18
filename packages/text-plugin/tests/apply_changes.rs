@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_bytes, parse_document_snapshot};
-use plugin_text_lines::{
+use text_plugin::{
     apply_changes, detect_changes, PluginApiError, PluginEntityChange, DOCUMENT_SCHEMA_KEY,
     LINE_SCHEMA_KEY,
 };

@@ -2,7 +2,7 @@ mod common;
 
 use common::{apply_scenarios, file_from_bytes};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use plugin_text_lines::apply_changes;
+use text_plugin::apply_changes;
 use std::time::Duration;
 
 fn bench_apply_changes(c: &mut Criterion) {

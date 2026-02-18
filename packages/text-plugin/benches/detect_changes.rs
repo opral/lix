@@ -2,7 +2,7 @@ mod common;
 
 use common::{detect_scenarios, file_from_bytes};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use plugin_text_lines::detect_changes;
+use text_plugin::detect_changes;
 use std::time::Duration;
 
 fn bench_detect_changes(c: &mut Criterion) {
