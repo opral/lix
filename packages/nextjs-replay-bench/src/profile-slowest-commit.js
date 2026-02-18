@@ -22,8 +22,8 @@ const RESULTS_DIR = join(__dirname, "..", "results");
 const DEFAULT_REPORT_PATH = join(RESULTS_DIR, "nextjs-replay.bench.json");
 const DEFAULT_OUTPUT_PATH = join(RESULTS_DIR, "nextjs-replay.slowest-commit.explain.txt");
 
-const TEXT_LINES_MANIFEST = {
-  key: "plugin_text_lines",
+const TEXT_PLUGIN_MANIFEST = {
+  key: "text_plugin",
   runtime: "wasm-component-v1",
   api_version: "0.1.0",
   detect_changes_glob: "**/*",
@@ -54,10 +54,7 @@ async function main() {
     ),
     firstParent: parseEnvBool("BENCH_REPLAY_FIRST_PARENT", config.firstParent ?? true),
     syncRemote: parseEnvBool("BENCH_REPLAY_FETCH", false),
-    installTextLinesPlugin: parseEnvBool(
-      "BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN",
-      config.installTextLinesPlugin ?? true,
-    ),
+    installTextPlugin: parseTextPluginInstallFlag(config.installTextPlugin ?? true),
     maxInsertRows: parseEnvInt("BENCH_REPLAY_MAX_INSERT_ROWS", Number(config.maxInsertRows ?? 200)),
     maxInsertSqlChars: parseEnvInt(
       "BENCH_REPLAY_MAX_INSERT_SQL_CHARS",
@@ -104,10 +101,10 @@ async function main() {
   });
 
   try {
-    if (replayConfig.installTextLinesPlugin) {
-      const wasmBytes = await loadTextLinesPluginWasmBytes();
+    if (replayConfig.installTextPlugin) {
+      const wasmBytes = await loadTextPluginWasmBytes();
       await lix.installPlugin({
-        manifestJson: TEXT_LINES_MANIFEST,
+        manifestJson: TEXT_PLUGIN_MANIFEST,
         wasmBytes,
       });
     }
@@ -608,22 +605,22 @@ function scalarToText(value) {
   return JSON.stringify(value);
 }
 
-async function loadTextLinesPluginWasmBytes() {
+async function loadTextPluginWasmBytes() {
   const packageDebugPath = join(
     REPO_ROOT,
     "packages",
-    "plugin-text-lines",
+    "text-plugin",
     "target",
     "wasm32-wasip2",
     "debug",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
   const workspaceDebugPath = join(
     REPO_ROOT,
     "target",
     "wasm32-wasip2",
     "debug",
-    "plugin_text_lines.wasm",
+    "text_plugin.wasm",
   );
 
   try {
@@ -632,7 +629,7 @@ async function loadTextLinesPluginWasmBytes() {
     try {
       return await readFile(workspaceDebugPath);
     } catch {
-      await ensureTextLinesPluginWasmBuilt();
+      await ensureTextPluginWasmBuilt();
       try {
         return await readFile(packageDebugPath);
       } catch {
@@ -642,8 +639,8 @@ async function loadTextLinesPluginWasmBytes() {
   }
 }
 
-async function ensureTextLinesPluginWasmBuilt() {
-  const manifestPath = join(REPO_ROOT, "packages", "plugin-text-lines", "Cargo.toml");
+async function ensureTextPluginWasmBuilt() {
+  const manifestPath = join(REPO_ROOT, "packages", "text-plugin", "Cargo.toml");
   try {
     await runCommand("cargo", [
       "build",
@@ -697,6 +694,13 @@ function parseEnvBool(name, fallback) {
     return false;
   }
   throw new Error(`${name} must be boolean-like (0/1/true/false), got '${raw}'`);
+}
+
+function parseTextPluginInstallFlag(fallback) {
+  if (process.env.BENCH_REPLAY_INSTALL_TEXT_PLUGIN !== undefined) {
+    return parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_PLUGIN", fallback);
+  }
+  return parseEnvBool("BENCH_REPLAY_INSTALL_TEXT_LINES_PLUGIN", fallback);
 }
 
 async function runCommand(command, args) {

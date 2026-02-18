@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "packages/engine",
   "packages/js-sdk",
-  "packages/plugin-text-lines",
+  "packages/text-plugin",
   "packages/rs-sdk",
 ]
 exclude = ["packages/plugin-json-v2"]

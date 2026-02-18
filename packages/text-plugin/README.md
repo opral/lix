@@ -1,9 +1,9 @@
-# plugin-text-lines
+# text-plugin
 
 Rust/WASM component plugin that models files as line entities for the Lix engine.
 
 - Uses `packages/engine/wit/lix-plugin.wit`.
-- Provides `manifest.json` for install metadata (`plugin_text_lines`).
+- Provides `manifest.json` for install metadata (`text_plugin`).
 - Provides Lix schema docs:
   - `schema/text_line.json`
   - `schema/text_document.json`
@@ -20,6 +20,6 @@ snapshot payloads.
 Run plugin micro-benchmarks:
 
 ```bash
-cargo bench -p plugin_text_lines --bench detect_changes
-cargo bench -p plugin_text_lines --bench apply_changes
+cargo bench -p text_plugin --bench detect_changes
+cargo bench -p text_plugin --bench apply_changes
 ```
