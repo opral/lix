@@ -62,16 +62,24 @@ pub enum PostprocessPlan {
 #[derive(Debug, Clone)]
 pub struct RewriteOutput {
     pub statements: Vec<Statement>,
+    pub params: Vec<Value>,
     pub registrations: Vec<SchemaRegistration>,
     pub postprocess: Option<PostprocessPlan>,
     pub mutations: Vec<MutationRow>,
     pub update_validations: Vec<UpdateValidationPlan>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PreprocessOutput {
     pub sql: String,
     pub params: Vec<Value>,
+    pub prepared_statements: Vec<PreparedStatement>,
     pub registrations: Vec<SchemaRegistration>,
     pub postprocess: Option<PostprocessPlan>,
     pub mutations: Vec<MutationRow>,
