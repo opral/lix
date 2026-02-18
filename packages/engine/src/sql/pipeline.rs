@@ -6,7 +6,7 @@ use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::sql::bind_sql;
+use crate::sql::{bind_sql_with_state, PlaceholderState};
 use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::object_name_matches;
@@ -282,9 +282,16 @@ fn render_statements_with_params(
 ) -> Result<(String, Vec<Value>, Vec<PreparedStatement>), LixError> {
     let mut rendered = Vec::with_capacity(statements.len());
     let mut prepared_statements = Vec::with_capacity(statements.len());
+    let mut placeholder_state = PlaceholderState::new();
 
     for (statement, statement_params) in statements {
-        let bound = bind_sql(&statement.to_string(), statement_params, dialect)?;
+        let bound = bind_sql_with_state(
+            &statement.to_string(),
+            statement_params,
+            dialect,
+            placeholder_state,
+        )?;
+        placeholder_state = bound.state;
         rendered.push(bound.sql.clone());
         prepared_statements.push(PreparedStatement {
             sql: bound.sql,
@@ -494,6 +501,7 @@ fn query_is_plain_values(query: &Query) -> bool {
 mod tests {
     use super::{parse_sql_statements, preprocess_sql_rewrite_only, preprocess_statements};
     use crate::backend::SqlDialect;
+    use crate::Value;
 
     #[test]
     fn rewrite_only_path_lowers_lix_json_text_functions() {
@@ -546,5 +554,20 @@ mod tests {
             rewritten.sql.contains("lix_internal_state_vtable"),
             "rewritten query should route through vtable reads"
         );
+    }
+
+    #[test]
+    fn preprocess_multi_statement_sqlite_anonymous_placeholders_keep_ordinal_progression() {
+        let statements = parse_sql_statements("SELECT ?; SELECT ?").expect("parse should succeed");
+        let rewritten = preprocess_statements(
+            statements,
+            &[Value::Integer(1), Value::Integer(2)],
+            SqlDialect::Sqlite,
+        )
+        .expect("rewrite should succeed");
+
+        assert_eq!(rewritten.prepared_statements.len(), 2);
+        assert_eq!(rewritten.prepared_statements[0].params, vec![Value::Integer(1)]);
+        assert_eq!(rewritten.prepared_statements[1].params, vec![Value::Integer(2)]);
     }
 }
