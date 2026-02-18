@@ -7,10 +7,10 @@ mod wasm {
         boot, observe_owned, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError,
         LixTransaction, ObserveEvent as EngineObserveEvent,
         ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, StateCommitEventBatch,
-        StateCommitEventChange, StateCommitEventFilter, StateCommitEventOperation,
-        StateCommitEvents as EngineStateCommitEvents, Value as EngineValue, WasmComponentInstance,
-        WasmLimits, WasmRuntime,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect,
+        StateCommitStream as EngineStateCommitStream, StateCommitStreamBatch,
+        StateCommitStreamChange, StateCommitStreamFilter, StateCommitStreamOperation,
+        Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -83,7 +83,7 @@ export type LixBootKeyValue = {
   lixcol_version_id?: string;
 };
 
-export type StateCommitEventFilter = {
+export type StateCommitStreamFilter = {
   schemaKeys?: string[];
   entityIds?: string[];
   fileIds?: string[];
@@ -93,10 +93,10 @@ export type StateCommitEventFilter = {
   includeUntracked?: boolean;
 };
 
-export type StateCommitEventOperation = "Insert" | "Update" | "Delete";
+export type StateCommitStreamOperation = "Insert" | "Update" | "Delete";
 
-export type StateCommitEventChange = {
-  operation: StateCommitEventOperation;
+export type StateCommitStreamChange = {
+  operation: StateCommitStreamOperation;
   entityId: string;
   schemaKey: string;
   schemaVersion: string;
@@ -108,13 +108,13 @@ export type StateCommitEventChange = {
   writerKey: string | null;
 };
 
-export type StateCommitEventBatch = {
+export type StateCommitStreamBatch = {
   sequence: number;
-  changes: StateCommitEventChange[];
+  changes: StateCommitStreamChange[];
 };
 
-export type LixStateCommitEvents = {
-  tryNext(): StateCommitEventBatch | undefined;
+export type LixStateCommitStream = {
+  tryNext(): StateCommitStreamBatch | undefined;
   close(): void;
 };
 
@@ -148,9 +148,9 @@ export type LixObserveEvents = {
         engine: Arc<lix_engine::Engine>,
     }
 
-    #[wasm_bindgen(js_name = StateCommitEvents)]
-    pub struct JsStateCommitEvents {
-        inner: std::sync::Mutex<Option<EngineStateCommitEvents>>,
+    #[wasm_bindgen(js_name = StateCommitStream)]
+    pub struct JsStateCommitStream {
+        inner: std::sync::Mutex<Option<EngineStateCommitStream>>,
     }
 
     #[wasm_bindgen(js_name = ObserveEvents)]
@@ -201,11 +201,11 @@ export type LixObserveEvents = {
             Ok(Uint8Array::from(writer.bytes.as_slice()))
         }
 
-        #[wasm_bindgen(js_name = stateCommitEvents)]
-        pub fn state_commit_events(&self, filter: JsValue) -> Result<JsStateCommitEvents, JsValue> {
-            let filter = parse_state_commit_event_filter(filter).map_err(js_error)?;
-            let events = self.engine.state_commit_events(filter);
-            Ok(JsStateCommitEvents {
+        #[wasm_bindgen(js_name = stateCommitStream)]
+        pub fn state_commit_stream(&self, filter: JsValue) -> Result<JsStateCommitStream, JsValue> {
+            let filter = parse_state_commit_stream_filter(filter).map_err(js_error)?;
+            let events = self.engine.state_commit_stream(filter);
+            Ok(JsStateCommitStream {
                 inner: std::sync::Mutex::new(Some(events)),
             })
         }
@@ -222,20 +222,20 @@ export type LixObserveEvents = {
         }
     }
 
-    #[wasm_bindgen(js_class = StateCommitEvents)]
-    impl JsStateCommitEvents {
+    #[wasm_bindgen(js_class = StateCommitStream)]
+    impl JsStateCommitStream {
         #[wasm_bindgen(js_name = tryNext)]
         pub fn try_next(&self) -> Result<JsValue, JsValue> {
             let guard = self.inner.lock().map_err(|_| {
                 js_error(LixError {
-                    message: "state commit events lock poisoned".to_string(),
+                    message: "state commit stream lock poisoned".to_string(),
                 })
             })?;
             let Some(events) = guard.as_ref() else {
                 return Ok(JsValue::UNDEFINED);
             };
             match events.try_next() {
-                Some(batch) => Ok(state_commit_event_batch_to_js(batch).into()),
+                Some(batch) => Ok(state_commit_stream_batch_to_js(batch).into()),
                 None => Ok(JsValue::UNDEFINED),
             }
         }
@@ -244,7 +244,7 @@ export type LixObserveEvents = {
         pub fn close(&self) -> Result<(), JsValue> {
             let mut guard = self.inner.lock().map_err(|_| {
                 js_error(LixError {
-                    message: "state commit events lock poisoned".to_string(),
+                    message: "state commit stream lock poisoned".to_string(),
                 })
             })?;
             if let Some(events) = guard.take() {
@@ -299,7 +299,20 @@ export type LixObserveEvents = {
             }
 
             let next = match next {
-                Ok(next) => next.map_err(js_error)?,
+                Ok(Ok(next)) => next,
+                Ok(Err(error)) => {
+                    let mut guard = self.inner.lock().map_err(|_| {
+                        js_error(LixError {
+                            message: "observe events lock poisoned".to_string(),
+                        })
+                    })?;
+                    if self.closed.load(Ordering::SeqCst) {
+                        events.close();
+                        return Ok(JsValue::UNDEFINED);
+                    }
+                    *guard = Some(events);
+                    return Err(js_error(error));
+                }
                 Err(_) => {
                     events.close();
                     return Ok(JsValue::UNDEFINED);
@@ -430,17 +443,19 @@ export type LixObserveEvents = {
         Ok(parsed)
     }
 
-    fn parse_state_commit_event_filter(input: JsValue) -> Result<StateCommitEventFilter, LixError> {
+    fn parse_state_commit_stream_filter(
+        input: JsValue,
+    ) -> Result<StateCommitStreamFilter, LixError> {
         if input.is_null() || input.is_undefined() {
-            return Ok(StateCommitEventFilter::default());
+            return Ok(StateCommitStreamFilter::default());
         }
         if !input.is_object() {
             return Err(LixError {
-                message: "stateCommitEvents filter must be an object".to_string(),
+                message: "stateCommitStream filter must be an object".to_string(),
             });
         }
 
-        Ok(StateCommitEventFilter {
+        Ok(StateCommitStreamFilter {
             schema_keys: read_optional_string_array_property(&input, "schemaKeys")?
                 .unwrap_or_default(),
             entity_ids: read_optional_string_array_property(&input, "entityIds")?
@@ -491,14 +506,14 @@ export type LixObserveEvents = {
         }
         if !Array::is_array(&value) {
             return Err(LixError {
-                message: format!("stateCommitEvents filter '{key}' must be an array of strings"),
+                message: format!("stateCommitStream filter '{key}' must be an array of strings"),
             });
         }
         let values = Array::from(&value);
         let mut out = Vec::with_capacity(values.length() as usize);
         for item in values.iter() {
             let text = item.as_string().ok_or_else(|| LixError {
-                message: format!("stateCommitEvents filter '{key}' must be an array of strings"),
+                message: format!("stateCommitStream filter '{key}' must be an array of strings"),
             })?;
             if !text.trim().is_empty() {
                 out.push(text);
@@ -515,12 +530,12 @@ export type LixObserveEvents = {
         value
             .as_bool()
             .ok_or_else(|| LixError {
-                message: format!("stateCommitEvents filter '{key}' must be a boolean"),
+                message: format!("stateCommitStream filter '{key}' must be a boolean"),
             })
             .map(Some)
     }
 
-    fn state_commit_event_batch_to_js(batch: StateCommitEventBatch) -> Object {
+    fn state_commit_stream_batch_to_js(batch: StateCommitStreamBatch) -> Object {
         let object = Object::new();
         let _ = Reflect::set(
             &object,
@@ -529,21 +544,21 @@ export type LixObserveEvents = {
         );
         let changes = Array::new();
         for change in batch.changes {
-            changes.push(&state_commit_event_change_to_js(change).into());
+            changes.push(&state_commit_stream_change_to_js(change).into());
         }
         let _ = Reflect::set(&object, &JsValue::from_str("changes"), &changes);
         object
     }
 
-    fn state_commit_event_change_to_js(change: StateCommitEventChange) -> Object {
+    fn state_commit_stream_change_to_js(change: StateCommitStreamChange) -> Object {
         let object = Object::new();
         let _ = Reflect::set(
             &object,
             &JsValue::from_str("operation"),
             &JsValue::from_str(match change.operation {
-                StateCommitEventOperation::Insert => "Insert",
-                StateCommitEventOperation::Update => "Update",
-                StateCommitEventOperation::Delete => "Delete",
+                StateCommitStreamOperation::Insert => "Insert",
+                StateCommitStreamOperation::Update => "Update",
+                StateCommitStreamOperation::Delete => "Delete",
             }),
         );
         let _ = Reflect::set(

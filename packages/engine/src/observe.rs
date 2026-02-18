@@ -1,6 +1,6 @@
 use crate::engine::{Engine, ExecuteOptions};
 use crate::sql::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
-use crate::state_commit_events::{StateCommitEventFilter, StateCommitEvents};
+use crate::state_commit_stream::{StateCommitStream, StateCommitStreamFilter};
 use crate::{LixError, QueryResult, SqlDialect, Value};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
@@ -46,7 +46,7 @@ pub struct ObserveEventsOwned {
 
 struct ObserveState {
     query: ObserveQuery,
-    state_commits: StateCommitEvents,
+    state_commits: StateCommitStream,
     last_result: Option<QueryResult>,
     emitted_initial: bool,
     next_sequence: u64,
@@ -184,8 +184,8 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
         });
     }
 
-    let filter = derive_state_commit_event_filter(&statements, &query.params)?;
-    let state_commits = engine.state_commit_events(filter);
+    let filter = derive_state_commit_stream_filter(&statements, &query.params)?;
+    let state_commits = engine.state_commit_stream(filter);
 
     Ok(ObserveState {
         query,
@@ -206,10 +206,10 @@ struct DerivedObserveFilter {
     version_ids: BTreeSet<String>,
 }
 
-fn derive_state_commit_event_filter(
+fn derive_state_commit_stream_filter(
     statements: &[Statement],
     params: &[Value],
-) -> Result<StateCommitEventFilter, LixError> {
+) -> Result<StateCommitStreamFilter, LixError> {
     let mut derived = DerivedObserveFilter::default();
     let mut placeholder_state = PlaceholderState::new();
     // One conjunctive filter cannot represent OR across independent statements.
@@ -251,7 +251,7 @@ fn derive_state_commit_event_filter(
     Ok(state_commit_filter_from_derived(derived))
 }
 
-fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommitEventFilter {
+fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommitStreamFilter {
     let mut schema_keys = BTreeSet::new();
     let mut uses_dynamic_state_relations = false;
 
@@ -308,12 +308,12 @@ fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommi
         schema_keys.extend(derived.schema_keys);
     }
 
-    StateCommitEventFilter {
+    StateCommitStreamFilter {
         schema_keys: schema_keys.into_iter().collect(),
         entity_ids: derived.entity_ids.into_iter().collect(),
         file_ids: derived.file_ids.into_iter().collect(),
         version_ids: derived.version_ids.into_iter().collect(),
-        ..StateCommitEventFilter::default()
+        ..StateCommitStreamFilter::default()
     }
 }
 
@@ -556,7 +556,7 @@ fn add_filter_literal(out: &mut DerivedObserveFilter, column: FilterColumn, valu
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_state_commit_event_filter, parse_sql_statements};
+    use super::{derive_state_commit_stream_filter, parse_sql_statements};
     use crate::Value;
 
     #[test]
@@ -567,7 +567,7 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_event_filter(
+        let filter = derive_state_commit_stream_filter(
             &statements,
             &[
                 Value::Text("lix_key_value".to_string()),
@@ -590,7 +590,7 @@ mod tests {
             parse_sql_statements("SELECT id, path FROM lix_file WHERE path = '/docs/a.md'")
                 .expect("parse sql");
 
-        let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_file_descriptor".to_string()]);
     }
 
@@ -599,7 +599,7 @@ mod tests {
         let statements =
             parse_sql_statements("SELECT entity_id FROM lix_key_value LIMIT 1").expect("parse sql");
 
-        let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
     }
 
@@ -611,7 +611,7 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
     }
 
@@ -623,7 +623,7 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
         assert!(filter.schema_keys.is_empty());
         assert!(filter.entity_ids.is_empty());
         assert!(filter.file_ids.is_empty());
@@ -638,7 +638,7 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_event_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
         assert!(filter.schema_keys.is_empty());
         assert!(filter.entity_ids.is_empty());
         assert!(filter.file_ids.is_empty());

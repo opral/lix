@@ -35,7 +35,7 @@ export type InstallPluginOptions = {
   wasmBytes: Uint8Array | ArrayBuffer;
 };
 
-export type StateCommitEventFilter = {
+export type StateCommitStreamFilter = {
   schemaKeys?: string[];
   entityIds?: string[];
   fileIds?: string[];
@@ -45,10 +45,10 @@ export type StateCommitEventFilter = {
   includeUntracked?: boolean;
 };
 
-export type StateCommitEventOperation = "Insert" | "Update" | "Delete";
+export type StateCommitStreamOperation = "Insert" | "Update" | "Delete";
 
-export type StateCommitEventChange = {
-  operation: StateCommitEventOperation;
+export type StateCommitStreamChange = {
+  operation: StateCommitStreamOperation;
   entityId: string;
   schemaKey: string;
   schemaVersion: string;
@@ -60,13 +60,13 @@ export type StateCommitEventChange = {
   writerKey: string | null;
 };
 
-export type StateCommitEventBatch = {
+export type StateCommitStreamBatch = {
   sequence: number;
-  changes: StateCommitEventChange[];
+  changes: StateCommitStreamChange[];
 };
 
-export type StateCommitEvents = {
-  tryNext(): StateCommitEventBatch | undefined;
+export type StateCommitStream = {
+  tryNext(): StateCommitStreamBatch | undefined;
   close(): void;
 };
 
@@ -96,7 +96,7 @@ export type OpenLixKeyValue = {
 
 export type Lix = {
   execute(sql: string, params?: ReadonlyArray<unknown>): Promise<QueryResult>;
-  stateCommitEvents(filter?: StateCommitEventFilter): StateCommitEvents;
+  stateCommitStream(filter?: StateCommitStreamFilter): StateCommitStream;
   observe(query: ObserveQuery): ObserveEvents;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
   switchVersion(versionId: string): Promise<void>;
@@ -132,7 +132,7 @@ export async function openLix(
     args.keyValues ? [...args.keyValues] : undefined,
   );
   let closed = false;
-  const openStateCommitEventHandles = new Set<{
+  const openStateCommitStreamHandles = new Set<{
     close?: () => void;
   }>();
   const openObserveHandles = new Set<{
@@ -153,31 +153,31 @@ export async function openLix(
     return wasmLix.execute(sql, params.map((param) => Value.from(param)));
   };
 
-  const stateCommitEvents = (
-    filter: StateCommitEventFilter = {},
-  ): StateCommitEvents => {
-    ensureOpen("stateCommitEvents");
-    const rawEvents = (wasmLix as any).stateCommitEvents(filter ?? {});
+  const stateCommitStream = (
+    filter: StateCommitStreamFilter = {},
+  ): StateCommitStream => {
+    ensureOpen("stateCommitStream");
+    const rawEvents = (wasmLix as any).stateCommitStream(filter ?? {});
     if (!rawEvents || typeof rawEvents.tryNext !== "function") {
-      throw new Error("stateCommitEvents is not available in this wasm build");
+      throw new Error("stateCommitStream is not available in this wasm build");
     }
     let localClosed = false;
     const close = () => {
       if (localClosed) return;
       localClosed = true;
-      openStateCommitEventHandles.delete(rawEvents);
+      openStateCommitStreamHandles.delete(rawEvents);
       if (typeof rawEvents.close === "function") {
         rawEvents.close();
       }
     };
-    openStateCommitEventHandles.add(rawEvents);
+    openStateCommitStreamHandles.add(rawEvents);
 
     return {
-      tryNext(): StateCommitEventBatch | undefined {
+      tryNext(): StateCommitStreamBatch | undefined {
         if (localClosed) return undefined;
         const next = rawEvents.tryNext();
         if (next === undefined || next === null) return undefined;
-        return next as StateCommitEventBatch;
+        return next as StateCommitStreamBatch;
       },
       close,
     };
@@ -303,14 +303,14 @@ export async function openLix(
       return;
     }
     closed = true;
-    for (const handle of openStateCommitEventHandles) {
+    for (const handle of openStateCommitStreamHandles) {
       try {
         handle.close?.();
       } catch {
         // ignore close errors from individual event handles
       }
     }
-    openStateCommitEventHandles.clear();
+    openStateCommitStreamHandles.clear();
     for (const handle of openObserveHandles) {
       try {
         handle.close?.();
@@ -348,7 +348,7 @@ export async function openLix(
 
   return {
     execute,
-    stateCommitEvents,
+    stateCommitStream,
     observe,
     createVersion,
     switchVersion,
