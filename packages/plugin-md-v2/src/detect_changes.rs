@@ -7,7 +7,7 @@ use markdown::{to_mdast, Constructs, ParseOptions};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use strsim::normalized_levenshtein;
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 #[derive(Debug, Clone)]
 struct ParsedBlock {
@@ -73,9 +73,8 @@ pub(crate) fn detect_changes(
 
     for (id, after_block) in &after_by_id {
         match before_by_id.get(id) {
-            Some(before_block)
-                if before_block.fingerprint == after_block.fingerprint
-                    && before_block.schema_key == after_block.schema_key => {}
+            Some(before_block) if blocks_equal_for_change_detection(before_block, after_block)? => {
+            }
             _ => changes.push(block_upsert_change(after_block)?),
         }
     }
@@ -148,7 +147,7 @@ fn parse_state_context_projection(
                     "invalid markdown block row in detect state context: {error}"
                 ))
             })?;
-        let fingerprint = stable_json_string(&snapshot.node)?;
+        let fingerprint = normalize_text_for_fingerprint(&snapshot.markdown);
         let block = ParsedBlock {
             id: row.entity_id.clone(),
             schema_key: BLOCK_SCHEMA_KEY.to_string(),
@@ -467,6 +466,27 @@ fn block_upsert_change(block: &ParsedBlock) -> Result<EntityChange, PluginError>
     })
 }
 
+fn blocks_equal_for_change_detection(
+    before: &ParsedBlock,
+    after: &ParsedBlock,
+) -> Result<bool, PluginError> {
+    if before.schema_key != after.schema_key || before.node_type != after.node_type {
+        return Ok(false);
+    }
+    if before.fingerprint == after.fingerprint {
+        return Ok(true);
+    }
+    if !needs_semantic_ast_compare(&before.node_type) {
+        return Ok(false);
+    }
+
+    Ok(stable_json_string(&before.node_json)? == stable_json_string(&after.node_json)?)
+}
+
+fn needs_semantic_ast_compare(node_type: &str) -> bool {
+    matches!(node_type, "paragraph" | "code")
+}
+
 fn to_block_map(blocks: Vec<ParsedBlock>) -> Result<BTreeMap<String, ParsedBlock>, PluginError> {
     let mut map = BTreeMap::new();
     for block in blocks {
@@ -488,8 +508,8 @@ fn parse_top_level_block_candidates(
     for node in root.children {
         let node_type = node_type_name(&node).to_string();
         let node_json = node_json_without_position(&node)?;
-        let fingerprint = stable_json_string(&node_json)?;
         let markdown_fragment = extract_block_markdown(markdown, &node)?;
+        let fingerprint = normalize_text_for_fingerprint(&markdown_fragment);
         blocks.push(ParsedBlockCandidate {
             node_type,
             node_json,
@@ -570,7 +590,18 @@ fn normalize_json_for_fingerprint(value: &mut Value) {
 }
 
 fn normalize_text_for_fingerprint(input: &str) -> String {
+    let has_carriage_return = input.as_bytes().contains(&b'\r');
+    if !has_carriage_return {
+        if input.is_ascii() || is_nfc(input) {
+            return input.to_string();
+        }
+        return input.nfc().collect();
+    }
+
     let normalized_newlines = input.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized_newlines.is_ascii() || is_nfc(&normalized_newlines) {
+        return normalized_newlines;
+    }
     normalized_newlines.nfc().collect()
 }
 
