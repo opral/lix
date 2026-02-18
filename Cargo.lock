@@ -2410,6 +2410,7 @@ dependencies = [
  "markdown",
  "serde",
  "serde_json",
+ "unicode-normalization",
  "wit-bindgen 0.40.0",
 ]
 

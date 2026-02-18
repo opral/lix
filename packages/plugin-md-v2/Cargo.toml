@@ -11,6 +11,7 @@ crate-type = ["rlib"]
 markdown = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+unicode-normalization = "0.1"
 wit-bindgen = "0.40"
 
 [dev-dependencies]

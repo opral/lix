@@ -6,6 +6,7 @@ use markdown::mdast::{Node, Root};
 use markdown::{to_mdast, Constructs, ParseOptions};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone)]
 struct ParsedBlock {
@@ -67,7 +68,6 @@ pub(crate) fn detect_changes(
         match before_by_id.get(id) {
             Some(before_block)
                 if before_block.fingerprint == after_block.fingerprint
-                    && before_block.markdown == after_block.markdown
                     && before_block.schema_key == after_block.schema_key => {}
             _ => changes.push(block_upsert_change(after_block)?),
         }
@@ -201,9 +201,35 @@ fn strip_position_recursively(value: &mut Value) {
 }
 
 fn stable_json_string(value: &Value) -> Result<String, PluginError> {
-    serde_json::to_string(value).map_err(|error| {
+    let mut normalized = value.clone();
+    normalize_json_for_fingerprint(&mut normalized);
+    serde_json::to_string(&normalized).map_err(|error| {
         PluginError::Internal(format!("failed to serialize node fingerprint: {error}"))
     })
+}
+
+fn normalize_json_for_fingerprint(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for child in object.values_mut() {
+                normalize_json_for_fingerprint(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_json_for_fingerprint(item);
+            }
+        }
+        Value::String(text) => {
+            *text = normalize_text_for_fingerprint(text);
+        }
+        _ => {}
+    }
+}
+
+fn normalize_text_for_fingerprint(input: &str) -> String {
+    let normalized_newlines = input.replace("\r\n", "\n").replace('\r', "\n");
+    normalized_newlines.nfc().collect()
 }
 
 fn extract_block_markdown(markdown: &str, node: &Node) -> Result<String, PluginError> {
