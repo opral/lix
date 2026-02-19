@@ -33,6 +33,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
 
     assert_primary_key_pointers(schema)?;
     assert_unique_pointers(schema)?;
+    assert_non_aliased_lix_foreign_key_references(schema)?;
 
     Ok(())
 }
@@ -173,6 +174,50 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
     }
 
     Ok(())
+}
+
+fn assert_non_aliased_lix_foreign_key_references(schema: &JsonValue) -> Result<(), LixError> {
+    let Some(foreign_keys) = schema
+        .get("x-lix-foreign-keys")
+        .and_then(|value| value.as_array())
+    else {
+        return Ok(());
+    };
+
+    for foreign_key in foreign_keys {
+        let Some(schema_key) = foreign_key
+            .get("references")
+            .and_then(|value| value.get("schemaKey"))
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+
+        let Some(replacement) = preferred_lix_schema_key_alias(schema_key) else {
+            continue;
+        };
+
+        return Err(LixError {
+            message: format!(
+                "Invalid Lix schema definition: x-lix-foreign-keys references.schemaKey uses deprecated alias \"{schema_key}\"; use \"{replacement}\"."
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn preferred_lix_schema_key_alias(schema_key: &str) -> Option<&'static str> {
+    match schema_key {
+        "state" => Some("lix_state"),
+        "state_by_version" => Some("lix_state_by_version"),
+        "state_history" => Some("lix_state_history"),
+        "label" => Some("lix_label"),
+        "entity_label" => Some("lix_entity_label"),
+        "conversation" => Some("lix_conversation"),
+        "entity_conversation" => Some("lix_entity_conversation"),
+        _ => None,
+    }
 }
 
 fn schema_has_property(schema: &JsonValue, segments: &[String]) -> bool {

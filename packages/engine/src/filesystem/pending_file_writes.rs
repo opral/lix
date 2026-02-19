@@ -71,6 +71,7 @@ pub(crate) async fn collect_pending_file_writes_from_statements(
 
     for statement in statements {
         let start_len = writes.len();
+        let mut delete_statement_writes: Option<Vec<PendingFileWrite>> = None;
         match &statement {
             Statement::Insert(insert) => {
                 collect_insert_writes(insert, params, &effective_active_version_id, &mut writes)?;
@@ -86,10 +87,28 @@ pub(crate) async fn collect_pending_file_writes_from_statements(
                 )
                 .await?;
             }
+            Statement::Delete(delete) => {
+                let statement_writes = collect_delete_writes(
+                    backend,
+                    delete,
+                    params,
+                    &effective_active_version_id,
+                    &overlay,
+                )
+                .await?;
+                for write in &statement_writes {
+                    overlay.remove(&(write.file_id.clone(), write.version_id.clone()));
+                }
+                delete_statement_writes = Some(statement_writes);
+            }
             _ => {}
         }
-        writes_by_statement.push(writes[start_len..].to_vec());
-        apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
+        if let Some(statement_writes) = delete_statement_writes {
+            writes_by_statement.push(statement_writes);
+        } else {
+            writes_by_statement.push(writes[start_len..].to_vec());
+            apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
+        }
         if let Some(next_active_version_id) = next_active_version_id_from_statement(
             backend,
             &statement,
@@ -250,6 +269,142 @@ fn collect_insert_writes(
     }
 
     Ok(())
+}
+
+async fn collect_delete_writes(
+    backend: &dyn LixBackend,
+    delete: &sqlparser::ast::Delete,
+    params: &[Value],
+    active_version_id: &str,
+    overlay: &BTreeMap<(String, String), OverlayWriteState>,
+) -> Result<Vec<PendingFileWrite>, LixError> {
+    let Some(target) = file_write_target_from_delete(delete) else {
+        return Ok(Vec::new());
+    };
+
+    let mut query_sql = match target {
+        FileWriteTarget::ActiveVersion => format!(
+            "SELECT id, path, data, lixcol_version_id, \
+                    'pending.collect_delete_writes' AS __lix_trace \
+             FROM lix_file_by_version \
+             WHERE lixcol_version_id = '{}'",
+            escape_sql_string(active_version_id)
+        ),
+        FileWriteTarget::ExplicitVersion => "SELECT id, path, data, lixcol_version_id, \
+                    'pending.collect_delete_writes' AS __lix_trace \
+             FROM lix_file_by_version"
+            .to_string(),
+    };
+    if let Some(selection) = delete.selection.as_ref() {
+        query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
+            " AND "
+        } else {
+            " WHERE "
+        });
+        query_sql.push_str(&selection.to_string());
+    }
+
+    let bound = bind_sql_with_state(
+        &query_sql,
+        params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
+    let rows = execute_prefetch_query(
+        backend,
+        "pending.collect_delete_writes",
+        &bound.sql,
+        &bound.params,
+    )
+    .await
+    .map_err(|error| LixError {
+        message: format!(
+            "pending_file_writes delete prefetch failed for '{}': {}",
+            bound.sql, error.message
+        ),
+    })?
+    .rows;
+
+    let mut pending = Vec::with_capacity(rows.len());
+    let mut seen = BTreeSet::<(String, String)>::new();
+    for row in rows {
+        let Some(file_id) = row.first().and_then(value_as_text) else {
+            continue;
+        };
+        let Some(before_path_from_row) = row.get(1).and_then(value_as_text) else {
+            continue;
+        };
+        let version_id = match target {
+            FileWriteTarget::ActiveVersion => row
+                .get(3)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string()),
+            FileWriteTarget::ExplicitVersion => row
+                .get(3)
+                .and_then(value_as_text)
+                .unwrap_or_else(|| active_version_id.to_string()),
+        };
+        let key = (file_id.clone(), version_id.clone());
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let before_data_from_row = row.get(2).and_then(value_as_blob_or_text_bytes);
+        let (before_path, before_data) = if let Some(overlay_state) = overlay.get(&key) {
+            (
+                overlay_state.path.clone(),
+                Some(overlay_state.data.clone()),
+            )
+        } else {
+            (before_path_from_row, before_data_from_row)
+        };
+
+        pending.push(PendingFileWrite {
+            file_id,
+            version_id,
+            before_path: Some(before_path),
+            path: String::new(),
+            data_is_authoritative: true,
+            before_data,
+            after_data: Vec::new(),
+        });
+    }
+
+    let overlay_rows = execute_delete_overlay_prefetch_query(
+        backend,
+        delete,
+        params,
+        active_version_id,
+        target,
+        overlay,
+    )
+    .await?;
+    for row in overlay_rows {
+        let Some(file_id) = row.first().and_then(value_as_text) else {
+            continue;
+        };
+        let version_id = row
+            .get(1)
+            .and_then(value_as_text)
+            .unwrap_or_else(|| active_version_id.to_string());
+        let key = (file_id.clone(), version_id.clone());
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let Some(overlay_state) = overlay.get(&key) else {
+            continue;
+        };
+        pending.push(PendingFileWrite {
+            file_id,
+            version_id,
+            before_path: Some(overlay_state.path.clone()),
+            path: String::new(),
+            data_is_authoritative: true,
+            before_data: Some(overlay_state.data.clone()),
+            after_data: Vec::new(),
+        });
+    }
+
+    Ok(pending)
 }
 
 async fn collect_update_writes(

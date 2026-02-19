@@ -61,7 +61,7 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let error = engine
-            .raw_engine()
+
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
@@ -117,7 +117,6 @@ simulation_test!(
             .unwrap();
 
         engine
-            .raw_engine()
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     let first = tx
@@ -170,7 +169,6 @@ simulation_test!(
             .unwrap();
 
         engine
-            .raw_engine()
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
@@ -239,7 +237,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
 
-        let panic_result = std::panic::AssertUnwindSafe(engine.raw_engine().transaction(
+        let panic_result = std::panic::AssertUnwindSafe(engine.transaction(
             ExecuteOptions::default(),
             |tx| {
                 Box::pin(async move {

@@ -47,6 +47,7 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         wasm_runtime: None,
         key_values,
         active_account: None,
+        access_to_internal: false,
     });
     engine.init().await?;
     Ok(Lix { engine })
