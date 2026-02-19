@@ -1,5 +1,6 @@
 mod account;
 mod backend;
+mod boot;
 mod builtin_schema;
 mod cel;
 mod checkpoint;
