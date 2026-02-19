@@ -19,7 +19,7 @@ pub(crate) struct FileChangeDetectionRequest {
     pub file_id: String,
     pub version_id: String,
     pub before_path: Option<String>,
-    pub path: String,
+    pub after_path: Option<String>,
     pub before_data: Option<Vec<u8>>,
     pub after_data: Vec<u8>,
 }
@@ -146,7 +146,12 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         return Ok(Vec::new());
     }
     if installed_plugins.is_empty() {
-        return Ok(Vec::new());
+        let first = &writes[0];
+        return Err(no_matching_plugin_for_detect_error(
+            first,
+            classify_content_type_from_bytes(&first.after_data),
+            "no plugins are installed",
+        ));
     }
 
     let mut detected = Vec::new();
@@ -154,7 +159,11 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         BTreeMap::new();
     for write in writes {
         let has_before_context = write.before_path.is_some() || write.before_data.is_some();
-        let before_path = write.before_path.as_deref().unwrap_or(write.path.as_str());
+        let before_path = write
+            .before_path
+            .as_deref()
+            .or(write.after_path.as_deref())
+            .unwrap_or("");
         let before_content_type = write
             .before_data
             .as_deref()
@@ -165,8 +174,9 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             None
         };
         let after_content_type = classify_content_type_from_bytes(&write.after_data);
-        let after_plugin =
-            select_plugin_for_path(&write.path, Some(after_content_type), installed_plugins);
+        let after_plugin = write.after_path.as_deref().and_then(|path| {
+            select_plugin_for_path(path, Some(after_content_type), installed_plugins)
+        });
 
         if let Some(previous_plugin) = before_plugin {
             let plugin_changed = after_plugin
@@ -195,8 +205,20 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             }
         }
 
-        let Some(plugin) = after_plugin else {
+        let is_delete_without_after_path =
+            write.after_path.is_none() && write.after_data.is_empty();
+        if after_plugin.is_none() && before_plugin.is_some() && is_delete_without_after_path {
+            // Deletes flow through with no "after" path/data.
+            // In that case, we already emitted tombstones above for the previous plugin.
             continue;
+        }
+
+        let Some(plugin) = after_plugin else {
+            return Err(no_matching_plugin_for_detect_error(
+                write,
+                after_content_type,
+                "install a plugin whose match.path_glob and optional match.content_type cover this file",
+            ));
         };
 
         let plugin_changed = before_plugin
@@ -236,7 +258,10 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         });
         let after = PluginFile {
             id: write.file_id.clone(),
-            path: write.path.clone(),
+            path: write
+                .after_path
+                .clone()
+                .unwrap_or_else(|| before_path.to_string()),
             data: write.after_data.clone(),
         };
 
@@ -369,6 +394,16 @@ pub(crate) async fn materialize_file_data_with_plugins(
 ) -> Result<(), LixError> {
     let installed_plugins = load_installed_plugins(backend).await?;
     if installed_plugins.is_empty() {
+        if plan.writes.iter().any(|write| {
+            write.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                && write.op != MaterializationWriteOp::Tombstone
+                && write.snapshot_content.as_deref().is_some()
+        }) {
+            return Err(LixError {
+                message: "plugin materialization: no plugin matched file type because no plugins are installed"
+                    .to_string(),
+            });
+        }
         return Ok(());
     }
 
@@ -427,7 +462,12 @@ pub(crate) async fn materialize_file_data_with_plugins(
 
     for descriptor in descriptors.values() {
         let Some(plugin) = select_plugin_for_file(descriptor, &installed_plugins) else {
-            continue;
+            return Err(no_matching_plugin_for_materialization_error(
+                &descriptor.file_id,
+                &descriptor.version_id,
+                &descriptor.path,
+                "install a plugin whose match.path_glob and optional match.content_type cover this file",
+            ));
         };
 
         let Some(grouped_writes) = writes_by_target.get(&(
@@ -514,14 +554,23 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
     runtime: &dyn WasmRuntime,
     versions: Option<&BTreeSet<String>>,
 ) -> Result<(), LixError> {
-    let installed_plugins = load_installed_plugins(backend).await?;
-    if installed_plugins.is_empty() {
-        return Ok(());
-    }
-
     let descriptors = load_missing_file_descriptors(backend, versions).await?;
     if descriptors.is_empty() {
         return Ok(());
+    }
+
+    let installed_plugins = load_installed_plugins(backend).await?;
+    if installed_plugins.is_empty() {
+        let first = descriptors
+            .values()
+            .next()
+            .expect("descriptors should be non-empty");
+        return Err(no_matching_plugin_for_materialization_error(
+            &first.file_id,
+            &first.version_id,
+            &first.path,
+            "no plugins are installed",
+        ));
     }
 
     let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
@@ -529,7 +578,12 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
 
     for descriptor in descriptors.values() {
         let Some(plugin) = select_plugin_for_file(descriptor, &installed_plugins) else {
-            continue;
+            return Err(no_matching_plugin_for_materialization_error(
+                &descriptor.file_id,
+                &descriptor.version_id,
+                &descriptor.path,
+                "install a plugin whose match.path_glob and optional match.content_type cover this file",
+            ));
         };
 
         let changes = load_plugin_state_changes_for_file(
@@ -583,14 +637,24 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
     backend: &dyn LixBackend,
     runtime: &dyn WasmRuntime,
 ) -> Result<(), LixError> {
-    let installed_plugins = load_installed_plugins(backend).await?;
-    if installed_plugins.is_empty() {
-        return Ok(());
-    }
-
     let descriptors = load_missing_file_history_descriptors(backend).await?;
     if descriptors.is_empty() {
         return Ok(());
+    }
+
+    let installed_plugins = load_installed_plugins(backend).await?;
+    if installed_plugins.is_empty() {
+        let first = descriptors
+            .values()
+            .next()
+            .expect("descriptors should be non-empty");
+        return Err(no_matching_plugin_for_history_materialization_error(
+            &first.file_id,
+            &first.root_commit_id,
+            first.depth,
+            &first.path,
+            "no plugins are installed",
+        ));
     }
 
     let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
@@ -599,7 +663,13 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
     for descriptor in descriptors.values() {
         let Some(plugin) = select_plugin_for_path(&descriptor.path, None, &installed_plugins)
         else {
-            continue;
+            return Err(no_matching_plugin_for_history_materialization_error(
+                &descriptor.file_id,
+                &descriptor.root_commit_id,
+                descriptor.depth,
+                &descriptor.path,
+                "install a plugin whose match.path_glob and optional match.content_type cover this file",
+            ));
         };
 
         let changes = load_plugin_state_changes_for_file_at_history_slice(
@@ -681,6 +751,60 @@ fn classify_content_type_from_bytes(data: &[u8]) -> PluginContentType {
         PluginContentType::Text
     } else {
         PluginContentType::Binary
+    }
+}
+
+fn plugin_content_type_label(content_type: PluginContentType) -> &'static str {
+    match content_type {
+        PluginContentType::Text => "text",
+        PluginContentType::Binary => "binary",
+    }
+}
+
+fn no_matching_plugin_for_detect_error(
+    write: &FileChangeDetectionRequest,
+    content_type: PluginContentType,
+    reason: &str,
+) -> LixError {
+    let path = write.after_path.as_deref().unwrap_or("<none>");
+    LixError {
+        message: format!(
+            "plugin detect-changes: no plugin matched file type for file_id='{}' version_id='{}' path='{}' content_type='{}': {}",
+            write.file_id,
+            write.version_id,
+            path,
+            plugin_content_type_label(content_type),
+            reason,
+        ),
+    }
+}
+
+fn no_matching_plugin_for_materialization_error(
+    file_id: &str,
+    version_id: &str,
+    path: &str,
+    reason: &str,
+) -> LixError {
+    LixError {
+        message: format!(
+            "plugin materialization: no plugin matched file type for file_id='{}' version_id='{}' path='{}': {}",
+            file_id, version_id, path, reason,
+        ),
+    }
+}
+
+fn no_matching_plugin_for_history_materialization_error(
+    file_id: &str,
+    root_commit_id: &str,
+    depth: i64,
+    path: &str,
+    reason: &str,
+) -> LixError {
+    LixError {
+        message: format!(
+            "plugin materialization: no plugin matched file type for file_id='{}' root_commit_id='{}' depth='{}' path='{}': {}",
+            file_id, root_commit_id, depth, path, reason,
+        ),
     }
 }
 
@@ -1220,7 +1344,7 @@ pub(crate) async fn load_installed_plugins(
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let rows = backend
         .execute(
-            "SELECT key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm \
+            "SELECT key, runtime, api_version, match_path_glob, entry, manifest_json, wasm \
              FROM lix_internal_plugin \
              WHERE runtime = 'wasm-component-v1' \
              ORDER BY key",
@@ -1242,7 +1366,7 @@ fn parse_installed_plugin_row(row: &[Value]) -> Result<InstalledPlugin, LixError
         message: format!("plugin materialization: unsupported runtime '{runtime_raw}'"),
     })?;
     let api_version = text_required(row, 2, "api_version")?;
-    let path_glob = text_required(row, 3, "detect_changes_glob")?;
+    let path_glob = text_required(row, 3, "match_path_glob")?;
     let entry = text_required(row, 4, "entry")?;
     let manifest_json = text_required(row, 5, "manifest_json")?;
     let wasm = blob_required(row, 6, "wasm")?;
@@ -1552,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_changes_glob_matches_paths() {
+    fn match_path_glob_matches_paths() {
         assert!(glob_matches_path("*.{md,mdx}", "/notes.md"));
         assert!(glob_matches_path("*.{md,mdx}", "/notes.MDX"));
         assert!(glob_matches_path("docs/**/*.md", "docs/nested/readme.md"));
@@ -1562,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_changes_glob_invalid_pattern_does_not_match() {
+    fn match_path_glob_invalid_pattern_does_not_match() {
         assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
     }
 

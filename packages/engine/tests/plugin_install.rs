@@ -25,14 +25,14 @@ simulation_test!(
             .expect("install_plugin should succeed");
 
         let result = engine
-        .execute(
-            "SELECT key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm \
+            .execute(
+                "SELECT key, runtime, api_version, match_path_glob, entry, manifest_json, wasm \
              FROM lix_internal_plugin \
              WHERE key = 'plugin_json'",
-            &[],
-        )
-        .await
-        .expect("plugin lookup should succeed");
+                &[],
+            )
+            .await
+            .expect("plugin lookup should succeed");
 
         sim.assert_deterministic(result.rows.clone());
         assert_eq!(result.rows.len(), 1);
@@ -141,7 +141,7 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "SELECT key, api_version, detect_changes_glob, entry, wasm \
+                "SELECT key, api_version, match_path_glob, entry, wasm \
                  FROM lix_internal_plugin \
                  WHERE key = 'plugin_json'",
                 &[],

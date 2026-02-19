@@ -238,9 +238,6 @@ impl Engine {
         let installed_plugins = self
             .load_installed_plugins_with_backend(backend, allow_plugin_cache)
             .await?;
-        if installed_plugins.is_empty() {
-            return Ok(vec![Vec::new(); writes_by_statement.len()]);
-        }
 
         let mut loaded_instances = {
             self.plugin_component_cache
@@ -263,7 +260,7 @@ impl Engine {
                     file_id: write.file_id.clone(),
                     version_id: write.version_id.clone(),
                     before_path: write.before_path.clone(),
-                    path: write.path.clone(),
+                    after_path: write.after_path.clone(),
                     before_data: write.before_data.clone(),
                     after_data: write.after_data.clone(),
                 })
@@ -630,7 +627,10 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
-            let Some((name, extension)) = file_name_and_extension_from_path(&write.path) else {
+            let Some(path) = write.after_path.as_deref() else {
+                continue;
+            };
+            let Some((name, extension)) = file_name_and_extension_from_path(path) else {
                 continue;
             };
             self.backend
@@ -651,7 +651,7 @@ impl Engine {
                             Some(value) => Value::Text(value),
                             None => Value::Null,
                         },
-                        Value::Text(write.path.clone()),
+                        Value::Text(path.to_string()),
                     ],
                 )
                 .await?;
@@ -671,7 +671,10 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
-            let Some((name, extension)) = file_name_and_extension_from_path(&write.path) else {
+            let Some(path) = write.after_path.as_deref() else {
+                continue;
+            };
+            let Some((name, extension)) = file_name_and_extension_from_path(path) else {
                 continue;
             };
             transaction
@@ -692,7 +695,7 @@ impl Engine {
                             Some(value) => Value::Text(value),
                             None => Value::Null,
                         },
-                        Value::Text(write.path.clone()),
+                        Value::Text(path.to_string()),
                     ],
                 )
                 .await?;

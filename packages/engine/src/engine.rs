@@ -336,7 +336,9 @@ fn collapse_pending_file_writes_for_transaction(
         let key = (write.file_id.clone(), write.version_id.clone());
         if let Some(index) = index_by_key.get(&key).copied() {
             let existing = &mut collapsed[index];
-            existing.path = write.path.clone();
+            if write.after_path.is_some() {
+                existing.after_path = write.after_path.clone();
+            }
             existing.after_data = write.after_data.clone();
             existing.data_is_authoritative =
                 existing.data_is_authoritative || write.data_is_authoritative;
@@ -808,10 +810,10 @@ mod tests {
     #[test]
     fn plugin_cache_invalidation_detects_internal_plugin_mutations_only() {
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "INSERT INTO lix_internal_plugin (key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
+            "INSERT INTO lix_internal_plugin (key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'"
+            "UPDATE lix_internal_plugin SET match_path_glob = '*.md' WHERE key = 'k'"
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
             "DELETE FROM lix_internal_plugin WHERE key = 'k'"

@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_changes_glob_matches_paths() {
+    fn match_path_glob_matches_paths() {
         assert!(glob_matches_path("*.{md,mdx}", "/notes.md"));
         assert!(glob_matches_path("*.{md,mdx}", "/notes.MDX"));
         assert!(glob_matches_path("docs/**/*.md", "docs/nested/readme.md"));
@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_changes_glob_invalid_pattern_does_not_match() {
+    fn match_path_glob_invalid_pattern_does_not_match() {
         assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
     }
 
