@@ -96,6 +96,35 @@ async fn active_version_pointer(
 }
 
 simulation_test!(
+    checkpoint_create_succeeds_without_internal_access,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                access_to_internal: false,
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.expect("init should succeed");
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-no-internal', 'v1')",
+                &[],
+            )
+            .await
+            .expect("tracked write should succeed");
+
+        let checkpoint = engine
+            .create_checkpoint()
+            .await
+            .expect("create_checkpoint should succeed without internal table access");
+        assert!(!checkpoint.id.is_empty());
+        assert!(!checkpoint.change_set_id.is_empty());
+    }
+);
+
+simulation_test!(
     checkpoint_noop_returns_tip_and_keeps_version_pointer,
     |sim| async move {
         let engine = sim

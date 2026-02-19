@@ -143,6 +143,14 @@ impl<'a> EngineTransaction<'a> {
         self.execute_with_access(sql, params).await
     }
 
+    pub(crate) async fn execute_internal(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        self.execute_with_access(sql, params).await
+    }
+
     async fn execute_with_access(
         &mut self,
         sql: &str,

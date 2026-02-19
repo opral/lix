@@ -198,7 +198,7 @@ async fn create_checkpoint_in_transaction(
     )
     .await?;
     let checkpoint_commit_exists = tx
-        .execute(
+        .execute_internal(
             "SELECT 1 \
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE entity_id = $1 \
@@ -222,7 +222,7 @@ async fn create_checkpoint_in_transaction(
         )
         .await?;
     }
-    tx.execute(
+    tx.execute_internal(
         "DELETE FROM lix_internal_state_untracked \
          WHERE metadata = $1 \
            AND ( \
@@ -326,7 +326,7 @@ async fn load_commit(
 
 async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
     let result = tx
-        .execute(
+        .execute_internal(
             "SELECT snapshot_content \
              FROM lix_internal_state_vtable \
              WHERE schema_key = 'lix_label' \
@@ -506,7 +506,7 @@ async fn ensure_change_exists_for_checkpoint(
     change_id: &str,
 ) -> Result<(), LixError> {
     let existing = tx
-        .execute(
+        .execute_internal(
             "SELECT 1 \
              FROM lix_internal_state_materialized_v1_lix_change \
              WHERE entity_id = $1 \
