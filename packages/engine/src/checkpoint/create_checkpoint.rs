@@ -1,4 +1,5 @@
 use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
+use crate::working_projection::WORKING_PROJECTION_METADATA;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateCheckpointResult {
@@ -17,8 +18,6 @@ pub async fn create_checkpoint(engine: &Engine) -> Result<CreateCheckpointResult
 async fn create_checkpoint_in_transaction(
     tx: &mut EngineTransaction<'_>,
 ) -> Result<CreateCheckpointResult, LixError> {
-    const WORKING_PROJECTION_METADATA: &str = "{\"lix_internal_working_projection\":true}";
-
     let version_row = tx
         .execute(
             "SELECT av.version_id, v.commit_id, v.working_commit_id \

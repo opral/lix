@@ -3,11 +3,10 @@ use crate::version::{
     version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
     GLOBAL_VERSION_ID,
 };
+use crate::working_projection::WORKING_PROJECTION_METADATA;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-const WORKING_PROJECTION_METADATA: &str = "{\"lix_internal_working_projection\":true}";
 
 pub async fn refresh_working_projection_for_read_query(
     backend: &dyn LixBackend,
