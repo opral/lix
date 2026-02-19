@@ -21,7 +21,7 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
         serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
             message: format!("Plugin manifest does not match expected shape: {error}"),
         })?;
-    validate_detect_changes_glob(&manifest.detect_changes_glob)?;
+    validate_path_glob(&manifest.file_match.path_glob)?;
 
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
         message: format!("Failed to normalize plugin manifest JSON: {error}"),
@@ -33,9 +33,9 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
     })
 }
 
-fn validate_detect_changes_glob(glob: &str) -> Result<(), LixError> {
+fn validate_path_glob(glob: &str) -> Result<(), LixError> {
     Glob::new(glob).map_err(|error| LixError {
-        message: format!("Invalid plugin manifest: detect_changes_glob is invalid: {error}"),
+        message: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
     })?;
     Ok(())
 }
@@ -99,7 +99,7 @@ fn format_validation_errors<'a>(
 #[cfg(test)]
 mod tests {
     use super::parse_plugin_manifest_json;
-    use crate::plugin::types::StateContextColumn;
+    use crate::plugin::types::{PluginContentType, StateContextColumn};
 
     #[test]
     fn parses_valid_manifest() {
@@ -108,7 +108,7 @@ mod tests {
                 "key":"plugin_json",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.json"
+                "match":{"path_glob":"*.json"}
             }"#,
         )
         .expect("manifest should parse");
@@ -124,7 +124,7 @@ mod tests {
             r#"{
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.json"
+                "match":{"path_glob":"*.json"}
             }"#,
         )
         .expect_err("manifest should be invalid");
@@ -134,18 +134,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_detect_changes_glob() {
+    fn rejects_invalid_path_glob() {
         let err = parse_plugin_manifest_json(
             r#"{
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.{md,mdx"
+                "match":{"path_glob":"*.{md,mdx"}
             }"#,
         )
         .expect_err("invalid glob should fail");
 
-        assert!(err.message.contains("detect_changes_glob"));
+        assert!(err.message.contains("match.path_glob"));
+    }
+
+    #[test]
+    fn parses_manifest_with_content_type_match_filter() {
+        let validated = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_text",
+                "runtime":"wasm-component-v1",
+                "api_version":"0.1.0",
+                "match":{"path_glob":"**/*", "content_type":"text"}
+            }"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            validated.manifest.file_match.content_type,
+            Some(PluginContentType::Text)
+        );
     }
 
     #[test]
@@ -155,7 +173,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.{md,mdx}",
+                "match":{"path_glob":"*.{md,mdx}"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
@@ -191,7 +209,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true
@@ -219,7 +237,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "columns": ["entity_id", "schema_key"]
@@ -240,7 +258,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": false,
@@ -262,7 +280,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
@@ -284,7 +302,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
