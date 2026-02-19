@@ -6,5 +6,6 @@ members = [
   "packages/text-plugin",
   "packages/rs-sdk",
   "packages/plugin-md-v2",
+  "packages/plugin-binary",
 ]
 exclude = ["packages/plugin-json-v2"]
