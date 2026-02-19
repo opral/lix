@@ -124,7 +124,8 @@ async fn create_checkpoint_in_transaction(
     }
     let label_change_id = generate_uuid(tx).await?;
     let label_change_created_at = generate_timestamp(tx).await?;
-    let label_change_entity_id = format!("{working_commit_id}~{checkpoint_label_id}");
+    let label_change_entity_id =
+        format!("{working_commit_id}~lix_commit~lix~{checkpoint_label_id}");
     let label_state_snapshot = serde_json::json!({
         "entity_id": working_commit_id.clone(),
         "schema_key": "lix_commit",
