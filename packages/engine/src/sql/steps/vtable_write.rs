@@ -1128,33 +1128,6 @@ fn ensure_registration(registrations: &mut Vec<SchemaRegistration>, schema_key: 
     });
 }
 
-fn materialized_row_values(row: &MaterializedStateRow) -> Vec<Expr> {
-    vec![
-        string_expr(&row.entity_id),
-        string_expr(&row.schema_key),
-        string_expr(&row.schema_version),
-        string_expr(&row.file_id),
-        string_expr(&row.lixcol_version_id),
-        string_expr(&row.plugin_key),
-        row.snapshot_content
-            .as_ref()
-            .map(|value| string_expr(value))
-            .unwrap_or_else(null_expr),
-        string_expr(&row.id),
-        row.metadata
-            .as_ref()
-            .map(|value| string_expr(value))
-            .unwrap_or_else(null_expr),
-        row.writer_key
-            .as_ref()
-            .map(|value| string_expr(value))
-            .unwrap_or_else(null_expr),
-        number_expr("0"),
-        string_expr(&row.created_at),
-        string_expr(&row.created_at),
-    ]
-}
-
 async fn load_commit_active_accounts(
     executor: &mut dyn SqlExecutor,
     domain_changes: &[DomainChangeInput],
@@ -2012,7 +1985,7 @@ fn build_statements_from_generate_commit_result(
 ) -> Result<StatementBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
-    let mut snapshot_params = Vec::new();
+    let mut statement_params = Vec::new();
     let mut next_placeholder = placeholder_offset + 1;
     let mut change_rows = Vec::new();
     let mut materialized_by_schema: BTreeMap<String, Vec<Vec<Expr>>> = BTreeMap::new();
@@ -2023,10 +1996,10 @@ fn build_statements_from_generate_commit_result(
                 let id = functions.uuid_v7();
                 let id_placeholder = next_placeholder;
                 next_placeholder += 1;
-                snapshot_params.push(EngineValue::Text(id.clone()));
+                statement_params.push(EngineValue::Text(id.clone()));
                 let content_placeholder = next_placeholder;
                 next_placeholder += 1;
-                snapshot_params.push(EngineValue::Text(content.clone()));
+                statement_params.push(EngineValue::Text(content.clone()));
                 snapshot_rows.push(vec![
                     placeholder_expr(id_placeholder),
                     placeholder_expr(content_placeholder),
@@ -2039,22 +2012,24 @@ fn build_statements_from_generate_commit_result(
             }
         };
 
-        let metadata_expr = change
-            .metadata
-            .as_ref()
-            .map(|value| string_expr(value))
-            .unwrap_or_else(null_expr);
-
         change_rows.push(vec![
-            string_expr(&change.id),
-            string_expr(&change.entity_id),
-            string_expr(&change.schema_key),
-            string_expr(&change.schema_version),
-            string_expr(&change.file_id),
-            string_expr(&change.plugin_key),
-            string_expr(&snapshot_id),
-            metadata_expr,
-            string_expr(&change.created_at),
+            text_param_expr(&change.id, &mut next_placeholder, &mut statement_params),
+            text_param_expr(&change.entity_id, &mut next_placeholder, &mut statement_params),
+            text_param_expr(&change.schema_key, &mut next_placeholder, &mut statement_params),
+            text_param_expr(
+                &change.schema_version,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
+            text_param_expr(&change.file_id, &mut next_placeholder, &mut statement_params),
+            text_param_expr(&change.plugin_key, &mut next_placeholder, &mut statement_params),
+            text_param_expr(&snapshot_id, &mut next_placeholder, &mut statement_params),
+            optional_text_param_expr(
+                change.metadata.as_deref(),
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
+            text_param_expr(&change.created_at, &mut next_placeholder, &mut statement_params),
         ]);
     }
 
@@ -2062,7 +2037,11 @@ fn build_statements_from_generate_commit_result(
         materialized_by_schema
             .entry(row.schema_key.clone())
             .or_default()
-            .push(materialized_row_values(row));
+            .push(materialized_row_values_parameterized(
+                row,
+                &mut next_placeholder,
+                &mut statement_params,
+            ));
     }
 
     let mut statements = Vec::new();
@@ -2129,8 +2108,56 @@ fn build_statements_from_generate_commit_result(
 
     Ok(StatementBatch {
         statements,
-        params: snapshot_params,
+        params: statement_params,
     })
+}
+
+fn text_param_expr(
+    value: &str,
+    next_placeholder: &mut usize,
+    params: &mut Vec<EngineValue>,
+) -> Expr {
+    let index = *next_placeholder;
+    *next_placeholder += 1;
+    params.push(EngineValue::Text(value.to_string()));
+    placeholder_expr(index)
+}
+
+fn optional_text_param_expr(
+    value: Option<&str>,
+    next_placeholder: &mut usize,
+    params: &mut Vec<EngineValue>,
+) -> Expr {
+    match value {
+        Some(value) => text_param_expr(value, next_placeholder, params),
+        None => null_expr(),
+    }
+}
+
+fn materialized_row_values_parameterized(
+    row: &MaterializedStateRow,
+    next_placeholder: &mut usize,
+    params: &mut Vec<EngineValue>,
+) -> Vec<Expr> {
+    vec![
+        text_param_expr(&row.entity_id, next_placeholder, params),
+        text_param_expr(&row.schema_key, next_placeholder, params),
+        text_param_expr(&row.schema_version, next_placeholder, params),
+        text_param_expr(&row.file_id, next_placeholder, params),
+        text_param_expr(&row.lixcol_version_id, next_placeholder, params),
+        text_param_expr(&row.plugin_key, next_placeholder, params),
+        optional_text_param_expr(
+            row.snapshot_content.as_deref(),
+            next_placeholder,
+            params,
+        ),
+        text_param_expr(&row.id, next_placeholder, params),
+        optional_text_param_expr(row.metadata.as_deref(), next_placeholder, params),
+        optional_text_param_expr(row.writer_key.as_deref(), next_placeholder, params),
+        number_expr("0"),
+        text_param_expr(&row.created_at, next_placeholder, params),
+        text_param_expr(&row.created_at, next_placeholder, params),
+    ]
 }
 
 fn table_with_joins_for(table: &str) -> TableWithJoins {
@@ -3254,7 +3281,11 @@ mod tests {
         )
         .expect("build statements");
 
-        assert_eq!(batch.params.len(), 2);
+        assert_eq!(
+            batch.params.len(),
+            10,
+            "expected exact params: 2 snapshot params + 8 change-row params"
+        );
         assert!(matches!(batch.params[1], EngineValue::Text(ref value) if value == &snapshot_content));
 
         let snapshot_stmt = find_insert(&batch.statements, "lix_internal_snapshot");

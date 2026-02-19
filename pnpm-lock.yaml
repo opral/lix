@@ -504,6 +504,15 @@ importers:
         specifier: ^5.7.2
         version: 5.8.3
 
+  packages/vscode-docs-replay:
+    dependencies:
+      '@lix-js/better-sqlite3-backend':
+        specifier: workspace:*
+        version: link:../js-better-sqlite3-backend
+      js-sdk:
+        specifier: workspace:*
+        version: link:../js-sdk
+
   packages/website:
     dependencies:
       '@cloudflare/vite-plugin':
