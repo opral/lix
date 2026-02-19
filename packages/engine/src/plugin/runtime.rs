@@ -1,9 +1,9 @@
 use crate::cel::CelEvaluator;
 use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
+use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::types::{InstalledPlugin, PluginManifest, PluginRuntime, StateContextColumn};
 use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
-use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -647,36 +647,14 @@ fn select_plugin_for_file<'a>(
     descriptor: &FileDescriptorRow,
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
-    plugins
-        .iter()
-        .find(|plugin| glob_matches_path(&plugin.detect_changes_glob, &descriptor.path))
+    select_plugin_for_path(&descriptor.path, plugins)
 }
 
 fn select_plugin_for_path<'a>(
     path: &str,
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
-    plugins
-        .iter()
-        .find(|plugin| glob_matches_path(&plugin.detect_changes_glob, path))
-}
-
-fn glob_matches_path(glob: &str, path: &str) -> bool {
-    let normalized_glob = glob.trim();
-    let normalized_path = path.trim();
-    if normalized_glob.is_empty() || normalized_path.is_empty() {
-        return false;
-    }
-    if normalized_glob == "*" || normalized_glob == "**/*" {
-        return true;
-    }
-
-    GlobBuilder::new(normalized_glob)
-        .literal_separator(false)
-        .case_insensitive(true)
-        .build()
-        .map(|compiled| compiled.compile_matcher().is_match(normalized_path))
-        .unwrap_or(false)
+    select_best_glob_match(path, plugins, |plugin| plugin.detect_changes_glob.as_str())
 }
 
 fn plugin_detect_emits_complete_diff(plugin: &InstalledPlugin) -> bool {
@@ -1418,10 +1396,11 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 #[cfg(test)]
 mod tests {
     use super::{
-        append_implicit_tombstones_for_projection, glob_matches_path,
-        load_or_init_plugin_component, resolve_state_context_columns, CachedPluginComponent,
+        append_implicit_tombstones_for_projection, load_or_init_plugin_component,
+        resolve_state_context_columns, select_plugin_for_path, CachedPluginComponent,
         PluginEntityChange, PluginEntityKey,
     };
+    use crate::plugin::matching::glob_matches_path;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime, StateContextColumn};
     use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
     use async_trait::async_trait;
@@ -1435,6 +1414,18 @@ mod tests {
     }
 
     struct NoopComponent;
+
+    fn test_plugin(key: &str, detect_changes_glob: &str) -> InstalledPlugin {
+        InstalledPlugin {
+            key: key.to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            detect_changes_glob: detect_changes_glob.to_string(),
+            entry: "plugin.wasm".to_string(),
+            manifest_json: "{}".to_string(),
+            wasm: vec![1],
+        }
+    }
 
     #[async_trait(?Send)]
     impl WasmRuntime for CountingRuntime {
@@ -1535,6 +1526,22 @@ mod tests {
     #[test]
     fn detect_changes_glob_invalid_pattern_does_not_match() {
         assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
+    }
+
+    #[test]
+    fn select_plugin_prefers_specific_glob_over_catch_all() {
+        let plugins = vec![
+            test_plugin("text_plugin", "*"),
+            test_plugin("plugin_md_v2", "*.{md,mdx}"),
+        ];
+
+        let markdown_plugin =
+            select_plugin_for_path("/docs/readme.md", &plugins).expect("markdown should match");
+        assert_eq!(markdown_plugin.key, "plugin_md_v2");
+
+        let fallback_plugin = select_plugin_for_path("/docs/data.json", &plugins)
+            .expect("catch-all should match non-markdown");
+        assert_eq!(fallback_plugin.key, "text_plugin");
     }
 
     #[test]
