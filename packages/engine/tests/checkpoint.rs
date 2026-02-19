@@ -346,43 +346,32 @@ simulation_test!(
             .await
             .expect("baseline checkpoint should succeed");
 
-        let (_version_id, _tip_before_override, working_commit_id) =
+        let (_version_id, _tip_before_second_write, working_commit_id) =
             active_version_pointer(&engine).await;
 
-        let extra_parent_id = "checkpoint-parent-merge-parent";
-        let working_change_set_row = engine
+        let working_parent_row = engine
             .execute(
-                "SELECT change_set_id FROM lix_commit WHERE id = $1 LIMIT 1",
+                "SELECT parent_commit_ids FROM lix_commit WHERE id = $1 LIMIT 1",
                 &[Value::Text(working_commit_id.clone())],
             )
             .await
-            .expect("working commit lookup should succeed");
-        assert_eq!(working_change_set_row.rows.len(), 1);
-        let working_change_set_id = as_text(&working_change_set_row.rows[0][0]);
-
-        engine
-            .execute(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = $1 \
-                 WHERE entity_id = $2 \
-                   AND schema_key = 'lix_commit' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global'",
-                &[
-                    Value::Text(
-                        serde_json::json!({
-                            "id": working_commit_id.clone(),
-                            "change_set_id": working_change_set_id,
-                            "parent_commit_ids": [extra_parent_id],
-                            "change_ids": [],
-                        })
-                        .to_string(),
-                    ),
-                    Value::Text(working_commit_id.clone()),
-                ],
-            )
-            .await
-            .expect("working commit parent override should succeed");
+            .expect("working parent lookup should succeed");
+        assert_eq!(working_parent_row.rows.len(), 1);
+        let old_working_parents = parse_parent_commit_ids(&working_parent_row.rows[0][0]);
+        assert!(
+            !old_working_parents.is_empty(),
+            "working commit should already have at least one parent"
+        );
+        for parent_id in &old_working_parents {
+            let parent_exists = engine
+                .execute(
+                    "SELECT COUNT(*) FROM lix_commit WHERE id = $1",
+                    &[Value::Text(parent_id.clone())],
+                )
+                .await
+                .expect("parent commit existence query should succeed");
+            assert_eq!(as_i64(&parent_exists.rows[0][0]), 1);
+        }
 
         engine
             .execute(
@@ -414,9 +403,30 @@ simulation_test!(
         assert_eq!(parent_row.rows.len(), 1);
 
         let actual_parents = parse_parent_commit_ids(&parent_row.rows[0][0]);
-        let mut expected_parents = vec![extra_parent_id.to_string(), previous_tip_id];
+        let mut expected_parents = old_working_parents;
+        if !expected_parents.iter().any(|id| id == &previous_tip_id) {
+            expected_parents.push(previous_tip_id);
+        }
         expected_parents.sort();
+        expected_parents.dedup();
         assert_eq!(actual_parents, expected_parents);
+
+        for parent_id in &expected_parents {
+            let edge_count = engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_commit_edge \
+                     WHERE parent_id = $1 \
+                       AND child_id = $2",
+                    &[
+                        Value::Text(parent_id.clone()),
+                        Value::Text(checkpoint.id.clone()),
+                    ],
+                )
+                .await
+                .expect("checkpoint parent edge query should succeed");
+            assert_eq!(as_i64(&edge_count.rows[0][0]), 1);
+        }
     }
 );
 
