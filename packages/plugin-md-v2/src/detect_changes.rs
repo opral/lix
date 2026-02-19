@@ -42,16 +42,8 @@ pub(crate) fn detect_changes(
         return Ok(Vec::new());
     }
 
-    let after_markdown = match decode_markdown_bytes(&after.data) {
-        Ok(markdown) => markdown,
-        Err(PluginError::InvalidInput(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let after_candidates = match parse_top_level_block_candidates(&after_markdown) {
-        Ok(candidates) => candidates,
-        Err(PluginError::InvalidInput(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
+    let after_markdown = decode_markdown_bytes(&after.data)?;
+    let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
 
     let before_projection = parse_state_context_projection(state_context.as_ref())?;
 
