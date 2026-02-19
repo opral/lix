@@ -3,7 +3,7 @@ use crate::exports::lix::plugin::api::{DetectStateContext, EntityChange, File, P
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, ENTITY_SCHEMA_VERSION};
 use crate::ROOT_ENTITY_ID;
 use markdown::mdast::{Node, Root};
-use markdown::{to_mdast, Constructs, ParseOptions};
+use markdown::{to_mdast, ParseOptions};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use strsim::normalized_levenshtein;
@@ -678,7 +678,7 @@ fn is_markdown_path(path: &str) -> bool {
 }
 
 fn parse_options_all_extensions() -> ParseOptions {
-    let mut options = ParseOptions::mdx();
+    let mut options = ParseOptions::gfm();
     let constructs = &mut options.constructs;
 
     constructs.frontmatter = true;
@@ -690,17 +690,7 @@ fn parse_options_all_extensions() -> ParseOptions {
     constructs.gfm_task_list_item = true;
     constructs.math_flow = true;
     constructs.math_text = true;
-
-    ensure_mdx_constructs(constructs);
     options
-}
-
-fn ensure_mdx_constructs(constructs: &mut Constructs) {
-    constructs.mdx_esm = true;
-    constructs.mdx_expression_flow = true;
-    constructs.mdx_expression_text = true;
-    constructs.mdx_jsx_flow = true;
-    constructs.mdx_jsx_text = true;
 }
 
 fn node_type_name(node: &Node) -> &'static str {
