@@ -217,3 +217,96 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         ])
     );
 });
+
+simulation_test!(init_seeds_bootstrap_change_set_for_bootstrap_commit, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.init().await.unwrap();
+
+    let commit_result = engine
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_vtable \
+             WHERE entity_id = 'global' \
+               AND schema_key = 'lix_commit' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    sim.assert_deterministic(commit_result.rows.clone());
+    assert_eq!(commit_result.rows.len(), 1);
+
+    let commit_snapshot_content = match &commit_result.rows[0][0] {
+        lix_engine::Value::Text(value) => value,
+        other => panic!("expected text snapshot_content for bootstrap commit, got {other:?}"),
+    };
+    let commit_snapshot: serde_json::Value =
+        serde_json::from_str(commit_snapshot_content).expect("bootstrap commit snapshot must be JSON");
+    let change_set_id = commit_snapshot
+        .get("change_set_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("bootstrap commit must include change_set_id");
+    assert_eq!(change_set_id, "global");
+
+    let change_set_result = engine
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_vtable \
+             WHERE entity_id = $1 \
+               AND schema_key = 'lix_change_set' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            &[lix_engine::Value::Text(change_set_id.to_string())],
+        )
+        .await
+        .unwrap();
+    sim.assert_deterministic(change_set_result.rows.clone());
+    assert_eq!(change_set_result.rows.len(), 1);
+});
+
+simulation_test!(init_seeds_checkpoint_label_in_global_version, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.init().await.unwrap();
+
+    let result = engine
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_label' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let mut has_checkpoint = false;
+    for row in result.rows {
+        let snapshot_content = match &row[0] {
+            lix_engine::Value::Text(value) => value,
+            other => panic!("expected text snapshot_content for lix_label, got {other:?}"),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(snapshot_content).expect("lix_label snapshot must be JSON");
+        if parsed.get("name").and_then(serde_json::Value::as_str) == Some("checkpoint") {
+            has_checkpoint = true;
+            break;
+        }
+    }
+
+    assert!(has_checkpoint, "expected checkpoint label in global version");
+});
