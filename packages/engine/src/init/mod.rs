@@ -112,7 +112,7 @@ const INIT_STATEMENTS: &[&str] = &[
      key TEXT PRIMARY KEY,\
      runtime TEXT NOT NULL,\
      api_version TEXT NOT NULL,\
-     detect_changes_glob TEXT NOT NULL,\
+     match_path_glob TEXT NOT NULL,\
      entry TEXT NOT NULL,\
      manifest_json TEXT NOT NULL,\
      wasm BYTEA NOT NULL,\

@@ -21,6 +21,16 @@ const TEST_PLUGIN_MANIFEST: &str = r#"{
   "entry": "plugin.wasm"
 }"#;
 
+const TEST_TXT_PLUGIN_MANIFEST: &str = r#"{
+  "key": "txt_noop",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {"path_glob": "*.txt"},
+  "entry": "plugin.wasm"
+}"#;
+
+const TEST_TXT_NOOP_PLUGIN_WASM_BYTES: &[u8] = b"\0asm\x01\0\0\0lix-test-txt-noop-plugin-v1";
+
 #[derive(Debug, Deserialize)]
 struct WirePluginFile {
     id: String,
@@ -67,6 +77,22 @@ struct BeforeAwareRuntime;
 
 #[derive(Debug, Default)]
 struct BeforeAwareInstance;
+
+struct JsonWithTxtNoopRuntime {
+    inner: support::wasmtime_runtime::TestWasmtimeRuntime,
+}
+
+#[derive(Debug, Default)]
+struct TxtNoopInstance;
+
+impl JsonWithTxtNoopRuntime {
+    fn new() -> Self {
+        Self {
+            inner: support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                .expect("test wasmtime runtime should initialize"),
+        }
+    }
+}
 
 #[async_trait(?Send)]
 impl WasmRuntime for PathEchoRuntime {
@@ -177,6 +203,39 @@ impl WasmComponentInstance for BeforeAwareInstance {
     }
 }
 
+#[async_trait(?Send)]
+impl WasmRuntime for JsonWithTxtNoopRuntime {
+    async fn init_component(
+        &self,
+        bytes: Vec<u8>,
+        limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+        if bytes.as_slice() == TEST_TXT_NOOP_PLUGIN_WASM_BYTES {
+            return Ok(Arc::new(TxtNoopInstance));
+        }
+        self.inner.init_component(bytes, limits).await
+    }
+}
+
+#[async_trait(?Send)]
+impl WasmComponentInstance for TxtNoopInstance {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => Ok(b"[]".to_vec()),
+            "apply-changes" | "api#apply-changes" => {
+                let request: WireApplyChangesRequest =
+                    serde_json::from_slice(input).map_err(|error| LixError {
+                        message: format!("failed to decode apply-changes payload: {error}"),
+                    })?;
+                Ok(request.file.data)
+            }
+            other => Err(LixError {
+                message: format!("unsupported test export: {other}"),
+            }),
+        }
+    }
+}
+
 fn plugin_json_v2_manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../plugin-json-v2")
@@ -267,6 +326,10 @@ fn plugin_json_v2_wasm_bytes() -> Vec<u8> {
             })
         })
         .clone()
+}
+
+fn plugin_txt_noop_wasm_bytes() -> Vec<u8> {
+    TEST_TXT_NOOP_PLUGIN_WASM_BYTES.to_vec()
 }
 
 async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
@@ -554,6 +617,69 @@ async fn orphan_file_cache_row_count(engine: &support::simulation_test::Simulati
     assert_eq!(rows.rows.len(), 1);
     value_as_i64(&rows.rows[0][0])
 }
+
+async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
+    sim: &support::simulation_test::SimulationArgs,
+) -> (support::simulation_test::SimulationEngine, String) {
+    let runtime = Arc::new(JsonWithTxtNoopRuntime::new()) as Arc<dyn WasmRuntime>;
+
+    let engine = sim
+        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            key_values: Vec::new(),
+            active_account: None,
+            wasm_runtime: Some(runtime),
+            access_to_internal: true,
+        }))
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.expect("engine init should succeed");
+    register_plugin_schema(&engine).await;
+    let main_version_id = main_version_id(&engine).await;
+    let plugin_wasm = plugin_json_v2_wasm_bytes();
+    engine
+        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .await
+        .expect("install_plugin should succeed");
+    (engine, main_version_id)
+}
+
+simulation_test!(
+    file_write_fails_when_no_plugin_matches_file_type,
+    simulations = [sqlite],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: Some(runtime),
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+
+        let error = engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-no-plugin', '/assets/video.mp4', 'ignored')",
+                &[],
+            )
+            .await
+            .expect_err("write should fail when no plugin matches");
+
+        assert!(
+            error.message.contains("no plugin matched file type"),
+            "unexpected error: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("/assets/video.mp4"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+);
 
 simulation_test!(
     materialize_applies_real_json_plugin_and_persists_file_data_cache,
@@ -1376,7 +1502,13 @@ simulation_test!(
     file_update_path_only_plugin_switch_tombstones_previous_plugin_entities,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) =
+            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        engine
+            .install_plugin(TEST_TXT_PLUGIN_MANIFEST, &plugin_wasm)
+            .await
+            .expect("install txt plugin should succeed");
 
         engine
             .execute(
@@ -1402,10 +1534,27 @@ simulation_test!(
             .await
             .expect("path-only file update should succeed");
 
-        let after_entities =
-            detected_json_pointer_entities(&engine, "file-json-path-only-switch", &main_version_id)
-                .await;
-        assert!(after_entities.is_empty());
+        let after_json_entities = engine
+            .execute(
+                &format!(
+                    "SELECT entity_id \
+                     FROM lix_state_by_version \
+                     WHERE file_id = 'file-json-path-only-switch' \
+                       AND version_id = '{}' \
+                       AND schema_key = 'json_pointer' \
+                       AND plugin_key = 'json' \
+                       AND snapshot_content IS NOT NULL \
+                     ORDER BY entity_id",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("post-switch json plugin entities query should succeed");
+        assert!(
+            after_json_entities.rows.is_empty(),
+            "json plugin should have no live entities after switch"
+        );
 
         let tombstone_rows = engine
             .execute(
@@ -1415,6 +1564,7 @@ simulation_test!(
                      WHERE file_id = 'file-json-path-only-switch' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
+                       AND plugin_key = 'json' \
                        AND snapshot_content IS NULL",
                     main_version_id
                 ),
@@ -1444,7 +1594,13 @@ simulation_test!(
     file_update_path_only_plugin_switch_does_not_write_non_authoritative_cache_data,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) =
+            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        engine
+            .install_plugin(TEST_TXT_PLUGIN_MANIFEST, &plugin_wasm)
+            .await
+            .expect("install txt plugin should succeed");
 
         engine
             .execute(
