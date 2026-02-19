@@ -42,14 +42,6 @@ const CONFIG = {
   outputPath: process.env.BENCH_PARITY_REPORT_PATH ?? DEFAULT_OUTPUT_PATH,
 };
 
-const TEXT_PLUGIN_MANIFEST = {
-  key: "text_plugin",
-  runtime: "wasm-component-v1",
-  api_version: "0.1.0",
-  detect_changes_glob: "**/*",
-  entry: "plugin.wasm",
-};
-
 async function main() {
   const startedAt = new Date().toISOString();
   const runStarted = performance.now();
@@ -99,9 +91,10 @@ async function main() {
     let pluginInstallMs = 0;
     if (CONFIG.installTextPlugin) {
       const pluginWasmBytes = await loadTextPluginWasmBytes();
+      const pluginManifest = await loadTextPluginManifest();
       const installStarted = performance.now();
       await lix.installPlugin({
-        manifestJson: TEXT_PLUGIN_MANIFEST,
+        manifestJson: pluginManifest,
         wasmBytes: pluginWasmBytes,
       });
       pluginInstallMs = performance.now() - installStarted;
@@ -553,6 +546,11 @@ async function loadTextPluginWasmBytes() {
   } catch {
     return new Uint8Array(await readFile(workspaceReleasePath));
   }
+}
+
+async function loadTextPluginManifest() {
+  const manifestPath = join(REPO_ROOT, "packages", "text-plugin", "manifest.json");
+  return JSON.parse(await readFile(manifestPath, "utf8"));
 }
 
 async function runGit(repoPath, args, options = {}) {

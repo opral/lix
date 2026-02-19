@@ -26,7 +26,8 @@ pub struct PluginManifest {
     pub key: String,
     pub runtime: PluginRuntime,
     pub api_version: String,
-    pub detect_changes_glob: String,
+    #[serde(rename = "match")]
+    pub file_match: PluginMatch,
     #[serde(default)]
     pub detect_changes: Option<DetectChangesConfig>,
     #[serde(default)]
@@ -37,6 +38,20 @@ impl PluginManifest {
     pub fn entry_or_default(&self) -> &str {
         self.entry.as_deref().unwrap_or("plugin.wasm")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginMatch {
+    pub path_glob: String,
+    #[serde(default)]
+    pub content_type: Option<PluginContentType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginContentType {
+    Text,
+    Binary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +65,8 @@ pub struct InstalledPlugin {
     pub key: String,
     pub runtime: PluginRuntime,
     pub api_version: String,
-    pub detect_changes_glob: String,
+    pub path_glob: String,
+    pub content_type: Option<PluginContentType>,
     pub entry: String,
     pub manifest_json: String,
     pub wasm: Vec<u8>,

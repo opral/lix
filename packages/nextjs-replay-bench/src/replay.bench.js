@@ -42,14 +42,6 @@ const CONFIG = {
   executeMode: parseExecuteMode(process.env.BENCH_REPLAY_EXECUTE_MODE),
 };
 
-const TEXT_PLUGIN_MANIFEST = {
-  key: "text_plugin",
-  runtime: "wasm-component-v1",
-  api_version: "0.1.0",
-  detect_changes_glob: "**/*",
-  entry: "plugin.wasm",
-};
-
 async function main() {
   const startedAt = new Date().toISOString();
   const replayStarted = performance.now();
@@ -106,9 +98,10 @@ async function main() {
     let pluginInstallMs = 0;
     if (CONFIG.installTextPlugin) {
       const pluginWasmBytes = await loadTextPluginWasmBytes(CONFIG.showProgress);
+      const pluginManifest = await loadTextPluginManifest();
       const pluginInstallStarted = performance.now();
       await lix.installPlugin({
-        manifestJson: TEXT_PLUGIN_MANIFEST,
+        manifestJson: pluginManifest,
         wasmBytes: pluginWasmBytes,
       });
       pluginInstallMs = performance.now() - pluginInstallStarted;
@@ -631,6 +624,11 @@ async function ensureTextPluginWasmBuilt(showProgress) {
   if (showProgress) {
     console.log("[progress] text-plugin wasm build done");
   }
+}
+
+async function loadTextPluginManifest() {
+  const manifestPath = join(REPO_ROOT, "packages", "text-plugin", "manifest.json");
+  return JSON.parse(await readFile(manifestPath, "utf8"));
 }
 
 async function queryScalarNumber(lix, sql, context) {
