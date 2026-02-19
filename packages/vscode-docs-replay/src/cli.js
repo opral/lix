@@ -37,6 +37,11 @@ async function main() {
       return;
     }
 
+    case "analyze-file-types": {
+      await run("pnpm", ["run", "analyze-file-types:raw"]);
+      return;
+    }
+
     case "reset": {
       await run("pnpm", ["run", "reset:raw"]);
       return;
@@ -52,6 +57,7 @@ function printHelp() {
   console.log("Usage:");
   console.log("  replay --commits 100");
   console.log("  analyze");
+  console.log("  analyze-file-types");
   console.log("  reset");
 }
 

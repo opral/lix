@@ -1,8 +1,15 @@
-import { mkdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, stat } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 import { spawn } from "node:child_process";
 
 export const NULL_OID = "0000000000000000000000000000000000000000";
+const LFS_OID_REGEX = /^oid sha256:([0-9a-f]{64})$/i;
+const lfsFetchedAllRepos = new Set();
+
+const LFS_CONFIG = {
+  resolvePointers: parseEnvBool("VSCODE_REPLAY_RESOLVE_LFS_POINTERS", true),
+  fetchMissingObjects: parseEnvBool("VSCODE_REPLAY_FETCH_MISSING_LFS_OBJECTS", true),
+};
 
 export async function ensureGitRepo(options) {
   const {
@@ -199,7 +206,115 @@ async function readBlobs(repoPath, blobIds) {
     }
   }
 
+  if (!LFS_CONFIG.resolvePointers) {
+    return blobs;
+  }
+
+  return await resolveGitLfsPointers(repoPath, blobs);
+}
+
+async function resolveGitLfsPointers(repoPath, blobs) {
+  const pointerEntries = [];
+
+  for (const [gitBlobOid, bytes] of blobs.entries()) {
+    if (!(bytes instanceof Uint8Array)) {
+      continue;
+    }
+    const pointer = parseGitLfsPointer(bytes);
+    if (!pointer) {
+      continue;
+    }
+    pointerEntries.push({ gitBlobOid, lfsOid: pointer.oid });
+  }
+
+  if (pointerEntries.length === 0) {
+    return blobs;
+  }
+
+  const gitDir = await resolveGitDir(repoPath);
+  const unresolved = [];
+
+  for (const entry of pointerEntries) {
+    const resolved = await readLfsObjectBytes(gitDir, entry.lfsOid);
+    if (resolved) {
+      blobs.set(entry.gitBlobOid, resolved);
+    } else {
+      unresolved.push(entry);
+    }
+  }
+
+  if (unresolved.length === 0 || !LFS_CONFIG.fetchMissingObjects) {
+    return blobs;
+  }
+
+  await fetchMissingLfsObjects(repoPath, unresolved.map((entry) => entry.lfsOid));
+
+  for (const entry of unresolved) {
+    const resolved = await readLfsObjectBytes(gitDir, entry.lfsOid);
+    if (resolved) {
+      blobs.set(entry.gitBlobOid, resolved);
+    }
+  }
+
   return blobs;
+}
+
+function parseGitLfsPointer(bytes) {
+  if (bytes.byteLength < 48 || bytes.byteLength > 1024) {
+    return null;
+  }
+
+  let text;
+  try {
+    text = Buffer.from(bytes).toString("utf8");
+  } catch {
+    return null;
+  }
+
+  if (!text.startsWith("version https://git-lfs.github.com/spec/v1")) {
+    return null;
+  }
+
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(LFS_OID_REGEX);
+    if (match) {
+      return { oid: match[1].toLowerCase() };
+    }
+  }
+
+  return null;
+}
+
+async function resolveGitDir(repoPath) {
+  const gitDirRaw = await runGit(repoPath, ["rev-parse", "--git-dir"]);
+  const gitDirText =
+    typeof gitDirRaw === "string"
+      ? gitDirRaw.trim()
+      : Buffer.from(gitDirRaw).toString("utf8").trim();
+  const gitDir = isAbsolute(gitDirText) ? gitDirText : join(repoPath, gitDirText);
+  return gitDir;
+}
+
+async function readLfsObjectBytes(gitDir, oid) {
+  const objectPath = join(gitDir, "lfs", "objects", oid.slice(0, 2), oid.slice(2, 4), oid);
+  try {
+    const bytes = await readFile(objectPath);
+    return Uint8Array.from(bytes);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchMissingLfsObjects(repoPath, objectIds) {
+  if (objectIds.length === 0) {
+    return;
+  }
+  if (lfsFetchedAllRepos.has(repoPath)) {
+    return;
+  }
+  await runGit(repoPath, ["lfs", "fetch", "--all", "origin"]);
+  lfsFetchedAllRepos.add(repoPath);
 }
 
 async function assertGitRepo(repoPath) {
@@ -261,4 +376,18 @@ async function runCommand(command, args, options = {}) {
     }
     child.stdin.end();
   });
+}
+
+function parseEnvBool(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(raw.toLowerCase())) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(raw.toLowerCase())) {
+    return false;
+  }
+  throw new Error(`${name} must be boolean-like (0/1/true/false), got '${raw}'`);
 }
