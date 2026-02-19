@@ -8,10 +8,12 @@
     "bootstrap": "node ./src/bootstrap.js",
     "replay:raw": "pnpm --filter @lix-js/better-sqlite3-backend run build && pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && node ./src/replay.js",
     "analyze:raw": "node ./src/analyze.js",
+    "analyze-file-types:raw": "node ./src/analyze-file-types.js",
     "reset:raw": "node ./src/reset.js",
     "cli": "node ./src/cli.js",
     "replay": "pnpm run cli -- replay",
     "analyze": "pnpm run cli -- analyze",
+    "analyze-file-types": "pnpm run cli -- analyze-file-types",
     "reset": "pnpm run cli -- reset",
     "run": "pnpm run replay"
   },
