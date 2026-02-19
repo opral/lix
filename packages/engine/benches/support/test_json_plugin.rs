@@ -8,7 +8,7 @@ pub const TEST_PLUGIN_MANIFEST_JSON: &str = r#"{
   "key": "test_json_plugin",
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
-  "detect_changes_glob": "*.json",
+  "match": {"path_glob": "*.json"},
   "entry": "plugin.wasm"
 }"#;
 

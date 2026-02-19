@@ -6,13 +6,13 @@ use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::sql::{bind_sql_with_state, PlaceholderState};
 use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::object_name_matches;
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreparedStatement, PreprocessOutput, SchemaRegistration};
 use crate::sql::DetectedFileDomainChange;
+use crate::sql::{bind_sql_with_state, PlaceholderState};
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) mod context;
@@ -567,7 +567,13 @@ mod tests {
         .expect("rewrite should succeed");
 
         assert_eq!(rewritten.prepared_statements.len(), 2);
-        assert_eq!(rewritten.prepared_statements[0].params, vec![Value::Integer(1)]);
-        assert_eq!(rewritten.prepared_statements[1].params, vec![Value::Integer(2)]);
+        assert_eq!(
+            rewritten.prepared_statements[0].params,
+            vec![Value::Integer(1)]
+        );
+        assert_eq!(
+            rewritten.prepared_statements[1].params,
+            vec![Value::Integer(2)]
+        );
     }
 }

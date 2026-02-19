@@ -566,14 +566,12 @@ impl Engine {
                         }
                     },
                 };
-                if let Err(error) = execute_prepared_with_transaction(
-                    transaction.as_mut(),
-                    &followup_statements,
-                )
-                .await
+                if let Err(error) =
+                    execute_prepared_with_transaction(transaction.as_mut(), &followup_statements)
+                        .await
                 {
-                        let _ = transaction.rollback().await;
-                        return Err(error);
+                    let _ = transaction.rollback().await;
+                    return Err(error);
                 }
                 transaction.commit().await?;
                 plugin_changes_committed = true;
@@ -2546,7 +2544,9 @@ async fn execute_prepared_with_transaction(
 ) -> Result<QueryResult, LixError> {
     let mut last_result = QueryResult { rows: Vec::new() };
     for statement in statements {
-        last_result = transaction.execute(&statement.sql, &statement.params).await?;
+        last_result = transaction
+            .execute(&statement.sql, &statement.params)
+            .await?;
     }
     Ok(last_result)
 }
@@ -3889,7 +3889,7 @@ async fn upsert_plugin_record(
                 Value::Text(manifest.key.clone()),
                 Value::Text(manifest.runtime.as_str().to_string()),
                 Value::Text(manifest.api_version.clone()),
-                Value::Text(manifest.detect_changes_glob.clone()),
+                Value::Text(manifest.file_match.path_glob.clone()),
                 Value::Text(manifest.entry_or_default().to_string()),
                 Value::Text(manifest_json.to_string()),
                 Value::Blob(wasm_bytes.to_vec()),
@@ -4515,7 +4515,8 @@ mod tests {
                 key: "k".to_string(),
                 runtime: PluginRuntime::WasmComponentV1,
                 api_version: "0.1.0".to_string(),
-                detect_changes_glob: "*.json".to_string(),
+                path_glob: "*.json".to_string(),
+                content_type: None,
                 entry: "plugin.wasm".to_string(),
                 manifest_json: "{}".to_string(),
                 wasm: vec![0],
