@@ -34,7 +34,6 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let mut observed = engine
-            .raw_engine()
             .observe(ObserveQuery::new(
                 "SELECT entity_id \
                  FROM lix_state \
@@ -90,7 +89,6 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let mut observed_a = engine
-            .raw_engine()
             .observe(ObserveQuery::new(
                 "SELECT entity_id \
                  FROM lix_state \
@@ -100,7 +98,6 @@ simulation_test!(
             ))
             .expect("observe should succeed");
         let mut observed_b = engine
-            .raw_engine()
             .observe(ObserveQuery::new(
                 "SELECT entity_id \
                  FROM lix_state \
@@ -149,7 +146,6 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let mut observed = engine
-            .raw_engine()
             .observe(ObserveQuery::new(
                 "SELECT entity_id \
                  FROM lix_state \
@@ -198,7 +194,6 @@ simulation_test!(
             .unwrap();
 
         let mut observed = engine
-            .raw_engine()
             .observe(ObserveQuery::new(
                 "SELECT entity_id \
                  FROM lix_state \
@@ -246,7 +241,6 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let mut observed = engine
-            .raw_engine()
             .observe(ObserveQuery::new(
                 "SELECT entity_id \
                  FROM lix_state \
@@ -297,7 +291,7 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
 
-        let result = engine.raw_engine().observe(ObserveQuery::new(
+        let result = engine.observe(ObserveQuery::new(
             "UPDATE lix_state SET schema_version = '1' WHERE 1 = 0",
             vec![],
         ));

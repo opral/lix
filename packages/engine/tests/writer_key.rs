@@ -106,7 +106,7 @@ simulation_test!(
         engine.init().await.unwrap();
 
         engine
-            .raw_engine()
+
             .transaction(
                 ExecuteOptions {
                     writer_key: Some("editor:tx".to_string()),
@@ -261,7 +261,7 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let error = engine
-            .raw_engine()
+
             .transaction(
                 ExecuteOptions {
                     writer_key: Some("editor:rollback".to_string()),
@@ -306,7 +306,7 @@ simulation_test!(
         engine.init().await.unwrap();
 
         engine
-            .raw_engine()
+
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
@@ -321,7 +321,6 @@ simulation_test!(
             .unwrap();
 
         engine
-            .raw_engine()
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(

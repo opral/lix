@@ -68,7 +68,6 @@ use std::sync::RwLock;
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
@@ -94,6 +93,7 @@ pub struct BootArgs {
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     pub key_values: Vec<BootKeyValue>,
     pub active_account: Option<BootAccount>,
+    pub access_to_internal: bool,
 }
 
 impl BootArgs {
@@ -103,6 +103,7 @@ impl BootArgs {
             wasm_runtime: None,
             key_values: Vec::new(),
             active_account: None,
+            access_to_internal: false,
         }
     }
 }
@@ -117,6 +118,7 @@ pub struct Engine {
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
     active_version_id: RwLock<String>,
+    access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
@@ -135,6 +137,25 @@ pub struct EngineTransaction<'a> {
 
 impl<'a> EngineTransaction<'a> {
     pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        if !self.engine.access_to_internal {
+            reject_internal_table_access(sql)?;
+        }
+        self.execute_with_access(sql, params).await
+    }
+
+    pub(crate) async fn execute_internal(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        self.execute_with_access(sql, params).await
+    }
+
+    async fn execute_with_access(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
         let previous_active_version_id = self.active_version_id.clone();
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             message: "transaction is no longer active".to_string(),
@@ -218,6 +239,17 @@ struct DeferredTransactionSideEffects {
     file_cache_invalidation_targets: BTreeSet<(String, String)>,
 }
 
+fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
+    if sql.to_ascii_lowercase().contains("lix_internal_") {
+        return Err(LixError {
+            message:
+                "queries against lix_internal_* tables are not allowed; use public lix_* views"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
 // Internal access to the raw transaction pointer is serialized with a mutex.
 unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
@@ -269,6 +301,7 @@ pub fn boot(args: BootArgs) -> Engine {
         boot_deterministic_settings,
         deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
         active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
+        access_to_internal: args.access_to_internal,
         installed_plugins_cache: RwLock::new(None),
         plugin_component_cache: Mutex::new(BTreeMap::new()),
         state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
@@ -336,6 +369,7 @@ impl Engine {
             let default_active_version_id = self.seed_default_versions().await?;
             self.seed_default_active_version(&default_active_version_id)
                 .await?;
+            self.seed_default_checkpoint_label().await?;
             self.seed_boot_key_values().await?;
             self.seed_boot_account().await?;
             self.load_and_cache_active_version().await
@@ -356,6 +390,28 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
+        self.execute_impl(sql, params, options, false).await
+    }
+
+    async fn execute_internal(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
+        self.execute_impl(sql, params, options, true).await
+    }
+
+    async fn execute_impl(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        allow_internal_tables: bool,
+    ) -> Result<QueryResult, LixError> {
+        if !allow_internal_tables && !self.access_to_internal {
+            reject_internal_table_access(sql)?;
+        }
         let parsed_statements = parse_sql_statements(sql)?;
         if let Some(statements) =
             extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
@@ -368,6 +424,13 @@ impl Engine {
         let read_only_query = is_query_only_statements(&parsed_statements);
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
+        if read_only_query {
+            self.maybe_refresh_working_change_projection_for_read_query(
+                self.backend.as_ref(),
+                &active_version_id,
+            )
+            .await?;
+        }
         self.maybe_materialize_reads_with_backend_from_statements(
             self.backend.as_ref(),
             &parsed_statements,
@@ -864,6 +927,13 @@ impl Engine {
             output,
         ) = {
             let backend = TransactionBackendAdapter::new(transaction);
+            if read_only_query {
+                self.maybe_refresh_working_change_projection_for_read_query(
+                    &backend,
+                    active_version_id.as_str(),
+                )
+                .await?;
+            }
             self.maybe_materialize_reads_with_backend_from_statements(
                 &backend,
                 &parsed_statements,
@@ -1156,6 +1226,10 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
+        crate::checkpoint::create_checkpoint(self).await
+    }
+
     /// Exports a portable snapshot as SQLite3 file bytes written via chunk stream.
     pub async fn export_snapshot(
         &self,
@@ -1243,6 +1317,14 @@ impl Engine {
             .await?;
         }
         Ok(())
+    }
+
+    async fn maybe_refresh_working_change_projection_for_read_query(
+        &self,
+        backend: &dyn LixBackend,
+        active_version_id: &str,
+    ) -> Result<(), LixError> {
+        crate::sql::refresh_working_projection_for_read_query(backend, active_version_id).await
     }
 
     async fn collect_execution_side_effects_with_backend_from_statements(
@@ -1477,7 +1559,7 @@ impl Engine {
             let entity_id = builtin_schema_entity_id(schema)?;
 
             let existing = self
-                .execute(
+                .execute_internal(
                     "SELECT 1 FROM lix_internal_state_vtable \
                      WHERE schema_key = 'lix_stored_schema' \
                        AND entity_id = $1 \
@@ -1496,7 +1578,7 @@ impl Engine {
                 "value": schema
             })
             .to_string();
-            self.execute(
+            self.execute_internal(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) \
                  VALUES ('lix_stored_schema', $1)",
                 &[Value::Text(snapshot_content)],
@@ -1520,7 +1602,7 @@ impl Engine {
             })
             .to_string();
 
-            self.execute(
+            self.execute_internal(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
@@ -1538,6 +1620,53 @@ impl Engine {
             .await?;
         }
 
+        Ok(())
+    }
+
+    async fn seed_default_checkpoint_label(&self) -> Result<(), LixError> {
+        let existing = self
+            .execute_internal(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_label' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL",
+                &[],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        for row in &existing.rows {
+            let Some(value) = row.first() else {
+                continue;
+            };
+            let Value::Text(snapshot_content) = value else {
+                continue;
+            };
+            let parsed: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError {
+                    message: format!("checkpoint label snapshot invalid JSON: {error}"),
+                }
+            })?;
+            if parsed.get("name").and_then(JsonValue::as_str) == Some("checkpoint") {
+                return Ok(());
+            }
+        }
+
+        let label_id = self.generate_runtime_uuid().await?;
+        let snapshot_content = serde_json::json!({
+            "id": label_id,
+            "name": "checkpoint",
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_label', 'lix', 'global', 'lix', $2, '1', 1)",
+            &[Value::Text(label_id), Value::Text(snapshot_content)],
+            ExecuteOptions::default(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1565,6 +1694,10 @@ impl Engine {
             .load_latest_commit_id()
             .await?
             .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
+        if bootstrap_commit_id == GLOBAL_VERSION_ID {
+            self.seed_bootstrap_change_set().await?;
+            self.seed_bootstrap_commit().await?;
+        }
         self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
         self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
@@ -1579,7 +1712,7 @@ impl Engine {
         };
 
         let exists = self
-            .execute(
+            .execute_internal(
                 "SELECT 1 \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = $1 \
@@ -1598,7 +1731,7 @@ impl Engine {
             )
             .await?;
         if exists.rows.is_empty() {
-            self.execute(
+            self.execute_internal(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1616,7 +1749,7 @@ impl Engine {
             .await?;
         }
 
-        self.execute(
+        self.execute_internal(
             "DELETE FROM lix_internal_state_vtable \
              WHERE untracked = 1 \
                AND schema_key = $1 \
@@ -1631,7 +1764,7 @@ impl Engine {
         )
         .await?;
 
-        self.execute(
+        self.execute_internal(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
@@ -1809,6 +1942,83 @@ impl Engine {
         );
         self.backend.execute(&insert_sql, &[]).await?;
 
+        Ok(())
+    }
+
+    async fn seed_bootstrap_commit(&self) -> Result<(), LixError> {
+        let existing = self
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_commit' \
+                   AND entity_id = $1 \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = serde_json::json!({
+            "id": GLOBAL_VERSION_ID,
+            "change_set_id": GLOBAL_VERSION_ID,
+            "parent_commit_ids": [],
+            "change_ids": [],
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', 1)",
+            &[
+                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text(snapshot_content),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_bootstrap_change_set(&self) -> Result<(), LixError> {
+        let existing = self
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_change_set' \
+                   AND entity_id = $1 \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = serde_json::json!({
+            "id": GLOBAL_VERSION_ID,
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', 1)",
+            &[
+                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text(snapshot_content),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -2052,51 +2262,100 @@ impl Engine {
             return Ok(());
         }
 
-        let mut params = Vec::with_capacity(deduped_changes.len() * 10);
-        let mut rows = Vec::with_capacity(deduped_changes.len());
-        for (row_index, change) in deduped_changes.iter().enumerate() {
-            let base = row_index * 10;
-            rows.push(format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6,
-                base + 7,
-                base + 8,
-                base + 9,
-                base + 10
-            ));
-            params.push(Value::Text(change.entity_id.clone()));
-            params.push(Value::Text(change.schema_key.clone()));
-            params.push(Value::Text(change.file_id.clone()));
-            params.push(Value::Text(change.version_id.clone()));
-            params.push(Value::Text(change.plugin_key.clone()));
-            params.push(match &change.snapshot_content {
-                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Text(change.schema_version.clone()));
-            params.push(match &change.metadata {
-                Some(metadata) => Value::Text(metadata.clone()),
-                None => Value::Null,
-            });
-            params.push(match &change.writer_key {
-                Some(writer_key) => Value::Text(writer_key.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Integer(if untracked { 1 } else { 0 }));
-        }
-
-        let sql = format!(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
-             ) VALUES {}",
-            rows.join(", ")
-        );
-        Box::pin(self.execute(&sql, &params, ExecuteOptions::default())).await?;
+        let (sql, params) = if untracked {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 10);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 10;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9,
+                    base + 10
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Integer(1));
+            }
+            (
+                format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        } else {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 9);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 9;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+            }
+            (
+                format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        };
+        Box::pin(self.execute_internal(&sql, &params, ExecuteOptions::default())).await?;
 
         Ok(())
     }
@@ -2112,50 +2371,99 @@ impl Engine {
             return Ok(());
         }
 
-        let mut params = Vec::with_capacity(deduped_changes.len() * 10);
-        let mut rows = Vec::with_capacity(deduped_changes.len());
-        for (row_index, change) in deduped_changes.iter().enumerate() {
-            let base = row_index * 10;
-            rows.push(format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6,
-                base + 7,
-                base + 8,
-                base + 9,
-                base + 10
-            ));
-            params.push(Value::Text(change.entity_id.clone()));
-            params.push(Value::Text(change.schema_key.clone()));
-            params.push(Value::Text(change.file_id.clone()));
-            params.push(Value::Text(change.version_id.clone()));
-            params.push(Value::Text(change.plugin_key.clone()));
-            params.push(match &change.snapshot_content {
-                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Text(change.schema_version.clone()));
-            params.push(match &change.metadata {
-                Some(metadata) => Value::Text(metadata.clone()),
-                None => Value::Null,
-            });
-            params.push(match &change.writer_key {
-                Some(writer_key) => Value::Text(writer_key.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Integer(if untracked { 1 } else { 0 }));
-        }
-
-        let sql = format!(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
-             ) VALUES {}",
-            rows.join(", ")
-        );
+        let (sql, params) = if untracked {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 10);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 10;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9,
+                    base + 10
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Integer(1));
+            }
+            (
+                format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        } else {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 9);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 9;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+            }
+            (
+                format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        };
         let output = {
             let backend = TransactionBackendAdapter::new(transaction);
             preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?
@@ -4422,12 +4730,7 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.execute(
-            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'",
-            &[],
-        )
-        .await
-        .expect("transaction execute should succeed");
+        tx.installed_plugins_cache_invalidation_pending = true;
 
         assert!(
             engine
@@ -4474,12 +4777,7 @@ mod tests {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await
             .expect("begin transaction");
-        tx.execute(
-            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'",
-            &[],
-        )
-        .await
-        .expect("transaction execute should succeed");
+        tx.installed_plugins_cache_invalidation_pending = true;
         tx.rollback().await.expect("rollback should succeed");
 
         assert!(!commit_called.load(Ordering::SeqCst));

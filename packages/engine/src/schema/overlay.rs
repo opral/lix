@@ -72,9 +72,7 @@ impl SchemaProvider for OverlaySchemaProvider<'_> {
             }
             (Some((_, pending_schema)), None) => Ok(pending_schema),
             (None, Some((_, stored_schema))) => Ok(stored_schema),
-            (None, None) => Err(LixError {
-                message: format!("schema '{}' is not stored", schema_key),
-            }),
+            (None, None) => self.base.load_latest_schema(schema_key).await,
         }
     }
 }
@@ -290,6 +288,20 @@ mod tests {
             .expect("latest schema");
 
         assert_eq!(latest["x-lix-version"], json!("10"));
+    }
+
+    #[tokio::test]
+    async fn load_latest_uses_base_whitelist_for_lix_state() {
+        let backend = FakeBackend::default();
+        let base = SqlStoredSchemaProvider::new(&backend);
+        let mut provider = OverlaySchemaProvider::new(base);
+
+        let latest = provider
+            .load_latest_schema("lix_state")
+            .await
+            .expect("latest schema");
+
+        assert_eq!(latest["x-lix-key"], json!("lix_state"));
     }
 
     #[test]

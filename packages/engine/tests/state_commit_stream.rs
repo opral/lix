@@ -22,12 +22,10 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
 
-        let events = engine
-            .raw_engine()
-            .state_commit_stream(StateCommitStreamFilter {
-                schema_keys: vec!["lix_key_value".to_string()],
-                ..StateCommitStreamFilter::default()
-            });
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
 
         engine
             .execute(
@@ -66,13 +64,11 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
 
-        let events = engine
-            .raw_engine()
-            .state_commit_stream(StateCommitStreamFilter {
-                schema_keys: vec!["lix_key_value".to_string()],
-                exclude_writer_keys: vec!["ui-writer".to_string()],
-                ..StateCommitStreamFilter::default()
-            });
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            exclude_writer_keys: vec!["ui-writer".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
 
         engine
             .execute_with_options(
@@ -115,15 +111,12 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
 
-        let events = engine
-            .raw_engine()
-            .state_commit_stream(StateCommitStreamFilter {
-                schema_keys: vec!["lix_key_value".to_string()],
-                ..StateCommitStreamFilter::default()
-            });
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
 
         engine
-            .raw_engine()
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(

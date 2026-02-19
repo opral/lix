@@ -35,6 +35,11 @@ export type InstallPluginOptions = {
   wasmBytes: Uint8Array | ArrayBuffer;
 };
 
+export type CreateCheckpointResult = {
+  id: string;
+  changeSetId: string;
+};
+
 export type StateCommitStreamFilter = {
   schemaKeys?: string[];
   entityIds?: string[];
@@ -99,6 +104,7 @@ export type Lix = {
   stateCommitStream(filter?: StateCommitStreamFilter): StateCommitStream;
   observe(query: ObserveQuery): ObserveEvents;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
+  createCheckpoint(): Promise<CreateCheckpointResult>;
   switchVersion(versionId: string): Promise<void>;
   installPlugin(args: InstallPluginOptions): Promise<void>;
   /** Exports the current database as SQLite file bytes (portable `.lix` artifact). */
@@ -283,6 +289,28 @@ export async function openLix(
     await (wasmLix as any).installPlugin(manifestJson, wasmBytes);
   };
 
+  const createCheckpoint = async (): Promise<CreateCheckpointResult> => {
+    ensureOpen("createCheckpoint");
+    if (typeof (wasmLix as any).createCheckpoint !== "function") {
+      throw new Error("createCheckpoint is not available in this wasm build");
+    }
+    const raw = await (wasmLix as any).createCheckpoint();
+    if (!raw || typeof raw !== "object") {
+      throw new Error("createCheckpoint() must return an object");
+    }
+    const id = (raw as { id?: unknown }).id;
+    const changeSetId =
+      (raw as { changeSetId?: unknown; change_set_id?: unknown }).changeSetId ??
+      (raw as { change_set_id?: unknown }).change_set_id;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error("createCheckpoint() result is missing string id");
+    }
+    if (typeof changeSetId !== "string" || changeSetId.length === 0) {
+      throw new Error("createCheckpoint() result is missing string changeSetId");
+    }
+    return { id, changeSetId };
+  };
+
   const exportSnapshot = async (): Promise<Uint8Array> => {
     ensureOpen("exportSnapshot");
     if (typeof (wasmLix as any).exportSnapshot !== "function") {
@@ -351,6 +379,7 @@ export async function openLix(
     stateCommitStream,
     observe,
     createVersion,
+    createCheckpoint,
     switchVersion,
     installPlugin,
     exportSnapshot,

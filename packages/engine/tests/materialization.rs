@@ -61,6 +61,20 @@ simulation_test!(
             )
             .await
             .unwrap();
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) VALUES (\
+                     'entity-1b', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
+                     )",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
 
         let plan = engine
             .materialization_plan(&MaterializationRequest {
