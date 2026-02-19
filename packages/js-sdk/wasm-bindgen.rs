@@ -4,8 +4,8 @@ mod wasm {
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, observe_owned, BootArgs, BootKeyValue, ExecuteOptions, LixBackend, LixError,
-        LixTransaction, ObserveEvent as EngineObserveEvent,
+        boot, observe_owned, BootArgs, BootKeyValue, CreateCheckpointResult, ExecuteOptions,
+        LixBackend, LixError, LixTransaction, ObserveEvent as EngineObserveEvent,
         ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
         QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect,
         StateCommitStream as EngineStateCommitStream, StateCommitStreamBatch,
@@ -189,6 +189,12 @@ export type LixObserveEvents = {
                 .install_plugin(&manifest_json, &bytes)
                 .await
                 .map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = createCheckpoint)]
+        pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
+            let result = self.engine.create_checkpoint().await.map_err(js_error)?;
+            Ok(create_checkpoint_result_to_js(result).into())
         }
 
         #[wasm_bindgen(js_name = exportSnapshot)]
@@ -547,6 +553,21 @@ export type LixObserveEvents = {
             changes.push(&state_commit_stream_change_to_js(change).into());
         }
         let _ = Reflect::set(&object, &JsValue::from_str("changes"), &changes);
+        object
+    }
+
+    fn create_checkpoint_result_to_js(result: CreateCheckpointResult) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("id"),
+            &JsValue::from_str(&result.id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("changeSetId"),
+            &JsValue::from_str(&result.change_set_id),
+        );
         object
     }
 

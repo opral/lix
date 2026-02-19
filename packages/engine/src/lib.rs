@@ -2,6 +2,7 @@ mod account;
 mod backend;
 mod builtin_schema;
 mod cel;
+mod checkpoint;
 mod commit;
 mod default_values;
 mod deterministic_mode;
@@ -33,6 +34,7 @@ pub use schema::{
 pub use backend::LixBackend;
 pub use backend::LixTransaction;
 pub use backend::SqlDialect;
+pub use checkpoint::CreateCheckpointResult;
 pub use commit::{
     generate_commit, ChangeRow, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
     MaterializedStateRow, VersionInfo, VersionSnapshot,

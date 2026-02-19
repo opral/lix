@@ -1286,11 +1286,12 @@ fn parse_version_info_from_tip_snapshot(
         .working_commit_id
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| fallback_version_id.to_string());
-    let parent_commit_ids = if snapshot.commit_id.is_empty() {
-        Vec::new()
-    } else {
-        vec![snapshot.commit_id]
-    };
+    let parent_commit_ids =
+        if snapshot.commit_id.is_empty() || snapshot.commit_id == working_commit_id {
+            Vec::new()
+        } else {
+            vec![snapshot.commit_id]
+        };
 
     Ok(Some(VersionInfo {
         parent_commit_ids,
