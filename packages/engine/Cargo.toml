@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "lix_state_history"
 harness = false
+
+[[bench]]
+name = "binary_storage"
+harness = false

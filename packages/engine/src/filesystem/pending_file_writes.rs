@@ -350,10 +350,7 @@ async fn collect_delete_writes(
         }
         let before_data_from_row = row.get(2).and_then(value_as_blob_or_text_bytes);
         let (before_path, before_data) = if let Some(overlay_state) = overlay.get(&key) {
-            (
-                overlay_state.path.clone(),
-                Some(overlay_state.data.clone()),
-            )
+            (overlay_state.path.clone(), Some(overlay_state.data.clone()))
         } else {
             (before_path_from_row, before_data_from_row)
         };

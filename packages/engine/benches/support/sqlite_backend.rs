@@ -1,5 +1,6 @@
 use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 use sqlx::{Executor, Row, SqlitePool, ValueRef};
+use std::path::Path;
 use tokio::sync::OnceCell;
 
 pub struct BenchSqliteBackend {
@@ -17,6 +18,32 @@ impl BenchSqliteBackend {
             conn: "sqlite::memory:".to_string(),
             pool: OnceCell::const_new(),
         }
+    }
+
+    pub fn file_backed(path: &Path) -> Result<Self, LixError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| LixError {
+                message: format!(
+                    "failed to create sqlite benchmark directory {}: {error}",
+                    parent.display()
+                ),
+            })?;
+        }
+
+        if !path.exists() {
+            std::fs::File::create(path).map_err(|error| LixError {
+                message: format!(
+                    "failed to create sqlite benchmark file {}: {error}",
+                    path.display()
+                ),
+            })?;
+        }
+
+        let conn = format!("sqlite://{}", path.display());
+        Ok(Self {
+            conn,
+            pool: OnceCell::const_new(),
+        })
     }
 
     async fn pool(&self) -> Result<&SqlitePool, LixError> {

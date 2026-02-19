@@ -1,0 +1,13 @@
+benches/results/
+
+# local rust build output when invoked from this package
+target/
+
+# criterion benchmark output
+criterion/
+
+# local sqlite artifacts from benchmark runs
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
