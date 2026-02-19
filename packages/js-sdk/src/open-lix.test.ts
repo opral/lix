@@ -34,7 +34,7 @@ test("installPlugin stores plugin metadata", async () => {
     key: "plugin_json",
     runtime: "wasm-component-v1",
     api_version: "0.1.0",
-    detect_changes_glob: "*.json",
+    match: { path_glob: "*.json" },
   });
   const wasmBytes = new Uint8Array([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
