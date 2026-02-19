@@ -1,9 +1,15 @@
 use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Value};
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
+
+#[path = "../tests/support/wasmtime_runtime.rs"]
+mod bench_wasmtime_runtime;
 
 mod support;
 use support::sqlite_backend::BenchSqliteBackend;
@@ -115,8 +121,19 @@ fn run() -> Result<(), LixError> {
     let scan_read_ops = env_usize("LIX_BINARY_STORAGE_SCAN_READ_OPS", DEFAULT_SCAN_READ_OPS)?;
 
     let backend = Box::new(BenchSqliteBackend::file_backed(&db_path)?);
-    let engine = boot(BootArgs::new(backend));
+    let wasm_runtime = Arc::new(bench_wasmtime_runtime::TestWasmtimeRuntime::new().map_err(
+        |error| LixError {
+            message: format!(
+                "failed to initialize bench wasmtime runtime: {}",
+                error.message
+            ),
+        },
+    )?);
+    let mut boot_args = BootArgs::new(backend);
+    boot_args.wasm_runtime = Some(wasm_runtime);
+    let engine = boot(boot_args);
     runtime.block_on(engine.init())?;
+    install_binary_plugin_for_bench(&runtime, &engine, &manifest_dir)?;
 
     let mut dataset = build_dataset(files_per_class, base_blob_bytes);
     let total_files = dataset.len();
@@ -206,6 +223,172 @@ fn run() -> Result<(), LixError> {
         report.storage.update_write_amp
     );
     Ok(())
+}
+
+fn install_binary_plugin_for_bench(
+    runtime: &Runtime,
+    engine: &lix_engine::Engine,
+    engine_manifest_dir: &Path,
+) -> Result<(), LixError> {
+    let plugin_dir = engine_manifest_dir.join("../plugin-binary");
+    let plugin_manifest_path = plugin_dir.join("manifest.json");
+    let plugin_schema_path = plugin_dir.join("schema/binary_blob.json");
+    let (schema_entity_id, schema_snapshot_content) =
+        load_schema_registration_payload(&plugin_schema_path)?;
+
+    runtime.block_on(engine.execute(
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')",
+        &[
+            Value::Text(schema_entity_id),
+            Value::Text(schema_snapshot_content),
+        ],
+        ExecuteOptions::default(),
+    ))?;
+
+    let plugin_manifest_json =
+        std::fs::read_to_string(&plugin_manifest_path).map_err(|error| LixError {
+            message: format!(
+                "failed to read binary plugin manifest {}: {error}",
+                plugin_manifest_path.display()
+            ),
+        })?;
+    let plugin_wasm = plugin_binary_wasm_bytes(&plugin_dir)?;
+    runtime.block_on(engine.install_plugin(&plugin_manifest_json, &plugin_wasm))?;
+    Ok(())
+}
+
+fn load_schema_registration_payload(schema_path: &Path) -> Result<(String, String), LixError> {
+    let raw_schema = std::fs::read_to_string(schema_path).map_err(|error| LixError {
+        message: format!(
+            "failed to read binary plugin schema {}: {error}",
+            schema_path.display()
+        ),
+    })?;
+    let schema: JsonValue = serde_json::from_str(&raw_schema).map_err(|error| LixError {
+        message: format!(
+            "binary plugin schema must be valid JSON ({}): {error}",
+            schema_path.display()
+        ),
+    })?;
+
+    let schema_key = schema
+        .get("x-lix-key")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            message: format!(
+                "binary plugin schema {} is missing string x-lix-key",
+                schema_path.display()
+            ),
+        })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            message: format!(
+                "binary plugin schema {} is missing string x-lix-version",
+                schema_path.display()
+            ),
+        })?;
+
+    let entity_id = format!("{schema_key}~{schema_version}");
+    let snapshot_content = serde_json::json!({ "value": schema }).to_string();
+    Ok((entity_id, snapshot_content))
+}
+
+fn plugin_binary_wasm_bytes(plugin_dir: &Path) -> Result<Vec<u8>, LixError> {
+    let wasm_path = plugin_binary_wasm_path(plugin_dir);
+    if !wasm_path.exists() {
+        build_plugin_binary_wasm(plugin_dir)?;
+    }
+    std::fs::read(&wasm_path).map_err(|error| LixError {
+        message: format!(
+            "failed to read binary plugin wasm {}: {error}",
+            wasm_path.display()
+        ),
+    })
+}
+
+fn plugin_binary_wasm_path(plugin_dir: &Path) -> PathBuf {
+    plugin_dir.join("target/wasm32-wasip2/debug/plugin_binary.wasm")
+}
+
+fn build_plugin_binary_wasm(plugin_dir: &Path) -> Result<(), LixError> {
+    let manifest_path = plugin_dir.join("Cargo.toml");
+    let target_dir = plugin_dir.join("target");
+
+    let output = Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest_path)
+        .arg("--target")
+        .arg("wasm32-wasip2")
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .map_err(|error| LixError {
+            message: format!(
+                "failed to run cargo build for binary plugin ({}): {error}",
+                manifest_path.display()
+            ),
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if stderr.contains("wasm32-wasip2")
+        && (stderr.contains("target may not be installed")
+            || stderr.contains("can't find crate for `core`"))
+    {
+        ensure_wasm32_wasip2_target()?;
+        let retry = Command::new("cargo")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(&manifest_path)
+            .arg("--target")
+            .arg("wasm32-wasip2")
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .output()
+            .map_err(|error| LixError {
+                message: format!(
+                    "failed to rerun cargo build for binary plugin ({}): {error}",
+                    manifest_path.display()
+                ),
+            })?;
+        if retry.status.success() {
+            return Ok(());
+        }
+        let retry_stderr = String::from_utf8_lossy(&retry.stderr);
+        return Err(LixError {
+            message: format!("cargo build for binary plugin failed:\n{retry_stderr}"),
+        });
+    }
+
+    Err(LixError {
+        message: format!("cargo build for binary plugin failed:\n{stderr}"),
+    })
+}
+
+fn ensure_wasm32_wasip2_target() -> Result<(), LixError> {
+    let status = Command::new("rustup")
+        .arg("target")
+        .arg("add")
+        .arg("wasm32-wasip2")
+        .status()
+        .map_err(|error| LixError {
+            message: format!("failed to run rustup target add wasm32-wasip2: {error}"),
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LixError {
+            message: format!("rustup target add wasm32-wasip2 failed with status {status}"),
+        })
+    }
 }
 
 fn env_usize(name: &str, default_value: usize) -> Result<usize, LixError> {
