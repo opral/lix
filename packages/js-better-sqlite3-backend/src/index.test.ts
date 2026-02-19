@@ -72,3 +72,29 @@ test("exportSnapshot returns bytes", async () => {
   expect(snapshot.byteLength).toBeGreaterThan(0);
   await backend.close?.();
 });
+
+test("semicolon in string literal does not trigger multi-statement path", async () => {
+  const backend = await createBetterSqlite3Backend();
+  await backend.execute("CREATE TABLE t (name TEXT)", []);
+  await backend.execute("INSERT INTO t (name) VALUES ('a;b')", []);
+
+  const result = await backend.execute("SELECT name FROM t WHERE name = 'a;b'", []);
+  const rows = rowsOf(result);
+  expect(rows).toHaveLength(1);
+  expect(rows[0][0]).toEqual({ kind: "Text", value: "a;b" });
+  await backend.close?.();
+});
+
+test("multi-statement sql still executes with no params", async () => {
+  const backend = await createBetterSqlite3Backend();
+
+  await backend.execute(
+    "CREATE TABLE t2 (value INTEGER); INSERT INTO t2 (value) VALUES (1);",
+    [],
+  );
+
+  const result = await backend.execute("SELECT COUNT(*) FROM t2", []);
+  const rows = rowsOf(result);
+  expect(rows[0][0]).toEqual({ kind: "Integer", value: 1 });
+  await backend.close?.();
+});

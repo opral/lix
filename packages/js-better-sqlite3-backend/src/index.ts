@@ -127,11 +127,92 @@ function toSqlParam(raw: unknown): unknown {
 }
 
 function looksLikeMultiStatementSql(sql: string): boolean {
-  const segments = sql
-    .split(";")
-    .map((segment) => segment.trim())
-    .filter(Boolean);
-  return segments.length > 1;
+  let index = 0;
+  let statementCount = 0;
+  let hasTokenInCurrentStatement = false;
+
+  while (index < sql.length) {
+    const char = sql[index];
+    const next = sql[index + 1];
+
+    if (char === "-" && next === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index < sql.length) {
+        if (sql[index] === "*" && sql[index + 1] === "/") {
+          index += 2;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === "`") {
+      hasTokenInCurrentStatement = true;
+      index = consumeQuotedLiteral(sql, index, char);
+      continue;
+    }
+
+    if (char === "[") {
+      hasTokenInCurrentStatement = true;
+      index = consumeBracketIdentifier(sql, index);
+      continue;
+    }
+
+    if (char === ";") {
+      if (hasTokenInCurrentStatement) {
+        statementCount += 1;
+        hasTokenInCurrentStatement = false;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (!/\s/.test(char)) {
+      hasTokenInCurrentStatement = true;
+    }
+    index += 1;
+  }
+
+  if (hasTokenInCurrentStatement) {
+    statementCount += 1;
+  }
+
+  return statementCount > 1;
+}
+
+function consumeQuotedLiteral(sql: string, start: number, quote: "'" | '"' | "`"): number {
+  let index = start + 1;
+  while (index < sql.length) {
+    if (sql[index] === quote) {
+      if (sql[index + 1] === quote) {
+        index += 2;
+        continue;
+      }
+      return index + 1;
+    }
+    index += 1;
+  }
+  return index;
+}
+
+function consumeBracketIdentifier(sql: string, start: number): number {
+  let index = start + 1;
+  while (index < sql.length) {
+    if (sql[index] === "]") {
+      return index + 1;
+    }
+    index += 1;
+  }
+  return index;
 }
 
 function detectIndexedPlaceholderMax(sql: string): number {
