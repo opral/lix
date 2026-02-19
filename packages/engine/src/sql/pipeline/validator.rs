@@ -188,6 +188,7 @@ mod tests {
     fn statement_validator_rejects_postprocess_with_mutations() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: "schema".to_string(),
@@ -217,6 +218,7 @@ mod tests {
     fn statement_validator_rejects_multi_statement_update_validation() {
         let output = RewriteOutput {
             statements: vec![empty_statement(), empty_statement()],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -239,6 +241,7 @@ mod tests {
     fn statement_validator_rejects_update_validation_on_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -261,6 +264,7 @@ mod tests {
     fn statement_validator_rejects_vtable_update_postprocess_on_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
                 schema_key: "schema".to_string(),
@@ -282,6 +286,7 @@ mod tests {
     fn statement_validator_rejects_vtable_delete_postprocess_on_non_delete_or_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: "schema".to_string(),

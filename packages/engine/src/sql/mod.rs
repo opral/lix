@@ -42,5 +42,6 @@ pub use steps::vtable_write::{
     build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
 };
 pub use types::PostprocessPlan;
+pub(crate) use types::PreparedStatement;
 pub use types::SchemaRegistration;
 pub use types::{MutationOperation, MutationRow, UpdateValidationPlan};

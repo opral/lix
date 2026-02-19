@@ -2,6 +2,9 @@
   "key": "text_plugin",
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
-  "detect_changes_glob": "*",
+  "match": {
+    "path_glob": "*",
+    "content_type": "text"
+  },
   "entry": "plugin.wasm"
 }

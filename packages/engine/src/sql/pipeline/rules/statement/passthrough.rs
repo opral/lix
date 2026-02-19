@@ -5,6 +5,7 @@ use crate::sql::types::RewriteOutput;
 pub(crate) fn apply(statement: Statement) -> RewriteOutput {
     RewriteOutput {
         statements: vec![statement],
+        params: Vec::new(),
         registrations: Vec::new(),
         postprocess: None,
         mutations: Vec::new(),

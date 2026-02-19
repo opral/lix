@@ -22,14 +22,6 @@ const RESULTS_DIR = join(__dirname, "..", "results");
 const DEFAULT_REPORT_PATH = join(RESULTS_DIR, "nextjs-replay.bench.json");
 const DEFAULT_OUTPUT_PATH = join(RESULTS_DIR, "nextjs-replay.slowest-commit.explain.txt");
 
-const TEXT_PLUGIN_MANIFEST = {
-  key: "text_plugin",
-  runtime: "wasm-component-v1",
-  api_version: "0.1.0",
-  detect_changes_glob: "**/*",
-  entry: "plugin.wasm",
-};
-
 async function main() {
   const reportPath = process.env.BENCH_REPLAY_REPORT_PATH ?? DEFAULT_REPORT_PATH;
   const outputPath = process.env.BENCH_REPLAY_EXPLAIN_OUTPUT ?? DEFAULT_OUTPUT_PATH;
@@ -103,8 +95,9 @@ async function main() {
   try {
     if (replayConfig.installTextPlugin) {
       const wasmBytes = await loadTextPluginWasmBytes();
+      const pluginManifest = await loadTextPluginManifest();
       await lix.installPlugin({
-        manifestJson: TEXT_PLUGIN_MANIFEST,
+        manifestJson: pluginManifest,
         wasmBytes,
       });
     }
@@ -668,6 +661,11 @@ async function ensureTextPluginWasmBuilt() {
     }
     throw error;
   }
+}
+
+async function loadTextPluginManifest() {
+  const manifestPath = join(REPO_ROOT, "packages", "text-plugin", "manifest.json");
+  return JSON.parse(await readFile(manifestPath, "utf8"));
 }
 
 function parseEnvInt(name, fallback) {
