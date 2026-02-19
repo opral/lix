@@ -22,21 +22,43 @@ export async function createBetterSqlite3Backend(
   const runQuery = (sql: string, params: ReadonlyArray<unknown>): QueryResult => {
     ensureBackendOpen();
     try {
+      if (params.length === 0 && looksLikeMultiStatementSql(sql)) {
+        db.exec(sql);
+        return { rows: [] };
+      }
+
       const statement = db.prepare(sql);
       const boundParams = params.map(toSqlParam);
+      const numberedPlaceholderMax = detectIndexedPlaceholderMax(sql);
+      const numberedBindObject =
+        numberedPlaceholderMax > 0
+          ? toNumberedBindObject(boundParams, numberedPlaceholderMax)
+          : null;
       if (statement.reader) {
-        const rawRows = statement.raw(true).all(...boundParams) as unknown[][];
+        const rawRows =
+          boundParams.length === 0
+            ? (statement.raw(true).all() as unknown[][])
+            : numberedBindObject
+              ? (statement.raw(true).all(numberedBindObject) as unknown[][])
+              : (statement.raw(true).all(boundParams) as unknown[][]);
         const rows = rawRows.map((row: readonly unknown[]) =>
           Array.isArray(row) ? row.map((value) => fromSqlValue(value)) : [],
         );
         return { rows };
       }
 
-      statement.run(...boundParams);
+      if (boundParams.length === 0) {
+        statement.run();
+      } else if (numberedBindObject) {
+        statement.run(numberedBindObject);
+      } else {
+        statement.run(boundParams);
+      }
       return { rows: [] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`${message}\nwhile executing SQL:\n${sql}`);
+      const sqlPreview = sql.replace(/\s+/g, " ").slice(0, 500);
+      throw new Error(`${message} [sql: ${sqlPreview}]`);
     }
   };
 
@@ -102,6 +124,39 @@ function toSqlParam(raw: unknown): unknown {
     default:
       return null;
   }
+}
+
+function looksLikeMultiStatementSql(sql: string): boolean {
+  const segments = sql
+    .split(";")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  return segments.length > 1;
+}
+
+function detectIndexedPlaceholderMax(sql: string): number {
+  const numberedPlaceholders = [...sql.matchAll(/(?:\?|\$)(\d+)/g)];
+  let maxIndex = 0;
+  for (const match of numberedPlaceholders) {
+    const parsed = Number.parseInt(match[1] ?? "0", 10);
+    if (Number.isFinite(parsed) && parsed > maxIndex) {
+      maxIndex = parsed;
+    }
+  }
+  return maxIndex;
+}
+
+function toNumberedBindObject(
+  params: ReadonlyArray<unknown>,
+  maxIndex: number,
+): Record<string, unknown> {
+  const bind: Record<string, unknown> = {};
+  for (let index = 1; index <= maxIndex; index++) {
+    if (index - 1 < params.length) {
+      bind[String(index)] = params[index - 1];
+    }
+  }
+  return bind;
 }
 
 function fromSqlValue(value: unknown): ReturnType<typeof Value.from> {

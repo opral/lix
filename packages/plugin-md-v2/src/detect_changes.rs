@@ -38,6 +38,21 @@ pub(crate) fn detect_changes(
     after: File,
     state_context: Option<DetectStateContext>,
 ) -> Result<Vec<EntityChange>, PluginError> {
+    if !is_markdown_path(&after.path) {
+        return Ok(Vec::new());
+    }
+
+    let after_markdown = match decode_markdown_bytes(&after.data) {
+        Ok(markdown) => markdown,
+        Err(PluginError::InvalidInput(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let after_candidates = match parse_top_level_block_candidates(&after_markdown) {
+        Ok(candidates) => candidates,
+        Err(PluginError::InvalidInput(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
     let before_projection = parse_state_context_projection(state_context.as_ref())?;
 
     let BeforeProjection {
@@ -45,8 +60,6 @@ pub(crate) fn detect_changes(
         blocks_by_id: before_by_id,
     } = before_projection;
 
-    let after_markdown = decode_markdown_bytes(&after.data)?;
-    let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
     let after_blocks =
         assign_ids_with_existing_state(after_candidates, &before_order, &before_by_id);
     let after_order = after_blocks
@@ -105,15 +118,17 @@ fn parse_state_context_projection(
     state_context: Option<&DetectStateContext>,
 ) -> Result<BeforeProjection, PluginError> {
     let Some(state_context) = state_context else {
-        return Err(PluginError::InvalidInput(
-            "state_context is required for markdown detect_changes".to_string(),
-        ));
+        return Ok(BeforeProjection {
+            order: Vec::new(),
+            blocks_by_id: BTreeMap::new(),
+        });
     };
-    let rows = state_context.active_state.as_ref().ok_or_else(|| {
-        PluginError::InvalidInput(
-            "state_context.active_state is required for markdown detect_changes".to_string(),
-        )
-    })?;
+    let Some(rows) = state_context.active_state.as_ref() else {
+        return Ok(BeforeProjection {
+            order: Vec::new(),
+            blocks_by_id: BTreeMap::new(),
+        });
+    };
 
     let mut document_order = None::<Vec<String>>;
     let mut blocks_by_id = BTreeMap::<String, ParsedBlock>::new();
@@ -655,6 +670,11 @@ fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, PluginError> {
                 "file.data must be valid UTF-8 markdown bytes: {error}"
             ))
         })
+}
+
+fn is_markdown_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".md") || path.ends_with(".mdx")
 }
 
 fn parse_options_all_extensions() -> ParseOptions {

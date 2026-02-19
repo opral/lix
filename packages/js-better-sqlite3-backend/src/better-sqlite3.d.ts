@@ -14,6 +14,7 @@ declare module "better-sqlite3" {
 
   interface BetterSqlite3Database {
     prepare(sql: string): BetterSqlite3Statement;
+    exec(sql: string): this;
     close(): void;
     serialize(): Uint8Array;
   }
@@ -21,6 +22,7 @@ declare module "better-sqlite3" {
   class Database implements BetterSqlite3Database {
     constructor(filename?: string, options?: Record<string, unknown>);
     prepare(sql: string): BetterSqlite3Statement;
+    exec(sql: string): this;
     close(): void;
     serialize(): Uint8Array;
   }

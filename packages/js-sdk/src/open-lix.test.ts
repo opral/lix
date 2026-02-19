@@ -111,7 +111,7 @@ test("stateCommitStream emits filtered commit batches", async () => {
   expect(batch!.changes.length).toBeGreaterThan(0);
   expect(
     batch!.changes.some(
-      (change) =>
+      (change: { schemaKey: string; entityId: string }) =>
         change.schemaKey === "lix_key_value" &&
         change.entityId === "state-commit-events-js",
     ),
