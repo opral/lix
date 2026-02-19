@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 
 use crate::sql::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
@@ -10,6 +10,7 @@ use super::key::SchemaKey;
 
 const STORED_SCHEMA_TABLE: &str = "lix_internal_state_materialized_v1_lix_stored_schema";
 const GLOBAL_VERSION: &str = "global";
+const INTERNAL_SCHEMA_VERSION: &str = "1";
 
 #[async_trait(?Send)]
 pub trait SchemaProvider {
@@ -96,6 +97,13 @@ impl<'a> SqlStoredSchemaProvider<'a> {
 #[async_trait(?Send)]
 impl SchemaProvider for SqlStoredSchemaProvider<'_> {
     async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError> {
+        if let Some(schema) = whitelisted_internal_schema(&key.schema_key) {
+            if key.schema_version == INTERNAL_SCHEMA_VERSION {
+                self.cache.insert(key.clone(), schema.clone());
+                return Ok(schema);
+            }
+        }
+
         if let Some(schema) = self.cache.get(key) {
             return Ok(schema.clone());
         }
@@ -113,6 +121,12 @@ impl SchemaProvider for SqlStoredSchemaProvider<'_> {
     }
 
     async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError> {
+        if let Some(schema) = whitelisted_internal_schema(schema_key) {
+            let key = SchemaKey::new(schema_key.to_string(), INTERNAL_SCHEMA_VERSION.to_string());
+            self.cache.insert(key, schema.clone());
+            return Ok(schema);
+        }
+
         let Some((_, schema)) = self.load_latest_schema_entry(schema_key).await? else {
             return Err(LixError {
                 message: format!("schema '{}' is not stored", schema_key),
@@ -120,6 +134,35 @@ impl SchemaProvider for SqlStoredSchemaProvider<'_> {
         };
 
         Ok(schema)
+    }
+}
+
+fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
+    match schema_key {
+        "lix_state" => Some(json!({
+            "x-lix-key": "lix_state",
+            "x-lix-version": INTERNAL_SCHEMA_VERSION,
+            "x-lix-primary-key": [
+                "/entity_id",
+                "/schema_key",
+                "/file_id"
+            ],
+            "type": "object",
+            "properties": {
+                "entity_id": { "type": "string" },
+                "schema_key": { "type": "string" },
+                "file_id": { "type": "string" },
+                "version_id": { "type": "string" }
+            },
+            "required": [
+                "entity_id",
+                "schema_key",
+                "file_id",
+                "version_id"
+            ],
+            "additionalProperties": true
+        })),
+        _ => None,
     }
 }
 
@@ -333,5 +376,39 @@ mod tests {
             .await
             .expect_err("should fail");
         assert!(err.message.contains("invalid JSON"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn load_latest_uses_internal_whitelist_for_lix_state() {
+        let backend = FakeBackend::default();
+        let mut provider = SqlStoredSchemaProvider::new(&backend);
+
+        let schema = provider
+            .load_latest_schema("lix_state")
+            .await
+            .expect("loads internal schema");
+
+        assert_eq!(schema["x-lix-key"], json!("lix_state"));
+        assert_eq!(
+            backend.query_count_containing("SELECT schema_version, snapshot_content"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn load_schema_uses_internal_whitelist_for_lix_state() {
+        let backend = FakeBackend::default();
+        let mut provider = SqlStoredSchemaProvider::new(&backend);
+
+        let schema = provider
+            .load_schema(&SchemaKey::new("lix_state", "1"))
+            .await
+            .expect("loads internal schema");
+
+        assert_eq!(schema["x-lix-key"], json!("lix_state"));
+        assert_eq!(
+            backend.query_count_containing("SELECT snapshot_content FROM"),
+            0
+        );
     }
 }

@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -38,11 +39,22 @@ pub struct SimulationArgs {
     expect: ExpectDeterministic,
 }
 
-#[derive(Default)]
 pub struct SimulationBootArgs {
     pub key_values: Vec<BootKeyValue>,
     pub active_account: Option<BootAccount>,
     pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    pub access_to_internal: bool,
+}
+
+impl Default for SimulationBootArgs {
+    fn default() -> Self {
+        Self {
+            key_values: Vec::new(),
+            active_account: None,
+            wasm_runtime: None,
+            access_to_internal: true,
+        }
+    }
 }
 
 pub struct SimulationEngine {
@@ -116,10 +128,6 @@ impl SimulationEngine {
         }
     }
 
-    pub fn raw_engine(&self) -> &Engine {
-        &self.engine
-    }
-
     pub async fn install_plugin(
         &self,
         manifest_json: &str,
@@ -177,6 +185,14 @@ impl SimulationEngine {
     }
 }
 
+impl Deref for SimulationEngine {
+    type Target = Engine;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
 impl SimulationArgs {
     pub async fn boot_simulated_engine(
         &self,
@@ -192,6 +208,7 @@ impl SimulationArgs {
                 wasm_runtime: args.wasm_runtime,
                 key_values: args.key_values,
                 active_account: args.active_account,
+                access_to_internal: args.access_to_internal,
             }),
             behavior: self.behavior,
             rematerialization_pending: AtomicBool::new(false),
@@ -209,6 +226,7 @@ impl SimulationArgs {
             }],
             active_account: None,
             wasm_runtime: None,
+            access_to_internal: true,
         }))
         .await
     }

@@ -10,6 +10,14 @@ test("openLix executes SQL against default in-memory sqlite backend", async () =
   await lix.close();
 });
 
+test("openLix disallows querying internal tables", async () => {
+  const lix = await openLix();
+  await expect(lix.execute("SELECT * FROM lix_internal_state_vtable", [])).rejects.toThrow(
+    "lix_internal_* tables are not allowed",
+  );
+  await lix.close();
+});
+
 test("createVersion + switchVersion use the JS API surface", async () => {
   const lix = await openLix();
 
@@ -27,6 +35,31 @@ test("createVersion + switchVersion use the JS API surface", async () => {
   await lix.close();
 });
 
+test("createCheckpoint returns checkpoint metadata and rotates working pointer", async () => {
+  const lix = await openLix();
+  await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+    "js-create-checkpoint",
+    "v1",
+  ]);
+
+  const checkpoint = await lix.createCheckpoint();
+  expect(checkpoint.id.length).toBeGreaterThan(0);
+  expect(checkpoint.changeSetId.length).toBeGreaterThan(0);
+
+  const version = await lix.execute(
+    "SELECT av.version_id, v.commit_id, v.working_commit_id \
+     FROM lix_active_version av \
+     JOIN lix_version v ON v.id = av.version_id \
+     ORDER BY av.id LIMIT 1",
+    [],
+  );
+  expect(version.rows.length).toBe(1);
+  expect(version.rows[0][1]).toEqual({ kind: "Text", value: checkpoint.id });
+  expect(version.rows[0][2]).not.toEqual({ kind: "Text", value: checkpoint.id });
+
+  await lix.close();
+});
+
 test("installPlugin stores plugin metadata", async () => {
   const lix = await openLix();
 
@@ -41,12 +74,7 @@ test("installPlugin stores plugin metadata", async () => {
   ]);
 
   await lix.installPlugin({ manifestJson, wasmBytes });
-
-  const result = await lix.execute(
-    "SELECT key FROM lix_internal_plugin WHERE key = 'plugin_json'",
-  );
-  expect(result.rows.length).toBe(1);
-  expect(result.rows[0][0]).toEqual({ kind: "Text", value: "plugin_json" });
+  await expect(lix.installPlugin({ manifestJson, wasmBytes })).resolves.toBeUndefined();
   await lix.close();
 });
 
@@ -97,14 +125,15 @@ test("stateCommitStream emits filtered commit batches", async () => {
   const events = lix.stateCommitStream({ schemaKeys: ["lix_key_value"] });
 
   await lix.execute(
-    "INSERT INTO lix_internal_state_vtable (\
-     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-     ) VALUES (\
-     'state-commit-events-js', 'lix_key_value', 'lix', 'global', 'lix',\
-     '{\"key\":\"state-commit-events-js\",\"value\":\"ok\"}', '1'\
-     )",
-    [],
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["state-commit-events-js", "ok"],
   );
+
+  const secondBatchTrigger = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1",
+    ["state-commit-events-js"],
+  );
+  expect(secondBatchTrigger.rows.length).toBe(1);
 
   const batch = await waitForBatch(events);
   expect(batch).toBeDefined();
@@ -136,13 +165,8 @@ test("observe emits initial and follow-up query results", async () => {
 
   const nextPromise = events.next();
   await lix.execute(
-    "INSERT INTO lix_internal_state_vtable (\
-     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-     ) VALUES (\
-     'observe-js', 'lix_key_value', 'lix', 'global', 'lix',\
-     '{\"key\":\"observe-js\",\"value\":\"ok\"}', '1'\
-     )",
-    [],
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["observe-js", "ok"],
   );
 
   const followUp = await nextPromise;
@@ -170,13 +194,8 @@ test("observe on _by_version view emits follow-up results", async () => {
 
   const nextPromise = events.next();
   await lix.execute(
-    "INSERT INTO lix_internal_state_vtable (\
-     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-     ) VALUES (\
-     'observe-by-version', 'lix_key_value', 'lix', 'global', 'lix',\
-     '{\"key\":\"observe-by-version\",\"value\":\"ok\"}', '1'\
-     )",
-    [],
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["observe-by-version", "ok"],
   );
 
   const followUp = await withTimeout(nextPromise, 1500);
@@ -227,13 +246,8 @@ test("observe stream remains usable after query error", async () => {
   await lix.execute("DROP TABLE observe_recover", []);
   const failingNext = events.next();
   await lix.execute(
-    "INSERT INTO lix_internal_state_vtable (\
-     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-     ) VALUES (\
-     'observe-recover-trigger-1', 'lix_key_value', 'lix', 'global', 'lix',\
-     '{\"key\":\"observe-recover-trigger-1\",\"value\":\"x\"}', '1'\
-     )",
-    [],
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["observe-recover-trigger-1", "x"],
   );
 
   await expect(failingNext).rejects.toThrow(
@@ -245,12 +259,8 @@ test("observe stream remains usable after query error", async () => {
 
   const recoveredNext = events.next();
   await lix.execute(
-    "INSERT INTO lix_internal_state_vtable (\
-     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-     ) VALUES (\
-     'observe-recover-trigger-2', 'lix_key_value', 'lix', 'global', 'lix',\
-     '{\"key\":\"observe-recover-trigger-2\",\"value\":\"x\"}', '1'\
-     )",
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["observe-recover-trigger-2", "x"],
     [],
   );
 

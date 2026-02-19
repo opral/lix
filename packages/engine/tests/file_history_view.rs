@@ -190,6 +190,7 @@ async fn boot_engine_with_json_plugin(
             key_values: Vec::new(),
             active_account: None,
             wasm_runtime: Some(runtime),
+            access_to_internal: true,
         }))
         .await
         .expect("boot_simulated_engine should succeed");
