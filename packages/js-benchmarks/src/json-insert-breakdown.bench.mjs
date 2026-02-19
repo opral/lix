@@ -19,7 +19,7 @@ const MANIFEST = {
   key: "plugin_json",
   runtime: "wasm-component-v1",
   api_version: "0.1.0",
-  detect_changes_glob: "*.json",
+  match: { path_glob: "*.json" },
   entry: "plugin.wasm",
 };
 

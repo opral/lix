@@ -3,7 +3,7 @@ use crate::exports::lix::plugin::api::{DetectStateContext, EntityChange, File, P
 use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, ENTITY_SCHEMA_VERSION};
 use crate::ROOT_ENTITY_ID;
 use markdown::mdast::{Node, Root};
-use markdown::{to_mdast, Constructs, ParseOptions};
+use markdown::{to_mdast, ParseOptions};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use strsim::normalized_levenshtein;
@@ -38,6 +38,13 @@ pub(crate) fn detect_changes(
     after: File,
     state_context: Option<DetectStateContext>,
 ) -> Result<Vec<EntityChange>, PluginError> {
+    if !is_markdown_path(&after.path) {
+        return Ok(Vec::new());
+    }
+
+    let after_markdown = decode_markdown_bytes(&after.data)?;
+    let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
+
     let before_projection = parse_state_context_projection(state_context.as_ref())?;
 
     let BeforeProjection {
@@ -45,8 +52,6 @@ pub(crate) fn detect_changes(
         blocks_by_id: before_by_id,
     } = before_projection;
 
-    let after_markdown = decode_markdown_bytes(&after.data)?;
-    let after_candidates = parse_top_level_block_candidates(&after_markdown)?;
     let after_blocks =
         assign_ids_with_existing_state(after_candidates, &before_order, &before_by_id);
     let after_order = after_blocks
@@ -105,15 +110,17 @@ fn parse_state_context_projection(
     state_context: Option<&DetectStateContext>,
 ) -> Result<BeforeProjection, PluginError> {
     let Some(state_context) = state_context else {
-        return Err(PluginError::InvalidInput(
-            "state_context is required for markdown detect_changes".to_string(),
-        ));
+        return Ok(BeforeProjection {
+            order: Vec::new(),
+            blocks_by_id: BTreeMap::new(),
+        });
     };
-    let rows = state_context.active_state.as_ref().ok_or_else(|| {
-        PluginError::InvalidInput(
-            "state_context.active_state is required for markdown detect_changes".to_string(),
-        )
-    })?;
+    let Some(rows) = state_context.active_state.as_ref() else {
+        return Ok(BeforeProjection {
+            order: Vec::new(),
+            blocks_by_id: BTreeMap::new(),
+        });
+    };
 
     let mut document_order = None::<Vec<String>>;
     let mut blocks_by_id = BTreeMap::<String, ParsedBlock>::new();
@@ -657,8 +664,13 @@ fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, PluginError> {
         })
 }
 
+fn is_markdown_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.ends_with(".md") || path.ends_with(".mdx")
+}
+
 fn parse_options_all_extensions() -> ParseOptions {
-    let mut options = ParseOptions::mdx();
+    let mut options = ParseOptions::gfm();
     let constructs = &mut options.constructs;
 
     constructs.frontmatter = true;
@@ -670,17 +682,7 @@ fn parse_options_all_extensions() -> ParseOptions {
     constructs.gfm_task_list_item = true;
     constructs.math_flow = true;
     constructs.math_text = true;
-
-    ensure_mdx_constructs(constructs);
     options
-}
-
-fn ensure_mdx_constructs(constructs: &mut Constructs) {
-    constructs.mdx_esm = true;
-    constructs.mdx_expression_flow = true;
-    constructs.mdx_expression_text = true;
-    constructs.mdx_jsx_flow = true;
-    constructs.mdx_jsx_text = true;
 }
 
 fn node_type_name(node: &Node) -> &'static str {

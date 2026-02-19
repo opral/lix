@@ -1,9 +1,11 @@
 use crate::cel::CelEvaluator;
 use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
-use crate::plugin::types::{InstalledPlugin, PluginManifest, PluginRuntime, StateContextColumn};
+use crate::plugin::matching::select_best_glob_match;
+use crate::plugin::types::{
+    InstalledPlugin, PluginContentType, PluginManifest, PluginRuntime, StateContextColumn,
+};
 use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
-use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -153,12 +155,18 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
     for write in writes {
         let has_before_context = write.before_path.is_some() || write.before_data.is_some();
         let before_path = write.before_path.as_deref().unwrap_or(write.path.as_str());
+        let before_content_type = write
+            .before_data
+            .as_deref()
+            .map(classify_content_type_from_bytes);
         let before_plugin = if has_before_context {
-            select_plugin_for_path(before_path, installed_plugins)
+            select_plugin_for_path(before_path, before_content_type, installed_plugins)
         } else {
             None
         };
-        let after_plugin = select_plugin_for_path(&write.path, installed_plugins);
+        let after_content_type = classify_content_type_from_bytes(&write.after_data);
+        let after_plugin =
+            select_plugin_for_path(&write.path, Some(after_content_type), installed_plugins);
 
         if let Some(previous_plugin) = before_plugin {
             let plugin_changed = after_plugin
@@ -589,7 +597,8 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
-        let Some(plugin) = select_plugin_for_path(&descriptor.path, &installed_plugins) else {
+        let Some(plugin) = select_plugin_for_path(&descriptor.path, None, &installed_plugins)
+        else {
             continue;
         };
 
@@ -647,36 +656,32 @@ fn select_plugin_for_file<'a>(
     descriptor: &FileDescriptorRow,
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
-    plugins
-        .iter()
-        .find(|plugin| glob_matches_path(&plugin.detect_changes_glob, &descriptor.path))
+    select_plugin_for_path(&descriptor.path, None, plugins)
 }
 
 fn select_plugin_for_path<'a>(
     path: &str,
+    file_content_type: Option<PluginContentType>,
     plugins: &'a [InstalledPlugin],
 ) -> Option<&'a InstalledPlugin> {
-    plugins
-        .iter()
-        .find(|plugin| glob_matches_path(&plugin.detect_changes_glob, path))
+    select_best_glob_match(
+        path,
+        file_content_type,
+        plugins,
+        |plugin| plugin.path_glob.as_str(),
+        |plugin| plugin.content_type,
+    )
 }
 
-fn glob_matches_path(glob: &str, path: &str) -> bool {
-    let normalized_glob = glob.trim();
-    let normalized_path = path.trim();
-    if normalized_glob.is_empty() || normalized_path.is_empty() {
-        return false;
+fn classify_content_type_from_bytes(data: &[u8]) -> PluginContentType {
+    if data.contains(&0) {
+        return PluginContentType::Binary;
     }
-    if normalized_glob == "*" || normalized_glob == "**/*" {
-        return true;
+    if std::str::from_utf8(data).is_ok() {
+        PluginContentType::Text
+    } else {
+        PluginContentType::Binary
     }
-
-    GlobBuilder::new(normalized_glob)
-        .literal_separator(false)
-        .case_insensitive(true)
-        .build()
-        .map(|compiled| compiled.compile_matcher().is_match(normalized_path))
-        .unwrap_or(false)
 }
 
 fn plugin_detect_emits_complete_diff(plugin: &InstalledPlugin) -> bool {
@@ -1237,16 +1242,20 @@ fn parse_installed_plugin_row(row: &[Value]) -> Result<InstalledPlugin, LixError
         message: format!("plugin materialization: unsupported runtime '{runtime_raw}'"),
     })?;
     let api_version = text_required(row, 2, "api_version")?;
-    let detect_changes_glob = text_required(row, 3, "detect_changes_glob")?;
+    let path_glob = text_required(row, 3, "detect_changes_glob")?;
     let entry = text_required(row, 4, "entry")?;
     let manifest_json = text_required(row, 5, "manifest_json")?;
     let wasm = blob_required(row, 6, "wasm")?;
+    let content_type = serde_json::from_str::<PluginManifest>(&manifest_json)
+        .ok()
+        .and_then(|manifest| manifest.file_match.content_type);
 
     Ok(InstalledPlugin {
         key,
         runtime,
         api_version,
-        detect_changes_glob,
+        path_glob,
+        content_type,
         entry,
         manifest_json,
         wasm,
@@ -1418,11 +1427,14 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 #[cfg(test)]
 mod tests {
     use super::{
-        append_implicit_tombstones_for_projection, glob_matches_path,
-        load_or_init_plugin_component, resolve_state_context_columns, CachedPluginComponent,
-        PluginEntityChange, PluginEntityKey,
+        append_implicit_tombstones_for_projection, classify_content_type_from_bytes,
+        load_or_init_plugin_component, resolve_state_context_columns, select_plugin_for_path,
+        CachedPluginComponent, PluginEntityChange, PluginEntityKey,
     };
-    use crate::plugin::types::{InstalledPlugin, PluginRuntime, StateContextColumn};
+    use crate::plugin::matching::glob_matches_path;
+    use crate::plugin::types::{
+        InstalledPlugin, PluginContentType, PluginRuntime, StateContextColumn,
+    };
     use crate::{LixError, WasmComponentInstance, WasmLimits, WasmRuntime};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
@@ -1435,6 +1447,23 @@ mod tests {
     }
 
     struct NoopComponent;
+
+    fn test_plugin(
+        key: &str,
+        path_glob: &str,
+        content_type: Option<PluginContentType>,
+    ) -> InstalledPlugin {
+        InstalledPlugin {
+            key: key.to_string(),
+            runtime: PluginRuntime::WasmComponentV1,
+            api_version: "0.1.0".to_string(),
+            path_glob: path_glob.to_string(),
+            content_type,
+            entry: "plugin.wasm".to_string(),
+            manifest_json: "{}".to_string(),
+            wasm: vec![1],
+        }
+    }
 
     #[async_trait(?Send)]
     impl WasmRuntime for CountingRuntime {
@@ -1538,18 +1567,63 @@ mod tests {
     }
 
     #[test]
+    fn select_plugin_prefers_specific_glob_over_catch_all() {
+        let plugins = vec![
+            test_plugin("text_plugin", "*", None),
+            test_plugin("plugin_md_v2", "*.{md,mdx}", None),
+        ];
+
+        let markdown_plugin = select_plugin_for_path("/docs/readme.md", None, &plugins)
+            .expect("markdown should match");
+        assert_eq!(markdown_plugin.key, "plugin_md_v2");
+
+        let fallback_plugin = select_plugin_for_path("/docs/data.json", None, &plugins)
+            .expect("catch-all should match non-markdown");
+        assert_eq!(fallback_plugin.key, "text_plugin");
+    }
+
+    #[test]
+    fn select_plugin_applies_content_type_filter_when_available() {
+        let plugins = vec![
+            test_plugin("text_plugin", "*", Some(PluginContentType::Text)),
+            test_plugin("binary_plugin", "*", Some(PluginContentType::Binary)),
+        ];
+
+        let selected = select_plugin_for_path(
+            "/images/logo.png",
+            Some(PluginContentType::Binary),
+            &plugins,
+        )
+        .expect("binary plugin should match");
+        assert_eq!(selected.key, "binary_plugin");
+    }
+
+    #[test]
+    fn classify_content_type_detects_text_and_binary() {
+        assert_eq!(
+            classify_content_type_from_bytes(br#"{"hello":"world"}"#),
+            PluginContentType::Text
+        );
+        assert_eq!(
+            classify_content_type_from_bytes(&[0x89, 0x50, 0x4e, 0x47]),
+            PluginContentType::Binary
+        );
+    }
+
+    #[test]
     fn state_context_columns_disabled_by_default() {
         let plugin = InstalledPlugin {
             key: "k".to_string(),
             runtime: PluginRuntime::WasmComponentV1,
             api_version: "0.1.0".to_string(),
-            detect_changes_glob: "*.md".to_string(),
+            path_glob: "*.md".to_string(),
+            content_type: None,
             entry: "plugin.wasm".to_string(),
             manifest_json: r#"{
                 "key":"k",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md"
+                "match":{"path_glob":"*.md"}
             }"#
             .to_string(),
             wasm: vec![1],
@@ -1565,13 +1639,14 @@ mod tests {
             key: "k".to_string(),
             runtime: PluginRuntime::WasmComponentV1,
             api_version: "0.1.0".to_string(),
-            detect_changes_glob: "*.md".to_string(),
+            path_glob: "*.md".to_string(),
+            content_type: None,
             entry: "plugin.wasm".to_string(),
             manifest_json: r#"{
                 "key":"k",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true
@@ -1600,13 +1675,14 @@ mod tests {
             key: "k".to_string(),
             runtime: PluginRuntime::WasmComponentV1,
             api_version: "0.1.0".to_string(),
-            detect_changes_glob: "*.md".to_string(),
+            path_glob: "*.md".to_string(),
+            content_type: None,
             entry: "plugin.wasm".to_string(),
             manifest_json: r#"{
                 "key":"k",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.md",
+                "match":{"path_glob":"*.md"},
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
@@ -1636,7 +1712,8 @@ mod tests {
             key: "k".to_string(),
             runtime: PluginRuntime::WasmComponentV1,
             api_version: "0.1.0".to_string(),
-            detect_changes_glob: "*.json".to_string(),
+            path_glob: "*.json".to_string(),
+            content_type: None,
             entry: "plugin.wasm".to_string(),
             manifest_json: "{}".to_string(),
             wasm: vec![1],

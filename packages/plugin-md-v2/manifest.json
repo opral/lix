@@ -2,7 +2,10 @@
   "key": "plugin_md_v2",
   "runtime": "wasm-component-v1",
   "api_version": "0.1.0",
-  "detect_changes_glob": "*.{md,mdx}",
+  "match": {
+    "path_glob": "*.{md,mdx}",
+    "content_type": "text"
+  },
   "detect_changes": {
     "state_context": {
       "include_active_state": true,

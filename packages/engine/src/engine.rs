@@ -520,7 +520,11 @@ impl Engine {
         let mut plugin_changes_committed = false;
         let result = match output.postprocess {
             None => {
-                let result = self.backend.execute(&output.sql, &output.params).await?;
+                let result = execute_prepared_with_backend(
+                    self.backend.as_ref(),
+                    &output.prepared_statements,
+                )
+                .await?;
                 let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
                     mutation.operation == MutationOperation::Insert && !mutation.untracked
                 });
@@ -531,7 +535,12 @@ impl Engine {
             }
             Some(postprocess_plan) => {
                 let mut transaction = self.backend.begin_transaction().await?;
-                let result = match transaction.execute(&output.sql, &output.params).await {
+                let result = match execute_prepared_with_transaction(
+                    transaction.as_mut(),
+                    &output.prepared_statements,
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(error) => {
                         let _ = transaction.rollback().await;
@@ -585,7 +594,7 @@ impl Engine {
                     }
                 }
                 let mut followup_functions = functions.clone();
-                let followup_sql = match postprocess_plan {
+                let followup_statements = match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => match build_update_followup_sql(
                         transaction.as_mut(),
                         &plan,
@@ -596,7 +605,7 @@ impl Engine {
                     )
                     .await
                     {
-                        Ok(sql) => sql,
+                        Ok(statements) => statements,
                         Err(error) => {
                             let _ = transaction.rollback().await;
                             return Err(error);
@@ -613,18 +622,19 @@ impl Engine {
                     )
                     .await
                     {
-                        Ok(sql) => sql,
+                        Ok(statements) => statements,
                         Err(error) => {
                             let _ = transaction.rollback().await;
                             return Err(error);
                         }
                     },
                 };
-                if !followup_sql.is_empty() {
-                    if let Err(error) = transaction.execute(&followup_sql, &[]).await {
-                        let _ = transaction.rollback().await;
-                        return Err(error);
-                    }
+                if let Err(error) =
+                    execute_prepared_with_transaction(transaction.as_mut(), &followup_statements)
+                        .await
+                {
+                    let _ = transaction.rollback().await;
+                    return Err(error);
                 }
                 transaction.commit().await?;
                 plugin_changes_committed = true;
@@ -1036,7 +1046,9 @@ impl Engine {
         let mut plugin_changes_committed = false;
         let result = match output.postprocess {
             None => {
-                let result = transaction.execute(&output.sql, &output.params).await?;
+                let result =
+                    execute_prepared_with_transaction(transaction, &output.prepared_statements)
+                        .await?;
                 let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
                     mutation.operation == MutationOperation::Insert && !mutation.untracked
                 });
@@ -1046,7 +1058,9 @@ impl Engine {
                 result
             }
             Some(postprocess_plan) => {
-                let result = transaction.execute(&output.sql, &output.params).await?;
+                let result =
+                    execute_prepared_with_transaction(transaction, &output.prepared_statements)
+                        .await?;
                 match &postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         if should_refresh_file_cache {
@@ -1081,7 +1095,7 @@ impl Engine {
                     }
                 }
                 let mut followup_functions = functions.clone();
-                let followup_sql = match postprocess_plan {
+                let followup_statements = match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         build_update_followup_sql(
                             transaction,
@@ -1106,9 +1120,7 @@ impl Engine {
                         .await?
                     }
                 };
-                if !followup_sql.is_empty() {
-                    transaction.execute(&followup_sql, &[]).await?;
-                }
+                execute_prepared_with_transaction(transaction, &followup_statements).await?;
                 plugin_changes_committed = true;
                 result
             }
@@ -2452,9 +2464,11 @@ impl Engine {
                 params,
             )
         };
-        let backend = TransactionBackendAdapter::new(transaction);
-        let output = preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?;
-        backend.execute(&output.sql, &output.params).await?;
+        let output = {
+            let backend = TransactionBackendAdapter::new(transaction);
+            preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?
+        };
+        execute_prepared_with_transaction(transaction, &output.prepared_statements).await?;
 
         Ok(())
     }
@@ -2819,6 +2833,30 @@ impl Engine {
         )
         .await
     }
+}
+
+async fn execute_prepared_with_backend(
+    backend: &dyn LixBackend,
+    statements: &[crate::sql::PreparedStatement],
+) -> Result<QueryResult, LixError> {
+    let mut last_result = QueryResult { rows: Vec::new() };
+    for statement in statements {
+        last_result = backend.execute(&statement.sql, &statement.params).await?;
+    }
+    Ok(last_result)
+}
+
+async fn execute_prepared_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    statements: &[crate::sql::PreparedStatement],
+) -> Result<QueryResult, LixError> {
+    let mut last_result = QueryResult { rows: Vec::new() };
+    for statement in statements {
+        last_result = transaction
+            .execute(&statement.sql, &statement.params)
+            .await?;
+    }
+    Ok(last_result)
 }
 
 #[cfg(test)]
@@ -4159,7 +4197,7 @@ async fn upsert_plugin_record(
                 Value::Text(manifest.key.clone()),
                 Value::Text(manifest.runtime.as_str().to_string()),
                 Value::Text(manifest.api_version.clone()),
-                Value::Text(manifest.detect_changes_glob.clone()),
+                Value::Text(manifest.file_match.path_glob.clone()),
                 Value::Text(manifest.entry_or_default().to_string()),
                 Value::Text(manifest_json.to_string()),
                 Value::Blob(wasm_bytes.to_vec()),
@@ -4775,7 +4813,8 @@ mod tests {
                 key: "k".to_string(),
                 runtime: PluginRuntime::WasmComponentV1,
                 api_version: "0.1.0".to_string(),
-                detect_changes_glob: "*.json".to_string(),
+                path_glob: "*.json".to_string(),
+                content_type: None,
                 entry: "plugin.wasm".to_string(),
                 manifest_json: "{}".to_string(),
                 wasm: vec![0],

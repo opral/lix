@@ -19,6 +19,7 @@ pub(crate) fn merge_rewrite_output(
         base.postprocess = next.postprocess.take();
     }
     base.statements.extend(next.statements);
+    base.params.extend(next.params);
     base.registrations.extend(next.registrations);
     base.mutations.extend(next.mutations);
     base.update_validations.extend(next.update_validations);
@@ -32,6 +33,7 @@ pub(crate) fn rewrite_vtable_inserts<P: LixFunctionProvider>(
     writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError> {
     let mut statements = Vec::new();
+    let mut generated_params = Vec::new();
     let mut registrations = Vec::new();
     let mut mutations = Vec::new();
 
@@ -44,12 +46,14 @@ pub(crate) fn rewrite_vtable_inserts<P: LixFunctionProvider>(
             });
         };
         statements.extend(rewritten.statements);
+        generated_params.extend(rewritten.params);
         registrations.extend(rewritten.registrations);
         mutations.extend(rewritten.mutations);
     }
 
     Ok(RewriteOutput {
         statements,
+        params: generated_params,
         registrations,
         postprocess: None,
         mutations,
@@ -66,6 +70,8 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
     writer_key: Option<&str>,
 ) -> Result<RewriteOutput, LixError> {
     let mut statements = Vec::new();
+    let mut generated_params = Vec::new();
+    let mut generated_param_offset = 0usize;
     let mut registrations = Vec::new();
     let mut mutations = Vec::new();
 
@@ -74,6 +80,7 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
             backend,
             insert,
             params,
+            generated_param_offset,
             detected_file_domain_changes,
             writer_key,
             functions,
@@ -85,12 +92,15 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
             });
         };
         statements.extend(rewritten.statements);
+        generated_params.extend(rewritten.params);
+        generated_param_offset = generated_params.len();
         registrations.extend(rewritten.registrations);
         mutations.extend(rewritten.mutations);
     }
 
     Ok(RewriteOutput {
         statements,
+        params: generated_params,
         registrations,
         postprocess: None,
         mutations,
