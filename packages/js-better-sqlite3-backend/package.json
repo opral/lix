@@ -17,7 +17,6 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsc -p tsconfig.json --noEmit && vitest run",
-    "test:watch": "tsc -p tsconfig.json --noEmit && vitest run",
     "clean": "rm -rf ./dist ./node_modules"
   },
   "engines": {
