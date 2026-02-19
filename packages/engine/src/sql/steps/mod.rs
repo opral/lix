@@ -16,3 +16,4 @@ pub(crate) mod state_pushdown;
 pub mod stored_schema;
 pub mod vtable_read;
 pub mod vtable_write;
+pub mod working_projection_refresh;

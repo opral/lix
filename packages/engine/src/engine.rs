@@ -56,7 +56,7 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select,
     SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -68,8 +68,6 @@ use std::sync::RwLock;
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-const WORKING_PROJECTION_METADATA: &str = "{\"lix_internal_working_projection\":true}";
-
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
@@ -142,6 +140,14 @@ impl<'a> EngineTransaction<'a> {
         if !self.engine.access_to_internal {
             reject_internal_table_access(sql)?;
         }
+        self.execute_with_access(sql, params).await
+    }
+
+    async fn execute_with_access(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
         let previous_active_version_id = self.active_version_id.clone();
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             message: "transaction is no longer active".to_string(),
@@ -411,9 +417,8 @@ impl Engine {
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
         if read_only_query {
-            self.maybe_refresh_working_change_projection_with_backend_from_statements(
+            self.maybe_refresh_working_change_projection_for_read_query(
                 self.backend.as_ref(),
-                &parsed_statements,
                 &active_version_id,
             )
             .await?;
@@ -905,9 +910,8 @@ impl Engine {
         ) = {
             let backend = TransactionBackendAdapter::new(transaction);
             if read_only_query {
-                self.maybe_refresh_working_change_projection_with_backend_from_statements(
+                self.maybe_refresh_working_change_projection_for_read_query(
                     &backend,
-                    &parsed_statements,
                     active_version_id.as_str(),
                 )
                 .await?;
@@ -1295,409 +1299,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn maybe_refresh_working_change_projection_with_backend_from_statements(
-        &self,
-        backend: &dyn LixBackend,
-        statements: &[Statement],
-        active_version_id: &str,
-    ) -> Result<(), LixError> {
-        if !working_change_projection_required_for_statements(statements) {
-            return Ok(());
-        }
-
-        self.refresh_working_change_projection_with_backend(backend, active_version_id)
-            .await
-    }
-
-    async fn refresh_working_change_projection_with_backend(
+    async fn maybe_refresh_working_change_projection_for_read_query(
         &self,
         backend: &dyn LixBackend,
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        let version_pointer_untracked = backend
-            .execute(
-                "SELECT \
-                   snapshot_content \
-                 FROM lix_internal_state_untracked \
-                 WHERE schema_key = $1 \
-                   AND entity_id = $2 \
-                   AND file_id = $3 \
-                   AND version_id = $4 \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC \
-                 LIMIT 1",
-                &[
-                    Value::Text(version_pointer_schema_key().to_string()),
-                    Value::Text(active_version_id.to_string()),
-                    Value::Text(version_pointer_file_id().to_string()),
-                    Value::Text(version_pointer_storage_version_id().to_string()),
-                ],
-            )
-            .await?;
-        let working_commit_id =
-            first_row_json_text_field(&version_pointer_untracked, "working_commit_id")?;
-        let tip_commit_id = first_row_json_text_field(&version_pointer_untracked, "commit_id")?;
-        let (working_commit_id, tip_commit_id) =
-            if let (Some(working_commit_id), Some(tip_commit_id)) =
-                (working_commit_id, tip_commit_id)
-            {
-                (working_commit_id, tip_commit_id)
-            } else {
-                let version_pointer_table = format!(
-                    "lix_internal_state_materialized_v1_{}",
-                    version_pointer_schema_key()
-                );
-                let version_pointer_sql = format!(
-                    "SELECT \
-                       snapshot_content \
-                     FROM {table} \
-                     WHERE schema_key = '{schema_key}' \
-                       AND entity_id = $1 \
-                       AND file_id = '{file_id}' \
-                       AND version_id = '{version_id}' \
-                       AND is_tombstone = 0 \
-                       AND snapshot_content IS NOT NULL \
-                     LIMIT 1",
-                    table = version_pointer_table,
-                    schema_key = escape_sql_string(version_pointer_schema_key()),
-                    file_id = escape_sql_string(version_pointer_file_id()),
-                    version_id = escape_sql_string(version_pointer_storage_version_id()),
-                );
-                let version_pointer = backend
-                    .execute(
-                        &version_pointer_sql,
-                        &[Value::Text(active_version_id.to_string())],
-                    )
-                    .await?;
-                let Some(working_commit_id) =
-                    first_row_json_text_field(&version_pointer, "working_commit_id")?
-                else {
-                    return Ok(());
-                };
-                let Some(tip_commit_id) = first_row_json_text_field(&version_pointer, "commit_id")?
-                else {
-                    return Ok(());
-                };
-                (working_commit_id, tip_commit_id)
-            };
-
-        let change_set_untracked = backend
-            .execute(
-                "SELECT \
-                   snapshot_content \
-                 FROM lix_internal_state_untracked \
-                 WHERE schema_key = 'lix_commit' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = $2 \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC \
-                 LIMIT 1",
-                &[
-                    Value::Text(working_commit_id.clone()),
-                    Value::Text(GLOBAL_VERSION_ID.to_string()),
-                ],
-            )
-            .await?;
-        let working_change_set_id =
-            first_row_json_text_field(&change_set_untracked, "change_set_id")?;
-        let working_change_set_id = if let Some(working_change_set_id) = working_change_set_id {
-            working_change_set_id
-        } else {
-            let commit_table = format!("lix_internal_state_materialized_v1_lix_commit");
-            let change_set_sql = format!(
-                "SELECT \
-                   snapshot_content \
-                 FROM {table} \
-                 WHERE schema_key = 'lix_commit' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = '{version_id}' \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL \
-                 LIMIT 1",
-                table = commit_table,
-                version_id = escape_sql_string(GLOBAL_VERSION_ID),
-            );
-            let change_set_row = backend
-                .execute(&change_set_sql, &[Value::Text(working_commit_id.clone())])
-                .await?;
-            let Some(working_change_set_id) =
-                first_row_json_text_field(&change_set_row, "change_set_id")?
-            else {
-                return Ok(());
-            };
-            working_change_set_id
-        };
-
-        backend
-            .execute(
-                "DELETE FROM lix_internal_state_untracked \
-                 WHERE metadata = $1 \
-                   AND ( \
-                     (schema_key = 'lix_change_set_element' AND entity_id LIKE $2) \
-                     OR (schema_key = 'lix_change' AND entity_id LIKE $3) \
-                   )",
-                &[
-                    Value::Text(WORKING_PROJECTION_METADATA.to_string()),
-                    Value::Text(format!("{working_change_set_id}~%")),
-                    Value::Text(format!("working_projection:%:{working_change_set_id}:%")),
-                ],
-            )
-            .await?;
-
-        let commit_rows = backend
-            .execute(
-                "SELECT \
-                   snapshot_content \
-                 FROM lix_internal_state_materialized_v1_lix_commit \
-                 WHERE schema_key = 'lix_commit' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL",
-                &[],
-            )
-            .await?;
-        let mut change_set_by_commit_id = BTreeMap::new();
-        for row in &commit_rows.rows {
-            let raw = text_column(row, 0, "snapshot_content")?;
-            if let Some((commit_id, change_set_id)) = parse_commit_snapshot(&raw)? {
-                change_set_by_commit_id.insert(commit_id, change_set_id);
-            }
-        }
-        if change_set_by_commit_id.is_empty() {
-            return Ok(());
-        }
-
-        let edge_rows = backend
-            .execute(
-                "SELECT \
-                   snapshot_content \
-                 FROM lix_internal_state_materialized_v1_lix_commit_edge \
-                 WHERE schema_key = 'lix_commit_edge' \
-                   AND file_id = 'lix' \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL",
-                &[],
-            )
-            .await?;
-        let mut parents_by_child: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for row in &edge_rows.rows {
-            let raw = text_column(row, 0, "snapshot_content")?;
-            if let Some((parent_id, child_id)) = parse_commit_edge_snapshot(&raw)? {
-                parents_by_child
-                    .entry(child_id)
-                    .or_default()
-                    .push(parent_id);
-            }
-        }
-
-        let baseline_commit_id = parents_by_child
-            .get(&working_commit_id)
-            .and_then(|parents| parents.first())
-            .cloned()
-            .unwrap_or_else(|| working_commit_id.clone());
-
-        let mut depth_by_commit_id: BTreeMap<String, usize> = BTreeMap::new();
-        let mut queue = VecDeque::new();
-        queue.push_back((tip_commit_id.clone(), 0usize));
-        while let Some((commit_id, depth)) = queue.pop_front() {
-            if commit_id == baseline_commit_id {
-                continue;
-            }
-            if let Some(existing_depth) = depth_by_commit_id.get(&commit_id) {
-                if *existing_depth <= depth {
-                    continue;
-                }
-            }
-            depth_by_commit_id.insert(commit_id.clone(), depth);
-            if let Some(parents) = parents_by_child.get(&commit_id) {
-                for parent_id in parents {
-                    queue.push_back((parent_id.clone(), depth + 1));
-                }
-            }
-        }
-        if depth_by_commit_id.is_empty() {
-            return Ok(());
-        }
-
-        let cse_rows = backend
-            .execute(
-                "SELECT \
-                   snapshot_content, created_at \
-                 FROM lix_internal_state_materialized_v1_lix_change_set_element \
-                 WHERE schema_key = 'lix_change_set_element' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL",
-                &[],
-            )
-            .await?;
-        let mut cse_by_change_set_id: BTreeMap<String, Vec<WorkingProjectionChangeSetElement>> =
-            BTreeMap::new();
-        for row in &cse_rows.rows {
-            let raw = text_column(row, 0, "snapshot_content")?;
-            let created_at = text_column(row, 1, "created_at")?;
-            if let Some(cse) = parse_change_set_element_snapshot(&raw, created_at)? {
-                cse_by_change_set_id
-                    .entry(cse.change_set_id.clone())
-                    .or_default()
-                    .push(cse);
-            }
-        }
-        if cse_by_change_set_id.is_empty() {
-            return Ok(());
-        }
-
-        let mut selected_by_entity: BTreeMap<
-            (String, String, String),
-            WorkingProjectionSelectedChange,
-        > = BTreeMap::new();
-        for (commit_id, depth) in &depth_by_commit_id {
-            let Some(change_set_id) = change_set_by_commit_id.get(commit_id) else {
-                continue;
-            };
-            let Some(cse_rows) = cse_by_change_set_id.get(change_set_id) else {
-                continue;
-            };
-            for cse in cse_rows {
-                if !is_checkpointable_schema_key(&cse.schema_key) {
-                    continue;
-                }
-                let key = (
-                    cse.entity_id.clone(),
-                    cse.schema_key.clone(),
-                    cse.file_id.clone(),
-                );
-                let next = WorkingProjectionSelectedChange {
-                    change_id: cse.change_id.clone(),
-                    depth: *depth,
-                    created_at: cse.created_at.clone(),
-                };
-                match selected_by_entity.get(&key) {
-                    None => {
-                        selected_by_entity.insert(key, next);
-                    }
-                    Some(existing) => {
-                        if next.depth < existing.depth
-                            || (next.depth == existing.depth
-                                && next.created_at.as_str() > existing.created_at.as_str())
-                        {
-                            selected_by_entity.insert(key, next);
-                        }
-                    }
-                }
-            }
-        }
-        if selected_by_entity.is_empty() {
-            return Ok(());
-        }
-
-        let mut projected_change_ids = Vec::new();
-        let mut projected_change_set = BTreeSet::new();
-        for selected in selected_by_entity.values() {
-            if projected_change_set.insert(selected.change_id.clone()) {
-                projected_change_ids.push(selected.change_id.clone());
-            }
-        }
-
-        let mut placeholders = Vec::new();
-        let mut change_params = Vec::new();
-        for (index, change_id) in projected_change_ids.iter().enumerate() {
-            placeholders.push(format!("${}", index + 1));
-            change_params.push(Value::Text(change_id.clone()));
-        }
-        let change_sql = format!(
-            "SELECT \
-               c.id, c.schema_version, c.plugin_key, c.created_at, c.metadata, s.content \
-             FROM lix_internal_change c \
-             LEFT JOIN lix_internal_snapshot s \
-               ON s.id = c.snapshot_id \
-             WHERE c.id IN ({})",
-            placeholders.join(", ")
-        );
-        let change_rows = backend.execute(&change_sql, &change_params).await?;
-        let mut change_by_id = BTreeMap::new();
-        for row in &change_rows.rows {
-            let id = text_column(row, 0, "id")?;
-            let schema_version = text_column(row, 1, "schema_version")?;
-            let plugin_key = text_column(row, 2, "plugin_key")?;
-            let created_at = text_column(row, 3, "created_at")?;
-            let metadata = optional_json_column(row.get(4), "metadata")?;
-            let snapshot_content = optional_json_column(row.get(5), "snapshot_content")?;
-            change_by_id.insert(
-                id,
-                WorkingProjectionChangeRow {
-                    schema_version,
-                    plugin_key,
-                    created_at,
-                    metadata,
-                    snapshot_content,
-                },
-            );
-        }
-
-        for ((entity_id, schema_key, file_id), selected) in &selected_by_entity {
-            let Some(change_row) = change_by_id.get(&selected.change_id) else {
-                continue;
-            };
-
-            let change_id = build_working_projection_change_id(
-                active_version_id,
-                &working_change_set_id,
-                entity_id,
-                schema_key,
-                file_id,
-            );
-            let change_snapshot = serde_json::json!({
-                "id": change_id,
-                "entity_id": entity_id,
-                "schema_key": schema_key,
-                "schema_version": change_row.schema_version,
-                "file_id": file_id,
-                "plugin_key": change_row.plugin_key,
-                "created_at": change_row.created_at,
-                "snapshot_content": change_row.snapshot_content,
-                "metadata": change_row.metadata,
-            })
-            .to_string();
-            upsert_working_projection_row(
-                backend,
-                &change_id,
-                "lix_change",
-                GLOBAL_VERSION_ID,
-                "lix",
-                &change_snapshot,
-                "1",
-                &change_row.created_at,
-            )
-            .await?;
-
-            let cse_entity_id = format!("{working_change_set_id}~{change_id}");
-            let cse_snapshot = serde_json::json!({
-                "change_set_id": working_change_set_id,
-                "change_id": change_id,
-                "entity_id": entity_id,
-                "schema_key": schema_key,
-                "file_id": file_id,
-            })
-            .to_string();
-            upsert_working_projection_row(
-                backend,
-                &cse_entity_id,
-                "lix_change_set_element",
-                GLOBAL_VERSION_ID,
-                "lix",
-                &cse_snapshot,
-                "1",
-                &change_row.created_at,
-            )
-            .await?;
-        }
-
-        Ok(())
+        crate::sql::refresh_working_projection_for_read_query(backend, active_version_id).await
     }
 
     async fn collect_execution_side_effects_with_backend_from_statements(
@@ -1998,14 +1605,32 @@ impl Engine {
 
     async fn seed_default_checkpoint_label(&self) -> Result<(), LixError> {
         let existing = self
-            .execute(
-                "SELECT id FROM lix_label WHERE name = $1 LIMIT 1",
-                &[Value::Text("checkpoint".to_string())],
+            .execute_internal(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_label' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL",
+                &[],
                 ExecuteOptions::default(),
             )
             .await?;
-        if !existing.rows.is_empty() {
-            return Ok(());
+        for row in &existing.rows {
+            let Some(value) = row.first() else {
+                continue;
+            };
+            let Value::Text(snapshot_content) = value else {
+                continue;
+            };
+            let parsed: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError {
+                    message: format!("checkpoint label snapshot invalid JSON: {error}"),
+                }
+            })?;
+            if parsed.get("name").and_then(JsonValue::as_str) == Some("checkpoint") {
+                return Ok(());
+            }
         }
 
         let label_id = self.generate_runtime_uuid().await?;
@@ -2050,6 +1675,7 @@ impl Engine {
             .await?
             .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
         if bootstrap_commit_id == GLOBAL_VERSION_ID {
+            self.seed_bootstrap_change_set().await?;
             self.seed_bootstrap_commit().await?;
         }
         self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
@@ -2339,6 +1965,43 @@ impl Engine {
         Ok(())
     }
 
+    async fn seed_bootstrap_change_set(&self) -> Result<(), LixError> {
+        let existing = self
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_change_set' \
+                   AND entity_id = $1 \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = serde_json::json!({
+            "id": GLOBAL_VERSION_ID,
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', 1)",
+            &[
+                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text(snapshot_content),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn seed_default_active_version(&self, version_id: &str) -> Result<(), LixError> {
         let check_sql = format!(
             "SELECT 1 \
@@ -2579,50 +2242,99 @@ impl Engine {
             return Ok(());
         }
 
-        let mut params = Vec::with_capacity(deduped_changes.len() * 10);
-        let mut rows = Vec::with_capacity(deduped_changes.len());
-        for (row_index, change) in deduped_changes.iter().enumerate() {
-            let base = row_index * 10;
-            rows.push(format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6,
-                base + 7,
-                base + 8,
-                base + 9,
-                base + 10
-            ));
-            params.push(Value::Text(change.entity_id.clone()));
-            params.push(Value::Text(change.schema_key.clone()));
-            params.push(Value::Text(change.file_id.clone()));
-            params.push(Value::Text(change.version_id.clone()));
-            params.push(Value::Text(change.plugin_key.clone()));
-            params.push(match &change.snapshot_content {
-                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Text(change.schema_version.clone()));
-            params.push(match &change.metadata {
-                Some(metadata) => Value::Text(metadata.clone()),
-                None => Value::Null,
-            });
-            params.push(match &change.writer_key {
-                Some(writer_key) => Value::Text(writer_key.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Integer(if untracked { 1 } else { 0 }));
-        }
-
-        let sql = format!(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
-             ) VALUES {}",
-            rows.join(", ")
-        );
+        let (sql, params) = if untracked {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 10);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 10;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9,
+                    base + 10
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Integer(1));
+            }
+            (
+                format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        } else {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 9);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 9;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+            }
+            (
+                format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        };
         Box::pin(self.execute_internal(&sql, &params, ExecuteOptions::default())).await?;
 
         Ok(())
@@ -2639,50 +2351,99 @@ impl Engine {
             return Ok(());
         }
 
-        let mut params = Vec::with_capacity(deduped_changes.len() * 10);
-        let mut rows = Vec::with_capacity(deduped_changes.len());
-        for (row_index, change) in deduped_changes.iter().enumerate() {
-            let base = row_index * 10;
-            rows.push(format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6,
-                base + 7,
-                base + 8,
-                base + 9,
-                base + 10
-            ));
-            params.push(Value::Text(change.entity_id.clone()));
-            params.push(Value::Text(change.schema_key.clone()));
-            params.push(Value::Text(change.file_id.clone()));
-            params.push(Value::Text(change.version_id.clone()));
-            params.push(Value::Text(change.plugin_key.clone()));
-            params.push(match &change.snapshot_content {
-                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Text(change.schema_version.clone()));
-            params.push(match &change.metadata {
-                Some(metadata) => Value::Text(metadata.clone()),
-                None => Value::Null,
-            });
-            params.push(match &change.writer_key {
-                Some(writer_key) => Value::Text(writer_key.clone()),
-                None => Value::Null,
-            });
-            params.push(Value::Integer(if untracked { 1 } else { 0 }));
-        }
-
-        let sql = format!(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
-             ) VALUES {}",
-            rows.join(", ")
-        );
+        let (sql, params) = if untracked {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 10);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 10;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9,
+                    base + 10
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Integer(1));
+            }
+            (
+                format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        } else {
+            let mut params = Vec::with_capacity(deduped_changes.len() * 9);
+            let mut rows = Vec::with_capacity(deduped_changes.len());
+            for (row_index, change) in deduped_changes.iter().enumerate() {
+                let base = row_index * 9;
+                rows.push(format!(
+                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                    base + 6,
+                    base + 7,
+                    base + 8,
+                    base + 9
+                ));
+                params.push(Value::Text(change.entity_id.clone()));
+                params.push(Value::Text(change.schema_key.clone()));
+                params.push(Value::Text(change.file_id.clone()));
+                params.push(Value::Text(change.version_id.clone()));
+                params.push(Value::Text(change.plugin_key.clone()));
+                params.push(match &change.snapshot_content {
+                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                    None => Value::Null,
+                });
+                params.push(Value::Text(change.schema_version.clone()));
+                params.push(match &change.metadata {
+                    Some(metadata) => Value::Text(metadata.clone()),
+                    None => Value::Null,
+                });
+                params.push(match &change.writer_key {
+                    Some(writer_key) => Value::Text(writer_key.clone()),
+                    None => Value::Null,
+                });
+            }
+            (
+                format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+                     ) VALUES {}",
+                    rows.join(", ")
+                ),
+                params,
+            )
+        };
         let backend = TransactionBackendAdapter::new(transaction);
         let output = preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?;
         backend.execute(&output.sql, &output.params).await?;
@@ -3751,17 +3512,6 @@ fn should_refresh_file_cache_for_statements(statements: &[Statement]) -> bool {
         .any(statement_targets_file_cache_refresh_table)
 }
 
-fn working_change_projection_required_for_statements(statements: &[Statement]) -> bool {
-    statements.iter().any(|statement| {
-        statement_reads_table_name(statement, "lix_change_set_element")
-            || statement_reads_table_name(statement, "lix_change_set_element_by_version")
-            || statement_reads_table_name(statement, "lix_change_set_element_history")
-            || statement_reads_table_name(statement, "lix_change")
-            || statement_reads_table_name(statement, "lix_change_by_version")
-            || statement_reads_table_name(statement, "lix_change_history")
-    })
-}
-
 #[cfg(test)]
 fn is_query_only_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql_statements(sql) else {
@@ -3831,251 +3581,6 @@ fn object_name_targets_table_name(name: &ObjectName, table_name: &str) -> bool {
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
         .unwrap_or(false)
-}
-
-fn text_column(row: &[Value], index: usize, name: &str) -> Result<String, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            message: format!("working projection row is missing '{name}'"),
-        });
-    };
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        other => Err(LixError {
-            message: format!("working projection '{name}' must be text, got {other:?}"),
-        }),
-    }
-}
-
-fn first_row_json_text_field(
-    result: &QueryResult,
-    field: &str,
-) -> Result<Option<String>, LixError> {
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(value) = row.first() else {
-        return Ok(None);
-    };
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(raw) => parse_json_text_field(raw, field),
-        other => Err(LixError {
-            message: format!(
-                "working projection expected JSON snapshot text for '{field}', got {other:?}"
-            ),
-        }),
-    }
-}
-
-fn parse_json_text_field(raw: &str, field: &str) -> Result<Option<String>, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection snapshot_content invalid JSON: {error}"),
-    })?;
-    let value = parsed
-        .get(field)
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    Ok(value)
-}
-
-#[derive(Debug, Clone)]
-struct WorkingProjectionChangeSetElement {
-    change_set_id: String,
-    change_id: String,
-    entity_id: String,
-    schema_key: String,
-    file_id: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct WorkingProjectionSelectedChange {
-    change_id: String,
-    depth: usize,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct WorkingProjectionChangeRow {
-    schema_version: String,
-    plugin_key: String,
-    created_at: String,
-    metadata: JsonValue,
-    snapshot_content: JsonValue,
-}
-
-fn optional_json_column(value: Option<&Value>, name: &str) -> Result<JsonValue, LixError> {
-    let Some(value) = value else {
-        return Ok(JsonValue::Null);
-    };
-    match value {
-        Value::Null => Ok(JsonValue::Null),
-        Value::Text(raw) => serde_json::from_str(raw).map_err(|error| LixError {
-            message: format!("working projection '{name}' invalid JSON: {error}"),
-        }),
-        other => Err(LixError {
-            message: format!(
-                "working projection '{name}' must be JSON text or null, got {other:?}"
-            ),
-        }),
-    }
-}
-
-fn parse_commit_snapshot(raw: &str) -> Result<Option<(String, String)>, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection commit snapshot invalid JSON: {error}"),
-    })?;
-    let commit_id = parsed
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    let change_set_id = parsed
-        .get("change_set_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    match (commit_id, change_set_id) {
-        (Some(commit_id), Some(change_set_id)) => Ok(Some((commit_id, change_set_id))),
-        _ => Ok(None),
-    }
-}
-
-fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<(String, String)>, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection commit_edge snapshot invalid JSON: {error}"),
-    })?;
-    let parent_id = parsed
-        .get("parent_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    let child_id = parsed
-        .get("child_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    match (parent_id, child_id) {
-        (Some(parent_id), Some(child_id)) => Ok(Some((parent_id, child_id))),
-        _ => Ok(None),
-    }
-}
-
-fn parse_change_set_element_snapshot(
-    raw: &str,
-    created_at: String,
-) -> Result<Option<WorkingProjectionChangeSetElement>, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection change_set_element snapshot invalid JSON: {error}"),
-    })?;
-    let change_set_id = parsed
-        .get("change_set_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    let change_id = parsed
-        .get("change_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    let entity_id = parsed
-        .get("entity_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    let schema_key = parsed
-        .get("schema_key")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    let file_id = parsed
-        .get("file_id")
-        .and_then(JsonValue::as_str)
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty());
-    match (change_set_id, change_id, entity_id, schema_key, file_id) {
-        (
-            Some(change_set_id),
-            Some(change_id),
-            Some(entity_id),
-            Some(schema_key),
-            Some(file_id),
-        ) => Ok(Some(WorkingProjectionChangeSetElement {
-            change_set_id,
-            change_id,
-            entity_id,
-            schema_key,
-            file_id,
-            created_at,
-        })),
-        _ => Ok(None),
-    }
-}
-
-fn is_checkpointable_schema_key(schema_key: &str) -> bool {
-    !matches!(
-        schema_key,
-        "lix_version_pointer"
-            | "lix_commit"
-            | "lix_change_set_element"
-            | "lix_commit_edge"
-            | "lix_change_author"
-            | "lix_entity_label"
-            | "lix_version_descriptor"
-            | "lix_change_set"
-            | "lix_change"
-            | "lix_label"
-    )
-}
-
-fn build_working_projection_change_id(
-    active_version_id: &str,
-    change_set_id: &str,
-    entity_id: &str,
-    schema_key: &str,
-    file_id: &str,
-) -> String {
-    format!(
-        "working_projection:{active_version_id}:{change_set_id}:{schema_key}:{file_id}:{entity_id}"
-    )
-}
-
-async fn upsert_working_projection_row(
-    backend: &dyn LixBackend,
-    entity_id: &str,
-    schema_key: &str,
-    version_id: &str,
-    plugin_key: &str,
-    snapshot_content: &str,
-    schema_version: &str,
-    updated_at: &str,
-) -> Result<(), LixError> {
-    backend
-        .execute(
-            "INSERT INTO lix_internal_state_untracked (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, created_at, updated_at\
-             ) VALUES ($1, $2, 'lix', $3, $4, $5, $6, $7, $8, $8) \
-             ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
-             plugin_key = EXCLUDED.plugin_key, \
-             snapshot_content = EXCLUDED.snapshot_content, \
-             metadata = EXCLUDED.metadata, \
-             schema_version = EXCLUDED.schema_version, \
-             updated_at = EXCLUDED.updated_at",
-            &[
-                Value::Text(entity_id.to_string()),
-                Value::Text(schema_key.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Text(plugin_key.to_string()),
-                Value::Text(snapshot_content.to_string()),
-                Value::Text(WORKING_PROJECTION_METADATA.to_string()),
-                Value::Text(schema_version.to_string()),
-                Value::Text(updated_at.to_string()),
-            ],
-        )
-        .await?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
