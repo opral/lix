@@ -26,8 +26,8 @@ use crate::sql::types::{
 use crate::sql::SchemaRegistration;
 use crate::sql::{
     bind_sql, bind_sql_with_state, escape_sql_string, lowering::lower_statement,
-    object_name_matches,
-    quote_ident, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver,
+    object_name_matches, quote_ident, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
+    RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
@@ -2014,22 +2014,42 @@ fn build_statements_from_generate_commit_result(
 
         change_rows.push(vec![
             text_param_expr(&change.id, &mut next_placeholder, &mut statement_params),
-            text_param_expr(&change.entity_id, &mut next_placeholder, &mut statement_params),
-            text_param_expr(&change.schema_key, &mut next_placeholder, &mut statement_params),
+            text_param_expr(
+                &change.entity_id,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
+            text_param_expr(
+                &change.schema_key,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
             text_param_expr(
                 &change.schema_version,
                 &mut next_placeholder,
                 &mut statement_params,
             ),
-            text_param_expr(&change.file_id, &mut next_placeholder, &mut statement_params),
-            text_param_expr(&change.plugin_key, &mut next_placeholder, &mut statement_params),
+            text_param_expr(
+                &change.file_id,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
+            text_param_expr(
+                &change.plugin_key,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
             text_param_expr(&snapshot_id, &mut next_placeholder, &mut statement_params),
             optional_text_param_expr(
                 change.metadata.as_deref(),
                 &mut next_placeholder,
                 &mut statement_params,
             ),
-            text_param_expr(&change.created_at, &mut next_placeholder, &mut statement_params),
+            text_param_expr(
+                &change.created_at,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
         ]);
     }
 
@@ -2146,11 +2166,7 @@ fn materialized_row_values_parameterized(
         text_param_expr(&row.file_id, next_placeholder, params),
         text_param_expr(&row.lixcol_version_id, next_placeholder, params),
         text_param_expr(&row.plugin_key, next_placeholder, params),
-        optional_text_param_expr(
-            row.snapshot_content.as_deref(),
-            next_placeholder,
-            params,
-        ),
+        optional_text_param_expr(row.snapshot_content.as_deref(), next_placeholder, params),
         text_param_expr(&row.id, next_placeholder, params),
         optional_text_param_expr(row.metadata.as_deref(), next_placeholder, params),
         optional_text_param_expr(row.writer_key.as_deref(), next_placeholder, params),
@@ -3286,7 +3302,9 @@ mod tests {
             10,
             "expected exact params: 2 snapshot params + 8 change-row params"
         );
-        assert!(matches!(batch.params[1], EngineValue::Text(ref value) if value == &snapshot_content));
+        assert!(
+            matches!(batch.params[1], EngineValue::Text(ref value) if value == &snapshot_content)
+        );
 
         let snapshot_stmt = find_insert(&batch.statements, "lix_internal_snapshot");
         let (columns, rows) = insert_values(snapshot_stmt);
