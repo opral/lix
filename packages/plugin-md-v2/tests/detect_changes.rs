@@ -201,6 +201,24 @@ fn rejects_non_utf8_input() {
 }
 
 #[test]
+fn inline_html_br_does_not_drop_changes() {
+    let after = file_from_markdown(
+        "f1",
+        "/notes.md",
+        "SSH auth: `git clone git@github.com:microsoft/vscode-docs.git`<br>HTTPS auth: `git clone https://github.com/microsoft/vscode-docs.git`\n",
+    );
+
+    let changes = detect_changes(None, after).expect("detect_changes should succeed");
+
+    assert!(
+        !changes.is_empty(),
+        "inline html <br> in .md should not produce an empty change set"
+    );
+    assert!(changes.iter().any(is_document_change));
+    assert!(changes.iter().any(is_block_change));
+}
+
+#[test]
 fn move_only_emits_document_row() {
     let before = file_from_markdown("f1", "/notes.md", "First paragraph.\n\nSecond paragraph.\n");
     let after = file_from_markdown("f1", "/notes.md", "Second paragraph.\n\nFirst paragraph.\n");

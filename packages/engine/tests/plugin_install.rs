@@ -15,7 +15,7 @@ simulation_test!(
         "key":"plugin_json",
         "runtime":"wasm-component-v1",
         "api_version":"0.1.0",
-        "detect_changes_glob":"*.json"
+        "match":{"path_glob":"*.json"}
     }"#;
         let wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
@@ -67,7 +67,7 @@ simulation_test!(install_plugin_rejects_invalid_manifest, |sim| async move {
             r#"{
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.json"
+                "match":{"path_glob":"*.json"}
             }"#,
             &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
         )
@@ -92,7 +92,7 @@ simulation_test!(
                 "key":"plugin_json",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "detect_changes_glob":"*.json"
+                "match":{"path_glob":"*.json"}
             }"#,
                 &[0xde, 0xad, 0xbe, 0xef],
             )
@@ -118,13 +118,13 @@ simulation_test!(
             "key":"plugin_json",
             "runtime":"wasm-component-v1",
             "api_version":"0.1.0",
-            "detect_changes_glob":"*.json"
+            "match":{"path_glob":"*.json"}
         }"#;
         let second_manifest = r#"{
             "key":"plugin_json",
             "runtime":"wasm-component-v1",
             "api_version":"0.1.1",
-            "detect_changes_glob":"*.json5",
+            "match":{"path_glob":"*.json5"},
             "entry":"main.wasm"
         }"#;
         let first_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];

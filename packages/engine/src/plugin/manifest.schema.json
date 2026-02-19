@@ -6,7 +6,7 @@
     "key",
     "runtime",
     "api_version",
-    "detect_changes_glob"
+    "match"
   ],
   "properties": {
     "key": {
@@ -25,9 +25,20 @@
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
     },
-    "detect_changes_glob": {
-      "type": "string",
-      "minLength": 1
+    "match": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path_glob"],
+      "properties": {
+        "path_glob": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_type": {
+          "type": "string",
+          "enum": ["text", "binary"]
+        }
+      }
     },
     "detect_changes": {
       "type": "object",

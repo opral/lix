@@ -17,6 +17,7 @@ examples/sveltekit/package-lock.json
 **/test-results/
 **/playwright-report/
 **/playwright/.cache/
+packages/vscode-docs-replay/results/
 
 # SEO – Generated sitemap
 inlang/**/sitemap.xml
