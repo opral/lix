@@ -546,6 +546,13 @@ fn value_as_i64(value: &Value) -> i64 {
     }
 }
 
+fn value_as_text(value: &Value) -> String {
+    match value {
+        Value::Text(v) => v.clone(),
+        other => panic!("expected text value, got {other:?}"),
+    }
+}
+
 async fn file_cache_row_count(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -614,6 +621,102 @@ async fn orphan_file_cache_row_count(engine: &support::simulation_test::Simulati
         )
         .await
         .expect("orphan file_data_cache count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn binary_blob_hash_for_file_version(
+    engine: &support::simulation_test::SimulationEngine,
+    file_id: &str,
+    version_id: &str,
+) -> Option<String> {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT blob_hash \
+                 FROM lix_internal_binary_file_version_ref \
+                 WHERE file_id = '{}' AND version_id = '{}' \
+                 LIMIT 1",
+                file_id, version_id
+            ),
+            &[],
+        )
+        .await
+        .expect("binary file_version_ref lookup should succeed");
+    rows.rows.first().map(|row| value_as_text(&row[0]))
+}
+
+async fn binary_chunk_hash_for_blob(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> Option<String> {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT chunk_hash \
+                 FROM lix_internal_binary_blob_manifest_chunk \
+                 WHERE blob_hash = '{}' \
+                 ORDER BY chunk_index \
+                 LIMIT 1",
+                blob_hash
+            ),
+            &[],
+        )
+        .await
+        .expect("binary manifest chunk lookup should succeed");
+    rows.rows.first().map(|row| value_as_text(&row[0]))
+}
+
+async fn binary_manifest_row_count_by_hash(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> i64 {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_binary_blob_manifest \
+                 WHERE blob_hash = '{}'",
+                blob_hash
+            ),
+            &[],
+        )
+        .await
+        .expect("binary manifest row count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
+    let rows = engine
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_internal_binary_chunk_store c \
+             LEFT JOIN lix_internal_binary_blob_manifest_chunk mc \
+               ON mc.chunk_hash = c.chunk_hash \
+             WHERE mc.chunk_hash IS NULL",
+            &[],
+        )
+        .await
+        .expect("orphan binary chunk count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn orphan_binary_manifest_chunk_row_count(
+    engine: &support::simulation_test::SimulationEngine,
+) -> i64 {
+    let rows = engine
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_internal_binary_blob_manifest_chunk mc \
+             LEFT JOIN lix_internal_binary_blob_manifest m \
+               ON m.blob_hash = mc.blob_hash \
+             WHERE m.blob_hash IS NULL",
+            &[],
+        )
+        .await
+        .expect("orphan binary manifest chunk count query should succeed");
     assert_eq!(rows.rows.len(), 1);
     value_as_i64(&rows.rows[0][0])
 }
@@ -2726,5 +2829,145 @@ simulation_test!(
 
         assert_eq!(orphan_file_cache_row_count(&engine).await, 0);
         assert_eq!(total_file_cache_row_count(&engine).await, 1);
+    }
+);
+
+simulation_test!(
+    binary_cas_gc_keeps_history_referenced_rows_after_overwrite,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: Some(runtime),
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', 'AAAA-AAAA-AAAA-AAAA')",
+                &[],
+            )
+            .await
+            .expect("initial binary write should succeed");
+        let old_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-gc-overwrite", &main_version_id)
+                .await
+                .expect("old blob hash should exist");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = 'BBBB-BBBB-BBBB-BBBB-BBBB-BBBB' \
+                 WHERE id = 'binary-gc-overwrite'",
+                &[],
+            )
+            .await
+            .expect("binary overwrite should succeed");
+        let update_commit_id = active_version_commit_id(&engine).await;
+        let new_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-gc-overwrite", &main_version_id)
+                .await
+                .expect("new blob hash should exist");
+        assert_ne!(old_blob_hash, new_blob_hash);
+
+        assert_eq!(
+            binary_manifest_row_count_by_hash(&engine, &old_blob_hash).await,
+            1
+        );
+
+        let history_rows = engine
+            .execute(
+                &format!(
+                    "SELECT data \
+                 FROM lix_file_history \
+                 WHERE id = 'binary-gc-overwrite' \
+                   AND lixcol_root_commit_id = '{}' \
+                   AND lixcol_depth = 1 \
+                 LIMIT 1",
+                    update_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("history read should succeed");
+        assert_eq!(history_rows.rows.len(), 1);
+        assert_blob_bytes_eq(&history_rows.rows[0][0], b"AAAA-AAAA-AAAA-AAAA");
+
+        assert_eq!(orphan_binary_manifest_chunk_row_count(&engine).await, 0);
+        assert_eq!(orphan_binary_chunk_row_count(&engine).await, 0);
+    }
+);
+
+simulation_test!(
+    binary_cas_foreign_keys_restrict_live_parent_deletes,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: Some(runtime),
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('binary-fk-guard', '/assets/blob.mp4', 'FK-GUARD-DATA-123456')",
+                &[],
+            )
+            .await
+            .expect("binary write should succeed");
+
+        let blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-fk-guard", &main_version_id)
+                .await
+                .expect("blob hash should exist");
+        let chunk_hash = binary_chunk_hash_for_blob(&engine, &blob_hash)
+            .await
+            .expect("chunk hash should exist");
+
+        let delete_manifest = engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_blob_manifest \
+                     WHERE blob_hash = '{}'",
+                    blob_hash
+                ),
+                &[],
+            )
+            .await;
+        assert!(
+            delete_manifest.is_err(),
+            "manifest delete should be rejected while file_version_ref still points to it"
+        );
+
+        let delete_chunk = engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_chunk_store \
+                     WHERE chunk_hash = '{}'",
+                    chunk_hash
+                ),
+                &[],
+            )
+            .await;
+        assert!(
+            delete_chunk.is_err(),
+            "chunk delete should be rejected while manifest_chunk still points to it"
+        );
     }
 );

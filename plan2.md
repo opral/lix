@@ -311,6 +311,25 @@ Checkpoint:
 
 - `B3`: GC correctness (no broken history reads), reclaim behavior after GC + VACUUM.
 
+Phase 3 result (`B3`, implemented):
+
+- Added strict binary CAS GC pass after file side-effects:
+  - prunes stale `lix_internal_binary_file_version_ref` rows without live `lix_binary_blob_ref` state
+  - prunes unreachable `lix_internal_binary_blob_manifest_chunk`, `lix_internal_binary_chunk_store`, `lix_internal_binary_blob_manifest`, and legacy `lix_internal_binary_blob_store` rows
+- Added schema-level FK constraints with `ON DELETE RESTRICT`:
+  - `lix_internal_binary_blob_manifest_chunk.blob_hash -> lix_internal_binary_blob_manifest.blob_hash`
+  - `lix_internal_binary_blob_manifest_chunk.chunk_hash -> lix_internal_binary_chunk_store.chunk_hash`
+  - `lix_internal_binary_file_version_ref.blob_hash -> lix_internal_binary_blob_manifest.blob_hash`
+- Enabled sqlite FK enforcement at init (`PRAGMA foreign_keys = ON`) and in sqlite test simulation connections.
+
+Validation:
+
+- `binary_cas_gc_prunes_unreachable_rows_after_overwrite_{sqlite,postgres}`: passed
+- `binary_cas_foreign_keys_restrict_live_parent_deletes_{sqlite,postgres}`: passed
+- Regression checks:
+  - `file_write_uses_builtin_binary_fallback_when_no_plugin_matches_file_type_sqlite`: passed
+  - `file_cache_has_no_orphan_rows_after_mixed_lifecycle_{sqlite,postgres}`: passed
+
 ### Phase 4: Codec Metadata / Observability
 
 1. Replace payload prefix framing with explicit codec metadata (`raw`, `zstd`, `zstd+dict:<id>`).

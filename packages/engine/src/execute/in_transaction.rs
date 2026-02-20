@@ -294,6 +294,8 @@ impl Engine {
                 &file_cache_invalidation_targets,
             )
             .await?;
+            self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+                .await?;
             self.invalidate_file_data_cache_entries_in_transaction(
                 transaction,
                 &file_cache_invalidation_targets,
