@@ -131,3 +131,120 @@ This is the optimization baseline to beat.
 | ingest_write_amp          | 3.839 | 2.171 | -43.44% |
 | update_write_amp          | 1.451 | 1.092 | -24.73% |
 | storage_amp_after_update  | 7.527 | 4.371 | -41.93% |
+
+## Current (Custom FastCDC-like Chunking, Pre-Crate)
+
+- Report: `packages/engine/benches/results/binary-storage-report.json`
+- DB artifact: `packages/engine/benches/results/binary-storage-1771550854278.sqlite`
+- Config: same as baseline (`files_per_class=32`, `base_blob_bytes=65536`, `update_rounds=2`, `point_read_ops=500`, `scan_read_ops=8`)
+
+### Delta Vs Option 2 (No Chunking)
+
+| Metric               | Option 2 | Pre-Crate FastCDC | Delta |
+| -------------------- | -------: | ----------------: | ----: |
+| ingest wall (ms)     | 941.959 | 798.827 | -15.20% |
+| update wall (ms)     | 1769.325 | 1872.277 | +5.82% |
+| read point wall (ms) | 111385.573 | 114651.088 | +2.93% |
+| read scan wall (ms)  | 1750.026 | 1597.142 | -8.74% |
+| ingest ops/s         | 101.915 | 120.176 | +17.92% |
+| update ops/s         | 108.516 | 102.549 | -5.50% |
+| read point ops/s     | 4.489 | 4.361 | -2.86% |
+| read scan ops/s      | 4.571 | 5.009 | +9.58% |
+
+### Storage Delta Vs Option 2 (No Chunking)
+
+| Metric                    | Option 2 | Pre-Crate FastCDC | Delta |
+| ------------------------- | -------: | ----------------: | ----: |
+| DB bytes after ingest     | 14,475,264 | 14,581,760 | +0.74% |
+| DB bytes after update     | 28,647,424 | 28,848,128 | +0.70% |
+| DB bytes after reads      | 29,118,464 | 29,319,168 | +0.69% |
+| table bytes after update  | 27,160,576 | 27,234,304 | +0.27% |
+| index bytes after update  | 1,351,680 | 1,478,656 | +9.39% |
+| ingest_write_amp          | 2.171 | 2.183 | +0.55% |
+| update_write_amp          | 1.092 | 1.099 | +0.64% |
+| storage_amp_after_update  | 4.371 | 4.402 | +0.70% |
+
+## FastCDC Crate (v3.2.1)
+
+- Report: `packages/engine/benches/results/binary-storage-report.json`
+- DB artifact: `packages/engine/benches/results/binary-storage-1771551593619.sqlite`
+- Config: same as baseline (`files_per_class=32`, `base_blob_bytes=65536`, `update_rounds=2`, `point_read_ops=500`, `scan_read_ops=8`)
+
+### Delta Vs Pre-Crate FastCDC-like
+
+| Metric               | Pre-Crate FastCDC | Crate FastCDC | Delta |
+| -------------------- | ----------------: | ------------: | ----: |
+| ingest wall (ms)     | 798.827 | 875.764 | +9.63% |
+| update wall (ms)     | 1872.277 | 1910.233 | +2.03% |
+| read point wall (ms) | 114651.088 | 116485.415 | +1.60% |
+| read scan wall (ms)  | 1597.142 | 1732.878 | +8.50% |
+| ingest ops/s         | 120.176 | 109.619 | -8.78% |
+| update ops/s         | 102.549 | 100.511 | -1.99% |
+| read point ops/s     | 4.361 | 4.292 | -1.58% |
+| read scan ops/s      | 5.009 | 4.617 | -7.83% |
+
+### Storage Delta Vs Pre-Crate FastCDC-like
+
+| Metric                    | Pre-Crate FastCDC | Crate FastCDC | Delta |
+| ------------------------- | ----------------: | ------------: | ----: |
+| DB bytes after ingest     | 14,581,760 | 14,630,912 | +0.34% |
+| DB bytes after update     | 28,848,128 | 28,975,104 | +0.44% |
+| DB bytes after reads      | 29,319,168 | 29,446,144 | +0.43% |
+| table bytes after update  | 27,234,304 | 27,344,896 | +0.41% |
+| index bytes after update  | 1,478,656 | 1,495,040 | +1.11% |
+| ingest_write_amp          | 2.183 | 2.191 | +0.36% |
+| update_write_amp          | 1.099 | 1.105 | +0.55% |
+| storage_amp_after_update  | 4.402 | 4.421 | +0.44% |
+
+## Benchmark Redesign (Up To 4 MiB)
+
+- The benchmark in `packages/engine/benches/binary_storage.rs` was updated to use `profile=binary_4mb_focus` by default.
+- This profile targets realistic binary sizes up to `4 MiB` and a mixed update pattern (`localized`, `append`, `rewrite`).
+- Earlier benchmark sections in this file were run on the old small-file profile and are no longer decision-grade for FastCDC evaluation.
+- Earlier numbers are kept for historical context only.
+
+### Current 4 MiB Profile Snapshot
+
+| Metric            | Value |
+| ----------------- | ----: |
+| total_files       | 96 |
+| total_bytes       | 63,103,667 |
+| p50_file_bytes    | 214,670 |
+| p80_file_bytes    | 925,946 |
+| p95_file_bytes    | 3,133,734 |
+| max_file_bytes    | 4,124,547 |
+| files <= 256 KiB  | 53 |
+| files <= 1 MiB    | 82 |
+| files <= 4 MiB    | 96 |
+
+### Pre/Post FastCDC on 4 MiB Profile
+
+- Pre-FastCDC (single-chunk mode):
+  `packages/engine/benches/results/binary-storage-report-no-fastcdc-4mb.json`
+  (`db: packages/engine/benches/results/binary-storage-no-fastcdc-4mb.sqlite`)
+- Post-FastCDC:
+  `packages/engine/benches/results/binary-storage-report-fastcdc-4mb.json`
+  (`db: packages/engine/benches/results/binary-storage-fastcdc-4mb.sqlite`)
+
+### Delta (Post-FastCDC Vs Pre-FastCDC)
+
+| Metric                    | Pre-FastCDC | Post-FastCDC | Delta |
+| ------------------------- | ----------: | -----------: | ----: |
+| storage_amp_after_update  | 3.952 | 2.399 | -39.30% |
+| ingest_write_amp          | 2.021 | 1.639 | -18.89% |
+| update_write_amp          | 1.046 | 0.439 | -58.02% |
+| DB bytes after ingest     | 128,356,352 | 104,271,872 | -18.76% |
+| DB bytes after update     | 269,123,584 | 163,360,768 | -39.30% |
+| DB bytes after reads      | 269,664,256 | 163,360,768 | -39.42% |
+| ingest wall (ms)          | 1017.198 | 1242.264 | +22.13% |
+| update wall (ms)          | 2219.181 | 2667.707 | +20.21% |
+| read point wall (ms)      | 111015.706 | 112894.842 | +1.69% |
+| read scan wall (ms)       | 2737.350 | 2631.966 | -3.85% |
+
+### Dedup Diagnostics (4 MiB Profile)
+
+| Metric               | Pre-FastCDC | Post-FastCDC |
+| -------------------- | ----------: | -----------: |
+| avg_chunks_per_blob  | 1.000 | 4.792 |
+| chunk_reuse_rate     | 0.000 | 0.454 |
+| bytes_dedup_saved    | 0 | 107,225,831 |

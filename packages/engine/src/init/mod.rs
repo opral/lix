@@ -89,6 +89,29 @@ const INIT_STATEMENTS: &[&str] = &[
      size_bytes BIGINT NOT NULL,\
      created_at TEXT NOT NULL\
      )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_manifest (\
+     blob_hash TEXT PRIMARY KEY,\
+     size_bytes BIGINT NOT NULL,\
+     chunk_count BIGINT NOT NULL,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_chunk_store (\
+     chunk_hash TEXT PRIMARY KEY,\
+     data BYTEA NOT NULL,\
+     size_bytes BIGINT NOT NULL,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_manifest_chunk (\
+     blob_hash TEXT NOT NULL,\
+     chunk_index BIGINT NOT NULL,\
+     chunk_hash TEXT NOT NULL,\
+     chunk_size BIGINT NOT NULL,\
+     PRIMARY KEY (blob_hash, chunk_index)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_blob_manifest_chunk_hash \
+     ON lix_internal_binary_blob_manifest_chunk (chunk_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_blob_manifest_chunk_blob_hash \
+     ON lix_internal_binary_blob_manifest_chunk (blob_hash)",
     "CREATE TABLE IF NOT EXISTS lix_internal_binary_file_version_ref (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
