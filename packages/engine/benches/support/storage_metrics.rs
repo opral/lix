@@ -17,6 +17,18 @@ pub struct StorageMetrics {
     pub file_data_cache_bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BinaryChunkDiagnostics {
+    pub manifest_rows: u64,
+    pub manifest_chunk_refs: u64,
+    pub unique_chunks: u64,
+    pub chunk_store_bytes: u64,
+    pub manifest_logical_bytes: u64,
+    pub avg_chunks_per_blob: f64,
+    pub chunk_reuse_rate: f64,
+    pub bytes_dedup_saved: u64,
+}
+
 pub async fn collect_storage_metrics(db_path: &Path) -> Result<StorageMetrics, LixError> {
     let conn = format!("sqlite://{}", db_path.display());
     let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
@@ -58,6 +70,62 @@ pub async fn collect_storage_metrics(db_path: &Path) -> Result<StorageMetrics, L
     })
 }
 
+pub async fn collect_binary_chunk_diagnostics(
+    db_path: &Path,
+) -> Result<Option<BinaryChunkDiagnostics>, LixError> {
+    let conn = format!("sqlite://{}", db_path.display());
+    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
+        message: format!(
+            "failed to open sqlite db for binary chunk diagnostics ({}): {error}",
+            db_path.display()
+        ),
+    })?;
+
+    let has_manifest = query_table_exists(&pool, "lix_internal_binary_blob_manifest").await?;
+    let has_chunk_store = query_table_exists(&pool, "lix_internal_binary_chunk_store").await?;
+    if !has_manifest || !has_chunk_store {
+        return Ok(None);
+    }
+
+    let row = sqlx::query(
+        "SELECT \
+            CAST(COALESCE((SELECT COUNT(*) FROM lix_internal_binary_blob_manifest), 0) AS INTEGER), \
+            CAST(COALESCE((SELECT SUM(chunk_count) FROM lix_internal_binary_blob_manifest), 0) AS INTEGER), \
+            CAST(COALESCE((SELECT COUNT(*) FROM lix_internal_binary_chunk_store), 0) AS INTEGER), \
+            CAST(COALESCE((SELECT SUM(size_bytes) FROM lix_internal_binary_chunk_store), 0) AS INTEGER), \
+            CAST(COALESCE((SELECT SUM(size_bytes) FROM lix_internal_binary_blob_manifest), 0) AS INTEGER), \
+            COALESCE((SELECT AVG(chunk_count) FROM lix_internal_binary_blob_manifest), 0.0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|error| LixError {
+        message: format!("binary chunk diagnostics query failed: {error}"),
+    })?;
+
+    let manifest_rows = row.try_get::<i64, _>(0).unwrap_or(0).max(0) as u64;
+    let manifest_chunk_refs = row.try_get::<i64, _>(1).unwrap_or(0).max(0) as u64;
+    let unique_chunks = row.try_get::<i64, _>(2).unwrap_or(0).max(0) as u64;
+    let chunk_store_bytes = row.try_get::<i64, _>(3).unwrap_or(0).max(0) as u64;
+    let manifest_logical_bytes = row.try_get::<i64, _>(4).unwrap_or(0).max(0) as u64;
+    let avg_chunks_per_blob = row.try_get::<f64, _>(5).unwrap_or(0.0).max(0.0);
+    let chunk_reuse_rate = if manifest_chunk_refs > 0 {
+        1.0 - (unique_chunks as f64 / manifest_chunk_refs as f64)
+    } else {
+        0.0
+    };
+
+    Ok(Some(BinaryChunkDiagnostics {
+        manifest_rows,
+        manifest_chunk_refs,
+        unique_chunks,
+        chunk_store_bytes,
+        manifest_logical_bytes,
+        avg_chunks_per_blob,
+        chunk_reuse_rate,
+        bytes_dedup_saved: manifest_logical_bytes.saturating_sub(chunk_store_bytes),
+    }))
+}
+
 fn file_size_or_zero(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
@@ -97,4 +165,19 @@ async fn query_dbstat_bytes(pool: &SqlitePool, object_type: &str) -> Result<u64,
         })?;
     let value = row.try_get::<i64, _>(0).unwrap_or(0);
     Ok(value.max(0) as u64)
+}
+
+async fn query_table_exists(pool: &SqlitePool, table_name: &str) -> Result<bool, LixError> {
+    let row =
+        sqlx::query("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)")
+            .bind(table_name)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| LixError {
+                message: format!(
+                    "storage metrics table-exists query failed ({table_name}): {error}"
+                ),
+            })?;
+    let exists = row.try_get::<i64, _>(0).unwrap_or(0);
+    Ok(exists == 1)
 }

@@ -1521,7 +1521,7 @@ async fn load_binary_blob_data_by_hash(
     backend: &dyn LixBackend,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let result = backend
+    let inline_result = backend
         .execute(
             "SELECT data \
              FROM lix_internal_binary_blob_store \
@@ -1531,10 +1531,114 @@ async fn load_binary_blob_data_by_hash(
         )
         .await?;
 
-    let Some(row) = result.rows.first() else {
+    if let Some(row) = inline_result.rows.first() {
+        return Ok(Some(blob_required(row, 0, "data")?));
+    }
+
+    let manifest_rows = backend
+        .execute(
+            "SELECT size_bytes, chunk_count \
+             FROM lix_internal_binary_blob_manifest \
+             WHERE blob_hash = $1 \
+             LIMIT 1",
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+    let Some(manifest_row) = manifest_rows.rows.first() else {
         return Ok(None);
     };
-    Ok(Some(blob_required(row, 0, "data")?))
+    let manifest_size_bytes = i64_required(manifest_row, 0, "size_bytes")?;
+    let manifest_chunk_count = i64_required(manifest_row, 1, "chunk_count")?;
+    if manifest_size_bytes < 0 || manifest_chunk_count < 0 {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: invalid negative manifest values for blob hash '{}'",
+                blob_hash
+            ),
+        });
+    }
+
+    let chunk_rows = backend
+        .execute(
+            "SELECT mc.chunk_index, mc.chunk_hash, mc.chunk_size, cs.data \
+             FROM lix_internal_binary_blob_manifest_chunk mc \
+             LEFT JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+             WHERE mc.blob_hash = $1 \
+             ORDER BY mc.chunk_index ASC",
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+
+    let expected_chunk_count = usize::try_from(manifest_chunk_count).map_err(|_| LixError {
+        message: format!(
+            "plugin materialization: chunk count out of range for blob hash '{}'",
+            blob_hash
+        ),
+    })?;
+    if chunk_rows.rows.len() != expected_chunk_count {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: chunk manifest mismatch for blob hash '{}': expected {} chunks, got {}",
+                blob_hash,
+                expected_chunk_count,
+                chunk_rows.rows.len()
+            ),
+        });
+    }
+
+    let mut reconstructed = Vec::with_capacity(usize::try_from(manifest_size_bytes).unwrap_or(0));
+    for (expected_index, row) in chunk_rows.rows.iter().enumerate() {
+        let chunk_index = i64_required(row, 0, "chunk_index")?;
+        let chunk_hash = text_required(row, 1, "chunk_hash")?;
+        let chunk_size = i64_required(row, 2, "chunk_size")?;
+        if chunk_index != expected_index as i64 {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: unexpected chunk order for blob hash '{}': expected index {}, got {}",
+                    blob_hash, expected_index, chunk_index
+                ),
+            });
+        }
+        if chunk_size < 0 {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: invalid negative chunk size for blob hash '{}' chunk '{}'",
+                    blob_hash, chunk_hash
+                ),
+            });
+        }
+        let chunk_data = blob_required(row, 3, "data").map_err(|_| LixError {
+            message: format!(
+                "plugin materialization: missing chunk payload for blob hash '{}' chunk '{}'",
+                blob_hash, chunk_hash
+            ),
+        })?;
+        if chunk_data.len() as i64 != chunk_size {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: chunk size mismatch for blob hash '{}' chunk '{}': expected {}, got {}",
+                    blob_hash,
+                    chunk_hash,
+                    chunk_size,
+                    chunk_data.len()
+                ),
+            });
+        }
+        reconstructed.extend_from_slice(&chunk_data);
+    }
+
+    if reconstructed.len() as i64 != manifest_size_bytes {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: reconstructed size mismatch for blob hash '{}': expected {}, got {}",
+                blob_hash,
+                manifest_size_bytes,
+                reconstructed.len()
+            ),
+        });
+    }
+
+    Ok(Some(reconstructed))
 }
 
 async fn load_file_cache_data(

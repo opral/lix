@@ -599,44 +599,13 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
-            let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
-            let size_bytes = i64::try_from(write.after_data.len()).map_err(|_| LixError {
-                message: format!(
-                    "binary blob size exceeds supported range for file '{}' version '{}'",
-                    write.file_id, write.version_id
-                ),
-            })?;
-            let now = crate::functions::timestamp::timestamp();
-            self.backend
-                .execute(
-                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (blob_hash) DO NOTHING",
-                    &[
-                        Value::Text(blob_hash.clone()),
-                        Value::Blob(write.after_data.clone()),
-                        Value::Integer(size_bytes),
-                        Value::Text(now.clone()),
-                    ],
-                )
-                .await?;
-            self.backend
-                .execute(
-                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     blob_hash = EXCLUDED.blob_hash, \
-                     size_bytes = EXCLUDED.size_bytes, \
-                     updated_at = EXCLUDED.updated_at",
-                    &[
-                        Value::Text(write.file_id.clone()),
-                        Value::Text(write.version_id.clone()),
-                        Value::Text(blob_hash),
-                        Value::Integer(size_bytes),
-                        Value::Text(now),
-                    ],
-                )
-                .await?;
+            persist_binary_blob_with_fastcdc_backend(
+                self.backend.as_ref(),
+                &write.file_id,
+                &write.version_id,
+                &write.after_data,
+            )
+            .await?;
             self.backend
                 .execute(
                     "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
@@ -670,44 +639,13 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
-            let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
-            let size_bytes = i64::try_from(write.after_data.len()).map_err(|_| LixError {
-                message: format!(
-                    "binary blob size exceeds supported range for file '{}' version '{}'",
-                    write.file_id, write.version_id
-                ),
-            })?;
-            let now = crate::functions::timestamp::timestamp();
-            transaction
-                .execute(
-                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (blob_hash) DO NOTHING",
-                    &[
-                        Value::Text(blob_hash.clone()),
-                        Value::Blob(write.after_data.clone()),
-                        Value::Integer(size_bytes),
-                        Value::Text(now.clone()),
-                    ],
-                )
-                .await?;
-            transaction
-                .execute(
-                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     blob_hash = EXCLUDED.blob_hash, \
-                     size_bytes = EXCLUDED.size_bytes, \
-                     updated_at = EXCLUDED.updated_at",
-                    &[
-                        Value::Text(write.file_id.clone()),
-                        Value::Text(write.version_id.clone()),
-                        Value::Text(blob_hash),
-                        Value::Integer(size_bytes),
-                        Value::Text(now),
-                    ],
-                )
-                .await?;
+            persist_binary_blob_with_fastcdc_in_transaction(
+                transaction,
+                &write.file_id,
+                &write.version_id,
+                &write.after_data,
+            )
+            .await?;
             transaction
                 .execute(
                     "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
@@ -861,43 +799,13 @@ impl Engine {
                 });
             }
 
-            let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
-                message: format!(
-                    "builtin binary fallback: blob size exceeds supported range for file '{}' version '{}'",
-                    file_id, version_id
-                ),
-            })?;
-            let now = crate::functions::timestamp::timestamp();
-            self.backend
-                .execute(
-                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (blob_hash) DO NOTHING",
-                    &[
-                        Value::Text(snapshot.blob_hash.clone()),
-                        Value::Blob(data),
-                        Value::Integer(size_bytes),
-                        Value::Text(now.clone()),
-                    ],
-                )
-                .await?;
-            self.backend
-                .execute(
-                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     blob_hash = EXCLUDED.blob_hash, \
-                     size_bytes = EXCLUDED.size_bytes, \
-                     updated_at = EXCLUDED.updated_at",
-                    &[
-                        Value::Text(file_id.clone()),
-                        Value::Text(version_id.clone()),
-                        Value::Text(snapshot.blob_hash),
-                        Value::Integer(size_bytes),
-                        Value::Text(now),
-                    ],
-                )
-                .await?;
+            persist_binary_blob_with_fastcdc_backend(
+                self.backend.as_ref(),
+                file_id,
+                version_id,
+                &data,
+            )
+            .await?;
         }
 
         Ok(())
@@ -952,43 +860,13 @@ impl Engine {
                 });
             }
 
-            let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
-                message: format!(
-                    "builtin binary fallback: blob size exceeds supported range for file '{}' version '{}'",
-                    file_id, version_id
-                ),
-            })?;
-            let now = crate::functions::timestamp::timestamp();
-            transaction
-                .execute(
-                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (blob_hash) DO NOTHING",
-                    &[
-                        Value::Text(snapshot.blob_hash.clone()),
-                        Value::Blob(data),
-                        Value::Integer(size_bytes),
-                        Value::Text(now.clone()),
-                    ],
-                )
-                .await?;
-            transaction
-                .execute(
-                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     blob_hash = EXCLUDED.blob_hash, \
-                     size_bytes = EXCLUDED.size_bytes, \
-                     updated_at = EXCLUDED.updated_at",
-                    &[
-                        Value::Text(file_id.clone()),
-                        Value::Text(version_id.clone()),
-                        Value::Text(snapshot.blob_hash),
-                        Value::Integer(size_bytes),
-                        Value::Text(now),
-                    ],
-                )
-                .await?;
+            persist_binary_blob_with_fastcdc_in_transaction(
+                transaction,
+                file_id,
+                version_id,
+                &data,
+            )
+            .await?;
         }
 
         Ok(())
@@ -1298,7 +1176,11 @@ async fn binary_blob_exists(backend: &dyn LixBackend, blob_hash: &str) -> Result
     let result = backend
         .execute(
             "SELECT 1 \
-             FROM lix_internal_binary_blob_store \
+             FROM (\
+                 SELECT blob_hash FROM lix_internal_binary_blob_store \
+                 UNION ALL \
+                 SELECT blob_hash FROM lix_internal_binary_blob_manifest\
+             ) AS blobs \
              WHERE blob_hash = $1 \
              LIMIT 1",
             &[Value::Text(blob_hash.to_string())],
@@ -1314,7 +1196,11 @@ async fn binary_blob_exists_in_transaction(
     let result = transaction
         .execute(
             "SELECT 1 \
-             FROM lix_internal_binary_blob_store \
+             FROM (\
+                 SELECT blob_hash FROM lix_internal_binary_blob_store \
+                 UNION ALL \
+                 SELECT blob_hash FROM lix_internal_binary_blob_manifest\
+             ) AS blobs \
              WHERE blob_hash = $1 \
              LIMIT 1",
             &[Value::Text(blob_hash.to_string())],
@@ -1369,6 +1255,248 @@ async fn load_file_cache_blob_in_transaction(
         return Ok(None);
     };
     Ok(Some(blob_value_required(row, 0, "data")?))
+}
+
+const FASTCDC_MIN_CHUNK_BYTES: usize = 16 * 1024;
+const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
+const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
+
+async fn persist_binary_blob_with_fastcdc_backend(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+    data: &[u8],
+) -> Result<(), LixError> {
+    let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
+    let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
+        message: format!(
+            "binary blob size exceeds supported range for file '{}' version '{}'",
+            file_id, version_id
+        ),
+    })?;
+    let chunk_ranges = fastcdc_chunk_ranges(data);
+    let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
+        message: format!(
+            "binary chunk count exceeds supported range for file '{}' version '{}'",
+            file_id, version_id
+        ),
+    })?;
+    let now = crate::functions::timestamp::timestamp();
+
+    backend
+        .execute(
+            "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (blob_hash) DO NOTHING",
+            &[
+                Value::Text(blob_hash.clone()),
+                Value::Integer(size_bytes),
+                Value::Integer(chunk_count),
+                Value::Text(now.clone()),
+            ],
+        )
+        .await?;
+
+    for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
+        let chunk_data = data[start..end].to_vec();
+        let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
+        let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
+            message: format!(
+                "binary chunk size exceeds supported range for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+        let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
+            message: format!(
+                "binary chunk index exceeds supported range for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+
+        backend
+            .execute(
+                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, created_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (chunk_hash) DO NOTHING",
+                &[
+                    Value::Text(chunk_hash.clone()),
+                    Value::Blob(chunk_data),
+                    Value::Integer(chunk_size),
+                    Value::Text(now.clone()),
+                ],
+            )
+            .await?;
+        backend
+            .execute(
+                "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
+                &[
+                    Value::Text(blob_hash.clone()),
+                    Value::Integer(chunk_index),
+                    Value::Text(chunk_hash),
+                    Value::Integer(chunk_size),
+                ],
+            )
+            .await?;
+    }
+
+    backend
+        .execute(
+            "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (file_id, version_id) DO UPDATE SET \
+             blob_hash = EXCLUDED.blob_hash, \
+             size_bytes = EXCLUDED.size_bytes, \
+             updated_at = EXCLUDED.updated_at",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(blob_hash),
+                Value::Integer(size_bytes),
+                Value::Text(now),
+            ],
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn persist_binary_blob_with_fastcdc_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    file_id: &str,
+    version_id: &str,
+    data: &[u8],
+) -> Result<(), LixError> {
+    let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
+    let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
+        message: format!(
+            "binary blob size exceeds supported range for file '{}' version '{}'",
+            file_id, version_id
+        ),
+    })?;
+    let chunk_ranges = fastcdc_chunk_ranges(data);
+    let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
+        message: format!(
+            "binary chunk count exceeds supported range for file '{}' version '{}'",
+            file_id, version_id
+        ),
+    })?;
+    let now = crate::functions::timestamp::timestamp();
+
+    transaction
+        .execute(
+            "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (blob_hash) DO NOTHING",
+            &[
+                Value::Text(blob_hash.clone()),
+                Value::Integer(size_bytes),
+                Value::Integer(chunk_count),
+                Value::Text(now.clone()),
+            ],
+        )
+        .await?;
+
+    for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
+        let chunk_data = data[start..end].to_vec();
+        let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
+        let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
+            message: format!(
+                "binary chunk size exceeds supported range for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+        let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
+            message: format!(
+                "binary chunk index exceeds supported range for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+
+        transaction
+            .execute(
+                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, created_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (chunk_hash) DO NOTHING",
+                &[
+                    Value::Text(chunk_hash.clone()),
+                    Value::Blob(chunk_data),
+                    Value::Integer(chunk_size),
+                    Value::Text(now.clone()),
+                ],
+            )
+            .await?;
+        transaction
+            .execute(
+                "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
+                &[
+                    Value::Text(blob_hash.clone()),
+                    Value::Integer(chunk_index),
+                    Value::Text(chunk_hash),
+                    Value::Integer(chunk_size),
+                ],
+            )
+            .await?;
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (file_id, version_id) DO UPDATE SET \
+             blob_hash = EXCLUDED.blob_hash, \
+             size_bytes = EXCLUDED.size_bytes, \
+             updated_at = EXCLUDED.updated_at",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(blob_hash),
+                Value::Integer(size_bytes),
+                Value::Text(now),
+            ],
+        )
+        .await?;
+
+    Ok(())
+}
+
+fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    if fastcdc_disabled_via_env() {
+        return vec![(0, data.len())];
+    }
+
+    fastcdc::v2020::FastCDC::new(
+        data,
+        FASTCDC_MIN_CHUNK_BYTES as u32,
+        FASTCDC_AVG_CHUNK_BYTES as u32,
+        FASTCDC_MAX_CHUNK_BYTES as u32,
+    )
+    .map(|chunk| {
+        let start = chunk.offset as usize;
+        let end = start + (chunk.length as usize);
+        (start, end)
+    })
+    .collect()
+}
+
+fn fastcdc_disabled_via_env() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let Some(raw) = std::env::var_os("LIX_BINARY_DISABLE_FASTCDC") else {
+            return false;
+        };
+        matches!(
+            raw.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
