@@ -1228,8 +1228,14 @@ async fn load_file_cache_blob_in_transaction(
 const FASTCDC_MIN_CHUNK_BYTES: usize = 16 * 1024;
 const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
 const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
-const BINARY_CHUNK_CODEC_PREFIX_RAW: &[u8] = b"LIXRAW01";
-const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
+const BINARY_CHUNK_CODEC_RAW: &str = "raw";
+const BINARY_CHUNK_CODEC_ZSTD: &str = "zstd";
+
+struct EncodedBinaryChunkPayload {
+    codec: &'static str,
+    codec_dict_id: Option<String>,
+    data: Vec<u8>,
+}
 
 async fn persist_binary_blob_with_fastcdc_backend(
     backend: &dyn LixBackend,
@@ -1269,7 +1275,7 @@ async fn persist_binary_blob_with_fastcdc_backend(
 
     for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
         let chunk_data = data[start..end].to_vec();
-        let chunk_payload = encode_binary_chunk_payload(&chunk_data)?;
+        let encoded_chunk = encode_binary_chunk_payload(&chunk_data)?;
         let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
         let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
             message: format!(
@@ -1277,7 +1283,7 @@ async fn persist_binary_blob_with_fastcdc_backend(
                 file_id, version_id
             ),
         })?;
-        let stored_chunk_size = i64::try_from(chunk_payload.len()).map_err(|_| LixError {
+        let stored_chunk_size = i64::try_from(encoded_chunk.data.len()).map_err(|_| LixError {
             message: format!(
                 "binary stored chunk size exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
@@ -1292,13 +1298,18 @@ async fn persist_binary_blob_with_fastcdc_backend(
 
         backend
             .execute(
-                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, created_at) \
-                 VALUES ($1, $2, $3, $4) \
+                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, codec, codec_dict_id, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (chunk_hash) DO NOTHING",
                 &[
                     Value::Text(chunk_hash.clone()),
-                    Value::Blob(chunk_payload),
+                    Value::Blob(encoded_chunk.data),
                     Value::Integer(stored_chunk_size),
+                    Value::Text(encoded_chunk.codec.to_string()),
+                    match encoded_chunk.codec_dict_id {
+                        Some(codec_dict_id) => Value::Text(codec_dict_id),
+                        None => Value::Null,
+                    },
                     Value::Text(now.clone()),
                 ],
             )
@@ -1377,7 +1388,7 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
 
     for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
         let chunk_data = data[start..end].to_vec();
-        let chunk_payload = encode_binary_chunk_payload(&chunk_data)?;
+        let encoded_chunk = encode_binary_chunk_payload(&chunk_data)?;
         let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
         let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
             message: format!(
@@ -1385,7 +1396,7 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
                 file_id, version_id
             ),
         })?;
-        let stored_chunk_size = i64::try_from(chunk_payload.len()).map_err(|_| LixError {
+        let stored_chunk_size = i64::try_from(encoded_chunk.data.len()).map_err(|_| LixError {
             message: format!(
                 "binary stored chunk size exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
@@ -1400,13 +1411,18 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
 
         transaction
             .execute(
-                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, created_at) \
-                 VALUES ($1, $2, $3, $4) \
+                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, codec, codec_dict_id, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (chunk_hash) DO NOTHING",
                 &[
                     Value::Text(chunk_hash.clone()),
-                    Value::Blob(chunk_payload),
+                    Value::Blob(encoded_chunk.data),
                     Value::Integer(stored_chunk_size),
+                    Value::Text(encoded_chunk.codec.to_string()),
+                    match encoded_chunk.codec_dict_id {
+                        Some(codec_dict_id) => Value::Text(codec_dict_id),
+                        None => Value::Null,
+                    },
                     Value::Text(now.clone()),
                 ],
             )
@@ -1466,23 +1482,22 @@ fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     .collect()
 }
 
-fn encode_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError> {
-    let mut raw_payload =
-        Vec::with_capacity(BINARY_CHUNK_CODEC_PREFIX_RAW.len() + chunk_data.len());
-    raw_payload.extend_from_slice(BINARY_CHUNK_CODEC_PREFIX_RAW);
-    raw_payload.extend_from_slice(chunk_data);
-
+fn encode_binary_chunk_payload(chunk_data: &[u8]) -> Result<EncodedBinaryChunkPayload, LixError> {
     // Phase 2: per-chunk compression with "if smaller" admission.
     let compressed = compress_binary_chunk_payload(chunk_data)?;
-    let zstd_size = BINARY_CHUNK_CODEC_PREFIX_ZSTD.len() + compressed.len();
-    if zstd_size < raw_payload.len() {
-        let mut zstd_payload = Vec::with_capacity(zstd_size);
-        zstd_payload.extend_from_slice(BINARY_CHUNK_CODEC_PREFIX_ZSTD);
-        zstd_payload.extend_from_slice(&compressed);
-        return Ok(zstd_payload);
+    if compressed.len() < chunk_data.len() {
+        return Ok(EncodedBinaryChunkPayload {
+            codec: BINARY_CHUNK_CODEC_ZSTD,
+            codec_dict_id: None,
+            data: compressed,
+        });
     }
 
-    Ok(raw_payload)
+    Ok(EncodedBinaryChunkPayload {
+        codec: BINARY_CHUNK_CODEC_RAW,
+        codec_dict_id: None,
+        data: chunk_data.to_vec(),
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

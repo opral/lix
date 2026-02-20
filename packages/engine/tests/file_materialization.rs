@@ -721,6 +721,66 @@ async fn orphan_binary_manifest_chunk_row_count(
     value_as_i64(&rows.rows[0][0])
 }
 
+async fn binary_codec_counts_for_blob(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> (i64, i64, i64) {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT \
+                     COALESCE(SUM(CASE WHEN cs.codec = 'raw' THEN 1 ELSE 0 END), 0), \
+                     COALESCE(SUM(CASE WHEN cs.codec = 'zstd' THEN 1 ELSE 0 END), 0), \
+                     COALESCE(SUM(CASE WHEN cs.codec = 'legacy' OR cs.codec IS NULL THEN 1 ELSE 0 END), 0) \
+                 FROM lix_internal_binary_blob_manifest_chunk mc \
+                 JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+                 WHERE mc.blob_hash = '{}'",
+                blob_hash
+            ),
+            &[],
+        )
+        .await
+        .expect("binary codec counts query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    (
+        value_as_i64(&rows.rows[0][0]),
+        value_as_i64(&rows.rows[0][1]),
+        value_as_i64(&rows.rows[0][2]),
+    )
+}
+
+async fn binary_prefixed_chunk_payload_count_for_blob(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> i64 {
+    let sqlite_style_query = format!(
+        "SELECT COUNT(*) \
+         FROM lix_internal_binary_blob_manifest_chunk mc \
+         JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+         WHERE mc.blob_hash = '{}' \
+           AND hex(substr(cs.data, 1, 8)) IN ('4C49585241573031', '4C49585A53544431')",
+        blob_hash
+    );
+    let postgres_style_query = format!(
+        "SELECT COUNT(*) \
+         FROM lix_internal_binary_blob_manifest_chunk mc \
+         JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+         WHERE mc.blob_hash = '{}' \
+           AND encode(substring(cs.data from 1 for 8), 'hex') IN ('4c49585241573031', '4c49585a53544431')",
+        blob_hash
+    );
+
+    let rows = match engine.execute(&sqlite_style_query, &[]).await {
+        Ok(rows) => rows,
+        Err(_) => engine
+            .execute(&postgres_style_query, &[])
+            .await
+            .expect("prefixed binary chunk payload count query should succeed"),
+    };
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
 async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     sim: &support::simulation_test::SimulationArgs,
 ) -> (support::simulation_test::SimulationEngine, String) {
@@ -2969,5 +3029,62 @@ simulation_test!(
             delete_chunk.is_err(),
             "chunk delete should be rejected while manifest_chunk still points to it"
         );
+    }
+);
+
+simulation_test!(
+    binary_chunk_codec_metadata_is_explicit_and_payload_unframed,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: Some(runtime),
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let main_version_id = main_version_id(&engine).await;
+
+        let payload = vec![0u8; 300_000];
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('binary-codec-meta', '/assets/video.mp4', $1)",
+                &[Value::Blob(payload.clone())],
+            )
+            .await
+            .expect("binary write should succeed");
+
+        let blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-codec-meta", &main_version_id)
+                .await
+                .expect("blob hash should exist");
+
+        let (raw_count, zstd_count, legacy_count) =
+            binary_codec_counts_for_blob(&engine, &blob_hash).await;
+        assert!(raw_count + zstd_count > 0);
+        assert_eq!(legacy_count, 0);
+        assert!(
+            zstd_count >= 1,
+            "compressible payload should produce zstd chunks"
+        );
+        assert_eq!(
+            binary_prefixed_chunk_payload_count_for_blob(&engine, &blob_hash).await,
+            0
+        );
+
+        let rows = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'binary-codec-meta' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("binary file read should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        assert_blob_bytes_eq(&rows.rows[0][0], &payload);
     }
 );
