@@ -1,4 +1,4 @@
-use crate::{LixBackend, LixError, SqlDialect};
+use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const INIT_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_snapshot (\
@@ -99,6 +99,8 @@ const INIT_STATEMENTS: &[&str] = &[
      chunk_hash TEXT PRIMARY KEY,\
      data BYTEA NOT NULL,\
      size_bytes BIGINT NOT NULL,\
+     codec TEXT NOT NULL DEFAULT 'legacy',\
+     codec_dict_id TEXT,\
      created_at TEXT NOT NULL\
      )",
     "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_manifest_chunk (\
@@ -174,5 +176,78 @@ pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
     for statement in INIT_STATEMENTS {
         backend.execute(statement, &[]).await?;
     }
+    ensure_binary_chunk_codec_columns(backend).await?;
     Ok(())
+}
+
+async fn ensure_binary_chunk_codec_columns(backend: &dyn LixBackend) -> Result<(), LixError> {
+    ensure_column_exists(
+        backend,
+        "lix_internal_binary_chunk_store",
+        "codec",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )
+    .await?;
+    ensure_column_exists(
+        backend,
+        "lix_internal_binary_chunk_store",
+        "codec_dict_id",
+        "TEXT",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn ensure_column_exists(
+    backend: &dyn LixBackend,
+    table: &str,
+    column: &str,
+    column_ddl: &str,
+) -> Result<(), LixError> {
+    if column_exists(backend, table, column).await? {
+        return Ok(());
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_ddl}");
+    backend.execute(&alter, &[]).await?;
+    Ok(())
+}
+
+async fn column_exists(
+    backend: &dyn LixBackend,
+    table: &str,
+    column: &str,
+) -> Result<bool, LixError> {
+    let exists = match backend.dialect() {
+        SqlDialect::Sqlite => {
+            backend
+                .execute(
+                    &format!(
+                        "SELECT 1 \
+                         FROM pragma_table_info('{table}') \
+                         WHERE name = $1 \
+                         LIMIT 1"
+                    ),
+                    &[Value::Text(column.to_string())],
+                )
+                .await?
+        }
+        SqlDialect::Postgres => {
+            backend
+                .execute(
+                    "SELECT 1 \
+                     FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                       AND table_name = $1 \
+                       AND column_name = $2 \
+                     LIMIT 1",
+                    &[
+                        Value::Text(table.to_string()),
+                        Value::Text(column.to_string()),
+                    ],
+                )
+                .await?
+        }
+    };
+    Ok(!exists.rows.is_empty())
 }

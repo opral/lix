@@ -16,6 +16,9 @@ const BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
+const BINARY_CHUNK_CODEC_LEGACY: &str = "legacy";
+const BINARY_CHUNK_CODEC_RAW: &str = "raw";
+const BINARY_CHUNK_CODEC_ZSTD: &str = "zstd";
 const BINARY_CHUNK_CODEC_PREFIX_RAW: &[u8] = b"LIXRAW01";
 const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
 
@@ -1562,7 +1565,7 @@ async fn load_binary_blob_data_by_hash(
 
     let chunk_rows = backend
         .execute(
-            "SELECT mc.chunk_index, mc.chunk_hash, mc.chunk_size, cs.data \
+            "SELECT mc.chunk_index, mc.chunk_hash, mc.chunk_size, cs.data, cs.codec \
              FROM lix_internal_binary_blob_manifest_chunk mc \
              LEFT JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
              WHERE mc.blob_hash = $1 \
@@ -1615,14 +1618,20 @@ async fn load_binary_blob_data_by_hash(
                 blob_hash, chunk_hash
             ),
         })?;
+        let codec = nullable_text(row, 4, "codec")?;
         let expected_chunk_size = usize::try_from(chunk_size).map_err(|_| LixError {
             message: format!(
                 "plugin materialization: chunk size out of range for blob hash '{}' chunk '{}': {}",
                 blob_hash, chunk_hash, chunk_size
             ),
         })?;
-        let decoded_chunk_data =
-            decode_binary_chunk_payload(&chunk_data, expected_chunk_size, blob_hash, &chunk_hash)?;
+        let decoded_chunk_data = decode_binary_chunk_payload(
+            &chunk_data,
+            codec.as_deref(),
+            expected_chunk_size,
+            blob_hash,
+            &chunk_hash,
+        )?;
         if decoded_chunk_data.len() as i64 != chunk_size {
             return Err(LixError {
                 message: format!(
@@ -1652,6 +1661,30 @@ async fn load_binary_blob_data_by_hash(
 }
 
 fn decode_binary_chunk_payload(
+    chunk_data: &[u8],
+    codec: Option<&str>,
+    expected_chunk_size: usize,
+    blob_hash: &str,
+    chunk_hash: &str,
+) -> Result<Vec<u8>, LixError> {
+    match codec {
+        Some(BINARY_CHUNK_CODEC_RAW) => Ok(chunk_data.to_vec()),
+        Some(BINARY_CHUNK_CODEC_ZSTD) => {
+            decode_binary_chunk_zstd_payload(chunk_data, expected_chunk_size, blob_hash, chunk_hash)
+        }
+        Some(BINARY_CHUNK_CODEC_LEGACY) | None => {
+            decode_legacy_binary_chunk_payload(chunk_data, expected_chunk_size, blob_hash, chunk_hash)
+        }
+        Some(other) => Err(LixError {
+            message: format!(
+                "plugin materialization: unsupported chunk codec '{}' for blob hash '{}' chunk '{}'",
+                other, blob_hash, chunk_hash
+            ),
+        }),
+    }
+}
+
+fn decode_legacy_binary_chunk_payload(
     chunk_data: &[u8],
     expected_chunk_size: usize,
     blob_hash: &str,

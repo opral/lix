@@ -338,6 +338,37 @@ Checkpoint:
 
 - `B4`: no major storage change expected; improves auditability and measurement.
 
+Phase 4 result (`B4`, implemented):
+
+- Added explicit chunk codec metadata on `lix_internal_binary_chunk_store`:
+  - `codec` (`raw`, `zstd`, `legacy`)
+  - `codec_dict_id` (nullable; reserved for dictionary phases)
+- New writes store unframed chunk payloads plus codec metadata.
+- Reads are codec-driven; `legacy` rows still decode old framed payloads for compatibility.
+- Added migration-safe init logic to ensure codec columns exist on existing databases.
+- Added validation test:
+  - `binary_chunk_codec_metadata_is_explicit_and_payload_unframed_{sqlite,postgres}`: passed
+
+Phase 4 benchmark:
+
+- Report: `packages/engine/benches/results/phase4-b4-codecmeta-20260220-140357.json`
+- DB: `packages/engine/benches/results/phase4-b4-codecmeta-20260220-140357.sqlite`
+- Baseline for delta: `B3` (`packages/engine/benches/results/phase3-b3-gc-20260220-135331.json`)
+
+| Metric | `B3` | `B4` | Delta |
+| --- | ---: | ---: | ---: |
+| `history_tables_after_update` | 7,311,360 | 7,311,360 | 0.00% |
+| `history_storage_ratio_after_update` | 0.389 | 0.389 | 0.00% |
+| `ingest_write_amp` | 0.196 | 0.196 | 0.00% |
+| `update_write_amp` | 0.124 | 0.124 | 0.00% |
+| `chunk_store_bytes` | 7,119,458 | 7,118,098 | -0.02% |
+
+| Workload Wall Time (ms) | `B3` | `B4` | Delta |
+| --- | ---: | ---: | ---: |
+| `ingest_binary_cold` | 295.259 | 290.893 | -1.48% |
+| `update_binary_hot` | 605.460 | 607.989 | +0.42% |
+| `read_history_validate_single` | 45,675.611 | 46,409.204 | +1.61% |
+
 ### Phase 5: Dictionary Recompression + Maintenance
 
 1. Add background dictionary training by binary cohort.
