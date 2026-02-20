@@ -1,3 +1,4 @@
+mod analysis;
 mod ast_ref;
 mod ast_utils;
 mod entity_views;
@@ -6,10 +7,24 @@ mod lowering;
 mod params;
 mod pipeline;
 mod read_pipeline;
+mod rewrite;
 mod row_resolution;
 mod steps;
 mod types;
 
+pub(crate) use analysis::{
+    active_version_from_mutations, active_version_from_update_validations,
+    file_history_read_materialization_required_for_statements,
+    file_read_materialization_scope_for_statements, is_query_only_statements,
+    should_invalidate_installed_plugins_cache_for_sql,
+    should_invalidate_installed_plugins_cache_for_statements,
+    should_refresh_file_cache_for_statements, FileReadMaterializationScope,
+};
+#[cfg(test)]
+pub(crate) use analysis::{
+    file_history_read_materialization_required_for_sql, file_read_materialization_scope_for_sql,
+    is_query_only_sql, should_refresh_file_cache_for_sql,
+};
 pub(crate) use ast_ref::{expr_references_column_name, ColumnReferenceOptions};
 pub(crate) use ast_utils::{
     default_alias, object_name_matches, parse_single_query, quote_ident, rewrite_query_selects,
@@ -33,14 +48,19 @@ pub(crate) use read_pipeline::{
     rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
     ReadRewriteSession,
 };
+#[cfg(test)]
+pub(crate) use rewrite::extract_explicit_transaction_script;
+pub(crate) use rewrite::{
+    coalesce_lix_file_transaction_statements, extract_explicit_transaction_script_from_statements,
+};
 pub(crate) use row_resolution::{
     insert_values_rows_mut, materialize_vtable_insert_select_sources, resolve_expr_cell_with_state,
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
 };
-pub(crate) use steps::working_projection_refresh::refresh_working_projection_for_read_query;
 pub use steps::vtable_write::{
     build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
 };
+pub(crate) use steps::working_projection_refresh::refresh_working_projection_for_read_query;
 pub use types::PostprocessPlan;
 pub(crate) use types::PreparedStatement;
 pub use types::SchemaRegistration;
