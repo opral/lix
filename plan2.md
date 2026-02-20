@@ -188,6 +188,56 @@ Checkpoint:
 - `B1C`: dedup ratio and storage-growth behavior on append/localized-edit workloads.
 - `B1`: consolidated Phase 1 gate (all of `B1A/B1B/B1C` pass).
 
+Phase 1 result (`B1`, implemented):
+
+- Run tag: `phase1-b1-consolidated-20260220-124603`
+- Report: `packages/engine/benches/results/phase1-b1-consolidated-20260220-124603.json`
+- DB: `packages/engine/benches/results/phase1-b1-consolidated-20260220-124603.sqlite`
+
+| Metric | `B0A` | `B1` | Delta |
+| --- | ---: | ---: | ---: |
+| `history_tables_after_update` | 53,321,728 | 21,258,240 | -60.1% |
+| `history_storage_ratio_after_update` | 2.839 | 1.132 | -60.1% |
+| `ingest_write_amp` | 1.015 | 0.591 | -41.8% |
+| `update_write_amp` | 1.007 | 0.326 | -67.6% |
+
+| `B1` Chunk Diagnostics | Value |
+| --- | ---: |
+| `manifest_rows` | 72 |
+| `manifest_chunk_refs` | 332 |
+| `unique_chunks` | 170 |
+| `chunk_reuse_rate` | 0.488 |
+| `bytes_dedup_saved` | 32,147,414 |
+
+Phase 1 replay benchmark (`vscode-docs` first 100 commits, full LFS):
+
+- `B0A` output: `packages/vscode-docs-replay/results/vscode-docs-first-100-baseline-b0a.lix`
+- `B1` output: `packages/vscode-docs-replay/results/vscode-docs-first-100-phase1-b1.lix`
+- Same replay input/anchor/env as baseline (`artifact/vscode-docs-nosmudge`, `VSCODE_REPLAY_RESOLVE_LFS_POINTERS=1`).
+
+| Replay Metric | `B0A` | `B1` | Delta |
+| --- | ---: | ---: | ---: |
+| `elapsed_seconds` | 354.17 | 369.62 | +4.36% |
+| `commits_replayed` | 100 | 100 | 0 |
+| `commits_applied` | 100 | 100 | 0 |
+| `changed_paths_total` | 3,198 | 3,198 | 0 |
+
+| Storage Metric | `B0A` | `B1` | Delta |
+| --- | ---: | ---: | ---: |
+| `lix_file_bytes` | 955,736,064 | 958,664,704 | +0.31% |
+| `sqlite_page_count` | 233,334 | 234,049 | +0.31% |
+| `binary_objects_total_bytes` (`dbstat`: `lix_internal_binary*` + binary autoindexes) | 804,515,840 | 806,895,616 | +0.30% |
+| `binary_version_ref_rows` | 2,531 | 2,536 | +5 |
+| `logical_history_bytes` (`SUM(size_bytes)` in `lix_internal_binary_file_version_ref`) | 835,601,492 | 838,730,269 | +0.37% |
+
+| Binary Layout (`dbstat` table bytes) | `B0A` | `B1` |
+| --- | ---: | ---: |
+| `lix_internal_binary_blob_store` | 803,500,032 | 4,096 |
+| `lix_internal_binary_chunk_store` | 4,096 | 801,841,152 |
+| `lix_internal_binary_blob_manifest` | 4,096 | 286,720 |
+| `lix_internal_binary_blob_manifest_chunk` | 4,096 | 1,744,896 |
+| `lix_internal_binary_file_version_ref` | 491,520 | 491,520 |
+
 ### Phase 2: Zstd Per Chunk
 
 1. Add `zstd-if-smaller` compression per chunk.
