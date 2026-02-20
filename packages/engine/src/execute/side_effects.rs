@@ -599,26 +599,13 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
-            persist_binary_blob_with_fastcdc_backend(
+            persist_binary_blob_naive_backend(
                 self.backend.as_ref(),
                 &write.file_id,
                 &write.version_id,
                 &write.after_data,
             )
             .await?;
-            self.backend
-                .execute(
-                    "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
-                     VALUES ($1, $2, $3) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     data = EXCLUDED.data",
-                    &[
-                        Value::Text(write.file_id.clone()),
-                        Value::Text(write.version_id.clone()),
-                        Value::Blob(write.after_data.clone()),
-                    ],
-                )
-                .await?;
         }
 
         Ok(())
@@ -639,26 +626,13 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
-            persist_binary_blob_with_fastcdc_in_transaction(
+            persist_binary_blob_naive_in_transaction(
                 transaction,
                 &write.file_id,
                 &write.version_id,
                 &write.after_data,
             )
             .await?;
-            transaction
-                .execute(
-                    "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
-                     VALUES ($1, $2, $3) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     data = EXCLUDED.data",
-                    &[
-                        Value::Text(write.file_id.clone()),
-                        Value::Text(write.version_id.clone()),
-                        Value::Blob(write.after_data.clone()),
-                    ],
-                )
-                .await?;
         }
 
         Ok(())
@@ -799,13 +773,8 @@ impl Engine {
                 });
             }
 
-            persist_binary_blob_with_fastcdc_backend(
-                self.backend.as_ref(),
-                file_id,
-                version_id,
-                &data,
-            )
-            .await?;
+            persist_binary_blob_naive_backend(self.backend.as_ref(), file_id, version_id, &data)
+                .await?;
         }
 
         Ok(())
@@ -860,13 +829,8 @@ impl Engine {
                 });
             }
 
-            persist_binary_blob_with_fastcdc_in_transaction(
-                transaction,
-                file_id,
-                version_id,
-                &data,
-            )
-            .await?;
+            persist_binary_blob_naive_in_transaction(transaction, file_id, version_id, &data)
+                .await?;
         }
 
         Ok(())
@@ -1257,11 +1221,7 @@ async fn load_file_cache_blob_in_transaction(
     Ok(Some(blob_value_required(row, 0, "data")?))
 }
 
-const FASTCDC_MIN_CHUNK_BYTES: usize = 16 * 1024;
-const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
-const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
-
-async fn persist_binary_blob_with_fastcdc_backend(
+async fn persist_binary_blob_naive_backend(
     backend: &dyn LixBackend,
     file_id: &str,
     version_id: &str,
@@ -1274,72 +1234,21 @@ async fn persist_binary_blob_with_fastcdc_backend(
             file_id, version_id
         ),
     })?;
-    let chunk_ranges = fastcdc_chunk_ranges(data);
-    let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
-        message: format!(
-            "binary chunk count exceeds supported range for file '{}' version '{}'",
-            file_id, version_id
-        ),
-    })?;
     let now = crate::functions::timestamp::timestamp();
 
     backend
         .execute(
-            "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
+            "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (blob_hash) DO NOTHING",
             &[
                 Value::Text(blob_hash.clone()),
+                Value::Blob(data.to_vec()),
                 Value::Integer(size_bytes),
-                Value::Integer(chunk_count),
                 Value::Text(now.clone()),
             ],
         )
         .await?;
-
-    for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
-        let chunk_data = data[start..end].to_vec();
-        let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
-        let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
-            message: format!(
-                "binary chunk size exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-        let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
-            message: format!(
-                "binary chunk index exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-
-        backend
-            .execute(
-                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, created_at) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (chunk_hash) DO NOTHING",
-                &[
-                    Value::Text(chunk_hash.clone()),
-                    Value::Blob(chunk_data),
-                    Value::Integer(chunk_size),
-                    Value::Text(now.clone()),
-                ],
-            )
-            .await?;
-        backend
-            .execute(
-                "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
-                &[
-                    Value::Text(blob_hash.clone()),
-                    Value::Integer(chunk_index),
-                    Value::Text(chunk_hash),
-                    Value::Integer(chunk_size),
-                ],
-            )
-            .await?;
-    }
 
     backend
         .execute(
@@ -1362,7 +1271,7 @@ async fn persist_binary_blob_with_fastcdc_backend(
     Ok(())
 }
 
-async fn persist_binary_blob_with_fastcdc_in_transaction(
+async fn persist_binary_blob_naive_in_transaction(
     transaction: &mut dyn LixTransaction,
     file_id: &str,
     version_id: &str,
@@ -1375,72 +1284,21 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
             file_id, version_id
         ),
     })?;
-    let chunk_ranges = fastcdc_chunk_ranges(data);
-    let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
-        message: format!(
-            "binary chunk count exceeds supported range for file '{}' version '{}'",
-            file_id, version_id
-        ),
-    })?;
     let now = crate::functions::timestamp::timestamp();
 
     transaction
         .execute(
-            "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
+            "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (blob_hash) DO NOTHING",
             &[
                 Value::Text(blob_hash.clone()),
+                Value::Blob(data.to_vec()),
                 Value::Integer(size_bytes),
-                Value::Integer(chunk_count),
                 Value::Text(now.clone()),
             ],
         )
         .await?;
-
-    for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
-        let chunk_data = data[start..end].to_vec();
-        let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
-        let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
-            message: format!(
-                "binary chunk size exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-        let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
-            message: format!(
-                "binary chunk index exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-
-        transaction
-            .execute(
-                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, created_at) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (chunk_hash) DO NOTHING",
-                &[
-                    Value::Text(chunk_hash.clone()),
-                    Value::Blob(chunk_data),
-                    Value::Integer(chunk_size),
-                    Value::Text(now.clone()),
-                ],
-            )
-            .await?;
-        transaction
-            .execute(
-                "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
-                &[
-                    Value::Text(blob_hash.clone()),
-                    Value::Integer(chunk_index),
-                    Value::Text(chunk_hash),
-                    Value::Integer(chunk_size),
-                ],
-            )
-            .await?;
-    }
 
     transaction
         .execute(
@@ -1461,25 +1319,6 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
         .await?;
 
     Ok(())
-}
-
-fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-
-    fastcdc::v2020::FastCDC::new(
-        data,
-        FASTCDC_MIN_CHUNK_BYTES as u32,
-        FASTCDC_AVG_CHUNK_BYTES as u32,
-        FASTCDC_MAX_CHUNK_BYTES as u32,
-    )
-    .map(|chunk| {
-        let start = chunk.offset as usize;
-        let end = start + (chunk.length as usize);
-        (start, end)
-    })
-    .collect()
 }
 
 fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {

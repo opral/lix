@@ -16,6 +16,8 @@ const BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
+const BINARY_CHUNK_CODEC_PREFIX_RAW: &[u8] = b"LIXRAW01";
+const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileChangeDetectionRequest {
@@ -1613,18 +1615,26 @@ async fn load_binary_blob_data_by_hash(
                 blob_hash, chunk_hash
             ),
         })?;
-        if chunk_data.len() as i64 != chunk_size {
+        let expected_chunk_size = usize::try_from(chunk_size).map_err(|_| LixError {
+            message: format!(
+                "plugin materialization: chunk size out of range for blob hash '{}' chunk '{}': {}",
+                blob_hash, chunk_hash, chunk_size
+            ),
+        })?;
+        let decoded_chunk_data =
+            decode_binary_chunk_payload(&chunk_data, expected_chunk_size, blob_hash, &chunk_hash)?;
+        if decoded_chunk_data.len() as i64 != chunk_size {
             return Err(LixError {
                 message: format!(
                     "plugin materialization: chunk size mismatch for blob hash '{}' chunk '{}': expected {}, got {}",
                     blob_hash,
                     chunk_hash,
                     chunk_size,
-                    chunk_data.len()
+                    decoded_chunk_data.len()
                 ),
             });
         }
-        reconstructed.extend_from_slice(&chunk_data);
+        reconstructed.extend_from_slice(&decoded_chunk_data);
     }
 
     if reconstructed.len() as i64 != manifest_size_bytes {
@@ -1639,6 +1649,40 @@ async fn load_binary_blob_data_by_hash(
     }
 
     Ok(Some(reconstructed))
+}
+
+fn decode_binary_chunk_payload(
+    chunk_data: &[u8],
+    expected_chunk_size: usize,
+    blob_hash: &str,
+    chunk_hash: &str,
+) -> Result<Vec<u8>, LixError> {
+    if let Some(raw_payload) = chunk_data.strip_prefix(BINARY_CHUNK_CODEC_PREFIX_RAW) {
+        return Ok(raw_payload.to_vec());
+    }
+    if let Some(compressed_payload) = chunk_data.strip_prefix(BINARY_CHUNK_CODEC_PREFIX_ZSTD) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: zstd-compressed chunk is not supported in wasm build for blob hash '{}' chunk '{}'",
+                    blob_hash, chunk_hash
+                ),
+            });
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        return zstd::bulk::decompress(compressed_payload, expected_chunk_size).map_err(|error| {
+            LixError {
+                message: format!(
+                    "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
+                    blob_hash, chunk_hash
+                ),
+            }
+        });
+    }
+    // Backward compatibility for rows written before payload framing/compression.
+    Ok(chunk_data.to_vec())
 }
 
 async fn load_file_cache_data(

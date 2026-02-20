@@ -16,7 +16,9 @@ uuid = { version = "1", features = ["v7", "std", "js"] }
 unicode-normalization = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 blake3 = "1"
-fastcdc = "3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = "0.13"
 
 [dev-dependencies]
 criterion = "0.8.2"

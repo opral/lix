@@ -248,3 +248,84 @@ This is the optimization baseline to beat.
 | avg_chunks_per_blob  | 1.000 | 4.792 |
 | chunk_reuse_rate     | 0.000 | 0.454 |
 | bytes_dedup_saved    | 0 | 107,225,831 |
+
+## Experiment: Bounded Binary Read Cache (`<=256 KiB`)
+
+- Goal: test whether we can keep `lix_internal_file_data_cache` non-authoritative and bounded so storage stays low after read-heavy workloads.
+- Setup:
+  `packages/engine/src/execute/side_effects.rs` keeps write-time cache disabled.
+  `packages/engine/src/execute/entry.rs` prunes large binary cache rows (`length(data) > 256 KiB`) after read-only queries.
+- Report:
+  `packages/engine/benches/results/binary-storage-report-bounded-read-cache-4mb.json`
+- DB artifact:
+  `packages/engine/benches/results/binary-storage-bounded-read-cache-4mb.sqlite`
+
+### Delta Vs FastCDC 4 MiB Baseline
+
+| Metric                          | FastCDC Baseline | Bounded Read Cache | Delta |
+| ------------------------------- | ---------------: | -----------------: | ----: |
+| DB bytes after update           | 163,360,768 | 94,273,536 | -42.29% |
+| DB bytes after reads            | 163,360,768 | 163,065,856 | -0.18% |
+| table bytes after reads         | 161,062,912 | 97,886,208 | -39.22% |
+| file_data_cache bytes after reads | 68,092,152 | 5,032,913 | -92.61% |
+| freelist pages after reads      | 67 | 15,423 | +22919.40% |
+| read_point wall (ms)            | 112,894.842 | 261,148.138 | +131.32% |
+| read_point p95 (ms)             | 406.562 | 570.419 | +40.30% |
+| read_scan wall (ms)             | 2,631.966 | 5,299.681 | +101.36% |
+| read_scan p95 (ms)              | 344.719 | 685.114 | +98.75% |
+
+### Outcome
+
+- Storage target:
+  yes for logical table footprint after reads (`-39.22%`) and cache bytes (`-92.61%`).
+- Read performance target:
+  no, this approach is too expensive in current form (`read_point p95 +40.30%`, `read_scan p95 +98.75%`).
+- Important detail:
+  DB file bytes stayed almost flat after reads because deleted cache pages moved to freelist instead of shrinking the file.
+  A manual `VACUUM` on this DB reduced size from `163,065,856` to `100,159,488` bytes (`-38.69%`).
+- Note:
+  benchmark report values are pre-`VACUUM`; the DB artifact was vacuumed once to validate reclaim potential.
+
+Conclusion: bounded non-authoritative cache can deliver the storage win, but we need direct CAS read path (avoid write-then-delete churn) to avoid large read regressions.
+
+## Experiment: Zstd-Compressed CAS Chunks (FastCDC + BLAKE3)
+
+- Goal: test chunk-level zstd compression in the current engine CAS pipeline for opaque binaries.
+- Implementation:
+  `packages/engine/src/execute/side_effects.rs` now frames each chunk as either raw (`LIXRAW01`) or zstd (`LIXZSTD1`) and stores the smaller payload.
+  `packages/engine/src/plugin/runtime.rs` decodes framed chunk payloads during materialization, with backward compatibility for legacy unframed rows.
+- Report:
+  `packages/engine/benches/results/binary-storage-report-zstd-4mb.json`
+- DB artifact:
+  `packages/engine/benches/results/binary-storage-zstd-4mb.sqlite`
+
+### Delta Vs Current Baseline (No-Zstd CAS)
+
+- Baseline report:
+  `packages/engine/benches/results/binary-storage-report-no-write-cache-4mb.json`
+
+| Metric                    | No-Zstd Baseline | Zstd CAS | Delta |
+| ------------------------- | ---------------: | -------: | ----: |
+| DB bytes after ingest     | 41,021,440 | 16,007,168 | -60.98% |
+| DB bytes after update     | 94,273,536 | 35,852,288 | -61.97% |
+| DB bytes after reads      | 163,057,664 | 104,636,416 | -35.83% |
+| table bytes after update  | 92,446,720 | 34,025,472 | -63.19% |
+| chunk_store_bytes         | 90,451,780 | 32,117,457 | -64.49% |
+| bytes_dedup_saved         | 107,225,831 | 165,560,154 | +54.40% |
+| ingest wall (ms)          | 1188.048 | 1430.321 | +20.39% |
+| update wall (ms)          | 2704.615 | 2583.577 | -4.48% |
+| read_point wall (ms)      | 110315.525 | 127442.426 | +15.53% |
+| read_scan wall (ms)       | 2855.870 | 3004.858 | +5.22% |
+| read_point p95 (ms)       | 487.975 | 622.898 | +27.65% |
+| read_scan p95 (ms)        | 454.547 | 458.508 | +0.87% |
+| ingest_write_amp          | 0.637 | 0.240 | -62.27% |
+| update_write_amp          | 0.396 | 0.147 | -62.73% |
+
+### Outcome
+
+- Storage target:
+  met with high margin (`-61.97%` after update, `-35.83%` sustained after reads).
+- Performance trade-off:
+  ingest and read-point got slower (`ingest +20.39%`, `read_point p95 +27.65%`), while update improved modestly (`-4.48%`) and read-scan p95 stayed nearly flat (`+0.87%`).
+
+Conclusion: zstd chunk compression is a high-impact storage optimization and passes the `>30%` storage bar, but it introduces noticeable point-read latency overhead.

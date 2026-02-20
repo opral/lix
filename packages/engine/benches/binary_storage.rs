@@ -1,6 +1,5 @@
 use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Value};
 use serde::Serialize;
-use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -9,17 +8,18 @@ use tokio::runtime::Runtime;
 #[path = "../tests/support/wasmtime_runtime.rs"]
 mod bench_wasmtime_runtime;
 
-mod support;
-use support::sqlite_backend::BenchSqliteBackend;
-use support::storage_metrics::{
-    collect_binary_chunk_diagnostics, collect_storage_metrics, BinaryChunkDiagnostics,
-    StorageMetrics,
+#[path = "support/sqlite_backend.rs"]
+mod sqlite_backend;
+#[path = "support/storage_metrics.rs"]
+mod storage_metrics;
+use sqlite_backend::BenchSqliteBackend;
+use storage_metrics::{
+    collect_binary_chunk_diagnostics, collect_binary_history_storage_metrics,
+    collect_storage_metrics, BinaryChunkDiagnostics, BinaryHistoryStorageMetrics, StorageMetrics,
 };
 
-const DEFAULT_FILES_PER_CLASS: usize = 32;
+const DEFAULT_FILES_PER_CLASS: usize = 8;
 const DEFAULT_UPDATE_ROUNDS: usize = 2;
-const DEFAULT_POINT_READ_OPS: usize = 500;
-const DEFAULT_SCAN_READ_OPS: usize = 8;
 const PROFILE_4MB_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -40,6 +40,12 @@ struct FileSpec {
     media_ext: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WorkloadIo {
+    Write,
+    Read,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct WorkloadMetrics {
     name: String,
@@ -54,11 +60,11 @@ struct WorkloadMetrics {
 
 #[derive(Debug, Clone, Serialize)]
 struct BenchConfig {
+    phase_label: String,
     files_per_class: usize,
     max_blob_bytes: usize,
     update_rounds: usize,
-    point_read_ops: usize,
-    scan_read_ops: usize,
+    history_validation_queries: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,10 +86,12 @@ struct StorageSummary {
     baseline: StorageMetrics,
     after_ingest: StorageMetrics,
     after_update: StorageMetrics,
-    after_reads: StorageMetrics,
+    baseline_history: BinaryHistoryStorageMetrics,
+    after_ingest_history: BinaryHistoryStorageMetrics,
+    after_update_history: BinaryHistoryStorageMetrics,
     ingest_write_amp: f64,
     update_write_amp: f64,
-    storage_amp_after_update: f64,
+    history_storage_ratio_after_update: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,10 +138,11 @@ fn run() -> Result<(), LixError> {
         "LIX_BINARY_STORAGE_FILES_PER_CLASS",
         DEFAULT_FILES_PER_CLASS,
     )?;
+    let phase_label = std::env::var("LIX_BINARY_STORAGE_PHASE_LABEL")
+        .unwrap_or_else(|_| "history-bench".to_string());
     let max_blob_bytes = PROFILE_4MB_MAX_BYTES;
     let update_rounds = env_usize("LIX_BINARY_STORAGE_UPDATE_ROUNDS", DEFAULT_UPDATE_ROUNDS)?;
-    let point_read_ops = env_usize("LIX_BINARY_STORAGE_POINT_READ_OPS", DEFAULT_POINT_READ_OPS)?;
-    let scan_read_ops = env_usize("LIX_BINARY_STORAGE_SCAN_READ_OPS", DEFAULT_SCAN_READ_OPS)?;
+    let history_validation_queries = 1usize;
 
     let backend = Box::new(BenchSqliteBackend::file_backed(&db_path)?);
     let wasm_runtime = Arc::new(bench_wasmtime_runtime::TestWasmtimeRuntime::new().map_err(
@@ -160,25 +169,41 @@ fn run() -> Result<(), LixError> {
     );
 
     let baseline_storage = runtime.block_on(collect_storage_metrics(&db_path))?;
+    let baseline_history = runtime.block_on(collect_binary_history_storage_metrics(&db_path))?;
     println!("[binary-storage] workload ingest_binary_cold");
     let ingest = run_ingest_workload(&runtime, &engine, &dataset)?;
     let after_ingest_storage = runtime.block_on(collect_storage_metrics(&db_path))?;
+    let after_ingest_history =
+        runtime.block_on(collect_binary_history_storage_metrics(&db_path))?;
 
+    let history_sample_file_id =
+        dataset
+            .first()
+            .map(|entry| entry.id.clone())
+            .ok_or_else(|| LixError {
+                message: "dataset is empty; expected at least one file for history validation"
+                    .to_string(),
+            })?;
     println!("[binary-storage] workload update_binary_hot");
-    let update = run_update_workload(
+    let (update, history_sample_before, history_sample_after) = run_update_workload(
         &runtime,
         &engine,
         &mut dataset,
         update_rounds,
         max_blob_bytes,
+        &history_sample_file_id,
     )?;
     let after_update_storage = runtime.block_on(collect_storage_metrics(&db_path))?;
-
-    println!("[binary-storage] workload read_point_binary");
-    let read_point = run_read_point_workload(&runtime, &engine, &dataset, point_read_ops)?;
-    println!("[binary-storage] workload read_scan_binary");
-    let read_scan = run_read_scan_workload(&runtime, &engine, &dataset, scan_read_ops)?;
-    let after_reads_storage = runtime.block_on(collect_storage_metrics(&db_path))?;
+    let after_update_history =
+        runtime.block_on(collect_binary_history_storage_metrics(&db_path))?;
+    println!("[binary-storage] workload read_history_validate_single");
+    let history_validation = run_history_validation_workload(
+        &runtime,
+        &engine,
+        &history_sample_file_id,
+        &history_sample_before,
+        &history_sample_after,
+    )?;
     let chunk_diagnostics = runtime.block_on(collect_binary_chunk_diagnostics(&db_path))?;
 
     let baseline_total = total_storage_bytes(&baseline_storage);
@@ -195,32 +220,36 @@ fn run() -> Result<(), LixError> {
     } else {
         0.0
     };
-    let storage_amp_after_update = if after_update_storage.file_data_cache_bytes > 0 {
-        update_total as f64 / after_update_storage.file_data_cache_bytes as f64
+    let history_storage_ratio_after_update = if after_update_history.logical_history_bytes > 0 {
+        after_update_history.total_binary_history_table_bytes as f64
+            / after_update_history.logical_history_bytes as f64
     } else {
         0.0
     };
+    let workloads = vec![ingest, update, history_validation];
 
     let report = BenchmarkReport {
         generated_unix_ms: unix_ms,
         db_path: db_path.display().to_string(),
         config: BenchConfig {
+            phase_label,
             files_per_class,
             max_blob_bytes,
             update_rounds,
-            point_read_ops,
-            scan_read_ops,
+            history_validation_queries,
         },
         dataset: dataset_summary,
-        workloads: vec![ingest, update, read_point, read_scan],
+        workloads,
         storage: StorageSummary {
             baseline: baseline_storage,
             after_ingest: after_ingest_storage,
             after_update: after_update_storage,
-            after_reads: after_reads_storage,
+            baseline_history,
+            after_ingest_history,
+            after_update_history,
             ingest_write_amp,
             update_write_amp,
-            storage_amp_after_update,
+            history_storage_ratio_after_update,
         },
         chunk_diagnostics,
     };
@@ -244,10 +273,18 @@ fn run() -> Result<(), LixError> {
         db_path.display()
     );
     println!(
-        "[binary-storage] storage_amp_after_update={:.3}, ingest_write_amp={:.3}, update_write_amp={:.3}",
-        report.storage.storage_amp_after_update,
+        "[binary-storage] history_storage_ratio_after_update={:.3}, ingest_write_amp={:.3}, update_write_amp={:.3}",
+        report.storage.history_storage_ratio_after_update,
         report.storage.ingest_write_amp,
         report.storage.update_write_amp
+    );
+    println!(
+        "[binary-storage] history_tables_after_update={} logical_history_after_update={}",
+        report
+            .storage
+            .after_update_history
+            .total_binary_history_table_bytes,
+        report.storage.after_update_history.logical_history_bytes
     );
     if let Some(chunk) = report.chunk_diagnostics.as_ref() {
         println!(
@@ -286,19 +323,24 @@ fn run_ingest_workload(
     engine: &lix_engine::Engine,
     dataset: &[FileSpec],
 ) -> Result<WorkloadMetrics, LixError> {
-    run_measured("ingest_binary_cold", dataset.len(), |index| {
-        let spec = &dataset[index];
-        runtime.block_on(engine.execute(
-            "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
-            &[
-                Value::Text(spec.id.clone()),
-                Value::Text(spec.path.clone()),
-                Value::Blob(spec.data.clone()),
-            ],
-            ExecuteOptions::default(),
-        ))?;
-        Ok(spec.data.len() as u64)
-    })
+    run_measured(
+        "ingest_binary_cold",
+        dataset.len(),
+        WorkloadIo::Write,
+        |index| {
+            let spec = &dataset[index];
+            runtime.block_on(engine.execute(
+                "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
+                &[
+                    Value::Text(spec.id.clone()),
+                    Value::Text(spec.path.clone()),
+                    Value::Blob(spec.data.clone()),
+                ],
+                ExecuteOptions::default(),
+            ))?;
+            Ok(spec.data.len() as u64)
+        },
+    )
 }
 
 fn run_update_workload(
@@ -307,67 +349,123 @@ fn run_update_workload(
     dataset: &mut [FileSpec],
     rounds: usize,
     max_blob_bytes: usize,
-) -> Result<WorkloadMetrics, LixError> {
+    sample_file_id: &str,
+) -> Result<(WorkloadMetrics, Vec<u8>, Vec<u8>), LixError> {
     let operations = dataset.len() * rounds;
-    run_measured("update_binary_hot", operations, |op_index| {
-        let file_index = op_index % dataset.len();
-        let round = op_index / dataset.len();
-        let spec = &mut dataset[file_index];
-        let next = mutate_blob(spec, round, op_index, max_blob_bytes);
+    let mut sample_before_last: Option<Vec<u8>> = None;
+    let mut sample_after_last: Option<Vec<u8>> = None;
+    let metrics = run_measured(
+        "update_binary_hot",
+        operations,
+        WorkloadIo::Write,
+        |op_index| {
+            let file_index = op_index % dataset.len();
+            let round = op_index / dataset.len();
+            let spec = &mut dataset[file_index];
+            let before = spec.data.clone();
+            let next = mutate_blob(spec, round, op_index, max_blob_bytes);
+            if spec.id == sample_file_id {
+                sample_before_last = Some(before.clone());
+                sample_after_last = Some(next.clone());
+            }
 
-        runtime.block_on(engine.execute(
-            "UPDATE lix_file SET data = ? WHERE id = ?",
-            &[Value::Blob(next.clone()), Value::Text(spec.id.clone())],
-            ExecuteOptions::default(),
-        ))?;
+            runtime.block_on(engine.execute(
+                "UPDATE lix_file SET data = ? WHERE id = ?",
+                &[Value::Blob(next.clone()), Value::Text(spec.id.clone())],
+                ExecuteOptions::default(),
+            ))?;
 
-        spec.data = next;
-        Ok(spec.data.len() as u64)
-    })
+            spec.data = next;
+            Ok(spec.data.len() as u64)
+        },
+    )?;
+
+    let sample_before_last = sample_before_last.ok_or_else(|| LixError {
+        message: format!(
+            "update workload could not capture pre-update payload for sample file '{}'",
+            sample_file_id
+        ),
+    })?;
+    let sample_after_last = sample_after_last.ok_or_else(|| LixError {
+        message: format!(
+            "update workload could not capture post-update payload for sample file '{}'",
+            sample_file_id
+        ),
+    })?;
+
+    Ok((metrics, sample_before_last, sample_after_last))
 }
 
-fn run_read_point_workload(
+fn run_history_validation_workload(
     runtime: &Runtime,
     engine: &lix_engine::Engine,
-    dataset: &[FileSpec],
-    operations: usize,
+    file_id: &str,
+    expected_before: &[u8],
+    expected_after: &[u8],
 ) -> Result<WorkloadMetrics, LixError> {
-    run_measured("read_point_binary", operations, |index| {
-        let dataset_index = (index * 17) % dataset.len();
-        let spec = &dataset[dataset_index];
-        let result = runtime.block_on(engine.execute(
-            "SELECT data FROM lix_file WHERE id = ?",
-            &[Value::Text(spec.id.clone())],
-            ExecuteOptions::default(),
-        ))?;
-        let row_count = result.rows.len();
-        black_box(row_count);
-        Ok(spec.data.len() as u64)
-    })
+    let expected_before = expected_before.to_vec();
+    let expected_after = expected_after.to_vec();
+    run_measured(
+        "read_history_validate_single",
+        1,
+        WorkloadIo::Read,
+        |_index| {
+            let result = runtime.block_on(engine.execute(
+                "SELECT data \
+                 FROM lix_file_history \
+                 WHERE id = ? \
+                 ORDER BY lixcol_root_commit_id ASC, lixcol_depth ASC",
+                &[Value::Text(file_id.to_string())],
+                ExecuteOptions::default(),
+            ))?;
+
+            if result.rows.is_empty() {
+                return Err(LixError {
+                    message: format!("history validation returned no rows for file '{}'", file_id),
+                });
+            }
+
+            let mut bytes_read = 0_u64;
+            let mut rows = Vec::with_capacity(result.rows.len());
+            for row in &result.rows {
+                if row.is_empty() {
+                    return Err(LixError {
+                        message: "history validation returned row with fewer than 1 column"
+                            .to_string(),
+                    });
+                }
+                let payload = value_binary_bytes(&row[0], "data")?;
+                rows.push(payload.clone());
+                bytes_read = bytes_read.saturating_add(payload.len() as u64);
+            }
+
+            let has_expected_before = rows.iter().any(|payload| payload == &expected_before);
+            let has_expected_after = rows.iter().any(|payload| payload == &expected_after);
+
+            if !has_expected_before || !has_expected_after {
+                return Err(LixError {
+                    message: format!(
+                        "history validation missing expected payload(s) for file '{}': has_before={}, has_after={}, before={} bytes, after={} bytes",
+                        file_id,
+                        has_expected_before,
+                        has_expected_after,
+                        expected_before.len(),
+                        expected_after.len()
+                    ),
+                });
+            }
+
+            Ok(bytes_read)
+        },
+    )
 }
 
-fn run_read_scan_workload(
-    runtime: &Runtime,
-    engine: &lix_engine::Engine,
-    dataset: &[FileSpec],
+fn run_measured<F>(
+    name: &str,
     operations: usize,
-) -> Result<WorkloadMetrics, LixError> {
-    let bytes_per_scan = dataset
-        .iter()
-        .map(|entry| entry.data.len() as u64)
-        .sum::<u64>();
-    run_measured("read_scan_binary", operations, |_index| {
-        let result = runtime.block_on(engine.execute(
-            "SELECT path, data FROM lix_file ORDER BY path",
-            &[],
-            ExecuteOptions::default(),
-        ))?;
-        black_box(result.rows.len());
-        Ok(bytes_per_scan)
-    })
-}
-
-fn run_measured<F>(name: &str, operations: usize, mut op: F) -> Result<WorkloadMetrics, LixError>
+    io: WorkloadIo,
+    mut op: F,
+) -> Result<WorkloadMetrics, LixError>
 where
     F: FnMut(usize) -> Result<u64, LixError>,
 {
@@ -396,12 +494,12 @@ where
     Ok(WorkloadMetrics {
         name: name.to_string(),
         operations: operations as u64,
-        bytes_written: if name.starts_with("read_") {
-            0
-        } else {
+        bytes_written: if matches!(io, WorkloadIo::Write) {
             bytes_total
+        } else {
+            0
         },
-        bytes_read: if name.starts_with("read_") {
+        bytes_read: if matches!(io, WorkloadIo::Read) {
             bytes_total
         } else {
             0
@@ -411,6 +509,20 @@ where
         p95_ms,
         ops_per_sec,
     })
+}
+
+fn value_binary_bytes(value: &Value, column: &str) -> Result<Vec<u8>, LixError> {
+    match value {
+        Value::Blob(bytes) => Ok(bytes.clone()),
+        Value::Text(text) => Ok(text.as_bytes().to_vec()),
+        Value::Null => Ok(Vec::new()),
+        other => Err(LixError {
+            message: format!(
+                "expected blob/text value for column '{}' but got {:?}",
+                column, other
+            ),
+        }),
+    }
 }
 
 fn percentile_ms(sorted_samples_ms: &[f64], percentile: f64) -> f64 {

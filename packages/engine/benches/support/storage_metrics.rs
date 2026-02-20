@@ -29,6 +29,19 @@ pub struct BinaryChunkDiagnostics {
     pub bytes_dedup_saved: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BinaryHistoryStorageMetrics {
+    pub blob_store_bytes: u64,
+    pub chunk_store_bytes: u64,
+    pub blob_manifest_bytes: u64,
+    pub blob_manifest_chunk_bytes: u64,
+    pub file_version_ref_bytes: u64,
+    pub binary_history_index_bytes: u64,
+    pub total_binary_history_table_bytes: u64,
+    pub total_binary_history_bytes: u64,
+    pub logical_history_bytes: u64,
+}
+
 pub async fn collect_storage_metrics(db_path: &Path) -> Result<StorageMetrics, LixError> {
     let conn = format!("sqlite://{}", db_path.display());
     let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
@@ -67,6 +80,85 @@ pub async fn collect_storage_metrics(db_path: &Path) -> Result<StorageMetrics, L
         table_bytes,
         index_bytes,
         file_data_cache_bytes,
+    })
+}
+
+pub async fn collect_binary_history_storage_metrics(
+    db_path: &Path,
+) -> Result<BinaryHistoryStorageMetrics, LixError> {
+    let conn = format!("sqlite://{}", db_path.display());
+    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
+        message: format!(
+            "failed to open sqlite db for binary history storage metrics ({}): {error}",
+            db_path.display()
+        ),
+    })?;
+
+    let chunk_store_bytes =
+        query_dbstat_table_bytes_for_table(&pool, "lix_internal_binary_chunk_store")
+            .await
+            .unwrap_or(0);
+    let blob_store_bytes =
+        query_dbstat_table_bytes_for_table(&pool, "lix_internal_binary_blob_store")
+            .await
+            .unwrap_or(0);
+    let blob_manifest_bytes =
+        query_dbstat_table_bytes_for_table(&pool, "lix_internal_binary_blob_manifest")
+            .await
+            .unwrap_or(0);
+    let blob_manifest_chunk_bytes =
+        query_dbstat_table_bytes_for_table(&pool, "lix_internal_binary_blob_manifest_chunk")
+            .await
+            .unwrap_or(0);
+    let file_version_ref_bytes =
+        query_dbstat_table_bytes_for_table(&pool, "lix_internal_binary_file_version_ref")
+            .await
+            .unwrap_or(0);
+
+    let mut binary_history_index_bytes = 0_u64;
+    for table_name in [
+        "lix_internal_binary_blob_store",
+        "lix_internal_binary_chunk_store",
+        "lix_internal_binary_blob_manifest",
+        "lix_internal_binary_blob_manifest_chunk",
+        "lix_internal_binary_file_version_ref",
+    ] {
+        binary_history_index_bytes = binary_history_index_bytes.saturating_add(
+            query_dbstat_index_bytes_for_table(&pool, table_name)
+                .await
+                .unwrap_or(0),
+        );
+    }
+
+    let total_binary_history_table_bytes = blob_store_bytes
+        .saturating_add(chunk_store_bytes)
+        .saturating_add(blob_manifest_bytes)
+        .saturating_add(blob_manifest_chunk_bytes)
+        .saturating_add(file_version_ref_bytes);
+    let total_binary_history_bytes =
+        total_binary_history_table_bytes.saturating_add(binary_history_index_bytes);
+
+    let logical_history_bytes =
+        if query_table_exists(&pool, "lix_internal_binary_file_version_ref").await? {
+            query_scalar_u64(
+                &pool,
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM lix_internal_binary_file_version_ref",
+            )
+            .await?
+        } else {
+            0
+        };
+
+    Ok(BinaryHistoryStorageMetrics {
+        blob_store_bytes,
+        chunk_store_bytes,
+        blob_manifest_bytes,
+        blob_manifest_chunk_bytes,
+        file_version_ref_bytes,
+        binary_history_index_bytes,
+        total_binary_history_table_bytes,
+        total_binary_history_bytes,
+        logical_history_bytes,
     })
 }
 
@@ -162,6 +254,44 @@ async fn query_dbstat_bytes(pool: &SqlitePool, object_type: &str) -> Result<u64,
         .await
         .map_err(|error| LixError {
             message: format!("storage metrics dbstat query failed ({object_type}): {error}"),
+        })?;
+    let value = row.try_get::<i64, _>(0).unwrap_or(0);
+    Ok(value.max(0) as u64)
+}
+
+async fn query_dbstat_table_bytes_for_table(
+    pool: &SqlitePool,
+    table_name: &str,
+) -> Result<u64, LixError> {
+    let sql = "SELECT COALESCE(SUM(d.pgsize), 0) \
+               FROM dbstat d \
+               JOIN sqlite_master m ON m.name = d.name \
+               WHERE m.type = 'table' AND m.name = ?";
+    let row = sqlx::query(sql)
+        .bind(table_name)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| LixError {
+            message: format!("storage metrics dbstat table query failed ({table_name}): {error}"),
+        })?;
+    let value = row.try_get::<i64, _>(0).unwrap_or(0);
+    Ok(value.max(0) as u64)
+}
+
+async fn query_dbstat_index_bytes_for_table(
+    pool: &SqlitePool,
+    table_name: &str,
+) -> Result<u64, LixError> {
+    let sql = "SELECT COALESCE(SUM(d.pgsize), 0) \
+               FROM dbstat d \
+               JOIN sqlite_master m ON m.name = d.name \
+               WHERE m.type = 'index' AND m.tbl_name = ?";
+    let row = sqlx::query(sql)
+        .bind(table_name)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| LixError {
+            message: format!("storage metrics dbstat index query failed ({table_name}): {error}"),
         })?;
     let value = row.try_get::<i64, _>(0).unwrap_or(0);
     Ok(value.max(0) as u64)
