@@ -1468,10 +1468,6 @@ fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         return Vec::new();
     }
 
-    if fastcdc_disabled_via_env() {
-        return vec![(0, data.len())];
-    }
-
     fastcdc::v2020::FastCDC::new(
         data,
         FASTCDC_MIN_CHUNK_BYTES as u32,
@@ -1484,19 +1480,6 @@ fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         (start, end)
     })
     .collect()
-}
-
-fn fastcdc_disabled_via_env() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        let Some(raw) = std::env::var_os("LIX_BINARY_DISABLE_FASTCDC") else {
-            return false;
-        };
-        matches!(
-            raw.to_string_lossy().trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 
 fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {

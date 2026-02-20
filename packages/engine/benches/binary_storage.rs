@@ -17,11 +17,9 @@ use support::storage_metrics::{
 };
 
 const DEFAULT_FILES_PER_CLASS: usize = 32;
-const DEFAULT_BASE_BLOB_BYTES: usize = 64 * 1024;
 const DEFAULT_UPDATE_ROUNDS: usize = 2;
 const DEFAULT_POINT_READ_OPS: usize = 500;
 const DEFAULT_SCAN_READ_OPS: usize = 8;
-const DEFAULT_BENCH_PROFILE: &str = "binary_4mb_focus";
 const PROFILE_4MB_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -30,41 +28,6 @@ enum BlobClass {
     Random,
     MediaLike,
     AppendFriendly,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum BenchProfile {
-    SmallDocs,
-    Binary4MbFocus,
-}
-
-impl BenchProfile {
-    fn parse(raw: &str) -> Result<Self, LixError> {
-        match raw {
-            "small_docs" => Ok(Self::SmallDocs),
-            "binary_4mb_focus" => Ok(Self::Binary4MbFocus),
-            _ => Err(LixError {
-                message: format!(
-                    "LIX_BINARY_STORAGE_PROFILE must be one of: small_docs, binary_4mb_focus; got '{raw}'"
-                ),
-            }),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SmallDocs => "small_docs",
-            Self::Binary4MbFocus => "binary_4mb_focus",
-        }
-    }
-
-    fn max_blob_bytes(self, _base_blob_bytes: usize) -> usize {
-        match self {
-            Self::SmallDocs => usize::MAX,
-            Self::Binary4MbFocus => PROFILE_4MB_MAX_BYTES,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,9 +54,7 @@ struct WorkloadMetrics {
 
 #[derive(Debug, Clone, Serialize)]
 struct BenchConfig {
-    profile: String,
     files_per_class: usize,
-    base_blob_bytes: usize,
     max_blob_bytes: usize,
     update_rounds: usize,
     point_read_ops: usize,
@@ -169,12 +130,7 @@ fn run() -> Result<(), LixError> {
         "LIX_BINARY_STORAGE_FILES_PER_CLASS",
         DEFAULT_FILES_PER_CLASS,
     )?;
-    let profile = env_profile("LIX_BINARY_STORAGE_PROFILE", DEFAULT_BENCH_PROFILE)?;
-    let base_blob_bytes = env_usize(
-        "LIX_BINARY_STORAGE_BASE_BLOB_BYTES",
-        DEFAULT_BASE_BLOB_BYTES,
-    )?;
-    let max_blob_bytes = profile.max_blob_bytes(base_blob_bytes);
+    let max_blob_bytes = PROFILE_4MB_MAX_BYTES;
     let update_rounds = env_usize("LIX_BINARY_STORAGE_UPDATE_ROUNDS", DEFAULT_UPDATE_ROUNDS)?;
     let point_read_ops = env_usize("LIX_BINARY_STORAGE_POINT_READ_OPS", DEFAULT_POINT_READ_OPS)?;
     let scan_read_ops = env_usize("LIX_BINARY_STORAGE_SCAN_READ_OPS", DEFAULT_SCAN_READ_OPS)?;
@@ -193,12 +149,11 @@ fn run() -> Result<(), LixError> {
     let engine = boot(boot_args);
     runtime.block_on(engine.init())?;
 
-    let mut dataset = build_dataset(files_per_class, base_blob_bytes, profile);
+    let mut dataset = build_dataset(files_per_class);
     let dataset_summary = summarize_dataset(&dataset);
     let total_files = dataset.len();
     println!(
-        "[binary-storage] dataset prepared: profile={}, files={total_files}, total_bytes={}, p80_file_bytes={}, max_file_bytes={}",
-        profile.as_str(),
+        "[binary-storage] dataset prepared: profile=binary_4mb_focus, files={total_files}, total_bytes={}, p80_file_bytes={}, max_file_bytes={}",
         dataset_summary.total_bytes,
         dataset_summary.p80_file_bytes,
         dataset_summary.max_file_bytes
@@ -215,7 +170,6 @@ fn run() -> Result<(), LixError> {
         &engine,
         &mut dataset,
         update_rounds,
-        profile,
         max_blob_bytes,
     )?;
     let after_update_storage = runtime.block_on(collect_storage_metrics(&db_path))?;
@@ -251,9 +205,7 @@ fn run() -> Result<(), LixError> {
         generated_unix_ms: unix_ms,
         db_path: db_path.display().to_string(),
         config: BenchConfig {
-            profile: profile.as_str().to_string(),
             files_per_class,
-            base_blob_bytes,
             max_blob_bytes,
             update_rounds,
             point_read_ops,
@@ -329,11 +281,6 @@ fn env_usize(name: &str, default_value: usize) -> Result<usize, LixError> {
     Ok(parsed)
 }
 
-fn env_profile(name: &str, default_value: &str) -> Result<BenchProfile, LixError> {
-    let raw = std::env::var(name).unwrap_or_else(|_| default_value.to_string());
-    BenchProfile::parse(raw.trim())
-}
-
 fn run_ingest_workload(
     runtime: &Runtime,
     engine: &lix_engine::Engine,
@@ -359,7 +306,6 @@ fn run_update_workload(
     engine: &lix_engine::Engine,
     dataset: &mut [FileSpec],
     rounds: usize,
-    profile: BenchProfile,
     max_blob_bytes: usize,
 ) -> Result<WorkloadMetrics, LixError> {
     let operations = dataset.len() * rounds;
@@ -367,7 +313,7 @@ fn run_update_workload(
         let file_index = op_index % dataset.len();
         let round = op_index / dataset.len();
         let spec = &mut dataset[file_index];
-        let next = mutate_blob(spec, round, op_index, profile, max_blob_bytes);
+        let next = mutate_blob(spec, round, op_index, max_blob_bytes);
 
         runtime.block_on(engine.execute(
             "UPDATE lix_file SET data = ? WHERE id = ?",
@@ -476,18 +422,14 @@ fn percentile_ms(sorted_samples_ms: &[f64], percentile: f64) -> f64 {
     sorted_samples_ms[position.min(last)]
 }
 
-fn build_dataset(
-    files_per_class: usize,
-    base_blob_bytes: usize,
-    profile: BenchProfile,
-) -> Vec<FileSpec> {
+fn build_dataset(files_per_class: usize) -> Vec<FileSpec> {
     let mut out = Vec::with_capacity(files_per_class * 3);
     let total_slots = files_per_class * 3;
     let mut slot = 0usize;
 
     for index in 0..files_per_class {
         let seed = 0xA11CE_u64 ^ (index as u64 * 0x9E37_79B9);
-        let size = pick_initial_size(profile, slot, total_slots, base_blob_bytes, seed);
+        let size = pick_initial_size(slot, total_slots, seed);
         slot += 1;
         out.push(FileSpec {
             id: format!("bench-random-{index:05}"),
@@ -503,7 +445,7 @@ fn build_dataset(
     for index in 0..files_per_class {
         let seed = 0xB10B_u64 ^ (index as u64 * 0x517C_C1B7);
         let ext = media_ext[index % media_ext.len()];
-        let size = pick_initial_size(profile, slot, total_slots, base_blob_bytes, seed);
+        let size = pick_initial_size(slot, total_slots, seed);
         slot += 1;
         out.push(FileSpec {
             id: format!("bench-media-{index:05}"),
@@ -517,7 +459,7 @@ fn build_dataset(
 
     for index in 0..files_per_class {
         let seed = 0x5EED_u64 ^ (index as u64 * 0x6A09_E667);
-        let size = pick_initial_size(profile, slot, total_slots, base_blob_bytes, seed);
+        let size = pick_initial_size(slot, total_slots, seed);
         slot += 1;
         out.push(FileSpec {
             id: format!("bench-append-{index:05}"),
@@ -532,13 +474,7 @@ fn build_dataset(
     out
 }
 
-fn mutate_blob(
-    spec: &FileSpec,
-    round: usize,
-    op_index: usize,
-    profile: BenchProfile,
-    max_blob_bytes: usize,
-) -> Vec<u8> {
+fn mutate_blob(spec: &FileSpec, round: usize, op_index: usize, max_blob_bytes: usize) -> Vec<u8> {
     let selector = deterministic_mix_u64(
         spec.seed
             ^ ((round as u64 + 1) * 0x9E37_79B9_7F4A_7C15)
@@ -549,13 +485,12 @@ fn mutate_blob(
     } else if selector < 85 {
         mutate_append(spec, round, max_blob_bytes)
     } else {
-        mutate_full_rewrite(spec, round, profile)
+        mutate_full_rewrite(spec, round, max_blob_bytes)
     }
 }
 
-fn mutate_full_rewrite(spec: &FileSpec, round: usize, profile: BenchProfile) -> Vec<u8> {
-    let max_blob = profile.max_blob_bytes(spec.data.len());
-    let next_len = spec.data.len().min(max_blob);
+fn mutate_full_rewrite(spec: &FileSpec, round: usize, max_blob_bytes: usize) -> Vec<u8> {
+    let next_len = spec.data.len().min(max_blob_bytes);
     let seed = spec.seed ^ ((round as u64 + 1) * 0xFF51_1AFD);
     match spec.class {
         BlobClass::Random => pseudo_random_bytes(next_len, seed),
@@ -619,31 +554,20 @@ fn mutate_append(spec: &FileSpec, round: usize, max_blob_bytes: usize) -> Vec<u8
     next
 }
 
-fn pick_initial_size(
-    profile: BenchProfile,
-    slot: usize,
-    total_slots: usize,
-    base_blob_bytes: usize,
-    seed: u64,
-) -> usize {
-    match profile {
-        BenchProfile::SmallDocs => base_blob_bytes,
-        BenchProfile::Binary4MbFocus => {
-            let percentile = if total_slots == 0 {
-                0.0
-            } else {
-                slot as f64 / total_slots as f64
-            };
-            if percentile < 0.20 {
-                sample_size_inclusive(8 * 1024, 64 * 1024, seed ^ 0xA11C_EA55)
-            } else if percentile < 0.55 {
-                sample_size_inclusive(64 * 1024 + 1, 256 * 1024, seed ^ 0xB10B_CAFE)
-            } else if percentile < 0.85 {
-                sample_size_inclusive(256 * 1024 + 1, 1024 * 1024, seed ^ 0x5EED_FACE)
-            } else {
-                sample_size_inclusive(1024 * 1024 + 1, PROFILE_4MB_MAX_BYTES, seed ^ 0xC0DE_4D2B)
-            }
-        }
+fn pick_initial_size(slot: usize, total_slots: usize, seed: u64) -> usize {
+    let percentile = if total_slots == 0 {
+        0.0
+    } else {
+        slot as f64 / total_slots as f64
+    };
+    if percentile < 0.20 {
+        sample_size_inclusive(8 * 1024, 64 * 1024, seed ^ 0xA11C_EA55)
+    } else if percentile < 0.55 {
+        sample_size_inclusive(64 * 1024 + 1, 256 * 1024, seed ^ 0xB10B_CAFE)
+    } else if percentile < 0.85 {
+        sample_size_inclusive(256 * 1024 + 1, 1024 * 1024, seed ^ 0x5EED_FACE)
+    } else {
+        sample_size_inclusive(1024 * 1024 + 1, PROFILE_4MB_MAX_BYTES, seed ^ 0xC0DE_4D2B)
     }
 }
 
