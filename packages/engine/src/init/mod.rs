@@ -83,6 +83,24 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_history_data_cache_root_depth \
      ON lix_internal_file_history_data_cache (root_commit_id, depth)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_store (\
+     blob_hash TEXT PRIMARY KEY,\
+     data BYTEA NOT NULL,\
+     size_bytes BIGINT NOT NULL,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_file_version_ref (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     blob_hash TEXT NOT NULL,\
+     size_bytes BIGINT NOT NULL,\
+     updated_at TEXT NOT NULL,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_file_version_ref_blob_hash \
+     ON lix_internal_binary_file_version_ref (blob_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_file_version_ref_version_id \
+     ON lix_internal_binary_file_version_ref (version_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\

@@ -350,6 +350,8 @@ impl Engine {
             .await?;
         self.persist_pending_file_path_updates(&pending_file_writes)
             .await?;
+        self.ensure_builtin_binary_blob_store_for_targets(&file_cache_invalidation_targets)
+            .await?;
         self.invalidate_file_data_cache_entries(&file_cache_invalidation_targets)
             .await?;
         self.invalidate_file_path_cache_entries(&file_cache_invalidation_targets)
