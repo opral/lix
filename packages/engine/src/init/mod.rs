@@ -1,4 +1,4 @@
-use crate::{LixBackend, LixError};
+use crate::{LixBackend, LixError, SqlDialect};
 
 const INIT_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_snapshot (\
@@ -106,7 +106,9 @@ const INIT_STATEMENTS: &[&str] = &[
      chunk_index BIGINT NOT NULL,\
      chunk_hash TEXT NOT NULL,\
      chunk_size BIGINT NOT NULL,\
-     PRIMARY KEY (blob_hash, chunk_index)\
+     PRIMARY KEY (blob_hash, chunk_index),\
+     FOREIGN KEY (blob_hash) REFERENCES lix_internal_binary_blob_manifest (blob_hash) ON DELETE RESTRICT,\
+     FOREIGN KEY (chunk_hash) REFERENCES lix_internal_binary_chunk_store (chunk_hash) ON DELETE RESTRICT\
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_blob_manifest_chunk_hash \
      ON lix_internal_binary_blob_manifest_chunk (chunk_hash)",
@@ -118,7 +120,8 @@ const INIT_STATEMENTS: &[&str] = &[
      blob_hash TEXT NOT NULL,\
      size_bytes BIGINT NOT NULL,\
      updated_at TEXT NOT NULL,\
-     PRIMARY KEY (file_id, version_id)\
+     PRIMARY KEY (file_id, version_id),\
+     FOREIGN KEY (blob_hash) REFERENCES lix_internal_binary_blob_manifest (blob_hash) ON DELETE RESTRICT\
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_file_version_ref_blob_hash \
      ON lix_internal_binary_file_version_ref (blob_hash)",
@@ -165,6 +168,9 @@ const INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
+    if backend.dialect() == SqlDialect::Sqlite {
+        backend.execute("PRAGMA foreign_keys = ON", &[]).await?;
+    }
     for statement in INIT_STATEMENTS {
         backend.execute(statement, &[]).await?;
     }

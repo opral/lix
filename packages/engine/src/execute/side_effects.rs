@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use crate::SqlDialect;
 use serde::Deserialize;
 
 impl Engine {
@@ -219,6 +220,8 @@ impl Engine {
             &side_effects.file_cache_invalidation_targets,
         )
         .await?;
+        self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+            .await?;
         self.invalidate_file_data_cache_entries_in_transaction(
             transaction,
             &side_effects.file_cache_invalidation_targets,
@@ -844,6 +847,17 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn garbage_collect_unreachable_binary_cas(&self) -> Result<(), LixError> {
+        garbage_collect_unreachable_binary_cas_with_backend(self.backend.as_ref()).await
+    }
+
+    pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+    ) -> Result<(), LixError> {
+        garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
     }
 
     pub(crate) async fn invalidate_file_data_cache_entries(
@@ -1507,5 +1521,292 @@ fn blob_value_required(row: &[Value], index: usize, column: &str) -> Result<Vec<
                 column, index
             ),
         }),
+    }
+}
+
+async fn garbage_collect_unreachable_binary_cas_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<(), LixError> {
+    if !binary_blob_ref_relation_exists_with_backend(backend).await? {
+        return Ok(());
+    }
+
+    let state_blob_hash_expr = binary_blob_hash_extract_expr_sql(backend.dialect());
+
+    backend
+        .execute(
+            &format!(
+                "WITH referenced AS (\
+                     SELECT file_id, version_id, {state_blob_hash_expr} AS blob_hash \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND snapshot_content IS NOT NULL \
+                       AND {state_blob_hash_expr} IS NOT NULL\
+                 ) \
+                 DELETE FROM lix_internal_binary_file_version_ref \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM referenced r \
+                 WHERE r.file_id = lix_internal_binary_file_version_ref.file_id \
+                   AND r.version_id = lix_internal_binary_file_version_ref.version_id \
+                   AND r.blob_hash = lix_internal_binary_file_version_ref.blob_hash\
+             )"
+            ),
+            &[],
+        )
+        .await?;
+
+    backend
+        .execute(
+            &format!(
+                "WITH referenced AS (\
+                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND snapshot_content IS NOT NULL \
+                       AND {state_blob_hash_expr} IS NOT NULL\
+                 ) \
+                 DELETE FROM lix_internal_binary_blob_manifest_chunk \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM referenced r \
+                 WHERE r.blob_hash = lix_internal_binary_blob_manifest_chunk.blob_hash\
+             )"
+            ),
+            &[],
+        )
+        .await?;
+
+    backend
+        .execute(
+            "DELETE FROM lix_internal_binary_chunk_store \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM lix_internal_binary_blob_manifest_chunk mc \
+                 WHERE mc.chunk_hash = lix_internal_binary_chunk_store.chunk_hash\
+             )",
+            &[],
+        )
+        .await?;
+
+    backend
+        .execute(
+            &format!(
+                "WITH referenced AS (\
+                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND snapshot_content IS NOT NULL \
+                       AND {state_blob_hash_expr} IS NOT NULL\
+                 ) \
+                 DELETE FROM lix_internal_binary_blob_manifest \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM referenced r \
+                 WHERE r.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
+             ) \
+             AND NOT EXISTS (\
+                 SELECT 1 \
+                 FROM lix_internal_binary_blob_manifest_chunk mc \
+                 WHERE mc.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
+             )"
+            ),
+            &[],
+        )
+        .await?;
+
+    backend
+        .execute(
+            "DELETE FROM lix_internal_binary_blob_store \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM lix_internal_binary_file_version_ref r \
+                 WHERE r.blob_hash = lix_internal_binary_blob_store.blob_hash\
+             )",
+            &[],
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn garbage_collect_unreachable_binary_cas_in_transaction(
+    transaction: &mut dyn LixTransaction,
+) -> Result<(), LixError> {
+    if !binary_blob_ref_relation_exists_in_transaction(transaction).await? {
+        return Ok(());
+    }
+
+    let state_blob_hash_expr = binary_blob_hash_extract_expr_sql(transaction.dialect());
+
+    transaction
+        .execute(
+            &format!(
+                "WITH referenced AS (\
+                     SELECT file_id, version_id, {state_blob_hash_expr} AS blob_hash \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND snapshot_content IS NOT NULL \
+                       AND {state_blob_hash_expr} IS NOT NULL\
+                 ) \
+                 DELETE FROM lix_internal_binary_file_version_ref \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM referenced r \
+                 WHERE r.file_id = lix_internal_binary_file_version_ref.file_id \
+                   AND r.version_id = lix_internal_binary_file_version_ref.version_id \
+                   AND r.blob_hash = lix_internal_binary_file_version_ref.blob_hash\
+             )"
+            ),
+            &[],
+        )
+        .await?;
+
+    transaction
+        .execute(
+            &format!(
+                "WITH referenced AS (\
+                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND snapshot_content IS NOT NULL \
+                       AND {state_blob_hash_expr} IS NOT NULL\
+                 ) \
+                 DELETE FROM lix_internal_binary_blob_manifest_chunk \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM referenced r \
+                 WHERE r.blob_hash = lix_internal_binary_blob_manifest_chunk.blob_hash\
+             )"
+            ),
+            &[],
+        )
+        .await?;
+
+    transaction
+        .execute(
+            "DELETE FROM lix_internal_binary_chunk_store \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM lix_internal_binary_blob_manifest_chunk mc \
+                 WHERE mc.chunk_hash = lix_internal_binary_chunk_store.chunk_hash\
+             )",
+            &[],
+        )
+        .await?;
+
+    transaction
+        .execute(
+            &format!(
+                "WITH referenced AS (\
+                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_binary_blob_ref' \
+                       AND snapshot_content IS NOT NULL \
+                       AND {state_blob_hash_expr} IS NOT NULL\
+                 ) \
+                 DELETE FROM lix_internal_binary_blob_manifest \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM referenced r \
+                 WHERE r.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
+             ) \
+             AND NOT EXISTS (\
+                 SELECT 1 \
+                 FROM lix_internal_binary_blob_manifest_chunk mc \
+                 WHERE mc.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
+             )"
+            ),
+            &[],
+        )
+        .await?;
+
+    transaction
+        .execute(
+            "DELETE FROM lix_internal_binary_blob_store \
+             WHERE NOT EXISTS (\
+                 SELECT 1 \
+                 FROM lix_internal_binary_file_version_ref r \
+                 WHERE r.blob_hash = lix_internal_binary_blob_store.blob_hash\
+             )",
+            &[],
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn binary_blob_ref_relation_exists_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<bool, LixError> {
+    match backend.dialect() {
+        SqlDialect::Sqlite => {
+            let result = backend
+                .execute(
+                    "SELECT 1 \
+                     FROM sqlite_master \
+                     WHERE name = $1 \
+                       AND type IN ('table', 'view') \
+                     LIMIT 1",
+                    &[Value::Text("lix_state_by_version".to_string())],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+        SqlDialect::Postgres => {
+            let result = backend
+                .execute(
+                    "SELECT 1 \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = current_schema() \
+                       AND c.relname = $1 \
+                     LIMIT 1",
+                    &[Value::Text("lix_state_by_version".to_string())],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+    }
+}
+
+async fn binary_blob_ref_relation_exists_in_transaction(
+    transaction: &mut dyn LixTransaction,
+) -> Result<bool, LixError> {
+    match transaction.dialect() {
+        SqlDialect::Sqlite => {
+            let result = transaction
+                .execute(
+                    "SELECT 1 \
+                     FROM sqlite_master \
+                     WHERE name = $1 \
+                       AND type IN ('table', 'view') \
+                     LIMIT 1",
+                    &[Value::Text("lix_state_by_version".to_string())],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+        SqlDialect::Postgres => {
+            let result = transaction
+                .execute(
+                    "SELECT 1 \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = current_schema() \
+                       AND c.relname = $1 \
+                     LIMIT 1",
+                    &[Value::Text("lix_state_by_version".to_string())],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+    }
+}
+
+fn binary_blob_hash_extract_expr_sql(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Sqlite => "json_extract(snapshot_content, '$.blob_hash')",
+        SqlDialect::Postgres => "(snapshot_content::jsonb ->> 'blob_hash')",
     }
 }
