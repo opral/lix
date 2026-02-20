@@ -13,6 +13,7 @@ struct BenchSqliteTransaction {
 }
 
 impl BenchSqliteBackend {
+    #[allow(dead_code)]
     pub fn in_memory() -> Self {
         Self {
             conn: "sqlite::memory:".to_string(),
