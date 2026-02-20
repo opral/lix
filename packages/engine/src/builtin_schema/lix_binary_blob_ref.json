@@ -1,0 +1,29 @@
+{
+  "x-lix-key": "lix_binary_blob_ref",
+  "x-lix-version": "1",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "x-lix-override-lixcols": {
+    "lixcol_plugin_key": "\"lix\""
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "blob_hash": {
+      "type": "string"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "id",
+    "blob_hash",
+    "size_bytes"
+  ],
+  "additionalProperties": false
+}

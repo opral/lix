@@ -644,7 +644,7 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
 }
 
 simulation_test!(
-    file_write_fails_when_no_plugin_matches_file_type,
+    file_write_uses_builtin_binary_fallback_when_no_plugin_matches_file_type,
     simulations = [sqlite],
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
@@ -659,24 +659,48 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.expect("engine init should succeed");
 
-        let error = engine
+        engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-no-plugin', '/assets/video.mp4', 'ignored')",
                 &[],
             )
             .await
-            .expect_err("write should fail when no plugin matches");
+            .expect("write should use builtin binary fallback");
 
-        assert!(
-            error.message.contains("no plugin matched file type"),
-            "unexpected error: {}",
-            error.message
+        let rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE file_id = 'file-no-plugin' \
+                   AND schema_key = 'lix_binary_blob_ref' \
+                   AND plugin_key = 'lix_builtin_binary_fallback' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("builtin fallback state row query should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        let snapshot = match &rows.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected snapshot text, got {other:?}"),
+        };
+        let parsed: JsonValue =
+            serde_json::from_str(&snapshot).expect("fallback snapshot should be valid JSON");
+        assert_eq!(
+            parsed
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            "file-no-plugin"
         );
-        assert!(
-            error.message.contains("/assets/video.mp4"),
-            "unexpected error: {}",
-            error.message
+        assert_eq!(
+            parsed
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default(),
+            7
         );
     }
 );

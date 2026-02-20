@@ -11,6 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+pub(crate) const BUILTIN_BINARY_FALLBACK_PLUGIN_KEY: &str = "lix_builtin_binary_fallback";
+const BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const DETECT_CHANGES_EXPORTS: &[&str] = &["detect-changes", "api#detect-changes"];
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
 
@@ -117,6 +120,14 @@ struct PluginActiveStateRow {
     updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinBinaryBlobRefSnapshot {
+    id: String,
+    blob_hash: String,
+    size_bytes: u64,
+}
+
 #[allow(dead_code)]
 pub(crate) async fn detect_file_changes_with_plugins(
     backend: &dyn LixBackend,
@@ -145,14 +156,6 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
     if writes.is_empty() {
         return Ok(Vec::new());
     }
-    if installed_plugins.is_empty() {
-        let first = &writes[0];
-        return Err(no_matching_plugin_for_detect_error(
-            first,
-            classify_content_type_from_bytes(&first.after_data),
-            "no plugins are installed",
-        ));
-    }
 
     let mut detected = Vec::new();
     let mut state_context_columns_by_plugin: BTreeMap<String, Option<Vec<StateContextColumn>>> =
@@ -173,10 +176,15 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         } else {
             None
         };
+        let before_uses_builtin_fallback = has_before_context && before_plugin.is_none();
         let after_content_type = classify_content_type_from_bytes(&write.after_data);
         let after_plugin = write.after_path.as_deref().and_then(|path| {
             select_plugin_for_path(path, Some(after_content_type), installed_plugins)
         });
+        let is_delete_without_after_path =
+            write.after_path.is_none() && write.after_data.is_empty();
+        let after_uses_builtin_fallback =
+            !is_delete_without_after_path && write.after_path.is_some() && after_plugin.is_none();
 
         if let Some(previous_plugin) = before_plugin {
             let plugin_changed = after_plugin
@@ -205,11 +213,69 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             }
         }
 
-        let is_delete_without_after_path =
-            write.after_path.is_none() && write.after_data.is_empty();
-        if after_plugin.is_none() && before_plugin.is_some() && is_delete_without_after_path {
+        if before_uses_builtin_fallback {
+            let fallback_changed = after_plugin.is_some() || is_delete_without_after_path;
+            if fallback_changed {
+                for existing in load_existing_plugin_entities(
+                    backend,
+                    &write.file_id,
+                    &write.version_id,
+                    BUILTIN_BINARY_FALLBACK_PLUGIN_KEY,
+                )
+                .await?
+                {
+                    detected.push(DetectedFileChange {
+                        entity_id: existing.entity_id,
+                        schema_key: existing.schema_key,
+                        schema_version: existing.schema_version,
+                        file_id: write.file_id.clone(),
+                        version_id: write.version_id.clone(),
+                        plugin_key: BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string(),
+                        snapshot_content: None,
+                    });
+                }
+            }
+        }
+
+        if is_delete_without_after_path {
             // Deletes flow through with no "after" path/data.
             // In that case, we already emitted tombstones above for the previous plugin.
+            continue;
+        }
+
+        if after_uses_builtin_fallback {
+            let after_blob_hash = binary_blob_hash_hex(&write.after_data);
+            let before_blob_hash = if before_uses_builtin_fallback {
+                load_builtin_binary_blob_ref_for_file(backend, &write.file_id, &write.version_id)
+                    .await?
+                    .map(|snapshot| snapshot.blob_hash)
+            } else {
+                None
+            };
+            if before_blob_hash.as_deref() == Some(after_blob_hash.as_str()) {
+                continue;
+            }
+
+            let snapshot_content = serde_json::to_string(&BuiltinBinaryBlobRefSnapshot {
+                id: write.file_id.clone(),
+                blob_hash: after_blob_hash,
+                size_bytes: write.after_data.len() as u64,
+            })
+            .map_err(|error| LixError {
+                message: format!(
+                    "plugin detect-changes: failed to encode builtin binary fallback snapshot: {error}"
+                ),
+            })?;
+
+            detected.push(DetectedFileChange {
+                entity_id: write.file_id.clone(),
+                schema_key: BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+                schema_version: BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
+                file_id: write.file_id.clone(),
+                version_id: write.version_id.clone(),
+                plugin_key: BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string(),
+                snapshot_content: Some(snapshot_content),
+            });
             continue;
         }
 
@@ -393,19 +459,6 @@ pub(crate) async fn materialize_file_data_with_plugins(
     plan: &MaterializationPlan,
 ) -> Result<(), LixError> {
     let installed_plugins = load_installed_plugins(backend).await?;
-    if installed_plugins.is_empty() {
-        if plan.writes.iter().any(|write| {
-            write.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-                && write.op != MaterializationWriteOp::Tombstone
-                && write.snapshot_content.as_deref().is_some()
-        }) {
-            return Err(LixError {
-                message: "plugin materialization: no plugin matched file type because no plugins are installed"
-                    .to_string(),
-            });
-        }
-        return Ok(());
-    }
 
     let mut descriptor_targets: BTreeSet<(String, String)> = BTreeSet::new();
     let mut tombstoned_files: Vec<(String, String)> = Vec::new();
@@ -461,19 +514,14 @@ pub(crate) async fn materialize_file_data_with_plugins(
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
-        let Some(plugin) = select_plugin_for_file(descriptor, &installed_plugins) else {
-            return Err(no_matching_plugin_for_materialization_error(
-                &descriptor.file_id,
-                &descriptor.version_id,
-                &descriptor.path,
-                "install a plugin whose match.path_glob and optional match.content_type cover this file",
-            ));
-        };
-
+        let plugin = select_plugin_for_file(descriptor, &installed_plugins);
+        let target_plugin_key = plugin
+            .map(|entry| entry.key.clone())
+            .unwrap_or_else(|| BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string());
         let Some(grouped_writes) = writes_by_target.get(&(
             descriptor.version_id.clone(),
             descriptor.file_id.clone(),
-            plugin.key.clone(),
+            target_plugin_key.clone(),
         )) else {
             continue;
         };
@@ -486,7 +534,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
                 return Err(LixError {
                     message: format!(
                         "plugin materialization: duplicate change key for plugin '{}' file '{}' version '{}': schema_key='{}' entity_id='{}'",
-                        plugin.key,
+                        target_plugin_key,
                         descriptor.file_id,
                         descriptor.version_id,
                         dedupe_key.0,
@@ -510,6 +558,32 @@ pub(crate) async fn materialize_file_data_with_plugins(
         if changes.is_empty() {
             continue;
         }
+
+        if plugin.is_none() {
+            let blob_ref = builtin_binary_blob_ref_from_changes(&changes, &descriptor.file_id)?;
+            if let Some(blob_ref) = blob_ref {
+                let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
+                    .await?
+                    .ok_or_else(|| LixError {
+                        message: format!(
+                            "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
+                            blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
+                        ),
+                    })?;
+                upsert_file_cache_data(
+                    backend,
+                    &descriptor.file_id,
+                    &descriptor.version_id,
+                    &blob_data,
+                )
+                .await?;
+            } else {
+                delete_file_cache_data(backend, &descriptor.file_id, &descriptor.version_id)
+                    .await?;
+            }
+            continue;
+        }
+        let plugin = plugin.expect("plugin must be present");
 
         let previous_data =
             load_file_cache_data(backend, &descriptor.file_id, &descriptor.version_id).await?;
@@ -560,31 +634,40 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
     }
 
     let installed_plugins = load_installed_plugins(backend).await?;
-    if installed_plugins.is_empty() {
-        let first = descriptors
-            .values()
-            .next()
-            .expect("descriptors should be non-empty");
-        return Err(no_matching_plugin_for_materialization_error(
-            &first.file_id,
-            &first.version_id,
-            &first.path,
-            "no plugins are installed",
-        ));
-    }
 
     let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
-        let Some(plugin) = select_plugin_for_file(descriptor, &installed_plugins) else {
-            return Err(no_matching_plugin_for_materialization_error(
+        let plugin = select_plugin_for_file(descriptor, &installed_plugins);
+        if plugin.is_none() {
+            let blob_ref = load_builtin_binary_blob_ref_for_file(
+                backend,
                 &descriptor.file_id,
                 &descriptor.version_id,
-                &descriptor.path,
-                "install a plugin whose match.path_glob and optional match.content_type cover this file",
-            ));
-        };
+            )
+            .await?;
+            let Some(blob_ref) = blob_ref else {
+                continue;
+            };
+            let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!(
+                        "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
+                        blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
+                    ),
+                })?;
+            upsert_file_cache_data(
+                backend,
+                &descriptor.file_id,
+                &descriptor.version_id,
+                &blob_data,
+            )
+            .await?;
+            continue;
+        }
+        let plugin = plugin.expect("plugin must be present");
 
         let changes = load_plugin_state_changes_for_file(
             backend,
@@ -643,34 +726,49 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
     }
 
     let installed_plugins = load_installed_plugins(backend).await?;
-    if installed_plugins.is_empty() {
-        let first = descriptors
-            .values()
-            .next()
-            .expect("descriptors should be non-empty");
-        return Err(no_matching_plugin_for_history_materialization_error(
-            &first.file_id,
-            &first.root_commit_id,
-            first.depth,
-            &first.path,
-            "no plugins are installed",
-        ));
-    }
 
     let mut loaded_instances: BTreeMap<String, std::sync::Arc<dyn crate::WasmComponentInstance>> =
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
-        let Some(plugin) = select_plugin_for_path(&descriptor.path, None, &installed_plugins)
-        else {
-            return Err(no_matching_plugin_for_history_materialization_error(
+        let plugin = select_plugin_for_path(&descriptor.path, None, &installed_plugins);
+        if plugin.is_none() {
+            let changes = load_plugin_state_changes_for_file_at_history_slice(
+                backend,
+                &descriptor.file_id,
+                BUILTIN_BINARY_FALLBACK_PLUGIN_KEY,
+                &descriptor.root_commit_id,
+                &descriptor.commit_id,
+                descriptor.depth,
+            )
+            .await?;
+            let Some(blob_ref) =
+                builtin_binary_blob_ref_from_changes(&changes, &descriptor.file_id)?
+            else {
+                continue;
+            };
+            let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!(
+                        "plugin materialization: missing builtin binary history blob payload for hash '{}' (file_id='{}' root_commit_id='{}' depth='{}')",
+                        blob_ref.blob_hash,
+                        descriptor.file_id,
+                        descriptor.root_commit_id,
+                        descriptor.depth
+                    ),
+                })?;
+            upsert_file_history_cache_data(
+                backend,
                 &descriptor.file_id,
                 &descriptor.root_commit_id,
                 descriptor.depth,
-                &descriptor.path,
-                "install a plugin whose match.path_glob and optional match.content_type cover this file",
-            ));
-        };
+                &blob_data,
+            )
+            .await?;
+            continue;
+        }
+        let plugin = plugin.expect("plugin must be present");
 
         let changes = load_plugin_state_changes_for_file_at_history_slice(
             backend,
@@ -761,6 +859,10 @@ fn plugin_content_type_label(content_type: PluginContentType) -> &'static str {
     }
 }
 
+pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
 fn no_matching_plugin_for_detect_error(
     write: &FileChangeDetectionRequest,
     content_type: PluginContentType,
@@ -775,35 +877,6 @@ fn no_matching_plugin_for_detect_error(
             path,
             plugin_content_type_label(content_type),
             reason,
-        ),
-    }
-}
-
-fn no_matching_plugin_for_materialization_error(
-    file_id: &str,
-    version_id: &str,
-    path: &str,
-    reason: &str,
-) -> LixError {
-    LixError {
-        message: format!(
-            "plugin materialization: no plugin matched file type for file_id='{}' version_id='{}' path='{}': {}",
-            file_id, version_id, path, reason,
-        ),
-    }
-}
-
-fn no_matching_plugin_for_history_materialization_error(
-    file_id: &str,
-    root_commit_id: &str,
-    depth: i64,
-    path: &str,
-    reason: &str,
-) -> LixError {
-    LixError {
-        message: format!(
-            "plugin materialization: no plugin matched file type for file_id='{}' root_commit_id='{}' depth='{}' path='{}': {}",
-            file_id, root_commit_id, depth, path, reason,
         ),
     }
 }
@@ -922,6 +995,64 @@ async fn load_plugin_state_changes_for_file(
         });
     }
     Ok(changes)
+}
+
+fn parse_builtin_binary_blob_ref_snapshot(
+    raw_snapshot: &str,
+) -> Result<BuiltinBinaryBlobRefSnapshot, LixError> {
+    serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+        message: format!(
+            "plugin materialization: builtin binary fallback snapshot_content is invalid JSON: {error}"
+        ),
+    })
+}
+
+fn builtin_binary_blob_ref_from_changes(
+    changes: &[PluginEntityChange],
+    file_id: &str,
+) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
+    for change in changes {
+        if change.schema_key != BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY {
+            continue;
+        }
+        if change.schema_version != BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: builtin binary fallback schema version mismatch for file '{}' (got '{}', expected '{}')",
+                    file_id, change.schema_version, BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION
+                ),
+            });
+        }
+        let Some(raw_snapshot) = change.snapshot_content.as_deref() else {
+            continue;
+        };
+        let parsed = parse_builtin_binary_blob_ref_snapshot(raw_snapshot)?;
+        if parsed.id != file_id {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: builtin binary fallback snapshot id '{}' does not match file_id '{}'",
+                    parsed.id, file_id
+                ),
+            });
+        }
+        return Ok(Some(parsed));
+    }
+    Ok(None)
+}
+
+async fn load_builtin_binary_blob_ref_for_file(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
+    let changes = load_plugin_state_changes_for_file(
+        backend,
+        file_id,
+        version_id,
+        BUILTIN_BINARY_FALLBACK_PLUGIN_KEY,
+    )
+    .await?;
+    builtin_binary_blob_ref_from_changes(&changes, file_id)
 }
 
 fn resolve_state_context_columns(
@@ -1384,6 +1515,26 @@ fn parse_installed_plugin_row(row: &[Value]) -> Result<InstalledPlugin, LixError
         manifest_json,
         wasm,
     })
+}
+
+async fn load_binary_blob_data_by_hash(
+    backend: &dyn LixBackend,
+    blob_hash: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let result = backend
+        .execute(
+            "SELECT data \
+             FROM lix_internal_binary_blob_store \
+             WHERE blob_hash = $1 \
+             LIMIT 1",
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(blob_required(row, 0, "data")?))
 }
 
 async fn load_file_cache_data(

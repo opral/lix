@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use serde::Deserialize;
 
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
@@ -211,6 +212,11 @@ impl Engine {
         self.persist_pending_file_path_updates_in_transaction(
             transaction,
             &side_effects.pending_file_writes,
+        )
+        .await?;
+        self.ensure_builtin_binary_blob_store_for_targets_in_transaction(
+            transaction,
+            &side_effects.file_cache_invalidation_targets,
         )
         .await?;
         self.invalidate_file_data_cache_entries_in_transaction(
@@ -433,7 +439,35 @@ impl Engine {
                 params,
             )
         };
-        Box::pin(self.execute_internal(&sql, &params, ExecuteOptions::default())).await?;
+        let mut transaction = self.backend.begin_transaction().await?;
+        let mut active_version_id = self.active_version_id.read().unwrap().clone();
+        let previous_active_version_id = active_version_id.clone();
+        let mut pending_state_commit_stream_changes = Vec::new();
+        let result = self
+            .execute_with_options_in_transaction(
+                transaction.as_mut(),
+                &sql,
+                &params,
+                &ExecuteOptions::default(),
+                &mut active_version_id,
+                None,
+                true,
+                &mut pending_state_commit_stream_changes,
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                transaction.commit().await?;
+                if active_version_id != previous_active_version_id {
+                    self.set_active_version_id(active_version_id);
+                }
+                self.emit_state_commit_stream_changes(pending_state_commit_stream_changes);
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
 
         Ok(())
     }
@@ -565,6 +599,44 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
+            let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
+            let size_bytes = i64::try_from(write.after_data.len()).map_err(|_| LixError {
+                message: format!(
+                    "binary blob size exceeds supported range for file '{}' version '{}'",
+                    write.file_id, write.version_id
+                ),
+            })?;
+            let now = crate::functions::timestamp::timestamp();
+            self.backend
+                .execute(
+                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (blob_hash) DO NOTHING",
+                    &[
+                        Value::Text(blob_hash.clone()),
+                        Value::Blob(write.after_data.clone()),
+                        Value::Integer(size_bytes),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await?;
+            self.backend
+                .execute(
+                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     blob_hash = EXCLUDED.blob_hash, \
+                     size_bytes = EXCLUDED.size_bytes, \
+                     updated_at = EXCLUDED.updated_at",
+                    &[
+                        Value::Text(write.file_id.clone()),
+                        Value::Text(write.version_id.clone()),
+                        Value::Text(blob_hash),
+                        Value::Integer(size_bytes),
+                        Value::Text(now),
+                    ],
+                )
+                .await?;
             self.backend
                 .execute(
                     "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
@@ -598,6 +670,44 @@ impl Engine {
 
         for index in latest_by_key.into_values() {
             let write = &writes[index];
+            let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
+            let size_bytes = i64::try_from(write.after_data.len()).map_err(|_| LixError {
+                message: format!(
+                    "binary blob size exceeds supported range for file '{}' version '{}'",
+                    write.file_id, write.version_id
+                ),
+            })?;
+            let now = crate::functions::timestamp::timestamp();
+            transaction
+                .execute(
+                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (blob_hash) DO NOTHING",
+                    &[
+                        Value::Text(blob_hash.clone()),
+                        Value::Blob(write.after_data.clone()),
+                        Value::Integer(size_bytes),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await?;
+            transaction
+                .execute(
+                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     blob_hash = EXCLUDED.blob_hash, \
+                     size_bytes = EXCLUDED.size_bytes, \
+                     updated_at = EXCLUDED.updated_at",
+                    &[
+                        Value::Text(write.file_id.clone()),
+                        Value::Text(write.version_id.clone()),
+                        Value::Text(blob_hash),
+                        Value::Integer(size_bytes),
+                        Value::Text(now),
+                    ],
+                )
+                .await?;
             transaction
                 .execute(
                     "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
@@ -703,6 +813,187 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) async fn ensure_builtin_binary_blob_store_for_targets(
+        &self,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        for (file_id, version_id) in targets {
+            let snapshot = load_builtin_binary_blob_ref_snapshot_for_target(
+                self.backend.as_ref(),
+                file_id,
+                version_id,
+            )
+            .await?;
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+
+            if binary_blob_exists(self.backend.as_ref(), &snapshot.blob_hash).await? {
+                continue;
+            }
+
+            let data = load_file_cache_blob(self.backend.as_ref(), file_id, version_id)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!(
+                        "builtin binary fallback: missing file_data_cache bytes for file '{}' version '{}' while backfilling blob hash '{}'",
+                        file_id, version_id, snapshot.blob_hash
+                    ),
+                })?;
+            let actual_hash = crate::plugin::runtime::binary_blob_hash_hex(&data);
+            if actual_hash != snapshot.blob_hash {
+                return Err(LixError {
+                    message: format!(
+                        "builtin binary fallback: cache bytes hash mismatch for file '{}' version '{}': expected '{}' from state, got '{}'",
+                        file_id, version_id, snapshot.blob_hash, actual_hash
+                    ),
+                });
+            }
+            if data.len() as u64 != snapshot.size_bytes {
+                return Err(LixError {
+                    message: format!(
+                        "builtin binary fallback: cache bytes size mismatch for file '{}' version '{}': expected {} bytes from state, got {}",
+                        file_id,
+                        version_id,
+                        snapshot.size_bytes,
+                        data.len()
+                    ),
+                });
+            }
+
+            let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
+                message: format!(
+                    "builtin binary fallback: blob size exceeds supported range for file '{}' version '{}'",
+                    file_id, version_id
+                ),
+            })?;
+            let now = crate::functions::timestamp::timestamp();
+            self.backend
+                .execute(
+                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (blob_hash) DO NOTHING",
+                    &[
+                        Value::Text(snapshot.blob_hash.clone()),
+                        Value::Blob(data),
+                        Value::Integer(size_bytes),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await?;
+            self.backend
+                .execute(
+                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     blob_hash = EXCLUDED.blob_hash, \
+                     size_bytes = EXCLUDED.size_bytes, \
+                     updated_at = EXCLUDED.updated_at",
+                    &[
+                        Value::Text(file_id.clone()),
+                        Value::Text(version_id.clone()),
+                        Value::Text(snapshot.blob_hash),
+                        Value::Integer(size_bytes),
+                        Value::Text(now),
+                    ],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_builtin_binary_blob_store_for_targets_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        for (file_id, version_id) in targets {
+            let snapshot = load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
+                transaction,
+                file_id,
+                version_id,
+            )
+            .await?;
+            let Some(snapshot) = snapshot else {
+                continue;
+            };
+
+            if binary_blob_exists_in_transaction(transaction, &snapshot.blob_hash).await? {
+                continue;
+            }
+
+            let data = load_file_cache_blob_in_transaction(transaction, file_id, version_id)
+                .await?
+                .ok_or_else(|| LixError {
+                    message: format!(
+                        "builtin binary fallback: missing file_data_cache bytes for file '{}' version '{}' while backfilling blob hash '{}'",
+                        file_id, version_id, snapshot.blob_hash
+                    ),
+                })?;
+            let actual_hash = crate::plugin::runtime::binary_blob_hash_hex(&data);
+            if actual_hash != snapshot.blob_hash {
+                return Err(LixError {
+                    message: format!(
+                        "builtin binary fallback: cache bytes hash mismatch for file '{}' version '{}': expected '{}' from state, got '{}'",
+                        file_id, version_id, snapshot.blob_hash, actual_hash
+                    ),
+                });
+            }
+            if data.len() as u64 != snapshot.size_bytes {
+                return Err(LixError {
+                    message: format!(
+                        "builtin binary fallback: cache bytes size mismatch for file '{}' version '{}': expected {} bytes from state, got {}",
+                        file_id,
+                        version_id,
+                        snapshot.size_bytes,
+                        data.len()
+                    ),
+                });
+            }
+
+            let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
+                message: format!(
+                    "builtin binary fallback: blob size exceeds supported range for file '{}' version '{}'",
+                    file_id, version_id
+                ),
+            })?;
+            let now = crate::functions::timestamp::timestamp();
+            transaction
+                .execute(
+                    "INSERT INTO lix_internal_binary_blob_store (blob_hash, data, size_bytes, created_at) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (blob_hash) DO NOTHING",
+                    &[
+                        Value::Text(snapshot.blob_hash.clone()),
+                        Value::Blob(data),
+                        Value::Integer(size_bytes),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await?;
+            transaction
+                .execute(
+                    "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                     blob_hash = EXCLUDED.blob_hash, \
+                     size_bytes = EXCLUDED.size_bytes, \
+                     updated_at = EXCLUDED.updated_at",
+                    &[
+                        Value::Text(file_id.clone()),
+                        Value::Text(version_id.clone()),
+                        Value::Text(snapshot.blob_hash),
+                        Value::Integer(size_bytes),
+                        Value::Text(now),
+                    ],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn invalidate_file_data_cache_entries(
         &self,
         targets: &BTreeSet<(String, String)>,
@@ -731,6 +1022,16 @@ impl Engine {
                 .execute(
                     &format!(
                         "DELETE FROM lix_internal_file_data_cache \
+                         WHERE {}",
+                        predicates.join(" OR ")
+                    ),
+                    &params,
+                )
+                .await?;
+            self.backend
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_binary_file_version_ref \
                          WHERE {}",
                         predicates.join(" OR ")
                     ),
@@ -770,6 +1071,16 @@ impl Engine {
                 .execute(
                     &format!(
                         "DELETE FROM lix_internal_file_data_cache \
+                         WHERE {}",
+                        predicates.join(" OR ")
+                    ),
+                    &params,
+                )
+                .await?;
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_binary_file_version_ref \
                          WHERE {}",
                         predicates.join(" OR ")
                     ),
@@ -884,5 +1195,202 @@ impl Engine {
             return;
         }
         *guard = version_id;
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinBinaryBlobRefSnapshot {
+    id: String,
+    blob_hash: String,
+    size_bytes: u64,
+}
+
+fn parse_builtin_binary_blob_ref_snapshot(
+    raw: &str,
+) -> Result<BuiltinBinaryBlobRefSnapshot, LixError> {
+    serde_json::from_str(raw).map_err(|error| LixError {
+        message: format!(
+            "builtin binary fallback: invalid lix_binary_blob_ref snapshot_content: {error}"
+        ),
+    })
+}
+
+async fn load_builtin_binary_blob_ref_snapshot_for_target(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
+    let result = backend
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_materialized_v1_lix_binary_blob_ref \
+             WHERE file_id = $1 \
+               AND version_id = $2 \
+               AND plugin_key = $3 \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(crate::plugin::runtime::BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
+    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
+    if parsed.id != file_id {
+        return Err(LixError {
+            message: format!(
+                "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
+                parsed.id, file_id
+            ),
+        });
+    }
+    Ok(Some(parsed))
+}
+
+async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
+    let result = transaction
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_materialized_v1_lix_binary_blob_ref \
+             WHERE file_id = $1 \
+               AND version_id = $2 \
+               AND plugin_key = $3 \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(crate::plugin::runtime::BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
+    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
+    if parsed.id != file_id {
+        return Err(LixError {
+            message: format!(
+                "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
+                parsed.id, file_id
+            ),
+        });
+    }
+    Ok(Some(parsed))
+}
+
+async fn binary_blob_exists(backend: &dyn LixBackend, blob_hash: &str) -> Result<bool, LixError> {
+    let result = backend
+        .execute(
+            "SELECT 1 \
+             FROM lix_internal_binary_blob_store \
+             WHERE blob_hash = $1 \
+             LIMIT 1",
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+    Ok(!result.rows.is_empty())
+}
+
+async fn binary_blob_exists_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    blob_hash: &str,
+) -> Result<bool, LixError> {
+    let result = transaction
+        .execute(
+            "SELECT 1 \
+             FROM lix_internal_binary_blob_store \
+             WHERE blob_hash = $1 \
+             LIMIT 1",
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+    Ok(!result.rows.is_empty())
+}
+
+async fn load_file_cache_blob(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let result = backend
+        .execute(
+            "SELECT data \
+             FROM lix_internal_file_data_cache \
+             WHERE file_id = $1 \
+               AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(blob_value_required(row, 0, "data")?))
+}
+
+async fn load_file_cache_blob_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let result = transaction
+        .execute(
+            "SELECT data \
+             FROM lix_internal_file_data_cache \
+             WHERE file_id = $1 \
+               AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(blob_value_required(row, 0, "data")?))
+}
+
+fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
+    match row.get(index) {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        _ => Err(LixError {
+            message: format!(
+                "builtin binary fallback: expected text column '{}' at index {}",
+                column, index
+            ),
+        }),
+    }
+}
+
+fn blob_value_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, LixError> {
+    match row.get(index) {
+        Some(Value::Blob(value)) => Ok(value.clone()),
+        _ => Err(LixError {
+            message: format!(
+                "builtin binary fallback: expected blob column '{}' at index {}",
+                column, index
+            ),
+        }),
     }
 }

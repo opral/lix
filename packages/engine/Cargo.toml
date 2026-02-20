@@ -15,6 +15,7 @@ globset = "0.4"
 uuid = { version = "1", features = ["v7", "std", "js"] }
 unicode-normalization = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+blake3 = "1"
 
 [dev-dependencies]
 criterion = "0.8.2"

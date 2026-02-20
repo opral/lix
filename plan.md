@@ -99,3 +99,35 @@
 | storage_amp_after_update | 7.527 |
 
 This is the optimization baseline to beat.
+
+## Current (Engine Internal Fallback, Option 2)
+
+- Report: `packages/engine/benches/results/binary-storage-report.json`
+- DB artifact: `packages/engine/benches/results/binary-storage-1771548261890.sqlite`
+- Config: same as baseline (`files_per_class=32`, `base_blob_bytes=65536`, `update_rounds=2`, `point_read_ops=500`, `scan_read_ops=8`)
+
+### Delta Vs Baseline
+
+| Metric             | Baseline | Current | Delta |
+| ------------------ | -------: | ------: | ----: |
+| ingest wall (ms)   | 1230.734 | 941.959 | -23.46% |
+| update wall (ms)   | 93003.927 | 1769.325 | -98.10% |
+| read point wall (ms) | 117890.028 | 111385.573 | -5.52% |
+| read scan wall (ms) | 5429.370 | 1750.026 | -67.77% |
+| ingest ops/s       | 78.002 | 101.915 | +30.66% |
+| update ops/s       | 2.064 | 108.516 | +5157.56% |
+| read point ops/s   | 4.241 | 4.489 | +5.85% |
+| read scan ops/s    | 1.473 | 4.571 | +210.34% |
+
+### Storage Delta Vs Baseline
+
+| Metric                    | Baseline | Current | Delta |
+| ------------------------- | -------: | ------: | ----: |
+| DB bytes after ingest     | 30,502,912 | 14,475,264 | -52.54% |
+| DB bytes after update     | 49,332,224 | 28,647,424 | -41.93% |
+| DB bytes after reads      | 58,523,648 | 29,118,464 | -50.24% |
+| table bytes after update  | 47,894,528 | 27,160,576 | -43.29% |
+| index bytes after update  | 1,286,144 | 1,351,680 | +5.10% |
+| ingest_write_amp          | 3.839 | 2.171 | -43.44% |
+| update_write_amp          | 1.451 | 1.092 | -24.73% |
+| storage_amp_after_update  | 7.527 | 4.371 | -41.93% |
