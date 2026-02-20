@@ -1214,6 +1214,8 @@ async fn load_file_cache_blob_in_transaction(
 const FASTCDC_MIN_CHUNK_BYTES: usize = 16 * 1024;
 const FASTCDC_AVG_CHUNK_BYTES: usize = 64 * 1024;
 const FASTCDC_MAX_CHUNK_BYTES: usize = 256 * 1024;
+const BINARY_CHUNK_CODEC_PREFIX_RAW: &[u8] = b"LIXRAW01";
+const BINARY_CHUNK_CODEC_PREFIX_ZSTD: &[u8] = b"LIXZSTD1";
 
 async fn persist_binary_blob_with_fastcdc_backend(
     backend: &dyn LixBackend,
@@ -1253,10 +1255,17 @@ async fn persist_binary_blob_with_fastcdc_backend(
 
     for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
         let chunk_data = data[start..end].to_vec();
+        let chunk_payload = encode_binary_chunk_payload(&chunk_data)?;
         let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
         let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
             message: format!(
                 "binary chunk size exceeds supported range for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+        let stored_chunk_size = i64::try_from(chunk_payload.len()).map_err(|_| LixError {
+            message: format!(
+                "binary stored chunk size exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
             ),
         })?;
@@ -1274,8 +1283,8 @@ async fn persist_binary_blob_with_fastcdc_backend(
                  ON CONFLICT (chunk_hash) DO NOTHING",
                 &[
                     Value::Text(chunk_hash.clone()),
-                    Value::Blob(chunk_data),
-                    Value::Integer(chunk_size),
+                    Value::Blob(chunk_payload),
+                    Value::Integer(stored_chunk_size),
                     Value::Text(now.clone()),
                 ],
             )
@@ -1354,10 +1363,17 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
 
     for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
         let chunk_data = data[start..end].to_vec();
+        let chunk_payload = encode_binary_chunk_payload(&chunk_data)?;
         let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
         let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
             message: format!(
                 "binary chunk size exceeds supported range for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+        let stored_chunk_size = i64::try_from(chunk_payload.len()).map_err(|_| LixError {
+            message: format!(
+                "binary stored chunk size exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
             ),
         })?;
@@ -1375,8 +1391,8 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
                  ON CONFLICT (chunk_hash) DO NOTHING",
                 &[
                     Value::Text(chunk_hash.clone()),
-                    Value::Blob(chunk_data),
-                    Value::Integer(chunk_size),
+                    Value::Blob(chunk_payload),
+                    Value::Integer(stored_chunk_size),
                     Value::Text(now.clone()),
                 ],
             )
@@ -1434,6 +1450,40 @@ fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         (start, end)
     })
     .collect()
+}
+
+fn encode_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError> {
+    let mut raw_payload =
+        Vec::with_capacity(BINARY_CHUNK_CODEC_PREFIX_RAW.len() + chunk_data.len());
+    raw_payload.extend_from_slice(BINARY_CHUNK_CODEC_PREFIX_RAW);
+    raw_payload.extend_from_slice(chunk_data);
+
+    // Phase 2: per-chunk compression with "if smaller" admission.
+    let compressed = compress_binary_chunk_payload(chunk_data)?;
+    let zstd_size = BINARY_CHUNK_CODEC_PREFIX_ZSTD.len() + compressed.len();
+    if zstd_size < raw_payload.len() {
+        let mut zstd_payload = Vec::with_capacity(zstd_size);
+        zstd_payload.extend_from_slice(BINARY_CHUNK_CODEC_PREFIX_ZSTD);
+        zstd_payload.extend_from_slice(&compressed);
+        return Ok(zstd_payload);
+    }
+
+    Ok(raw_payload)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError> {
+    zstd::bulk::compress(chunk_data, 3).map_err(|error| LixError {
+        message: format!("binary chunk compression failed: {error}"),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError> {
+    Ok(ruzstd::encoding::compress_to_vec(
+        chunk_data,
+        ruzstd::encoding::CompressionLevel::Fastest,
+    ))
 }
 
 fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {

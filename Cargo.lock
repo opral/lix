@@ -1917,6 +1917,7 @@ dependencies = [
  "jsonschema",
  "paste",
  "postgresql_embedded",
+ "ruzstd",
  "serde",
  "serde_json",
  "sqlparser",
@@ -1926,6 +1927,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "zstd",
 ]
 
 [[package]]
@@ -3032,6 +3034,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ruzstd"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5ff0cc5e135c8870a775d3320910cd9b564ec036b4dc0b8741629020be63f01"
 
 [[package]]
 name = "ryu"
