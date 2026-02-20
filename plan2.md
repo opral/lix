@@ -76,7 +76,7 @@ Recommended next cleanup:
 ### Acceptance Gates
 
 - `>=30%` history storage reduction vs naive full-dup baseline (`B0A`).
-- Ingest slowdown no worse than `+20%` vs raw-chunk CAS baseline (`B1B`).
+- Ingest slowdown no worse than `+20%` vs Phase 1 raw-chunk CAS checkpoint (`B1B`).
 - Sublinear storage growth with version count for small-edit workloads.
 
 ## Delivery Phases (Benchmarkable)
@@ -103,11 +103,11 @@ Baseline result (current Phase 0 profile):
 | `update_binary_hot`            |  48 |    36,637,396 |          0 |    486.038 |     18.694 | 98.758 |
 | `read_history_validate_single` |   1 |             0 |  3,361,662 | 46,779.206 | 46,779.205 |  0.021 |
 
-| Storage Snapshot |     DB Bytes | Table Bytes | Index Bytes | File Data Cache Bytes |
-| ---------------- | -----------: | ----------: | ----------: | --------------------: |
-| `baseline`       |      847,872 |     147,456 |     634,880 |                     0 |
-| `after_ingest`   |   17,649,664 |  16,900,096 |     684,032 |                     0 |
-| `after_update`   |   54,546,432 |  53,731,328 |     749,568 |                     0 |
+| Storage Snapshot |   DB Bytes | Table Bytes | Index Bytes | File Data Cache Bytes |
+| ---------------- | ---------: | ----------: | ----------: | --------------------: |
+| `baseline`       |    847,872 |     147,456 |     634,880 |                     0 |
+| `after_ingest`   | 17,649,664 |  16,900,096 |     684,032 |                     0 |
+| `after_update`   | 54,546,432 |  53,731,328 |     749,568 |                     0 |
 
 | History Storage Snapshot (`after_update_history`) |      Bytes |
 | ------------------------------------------------- | ---------: |
@@ -125,61 +125,96 @@ Baseline result (current Phase 0 profile):
 - `ingest_write_amp = 1.015`
 - `update_write_amp = 1.007`
 
-### Phase 1A: History Contract
+Baseline result (second baseline: `vscode-docs` replay, first 100 commits, full LFS):
+
+- Run date: `2026-02-20`
+- Replay output: `packages/vscode-docs-replay/results/vscode-docs-first-100-baseline-b0a.lix`
+- Replay anchor: `1cf1f46f42bfb84dae7206fc9711344461d3efdb`
+- Replay input repo: `artifact/vscode-docs-nosmudge`
+- Notes: JS SDK reflection was rebuilt before replay (`pnpm --filter js-sdk run build`); replay executed with `VSCODE_REPLAY_RESOLVE_LFS_POINTERS=1`.
+
+| Replay Metric         |  Value |
+| --------------------- | -----: |
+| `commits_replayed`    |    100 |
+| `commits_applied`     |    100 |
+| `commits_noop`        |      0 |
+| `changed_paths_total` |  3,198 |
+| `elapsed_seconds`     | 354.17 |
+
+| Storage Metric      |       Bytes |
+| ------------------- | ----------: |
+| `lix_file_bytes`    | 955,736,064 |
+| `sqlite_page_size`  |       4,096 |
+| `sqlite_page_count` |     233,334 |
+| `sqlite_estimated`  | 955,736,064 |
+| `sqlite_freelist`   |           0 |
+
+| Git vs Lix Size       |         Bytes |   Ratio |
+| --------------------- | ------------: | ------: |
+| `git_worktree_bytes`  |    47,960,064 |         |
+| `git_git_bytes`       | 7,450,468,352 |         |
+| `git_total_bytes`     | 7,498,428,416 |         |
+| `lix_vs_git_total`    |             - | 0.1275x |
+| `lix_vs_git_worktree` |             - |  19.93x |
+
+| Binary History Object (dbstat)                            |       Bytes |   Pages |
+| --------------------------------------------------------- | ----------: | ------: |
+| `lix_internal_binary_blob_store`                          | 803,500,032 | 196,167 |
+| `lix_internal_binary_file_version_ref`                    |     491,520 |     120 |
+| `sqlite_autoindex_lix_internal_binary_file_version_ref_1` |     274,432 |      67 |
+| `sqlite_autoindex_lix_internal_binary_blob_store_1`       |     225,280 |      55 |
+| `lix_internal_binary_chunk_store`                         |       4,096 |       1 |
+| `lix_internal_binary_blob_manifest`                       |       4,096 |       1 |
+| `lix_internal_binary_blob_manifest_chunk`                 |       4,096 |       1 |
+
+| Key Row Counts                         |  Count |
+| -------------------------------------- | -----: |
+| `lix_internal_binary_blob_store`       |  2,743 |
+| `lix_internal_binary_file_version_ref` |  2,531 |
+| `lix_internal_change`                  | 49,131 |
+| `lix_internal_snapshot`                | 44,896 |
+
+### Phase 1: History Contract + CAS + FastCDC
 
 1. Freeze engine-builtin opaque-binary handler contract.
 2. Ensure state rows are metadata-only (`lix_binary_blob_ref`), no payload snapshots.
+3. Store canonical binary history in CAS (chunk store + manifest + file-version refs), dedup by BLAKE3 chunk hash.
+4. Enable FastCDC chunk boundaries (`16/64/256 KiB`) with raw chunk payloads (no zstd yet).
 
 Checkpoint:
 
-- `B1A`: verify historical reconstruction correctness and reduced state-row payload size.
+- `B1A`: historical reconstruction correctness and reduced state-row payload size.
+- `B1B`: storage and ingest vs `B0A` on raw-chunk CAS (ablation reference for compression-only effects).
+- `B1C`: dedup ratio and storage-growth behavior on append/localized-edit workloads.
+- `B1`: consolidated Phase 1 gate (all of `B1A/B1B/B1C` pass).
 
-### Phase 1B: CAS Core (Raw Chunks)
-
-1. Store canonical binary history in CAS (chunk store + manifest + file-version refs).
-2. Dedup by BLAKE3 chunk hash.
-
-Checkpoint:
-
-- `B1B`: storage and ingest vs `B0A` on raw-chunk CAS.
-- `B1B` also becomes the ablation reference for later compression-only effects.
-
-### Phase 1C: FastCDC Chunking
-
-1. Enable FastCDC chunk boundaries (`16/64/256 KiB`).
-2. Keep raw chunk payloads (no zstd yet) for isolated chunking effect.
-
-Checkpoint:
-
-- `B1C`: dedup ratio and storage growth behavior on append/localized-edit workloads.
-
-### Phase 1D: Zstd Per Chunk
+### Phase 2: Zstd Per Chunk
 
 1. Add `zstd-if-smaller` compression per chunk.
 2. Keep same CAS/ref model to isolate compression effect.
 
 Checkpoint:
 
-- `B1D`: storage reduction and ingest overhead vs `B1C`.
+- `B2`: storage reduction and ingest overhead vs `B1`.
 
-### Phase 1E: History Safety Guarantees
+### Phase 3: History Safety Guarantees (GC)
 
 1. Implement strict referential GC (delete only unreachable blobs/chunks).
 2. Add schema constraints (`FK` + `ON DELETE RESTRICT`) to enforce invariants.
 
 Checkpoint:
 
-- `B1E`: GC correctness (no broken history reads), reclaim behavior after GC + VACUUM.
+- `B3`: GC correctness (no broken history reads), reclaim behavior after GC + VACUUM.
 
-### Phase 2A: Codec Metadata / Observability
+### Phase 4: Codec Metadata / Observability
 
 1. Replace payload prefix framing with explicit codec metadata (`raw`, `zstd`, `zstd+dict:<id>`).
 
 Checkpoint:
 
-- `B2A`: no major storage change expected; improves auditability and measurement.
+- `B4`: no major storage change expected; improves auditability and measurement.
 
-### Phase 2B: Dictionary Recompression + Maintenance
+### Phase 5: Dictionary Recompression + Maintenance
 
 1. Add background dictionary training by binary cohort.
 2. Recompress eligible chunks with trained dictionaries.
@@ -187,7 +222,7 @@ Checkpoint:
 
 Checkpoint:
 
-- `B2B`: incremental storage gain vs `B1D`, within accepted ingest/read overhead, plus long-run file-size stability and reclaim efficiency under replay/update churn.
+- `B5`: incremental storage gain vs `B2`, within accepted ingest/read overhead, plus long-run file-size stability and reclaim efficiency under replay/update churn.
 
 ## Note On Prior Replay Results
 
