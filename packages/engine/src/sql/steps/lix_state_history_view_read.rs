@@ -29,7 +29,9 @@ pub async fn rewrite_query_with_backend(
     let (rewritten, requests) = rewrite_query_collect_requests(query)?;
     let mut seen_requests = BTreeSet::new();
     for request in requests {
-        if should_fallback_to_phase1_query(&request) {
+        if should_fallback_to_phase1_query(&request)
+            || request.requested_pushdown_blocked_by_bare_placeholders
+        {
             continue;
         }
         let request_key = format!(
@@ -160,6 +162,7 @@ struct HistoryPushdown {
     change_predicates: Vec<String>,
     requested_predicates: Vec<String>,
     cse_predicates: Vec<String>,
+    requested_pushdown_blocked_by_bare_placeholders: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -207,9 +210,11 @@ fn take_history_pushdown_predicates(
     let mut pushdown = HistoryPushdown::default();
     let mut remaining = Vec::new();
     for part in parts {
+        let blocked_by_cross_bucket =
+            part.has_bare_placeholder && has_cross_bucket_bare_placeholders;
         match part.extracted {
             Some(ExtractedPredicate::Push(bucket, sql))
-                if !(part.has_bare_placeholder && has_cross_bucket_bare_placeholders) =>
+                if !blocked_by_cross_bucket =>
             {
                 match bucket {
                     HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
@@ -218,8 +223,13 @@ fn take_history_pushdown_predicates(
                     HistoryPushdownBucket::Remaining => remaining.push(part.predicate),
                 }
             }
-            Some(ExtractedPredicate::Drop)
-                if !(part.has_bare_placeholder && has_cross_bucket_bare_placeholders) => {}
+            Some(ExtractedPredicate::Push(HistoryPushdownBucket::Requested, _))
+                if blocked_by_cross_bucket =>
+            {
+                pushdown.requested_pushdown_blocked_by_bare_placeholders = true;
+                remaining.push(part.predicate);
+            }
+            Some(ExtractedPredicate::Drop) if !blocked_by_cross_bucket => {}
             _ => remaining.push(part.predicate),
         }
     }
@@ -1415,7 +1425,7 @@ fn default_lix_state_history_alias() -> sqlparser::ast::TableAlias {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_query;
+    use super::{rewrite_query, rewrite_query_collect_requests};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -1483,6 +1493,24 @@ mod tests {
         assert!(!sql.contains("bp.schema_key = ?"));
         assert!(sql.contains("sh.schema_key = ?"));
         assert!(sql.contains("sh.root_commit_id = ?"));
+    }
+
+    #[test]
+    fn marks_requested_pushdown_as_blocked_when_bare_placeholders_cross_buckets() {
+        let query = parse_query(
+            "SELECT COUNT(*) \
+             FROM lix_state_history AS sh \
+             WHERE sh.schema_key = ? \
+               AND sh.root_commit_id = ?",
+        );
+
+        let (_rewritten, requests) =
+            rewrite_query_collect_requests(query).expect("rewrite should succeed");
+        assert_eq!(requests.len(), 1);
+        let request = requests.into_iter().next().expect("request should exist");
+
+        assert!(request.requested_pushdown_blocked_by_bare_placeholders);
+        assert!(request.requested_predicates.is_empty());
     }
 
     #[test]
