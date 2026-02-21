@@ -1,5 +1,5 @@
-use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 use crate::working_projection::WORKING_PROJECTION_METADATA;
+use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateCheckpointResult {
@@ -58,7 +58,10 @@ async fn create_checkpoint_in_transaction(
         previous_tip_id.clone()
     };
     let mut merged_parents = working_commit.parent_commit_ids;
-    if !merged_parents.iter().any(|id| id == &effective_previous_tip_id) {
+    if !merged_parents
+        .iter()
+        .any(|id| id == &effective_previous_tip_id)
+    {
         merged_parents.push(effective_previous_tip_id.clone());
     }
     let merged_parents = normalize_parent_commit_ids(merged_parents, working_commit_id.as_str());
@@ -75,12 +78,8 @@ async fn create_checkpoint_in_transaction(
         });
     }
 
-    ensure_change_set_elements_for_checkpoint(
-        tx,
-        &working_change_set_id,
-        &working_change_ids,
-    )
-    .await?;
+    ensure_change_set_elements_for_checkpoint(tx, &working_change_set_id, &working_change_ids)
+        .await?;
 
     let checkpoint_label_id = load_checkpoint_label_id(tx).await?;
     let mut checkpoint_change_ids = working_change_ids.clone();
@@ -173,7 +172,10 @@ async fn create_checkpoint_in_transaction(
         ],
     )
     .await?;
-    if !checkpoint_change_ids.iter().any(|id| id == &label_change_id) {
+    if !checkpoint_change_ids
+        .iter()
+        .any(|id| id == &label_change_id)
+    {
         checkpoint_change_ids.push(label_change_id);
     }
 
@@ -243,6 +245,7 @@ async fn create_checkpoint_in_transaction(
     )
     .await?;
     ensure_commit_edge(tx, &effective_previous_tip_id, &working_commit_id).await?;
+    ensure_commit_ancestry(tx, &working_commit_id, &merged_parents).await?;
 
     let new_change_set_id = generate_uuid(tx).await?;
     let new_working_commit_id = generate_uuid(tx).await?;
@@ -272,6 +275,12 @@ async fn create_checkpoint_in_transaction(
     .await?;
 
     ensure_commit_edge(tx, &working_commit_id, &new_working_commit_id).await?;
+    ensure_commit_ancestry(
+        tx,
+        &new_working_commit_id,
+        std::slice::from_ref(&working_commit_id),
+    )
+    .await?;
 
     tx.execute(
         "UPDATE lix_version \
@@ -570,16 +579,31 @@ async fn ensure_change_exists_for_checkpoint(
         _ => None,
     };
     let mut change_snapshot = serde_json::Map::new();
-    change_snapshot.insert("id".to_string(), serde_json::Value::String(change_id.to_string()));
-    change_snapshot.insert("entity_id".to_string(), serde_json::Value::String(entity_id));
-    change_snapshot.insert("schema_key".to_string(), serde_json::Value::String(schema_key));
+    change_snapshot.insert(
+        "id".to_string(),
+        serde_json::Value::String(change_id.to_string()),
+    );
+    change_snapshot.insert(
+        "entity_id".to_string(),
+        serde_json::Value::String(entity_id),
+    );
+    change_snapshot.insert(
+        "schema_key".to_string(),
+        serde_json::Value::String(schema_key),
+    );
     change_snapshot.insert(
         "schema_version".to_string(),
         serde_json::Value::String(schema_version),
     );
     change_snapshot.insert("file_id".to_string(), serde_json::Value::String(file_id));
-    change_snapshot.insert("plugin_key".to_string(), serde_json::Value::String(plugin_key));
-    change_snapshot.insert("created_at".to_string(), serde_json::Value::String(created_at));
+    change_snapshot.insert(
+        "plugin_key".to_string(),
+        serde_json::Value::String(plugin_key),
+    );
+    change_snapshot.insert(
+        "created_at".to_string(),
+        serde_json::Value::String(created_at),
+    );
     if let Some(snapshot_content) = snapshot_content {
         change_snapshot.insert("snapshot_content".to_string(), snapshot_content);
     }
@@ -600,7 +624,6 @@ async fn ensure_change_exists_for_checkpoint(
 
     Ok(())
 }
-
 
 async fn ensure_commit_edge(
     tx: &mut EngineTransaction<'_>,
@@ -642,6 +665,45 @@ async fn ensure_commit_edge(
         ],
     )
     .await?;
+    Ok(())
+}
+
+async fn ensure_commit_ancestry(
+    tx: &mut EngineTransaction<'_>,
+    commit_id: &str,
+    parent_ids: &[String],
+) -> Result<(), LixError> {
+    tx.execute(
+        "INSERT INTO lix_commit_ancestry (commit_id, ancestor_id, depth) \
+         VALUES ($1, $1, 0) \
+         ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
+        &[Value::Text(commit_id.to_string())],
+    )
+    .await?;
+
+    let normalized_parents = normalize_parent_commit_ids(parent_ids.to_vec(), commit_id);
+    for parent_id in normalized_parents {
+        tx.execute(
+            "INSERT INTO lix_commit_ancestry (commit_id, ancestor_id, depth) \
+             SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
+             FROM ( \
+               SELECT $2 AS ancestor_id, 1 AS depth \
+               UNION ALL \
+               SELECT ancestor_id, depth + 1 AS depth \
+               FROM lix_commit_ancestry \
+               WHERE commit_id = $2 \
+             ) AS candidate \
+             GROUP BY candidate.ancestor_id \
+             ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
+             SET depth = CASE \
+               WHEN excluded.depth < lix_commit_ancestry.depth THEN excluded.depth \
+               ELSE lix_commit_ancestry.depth \
+             END",
+            &[Value::Text(commit_id.to_string()), Value::Text(parent_id)],
+        )
+        .await?;
+    }
+
     Ok(())
 }
 

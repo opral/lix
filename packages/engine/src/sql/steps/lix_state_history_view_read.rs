@@ -645,15 +645,16 @@ fn build_lix_state_history_view_query(
     };
 
     let sql = format!(
-        "WITH RECURSIVE \
+        "WITH \
            commit_by_version AS ( \
              SELECT \
-               COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS id, \
+               entity_id AS id, \
                lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_state_vtable \
+             FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
            change_set_element_by_version AS ( \
@@ -664,19 +665,10 @@ fn build_lix_state_history_view_query(
                lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
                lix_json_text(snapshot_content, 'file_id') AS file_id, \
                version_id AS lixcol_version_id \
-             FROM lix_internal_state_vtable \
+             FROM lix_internal_state_materialized_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           commit_edge_by_version AS ( \
-             SELECT \
-               lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-               lix_json_text(snapshot_content, 'child_id') AS child_id, \
-               version_id AS lixcol_version_id \
-             FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_commit_edge' \
-               AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
            all_changes_with_snapshots AS ( \
@@ -689,19 +681,13 @@ fn build_lix_state_history_view_query(
            ), \
            reachable_commits_from_requested(id, root_commit_id, depth) AS ( \
              SELECT \
-               commit_id, \
-               commit_id AS root_commit_id, \
-               0 AS depth \
-             FROM requested_commits \
-             UNION ALL \
-             SELECT \
-               ce.parent_id, \
-               r.root_commit_id, \
-               r.depth + 1 \
-             FROM commit_edge_by_version ce \
-             JOIN reachable_commits_from_requested r ON ce.child_id = r.id \
-             WHERE ce.lixcol_version_id = '{global_version}' \
-               AND r.depth < 512 \
+               ancestry.ancestor_id AS id, \
+               requested.commit_id AS root_commit_id, \
+               ancestry.depth AS depth \
+             FROM requested_commits requested \
+             JOIN lix_commit_ancestry ancestry \
+               ON ancestry.commit_id = requested.commit_id \
+             WHERE ancestry.depth <= 512 \
            ), \
            commit_changesets AS ( \
              SELECT \
@@ -814,6 +800,29 @@ mod tests {
         assert!(!sql.contains("sh.root_commit_id = ?1"));
         assert!(!sql.contains("sh.schema_key = ?2"));
         assert!(sql.contains("SELECT COUNT(*) AS count FROM ranked_cse ranked WHERE ranked.rn = 1"));
+    }
+
+    #[test]
+    fn uses_materialized_commit_ancestry_instead_of_recursive_commit_edges() {
+        let query = parse_query(
+            "SELECT depth, snapshot_content \
+             FROM lix_state_history AS sh \
+             WHERE sh.root_commit_id = ? \
+             ORDER BY depth ASC",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("JOIN lix_commit_ancestry ancestry"));
+        assert!(sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
+        assert!(!sql.contains("WITH RECURSIVE"));
+        assert!(!sql.contains("commit_edge_by_version"));
+        assert!(
+            !sql.contains("FROM lix_internal_state_vtable WHERE schema_key = 'lix_commit_edge'")
+        );
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
