@@ -58,7 +58,8 @@ pub(crate) async fn rewrite_query_with_backend(
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_state_by_version::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_state_history::rewrite_query(current.clone())?;
+    let rewritten =
+        lix_state_history::rewrite_query_with_backend(backend, current.clone(), params).await?;
     changed |= apply_step(&mut current, rewritten);
 
     if changed {

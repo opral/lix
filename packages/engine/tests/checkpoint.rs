@@ -283,7 +283,8 @@ simulation_test!(
             .await
             .expect("checkpoint change_ids query should succeed");
         assert_eq!(checkpoint_change_ids_row.rows.len(), 1);
-        let mut checkpoint_change_ids = parse_parent_commit_ids(&checkpoint_change_ids_row.rows[0][0]);
+        let mut checkpoint_change_ids =
+            parse_parent_commit_ids(&checkpoint_change_ids_row.rows[0][0]);
         checkpoint_change_ids.sort();
         for change_id in &pre_checkpoint_change_ids {
             assert!(

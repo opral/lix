@@ -1,19 +1,66 @@
+use std::collections::BTreeSet;
+
 use sqlparser::ast::{BinaryOperator, Expr, Query, Select, TableFactor, TableWithJoins};
 
+use crate::backend::SqlDialect;
 use crate::sql::steps::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
-    default_alias, object_name_matches, parse_single_query, rewrite_query_with_select_rewriter,
+    default_alias, escape_sql_string, object_name_matches, parse_single_query,
+    rewrite_query_with_select_rewriter,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::LixError;
+use crate::{LixBackend, LixError, QueryResult, Value};
 
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
+const TIMELINE_BREAKPOINT_TABLE: &str = "lix_entity_state_timeline_breakpoint";
+const TIMELINE_STATUS_TABLE: &str = "lix_timeline_status";
+const MAX_HISTORY_DEPTH: i64 = 512;
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    rewrite_query_with_select_rewriter(query, &mut rewrite_select)
+    let (rewritten, _requests) = rewrite_query_collect_requests(query)?;
+    Ok(rewritten)
 }
 
-fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
+pub async fn rewrite_query_with_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Option<Query>, LixError> {
+    let (rewritten, requests) = rewrite_query_collect_requests(query)?;
+    let mut seen_requests = BTreeSet::new();
+    for request in requests {
+        if should_fallback_to_phase1_query(&request) {
+            continue;
+        }
+        let request_key = format!(
+            "{}||{}||{}",
+            request.change_predicates.join("&&"),
+            request.requested_predicates.join("&&"),
+            request.cse_predicates.join("&&")
+        );
+        if !seen_requests.insert(request_key) {
+            continue;
+        }
+        ensure_history_timeline_materialized_for_request(backend, &request, params).await?;
+    }
+    Ok(rewritten)
+}
+
+fn rewrite_query_collect_requests(
+    query: Query,
+) -> Result<(Option<Query>, Vec<HistoryPushdown>), LixError> {
+    let mut requests = Vec::new();
+    let rewritten = rewrite_query_with_select_rewriter(query, &mut |select, changed| {
+        rewrite_select(select, changed, &mut requests)
+    })?;
+    Ok((rewritten, requests))
+}
+
+fn rewrite_select(
+    select: &mut Select,
+    changed: &mut bool,
+    requests: &mut Vec<HistoryPushdown>,
+) -> Result<(), LixError> {
     let count_fast_path = select_supports_count_fast_path(select);
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
     for table in &mut select.from {
@@ -23,6 +70,7 @@ fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixErro
             allow_unqualified,
             count_fast_path,
             changed,
+            requests,
         )?;
     }
     Ok(())
@@ -34,6 +82,7 @@ fn rewrite_table_with_joins(
     allow_unqualified: bool,
     count_fast_path: bool,
     changed: &mut bool,
+    requests: &mut Vec<HistoryPushdown>,
 ) -> Result<(), LixError> {
     rewrite_table_factor(
         &mut table.relation,
@@ -41,9 +90,17 @@ fn rewrite_table_with_joins(
         allow_unqualified,
         count_fast_path,
         changed,
+        requests,
     )?;
     for join in &mut table.joins {
-        rewrite_table_factor(&mut join.relation, selection, false, false, changed)?;
+        rewrite_table_factor(
+            &mut join.relation,
+            selection,
+            false,
+            false,
+            changed,
+            requests,
+        )?;
     }
     Ok(())
 }
@@ -54,6 +111,7 @@ fn rewrite_table_factor(
     allow_unqualified: bool,
     count_fast_path: bool,
     changed: &mut bool,
+    requests: &mut Vec<HistoryPushdown>,
 ) -> Result<(), LixError> {
     match relation {
         TableFactor::Table { name, alias, .. }
@@ -69,6 +127,7 @@ fn rewrite_table_factor(
                 &pushdown,
                 count_fast_path && selection.is_none(),
             )?;
+            requests.push(pushdown.clone());
             let derived_alias = alias
                 .clone()
                 .or_else(|| Some(default_lix_state_history_alias()));
@@ -88,6 +147,7 @@ fn rewrite_table_factor(
                 allow_unqualified,
                 count_fast_path,
                 changed,
+                requests,
             )?;
         }
         _ => {}
@@ -95,7 +155,7 @@ fn rewrite_table_factor(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct HistoryPushdown {
     change_predicates: Vec<String>,
     requested_predicates: Vec<String>,
@@ -247,23 +307,23 @@ fn extract_binary_pushdown(
     match column {
         "schema_key" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.schema_key {op_sql} {rhs}"),
+            format!("bp.schema_key {op_sql} {rhs}"),
         )),
         "entity_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.entity_id {op_sql} {rhs}"),
+            format!("bp.entity_id {op_sql} {rhs}"),
         )),
         "file_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.file_id {op_sql} {rhs}"),
+            format!("bp.file_id {op_sql} {rhs}"),
         )),
         "plugin_key" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.plugin_key {op_sql} {rhs}"),
+            format!("bp.plugin_key {op_sql} {rhs}"),
         )),
         "change_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.id {op_sql} {rhs}"),
+            format!("bp.change_id {op_sql} {rhs}"),
         )),
         "root_commit_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Requested,
@@ -271,11 +331,11 @@ fn extract_binary_pushdown(
         )),
         "commit_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Cse,
-            format!("cc_raw.commit_id {op_sql} {rhs}"),
+            format!("rc.commit_id {op_sql} {rhs}"),
         )),
         "depth" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Cse,
-            format!("cc_raw.commit_depth {op_sql} {rhs}"),
+            format!("rc.commit_depth {op_sql} {rhs}"),
         )),
         _ => None,
     }
@@ -286,23 +346,23 @@ fn extract_in_list_pushdown(column: &str, list: &[Expr]) -> Option<ExtractedPred
     match column {
         "schema_key" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.schema_key IN ({list_sql})"),
+            format!("bp.schema_key IN ({list_sql})"),
         )),
         "entity_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.entity_id IN ({list_sql})"),
+            format!("bp.entity_id IN ({list_sql})"),
         )),
         "file_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.file_id IN ({list_sql})"),
+            format!("bp.file_id IN ({list_sql})"),
         )),
         "plugin_key" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.plugin_key IN ({list_sql})"),
+            format!("bp.plugin_key IN ({list_sql})"),
         )),
         "change_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.id IN ({list_sql})"),
+            format!("bp.change_id IN ({list_sql})"),
         )),
         "root_commit_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Requested,
@@ -310,11 +370,11 @@ fn extract_in_list_pushdown(column: &str, list: &[Expr]) -> Option<ExtractedPred
         )),
         "commit_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Cse,
-            format!("cc_raw.commit_id IN ({list_sql})"),
+            format!("rc.commit_id IN ({list_sql})"),
         )),
         "depth" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Cse,
-            format!("cc_raw.commit_depth IN ({list_sql})"),
+            format!("rc.commit_depth IN ({list_sql})"),
         )),
         _ => None,
     }
@@ -324,23 +384,23 @@ fn extract_in_subquery_pushdown(column: &str, subquery: &Query) -> Option<Extrac
     match column {
         "schema_key" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.schema_key IN ({subquery})"),
+            format!("bp.schema_key IN ({subquery})"),
         )),
         "entity_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.entity_id IN ({subquery})"),
+            format!("bp.entity_id IN ({subquery})"),
         )),
         "file_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.file_id IN ({subquery})"),
+            format!("bp.file_id IN ({subquery})"),
         )),
         "plugin_key" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.plugin_key IN ({subquery})"),
+            format!("bp.plugin_key IN ({subquery})"),
         )),
         "change_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Change,
-            format!("ic.id IN ({subquery})"),
+            format!("bp.change_id IN ({subquery})"),
         )),
         "root_commit_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Requested,
@@ -348,11 +408,11 @@ fn extract_in_subquery_pushdown(column: &str, subquery: &Query) -> Option<Extrac
         )),
         "commit_id" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Cse,
-            format!("cc_raw.commit_id IN ({subquery})"),
+            format!("rc.commit_id IN ({subquery})"),
         )),
         "depth" => Some(ExtractedPredicate::Push(
             HistoryPushdownBucket::Cse,
-            format!("cc_raw.commit_depth IN ({subquery})"),
+            format!("rc.commit_depth IN ({subquery})"),
         )),
         _ => None,
     }
@@ -516,17 +576,164 @@ fn build_lix_state_history_view_query(
     pushdown: &HistoryPushdown,
     count_fast_path: bool,
 ) -> Result<Query, LixError> {
+    if should_fallback_to_phase1_query(pushdown) {
+        return build_lix_state_history_view_query_phase1(pushdown, count_fast_path);
+    }
+
+    let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
+    requested_predicates.extend(pushdown.requested_predicates.clone());
+    let reachable_where_sql = render_where_clause(&pushdown.cse_predicates);
+    let breakpoint_where_sql = render_where_clause(&pushdown.change_predicates);
+    let requested_where_sql = render_where_clause(&requested_predicates);
+
+    let final_select_sql = if count_fast_path {
+        "SELECT COUNT(*) AS count \
+         FROM history_rows h \
+         WHERE h.snapshot_id != 'no-content'"
+            .to_string()
+    } else {
+        format!(
+            "SELECT \
+               h.entity_id AS entity_id, \
+               h.schema_key AS schema_key, \
+               h.file_id AS file_id, \
+               h.plugin_key AS plugin_key, \
+               s.content AS snapshot_content, \
+               h.metadata AS metadata, \
+               h.schema_version AS schema_version, \
+               h.change_id AS change_id, \
+               h.commit_id AS commit_id, \
+               h.root_commit_id AS root_commit_id, \
+               h.depth AS depth, \
+               '{global_version}' AS version_id \
+             FROM history_rows h \
+             LEFT JOIN lix_internal_snapshot s \
+               ON s.id = h.snapshot_id \
+             WHERE h.snapshot_id != 'no-content'",
+            global_version = GLOBAL_VERSION_ID
+        )
+    };
+
+    let sql = format!(
+        "WITH \
+           commit_by_version AS ( \
+             SELECT \
+               entity_id AS id, \
+               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+               version_id AS lixcol_version_id \
+             FROM lix_internal_state_materialized_v1_lix_commit \
+             WHERE schema_key = 'lix_commit' \
+               AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           requested_commits AS ( \
+             SELECT DISTINCT c.id AS commit_id \
+             FROM commit_by_version c \
+             {requested_where_sql} \
+           ), \
+           reachable_commits AS ( \
+             SELECT \
+               ancestry.ancestor_id AS commit_id, \
+               requested.commit_id AS root_commit_id, \
+               ancestry.depth AS commit_depth \
+             FROM requested_commits requested \
+             JOIN lix_commit_ancestry ancestry \
+               ON ancestry.commit_id = requested.commit_id \
+             WHERE ancestry.depth <= {max_depth} \
+           ), \
+           filtered_reachable_commits AS ( \
+             SELECT \
+               rc.commit_id, \
+               rc.root_commit_id, \
+               rc.commit_depth \
+             FROM reachable_commits rc \
+             {reachable_where_sql} \
+           ), \
+           breakpoint_intervals AS ( \
+             SELECT \
+               bp.root_commit_id, \
+               bp.entity_id, \
+               bp.schema_key, \
+               bp.file_id, \
+               bp.plugin_key, \
+               bp.schema_version, \
+                bp.metadata, \
+                bp.snapshot_id, \
+                bp.change_id, \
+                bp.from_depth, \
+                COALESCE( \
+                 LEAD(bp.from_depth) OVER ( \
+                   PARTITION BY bp.root_commit_id, bp.entity_id, bp.file_id, bp.schema_key \
+                   ORDER BY bp.from_depth ASC \
+                 ) - 1, \
+                 {max_depth} \
+               ) AS to_depth \
+             FROM lix_entity_state_timeline_breakpoint bp \
+             JOIN requested_commits requested \
+               ON requested.commit_id = bp.root_commit_id \
+             {breakpoint_where_sql} \
+           ), \
+           history_rows AS ( \
+             SELECT \
+               bp.entity_id, \
+               bp.schema_key, \
+               bp.file_id, \
+               bp.plugin_key, \
+               bp.schema_version, \
+               bp.metadata, \
+               bp.snapshot_id, \
+               bp.change_id, \
+               rc.commit_id AS commit_id, \
+               rc.root_commit_id AS root_commit_id, \
+               rc.commit_depth AS depth \
+             FROM filtered_reachable_commits rc \
+             JOIN breakpoint_intervals bp \
+               ON bp.root_commit_id = rc.root_commit_id \
+              AND rc.commit_depth BETWEEN bp.from_depth AND bp.to_depth \
+           ) \
+         {final_select_sql}",
+        global_version = GLOBAL_VERSION_ID,
+        max_depth = MAX_HISTORY_DEPTH,
+        requested_where_sql = requested_where_sql,
+        reachable_where_sql = reachable_where_sql,
+        breakpoint_where_sql = breakpoint_where_sql,
+        final_select_sql = final_select_sql,
+    );
+    parse_single_query(&sql)
+}
+
+fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
+    pushdown
+        .cse_predicates
+        .iter()
+        .any(|predicate| predicate.contains("rc.commit_id"))
+}
+
+fn build_lix_state_history_view_query_phase1(
+    pushdown: &HistoryPushdown,
+    count_fast_path: bool,
+) -> Result<Query, LixError> {
     let mut all_changes_predicates = Vec::new();
     if count_fast_path {
         all_changes_predicates.push("ic.snapshot_id != 'no-content'".to_string());
     }
-    all_changes_predicates.extend(pushdown.change_predicates.clone());
+    all_changes_predicates.extend(
+        pushdown
+            .change_predicates
+            .iter()
+            .map(|predicate| predicate.replace("bp.", "ic.")),
+    );
 
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
     requested_predicates.extend(pushdown.requested_predicates.clone());
 
     let mut cse_predicates = vec![format!("cse_raw.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
-    cse_predicates.extend(pushdown.cse_predicates.clone());
+    cse_predicates.extend(pushdown.cse_predicates.iter().map(|predicate| {
+        predicate
+            .replace("rc.commit_depth", "cc_raw.commit_depth")
+            .replace("rc.commit_id", "cc_raw.commit_id")
+    }));
 
     let all_changes_where_sql = render_where_clause(&all_changes_predicates);
     let requested_where_sql = render_where_clause(&requested_predicates);
@@ -687,7 +894,7 @@ fn build_lix_state_history_view_query(
              FROM requested_commits requested \
              JOIN lix_commit_ancestry ancestry \
                ON ancestry.commit_id = requested.commit_id \
-             WHERE ancestry.depth <= 512 \
+             WHERE ancestry.depth <= {max_depth} \
            ), \
            commit_changesets AS ( \
              SELECT \
@@ -718,6 +925,7 @@ fn build_lix_state_history_view_query(
            ) \
          {final_select_sql}",
         global_version = GLOBAL_VERSION_ID,
+        max_depth = MAX_HISTORY_DEPTH,
         all_changes_sql = all_changes_sql,
         requested_where_sql = requested_where_sql,
         cse_where_sql = cse_where_sql,
@@ -725,6 +933,487 @@ fn build_lix_state_history_view_query(
         final_select_sql = final_select_sql,
     );
     parse_single_query(&sql)
+}
+
+async fn ensure_history_timeline_materialized_for_request(
+    backend: &dyn LixBackend,
+    pushdown: &HistoryPushdown,
+    params: &[Value],
+) -> Result<(), LixError> {
+    let requested_roots = resolve_requested_root_commits(backend, pushdown, params).await?;
+    for root_commit_id in requested_roots {
+        ensure_history_timeline_materialized_for_root(backend, &root_commit_id, MAX_HISTORY_DEPTH)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn resolve_requested_root_commits(
+    backend: &dyn LixBackend,
+    pushdown: &HistoryPushdown,
+    params: &[Value],
+) -> Result<Vec<String>, LixError> {
+    let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
+    requested_predicates.extend(pushdown.requested_predicates.clone());
+    let requested_where_sql = render_where_clause(&requested_predicates);
+    let sql = format!(
+        "WITH commit_by_version AS ( \
+           SELECT \
+             entity_id AS id, \
+             version_id AS lixcol_version_id \
+           FROM lix_internal_state_materialized_v1_lix_commit \
+           WHERE schema_key = 'lix_commit' \
+             AND version_id = '{global_version}' \
+             AND is_tombstone = 0 \
+             AND snapshot_content IS NOT NULL \
+         ) \
+         SELECT DISTINCT c.id \
+         FROM commit_by_version c \
+         {requested_where}",
+        global_version = GLOBAL_VERSION_ID,
+        requested_where = requested_where_sql,
+    );
+    let rows = backend.execute(&sql, params).await?;
+    let mut roots = BTreeSet::new();
+    for row in &rows.rows {
+        if let Some(id) = text_value_at(row, 0) {
+            roots.insert(id.to_string());
+        }
+    }
+    Ok(roots.into_iter().collect())
+}
+
+async fn ensure_history_timeline_materialized_for_root(
+    backend: &dyn LixBackend,
+    root_commit_id: &str,
+    required_depth: i64,
+) -> Result<(), LixError> {
+    let built_max_depth = load_timeline_built_max_depth(backend, root_commit_id).await?;
+    if built_max_depth.is_some_and(|built| built >= required_depth) {
+        return Ok(());
+    }
+
+    let start_depth = built_max_depth.map_or(0, |built| built.saturating_add(1));
+    let query_start = if start_depth > 0 { start_depth - 1 } else { 0 };
+    let source_rows = load_phase1_source_rows_for_root_range(
+        backend,
+        root_commit_id,
+        query_start,
+        required_depth,
+    )
+    .await?;
+    let breakpoints = derive_breakpoints_from_source_rows(root_commit_id, start_depth, source_rows);
+    insert_breakpoints(backend, &breakpoints).await?;
+    upsert_timeline_status(backend, root_commit_id, required_depth).await?;
+    Ok(())
+}
+
+async fn load_timeline_built_max_depth(
+    backend: &dyn LixBackend,
+    root_commit_id: &str,
+) -> Result<Option<i64>, LixError> {
+    let sql = format!(
+        "SELECT built_max_depth \
+         FROM {status_table} \
+         WHERE root_commit_id = '{root_commit_id}' \
+         LIMIT 1",
+        status_table = TIMELINE_STATUS_TABLE,
+        root_commit_id = escape_sql_string(root_commit_id),
+    );
+    let result = backend.execute(&sql, &[]).await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(row.first().and_then(integer_from_value))
+}
+
+async fn load_phase1_source_rows_for_root_range(
+    backend: &dyn LixBackend,
+    root_commit_id: &str,
+    start_depth: i64,
+    end_depth: i64,
+) -> Result<Vec<TimelineSourceRow>, LixError> {
+    if start_depth > end_depth {
+        return Ok(Vec::new());
+    }
+
+    let sql =
+        build_phase1_source_query_sql(backend.dialect(), root_commit_id, start_depth, end_depth);
+    let result = backend.execute(&sql, &[]).await?;
+    parse_timeline_source_rows(result)
+}
+
+fn build_phase1_source_query_sql(
+    dialect: SqlDialect,
+    root_commit_id: &str,
+    start_depth: i64,
+    end_depth: i64,
+) -> String {
+    let change_set_id_sql = json_text_expr_sql(dialect, "snapshot_content", "change_set_id");
+    let cse_change_set_id_sql = json_text_expr_sql(dialect, "snapshot_content", "change_set_id");
+    let cse_change_id_sql = json_text_expr_sql(dialect, "snapshot_content", "change_id");
+    let cse_entity_id_sql = json_text_expr_sql(dialect, "snapshot_content", "entity_id");
+    let cse_schema_key_sql = json_text_expr_sql(dialect, "snapshot_content", "schema_key");
+    let cse_file_id_sql = json_text_expr_sql(dialect, "snapshot_content", "file_id");
+    format!(
+        "WITH \
+           commit_by_version AS ( \
+             SELECT \
+               entity_id AS id, \
+               {change_set_id_sql} AS change_set_id, \
+               version_id AS lixcol_version_id \
+             FROM lix_internal_state_materialized_v1_lix_commit \
+             WHERE schema_key = 'lix_commit' \
+               AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_set_element_by_version AS ( \
+             SELECT \
+               {cse_change_set_id_sql} AS change_set_id, \
+               {cse_change_id_sql} AS change_id, \
+               {cse_entity_id_sql} AS entity_id, \
+               {cse_schema_key_sql} AS schema_key, \
+               {cse_file_id_sql} AS file_id, \
+               version_id AS lixcol_version_id \
+             FROM lix_internal_state_materialized_v1_lix_change_set_element \
+             WHERE schema_key = 'lix_change_set_element' \
+               AND version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           all_changes AS ( \
+             SELECT \
+               ic.id, \
+               ic.plugin_key, \
+               ic.schema_version, \
+               ic.metadata, \
+               ic.snapshot_id, \
+               ic.created_at \
+             FROM lix_internal_change ic \
+           ), \
+           reachable_commits AS ( \
+             SELECT \
+               ancestry.ancestor_id AS commit_id, \
+               ancestry.depth AS commit_depth \
+             FROM lix_commit_ancestry ancestry \
+             WHERE ancestry.commit_id = '{root_commit_id}' \
+               AND ancestry.depth BETWEEN {start_depth} AND {end_depth} \
+           ), \
+           commit_changesets AS ( \
+             SELECT \
+               c.id AS commit_id, \
+               c.change_set_id AS change_set_id, \
+               rc.commit_depth AS commit_depth \
+             FROM commit_by_version c \
+             JOIN reachable_commits rc ON c.id = rc.commit_id \
+             WHERE c.lixcol_version_id = '{global_version}' \
+           ), \
+           cse_in_reachable AS ( \
+             SELECT \
+               cse.entity_id AS entity_id, \
+               cse.schema_key AS schema_key, \
+               cse.file_id AS file_id, \
+               cse.change_id AS change_id, \
+               cc.commit_depth AS commit_depth \
+             FROM change_set_element_by_version cse \
+             JOIN commit_changesets cc \
+               ON cse.change_set_id = cc.change_set_id \
+             WHERE cse.lixcol_version_id = '{global_version}' \
+           ), \
+           ranked AS ( \
+             SELECT \
+               r.entity_id, \
+               r.schema_key, \
+               r.file_id, \
+               changes.plugin_key, \
+               changes.schema_version, \
+               changes.metadata, \
+               changes.snapshot_id, \
+               r.change_id, \
+               r.commit_depth, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY r.entity_id, r.file_id, r.schema_key, r.commit_depth \
+                 ORDER BY changes.created_at DESC, changes.id DESC \
+               ) AS rn \
+             FROM cse_in_reachable r \
+             JOIN all_changes changes ON changes.id = r.change_id \
+           ) \
+         SELECT \
+           ranked.entity_id, \
+           ranked.schema_key, \
+           ranked.file_id, \
+           ranked.plugin_key, \
+           ranked.schema_version, \
+           ranked.metadata, \
+           ranked.snapshot_id, \
+           ranked.change_id, \
+           ranked.commit_depth \
+         FROM ranked \
+         WHERE ranked.rn = 1 \
+         ORDER BY \
+           ranked.entity_id ASC, \
+           ranked.file_id ASC, \
+           ranked.schema_key ASC, \
+           ranked.commit_depth ASC",
+        global_version = GLOBAL_VERSION_ID,
+        change_set_id_sql = change_set_id_sql,
+        cse_change_set_id_sql = cse_change_set_id_sql,
+        cse_change_id_sql = cse_change_id_sql,
+        cse_entity_id_sql = cse_entity_id_sql,
+        cse_schema_key_sql = cse_schema_key_sql,
+        cse_file_id_sql = cse_file_id_sql,
+        root_commit_id = escape_sql_string(root_commit_id),
+        start_depth = start_depth,
+        end_depth = end_depth,
+    )
+}
+
+fn json_text_expr_sql(dialect: SqlDialect, column: &str, field: &str) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!("json_extract({column}, '$.\"{field}\"')"),
+        SqlDialect::Postgres => {
+            format!("jsonb_extract_path_text(CAST({column} AS JSONB), '{field}')")
+        }
+    }
+}
+
+fn parse_timeline_source_rows(result: QueryResult) -> Result<Vec<TimelineSourceRow>, LixError> {
+    let mut out = Vec::with_capacity(result.rows.len());
+    for row in result.rows {
+        let entity_id = required_text_value(&row, 0, "entity_id")?;
+        let schema_key = required_text_value(&row, 1, "schema_key")?;
+        let file_id = required_text_value(&row, 2, "file_id")?;
+        let plugin_key = required_text_value(&row, 3, "plugin_key")?;
+        let schema_version = required_text_value(&row, 4, "schema_version")?;
+        let metadata = optional_text_value(&row, 5, "metadata")?;
+        let snapshot_id = required_text_value(&row, 6, "snapshot_id")?;
+        let change_id = required_text_value(&row, 7, "change_id")?;
+        let depth = required_integer_value(&row, 8, "commit_depth")?;
+
+        out.push(TimelineSourceRow {
+            entity_id,
+            schema_key,
+            file_id,
+            plugin_key,
+            schema_version,
+            metadata,
+            snapshot_id,
+            change_id,
+            depth,
+        });
+    }
+    Ok(out)
+}
+
+fn derive_breakpoints_from_source_rows(
+    root_commit_id: &str,
+    start_depth: i64,
+    source_rows: Vec<TimelineSourceRow>,
+) -> Vec<TimelineBreakpointRow> {
+    let mut breakpoints = Vec::new();
+    let mut current_key: Option<TimelineEntityKey> = None;
+    let mut current_signature: Option<TimelineStateSignature> = None;
+
+    for row in source_rows {
+        let key = TimelineEntityKey {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+        };
+        let signature = TimelineStateSignature {
+            plugin_key: row.plugin_key.clone(),
+            schema_version: row.schema_version.clone(),
+            metadata: row.metadata.clone(),
+            snapshot_id: row.snapshot_id.clone(),
+            change_id: row.change_id.clone(),
+        };
+
+        if current_key.as_ref() != Some(&key) {
+            current_key = Some(key.clone());
+            current_signature = None;
+        }
+
+        if row.depth < start_depth {
+            current_signature = Some(signature);
+            continue;
+        }
+
+        if current_signature.as_ref() != Some(&signature) {
+            breakpoints.push(TimelineBreakpointRow {
+                root_commit_id: root_commit_id.to_string(),
+                entity_id: key.entity_id,
+                schema_key: key.schema_key,
+                file_id: key.file_id,
+                from_depth: row.depth,
+                plugin_key: row.plugin_key,
+                schema_version: row.schema_version,
+                metadata: row.metadata,
+                snapshot_id: row.snapshot_id,
+                change_id: row.change_id,
+            });
+        }
+
+        current_signature = Some(signature);
+    }
+
+    breakpoints
+}
+
+async fn insert_breakpoints(
+    backend: &dyn LixBackend,
+    breakpoints: &[TimelineBreakpointRow],
+) -> Result<(), LixError> {
+    for breakpoint in breakpoints {
+        let metadata_sql = breakpoint
+            .metadata
+            .as_ref()
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let sql = format!(
+            "INSERT INTO {table} (\
+               root_commit_id, entity_id, schema_key, file_id, from_depth, \
+               plugin_key, schema_version, metadata, snapshot_id, change_id\
+             ) VALUES (\
+               '{root_commit_id}', '{entity_id}', '{schema_key}', '{file_id}', {from_depth}, \
+               '{plugin_key}', '{schema_version}', {metadata_sql}, '{snapshot_id}', '{change_id}'\
+             ) \
+             ON CONFLICT (root_commit_id, entity_id, schema_key, file_id, from_depth) DO NOTHING",
+            table = TIMELINE_BREAKPOINT_TABLE,
+            root_commit_id = escape_sql_string(&breakpoint.root_commit_id),
+            entity_id = escape_sql_string(&breakpoint.entity_id),
+            schema_key = escape_sql_string(&breakpoint.schema_key),
+            file_id = escape_sql_string(&breakpoint.file_id),
+            from_depth = breakpoint.from_depth,
+            plugin_key = escape_sql_string(&breakpoint.plugin_key),
+            schema_version = escape_sql_string(&breakpoint.schema_version),
+            metadata_sql = metadata_sql,
+            snapshot_id = escape_sql_string(&breakpoint.snapshot_id),
+            change_id = escape_sql_string(&breakpoint.change_id),
+        );
+        backend.execute(&sql, &[]).await?;
+    }
+    Ok(())
+}
+
+async fn upsert_timeline_status(
+    backend: &dyn LixBackend,
+    root_commit_id: &str,
+    built_max_depth: i64,
+) -> Result<(), LixError> {
+    let sql = format!(
+        "INSERT INTO {table} (root_commit_id, built_max_depth, built_at) \
+         VALUES ('{root_commit_id}', {built_max_depth}, CURRENT_TIMESTAMP) \
+         ON CONFLICT (root_commit_id) DO UPDATE \
+         SET built_max_depth = CASE \
+               WHEN excluded.built_max_depth > {table}.built_max_depth THEN excluded.built_max_depth \
+               ELSE {table}.built_max_depth \
+             END, \
+             built_at = CASE \
+               WHEN excluded.built_max_depth > {table}.built_max_depth THEN excluded.built_at \
+               ELSE {table}.built_at \
+             END",
+        table = TIMELINE_STATUS_TABLE,
+        root_commit_id = escape_sql_string(root_commit_id),
+        built_max_depth = built_max_depth,
+    );
+    backend.execute(&sql, &[]).await?;
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TimelineEntityKey {
+    entity_id: String,
+    schema_key: String,
+    file_id: String,
+}
+
+#[derive(Clone)]
+struct TimelineSourceRow {
+    entity_id: String,
+    schema_key: String,
+    file_id: String,
+    plugin_key: String,
+    schema_version: String,
+    metadata: Option<String>,
+    snapshot_id: String,
+    change_id: String,
+    depth: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TimelineStateSignature {
+    plugin_key: String,
+    schema_version: String,
+    metadata: Option<String>,
+    snapshot_id: String,
+    change_id: String,
+}
+
+struct TimelineBreakpointRow {
+    root_commit_id: String,
+    entity_id: String,
+    schema_key: String,
+    file_id: String,
+    from_depth: i64,
+    plugin_key: String,
+    schema_version: String,
+    metadata: Option<String>,
+    snapshot_id: String,
+    change_id: String,
+}
+
+fn text_value_at(row: &[Value], index: usize) -> Option<&str> {
+    match row.get(index) {
+        Some(Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn required_text_value(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
+    match row.get(index) {
+        Some(Value::Text(value)) => Ok(value.clone()),
+        Some(other) => Err(LixError {
+            message: format!("expected text for {field}, got {other:?}"),
+        }),
+        None => Err(LixError {
+            message: format!("missing column {field} at index {index}"),
+        }),
+    }
+}
+
+fn optional_text_value(
+    row: &[Value],
+    index: usize,
+    field: &str,
+) -> Result<Option<String>, LixError> {
+    match row.get(index) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(LixError {
+            message: format!("expected nullable text for {field}, got {other:?}"),
+        }),
+    }
+}
+
+fn required_integer_value(row: &[Value], index: usize, field: &str) -> Result<i64, LixError> {
+    match row.get(index) {
+        Some(value) => integer_from_value(value).ok_or_else(|| LixError {
+            message: format!("expected integer for {field}, got {value:?}"),
+        }),
+        None => Err(LixError {
+            message: format!("missing column {field} at index {index}"),
+        }),
+    }
+}
+
+fn integer_from_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Integer(value) => Some(*value),
+        Value::Real(value) => Some(*value as i64),
+        Value::Text(value) => value.parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn default_lix_state_history_alias() -> sqlparser::ast::TableAlias {
@@ -753,11 +1442,13 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("ic.schema_key = ?"));
+        assert!(sql.contains("bp.schema_key = ?"));
         assert!(sql.contains("c.id = ?"));
         assert!(!sql.contains("sh.schema_key = ?"));
         assert!(!sql.contains("sh.root_commit_id = ?"));
-        assert!(sql.contains("SELECT COUNT(*) AS count FROM ranked_cse ranked WHERE ranked.rn = 1"));
+        assert!(sql.contains("SELECT COUNT(*) AS count"));
+        assert!(sql.contains("FROM history_rows h"));
+        assert!(sql.contains("no-content"));
         assert!(!sql.contains("ranked.snapshot_content IS NOT NULL"));
     }
 
@@ -776,7 +1467,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(!sql.contains("c.id = ?"));
-        assert!(!sql.contains("ic.schema_key = ?"));
+        assert!(!sql.contains("bp.schema_key = ?"));
         assert!(sql.contains("sh.root_commit_id = ?"));
         assert!(sql.contains("sh.schema_key = ?"));
     }
@@ -796,10 +1487,12 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("c.id = ?1"));
-        assert!(sql.contains("ic.schema_key = ?2"));
+        assert!(sql.contains("bp.schema_key = ?2"));
         assert!(!sql.contains("sh.root_commit_id = ?1"));
         assert!(!sql.contains("sh.schema_key = ?2"));
-        assert!(sql.contains("SELECT COUNT(*) AS count FROM ranked_cse ranked WHERE ranked.rn = 1"));
+        assert!(sql.contains("SELECT COUNT(*) AS count"));
+        assert!(sql.contains("FROM history_rows h"));
+        assert!(sql.contains("no-content"));
     }
 
     #[test]
@@ -817,6 +1510,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("JOIN lix_commit_ancestry ancestry"));
+        assert!(sql.contains("FROM lix_entity_state_timeline_breakpoint bp"));
         assert!(sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
         assert!(!sql.contains("WITH RECURSIVE"));
         assert!(!sql.contains("commit_edge_by_version"));
