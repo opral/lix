@@ -650,7 +650,7 @@ fn build_lix_state_history_view_query(
              FROM reachable_commits rc \
              {reachable_where_sql} \
            ), \
-           breakpoint_intervals AS ( \
+           breakpoint_rows AS ( \
              SELECT \
                bp.root_commit_id, \
                bp.entity_id, \
@@ -661,14 +661,7 @@ fn build_lix_state_history_view_query(
                 bp.metadata, \
                 bp.snapshot_id, \
                 bp.change_id, \
-                bp.from_depth, \
-                COALESCE( \
-                 LEAD(bp.from_depth) OVER ( \
-                   PARTITION BY bp.root_commit_id, bp.entity_id, bp.file_id, bp.schema_key \
-                   ORDER BY bp.from_depth ASC \
-                 ) - 1, \
-                 {max_depth} \
-               ) AS to_depth \
+                bp.from_depth \
              FROM lix_entity_state_timeline_breakpoint bp \
              JOIN requested_commits requested \
                ON requested.commit_id = bp.root_commit_id \
@@ -688,9 +681,9 @@ fn build_lix_state_history_view_query(
                rc.root_commit_id AS root_commit_id, \
                rc.commit_depth AS depth \
              FROM filtered_reachable_commits rc \
-             JOIN breakpoint_intervals bp \
+             JOIN breakpoint_rows bp \
                ON bp.root_commit_id = rc.root_commit_id \
-              AND rc.commit_depth BETWEEN bp.from_depth AND bp.to_depth \
+              AND rc.commit_depth = bp.from_depth \
            ) \
          {final_select_sql}",
         global_version = GLOBAL_VERSION_ID,
