@@ -46,7 +46,7 @@ const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
-const COMMIT_ANCESTRY_TABLE: &str = "lix_commit_ancestry";
+const COMMIT_ANCESTRY_TABLE: &str = "lix_internal_commit_ancestry";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const GLOBAL_VERSION: &str = "global";
@@ -3569,7 +3569,7 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(sql.contains("INSERT INTO lix_commit_ancestry"));
+        assert!(sql.contains("INSERT INTO lix_internal_commit_ancestry"));
         assert!(sql.contains("ON CONFLICT"));
         assert!(sql.contains("DO UPDATE"));
         assert!(sql.contains("SET depth = CASE"));

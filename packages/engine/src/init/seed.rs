@@ -158,10 +158,10 @@ impl Engine {
     pub(crate) async fn seed_commit_ancestry(&self) -> Result<(), LixError> {
         let ancestry_count_result = self
             .backend
-            .execute("SELECT COUNT(*) FROM lix_commit_ancestry", &[])
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_ancestry", &[])
             .await?;
         let ancestry_count =
-            read_scalar_count(&ancestry_count_result, "lix_commit_ancestry count")?;
+            read_scalar_count(&ancestry_count_result, "lix_internal_commit_ancestry count")?;
         if ancestry_count > 0 {
             return Ok(());
         }
@@ -215,7 +215,7 @@ impl Engine {
                      JOIN edges e ON e.child_id = w.ancestor_id \
                      WHERE w.depth < 512 \
                    ) \
-                 INSERT INTO lix_commit_ancestry (commit_id, ancestor_id, depth) \
+                 INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
                  SELECT commit_id, ancestor_id, MIN(depth) AS depth \
                  FROM walk \
                  GROUP BY commit_id, ancestor_id",

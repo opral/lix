@@ -29,7 +29,7 @@ const BRANCHY_SEED_CONFIG: HistorySeedConfig = HistorySeedConfig {
 const PLUGIN_RUNTIME_HISTORY_QUERY: &str = "WITH target_commit_depth AS (\
     SELECT COALESCE((\
       SELECT depth \
-      FROM lix_commit_ancestry \
+      FROM lix_internal_commit_ancestry \
       WHERE commit_id = $3 \
         AND ancestor_id = $4 \
       LIMIT 1\

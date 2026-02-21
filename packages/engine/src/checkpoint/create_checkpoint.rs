@@ -674,7 +674,7 @@ async fn ensure_commit_ancestry(
     parent_ids: &[String],
 ) -> Result<(), LixError> {
     tx.execute(
-        "INSERT INTO lix_commit_ancestry (commit_id, ancestor_id, depth) \
+        "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
          VALUES ($1, $1, 0) \
          ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
         &[Value::Text(commit_id.to_string())],
@@ -684,20 +684,20 @@ async fn ensure_commit_ancestry(
     let normalized_parents = normalize_parent_commit_ids(parent_ids.to_vec(), commit_id);
     for parent_id in normalized_parents {
         tx.execute(
-            "INSERT INTO lix_commit_ancestry (commit_id, ancestor_id, depth) \
+            "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
              SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
              FROM ( \
                SELECT $2 AS ancestor_id, 1 AS depth \
                UNION ALL \
                SELECT ancestor_id, depth + 1 AS depth \
-               FROM lix_commit_ancestry \
+               FROM lix_internal_commit_ancestry \
                WHERE commit_id = $2 \
              ) AS candidate \
              GROUP BY candidate.ancestor_id \
              ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
              SET depth = CASE \
-               WHEN excluded.depth < lix_commit_ancestry.depth THEN excluded.depth \
-               ELSE lix_commit_ancestry.depth \
+               WHEN excluded.depth < lix_internal_commit_ancestry.depth THEN excluded.depth \
+               ELSE lix_internal_commit_ancestry.depth \
              END",
             &[Value::Text(commit_id.to_string()), Value::Text(parent_id)],
         )
