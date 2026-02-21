@@ -12,6 +12,7 @@ const SCHEMA_KEY: &str = "bench_state_history_schema";
 const FILE_ID: &str = "bench-state-history-file";
 const PLUGIN_KEY: &str = "lix";
 const TARGET_ENTITY_INDEX: usize = 3;
+const PHASE0_ALL_ENTITIES_DEPTH: i64 = 10;
 
 const DEFAULT_SEED_CONFIG: HistorySeedConfig = HistorySeedConfig {
     entity_count: 8,
@@ -39,6 +40,47 @@ const PLUGIN_RUNTIME_HISTORY_QUERY: &str = "WITH target_commit_depth AS (\
    AND root_commit_id = $3 \
    AND depth >= COALESCE((SELECT raw_depth FROM target_commit_depth), $5) \
  ORDER BY entity_id ASC, depth ASC";
+
+const HISTORY_COUNT_BY_ROOT_QUERY: &str = "SELECT COUNT(*) \
+    FROM lix_state_history \
+    WHERE schema_key = ? \
+      AND root_commit_id = ? \
+      AND snapshot_content IS NOT NULL";
+
+const HISTORY_ENTITY_TIMELINE_SCAN_QUERY: &str = "SELECT depth, snapshot_content \
+    FROM lix_state_history \
+    WHERE schema_key = ? \
+      AND entity_id = ? \
+      AND root_commit_id = ? \
+    ORDER BY depth ASC";
+
+const HISTORY_FILE_PLUGIN_ROOT_DEPTH_RANGE_TIMELINE_QUERY: &str =
+    "SELECT entity_id, depth, snapshot_content \
+     FROM lix_state_history \
+     WHERE file_id = ? \
+       AND plugin_key = ? \
+       AND root_commit_id = ? \
+       AND depth >= ? \
+       AND depth <= ? \
+     ORDER BY entity_id ASC, depth ASC";
+
+const HISTORY_FILE_PLUGIN_ROOT_DEPTH_BETWEEN_0_10_QUERY: &str =
+    "SELECT entity_id, depth, snapshot_content \
+     FROM lix_state_history \
+     WHERE file_id = ? \
+       AND plugin_key = ? \
+       AND root_commit_id = ? \
+       AND depth BETWEEN 0 AND 10 \
+     ORDER BY entity_id ASC, depth ASC";
+
+const HISTORY_FILE_PLUGIN_ROOT_ALL_ENTITIES_AT_DEPTH_QUERY: &str =
+    "SELECT entity_id, depth, snapshot_content \
+     FROM lix_state_history \
+     WHERE file_id = ? \
+       AND plugin_key = ? \
+       AND root_commit_id = ? \
+       AND depth = ? \
+     ORDER BY entity_id ASC";
 
 #[derive(Clone, Copy)]
 struct HistorySeedConfig {
@@ -71,16 +113,22 @@ fn bench_lix_state_history_count_by_root_commit(c: &mut Criterion) {
         Value::Text(SCHEMA_KEY.to_string()),
         Value::Text(seed.root_commit_id.clone()),
     ];
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_count_by_root_commit",
+        HISTORY_COUNT_BY_ROOT_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
 
     c.bench_function("lix_state_history_count_by_root_commit", |b| {
         b.iter(|| {
             let result = runtime
                 .block_on(seed.engine.execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_state_history \
-                     WHERE schema_key = ? \
-                       AND root_commit_id = ? \
-                       AND snapshot_content IS NOT NULL",
+                    HISTORY_COUNT_BY_ROOT_QUERY,
                     &params,
                     ExecuteOptions::default(),
                 ))
@@ -106,17 +154,22 @@ fn bench_lix_state_history_entity_timeline_scan(c: &mut Criterion) {
         Value::Text(seed.target_entity_id.clone()),
         Value::Text(seed.root_commit_id.clone()),
     ];
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_entity_timeline_scan",
+        HISTORY_ENTITY_TIMELINE_SCAN_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
 
     c.bench_function("lix_state_history_entity_timeline_scan", |b| {
         b.iter(|| {
             let result = runtime
                 .block_on(seed.engine.execute(
-                    "SELECT depth, snapshot_content \
-                     FROM lix_state_history \
-                     WHERE schema_key = ? \
-                       AND entity_id = ? \
-                       AND root_commit_id = ? \
-                     ORDER BY depth ASC",
+                    HISTORY_ENTITY_TIMELINE_SCAN_QUERY,
                     &params,
                     ExecuteOptions::default(),
                 ))
@@ -132,6 +185,16 @@ fn bench_lix_state_history_plugin_runtime_query_exact(c: &mut Criterion) {
         .block_on(seed_engine_with_history())
         .expect("failed to seed benchmark engine");
     let params = plugin_runtime_query_params(&seed);
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_plugin_runtime_query_exact",
+        PLUGIN_RUNTIME_HISTORY_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
 
     c.bench_function("lix_state_history_plugin_runtime_query_exact", |b| {
         b.iter(|| {
@@ -153,6 +216,16 @@ fn bench_lix_state_history_file_plugin_root_depth_range_timeline(c: &mut Criteri
         .block_on(seed_engine_with_history())
         .expect("failed to seed benchmark engine");
     let params = file_plugin_depth_range_params(&seed);
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_file_plugin_root_depth_range_timeline",
+        HISTORY_FILE_PLUGIN_ROOT_DEPTH_RANGE_TIMELINE_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
 
     c.bench_function(
         "lix_state_history_file_plugin_root_depth_range_timeline",
@@ -160,18 +233,79 @@ fn bench_lix_state_history_file_plugin_root_depth_range_timeline(c: &mut Criteri
             b.iter(|| {
                 let result = runtime
                     .block_on(seed.engine.execute(
-                        "SELECT entity_id, depth, snapshot_content \
-                         FROM lix_state_history \
-                         WHERE file_id = ? \
-                           AND plugin_key = ? \
-                           AND root_commit_id = ? \
-                           AND depth >= ? \
-                           AND depth <= ? \
-                         ORDER BY entity_id ASC, depth ASC",
+                        HISTORY_FILE_PLUGIN_ROOT_DEPTH_RANGE_TIMELINE_QUERY,
                         &params,
                         ExecuteOptions::default(),
                     ))
                     .expect("file/plugin/root/depth timeline query should succeed");
+                black_box(result.rows.len());
+            });
+        },
+    );
+}
+
+fn bench_lix_state_history_file_plugin_root_depth_between_0_and_10(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to build tokio runtime");
+    let seed = runtime
+        .block_on(seed_engine_with_history())
+        .expect("failed to seed benchmark engine");
+    let params = file_plugin_root_params(&seed);
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_file_plugin_root_depth_between_0_and_10",
+        HISTORY_FILE_PLUGIN_ROOT_DEPTH_BETWEEN_0_10_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
+
+    c.bench_function(
+        "lix_state_history_file_plugin_root_depth_between_0_and_10",
+        |b| {
+            b.iter(|| {
+                let result = runtime
+                    .block_on(seed.engine.execute(
+                        HISTORY_FILE_PLUGIN_ROOT_DEPTH_BETWEEN_0_10_QUERY,
+                        &params,
+                        ExecuteOptions::default(),
+                    ))
+                    .expect("file/plugin/root/depth BETWEEN 0 AND 10 query should succeed");
+                black_box(result.rows.len());
+            });
+        },
+    );
+}
+
+fn bench_lix_state_history_file_plugin_root_all_entities_at_depth(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to build tokio runtime");
+    let seed = runtime
+        .block_on(seed_engine_with_history())
+        .expect("failed to seed benchmark engine");
+    let params = file_plugin_all_entities_at_depth_params(&seed);
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_file_plugin_root_all_entities_at_depth",
+        HISTORY_FILE_PLUGIN_ROOT_ALL_ENTITIES_AT_DEPTH_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
+
+    c.bench_function(
+        "lix_state_history_file_plugin_root_all_entities_at_depth",
+        |b| {
+            b.iter(|| {
+                let result = runtime
+                    .block_on(seed.engine.execute(
+                        HISTORY_FILE_PLUGIN_ROOT_ALL_ENTITIES_AT_DEPTH_QUERY,
+                        &params,
+                        ExecuteOptions::default(),
+                    ))
+                    .expect("file/plugin/root/all-entities-at-depth query should succeed");
                 black_box(result.rows.len());
             });
         },
@@ -184,6 +318,16 @@ fn bench_lix_state_history_plugin_runtime_query_exact_branchy_graph(c: &mut Crit
         .block_on(seed_engine_with_history_config(BRANCHY_SEED_CONFIG))
         .expect("failed to seed branchy benchmark engine");
     let params = plugin_runtime_query_params(&seed);
+    emit_explain_query_plan(
+        &runtime,
+        &seed.engine,
+        "lix_state_history_plugin_runtime_query_exact_branchy_graph",
+        PLUGIN_RUNTIME_HISTORY_QUERY,
+        &params,
+    );
+    if explain_only_mode() {
+        return;
+    }
 
     c.bench_function(
         "lix_state_history_plugin_runtime_query_exact_branchy_graph",
@@ -215,6 +359,16 @@ fn bench_lix_state_history_plugin_runtime_scale_matrix(c: &mut Criterion) {
             .expect("failed to seed scale matrix engine");
         let params = plugin_runtime_query_params(&seed);
         let label = config.label();
+        emit_explain_query_plan(
+            &runtime,
+            &seed.engine,
+            &format!("lix_state_history_plugin_runtime_scale_matrix/{label}"),
+            PLUGIN_RUNTIME_HISTORY_QUERY,
+            &params,
+        );
+        if explain_only_mode() {
+            continue;
+        }
         group.throughput(Throughput::Elements(config.slope_units()));
         group.bench_function(BenchmarkId::new("plugin_runtime_exact", label), |b| {
             b.iter(|| {
@@ -225,6 +379,47 @@ fn bench_lix_state_history_plugin_runtime_scale_matrix(c: &mut Criterion) {
                         ExecuteOptions::default(),
                     ))
                     .expect("plugin runtime history scale query should succeed");
+                black_box(result.rows.len());
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_lix_state_history_phase0_scale_tiers(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("failed to build tokio runtime");
+    let mut group = c.benchmark_group("lix_state_history_phase0_scale_tiers");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+
+    for config in phase0_scale_tier_configs() {
+        let seed = runtime
+            .block_on(seed_engine_with_history_config(config))
+            .expect("failed to seed phase0 tier engine");
+        let params = plugin_runtime_query_params(&seed);
+        let label = config.label();
+        emit_explain_query_plan(
+            &runtime,
+            &seed.engine,
+            &format!("lix_state_history_phase0_scale_tiers/{label}"),
+            PLUGIN_RUNTIME_HISTORY_QUERY,
+            &params,
+        );
+        if explain_only_mode() {
+            continue;
+        }
+        group.throughput(Throughput::Elements(config.slope_units()));
+        group.bench_function(BenchmarkId::new("plugin_runtime_exact", label), |b| {
+            b.iter(|| {
+                let result = runtime
+                    .block_on(seed.engine.execute(
+                        PLUGIN_RUNTIME_HISTORY_QUERY,
+                        &params,
+                        ExecuteOptions::default(),
+                    ))
+                    .expect("plugin runtime history phase0 tier query should succeed");
                 black_box(result.rows.len());
             });
         });
@@ -629,6 +824,14 @@ fn plugin_runtime_query_params(seed: &HistorySeed) -> Vec<Value> {
     ]
 }
 
+fn file_plugin_root_params(seed: &HistorySeed) -> Vec<Value> {
+    vec![
+        Value::Text(FILE_ID.to_string()),
+        Value::Text(PLUGIN_KEY.to_string()),
+        Value::Text(seed.root_commit_id.clone()),
+    ]
+}
+
 fn file_plugin_depth_range_params(seed: &HistorySeed) -> Vec<Value> {
     vec![
         Value::Text(FILE_ID.to_string()),
@@ -636,6 +839,15 @@ fn file_plugin_depth_range_params(seed: &HistorySeed) -> Vec<Value> {
         Value::Text(seed.root_commit_id.clone()),
         Value::Integer(seed.depth_range_start),
         Value::Integer(seed.depth_range_end),
+    ]
+}
+
+fn file_plugin_all_entities_at_depth_params(seed: &HistorySeed) -> Vec<Value> {
+    vec![
+        Value::Text(FILE_ID.to_string()),
+        Value::Text(PLUGIN_KEY.to_string()),
+        Value::Text(seed.root_commit_id.clone()),
+        Value::Integer(seed.depth_range_end.min(PHASE0_ALL_ENTITIES_DEPTH)),
     ]
 }
 
@@ -666,6 +878,47 @@ fn value_as_i64(value: &Value, column: &str) -> Result<i64, LixError> {
     }
 }
 
+fn emit_explain_query_plan(
+    runtime: &Runtime,
+    engine: &lix_engine::Engine,
+    label: &str,
+    sql: &str,
+    params: &[Value],
+) {
+    let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+    let result = runtime
+        .block_on(engine.execute(&explain_sql, params, ExecuteOptions::default()))
+        .unwrap_or_else(|error| panic!("EXPLAIN QUERY PLAN failed for '{label}': {error:?}"));
+    println!("[bench-explain] {label}");
+    for row in &result.rows {
+        let detail = row
+            .get(3)
+            .or_else(|| row.first())
+            .map(value_for_explain)
+            .unwrap_or_else(|| "<no explain detail row>".to_string());
+        println!("[bench-explain]   {detail}");
+    }
+}
+
+fn explain_only_mode() -> bool {
+    std::env::var("LIX_BENCH_EXPLAIN_ONLY")
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            !normalized.is_empty() && normalized != "0" && normalized != "false"
+        })
+        .unwrap_or(false)
+}
+
+fn value_for_explain(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(number) => number.to_string(),
+        Value::Real(number) => number.to_string(),
+        Value::Text(text) => text.clone(),
+        Value::Blob(blob) => format!("<blob:{} bytes>", blob.len()),
+    }
+}
+
 fn scale_matrix_configs() -> Vec<HistorySeedConfig> {
     let entity_counts = [8, 32, 128];
     let depth_counts = [32, 128];
@@ -685,13 +938,31 @@ fn scale_matrix_configs() -> Vec<HistorySeedConfig> {
     out
 }
 
+fn phase0_scale_tier_configs() -> [HistorySeedConfig; 2] {
+    [
+        HistorySeedConfig {
+            entity_count: 50,
+            history_updates: 100,
+            branch_roots: 1,
+        },
+        HistorySeedConfig {
+            entity_count: 200,
+            history_updates: 200,
+            branch_roots: 1,
+        },
+    ]
+}
+
 criterion_group!(
     benches,
     bench_lix_state_history_count_by_root_commit,
     bench_lix_state_history_entity_timeline_scan,
     bench_lix_state_history_plugin_runtime_query_exact,
     bench_lix_state_history_file_plugin_root_depth_range_timeline,
+    bench_lix_state_history_file_plugin_root_depth_between_0_and_10,
+    bench_lix_state_history_file_plugin_root_all_entities_at_depth,
     bench_lix_state_history_plugin_runtime_query_exact_branchy_graph,
-    bench_lix_state_history_plugin_runtime_scale_matrix
+    bench_lix_state_history_plugin_runtime_scale_matrix,
+    bench_lix_state_history_phase0_scale_tiers
 );
 criterion_main!(benches);
