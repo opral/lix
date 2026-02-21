@@ -1,7 +1,6 @@
 use super::super::*;
 use super::*;
 use crate::SqlDialect;
-use serde::Deserialize;
 
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
@@ -1040,17 +1039,9 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BuiltinBinaryBlobRefSnapshot {
-    id: String,
-    blob_hash: String,
-    size_bytes: u64,
-}
-
 fn parse_builtin_binary_blob_ref_snapshot(
     raw: &str,
-) -> Result<BuiltinBinaryBlobRefSnapshot, LixError> {
+) -> Result<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot, LixError> {
     serde_json::from_str(raw).map_err(|error| LixError {
         message: format!(
             "builtin binary fallback: invalid lix_binary_blob_ref snapshot_content: {error}"
@@ -1062,7 +1053,7 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target(
     backend: &dyn LixBackend,
     file_id: &str,
     version_id: &str,
-) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
+) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
     let result = backend
         .execute(
             "SELECT snapshot_content \
@@ -1101,7 +1092,7 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
     transaction: &mut dyn LixTransaction,
     file_id: &str,
     version_id: &str,
-) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
+) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
     let result = transaction
         .execute(
             "SELECT snapshot_content \
