@@ -43,19 +43,20 @@ async fn refresh_working_change_projection_with_backend(
             ],
         )
         .await?;
-    let working_commit_id = first_row_json_text_field(&version_pointer_untracked, "working_commit_id")?;
+    let working_commit_id =
+        first_row_json_text_field(&version_pointer_untracked, "working_commit_id")?;
     let tip_commit_id = first_row_json_text_field(&version_pointer_untracked, "commit_id")?;
-    let (working_commit_id, tip_commit_id) =
-        if let (Some(working_commit_id), Some(tip_commit_id)) = (working_commit_id, tip_commit_id)
-        {
-            (working_commit_id, tip_commit_id)
-        } else {
-            let version_pointer_table = format!(
-                "lix_internal_state_materialized_v1_{}",
-                version_pointer_schema_key()
-            );
-            let version_pointer_sql = format!(
-                "SELECT \
+    let (working_commit_id, tip_commit_id) = if let (Some(working_commit_id), Some(tip_commit_id)) =
+        (working_commit_id, tip_commit_id)
+    {
+        (working_commit_id, tip_commit_id)
+    } else {
+        let version_pointer_table = format!(
+            "lix_internal_state_materialized_v1_{}",
+            version_pointer_schema_key()
+        );
+        let version_pointer_sql = format!(
+            "SELECT \
                    snapshot_content \
                  FROM {table} \
                  WHERE schema_key = '{schema_key}' \
@@ -65,25 +66,27 @@ async fn refresh_working_change_projection_with_backend(
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
-                table = version_pointer_table,
-                schema_key = escape_sql_string(version_pointer_schema_key()),
-                file_id = escape_sql_string(version_pointer_file_id()),
-                version_id = escape_sql_string(version_pointer_storage_version_id()),
-            );
-            let version_pointer = backend
-                .execute(&version_pointer_sql, &[Value::Text(active_version_id.to_string())])
-                .await?;
-            let Some(working_commit_id) =
-                first_row_json_text_field(&version_pointer, "working_commit_id")?
-            else {
-                return Ok(());
-            };
-            let Some(tip_commit_id) = first_row_json_text_field(&version_pointer, "commit_id")?
-            else {
-                return Ok(());
-            };
-            (working_commit_id, tip_commit_id)
+            table = version_pointer_table,
+            schema_key = escape_sql_string(version_pointer_schema_key()),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            version_id = escape_sql_string(version_pointer_storage_version_id()),
+        );
+        let version_pointer = backend
+            .execute(
+                &version_pointer_sql,
+                &[Value::Text(active_version_id.to_string())],
+            )
+            .await?;
+        let Some(working_commit_id) =
+            first_row_json_text_field(&version_pointer, "working_commit_id")?
+        else {
+            return Ok(());
         };
+        let Some(tip_commit_id) = first_row_json_text_field(&version_pointer, "commit_id")? else {
+            return Ok(());
+        };
+        (working_commit_id, tip_commit_id)
+    };
 
     let change_set_untracked = backend
         .execute(
@@ -104,8 +107,7 @@ async fn refresh_working_change_projection_with_backend(
         )
         .await?;
     let mut working_commit_snapshot_raw = first_row_text(&change_set_untracked)?;
-    let working_change_set_id =
-        first_row_json_text_field(&change_set_untracked, "change_set_id")?;
+    let working_change_set_id = first_row_json_text_field(&change_set_untracked, "change_set_id")?;
     let working_change_set_id = if let Some(working_change_set_id) = working_change_set_id {
         working_change_set_id
     } else {
@@ -128,7 +130,8 @@ async fn refresh_working_change_projection_with_backend(
             .execute(&change_set_sql, &[Value::Text(working_commit_id.clone())])
             .await?;
         working_commit_snapshot_raw = first_row_text(&change_set_row)?;
-        let Some(working_change_set_id) = first_row_json_text_field(&change_set_row, "change_set_id")?
+        let Some(working_change_set_id) =
+            first_row_json_text_field(&change_set_row, "change_set_id")?
         else {
             return Ok(());
         };
@@ -191,7 +194,10 @@ async fn refresh_working_change_projection_with_backend(
     for row in &edge_rows.rows {
         let raw = text_column(row, 0, "snapshot_content")?;
         if let Some((parent_id, child_id)) = parse_commit_edge_snapshot(&raw)? {
-            parents_by_child.entry(child_id).or_default().push(parent_id);
+            parents_by_child
+                .entry(child_id)
+                .or_default()
+                .push(parent_id);
         }
     }
 
@@ -252,8 +258,10 @@ async fn refresh_working_change_projection_with_backend(
         return Ok(());
     }
 
-    let mut selected_by_entity: BTreeMap<(String, String, String), WorkingProjectionSelectedChange> =
-        BTreeMap::new();
+    let mut selected_by_entity: BTreeMap<
+        (String, String, String),
+        WorkingProjectionSelectedChange,
+    > = BTreeMap::new();
     for (commit_id, depth) in &depth_by_commit_id {
         let Some(change_set_id) = change_set_by_commit_id.get(commit_id) else {
             continue;
@@ -261,15 +269,15 @@ async fn refresh_working_change_projection_with_backend(
         let Some(cse_rows) = cse_by_change_set_id.get(change_set_id) else {
             continue;
         };
-            for cse in cse_rows {
-                if cse.change_id.starts_with("working_projection:") {
-                    continue;
-                }
-                let key = (
-                    cse.entity_id.clone(),
-                    cse.schema_key.clone(),
-                    cse.file_id.clone(),
-                );
+        for cse in cse_rows {
+            if cse.change_id.starts_with("working_projection:") {
+                continue;
+            }
+            let key = (
+                cse.entity_id.clone(),
+                cse.schema_key.clone(),
+                cse.file_id.clone(),
+            );
             let next = WorkingProjectionSelectedChange {
                 change_id: cse.change_id.clone(),
                 depth: *depth,
@@ -466,7 +474,10 @@ fn text_column(row: &[Value], index: usize, name: &str) -> Result<String, LixErr
     }
 }
 
-fn first_row_json_text_field(result: &QueryResult, field: &str) -> Result<Option<String>, LixError> {
+fn first_row_json_text_field(
+    result: &QueryResult,
+    field: &str,
+) -> Result<Option<String>, LixError> {
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };

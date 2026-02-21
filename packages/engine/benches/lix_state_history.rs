@@ -26,20 +26,22 @@ const BRANCHY_SEED_CONFIG: HistorySeedConfig = HistorySeedConfig {
     branch_roots: 8,
 };
 
-const PLUGIN_RUNTIME_HISTORY_QUERY: &str = "WITH target_commit_depth AS (\
-    SELECT MIN(depth) AS raw_depth \
-    FROM lix_state_history \
-    WHERE file_id = $1 \
-      AND root_commit_id = $3 \
-      AND commit_id = $4\
+const PLUGIN_RUNTIME_HISTORY_QUERY: &str = "WITH resolved_depth AS (\
+    SELECT COALESCE((\
+      SELECT depth \
+      FROM lix_commit_ancestry \
+      WHERE commit_id = $3 \
+        AND ancestor_id = $4 \
+      LIMIT 1\
+    ), $5) AS target_depth\
  ) \
- SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
- FROM lix_state_history \
- WHERE file_id = $1 \
-   AND plugin_key = $2 \
-   AND root_commit_id = $3 \
-   AND depth >= COALESCE((SELECT raw_depth FROM target_commit_depth), $5) \
- ORDER BY entity_id ASC, depth ASC";
+ SELECT h.entity_id, h.schema_key, h.schema_version, h.snapshot_content, h.depth \
+ FROM lix_state_history AS h \
+ WHERE h.file_id = $1 \
+   AND h.plugin_key = $2 \
+   AND h.root_commit_id = $3 \
+   AND h.depth = (SELECT target_depth FROM resolved_depth) \
+ ORDER BY h.entity_id ASC";
 
 const HISTORY_COUNT_BY_ROOT_QUERY: &str = "SELECT COUNT(*) \
     FROM lix_state_history \

@@ -93,6 +93,30 @@ const INIT_STATEMENTS: &[&str] = &[
      ON lix_commit_ancestry (commit_id, depth)",
     "CREATE INDEX IF NOT EXISTS idx_lix_commit_ancestry_ancestor \
      ON lix_commit_ancestry (ancestor_id)",
+    "CREATE TABLE IF NOT EXISTS lix_entity_state_timeline_breakpoint (\
+     root_commit_id TEXT NOT NULL,\
+     entity_id TEXT NOT NULL,\
+     schema_key TEXT NOT NULL,\
+     file_id TEXT NOT NULL,\
+     from_depth BIGINT NOT NULL,\
+     plugin_key TEXT NOT NULL,\
+     schema_version TEXT NOT NULL,\
+     metadata TEXT,\
+     snapshot_id TEXT NOT NULL,\
+     change_id TEXT NOT NULL,\
+     PRIMARY KEY (root_commit_id, entity_id, schema_key, file_id, from_depth)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_entity_state_timeline_breakpoint_root_depth \
+     ON lix_entity_state_timeline_breakpoint (root_commit_id, from_depth)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_entity_state_timeline_breakpoint_lookup \
+     ON lix_entity_state_timeline_breakpoint (root_commit_id, entity_id, file_id, schema_key, from_depth)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_entity_state_timeline_breakpoint_filters \
+     ON lix_entity_state_timeline_breakpoint (root_commit_id, file_id, plugin_key, schema_key, entity_id, from_depth)",
+    "CREATE TABLE IF NOT EXISTS lix_timeline_status (\
+     root_commit_id TEXT PRIMARY KEY,\
+     built_max_depth BIGINT NOT NULL,\
+     built_at TEXT NOT NULL\
+     )",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
