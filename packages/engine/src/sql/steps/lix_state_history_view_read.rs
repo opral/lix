@@ -12,8 +12,8 @@ use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
-const TIMELINE_BREAKPOINT_TABLE: &str = "lix_entity_state_timeline_breakpoint";
-const TIMELINE_STATUS_TABLE: &str = "lix_timeline_status";
+const TIMELINE_BREAKPOINT_TABLE: &str = "lix_internal_entity_state_timeline_breakpoint";
+const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
 const MAX_HISTORY_DEPTH: i64 = 512;
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
@@ -638,7 +638,7 @@ fn build_lix_state_history_view_query(
                requested.commit_id AS root_commit_id, \
                ancestry.depth AS commit_depth \
              FROM requested_commits requested \
-             JOIN lix_commit_ancestry ancestry \
+             JOIN lix_internal_commit_ancestry ancestry \
                ON ancestry.commit_id = requested.commit_id \
              WHERE ancestry.depth <= {max_depth} \
            ), \
@@ -662,7 +662,7 @@ fn build_lix_state_history_view_query(
                 bp.snapshot_id, \
                 bp.change_id, \
                 bp.from_depth \
-             FROM lix_entity_state_timeline_breakpoint bp \
+             FROM lix_internal_entity_state_timeline_breakpoint bp \
              JOIN requested_commits requested \
                ON requested.commit_id = bp.root_commit_id \
              {breakpoint_where_sql} \
@@ -885,7 +885,7 @@ fn build_lix_state_history_view_query_phase1(
                requested.commit_id AS root_commit_id, \
                ancestry.depth AS depth \
              FROM requested_commits requested \
-             JOIN lix_commit_ancestry ancestry \
+             JOIN lix_internal_commit_ancestry ancestry \
                ON ancestry.commit_id = requested.commit_id \
              WHERE ancestry.depth <= {max_depth} \
            ), \
@@ -1089,7 +1089,7 @@ fn build_phase1_source_query_sql(
              SELECT \
                ancestry.ancestor_id AS commit_id, \
                ancestry.depth AS commit_depth \
-             FROM lix_commit_ancestry ancestry \
+             FROM lix_internal_commit_ancestry ancestry \
              WHERE ancestry.commit_id = '{root_commit_id}' \
                AND ancestry.depth BETWEEN {start_depth} AND {end_depth} \
            ), \
@@ -1502,8 +1502,8 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("JOIN lix_commit_ancestry ancestry"));
-        assert!(sql.contains("FROM lix_entity_state_timeline_breakpoint bp"));
+        assert!(sql.contains("JOIN lix_internal_commit_ancestry ancestry"));
+        assert!(sql.contains("FROM lix_internal_entity_state_timeline_breakpoint bp"));
         assert!(sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
         assert!(!sql.contains("WITH RECURSIVE"));
         assert!(!sql.contains("commit_edge_by_version"));

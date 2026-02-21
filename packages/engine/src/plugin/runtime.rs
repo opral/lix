@@ -1117,7 +1117,7 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
         "WITH target_commit_depth AS (\
             SELECT COALESCE((\
               SELECT depth \
-              FROM lix_commit_ancestry \
+              FROM lix_internal_commit_ancestry \
               WHERE commit_id = $3 \
                 AND ancestor_id = $4 \
               LIMIT 1\
