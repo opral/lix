@@ -1,23 +1,24 @@
 {
   "x-lix-key": "lix_binary_blob_ref",
   "x-lix-version": "1",
+  "description": "Metadata pointer from a file version to its binary payload in internal CAS storage.",
   "x-lix-primary-key": [
     "/id"
   ],
-  "x-lix-override-lixcols": {
-    "lixcol_plugin_key": "\"lix\""
-  },
   "type": "object",
   "properties": {
     "id": {
-      "type": "string"
+      "type": "string",
+      "description": "File/entity identifier (matches lix_file.id) for this binary reference row."
     },
     "blob_hash": {
-      "type": "string"
+      "type": "string",
+      "description": "BLAKE3 content hash used as the canonical CAS key for the binary payload."
     },
     "size_bytes": {
       "type": "integer",
-      "minimum": 0
+      "minimum": 0,
+      "description": "Logical uncompressed file size in bytes for the referenced binary payload."
     }
   },
   "required": [
