@@ -1,9 +1,0 @@
-{
-  "key": "plugin_binary",
-  "runtime": "wasm-component-v1",
-  "api_version": "0.1.0",
-  "match": {
-    "path_glob": "*"
-  },
-  "entry": "plugin.wasm"
-}
