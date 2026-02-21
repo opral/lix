@@ -127,10 +127,10 @@ struct PluginActiveStateRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BuiltinBinaryBlobRefSnapshot {
-    id: String,
-    blob_hash: String,
-    size_bytes: u64,
+pub(crate) struct BuiltinBinaryBlobRefSnapshot {
+    pub(crate) id: String,
+    pub(crate) blob_hash: String,
+    pub(crate) size_bytes: u64,
 }
 
 #[allow(dead_code)]
