@@ -44,6 +44,9 @@ const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
+const COMMIT_SCHEMA_KEY: &str = "lix_commit";
+const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
+const COMMIT_ANCESTRY_TABLE: &str = "lix_commit_ancestry";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const GLOBAL_VERSION: &str = "global";
@@ -2127,10 +2130,133 @@ fn build_statements_from_generate_commit_result(
         ));
     }
 
+    append_commit_ancestry_statements(
+        &mut statements,
+        &mut statement_params,
+        &mut next_placeholder,
+        &commit_result.materialized_state,
+    )?;
+
     Ok(StatementBatch {
         statements,
         params: statement_params,
     })
+}
+
+fn append_commit_ancestry_statements(
+    statements: &mut Vec<Statement>,
+    params: &mut Vec<EngineValue>,
+    next_placeholder: &mut usize,
+    materialized_state: &[MaterializedStateRow],
+) -> Result<(), LixError> {
+    let commit_parents = collect_commit_parent_map_for_ancestry(materialized_state)?;
+    for (commit_id, parent_ids) in commit_parents {
+        let commit_placeholder = *next_placeholder;
+        *next_placeholder += 1;
+        params.push(EngineValue::Text(commit_id));
+
+        let self_insert_sql = format!(
+            "INSERT INTO {table} (commit_id, ancestor_id, depth) \
+             VALUES (?{commit_placeholder}, ?{commit_placeholder}, 0) \
+             ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
+            table = COMMIT_ANCESTRY_TABLE,
+            commit_placeholder = commit_placeholder,
+        );
+        statements.push(parse_single_statement_from_sql(&self_insert_sql)?);
+
+        for parent_id in parent_ids {
+            let parent_placeholder = *next_placeholder;
+            *next_placeholder += 1;
+            params.push(EngineValue::Text(parent_id));
+
+            let insert_parent_ancestry_sql = format!(
+                "INSERT INTO {table} (commit_id, ancestor_id, depth) \
+                 SELECT ?{commit_placeholder} AS commit_id, candidate.ancestor_id, MIN(candidate.depth) AS depth \
+                 FROM ( \
+                   SELECT ?{parent_placeholder} AS ancestor_id, 1 AS depth \
+                   UNION ALL \
+                   SELECT ancestor_id, depth + 1 AS depth \
+                   FROM {table} \
+                   WHERE commit_id = ?{parent_placeholder} \
+                 ) AS candidate \
+                 GROUP BY candidate.ancestor_id \
+                 ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
+                 SET depth = CASE \
+                   WHEN excluded.depth < {table}.depth THEN excluded.depth \
+                   ELSE {table}.depth \
+                 END",
+                table = COMMIT_ANCESTRY_TABLE,
+                commit_placeholder = commit_placeholder,
+                parent_placeholder = parent_placeholder,
+            );
+            statements.push(parse_single_statement_from_sql(
+                &insert_parent_ancestry_sql,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn collect_commit_parent_map_for_ancestry(
+    materialized_state: &[MaterializedStateRow],
+) -> Result<BTreeMap<String, BTreeSet<String>>, LixError> {
+    let mut out = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in materialized_state {
+        if row.schema_key == COMMIT_SCHEMA_KEY && row.lixcol_version_id == GLOBAL_VERSION {
+            out.entry(row.entity_id.clone()).or_default();
+        }
+    }
+
+    for row in materialized_state {
+        if row.schema_key != COMMIT_EDGE_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION {
+            continue;
+        }
+        let Some(raw) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let Some((parent_id, child_id)) = parse_commit_edge_snapshot_for_ancestry(raw)? else {
+            continue;
+        };
+        if let Some(parents) = out.get_mut(&child_id) {
+            parents.insert(parent_id);
+        }
+    }
+
+    Ok(out)
+}
+
+fn parse_commit_edge_snapshot_for_ancestry(
+    raw: &str,
+) -> Result<Option<(String, String)>, LixError> {
+    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
+        message: format!("vtable write commit_edge snapshot invalid JSON: {error}"),
+    })?;
+    let parent_id = parsed
+        .get("parent_id")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let child_id = parsed
+        .get("child_id")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    match (parent_id, child_id) {
+        (Some(parent_id), Some(child_id)) => Ok(Some((parent_id, child_id))),
+        _ => Ok(None),
+    }
+}
+
+fn parse_single_statement_from_sql(sql: &str) -> Result<Statement, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "expected a single statement".to_string(),
+        });
+    }
+    Ok(statements.remove(0))
 }
 
 fn text_param_expr(
@@ -3200,7 +3326,7 @@ mod tests {
         UPDATE_RETURNING_COLUMNS,
     };
     use crate::backend::SqlDialect;
-    use crate::commit::{ChangeRow, GenerateCommitResult};
+    use crate::commit::{ChangeRow, GenerateCommitResult, MaterializedStateRow};
     use crate::functions::SystemFunctionProvider;
     use crate::Value as EngineValue;
     use serde_json::json;
@@ -3379,6 +3505,75 @@ mod tests {
             snapshot.params[1],
             EngineValue::Text(ref value) if value == &snapshot_content
         ));
+    }
+
+    #[test]
+    fn build_statements_from_commit_result_emits_commit_ancestry_upserts() {
+        let mut provider = SystemFunctionProvider;
+        let batch = build_statements_from_generate_commit_result(
+            GenerateCommitResult {
+                changes: Vec::new(),
+                materialized_state: vec![
+                    MaterializedStateRow {
+                        id: "change-commit".to_string(),
+                        entity_id: "child-commit".to_string(),
+                        schema_key: "lix_commit".to_string(),
+                        schema_version: "1".to_string(),
+                        file_id: "lix".to_string(),
+                        plugin_key: "lix".to_string(),
+                        snapshot_content: Some(
+                            json!({
+                                "id": "child-commit",
+                                "change_set_id": "child-change-set",
+                                "parent_commit_ids": ["parent-commit"],
+                                "change_ids": [],
+                            })
+                            .to_string(),
+                        ),
+                        metadata: None,
+                        created_at: "2025-01-01T00:00:00.000Z".to_string(),
+                        lixcol_version_id: "global".to_string(),
+                        lixcol_commit_id: "child-commit".to_string(),
+                        writer_key: None,
+                    },
+                    MaterializedStateRow {
+                        id: "change-edge".to_string(),
+                        entity_id: "parent-commit~child-commit".to_string(),
+                        schema_key: "lix_commit_edge".to_string(),
+                        schema_version: "1".to_string(),
+                        file_id: "lix".to_string(),
+                        plugin_key: "lix".to_string(),
+                        snapshot_content: Some(
+                            json!({
+                                "parent_id": "parent-commit",
+                                "child_id": "child-commit",
+                            })
+                            .to_string(),
+                        ),
+                        metadata: None,
+                        created_at: "2025-01-01T00:00:00.000Z".to_string(),
+                        lixcol_version_id: "global".to_string(),
+                        lixcol_commit_id: "child-commit".to_string(),
+                        writer_key: None,
+                    },
+                ],
+            },
+            &mut provider,
+            0,
+        )
+        .expect("build statements");
+
+        let sql = batch
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("INSERT INTO lix_commit_ancestry"));
+        assert!(sql.contains("ON CONFLICT"));
+        assert!(sql.contains("DO UPDATE"));
+        assert!(sql.contains("SET depth = CASE"));
+        assert!(sql.contains("GROUP BY candidate.ancestor_id"));
     }
 
     #[test]

@@ -392,4 +392,5 @@ packages/lix-docs/docs/.vitepress/cache
 packages/lix-docs/docs/.vitepress/dist
 
 artifact/*
+packages/engine/artifact/*
 target

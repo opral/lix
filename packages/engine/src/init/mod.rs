@@ -83,6 +83,16 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_history_data_cache_root_depth \
      ON lix_internal_file_history_data_cache (root_commit_id, depth)",
+    "CREATE TABLE IF NOT EXISTS lix_commit_ancestry (\
+     commit_id TEXT NOT NULL,\
+     ancestor_id TEXT NOT NULL,\
+     depth BIGINT NOT NULL,\
+     PRIMARY KEY (commit_id, ancestor_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_commit_ancestry_commit_depth \
+     ON lix_commit_ancestry (commit_id, depth)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_commit_ancestry_ancestor \
+     ON lix_commit_ancestry (ancestor_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
