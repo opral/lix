@@ -32,12 +32,12 @@ async fn upsert_plugin_record(
     backend
         .execute(
             "INSERT INTO lix_internal_plugin (\
-             key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm, created_at, updated_at\
+             key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) \
              ON CONFLICT (key) DO UPDATE SET \
              runtime = EXCLUDED.runtime, \
              api_version = EXCLUDED.api_version, \
-             detect_changes_glob = EXCLUDED.detect_changes_glob, \
+             match_path_glob = EXCLUDED.match_path_glob, \
              entry = EXCLUDED.entry, \
              manifest_json = EXCLUDED.manifest_json, \
              wasm = EXCLUDED.wasm, \

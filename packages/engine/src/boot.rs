@@ -23,17 +23,20 @@ pub struct BootAccount {
 
 pub struct BootArgs {
     pub backend: Box<dyn LixBackend + Send + Sync>,
-    pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub key_values: Vec<BootKeyValue>,
     pub active_account: Option<BootAccount>,
     pub access_to_internal: bool,
 }
 
 impl BootArgs {
-    pub fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Self {
+    pub fn new(
+        backend: Box<dyn LixBackend + Send + Sync>,
+        wasm_runtime: Arc<dyn WasmRuntime>,
+    ) -> Self {
         Self {
             backend,
-            wasm_runtime: None,
+            wasm_runtime,
             key_values: Vec::new(),
             active_account: None,
             access_to_internal: false,
