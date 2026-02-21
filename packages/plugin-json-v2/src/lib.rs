@@ -11,7 +11,7 @@ wit_bindgen::generate!({
 pub const SCHEMA_KEY: &str = "json_pointer";
 pub const SCHEMA_VERSION: &str = "1";
 const MAX_ARRAY_INDEX: usize = 100_000;
-const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../schema/json_pointer.schema.json");
+const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../schema/json_pointer.json");
 
 static JSON_POINTER_SCHEMA: OnceLock<Value> = OnceLock::new();
 

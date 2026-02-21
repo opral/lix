@@ -1,3 +1,6 @@
+use std::str::FromStr;
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
@@ -50,9 +53,18 @@ impl SqliteBackend {
                     format!("sqlite://{}", self.config.filename)
                 };
 
-                SqlitePool::connect(&conn).await.map_err(|err| LixError {
-                    message: err.to_string(),
-                })
+                let options = SqliteConnectOptions::from_str(&conn)
+                    .map_err(|err| LixError {
+                        message: err.to_string(),
+                    })?
+                    .foreign_keys(true);
+
+                SqlitePoolOptions::new()
+                    .connect_with(options)
+                    .await
+                    .map_err(|err| LixError {
+                        message: err.to_string(),
+                    })
             })
             .await
     }

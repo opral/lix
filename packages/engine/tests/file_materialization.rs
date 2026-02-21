@@ -21,6 +21,16 @@ const TEST_PLUGIN_MANIFEST: &str = r#"{
   "entry": "plugin.wasm"
 }"#;
 
+const TEST_TXT_PLUGIN_MANIFEST: &str = r#"{
+  "key": "txt_noop",
+  "runtime": "wasm-component-v1",
+  "api_version": "0.1.0",
+  "match": {"path_glob": "*.txt"},
+  "entry": "plugin.wasm"
+}"#;
+
+const TEST_TXT_NOOP_PLUGIN_WASM_BYTES: &[u8] = b"\0asm\x01\0\0\0lix-test-txt-noop-plugin-v1";
+
 #[derive(Debug, Deserialize)]
 struct WirePluginFile {
     id: String,
@@ -67,6 +77,22 @@ struct BeforeAwareRuntime;
 
 #[derive(Debug, Default)]
 struct BeforeAwareInstance;
+
+struct JsonWithTxtNoopRuntime {
+    inner: support::wasmtime_runtime::TestWasmtimeRuntime,
+}
+
+#[derive(Debug, Default)]
+struct TxtNoopInstance;
+
+impl JsonWithTxtNoopRuntime {
+    fn new() -> Self {
+        Self {
+            inner: support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                .expect("test wasmtime runtime should initialize"),
+        }
+    }
+}
 
 #[async_trait(?Send)]
 impl WasmRuntime for PathEchoRuntime {
@@ -177,6 +203,39 @@ impl WasmComponentInstance for BeforeAwareInstance {
     }
 }
 
+#[async_trait(?Send)]
+impl WasmRuntime for JsonWithTxtNoopRuntime {
+    async fn init_component(
+        &self,
+        bytes: Vec<u8>,
+        limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+        if bytes.as_slice() == TEST_TXT_NOOP_PLUGIN_WASM_BYTES {
+            return Ok(Arc::new(TxtNoopInstance));
+        }
+        self.inner.init_component(bytes, limits).await
+    }
+}
+
+#[async_trait(?Send)]
+impl WasmComponentInstance for TxtNoopInstance {
+    async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError> {
+        match export {
+            "detect-changes" | "api#detect-changes" => Ok(b"[]".to_vec()),
+            "apply-changes" | "api#apply-changes" => {
+                let request: WireApplyChangesRequest =
+                    serde_json::from_slice(input).map_err(|error| LixError {
+                        message: format!("failed to decode apply-changes payload: {error}"),
+                    })?;
+                Ok(request.file.data)
+            }
+            other => Err(LixError {
+                message: format!("unsupported test export: {other}"),
+            }),
+        }
+    }
+}
+
 fn plugin_json_v2_manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../plugin-json-v2")
@@ -269,6 +328,10 @@ fn plugin_json_v2_wasm_bytes() -> Vec<u8> {
         .clone()
 }
 
+fn plugin_txt_noop_wasm_bytes() -> Vec<u8> {
+    TEST_TXT_NOOP_PLUGIN_WASM_BYTES.to_vec()
+}
+
 async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -343,7 +406,7 @@ async fn boot_engine_with_json_plugin(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -368,7 +431,7 @@ async fn boot_engine_with_path_echo_plugin(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -393,7 +456,7 @@ async fn boot_engine_with_before_aware_plugin(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -483,6 +546,13 @@ fn value_as_i64(value: &Value) -> i64 {
     }
 }
 
+fn value_as_text(value: &Value) -> String {
+    match value {
+        Value::Text(v) => v.clone(),
+        other => panic!("expected text value, got {other:?}"),
+    }
+}
+
 async fn file_cache_row_count(
     engine: &support::simulation_test::SimulationEngine,
     file_id: &str,
@@ -555,6 +625,249 @@ async fn orphan_file_cache_row_count(engine: &support::simulation_test::Simulati
     value_as_i64(&rows.rows[0][0])
 }
 
+async fn binary_blob_hash_for_file_version(
+    engine: &support::simulation_test::SimulationEngine,
+    file_id: &str,
+    version_id: &str,
+) -> Option<String> {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT blob_hash \
+                 FROM lix_internal_binary_file_version_ref \
+                 WHERE file_id = '{}' AND version_id = '{}' \
+                 LIMIT 1",
+                file_id, version_id
+            ),
+            &[],
+        )
+        .await
+        .expect("binary file_version_ref lookup should succeed");
+    rows.rows.first().map(|row| value_as_text(&row[0]))
+}
+
+async fn binary_chunk_hash_for_blob(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> Option<String> {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT chunk_hash \
+                 FROM lix_internal_binary_blob_manifest_chunk \
+                 WHERE blob_hash = '{}' \
+                 ORDER BY chunk_index \
+                 LIMIT 1",
+                blob_hash
+            ),
+            &[],
+        )
+        .await
+        .expect("binary manifest chunk lookup should succeed");
+    rows.rows.first().map(|row| value_as_text(&row[0]))
+}
+
+async fn binary_manifest_row_count_by_hash(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> i64 {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_binary_blob_manifest \
+                 WHERE blob_hash = '{}'",
+                blob_hash
+            ),
+            &[],
+        )
+        .await
+        .expect("binary manifest row count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
+    let rows = engine
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_internal_binary_chunk_store c \
+             LEFT JOIN lix_internal_binary_blob_manifest_chunk mc \
+               ON mc.chunk_hash = c.chunk_hash \
+             WHERE mc.chunk_hash IS NULL",
+            &[],
+        )
+        .await
+        .expect("orphan binary chunk count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn orphan_binary_manifest_chunk_row_count(
+    engine: &support::simulation_test::SimulationEngine,
+) -> i64 {
+    let rows = engine
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_internal_binary_blob_manifest_chunk mc \
+             LEFT JOIN lix_internal_binary_blob_manifest m \
+               ON m.blob_hash = mc.blob_hash \
+             WHERE m.blob_hash IS NULL",
+            &[],
+        )
+        .await
+        .expect("orphan binary manifest chunk count query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn binary_codec_counts_for_blob(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> (i64, i64, i64) {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT \
+                     COALESCE(SUM(CASE WHEN cs.codec = 'raw' THEN 1 ELSE 0 END), 0), \
+                     COALESCE(SUM(CASE WHEN cs.codec = 'zstd' THEN 1 ELSE 0 END), 0), \
+                     COALESCE(SUM(CASE WHEN cs.codec = 'legacy' OR cs.codec IS NULL THEN 1 ELSE 0 END), 0) \
+                 FROM lix_internal_binary_blob_manifest_chunk mc \
+                 JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+                 WHERE mc.blob_hash = '{}'",
+                blob_hash
+            ),
+            &[],
+        )
+        .await
+        .expect("binary codec counts query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    (
+        value_as_i64(&rows.rows[0][0]),
+        value_as_i64(&rows.rows[0][1]),
+        value_as_i64(&rows.rows[0][2]),
+    )
+}
+
+async fn binary_prefixed_chunk_payload_count_for_blob(
+    engine: &support::simulation_test::SimulationEngine,
+    blob_hash: &str,
+) -> i64 {
+    let sqlite_style_query = format!(
+        "SELECT COUNT(*) \
+         FROM lix_internal_binary_blob_manifest_chunk mc \
+         JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+         WHERE mc.blob_hash = '{}' \
+           AND hex(substr(cs.data, 1, 8)) IN ('4C49585241573031', '4C49585A53544431')",
+        blob_hash
+    );
+    let postgres_style_query = format!(
+        "SELECT COUNT(*) \
+         FROM lix_internal_binary_blob_manifest_chunk mc \
+         JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
+         WHERE mc.blob_hash = '{}' \
+           AND encode(substring(cs.data from 1 for 8), 'hex') IN ('4c49585241573031', '4c49585a53544431')",
+        blob_hash
+    );
+
+    let rows = match engine.execute(&sqlite_style_query, &[]).await {
+        Ok(rows) => rows,
+        Err(_) => engine
+            .execute(&postgres_style_query, &[])
+            .await
+            .expect("prefixed binary chunk payload count query should succeed"),
+    };
+    assert_eq!(rows.rows.len(), 1);
+    value_as_i64(&rows.rows[0][0])
+}
+
+async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
+    sim: &support::simulation_test::SimulationArgs,
+) -> (support::simulation_test::SimulationEngine, String) {
+    let runtime = Arc::new(JsonWithTxtNoopRuntime::new()) as Arc<dyn WasmRuntime>;
+
+    let engine = sim
+        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            key_values: Vec::new(),
+            active_account: None,
+            wasm_runtime: runtime,
+            access_to_internal: true,
+        }))
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.expect("engine init should succeed");
+    register_plugin_schema(&engine).await;
+    let main_version_id = main_version_id(&engine).await;
+    let plugin_wasm = plugin_json_v2_wasm_bytes();
+    engine
+        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .await
+        .expect("install_plugin should succeed");
+    (engine, main_version_id)
+}
+
+simulation_test!(
+    file_write_uses_builtin_binary_fallback_when_no_plugin_matches_file_type,
+    simulations = [sqlite],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-no-plugin', '/assets/video.mp4', 'ignored')",
+                &[],
+            )
+            .await
+            .expect("write should use builtin binary fallback");
+
+        let rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE file_id = 'file-no-plugin' \
+                   AND schema_key = 'lix_binary_blob_ref' \
+                   AND plugin_key = 'lix_builtin_binary_fallback' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("builtin fallback state row query should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        let snapshot = match &rows.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected snapshot text, got {other:?}"),
+        };
+        let parsed: JsonValue =
+            serde_json::from_str(&snapshot).expect("fallback snapshot should be valid JSON");
+        assert_eq!(
+            parsed
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            "file-no-plugin"
+        );
+        assert_eq!(
+            parsed
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default(),
+            7
+        );
+    }
+);
+
 simulation_test!(
     materialize_applies_real_json_plugin_and_persists_file_data_cache,
     simulations = [sqlite, postgres],
@@ -568,7 +881,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -668,7 +981,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -752,7 +1065,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -1376,7 +1689,13 @@ simulation_test!(
     file_update_path_only_plugin_switch_tombstones_previous_plugin_entities,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) =
+            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        engine
+            .install_plugin(TEST_TXT_PLUGIN_MANIFEST, &plugin_wasm)
+            .await
+            .expect("install txt plugin should succeed");
 
         engine
             .execute(
@@ -1402,10 +1721,27 @@ simulation_test!(
             .await
             .expect("path-only file update should succeed");
 
-        let after_entities =
-            detected_json_pointer_entities(&engine, "file-json-path-only-switch", &main_version_id)
-                .await;
-        assert!(after_entities.is_empty());
+        let after_json_entities = engine
+            .execute(
+                &format!(
+                    "SELECT entity_id \
+                     FROM lix_state_by_version \
+                     WHERE file_id = 'file-json-path-only-switch' \
+                       AND version_id = '{}' \
+                       AND schema_key = 'json_pointer' \
+                       AND plugin_key = 'json' \
+                       AND snapshot_content IS NOT NULL \
+                     ORDER BY entity_id",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("post-switch json plugin entities query should succeed");
+        assert!(
+            after_json_entities.rows.is_empty(),
+            "json plugin should have no live entities after switch"
+        );
 
         let tombstone_rows = engine
             .execute(
@@ -1415,6 +1751,7 @@ simulation_test!(
                      WHERE file_id = 'file-json-path-only-switch' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
+                       AND plugin_key = 'json' \
                        AND snapshot_content IS NULL",
                     main_version_id
                 ),
@@ -1444,7 +1781,13 @@ simulation_test!(
     file_update_path_only_plugin_switch_does_not_write_non_authoritative_cache_data,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) =
+            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        engine
+            .install_plugin(TEST_TXT_PLUGIN_MANIFEST, &plugin_wasm)
+            .await
+            .expect("install txt plugin should succeed");
 
         engine
             .execute(
@@ -2546,5 +2889,202 @@ simulation_test!(
 
         assert_eq!(orphan_file_cache_row_count(&engine).await, 0);
         assert_eq!(total_file_cache_row_count(&engine).await, 1);
+    }
+);
+
+simulation_test!(
+    binary_cas_gc_keeps_history_referenced_rows_after_overwrite,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', 'AAAA-AAAA-AAAA-AAAA')",
+                &[],
+            )
+            .await
+            .expect("initial binary write should succeed");
+        let old_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-gc-overwrite", &main_version_id)
+                .await
+                .expect("old blob hash should exist");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = 'BBBB-BBBB-BBBB-BBBB-BBBB-BBBB' \
+                 WHERE id = 'binary-gc-overwrite'",
+                &[],
+            )
+            .await
+            .expect("binary overwrite should succeed");
+        let update_commit_id = active_version_commit_id(&engine).await;
+        let new_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-gc-overwrite", &main_version_id)
+                .await
+                .expect("new blob hash should exist");
+        assert_ne!(old_blob_hash, new_blob_hash);
+
+        assert_eq!(
+            binary_manifest_row_count_by_hash(&engine, &old_blob_hash).await,
+            1
+        );
+
+        let history_rows = engine
+            .execute(
+                &format!(
+                    "SELECT data \
+                 FROM lix_file_history \
+                 WHERE id = 'binary-gc-overwrite' \
+                   AND lixcol_root_commit_id = '{}' \
+                   AND lixcol_depth = 1 \
+                 LIMIT 1",
+                    update_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("history read should succeed");
+        assert_eq!(history_rows.rows.len(), 1);
+        assert_blob_bytes_eq(&history_rows.rows[0][0], b"AAAA-AAAA-AAAA-AAAA");
+
+        assert_eq!(orphan_binary_manifest_chunk_row_count(&engine).await, 0);
+        assert_eq!(orphan_binary_chunk_row_count(&engine).await, 0);
+    }
+);
+
+simulation_test!(
+    binary_cas_foreign_keys_restrict_live_parent_deletes,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('binary-fk-guard', '/assets/blob.mp4', 'FK-GUARD-DATA-123456')",
+                &[],
+            )
+            .await
+            .expect("binary write should succeed");
+
+        let blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-fk-guard", &main_version_id)
+                .await
+                .expect("blob hash should exist");
+        let chunk_hash = binary_chunk_hash_for_blob(&engine, &blob_hash)
+            .await
+            .expect("chunk hash should exist");
+
+        let delete_manifest = engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_blob_manifest \
+                     WHERE blob_hash = '{}'",
+                    blob_hash
+                ),
+                &[],
+            )
+            .await;
+        assert!(
+            delete_manifest.is_err(),
+            "manifest delete should be rejected while file_version_ref still points to it"
+        );
+
+        let delete_chunk = engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_chunk_store \
+                     WHERE chunk_hash = '{}'",
+                    chunk_hash
+                ),
+                &[],
+            )
+            .await;
+        assert!(
+            delete_chunk.is_err(),
+            "chunk delete should be rejected while manifest_chunk still points to it"
+        );
+    }
+);
+
+simulation_test!(
+    binary_chunk_codec_metadata_is_explicit_and_payload_unframed,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let main_version_id = main_version_id(&engine).await;
+
+        let payload = vec![0u8; 300_000];
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('binary-codec-meta', '/assets/video.mp4', $1)",
+                &[Value::Blob(payload.clone())],
+            )
+            .await
+            .expect("binary write should succeed");
+
+        let blob_hash =
+            binary_blob_hash_for_file_version(&engine, "binary-codec-meta", &main_version_id)
+                .await
+                .expect("blob hash should exist");
+
+        let (raw_count, zstd_count, legacy_count) =
+            binary_codec_counts_for_blob(&engine, &blob_hash).await;
+        assert!(raw_count + zstd_count > 0);
+        assert_eq!(legacy_count, 0);
+        assert!(
+            zstd_count >= 1,
+            "compressible payload should produce zstd chunks"
+        );
+        assert_eq!(
+            binary_prefixed_chunk_payload_count_for_blob(&engine, &blob_hash).await,
+            0
+        );
+
+        let rows = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'binary-codec-meta' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("binary file read should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        assert_blob_bytes_eq(&rows.rows[0][0], &payload);
     }
 );
