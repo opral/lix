@@ -337,6 +337,8 @@ impl Engine {
         let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
+        let should_run_binary_gc =
+            should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
 
         if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
             self.persist_detected_file_domain_changes(&detected_file_domain_changes)
@@ -352,7 +354,9 @@ impl Engine {
             .await?;
         self.ensure_builtin_binary_blob_store_for_targets(&file_cache_invalidation_targets)
             .await?;
-        self.garbage_collect_unreachable_binary_cas().await?;
+        if should_run_binary_gc {
+            self.garbage_collect_unreachable_binary_cas().await?;
+        }
         self.invalidate_file_data_cache_entries(&file_cache_invalidation_targets)
             .await?;
         self.invalidate_file_path_cache_entries(&file_cache_invalidation_targets)

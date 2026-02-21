@@ -178,6 +178,7 @@ impl Engine {
         }
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
+        let should_run_binary_gc = should_run_binary_cas_gc(&[], &detected_file_domain_changes);
         let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
             &std::mem::take(&mut side_effects.untracked_filesystem_update_domain_changes),
         );
@@ -216,8 +217,10 @@ impl Engine {
             &side_effects.file_cache_invalidation_targets,
         )
         .await?;
-        self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-            .await?;
+        if should_run_binary_gc {
+            self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+                .await?;
+        }
         self.invalidate_file_data_cache_entries_in_transaction(
             transaction,
             &side_effects.file_cache_invalidation_targets,
