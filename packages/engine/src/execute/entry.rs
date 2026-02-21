@@ -2,7 +2,7 @@ use super::super::*;
 use super::*;
 
 impl Engine {
-    pub fn wasm_runtime(&self) -> Option<Arc<dyn WasmRuntime>> {
+    pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
         self.wasm_runtime.clone()
     }
 
@@ -337,6 +337,8 @@ impl Engine {
         let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
+        let should_run_binary_gc =
+            should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
 
         if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
             self.persist_detected_file_domain_changes(&detected_file_domain_changes)
@@ -350,14 +352,17 @@ impl Engine {
             .await?;
         self.persist_pending_file_path_updates(&pending_file_writes)
             .await?;
+        self.ensure_builtin_binary_blob_store_for_targets(&file_cache_invalidation_targets)
+            .await?;
+        if should_run_binary_gc {
+            self.garbage_collect_unreachable_binary_cas().await?;
+        }
         self.invalidate_file_data_cache_entries(&file_cache_invalidation_targets)
             .await?;
         self.invalidate_file_path_cache_entries(&file_cache_invalidation_targets)
             .await?;
-        if self.wasm_runtime.is_some() {
-            self.refresh_file_data_for_versions(file_cache_refresh_targets)
-                .await?;
-        }
+        self.refresh_file_data_for_versions(file_cache_refresh_targets)
+            .await?;
         if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
             self.invalidate_installed_plugins_cache()?;
         }
@@ -410,14 +415,12 @@ impl Engine {
             crate::materialization::apply_materialization_plan(self.backend.as_ref(), &plan)
                 .await?;
 
-        if let Some(runtime) = self.wasm_runtime.as_ref() {
-            crate::plugin::runtime::materialize_file_data_with_plugins(
-                self.backend.as_ref(),
-                runtime.as_ref(),
-                &plan,
-            )
-            .await?;
-        }
+        crate::plugin::runtime::materialize_file_data_with_plugins(
+            self.backend.as_ref(),
+            self.wasm_runtime.as_ref(),
+            &plan,
+        )
+        .await?;
 
         Ok(MaterializationReport { plan, apply })
     }

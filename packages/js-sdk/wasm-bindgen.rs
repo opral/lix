@@ -389,18 +389,18 @@ export type LixObserveEvents = {
     #[wasm_bindgen(js_name = openLix)]
     pub async fn open_lix(
         backend: JsLixBackend,
-        wasm_runtime: Option<JsLixWasmRuntime>,
+        wasm_runtime: JsLixWasmRuntime,
         boot_key_values: Option<JsValue>,
     ) -> Result<Lix, JsValue> {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
         });
-        let mut boot_args = BootArgs::new(backend);
-        boot_args.wasm_runtime = wasm_runtime.map(|runtime| {
+        let mut boot_args = BootArgs::new(
+            backend,
             Arc::new(JsHostWasmRuntime {
-                runtime: runtime.into(),
-            }) as Arc<dyn WasmRuntime>
-        });
+                runtime: wasm_runtime.into(),
+            }) as Arc<dyn WasmRuntime>,
+        );
         if let Some(raw_key_values) = boot_key_values {
             boot_args.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
         }

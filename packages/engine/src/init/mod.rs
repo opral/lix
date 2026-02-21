@@ -1,4 +1,4 @@
-use crate::{LixBackend, LixError};
+use crate::{LixBackend, LixError, SqlDialect, Value};
 
 const INIT_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_snapshot (\
@@ -83,6 +83,52 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_history_data_cache_root_depth \
      ON lix_internal_file_history_data_cache (root_commit_id, depth)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_store (\
+     blob_hash TEXT PRIMARY KEY,\
+     data BYTEA NOT NULL,\
+     size_bytes BIGINT NOT NULL,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_manifest (\
+     blob_hash TEXT PRIMARY KEY,\
+     size_bytes BIGINT NOT NULL,\
+     chunk_count BIGINT NOT NULL,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_chunk_store (\
+     chunk_hash TEXT PRIMARY KEY,\
+     data BYTEA NOT NULL,\
+     size_bytes BIGINT NOT NULL,\
+     codec TEXT NOT NULL DEFAULT 'legacy',\
+     codec_dict_id TEXT,\
+     created_at TEXT NOT NULL\
+     )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_manifest_chunk (\
+     blob_hash TEXT NOT NULL,\
+     chunk_index BIGINT NOT NULL,\
+     chunk_hash TEXT NOT NULL,\
+     chunk_size BIGINT NOT NULL,\
+     PRIMARY KEY (blob_hash, chunk_index),\
+     FOREIGN KEY (blob_hash) REFERENCES lix_internal_binary_blob_manifest (blob_hash) ON DELETE RESTRICT,\
+     FOREIGN KEY (chunk_hash) REFERENCES lix_internal_binary_chunk_store (chunk_hash) ON DELETE RESTRICT\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_blob_manifest_chunk_hash \
+     ON lix_internal_binary_blob_manifest_chunk (chunk_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_blob_manifest_chunk_blob_hash \
+     ON lix_internal_binary_blob_manifest_chunk (blob_hash)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_binary_file_version_ref (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     blob_hash TEXT NOT NULL,\
+     size_bytes BIGINT NOT NULL,\
+     updated_at TEXT NOT NULL,\
+     PRIMARY KEY (file_id, version_id),\
+     FOREIGN KEY (blob_hash) REFERENCES lix_internal_binary_blob_manifest (blob_hash) ON DELETE RESTRICT\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_file_version_ref_blob_hash \
+     ON lix_internal_binary_file_version_ref (blob_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_binary_file_version_ref_version_id \
+     ON lix_internal_binary_file_version_ref (version_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
@@ -112,7 +158,7 @@ const INIT_STATEMENTS: &[&str] = &[
      key TEXT PRIMARY KEY,\
      runtime TEXT NOT NULL,\
      api_version TEXT NOT NULL,\
-     detect_changes_glob TEXT NOT NULL,\
+     match_path_glob TEXT NOT NULL,\
      entry TEXT NOT NULL,\
      manifest_json TEXT NOT NULL,\
      wasm BYTEA NOT NULL,\
@@ -124,8 +170,84 @@ const INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
+    if backend.dialect() == SqlDialect::Sqlite {
+        backend.execute("PRAGMA foreign_keys = ON", &[]).await?;
+    }
     for statement in INIT_STATEMENTS {
         backend.execute(statement, &[]).await?;
     }
+    ensure_binary_chunk_codec_columns(backend).await?;
     Ok(())
+}
+
+async fn ensure_binary_chunk_codec_columns(backend: &dyn LixBackend) -> Result<(), LixError> {
+    ensure_column_exists(
+        backend,
+        "lix_internal_binary_chunk_store",
+        "codec",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )
+    .await?;
+    ensure_column_exists(
+        backend,
+        "lix_internal_binary_chunk_store",
+        "codec_dict_id",
+        "TEXT",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn ensure_column_exists(
+    backend: &dyn LixBackend,
+    table: &str,
+    column: &str,
+    column_ddl: &str,
+) -> Result<(), LixError> {
+    if column_exists(backend, table, column).await? {
+        return Ok(());
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_ddl}");
+    backend.execute(&alter, &[]).await?;
+    Ok(())
+}
+
+async fn column_exists(
+    backend: &dyn LixBackend,
+    table: &str,
+    column: &str,
+) -> Result<bool, LixError> {
+    let exists = match backend.dialect() {
+        SqlDialect::Sqlite => {
+            backend
+                .execute(
+                    &format!(
+                        "SELECT 1 \
+                         FROM pragma_table_info('{table}') \
+                         WHERE name = $1 \
+                         LIMIT 1"
+                    ),
+                    &[Value::Text(column.to_string())],
+                )
+                .await?
+        }
+        SqlDialect::Postgres => {
+            backend
+                .execute(
+                    "SELECT 1 \
+                     FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                       AND table_name = $1 \
+                       AND column_name = $2 \
+                     LIMIT 1",
+                    &[
+                        Value::Text(table.to_string()),
+                        Value::Text(column.to_string()),
+                    ],
+                )
+                .await?
+        }
+    };
+    Ok(!exists.rows.is_empty())
 }

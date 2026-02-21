@@ -22,7 +22,7 @@ pub(crate) struct PendingFileWrite {
     pub(crate) file_id: String,
     pub(crate) version_id: String,
     pub(crate) before_path: Option<String>,
-    pub(crate) path: String,
+    pub(crate) after_path: Option<String>,
     pub(crate) data_is_authoritative: bool,
     pub(crate) before_data: Option<Vec<u8>>,
     pub(crate) after_data: Vec<u8>,
@@ -261,7 +261,7 @@ fn collect_insert_writes(
             file_id,
             version_id,
             before_path: None,
-            path,
+            after_path: Some(path),
             data_is_authoritative: true,
             before_data: None,
             after_data,
@@ -350,10 +350,7 @@ async fn collect_delete_writes(
         }
         let before_data_from_row = row.get(2).and_then(value_as_blob_or_text_bytes);
         let (before_path, before_data) = if let Some(overlay_state) = overlay.get(&key) {
-            (
-                overlay_state.path.clone(),
-                Some(overlay_state.data.clone()),
-            )
+            (overlay_state.path.clone(), Some(overlay_state.data.clone()))
         } else {
             (before_path_from_row, before_data_from_row)
         };
@@ -362,7 +359,7 @@ async fn collect_delete_writes(
             file_id,
             version_id,
             before_path: Some(before_path),
-            path: String::new(),
+            after_path: None,
             data_is_authoritative: true,
             before_data,
             after_data: Vec::new(),
@@ -397,7 +394,7 @@ async fn collect_delete_writes(
             file_id,
             version_id,
             before_path: Some(overlay_state.path.clone()),
-            path: String::new(),
+            after_path: None,
             data_is_authoritative: true,
             before_data: Some(overlay_state.data.clone()),
             after_data: Vec::new(),
@@ -502,7 +499,7 @@ async fn collect_update_writes(
                         file_id: exact_target.file_id,
                         version_id,
                         before_path: Some(before_path),
-                        path,
+                        after_path: Some(path),
                         data_is_authoritative: saw_data_assignment,
                         before_data,
                         after_data: assigned_after_data.clone().unwrap_or_default(),
@@ -526,7 +523,7 @@ async fn collect_update_writes(
                         file_id: exact_target.file_id,
                         version_id,
                         before_path: Some(before_path.clone()),
-                        path,
+                        after_path: Some(path),
                         data_is_authoritative: saw_data_assignment,
                         before_data,
                         after_data: assigned_after_data.clone().unwrap_or_default(),
@@ -640,7 +637,7 @@ async fn collect_update_writes(
             file_id,
             version_id,
             before_path: Some(before_path_for_write),
-            path,
+            after_path: Some(path),
             data_is_authoritative,
             before_data,
             after_data,
@@ -676,7 +673,7 @@ async fn collect_update_writes(
             write.before_data = Some(overlay_state.data.clone());
             write.before_path = Some(overlay_state.path.clone());
             if next_path.is_none() && next_path_by_id.is_none() {
-                write.path = overlay_state.path.clone();
+                write.after_path = Some(overlay_state.path.clone());
             }
         }
         if !write.data_is_authoritative {
@@ -871,10 +868,13 @@ fn apply_statement_writes_to_overlay(
     overlay: &mut BTreeMap<(String, String), OverlayWriteState>,
 ) {
     for write in statement_writes {
+        let Some(path) = write.after_path.as_ref() else {
+            continue;
+        };
         overlay.insert(
             (write.file_id.clone(), write.version_id.clone()),
             OverlayWriteState {
-                path: write.path.clone(),
+                path: path.clone(),
                 data: write.after_data.clone(),
             },
         );
@@ -2075,7 +2075,7 @@ mod tests {
         assert_eq!(write.file_id, "file-1");
         assert_eq!(write.version_id, "v1");
         assert_eq!(write.before_path.as_deref(), Some("/src/a.md"));
-        assert_eq!(write.path, "/src/b.md");
+        assert_eq!(write.after_path.as_deref(), Some("/src/b.md"));
         assert_eq!(write.before_data.as_deref(), Some(b"seed-data".as_slice()));
         assert_eq!(write.after_data, b"seed-data".to_vec());
     }
@@ -2102,7 +2102,7 @@ mod tests {
         assert_eq!(second.file_id, "file-1");
         assert_eq!(second.version_id, "v1");
         assert_eq!(second.before_path.as_deref(), Some("/seed.md"));
-        assert_eq!(second.path, "/next.md");
+        assert_eq!(second.after_path.as_deref(), Some("/next.md"));
         assert_eq!(second.before_data.as_deref(), Some(b"seed".as_slice()));
         assert_eq!(second.after_data, b"seed".to_vec());
     }

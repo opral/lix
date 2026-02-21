@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Value};
+use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, Value};
 use serde_json::json;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -281,11 +281,12 @@ fn run_file_insert_bench(
 
 async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> {
     let backend = Box::new(BenchSqliteBackend::in_memory());
-    let mut boot_args = BootArgs::new(backend);
-    if with_plugin {
-        boot_args.wasm_runtime = Some(Arc::new(BenchJsonPluginRuntime));
-    }
-    let engine = boot(boot_args);
+    let runtime: Arc<dyn lix_engine::WasmRuntime> = if with_plugin {
+        Arc::new(BenchJsonPluginRuntime)
+    } else {
+        Arc::new(NoopWasmRuntime)
+    };
+    let engine = boot(BootArgs::new(backend, runtime));
     engine.init().await?;
 
     if with_plugin {
