@@ -724,7 +724,7 @@ fn build_lix_state_history_view_query_phase1(
         pushdown
             .change_predicates
             .iter()
-            .map(|predicate| predicate.replace("bp.", "ic.")),
+            .map(|predicate| remap_change_predicate_for_phase1(predicate)),
     );
 
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
@@ -935,6 +935,12 @@ fn build_lix_state_history_view_query_phase1(
         final_select_sql = final_select_sql,
     );
     parse_single_query(&sql)
+}
+
+fn remap_change_predicate_for_phase1(predicate: &str) -> String {
+    predicate
+        .replace("bp.change_id", "ic.id")
+        .replace("bp.", "ic.")
 }
 
 async fn ensure_history_timeline_materialized_for_request(
@@ -1534,6 +1540,25 @@ mod tests {
         assert!(sql.contains("SELECT COUNT(*) AS count"));
         assert!(sql.contains("FROM history_rows h"));
         assert!(sql.contains("no-content"));
+    }
+
+    #[test]
+    fn phase1_fallback_maps_change_id_predicate_to_change_table_primary_key() {
+        let query = parse_query(
+            "SELECT * \
+             FROM lix_state_history AS sh \
+             WHERE sh.commit_id = 'commit-a' \
+               AND sh.change_id = 'change-a'",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("cc_raw.commit_id = 'commit-a'"));
+        assert!(sql.contains("ic.id = 'change-a'"));
+        assert!(!sql.contains("ic.change_id = 'change-a'"));
     }
 
     #[test]
