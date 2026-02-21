@@ -5,7 +5,7 @@ use sqlparser::ast::{BinaryOperator, Expr, Query, Select, TableFactor, TableWith
 use crate::backend::SqlDialect;
 use crate::sql::steps::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
-    default_alias, escape_sql_string, object_name_matches, parse_single_query,
+    bind_sql, default_alias, escape_sql_string, object_name_matches, parse_single_query,
     rewrite_query_with_select_rewriter,
 };
 use crate::version::GLOBAL_VERSION_ID;
@@ -202,14 +202,14 @@ fn take_history_pushdown_predicates(
         });
     }
 
-    let has_bare_placeholder_reordering = has_bare_placeholder_reordering(&parts);
+    let has_cross_bucket_bare_placeholders = has_cross_bucket_bare_placeholders(&parts);
 
     let mut pushdown = HistoryPushdown::default();
     let mut remaining = Vec::new();
     for part in parts {
         match part.extracted {
             Some(ExtractedPredicate::Push(bucket, sql))
-                if !(part.has_bare_placeholder && has_bare_placeholder_reordering) =>
+                if !(part.has_bare_placeholder && has_cross_bucket_bare_placeholders) =>
             {
                 match bucket {
                     HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
@@ -219,7 +219,7 @@ fn take_history_pushdown_predicates(
                 }
             }
             Some(ExtractedPredicate::Drop)
-                if !(part.has_bare_placeholder && has_bare_placeholder_reordering) => {}
+                if !(part.has_bare_placeholder && has_cross_bucket_bare_placeholders) => {}
             _ => remaining.push(part.predicate),
         }
     }
@@ -228,9 +228,8 @@ fn take_history_pushdown_predicates(
     pushdown
 }
 
-fn has_bare_placeholder_reordering(parts: &[PredicatePart]) -> bool {
-    let mut last_bucket = HistoryPushdownBucket::Change;
-    let mut saw_any = false;
+fn has_cross_bucket_bare_placeholders(parts: &[PredicatePart]) -> bool {
+    let mut first_bucket: Option<HistoryPushdownBucket> = None;
     for part in parts {
         if !part.has_bare_placeholder {
             continue;
@@ -239,11 +238,11 @@ fn has_bare_placeholder_reordering(parts: &[PredicatePart]) -> bool {
             Some(ExtractedPredicate::Push(bucket, _)) => *bucket,
             Some(ExtractedPredicate::Drop) | None => HistoryPushdownBucket::Remaining,
         };
-        if saw_any && bucket < last_bucket {
-            return true;
+        match first_bucket {
+            None => first_bucket = Some(bucket),
+            Some(existing) if existing != bucket => return true,
+            Some(_) => {}
         }
-        last_bucket = bucket;
-        saw_any = true;
     }
     false
 }
@@ -966,7 +965,8 @@ async fn resolve_requested_root_commits(
         global_version = GLOBAL_VERSION_ID,
         requested_where = requested_where_sql,
     );
-    let rows = backend.execute(&sql, params).await?;
+    let bound = bind_sql(&sql, params, backend.dialect())?;
+    let rows = backend.execute(&bound.sql, &bound.params).await?;
     let mut roots = BTreeSet::new();
     for row in &rows.rows {
         if let Some(id) = text_value_at(row, 0) {
@@ -1425,8 +1425,8 @@ mod tests {
         let query = parse_query(
             "SELECT COUNT(*) \
              FROM lix_state_history AS sh \
-             WHERE sh.schema_key = ? \
-               AND sh.root_commit_id = ? \
+             WHERE sh.schema_key = ?2 \
+               AND sh.root_commit_id = ?1 \
                AND sh.snapshot_content IS NOT NULL",
         );
 
@@ -1435,10 +1435,10 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("bp.schema_key = ?"));
-        assert!(sql.contains("c.id = ?"));
-        assert!(!sql.contains("sh.schema_key = ?"));
-        assert!(!sql.contains("sh.root_commit_id = ?"));
+        assert!(sql.contains("bp.schema_key = ?2"));
+        assert!(sql.contains("c.id = ?1"));
+        assert!(!sql.contains("sh.schema_key = ?2"));
+        assert!(!sql.contains("sh.root_commit_id = ?1"));
         assert!(sql.contains("SELECT COUNT(*) AS count"));
         assert!(sql.contains("FROM history_rows h"));
         assert!(sql.contains("no-content"));
@@ -1463,6 +1463,26 @@ mod tests {
         assert!(!sql.contains("bp.schema_key = ?"));
         assert!(sql.contains("sh.root_commit_id = ?"));
         assert!(sql.contains("sh.schema_key = ?"));
+    }
+
+    #[test]
+    fn does_not_push_down_bare_placeholders_across_buckets_when_schema_precedes_root() {
+        let query = parse_query(
+            "SELECT COUNT(*) \
+             FROM lix_state_history AS sh \
+             WHERE sh.schema_key = ? \
+               AND sh.root_commit_id = ?",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(!sql.contains("c.id = ?"));
+        assert!(!sql.contains("bp.schema_key = ?"));
+        assert!(sql.contains("sh.schema_key = ?"));
+        assert!(sql.contains("sh.root_commit_id = ?"));
     }
 
     #[test]
