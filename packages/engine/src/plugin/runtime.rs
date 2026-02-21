@@ -1114,22 +1114,22 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     let preprocessed = preprocess_sql(
         backend,
         &CelEvaluator::new(),
-        "WITH resolved_depth AS (\
+        "WITH target_commit_depth AS (\
             SELECT COALESCE((\
               SELECT depth \
               FROM lix_commit_ancestry \
               WHERE commit_id = $3 \
                 AND ancestor_id = $4 \
               LIMIT 1\
-            ), $5) AS target_depth\
+            ), $5) AS raw_depth\
          ) \
-         SELECT h.entity_id, h.schema_key, h.schema_version, h.snapshot_content, h.depth \
-         FROM lix_state_history AS h \
-         WHERE h.file_id = $1 \
-           AND h.plugin_key = $2 \
-           AND h.root_commit_id = $3 \
-           AND h.depth = (SELECT target_depth FROM resolved_depth) \
-         ORDER BY h.entity_id ASC",
+         SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
+         FROM lix_state_history \
+         WHERE file_id = $1 \
+           AND plugin_key = $2 \
+           AND root_commit_id = $3 \
+           AND depth >= (SELECT raw_depth FROM target_commit_depth) \
+         ORDER BY entity_id ASC, depth ASC",
         &params,
     )
     .await?;
