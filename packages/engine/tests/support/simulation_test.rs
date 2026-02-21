@@ -42,18 +42,13 @@ pub struct SimulationArgs {
 pub struct SimulationBootArgs {
     pub key_values: Vec<BootKeyValue>,
     pub active_account: Option<BootAccount>,
-    pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub access_to_internal: bool,
 }
 
 impl Default for SimulationBootArgs {
     fn default() -> Self {
-        Self {
-            key_values: Vec::new(),
-            active_account: None,
-            wasm_runtime: None,
-            access_to_internal: true,
-        }
+        default_simulation_boot_args()
     }
 }
 
@@ -201,7 +196,7 @@ impl SimulationArgs {
         if let Some(setup) = &self.setup {
             setup().await?;
         }
-        let args = args.unwrap_or_default();
+        let args = args.unwrap_or_else(default_simulation_boot_args);
         Ok(SimulationEngine {
             engine: boot(BootArgs {
                 backend: (self.backend_factory)(),
@@ -225,7 +220,7 @@ impl SimulationArgs {
                 version_id: None,
             }],
             active_account: None,
-            wasm_runtime: None,
+            wasm_runtime: default_simulation_wasm_runtime(),
             access_to_internal: true,
         }))
         .await
@@ -237,6 +232,22 @@ impl SimulationArgs {
     {
         self.expect.assert_deterministic(actual);
     }
+}
+
+fn default_simulation_boot_args() -> SimulationBootArgs {
+    SimulationBootArgs {
+        key_values: Vec::new(),
+        active_account: None,
+        wasm_runtime: default_simulation_wasm_runtime(),
+        access_to_internal: true,
+    }
+}
+
+fn default_simulation_wasm_runtime() -> Arc<dyn WasmRuntime> {
+    Arc::new(
+        crate::support::wasmtime_runtime::TestWasmtimeRuntime::new()
+            .expect("failed to initialize test wasmtime runtime"),
+    ) as Arc<dyn WasmRuntime>
 }
 
 #[derive(Clone)]

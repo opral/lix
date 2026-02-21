@@ -449,7 +449,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await

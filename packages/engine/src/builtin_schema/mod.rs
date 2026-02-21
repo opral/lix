@@ -222,9 +222,7 @@ fn parse_stored_schema_with_inlined_definition() -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        builtin_schema_definition, BUILTIN_SCHEMA_KEYS, LIX_BINARY_BLOB_REF_SCHEMA_KEY,
-    };
+    use super::{builtin_schema_definition, BUILTIN_SCHEMA_KEYS, LIX_BINARY_BLOB_REF_SCHEMA_KEY};
 
     #[test]
     fn builtin_schemas_use_lix_plugin_key_override() {
@@ -241,8 +239,7 @@ mod tests {
                 Some("\"lix\"")
             };
             assert_eq!(
-                plugin_key,
-                expected_plugin_key,
+                plugin_key, expected_plugin_key,
                 "schema '{}' has unexpected lixcol_plugin_key override",
                 schema_key,
             );

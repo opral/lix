@@ -10,10 +10,6 @@ impl Engine {
         statements: &[Statement],
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        let Some(runtime) = self.wasm_runtime.as_ref() else {
-            return Ok(());
-        };
-
         if let Some(scope) = file_read_materialization_scope_for_statements(statements) {
             let versions = match scope {
                 FileReadMaterializationScope::ActiveVersionOnly => {
@@ -25,7 +21,7 @@ impl Engine {
             };
             crate::plugin::runtime::materialize_missing_file_data_with_plugins(
                 backend,
-                runtime.as_ref(),
+                self.wasm_runtime.as_ref(),
                 versions.as_ref(),
             )
             .await?;
@@ -33,7 +29,7 @@ impl Engine {
         if file_history_read_materialization_required_for_statements(statements) {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
-                runtime.as_ref(),
+                self.wasm_runtime.as_ref(),
             )
             .await?;
         }
@@ -241,9 +237,6 @@ impl Engine {
         writes_by_statement: &[Vec<crate::filesystem::pending_file_writes::PendingFileWrite>],
         allow_plugin_cache: bool,
     ) -> Result<Vec<Vec<crate::plugin::runtime::DetectedFileChange>>, LixError> {
-        let Some(runtime) = self.wasm_runtime.as_ref() else {
-            return Ok(vec![Vec::new(); writes_by_statement.len()]);
-        };
         let installed_plugins = self
             .load_installed_plugins_with_backend(backend, allow_plugin_cache)
             .await?;
@@ -276,7 +269,7 @@ impl Engine {
                 .collect::<Vec<_>>();
             let detected = crate::plugin::runtime::detect_file_changes_with_plugins_with_cache(
                 backend,
-                runtime.as_ref(),
+                self.wasm_runtime.as_ref(),
                 &requests,
                 &installed_plugins,
                 &mut loaded_instances,
