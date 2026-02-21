@@ -153,9 +153,7 @@ fn run() -> Result<(), LixError> {
             ),
         },
     )?);
-    let mut boot_args = BootArgs::new(backend);
-    boot_args.wasm_runtime = Some(wasm_runtime);
-    let engine = boot(boot_args);
+    let engine = boot(BootArgs::new(backend, wasm_runtime));
     runtime.block_on(engine.init())?;
 
     let mut dataset = build_dataset(files_per_class);

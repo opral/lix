@@ -2,7 +2,7 @@ use super::super::*;
 use super::*;
 
 impl Engine {
-    pub fn wasm_runtime(&self) -> Option<Arc<dyn WasmRuntime>> {
+    pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
         self.wasm_runtime.clone()
     }
 
@@ -357,10 +357,8 @@ impl Engine {
             .await?;
         self.invalidate_file_path_cache_entries(&file_cache_invalidation_targets)
             .await?;
-        if self.wasm_runtime.is_some() {
-            self.refresh_file_data_for_versions(file_cache_refresh_targets)
-                .await?;
-        }
+        self.refresh_file_data_for_versions(file_cache_refresh_targets)
+            .await?;
         if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
             self.invalidate_installed_plugins_cache()?;
         }
@@ -413,14 +411,12 @@ impl Engine {
             crate::materialization::apply_materialization_plan(self.backend.as_ref(), &plan)
                 .await?;
 
-        if let Some(runtime) = self.wasm_runtime.as_ref() {
-            crate::plugin::runtime::materialize_file_data_with_plugins(
-                self.backend.as_ref(),
-                runtime.as_ref(),
-                &plan,
-            )
-            .await?;
-        }
+        crate::plugin::runtime::materialize_file_data_with_plugins(
+            self.backend.as_ref(),
+            self.wasm_runtime.as_ref(),
+            &plan,
+        )
+        .await?;
 
         Ok(MaterializationReport { plan, apply })
     }

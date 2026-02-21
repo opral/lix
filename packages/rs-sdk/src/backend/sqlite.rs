@@ -53,6 +53,14 @@ impl LixBackend for SqliteBackend {
         }
         Ok(QueryResult { rows: result_rows })
     }
+
+    async fn begin_transaction(
+        &self,
+    ) -> Result<Box<dyn lix_engine::LixTransaction + '_>, LixError> {
+        Err(LixError {
+            message: "transactions are not implemented for rs-sdk sqlite backend".to_string(),
+        })
+    }
 }
 
 fn map_row(row: &Row<'_>) -> Result<Vec<Value>, LixError> {

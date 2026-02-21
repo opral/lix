@@ -406,7 +406,7 @@ async fn boot_engine_with_json_plugin(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -431,7 +431,7 @@ async fn boot_engine_with_path_echo_plugin(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -456,7 +456,7 @@ async fn boot_engine_with_before_aware_plugin(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -790,7 +790,7 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
             active_account: None,
-            wasm_runtime: Some(runtime),
+            wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
@@ -815,7 +815,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -881,7 +881,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -981,7 +981,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -1065,7 +1065,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -2901,7 +2901,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -2975,7 +2975,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
@@ -3041,7 +3041,7 @@ simulation_test!(
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
                 active_account: None,
-                wasm_runtime: Some(runtime),
+                wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await

@@ -92,7 +92,7 @@ pub type EngineTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, 
 
 pub struct Engine {
     backend: Box<dyn LixBackend + Send + Sync>,
-    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    wasm_runtime: Arc<dyn WasmRuntime>,
     cel_evaluator: CelEvaluator,
     schema_cache: SchemaCache,
     boot_key_values: Vec<BootKeyValue>,
@@ -619,7 +619,9 @@ mod tests {
     };
     use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
     use crate::version::active_version_schema_key;
-    use crate::{LixError, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance};
+    use crate::{
+        LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
+    };
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
@@ -863,12 +865,17 @@ mod tests {
     async fn sequential_multi_statement_fallback_executes_inside_single_transaction() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called: Arc::clone(&commit_called),
-            rollback_called: Arc::clone(&rollback_called),
-            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
-            restored_active_version_snapshot: active_version_snapshot_json("global"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called: Arc::clone(&commit_called),
+                rollback_called: Arc::clone(&rollback_called),
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         engine
             .execute_multi_statement_sequential_with_options(
@@ -887,12 +894,17 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_happens_after_commit() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called: Arc::clone(&commit_called),
-            rollback_called: Arc::clone(&rollback_called),
-            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
-            restored_active_version_snapshot: active_version_snapshot_json("global"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called: Arc::clone(&commit_called),
+                rollback_called: Arc::clone(&rollback_called),
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         {
             let mut cache = engine
@@ -934,12 +946,17 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_skips_rollback() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called: Arc::clone(&commit_called),
-            rollback_called: Arc::clone(&rollback_called),
-            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
-            restored_active_version_snapshot: active_version_snapshot_json("global"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called: Arc::clone(&commit_called),
+                rollback_called: Arc::clone(&rollback_called),
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         {
             let mut cache = engine
@@ -973,12 +990,15 @@ mod tests {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
         let active_version_snapshot = Arc::new(RwLock::new(active_version_snapshot_json("before")));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called,
-            rollback_called,
-            active_version_snapshot: Arc::clone(&active_version_snapshot),
-            restored_active_version_snapshot: active_version_snapshot_json("after"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::clone(&active_version_snapshot),
+                restored_active_version_snapshot: active_version_snapshot_json("after"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         {
             let mut cache = engine

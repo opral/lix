@@ -1,7 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Value};
+use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, Value};
 use serde_json::json;
 use std::hint::black_box;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 mod support;
@@ -104,7 +105,7 @@ fn bench_lix_state_by_version_count_active_scope_subquery(c: &mut Criterion) {
 
 async fn seed_engine_with_versions() -> Result<lix_engine::Engine, LixError> {
     let backend = Box::new(BenchSqliteBackend::in_memory());
-    let engine = boot(BootArgs::new(backend));
+    let engine = boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime)));
     engine.init().await?;
 
     insert_stored_schema(&engine).await?;
