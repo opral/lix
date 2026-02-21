@@ -247,6 +247,8 @@ impl Engine {
         let mut file_cache_invalidation_targets = file_cache_refresh_targets;
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
+        let should_run_binary_gc =
+            should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without
@@ -294,8 +296,10 @@ impl Engine {
                 &file_cache_invalidation_targets,
             )
             .await?;
-            self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-                .await?;
+            if should_run_binary_gc {
+                self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+                    .await?;
+            }
             self.invalidate_file_data_cache_entries_in_transaction(
                 transaction,
                 &file_cache_invalidation_targets,

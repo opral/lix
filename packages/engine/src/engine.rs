@@ -83,6 +83,7 @@ pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
@@ -380,6 +381,18 @@ fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet
         })
         .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
+}
+
+fn should_run_binary_cas_gc(
+    mutations: &[MutationRow],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
+) -> bool {
+    mutations
+        .iter()
+        .any(|mutation| !mutation.untracked && mutation.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
+        || detected_file_domain_changes
+            .iter()
+            .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
 fn collect_postprocess_file_cache_targets(
