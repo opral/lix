@@ -1224,117 +1224,59 @@ struct EncodedBinaryChunkPayload {
     data: Vec<u8>,
 }
 
+#[async_trait::async_trait(?Send)]
+trait BinaryCasExecutor {
+    fn dialect(&self) -> SqlDialect;
+    async fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
+    async fn binary_blob_ref_relation_exists(&mut self) -> Result<bool, LixError>;
+}
+
+struct BackendBinaryCasExecutor<'a> {
+    backend: &'a dyn LixBackend,
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a> BinaryCasExecutor for BackendBinaryCasExecutor<'a> {
+    fn dialect(&self) -> SqlDialect {
+        self.backend.dialect()
+    }
+
+    async fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.backend.execute(sql, params).await
+    }
+
+    async fn binary_blob_ref_relation_exists(&mut self) -> Result<bool, LixError> {
+        binary_blob_ref_relation_exists_with_backend(self.backend).await
+    }
+}
+
+struct TransactionBinaryCasExecutor<'a> {
+    transaction: &'a mut dyn LixTransaction,
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a> BinaryCasExecutor for TransactionBinaryCasExecutor<'a> {
+    fn dialect(&self) -> SqlDialect {
+        self.transaction.dialect()
+    }
+
+    async fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.transaction.execute(sql, params).await
+    }
+
+    async fn binary_blob_ref_relation_exists(&mut self) -> Result<bool, LixError> {
+        binary_blob_ref_relation_exists_in_transaction(self.transaction).await
+    }
+}
+
 async fn persist_binary_blob_with_fastcdc_backend(
     backend: &dyn LixBackend,
     file_id: &str,
     version_id: &str,
     data: &[u8],
 ) -> Result<(), LixError> {
-    let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
-    let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
-        message: format!(
-            "binary blob size exceeds supported range for file '{}' version '{}'",
-            file_id, version_id
-        ),
-    })?;
-    let chunk_ranges = fastcdc_chunk_ranges(data);
-    let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
-        message: format!(
-            "binary chunk count exceeds supported range for file '{}' version '{}'",
-            file_id, version_id
-        ),
-    })?;
-    let now = crate::functions::timestamp::timestamp();
-
-    backend
-        .execute(
-            "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (blob_hash) DO NOTHING",
-            &[
-                Value::Text(blob_hash.clone()),
-                Value::Integer(size_bytes),
-                Value::Integer(chunk_count),
-                Value::Text(now.clone()),
-            ],
-        )
-        .await?;
-
-    for (chunk_index, (start, end)) in chunk_ranges.iter().copied().enumerate() {
-        let chunk_data = data[start..end].to_vec();
-        let encoded_chunk = encode_binary_chunk_payload(&chunk_data)?;
-        let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
-        let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
-            message: format!(
-                "binary chunk size exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-        let stored_chunk_size = i64::try_from(encoded_chunk.data.len()).map_err(|_| LixError {
-            message: format!(
-                "binary stored chunk size exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-        let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
-            message: format!(
-                "binary chunk index exceeds supported range for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-
-        backend
-            .execute(
-                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, codec, codec_dict_id, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (chunk_hash) DO NOTHING",
-                &[
-                    Value::Text(chunk_hash.clone()),
-                    Value::Blob(encoded_chunk.data),
-                    Value::Integer(stored_chunk_size),
-                    Value::Text(encoded_chunk.codec.to_string()),
-                    match encoded_chunk.codec_dict_id {
-                        Some(codec_dict_id) => Value::Text(codec_dict_id),
-                        None => Value::Null,
-                    },
-                    Value::Text(now.clone()),
-                ],
-            )
-            .await?;
-        backend
-            .execute(
-                "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
-                &[
-                    Value::Text(blob_hash.clone()),
-                    Value::Integer(chunk_index),
-                    Value::Text(chunk_hash),
-                    Value::Integer(chunk_size),
-                ],
-            )
-            .await?;
-    }
-
-    backend
-        .execute(
-            "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (file_id, version_id) DO UPDATE SET \
-             blob_hash = EXCLUDED.blob_hash, \
-             size_bytes = EXCLUDED.size_bytes, \
-             updated_at = EXCLUDED.updated_at",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Text(blob_hash),
-                Value::Integer(size_bytes),
-                Value::Text(now),
-            ],
-        )
-        .await?;
-
-    Ok(())
+    let mut executor = BackendBinaryCasExecutor { backend };
+    persist_binary_blob_with_fastcdc(&mut executor, file_id, version_id, data).await
 }
 
 async fn persist_binary_blob_with_fastcdc_in_transaction(
@@ -1343,6 +1285,16 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
     version_id: &str,
     data: &[u8],
 ) -> Result<(), LixError> {
+    let mut executor = TransactionBinaryCasExecutor { transaction };
+    persist_binary_blob_with_fastcdc(&mut executor, file_id, version_id, data).await
+}
+
+async fn persist_binary_blob_with_fastcdc(
+    executor: &mut dyn BinaryCasExecutor,
+    file_id: &str,
+    version_id: &str,
+    data: &[u8],
+) -> Result<(), LixError> {
     let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
     let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
         message: format!(
@@ -1359,8 +1311,8 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
     })?;
     let now = crate::functions::timestamp::timestamp();
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (blob_hash) DO NOTHING",
@@ -1396,8 +1348,8 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
             ),
         })?;
 
-        transaction
-            .execute(
+        executor
+            .execute_sql(
                 "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, codec, codec_dict_id, created_at) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (chunk_hash) DO NOTHING",
@@ -1414,8 +1366,8 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
                 ],
             )
             .await?;
-        transaction
-            .execute(
+        executor
+            .execute_sql(
                 "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
                  VALUES ($1, $2, $3, $4) \
                  ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
@@ -1429,8 +1381,8 @@ async fn persist_binary_blob_with_fastcdc_in_transaction(
             .await?;
     }
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (file_id, version_id) DO UPDATE SET \
@@ -1529,120 +1481,28 @@ fn blob_value_required(row: &[Value], index: usize, column: &str) -> Result<Vec<
 async fn garbage_collect_unreachable_binary_cas_with_backend(
     backend: &dyn LixBackend,
 ) -> Result<(), LixError> {
-    if !binary_blob_ref_relation_exists_with_backend(backend).await? {
-        return Ok(());
-    }
-
-    let state_blob_hash_expr = binary_blob_hash_extract_expr_sql(backend.dialect());
-
-    backend
-        .execute(
-            &format!(
-                "WITH referenced AS (\
-                     SELECT file_id, version_id, {state_blob_hash_expr} AS blob_hash \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND snapshot_content IS NOT NULL \
-                       AND {state_blob_hash_expr} IS NOT NULL\
-                 ) \
-                 DELETE FROM lix_internal_binary_file_version_ref \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM referenced r \
-                 WHERE r.file_id = lix_internal_binary_file_version_ref.file_id \
-                   AND r.version_id = lix_internal_binary_file_version_ref.version_id \
-                   AND r.blob_hash = lix_internal_binary_file_version_ref.blob_hash\
-             )"
-            ),
-            &[],
-        )
-        .await?;
-
-    backend
-        .execute(
-            &format!(
-                "WITH referenced AS (\
-                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND snapshot_content IS NOT NULL \
-                       AND {state_blob_hash_expr} IS NOT NULL\
-                 ) \
-                 DELETE FROM lix_internal_binary_blob_manifest_chunk \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM referenced r \
-                 WHERE r.blob_hash = lix_internal_binary_blob_manifest_chunk.blob_hash\
-             )"
-            ),
-            &[],
-        )
-        .await?;
-
-    backend
-        .execute(
-            "DELETE FROM lix_internal_binary_chunk_store \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM lix_internal_binary_blob_manifest_chunk mc \
-                 WHERE mc.chunk_hash = lix_internal_binary_chunk_store.chunk_hash\
-             )",
-            &[],
-        )
-        .await?;
-
-    backend
-        .execute(
-            &format!(
-                "WITH referenced AS (\
-                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND snapshot_content IS NOT NULL \
-                       AND {state_blob_hash_expr} IS NOT NULL\
-                 ) \
-                 DELETE FROM lix_internal_binary_blob_manifest \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM referenced r \
-                 WHERE r.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
-             ) \
-             AND NOT EXISTS (\
-                 SELECT 1 \
-                 FROM lix_internal_binary_blob_manifest_chunk mc \
-                 WHERE mc.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
-             )"
-            ),
-            &[],
-        )
-        .await?;
-
-    backend
-        .execute(
-            "DELETE FROM lix_internal_binary_blob_store \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM lix_internal_binary_file_version_ref r \
-                 WHERE r.blob_hash = lix_internal_binary_blob_store.blob_hash\
-             )",
-            &[],
-        )
-        .await?;
-
-    Ok(())
+    let mut executor = BackendBinaryCasExecutor { backend };
+    garbage_collect_unreachable_binary_cas_with_executor(&mut executor).await
 }
 
 async fn garbage_collect_unreachable_binary_cas_in_transaction(
     transaction: &mut dyn LixTransaction,
 ) -> Result<(), LixError> {
-    if !binary_blob_ref_relation_exists_in_transaction(transaction).await? {
+    let mut executor = TransactionBinaryCasExecutor { transaction };
+    garbage_collect_unreachable_binary_cas_with_executor(&mut executor).await
+}
+
+async fn garbage_collect_unreachable_binary_cas_with_executor(
+    executor: &mut dyn BinaryCasExecutor,
+) -> Result<(), LixError> {
+    if !executor.binary_blob_ref_relation_exists().await? {
         return Ok(());
     }
 
-    let state_blob_hash_expr = binary_blob_hash_extract_expr_sql(transaction.dialect());
+    let state_blob_hash_expr = binary_blob_hash_extract_expr_sql(executor.dialect());
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             &format!(
                 "WITH referenced AS (\
                      SELECT file_id, version_id, {state_blob_hash_expr} AS blob_hash \
@@ -1664,8 +1524,8 @@ async fn garbage_collect_unreachable_binary_cas_in_transaction(
         )
         .await?;
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             &format!(
                 "WITH referenced AS (\
                      SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
@@ -1685,8 +1545,8 @@ async fn garbage_collect_unreachable_binary_cas_in_transaction(
         )
         .await?;
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             "DELETE FROM lix_internal_binary_chunk_store \
              WHERE NOT EXISTS (\
                  SELECT 1 \
@@ -1697,8 +1557,8 @@ async fn garbage_collect_unreachable_binary_cas_in_transaction(
         )
         .await?;
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             &format!(
                 "WITH referenced AS (\
                      SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
@@ -1723,8 +1583,8 @@ async fn garbage_collect_unreachable_binary_cas_in_transaction(
         )
         .await?;
 
-    transaction
-        .execute(
+    executor
+        .execute_sql(
             "DELETE FROM lix_internal_binary_blob_store \
              WHERE NOT EXISTS (\
                  SELECT 1 \
