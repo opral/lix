@@ -336,9 +336,7 @@ fn collapse_pending_file_writes_for_transaction(
         let key = (write.file_id.clone(), write.version_id.clone());
         if let Some(index) = index_by_key.get(&key).copied() {
             let existing = &mut collapsed[index];
-            if write.after_path.is_some() {
-                existing.after_path = write.after_path.clone();
-            }
+            existing.after_path = write.after_path.clone();
             existing.after_data = write.after_data.clone();
             existing.data_is_authoritative =
                 existing.data_is_authoritative || write.data_is_authoritative;
