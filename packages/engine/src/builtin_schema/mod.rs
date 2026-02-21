@@ -22,6 +22,7 @@ const LIX_CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 const LIX_FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const LIX_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
 const LIX_STORED_SCHEMA_JSON: &str = include_str!("lix_stored_schema.json");
 const LIX_KEY_VALUE_SCHEMA_JSON: &str = include_str!("lix_key_value.json");
@@ -40,6 +41,7 @@ const LIX_CHANGE_SET_ELEMENT_SCHEMA_JSON: &str = include_str!("lix_change_set_el
 const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
 const LIX_FILE_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_file_descriptor.json");
 const LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_directory_descriptor.json");
+const LIX_BINARY_BLOB_REF_SCHEMA_JSON: &str = include_str!("lix_binary_blob_ref.json");
 
 static LIX_STORED_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_KEY_VALUE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -58,6 +60,7 @@ static LIX_CHANGE_SET_ELEMENT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_EDGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_FILE_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_DIRECTORY_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_BINARY_BLOB_REF_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 
 const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_STORED_SCHEMA_KEY,
@@ -77,6 +80,7 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_COMMIT_EDGE_SCHEMA_KEY,
     LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
     LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+    LIX_BINARY_BLOB_REF_SCHEMA_KEY,
 ];
 
 pub(crate) fn builtin_schema_keys() -> &'static [&'static str] {
@@ -157,6 +161,9 @@ pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static Jso
                 )
             }))
         }
+        LIX_BINARY_BLOB_REF_SCHEMA_KEY => Some(LIX_BINARY_BLOB_REF_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_binary_blob_ref.json", LIX_BINARY_BLOB_REF_SCHEMA_JSON)
+        })),
         _ => None,
     }
 }
@@ -181,6 +188,7 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
         LIX_COMMIT_EDGE_SCHEMA_KEY => Some(LIX_COMMIT_EDGE_SCHEMA_JSON),
         LIX_FILE_DESCRIPTOR_SCHEMA_KEY => Some(LIX_FILE_DESCRIPTOR_SCHEMA_JSON),
         LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY => Some(LIX_DIRECTORY_DESCRIPTOR_SCHEMA_JSON),
+        LIX_BINARY_BLOB_REF_SCHEMA_KEY => Some(LIX_BINARY_BLOB_REF_SCHEMA_JSON),
         _ => None,
     }
 }
@@ -214,7 +222,7 @@ fn parse_stored_schema_with_inlined_definition() -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_schema_definition, BUILTIN_SCHEMA_KEYS};
+    use super::{builtin_schema_definition, BUILTIN_SCHEMA_KEYS, LIX_BINARY_BLOB_REF_SCHEMA_KEY};
 
     #[test]
     fn builtin_schemas_use_lix_plugin_key_override() {
@@ -225,11 +233,15 @@ mod tests {
                 .and_then(|value| value.as_object())
                 .and_then(|map| map.get("lixcol_plugin_key"))
                 .and_then(|value| value.as_str());
+            let expected_plugin_key = if *schema_key == LIX_BINARY_BLOB_REF_SCHEMA_KEY {
+                None
+            } else {
+                Some("\"lix\"")
+            };
             assert_eq!(
-                plugin_key,
-                Some("\"lix\""),
-                "schema '{}' must override lixcol_plugin_key to 'lix'",
-                schema_key
+                plugin_key, expected_plugin_key,
+                "schema '{}' has unexpected lixcol_plugin_key override",
+                schema_key,
             );
         }
     }

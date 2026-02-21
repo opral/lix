@@ -1,7 +1,8 @@
 mod backend;
 
-use lix_engine::{boot, BootArgs, BootKeyValue};
+use lix_engine::{boot, BootArgs, BootKeyValue, ExecuteOptions, NoopWasmRuntime};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 pub struct OpenLixConfig {
     pub backend: Option<Box<dyn LixBackend + Send + Sync>>,
@@ -44,7 +45,7 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         .collect();
     let engine = boot(BootArgs {
         backend,
-        wasm_runtime: None,
+        wasm_runtime: Arc::new(NoopWasmRuntime),
         key_values,
         active_account: None,
         access_to_internal: false,
@@ -55,7 +56,9 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
 
 impl Lix {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.engine.execute(sql, params).await
+        self.engine
+            .execute(sql, params, ExecuteOptions::default())
+            .await
     }
 }
 

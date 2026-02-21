@@ -83,6 +83,7 @@ pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
@@ -92,7 +93,7 @@ pub type EngineTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, 
 
 pub struct Engine {
     backend: Box<dyn LixBackend + Send + Sync>,
-    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+    wasm_runtime: Arc<dyn WasmRuntime>,
     cel_evaluator: CelEvaluator,
     schema_cache: SchemaCache,
     boot_key_values: Vec<BootKeyValue>,
@@ -336,7 +337,7 @@ fn collapse_pending_file_writes_for_transaction(
         let key = (write.file_id.clone(), write.version_id.clone());
         if let Some(index) = index_by_key.get(&key).copied() {
             let existing = &mut collapsed[index];
-            existing.path = write.path.clone();
+            existing.after_path = write.after_path.clone();
             existing.after_data = write.after_data.clone();
             existing.data_is_authoritative =
                 existing.data_is_authoritative || write.data_is_authoritative;
@@ -380,6 +381,18 @@ fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet
         })
         .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
+}
+
+fn should_run_binary_cas_gc(
+    mutations: &[MutationRow],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
+) -> bool {
+    mutations
+        .iter()
+        .any(|mutation| !mutation.untracked && mutation.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
+        || detected_file_domain_changes
+            .iter()
+            .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
 fn collect_postprocess_file_cache_targets(
@@ -617,7 +630,9 @@ mod tests {
     };
     use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
     use crate::version::active_version_schema_key;
-    use crate::{LixError, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance};
+    use crate::{
+        LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
+    };
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
@@ -808,10 +823,10 @@ mod tests {
     #[test]
     fn plugin_cache_invalidation_detects_internal_plugin_mutations_only() {
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "INSERT INTO lix_internal_plugin (key, runtime, api_version, detect_changes_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
+            "INSERT INTO lix_internal_plugin (key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "UPDATE lix_internal_plugin SET detect_changes_glob = '*.md' WHERE key = 'k'"
+            "UPDATE lix_internal_plugin SET match_path_glob = '*.md' WHERE key = 'k'"
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
             "DELETE FROM lix_internal_plugin WHERE key = 'k'"
@@ -861,12 +876,17 @@ mod tests {
     async fn sequential_multi_statement_fallback_executes_inside_single_transaction() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called: Arc::clone(&commit_called),
-            rollback_called: Arc::clone(&rollback_called),
-            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
-            restored_active_version_snapshot: active_version_snapshot_json("global"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called: Arc::clone(&commit_called),
+                rollback_called: Arc::clone(&rollback_called),
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         engine
             .execute_multi_statement_sequential_with_options(
@@ -885,12 +905,17 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_happens_after_commit() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called: Arc::clone(&commit_called),
-            rollback_called: Arc::clone(&rollback_called),
-            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
-            restored_active_version_snapshot: active_version_snapshot_json("global"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called: Arc::clone(&commit_called),
+                rollback_called: Arc::clone(&rollback_called),
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         {
             let mut cache = engine
@@ -932,12 +957,17 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_skips_rollback() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called: Arc::clone(&commit_called),
-            rollback_called: Arc::clone(&rollback_called),
-            active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json("global"))),
-            restored_active_version_snapshot: active_version_snapshot_json("global"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called: Arc::clone(&commit_called),
+                rollback_called: Arc::clone(&rollback_called),
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         {
             let mut cache = engine
@@ -971,12 +1001,15 @@ mod tests {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
         let active_version_snapshot = Arc::new(RwLock::new(active_version_snapshot_json("before")));
-        let engine = boot(BootArgs::new(Box::new(TestBackend {
-            commit_called,
-            rollback_called,
-            active_version_snapshot: Arc::clone(&active_version_snapshot),
-            restored_active_version_snapshot: active_version_snapshot_json("after"),
-        })));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::clone(&active_version_snapshot),
+                restored_active_version_snapshot: active_version_snapshot_json("after"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
 
         {
             let mut cache = engine

@@ -68,8 +68,7 @@ impl Engine {
         } else {
             None
         };
-        let can_defer_side_effects =
-            params.is_empty() && self.wasm_runtime.is_none() && coalesced_statements.is_some();
+        let can_defer_side_effects = false;
         let mut deferred_side_effects = if can_defer_side_effects {
             let CollectedExecutionSideEffects {
                 pending_file_writes,
