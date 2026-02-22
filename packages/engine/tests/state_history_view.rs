@@ -288,5 +288,224 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    lix_state_history_stays_sparse_when_only_other_entities_change,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-a', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"a0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        let entity_a_commit_id = active_commit_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-b', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"b0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"b1\"}' \
+                 WHERE entity_id = 'entity-b' \
+                   AND schema_key = 'test_state_history_schema' \
+                   AND file_id = 'f0'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let latest_root_commit_id = active_commit_id(&engine).await;
+
+        let rows = engine
+            .execute(
+                &format!(
+                    "SELECT commit_id, root_commit_id, depth, snapshot_content \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'entity-a' \
+                       AND schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{latest_root_commit_id}' \
+                     ORDER BY depth ASC"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.rows.clone());
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], &entity_a_commit_id);
+        assert_text(&rows.rows[0][1], &latest_root_commit_id);
+        assert_eq!(rows.rows[0][2], Value::Integer(2));
+        assert_text(&rows.rows[0][3], "{\"value\":\"a0\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_history_depth_zero_exists_only_for_entities_changed_at_root,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-a', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"a0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-b', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"b0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"b1\"}' \
+                 WHERE entity_id = 'entity-b' \
+                   AND schema_key = 'test_state_history_schema' \
+                   AND file_id = 'f0'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let latest_root_commit_id = active_commit_id(&engine).await;
+
+        let entity_a_depth_zero = engine
+            .execute(
+                &format!(
+                    "SELECT depth \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'entity-a' \
+                       AND schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{latest_root_commit_id}' \
+                       AND depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(entity_a_depth_zero.rows.len(), 0);
+
+        let entity_b_depth_zero = engine
+            .execute(
+                &format!(
+                    "SELECT commit_id, root_commit_id, depth, snapshot_content \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'entity-b' \
+                       AND schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{latest_root_commit_id}' \
+                       AND depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(entity_b_depth_zero.rows.clone());
+        assert_eq!(entity_b_depth_zero.rows.len(), 1);
+        assert_text(&entity_b_depth_zero.rows[0][0], &latest_root_commit_id);
+        assert_text(&entity_b_depth_zero.rows[0][1], &latest_root_commit_id);
+        assert_eq!(entity_b_depth_zero.rows[0][2], Value::Integer(0));
+        assert_text(&entity_b_depth_zero.rows[0][3], "{\"value\":\"b1\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_history_has_no_duplicate_depth_rows_per_entity_and_root_commit,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-a', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"a0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-b', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"b0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"b1\"}' \
+                 WHERE entity_id = 'entity-b' \
+                   AND schema_key = 'test_state_history_schema' \
+                   AND file_id = 'f0'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let latest_root_commit_id = active_commit_id(&engine).await;
+
+        let duplicates = engine
+            .execute(
+                &format!(
+                    "SELECT entity_id, root_commit_id, depth, COUNT(*) AS count \
+                     FROM lix_state_history \
+                     WHERE schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{latest_root_commit_id}' \
+                     GROUP BY entity_id, root_commit_id, depth \
+                     HAVING COUNT(*) > 1"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(duplicates.rows.clone());
+        assert_eq!(duplicates.rows.len(), 0);
+    }
+);
+
 // TODO(m27-parity): Port checkpoint label and ancestor/descendant range filters from
 // packages/sdk/src/state-history/schema.test.ts once commit labels/query-filter helpers land.

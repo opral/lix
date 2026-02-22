@@ -245,6 +245,7 @@ async fn create_checkpoint_in_transaction(
     )
     .await?;
     ensure_commit_edge(tx, &effective_previous_tip_id, &working_commit_id).await?;
+    ensure_commit_ancestry(tx, &working_commit_id, &merged_parents).await?;
 
     let new_change_set_id = generate_uuid(tx).await?;
     let new_working_commit_id = generate_uuid(tx).await?;
@@ -274,6 +275,12 @@ async fn create_checkpoint_in_transaction(
     .await?;
 
     ensure_commit_edge(tx, &working_commit_id, &new_working_commit_id).await?;
+    ensure_commit_ancestry(
+        tx,
+        &new_working_commit_id,
+        std::slice::from_ref(&working_commit_id),
+    )
+    .await?;
 
     tx.execute(
         "UPDATE lix_version \
@@ -658,6 +665,45 @@ async fn ensure_commit_edge(
         ],
     )
     .await?;
+    Ok(())
+}
+
+async fn ensure_commit_ancestry(
+    tx: &mut EngineTransaction<'_>,
+    commit_id: &str,
+    parent_ids: &[String],
+) -> Result<(), LixError> {
+    tx.execute_internal(
+        "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+         VALUES ($1, $1, 0) \
+         ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
+        &[Value::Text(commit_id.to_string())],
+    )
+    .await?;
+
+    let normalized_parents = normalize_parent_commit_ids(parent_ids.to_vec(), commit_id);
+    for parent_id in normalized_parents {
+        tx.execute_internal(
+            "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+             SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
+             FROM ( \
+               SELECT $2 AS ancestor_id, 1 AS depth \
+               UNION ALL \
+               SELECT ancestor_id, depth + 1 AS depth \
+               FROM lix_internal_commit_ancestry \
+               WHERE commit_id = $2 \
+             ) AS candidate \
+             GROUP BY candidate.ancestor_id \
+             ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
+             SET depth = CASE \
+               WHEN excluded.depth < lix_internal_commit_ancestry.depth THEN excluded.depth \
+               ELSE lix_internal_commit_ancestry.depth \
+             END",
+            &[Value::Text(commit_id.to_string()), Value::Text(parent_id)],
+        )
+        .await?;
+    }
+
     Ok(())
 }
 

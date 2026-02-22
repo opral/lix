@@ -83,6 +83,40 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_history_data_cache_root_depth \
      ON lix_internal_file_history_data_cache (root_commit_id, depth)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_commit_ancestry (\
+     commit_id TEXT NOT NULL,\
+     ancestor_id TEXT NOT NULL,\
+     depth BIGINT NOT NULL,\
+     PRIMARY KEY (commit_id, ancestor_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_ancestry_commit_depth \
+     ON lix_internal_commit_ancestry (commit_id, depth)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_ancestry_ancestor \
+     ON lix_internal_commit_ancestry (ancestor_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_entity_state_timeline_breakpoint (\
+     root_commit_id TEXT NOT NULL,\
+     entity_id TEXT NOT NULL,\
+     schema_key TEXT NOT NULL,\
+     file_id TEXT NOT NULL,\
+     from_depth BIGINT NOT NULL,\
+     plugin_key TEXT NOT NULL,\
+     schema_version TEXT NOT NULL,\
+     metadata TEXT,\
+     snapshot_id TEXT NOT NULL,\
+     change_id TEXT NOT NULL,\
+     PRIMARY KEY (root_commit_id, entity_id, schema_key, file_id, from_depth)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_entity_state_timeline_breakpoint_root_depth \
+     ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, from_depth)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_entity_state_timeline_breakpoint_lookup \
+     ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, entity_id, file_id, schema_key, from_depth)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_entity_state_timeline_breakpoint_filters \
+     ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, file_id, plugin_key, schema_key, entity_id, from_depth)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_timeline_status (\
+     root_commit_id TEXT PRIMARY KEY,\
+     built_max_depth BIGINT NOT NULL,\
+     built_at TEXT NOT NULL\
+     )",
     "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_store (\
      blob_hash TEXT PRIMARY KEY,\
      data BYTEA NOT NULL,\
