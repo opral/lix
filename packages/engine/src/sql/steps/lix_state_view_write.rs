@@ -4,6 +4,7 @@ use sqlparser::ast::{
 };
 
 use crate::sql::object_name_matches;
+use crate::sql::bind_sql;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
@@ -138,7 +139,8 @@ async fn matches_untracked_rows(
         untracked_table = UNTRACKED_TABLE,
         selection = selection,
     );
-    let result = backend.execute(&sql, params).await?;
+    let bound = bind_sql(&sql, params, backend.dialect())?;
+    let result = backend.execute(&bound.sql, &bound.params).await?;
     Ok(!result.rows.is_empty())
 }
 

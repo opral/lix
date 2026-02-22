@@ -90,7 +90,8 @@ export function buildReplayCommitStatements(batch, options = {}) {
     }
     statements.push(
       replayStatement(
-        `DELETE FROM lix_file WHERE id IN (${deleteChunk.map(sqlText).join(", ")})`,
+        `DELETE FROM lix_file WHERE id IN (${deleteChunk.map(() => "?").join(", ")})`,
+        deleteChunk,
       ),
     );
   }
@@ -108,17 +109,64 @@ export function buildReplayCommitStatements(batch, options = {}) {
   return statements;
 }
 
+export function buildReplayCommitSqlScript(statements, options = {}) {
+  const maxScriptChars = positiveOrUndefined(options.maxScriptChars);
+
+  if (!Array.isArray(statements)) {
+    throw new Error("buildReplayCommitSqlScript expects an array of statements");
+  }
+
+  if (statements.length === 0) {
+    return "";
+  }
+
+  const lines = ["BEGIN;"];
+  let estimatedChars = 13; // "BEGIN;\nCOMMIT;"
+
+  for (let index = 0; index < statements.length; index++) {
+    const statement = statements[index];
+    const sql = String(statement?.sql ?? "").trim();
+
+    if (sql.length === 0) {
+      throw new Error(`statement ${index} has empty sql`);
+    }
+
+    const normalized = sql.endsWith(";") ? sql : `${sql};`;
+    lines.push(normalized);
+    estimatedChars += normalized.length + 1;
+
+    if (maxScriptChars !== undefined && estimatedChars > maxScriptChars) {
+      throw new Error(
+        `commit SQL script estimated at ${estimatedChars} chars exceeds limit ${maxScriptChars}`,
+      );
+    }
+  }
+
+  lines.push("COMMIT;");
+  return lines.join("\n");
+}
+
 function appendInsertStatements(statements, rows, options) {
   if (rows.length === 0) {
     return;
   }
-  const _ = options;
 
-  for (const row of rows) {
+  const maxRowsPerStatement = positiveOrDefault(options.maxInsertRows, 200);
+
+  for (const rowChunk of chunkArray(rows, maxRowsPerStatement)) {
+    if (rowChunk.length === 0) {
+      continue;
+    }
+    const params = [];
+    const valuesSql = rowChunk
+      .map((row) => {
+        params.push(row.id, row.path, row.data);
+        return "(?, ?, ?)";
+      })
+      .join(", ");
+
     statements.push(
-      replayStatement(
-        `INSERT INTO lix_file (id, path, data) VALUES (${sqlText(row.id)}, ${sqlText(row.path)}, ${sqlBlob(row.data)})`,
-      ),
+      replayStatement(`INSERT INTO lix_file (id, path, data) VALUES ${valuesSql}`, params),
     );
   }
 }
@@ -129,9 +177,13 @@ function appendUpdateStatements(statements, rows, options) {
   }
   const _ = options;
   for (const row of rows) {
-    statements.push(replayStatement(
-      `UPDATE lix_file SET path = ${sqlText(row.path)}, data = ${sqlBlob(row.data)} WHERE id = ${sqlText(row.id)}`,
-    ));
+    statements.push(
+      replayStatement("UPDATE lix_file SET path = ?, data = ? WHERE id = ?", [
+        row.path,
+        row.data,
+        row.id,
+      ]),
+    );
   }
 }
 
@@ -250,19 +302,21 @@ function chunkArray(values, size) {
   return chunks;
 }
 
-function sqlText(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function sqlBlob(value) {
-  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
-  return `x'${Buffer.from(bytes).toString("hex")}'`;
-}
-
 function positiveOrDefault(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return fallback;
+  }
+  return parsed;
+}
+
+function positiveOrUndefined(value) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`expected positive integer, got '${value}'`);
   }
   return parsed;
 }

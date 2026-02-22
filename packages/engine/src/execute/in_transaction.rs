@@ -114,7 +114,7 @@ impl Engine {
                     &backend,
                     &self.schema_cache,
                     &output.update_validations,
-                    &output.params,
+                    params,
                 )
                 .await?;
             }
