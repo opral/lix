@@ -156,14 +156,14 @@ where
             has_postprocess = true;
         }
 
-        let (physical_plan, next_placeholder_state) = emit_physical_statement_plan_with_state(
+        let (statement_prepared, next_placeholder_state) = emit_physical_statement_plan_with_state(
             &logical_plan,
             params,
             backend.dialect(),
             provider,
             placeholder_state,
         )?;
-        prepared_statements.extend(physical_plan.prepared_statements);
+        prepared_statements.extend(statement_prepared);
         placeholder_state = next_placeholder_state;
     }
 

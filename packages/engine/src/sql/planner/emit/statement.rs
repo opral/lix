@@ -7,7 +7,6 @@ use crate::sql::{
 use crate::{LixError, SqlDialect, Value};
 
 use crate::sql::planner::ir::logical::LogicalStatementPlan;
-use crate::sql::planner::ir::physical::PhysicalStatementPlan;
 
 pub(crate) fn emit_physical_statement_plan_with_state<P: LixFunctionProvider>(
     logical_plan: &LogicalStatementPlan,
@@ -15,7 +14,7 @@ pub(crate) fn emit_physical_statement_plan_with_state<P: LixFunctionProvider>(
     dialect: SqlDialect,
     provider: &mut P,
     mut placeholder_state: PlaceholderState,
-) -> Result<(PhysicalStatementPlan, PlaceholderState), LixError> {
+) -> Result<(Vec<PreparedStatement>, PlaceholderState), LixError> {
     let mut prepared_statements = Vec::with_capacity(logical_plan.planned_statements.len());
 
     for statement in &logical_plan.planned_statements {
@@ -36,11 +35,5 @@ pub(crate) fn emit_physical_statement_plan_with_state<P: LixFunctionProvider>(
         });
     }
 
-    Ok((
-        PhysicalStatementPlan {
-            operation: logical_plan.operation,
-            prepared_statements,
-        },
-        placeholder_state,
-    ))
+    Ok((prepared_statements, placeholder_state))
 }

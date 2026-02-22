@@ -78,7 +78,7 @@ where
         });
     }
 
-    let (physical_plan, next_placeholder_state) = emit_physical_statement_plan_with_state(
+    let (prepared_statements, next_placeholder_state) = emit_physical_statement_plan_with_state(
         &logical_plan,
         params,
         backend.dialect(),
@@ -86,9 +86,9 @@ where
         initial_placeholder_state,
     )?;
     if matches!(
-        physical_plan.operation,
+        logical_plan.operation,
         LogicalStatementOperation::CanonicalWrite
-    ) && physical_plan.prepared_statements.is_empty()
+    ) && prepared_statements.is_empty()
     {
         return Err(LixError {
             message: "planner canonical write emitted no executable statements".to_string(),
@@ -97,7 +97,7 @@ where
 
     Ok((
         CompiledStatementPlan {
-            prepared_statements: physical_plan.prepared_statements,
+            prepared_statements,
             registrations: logical_plan.registrations,
             postprocess: logical_plan.postprocess,
             mutations: logical_plan.mutations,
