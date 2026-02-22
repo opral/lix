@@ -20,9 +20,7 @@ pub(crate) fn extract_explicit_transaction_script_from_statements(
     statements: &[Statement],
     params: &[Value],
 ) -> Result<Option<Vec<Statement>>, LixError> {
-    if !params.is_empty() {
-        return Ok(None);
-    }
+    let _ = params;
     if statements.len() < 2 {
         return Ok(None);
     }

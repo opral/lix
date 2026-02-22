@@ -35,6 +35,23 @@ fn insert_many_key_values_sql(row_count: usize) -> String {
     )
 }
 
+fn build_large_multi_statement_select_script_and_params(
+    statement_count: usize,
+    blob_size_bytes: usize,
+) -> (String, Vec<Value>) {
+    let mut sql = String::new();
+    let mut params = Vec::with_capacity(statement_count);
+
+    for index in 0..statement_count {
+        if index > 0 {
+            sql.push(' ');
+        }
+        sql.push_str("SELECT ?;");
+        params.push(Value::Blob(vec![(index % 256) as u8; blob_size_bytes]));
+    }
+    (sql, params)
+}
+
 fn assert_blob_text(value: &Value, expected: &str) {
     match value {
         Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
@@ -264,6 +281,122 @@ simulation_test!(
             })
             .await
             .expect("large vtable insert should not fail with SQL variable overflow");
+    }
+);
+
+simulation_test!(
+    transaction_script_path_handles_large_parameterized_batch_without_param_fanout_oom,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let (sql, params) = build_large_multi_statement_select_script_and_params(20, 500_000);
+        engine
+            .execute(&sql, &params)
+            .await
+            .expect("large parameterized multi-statement script should execute without OOM");
+    }
+);
+
+simulation_test!(
+    transaction_script_path_handles_parameterized_lix_file_update_with_prior_statement_params,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-param-update', '/before.md', 'before')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "BEGIN; \
+                 DELETE FROM lix_file WHERE id IN (?); \
+                 INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?); \
+                 UPDATE lix_file SET path = ?, data = ? WHERE id = ?; \
+                 COMMIT;",
+                &[
+                    Value::Text("tx-script-delete-miss".to_string()),
+                    Value::Text("tx-script-insert".to_string()),
+                    Value::Text("/inserted.md".to_string()),
+                    Value::Blob(b"inserted".to_vec()),
+                    Value::Text("/after.md".to_string()),
+                    Value::Blob(b"after".to_vec()),
+                    Value::Text("tx-script-param-update".to_string()),
+                ],
+            )
+            .await
+            .expect(
+                "BEGIN/COMMIT transaction script with parameterized update should execute successfully",
+            );
+
+        let updated = engine
+            .execute(
+                "SELECT path, data FROM lix_file WHERE id = 'tx-script-param-update'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.rows.len(), 1);
+        assert_eq!(updated.rows[0][0], Value::Text("/after.md".to_string()));
+        assert_blob_text(&updated.rows[0][1], "after");
+    }
+);
+
+simulation_test!(
+    transaction_script_path_handles_single_parameterized_lix_file_update,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-single-update', '/before.md', 'before')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "BEGIN; \
+                 UPDATE lix_file SET path = ?, data = ? WHERE id = ?; \
+                 COMMIT;",
+                &[
+                    Value::Text("/after.md".to_string()),
+                    Value::Blob(b"after".to_vec()),
+                    Value::Text("tx-script-single-update".to_string()),
+                ],
+            )
+            .await
+            .expect("single update transaction script should execute successfully");
+
+        let updated = engine
+            .execute(
+                "SELECT path, data FROM lix_file WHERE id = 'tx-script-single-update'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.rows.len(), 1);
+        assert_eq!(updated.rows[0][0], Value::Text("/after.md".to_string()));
+        assert_blob_text(&updated.rows[0][1], "after");
     }
 );
 

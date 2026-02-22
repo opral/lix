@@ -1,12 +1,14 @@
 use super::super::*;
+use crate::sql::bind_sql_with_state;
 
 impl Engine {
     pub(crate) async fn execute_transaction_script_with_options(
         &self,
         statements: Vec<Statement>,
+        params: &[Value],
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
-        self.execute_statement_script_with_options(statements, &[], &options)
+        self.execute_statement_script_with_options(statements, params, &options)
             .await
     }
 
@@ -101,26 +103,38 @@ impl Engine {
         };
         let sql_statements = if let Some(coalesced) = coalesced_statements {
             coalesced
+                .into_iter()
+                .map(|sql| (sql, Vec::new()))
+                .collect::<Vec<_>>()
         } else if params.is_empty() {
             coalesce_vtable_inserts_in_statement_list(original_statements)?
                 .into_iter()
-                .map(|statement| statement.to_string())
+                .map(|statement| (statement.to_string(), Vec::new()))
                 .collect::<Vec<_>>()
         } else {
-            original_statements
-                .into_iter()
-                .map(|statement| statement.to_string())
-                .collect::<Vec<_>>()
+            let mut placeholder_state = PlaceholderState::new();
+            let mut bound_statements = Vec::with_capacity(original_statements.len());
+            for statement in original_statements {
+                let bound = bind_sql_with_state(
+                    &statement.to_string(),
+                    params,
+                    transaction.dialect(),
+                    placeholder_state,
+                )?;
+                placeholder_state = bound.state;
+                bound_statements.push((bound.sql, bound.params));
+            }
+            bound_statements
         };
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 
         let mut last_result = QueryResult { rows: Vec::new() };
-        for sql in sql_statements {
+        for (sql, statement_params) in sql_statements {
             let result = if skip_statement_side_effect_collection {
                 self.execute_with_options_in_transaction(
                     transaction,
                     &sql,
-                    params,
+                    &statement_params,
                     options,
                     active_version_id,
                     deferred_side_effects.as_mut(),
@@ -132,7 +146,7 @@ impl Engine {
                 self.execute_with_options_in_transaction(
                     transaction,
                     &sql,
-                    params,
+                    &statement_params,
                     options,
                     active_version_id,
                     None,

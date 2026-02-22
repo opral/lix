@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -12,7 +14,7 @@ use crate::sql::object_name_matches;
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
 use crate::sql::types::{PostprocessPlan, PreparedStatement, PreprocessOutput, SchemaRegistration};
 use crate::sql::DetectedFileDomainChange;
-use crate::sql::{bind_sql_with_state, PlaceholderState};
+use crate::sql::{bind_sql_with_state_and_appended_params, PlaceholderState};
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) mod context;
@@ -24,6 +26,11 @@ pub(crate) mod validator;
 pub(crate) mod walker;
 
 use self::statement_pipeline::StatementPipeline;
+
+struct RewrittenStatementBinding {
+    statement: Statement,
+    appended_params: Arc<Vec<Value>>,
+}
 
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     let dialect = GenericDialect {};
@@ -76,11 +83,13 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         }
         mutations.extend(output.mutations);
         update_validations.extend(output.update_validations);
-        let mut statement_params = params.to_vec();
-        statement_params.extend(output.params);
+        let appended_params = Arc::new(output.params);
         for rewritten_statement in output.statements {
             let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
-            rewritten.push((lower_statement(inlined, dialect)?, statement_params.clone()));
+            rewritten.push(RewrittenStatementBinding {
+                statement: lower_statement(inlined, dialect)?,
+                appended_params: Arc::clone(&appended_params),
+            });
         }
     }
 
@@ -91,7 +100,7 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     }
 
     let (normalized_sql, params, prepared_statements) =
-        render_statements_with_params(&rewritten, dialect)?;
+        render_statements_with_params(&rewritten, params, dialect)?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
@@ -146,14 +155,13 @@ where
         }
         mutations.extend(output.mutations);
         update_validations.extend(output.update_validations);
-        let mut statement_params = params.to_vec();
-        statement_params.extend(output.params);
+        let appended_params = Arc::new(output.params);
         for rewritten_statement in output.statements {
             let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
-            rewritten.push((
-                lower_statement(inlined, backend.dialect())?,
-                statement_params.clone(),
-            ));
+            rewritten.push(RewrittenStatementBinding {
+                statement: lower_statement(inlined, backend.dialect())?,
+                appended_params: Arc::clone(&appended_params),
+            });
         }
     }
 
@@ -164,7 +172,7 @@ where
     }
 
     let (normalized_sql, params, prepared_statements) =
-        render_statements_with_params(&rewritten, backend.dialect())?;
+        render_statements_with_params(&rewritten, params, backend.dialect())?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
@@ -277,17 +285,19 @@ pub fn preprocess_sql_rewrite_only(sql: &str) -> Result<PreprocessOutput, LixErr
 }
 
 fn render_statements_with_params(
-    statements: &[(Statement, Vec<Value>)],
+    statements: &[RewrittenStatementBinding],
+    base_params: &[Value],
     dialect: SqlDialect,
 ) -> Result<(String, Vec<Value>, Vec<PreparedStatement>), LixError> {
     let mut rendered = Vec::with_capacity(statements.len());
     let mut prepared_statements = Vec::with_capacity(statements.len());
     let mut placeholder_state = PlaceholderState::new();
 
-    for (statement, statement_params) in statements {
-        let bound = bind_sql_with_state(
-            &statement.to_string(),
-            statement_params,
+    for statement in statements {
+        let bound = bind_sql_with_state_and_appended_params(
+            &statement.statement.to_string(),
+            base_params,
+            statement.appended_params.as_slice(),
             dialect,
             placeholder_state,
         )?;

@@ -34,7 +34,9 @@ pub(crate) use ast_utils::{
 };
 pub(crate) use escaping::escape_sql_string;
 pub(crate) use lowering::lower_statement;
-pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};
+pub(crate) use params::{
+    bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
+};
 pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
 #[allow(unused_imports)]
 pub use pipeline::{
