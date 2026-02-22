@@ -7,11 +7,10 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::sql::lowering::lower_statement;
-use crate::sql::read_views::{lix_version_view_read, vtable_read};
+use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, object_name_matches, resolve_expr_cell_with_state,
-    PlaceholderState, RowSourceResolver,
+    escape_sql_string, object_name_matches, resolve_expr_cell_with_state, PlaceholderState,
+    RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -516,33 +515,14 @@ async fn query_lix_version_rows(
          FROM {view}{where_sql}",
         view = LIX_VERSION_VIEW_NAME
     );
-
-    let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single SELECT statement while querying lix_version rows"
-                .to_string(),
-        });
-    }
-    let Statement::Query(query) = statements.remove(0) else {
-        return Err(LixError {
-            message: "version row loader query must be SELECT".to_string(),
-        });
-    };
-
-    let query = *query;
-    let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
-    let bound = bind_sql_with_state(
-        &lowered.to_string(),
+    let result = execute_rewritten_read_sql_with_state(
+        backend,
+        &sql,
         params,
-        backend.dialect(),
         placeholder_state,
-    )?;
-    let result = backend.execute(&bound.sql, &bound.params).await?;
+        "lix_version row loader query",
+    )
+    .await?;
 
     let mut rows = Vec::new();
     for row in result.rows {

@@ -6,11 +6,9 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::sql::lowering::lower_statement;
-use crate::sql::read_views::{lix_active_version_view_read, vtable_read};
+use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, object_name_matches, resolve_expr_cell_with_state,
-    PlaceholderState,
+    escape_sql_string, object_name_matches, resolve_expr_cell_with_state, PlaceholderState,
 };
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
@@ -195,39 +193,14 @@ async fn query_lix_active_version_rows(
         sql.push_str(" WHERE ");
         sql.push_str(&selection.to_string());
     }
-
-    let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: format!("failed to parse lix_active_version row loader query: {error}"),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single SELECT statement while querying lix_active_version rows"
-                .to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    let Statement::Query(query) = statement else {
-        return Err(LixError {
-            message: "lix_active_version row loader query must be SELECT".to_string(),
-        });
-    };
-
-    let query = *query;
-    let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
-    let Statement::Query(lowered_query) = lowered else {
-        return Err(LixError {
-            message: "lix_active_version row loader rewrite expected query statement".to_string(),
-        });
-    };
-    let bound = bind_sql_with_state(
-        &lowered_query.to_string(),
+    let result = execute_rewritten_read_sql_with_state(
+        backend,
+        &sql,
         params,
-        backend.dialect(),
         placeholder_state,
-    )?;
-    let result = backend.execute(&bound.sql, &bound.params).await?;
+        "lix_active_version row loader query",
+    )
+    .await?;
 
     let mut rows = Vec::with_capacity(result.rows.len());
     for row in result.rows {

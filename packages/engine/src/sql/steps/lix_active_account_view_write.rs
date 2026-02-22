@@ -8,12 +8,8 @@ use crate::account::{
     active_account_schema_version, active_account_snapshot_content,
     active_account_storage_version_id,
 };
-use crate::sql::lowering::lower_statement;
-use crate::sql::read_views::{lix_active_account_view_read, vtable_read};
-use crate::sql::{
-    bind_sql_with_state, escape_sql_string, object_name_matches, resolve_insert_rows,
-    PlaceholderState,
-};
+use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
+use crate::sql::{escape_sql_string, object_name_matches, resolve_insert_rows, PlaceholderState};
 use crate::{LixBackend, LixError, Value as EngineValue};
 
 const LIX_ACTIVE_ACCOUNT_VIEW_NAME: &str = "lix_active_account";
@@ -150,39 +146,14 @@ async fn query_entity_ids_for_delete(
         sql.push_str(" WHERE ");
         sql.push_str(&selection.to_string());
     }
-
-    let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: format!("failed to parse lix_active_account row loader query: {error}"),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single SELECT statement while querying lix_active_account rows"
-                .to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    let Statement::Query(query) = statement else {
-        return Err(LixError {
-            message: "lix_active_account row loader query must be SELECT".to_string(),
-        });
-    };
-
-    let query = *query;
-    let query = lix_active_account_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
-    let Statement::Query(lowered_query) = lowered else {
-        return Err(LixError {
-            message: "lix_active_account row loader rewrite expected query statement".to_string(),
-        });
-    };
-    let bound = bind_sql_with_state(
-        &lowered_query.to_string(),
+    let result = execute_rewritten_read_sql_with_state(
+        backend,
+        &sql,
         params,
-        backend.dialect(),
         PlaceholderState::new(),
-    )?;
-    let result = backend.execute(&bound.sql, &bound.params).await?;
+        "lix_active_account row loader query",
+    )
+    .await?;
 
     let mut entity_ids = Vec::with_capacity(result.rows.len());
     for row in result.rows {

@@ -4,12 +4,14 @@ use crate::{LixBackend, LixError, Value};
 
 pub(crate) mod context;
 pub(crate) mod query_engine;
+pub(crate) mod query_loader;
 pub(crate) mod registry;
 pub(crate) mod rules;
 pub(crate) mod validator;
 pub(crate) mod walker;
 
 pub(crate) use query_engine::ReadRewriteSession;
+pub(crate) use query_loader::execute_rewritten_read_sql_with_state;
 
 #[cfg(test)]
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
