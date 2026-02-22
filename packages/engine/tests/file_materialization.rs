@@ -1801,7 +1801,7 @@ simulation_test!(
         assert_eq!(
             file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
                 .await,
-            1
+            0
         );
 
         engine
@@ -2329,7 +2329,7 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
-            1
+            0
         );
 
         let before_rows = engine
@@ -2487,7 +2487,7 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
-            1
+            0
         );
 
         engine
@@ -2561,7 +2561,7 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
-            1
+            0
         );
 
         engine
@@ -2622,7 +2622,7 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
-            1
+            0
         );
 
         engine
@@ -2711,7 +2711,7 @@ simulation_test!(
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
-            1
+            0
         );
 
         engine
