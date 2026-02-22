@@ -91,10 +91,7 @@ impl Engine {
         skip_side_effect_collection: bool,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<QueryResult, LixError> {
-        let StatementBlock {
-            statements,
-            explicit_transaction_script: _explicit_transaction_script,
-        } = prepare_statement_block_with_transaction_flag(parsed_statements)?;
+        let StatementBlock { statements } = prepare_statement_block_with_transaction_flag(parsed_statements)?;
         let mut last_result = QueryResult { rows: Vec::new() };
         let mut placeholder_state = PlaceholderState::new();
 

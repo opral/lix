@@ -17,8 +17,8 @@ pub(crate) fn emit_physical_statement_plan_with_state<P: LixFunctionProvider>(
 ) -> Result<(Vec<PreparedStatement>, PlaceholderState), LixError> {
     let mut prepared_statements = Vec::with_capacity(logical_plan.planned_statements.len());
 
-    for statement in &logical_plan.planned_statements {
-        let inlined = inline_lix_functions_with_provider(statement.clone(), provider);
+    for statement in logical_plan.planned_statements.iter().map(|step| step.as_statement()) {
+        let inlined = inline_lix_functions_with_provider(statement, provider);
         let lowered = lower_statement(inlined, dialect)?;
         let bound = bind_statement_with_state_and_appended_params(
             lowered,

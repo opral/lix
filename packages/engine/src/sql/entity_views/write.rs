@@ -16,9 +16,7 @@ use crate::cel::CelEvaluator;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::planner::rewrite::query::rewrite_query_with_backend;
-#[cfg(test)]
-use crate::sql::read_pipeline::rewrite_read_query;
+use crate::sql::rewrite_read_query_with_backend;
 use crate::sql::row_resolution::resolve_values_rows;
 use crate::sql::{resolve_expr_cell_with_state, PlaceholderState, ResolvedCell};
 use crate::{LixBackend, LixError, Value as EngineValue};
@@ -698,6 +696,39 @@ fn rewrite_expression(
 }
 
 #[cfg(test)]
+fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
+    let backend = EntityViewsTestReadBackend;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| LixError {
+            message: format!("failed to initialize test runtime: {error}"),
+        })?;
+    runtime.block_on(async move { rewrite_read_query_with_backend(&backend, query).await })
+}
+
+#[cfg(test)]
+struct EntityViewsTestReadBackend;
+
+#[cfg(test)]
+#[async_trait::async_trait(?Send)]
+impl LixBackend for EntityViewsTestReadBackend {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Sqlite
+    }
+
+    async fn execute(&self, _: &str, _: &[EngineValue]) -> Result<crate::QueryResult, LixError> {
+        Ok(crate::QueryResult { rows: Vec::new() })
+    }
+
+    async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+        Err(LixError {
+            message: "planner read rewrite should not open transactions".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
 fn rewrite_subquery_expressions(expr: Expr) -> Result<Expr, LixError> {
     Ok(match expr {
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
@@ -906,7 +937,7 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                 negated,
             } => Expr::InSubquery {
                 expr: Box::new(rewrite_subquery_expressions_with_backend(*expr, backend).await?),
-                subquery: Box::new(rewrite_query_with_backend(backend, *subquery).await?),
+                subquery: Box::new(rewrite_read_query_with_backend(backend, *subquery).await?),
                 negated,
             },
             Expr::Between {
@@ -982,11 +1013,11 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                 right: Box::new(rewrite_subquery_expressions_with_backend(*right, backend).await?),
             },
             Expr::Exists { subquery, negated } => Expr::Exists {
-                subquery: Box::new(rewrite_query_with_backend(backend, *subquery).await?),
+                subquery: Box::new(rewrite_read_query_with_backend(backend, *subquery).await?),
                 negated,
             },
             Expr::Subquery(subquery) => Expr::Subquery(Box::new(
-                rewrite_query_with_backend(backend, *subquery).await?,
+                rewrite_read_query_with_backend(backend, *subquery).await?,
             )),
             Expr::Function(function) => {
                 let mut function = function;

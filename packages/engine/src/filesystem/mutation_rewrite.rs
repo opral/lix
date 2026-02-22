@@ -14,11 +14,10 @@ use crate::filesystem::path::{
     file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
     normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
 };
-use crate::sql::escape_sql_string;
+use crate::sql::{escape_sql_string, rewrite_read_query_with_backend_and_params};
 use crate::sql::{
-    bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
-    rewrite_read_query_with_backend_and_params_in_session, DetectedFileDomainChange,
-    PlaceholderState, ReadRewriteSession, ResolvedCell,
+    bind_sql_with_state, lower_statement, parse_single_query_with_dialect, resolve_expr_cell_with_state,
+    resolve_values_rows, DetectedFileDomainChange, PlaceholderState, ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -46,6 +45,21 @@ const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 static REWRITTEN_HELPER_SQL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub type ResolvedDirectoryIdMap = BTreeMap<(String, String), String>;
+
+#[derive(Debug, Default)]
+pub(crate) struct ReadRewriteSession {
+    version_chain_cache: BTreeMap<String, Vec<String>>,
+}
+
+impl ReadRewriteSession {
+    pub(crate) fn cached_version_chain(&self, version_id: &str) -> Option<&[String]> {
+        self.version_chain_cache.get(version_id).map(Vec::as_slice)
+    }
+
+    pub(crate) fn cache_version_chain(&mut self, version_id: String, chain: Vec<String>) {
+        self.version_chain_cache.insert(version_id, chain);
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct FilesystemInsertSideEffects {
@@ -1923,25 +1937,12 @@ async fn rewrite_single_read_query_for_backend(
         return Ok(cached);
     }
 
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single SELECT statement".to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    let Statement::Query(query) = statement else {
-        return Err(LixError {
-            message: "expected SELECT statement".to_string(),
-        });
-    };
-    let rewritten = rewrite_read_query_with_backend_and_params_in_session(
+    let _ = read_rewrite_session;
+    let query = parse_single_query_with_dialect(sql, backend.dialect())?;
+    let rewritten = rewrite_read_query_with_backend_and_params(
         backend,
-        *query,
+        query,
         &[],
-        read_rewrite_session,
     )
     .await?;
     let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;

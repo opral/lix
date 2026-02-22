@@ -8,17 +8,15 @@ use super::types::StatementBlock;
 pub(crate) fn prepare_statement_block_with_transaction_flag(
     statements: Vec<Statement>,
 ) -> Result<StatementBlock, LixError> {
-    let (statements, explicit_transaction_script) =
-        if let Some(inner) = extract_explicit_transaction_script_from_statements(&statements)? {
-            (inner, true)
-        } else {
-            (statements, false)
-        };
+    let statements = if let Some(inner) =
+        extract_explicit_transaction_script_from_statements(&statements)?
+    {
+        inner
+    } else {
+        statements
+    };
 
-    Ok(StatementBlock {
-        statements,
-        explicit_transaction_script,
-    })
+    Ok(StatementBlock { statements })
 }
 
 #[cfg(test)]
@@ -33,7 +31,6 @@ mod tests {
         let block = prepare_statement_block_with_transaction_flag(statements)
             .expect("prepare statement block");
 
-        assert!(block.explicit_transaction_script);
         assert_eq!(block.statements.len(), 2);
     }
 
@@ -43,7 +40,6 @@ mod tests {
         let block = prepare_statement_block_with_transaction_flag(statements)
             .expect("prepare statement block");
 
-        assert!(!block.explicit_transaction_script);
         assert_eq!(block.statements.len(), 2);
     }
 

@@ -7,7 +7,6 @@ use crate::sql::types::{
 #[derive(Debug, Clone)]
 pub(crate) struct StatementBlock {
     pub(crate) statements: Vec<Statement>,
-    pub(crate) explicit_transaction_script: bool,
 }
 
 #[derive(Debug, Clone)]
