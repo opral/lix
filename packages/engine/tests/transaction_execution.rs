@@ -18,6 +18,23 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     )
 }
 
+fn insert_many_key_values_sql(row_count: usize) -> String {
+    let mut rows = String::new();
+    for index in 0..row_count {
+        if index > 0 {
+            rows.push_str(", ");
+        }
+        rows.push_str(&format!(
+            "('bulk-{index}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"bulk-{index}\",\"value\":\"value-{index}\"}}', '1')"
+        ));
+    }
+    format!(
+        "INSERT INTO lix_internal_state_vtable (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES {rows}"
+    )
+}
+
 fn assert_blob_text(value: &Value, expected: &str) {
     match value {
         Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
@@ -224,6 +241,29 @@ simulation_test!(
             .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_blob_text(&result.rows[0][0], "before");
+    }
+);
+
+simulation_test!(
+    transaction_path_handles_large_vtable_insert_batch_without_sqlite_variable_overflow,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let sql = insert_many_key_values_sql(4_000);
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(&sql, &[]).await?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect("large vtable insert should not fail with SQL variable overflow");
     }
 );
 

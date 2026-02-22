@@ -50,6 +50,11 @@ const COMMIT_ANCESTRY_TABLE: &str = "lix_internal_commit_ancestry";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const GLOBAL_VERSION: &str = "global";
+const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
+const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
+const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
+const CHANGE_INSERT_PARAM_COLUMNS: usize = 9;
+const MATERIALIZED_INSERT_PARAM_COLUMNS: usize = 13;
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -1116,7 +1121,12 @@ async fn rewrite_tracked_rows_with_backend(
         ensure_registration(registrations, &row.schema_key);
     }
 
-    build_statements_from_generate_commit_result(commit_result, functions, placeholder_offset)
+    build_statements_from_generate_commit_result(
+        commit_result,
+        functions,
+        placeholder_offset,
+        backend.dialect(),
+    )
 }
 
 fn ensure_registration(registrations: &mut Vec<SchemaRegistration>, schema_key: &str) {
@@ -1491,7 +1501,7 @@ async fn build_update_followup_statements(
         },
         || functions.uuid_v7(),
     )?;
-    build_statements_from_generate_commit_result(commit_result, functions, 0)
+    build_statements_from_generate_commit_result(commit_result, functions, 0, executor.dialect())
 }
 
 async fn build_delete_followup_statements(
@@ -1632,7 +1642,7 @@ async fn build_delete_followup_statements(
         },
         || functions.uuid_v7(),
     )?;
-    build_statements_from_generate_commit_result(commit_result, functions, 0)
+    build_statements_from_generate_commit_result(commit_result, functions, 0, executor.dialect())
 }
 
 struct EffectiveScopeDeleteRow {
@@ -1986,6 +1996,7 @@ fn build_statements_from_generate_commit_result(
     commit_result: GenerateCommitResult,
     functions: &mut dyn LixFunctionProvider,
     placeholder_offset: usize,
+    dialect: SqlDialect,
 ) -> Result<StatementBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
@@ -2079,16 +2090,19 @@ fn build_statements_from_generate_commit_result(
     }
 
     if !snapshot_rows.is_empty() {
-        statements.push(make_insert_statement(
+        push_chunked_insert_statements(
+            &mut statements,
             SNAPSHOT_TABLE,
             vec![Ident::new("id"), Ident::new("content")],
             snapshot_rows,
             Some(build_snapshot_on_conflict()),
-        ));
+            max_rows_per_insert_for_dialect(dialect, SNAPSHOT_INSERT_PARAM_COLUMNS),
+        );
     }
 
     if !change_rows.is_empty() {
-        statements.push(make_insert_statement(
+        push_chunked_insert_statements(
+            &mut statements,
             CHANGE_TABLE,
             vec![
                 Ident::new("id"),
@@ -2103,12 +2117,14 @@ fn build_statements_from_generate_commit_result(
             ],
             change_rows,
             None,
-        ));
+            max_rows_per_insert_for_dialect(dialect, CHANGE_INSERT_PARAM_COLUMNS),
+        );
     }
 
     for (schema_key, rows) in materialized_by_schema {
         let table_name = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
-        statements.push(make_insert_statement(
+        push_chunked_insert_statements(
+            &mut statements,
             &table_name,
             vec![
                 Ident::new("entity_id"),
@@ -2127,7 +2143,8 @@ fn build_statements_from_generate_commit_result(
             ],
             rows,
             Some(build_materialized_on_conflict()),
-        ));
+            max_rows_per_insert_for_dialect(dialect, MATERIALIZED_INSERT_PARAM_COLUMNS),
+        );
     }
 
     append_commit_ancestry_statements(
@@ -2141,6 +2158,52 @@ fn build_statements_from_generate_commit_result(
         statements,
         params: statement_params,
     })
+}
+
+fn max_bind_parameters_for_dialect(dialect: SqlDialect) -> usize {
+    match dialect {
+        SqlDialect::Sqlite => SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT,
+        SqlDialect::Postgres => POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT,
+    }
+}
+
+fn max_rows_per_insert_for_dialect(dialect: SqlDialect, params_per_row: usize) -> usize {
+    (max_bind_parameters_for_dialect(dialect) / params_per_row).max(1)
+}
+
+fn push_chunked_insert_statements(
+    statements: &mut Vec<Statement>,
+    table: &str,
+    columns: Vec<Ident>,
+    rows: Vec<Vec<Expr>>,
+    on: Option<OnInsert>,
+    max_rows_per_statement: usize,
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    if rows.len() <= max_rows_per_statement {
+        statements.push(make_insert_statement(table, columns, rows, on));
+        return;
+    }
+
+    let mut chunk = Vec::with_capacity(max_rows_per_statement);
+    for row in rows {
+        chunk.push(row);
+        if chunk.len() == max_rows_per_statement {
+            statements.push(make_insert_statement(
+                table,
+                columns.clone(),
+                std::mem::take(&mut chunk),
+                on.clone(),
+            ));
+        }
+    }
+
+    if !chunk.is_empty() {
+        statements.push(make_insert_statement(table, columns, chunk, on));
+    }
 }
 
 fn append_commit_ancestry_statements(
@@ -3421,6 +3484,7 @@ mod tests {
             },
             &mut provider,
             0,
+            SqlDialect::Sqlite,
         )
         .expect("build statements");
 
@@ -3482,6 +3546,7 @@ mod tests {
             },
             &mut provider,
             0,
+            SqlDialect::Sqlite,
         )
         .expect("build statements");
 
@@ -3560,6 +3625,7 @@ mod tests {
             },
             &mut provider,
             0,
+            SqlDialect::Sqlite,
         )
         .expect("build statements");
 
