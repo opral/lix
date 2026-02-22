@@ -28,6 +28,7 @@ pub(crate) struct FileChangeDetectionRequest {
     pub version_id: String,
     pub before_path: Option<String>,
     pub after_path: Option<String>,
+    pub data_is_authoritative: bool,
     pub before_data: Option<Vec<u8>>,
     pub after_data: Vec<u8>,
 }
@@ -249,7 +250,24 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         }
 
         if after_uses_builtin_fallback {
-            let after_blob_hash = binary_blob_hash_hex(&write.after_data);
+            // Path-only writes (no authoritative data assignment) must not rewrite builtin
+            // blob refs to an "empty" hash when bytes are unknown/missing from prefetch.
+            // In that case, preserve existing fallback state unless we have real before bytes.
+            if !write.data_is_authoritative {
+                if write.before_data.is_none() && before_uses_builtin_fallback {
+                    continue;
+                }
+            }
+
+            let blob_bytes = if write.data_is_authoritative {
+                write.after_data.as_slice()
+            } else if let Some(before_data) = write.before_data.as_ref() {
+                before_data.as_slice()
+            } else {
+                continue;
+            };
+
+            let after_blob_hash = binary_blob_hash_hex(blob_bytes);
             let before_blob_hash = if before_uses_builtin_fallback {
                 load_builtin_binary_blob_ref_for_file(backend, &write.file_id, &write.version_id)
                     .await?
@@ -264,7 +282,7 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             let snapshot_content = serde_json::to_string(&BuiltinBinaryBlobRefSnapshot {
                 id: write.file_id.clone(),
                 blob_hash: after_blob_hash,
-                size_bytes: write.after_data.len() as u64,
+                size_bytes: blob_bytes.len() as u64,
             })
             .map_err(|error| LixError {
                 message: format!(
@@ -1375,18 +1393,20 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
         backend,
         &CelEvaluator::new(),
         "WITH target_commit_depth AS (\
-            SELECT MIN(depth) AS raw_depth \
-            FROM lix_state_history \
-            WHERE file_id = $1 \
-              AND root_commit_id = $3 \
-              AND commit_id = $4\
+            SELECT COALESCE((\
+              SELECT depth \
+              FROM lix_internal_commit_ancestry \
+              WHERE commit_id = $3 \
+                AND ancestor_id = $4 \
+              LIMIT 1\
+            ), $5) AS raw_depth\
          ) \
          SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
          FROM lix_state_history \
          WHERE file_id = $1 \
            AND plugin_key = $2 \
            AND root_commit_id = $3 \
-           AND depth >= COALESCE((SELECT raw_depth FROM target_commit_depth), $5) \
+           AND depth >= (SELECT raw_depth FROM target_commit_depth) \
          ORDER BY entity_id ASC, depth ASC",
         &params,
     )

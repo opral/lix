@@ -155,6 +155,77 @@ impl Engine {
         Ok(main_version_id)
     }
 
+    pub(crate) async fn seed_commit_ancestry(&self) -> Result<(), LixError> {
+        let ancestry_count_result = self
+            .backend
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_ancestry", &[])
+            .await?;
+        let ancestry_count =
+            read_scalar_count(&ancestry_count_result, "lix_internal_commit_ancestry count")?;
+        if ancestry_count > 0 {
+            return Ok(());
+        }
+
+        let commit_count_result = self
+            .backend
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_materialized_v1_lix_commit \
+                 WHERE schema_key = 'lix_commit' \
+                   AND version_id = 'global' \
+                   AND is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL",
+                &[],
+            )
+            .await?;
+        let commit_count = read_scalar_count(&commit_count_result, "lix_commit count")?;
+        if commit_count == 0 {
+            return Ok(());
+        }
+
+        self.backend
+            .execute(
+                "WITH RECURSIVE \
+                   commits AS ( \
+                     SELECT entity_id AS commit_id \
+                     FROM lix_internal_state_materialized_v1_lix_commit \
+                     WHERE schema_key = 'lix_commit' \
+                       AND version_id = 'global' \
+                       AND is_tombstone = 0 \
+                       AND snapshot_content IS NOT NULL \
+                   ), \
+                   edges AS ( \
+                     SELECT \
+                       lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
+                       lix_json_text(snapshot_content, 'child_id') AS child_id \
+                     FROM lix_internal_state_materialized_v1_lix_commit_edge \
+                     WHERE schema_key = 'lix_commit_edge' \
+                       AND version_id = 'global' \
+                       AND is_tombstone = 0 \
+                       AND snapshot_content IS NOT NULL \
+                       AND lix_json_text(snapshot_content, 'parent_id') IS NOT NULL \
+                       AND lix_json_text(snapshot_content, 'child_id') IS NOT NULL \
+                   ), \
+                   walk(commit_id, ancestor_id, depth) AS ( \
+                     SELECT c.commit_id, c.commit_id AS ancestor_id, 0 AS depth \
+                     FROM commits c \
+                     UNION ALL \
+                     SELECT w.commit_id, e.parent_id AS ancestor_id, w.depth + 1 AS depth \
+                     FROM walk w \
+                     JOIN edges e ON e.child_id = w.ancestor_id \
+                     WHERE w.depth < 512 \
+                   ) \
+                 INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+                 SELECT commit_id, ancestor_id, MIN(depth) AS depth \
+                 FROM walk \
+                 GROUP BY commit_id, ancestor_id",
+                &[],
+            )
+            .await?;
+
+        Ok(())
+    }
+
     pub(crate) async fn seed_boot_account(&self) -> Result<(), LixError> {
         let Some(account) = &self.boot_active_account else {
             return Ok(());
@@ -513,5 +584,24 @@ impl Engine {
         );
         self.backend.execute(&insert_sql, &[]).await?;
         Ok(())
+    }
+}
+
+fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, LixError> {
+    let value = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .ok_or_else(|| LixError {
+            message: format!("{label} query returned no rows"),
+        })?;
+    match value {
+        Value::Integer(number) => Ok(*number),
+        Value::Text(raw) => raw.parse::<i64>().map_err(|error| LixError {
+            message: format!("{label} query returned invalid integer '{raw}': {error}"),
+        }),
+        other => Err(LixError {
+            message: format!("{label} query returned non-integer value: {other:?}"),
+        }),
     }
 }
