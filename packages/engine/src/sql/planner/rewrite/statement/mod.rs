@@ -27,15 +27,15 @@ pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    match statement {
+    let logical_plan = match statement {
         Statement::Query(query) => {
             let semantics = LogicalStatementSemantics::QueryRead(read_semantics_for_query(&query));
             let rewritten = rewrite_query_with_backend_and_params(backend, *query, params).await?;
-            Ok(LogicalStatementPlan::new(
+            LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
                 semantics,
                 vec![LogicalStatementStep::Query(rewritten)],
-            ))
+            )
         }
         Statement::Explain {
             describe_alias,
@@ -79,11 +79,11 @@ where
                 }),
             };
 
-            Ok(LogicalStatementPlan::new(
+            LogicalStatementPlan::new(
                 LogicalStatementOperation::ExplainRead,
                 semantics,
                 vec![step],
-            ))
+            )
         }
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
             let Some(rewrite_output) = write::rewrite_backend_statement(
@@ -108,7 +108,7 @@ where
                 &rewrite_output.mutations,
                 &rewrite_output.update_validations,
             )?;
-            Ok(LogicalStatementPlan::new(
+            LogicalStatementPlan::new(
                 LogicalStatementOperation::CanonicalWrite,
                 LogicalStatementSemantics::CanonicalWrite,
                 rewrite_output
@@ -123,14 +123,16 @@ where
                 rewrite_output.postprocess,
                 rewrite_output.mutations,
                 rewrite_output.update_validations,
-            ))
+            )
         }
-        other => Ok(LogicalStatementPlan::new(
+        other => LogicalStatementPlan::new(
             LogicalStatementOperation::Passthrough,
             LogicalStatementSemantics::Passthrough,
             vec![LogicalStatementStep::Statement(other)],
-        )),
-    }
+        ),
+    };
+    logical_plan.validate_plan_shape()?;
+    Ok(logical_plan)
 }
 
 fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {

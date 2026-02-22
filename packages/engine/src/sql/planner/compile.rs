@@ -71,8 +71,6 @@ where
         &[],
     )
     .await?;
-    logical_plan.validate_plan_shape()?;
-
     if logical_plan.postprocess.is_some() && logical_plan.planned_statements.len() != 1 {
         return Err(LixError {
             message: "postprocess rewrites require a single statement".to_string(),
