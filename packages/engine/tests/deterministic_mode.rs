@@ -1,5 +1,6 @@
 mod support;
 
+use chrono::DateTime;
 use lix_engine::Value;
 use uuid::Uuid;
 
@@ -384,5 +385,46 @@ simulation_test!(
         Uuid::parse_str(uuid).expect("deterministic uuid to remain parseable after u32 overflow");
 
         assert_eq!(read_sequence_value(&engine).await, 4_294_967_296);
+    }
+);
+
+simulation_test!(
+    timestamp_shuffle_simulation_produces_non_monotonic_timestamps,
+    simulations = [timestamp_shuffle],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let before = read_sequence_value(&engine).await;
+        let mut millis = Vec::new();
+        for _ in 0..12 {
+            let result = engine.execute("SELECT lix_timestamp()", &[]).await.unwrap();
+            assert_eq!(result.rows.len(), 1);
+            let timestamp = match &result.rows[0][0] {
+                Value::Text(value) => value,
+                other => panic!("expected text timestamp, got {other:?}"),
+            };
+            let parsed =
+                DateTime::parse_from_rfc3339(timestamp).expect("timestamp should be valid RFC3339");
+            millis.push(parsed.timestamp_millis());
+        }
+
+        let mut found_non_monotonic_step = false;
+        for pair in millis.windows(2) {
+            if pair[1] < pair[0] {
+                found_non_monotonic_step = true;
+                break;
+            }
+        }
+        assert!(
+            found_non_monotonic_step,
+            "timestamp shuffle simulation should produce at least one out-of-order timestamp"
+        );
+
+        let after = read_sequence_value(&engine).await;
+        assert_eq!(after, before + 12);
     }
 );

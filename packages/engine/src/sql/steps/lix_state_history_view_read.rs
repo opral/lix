@@ -213,16 +213,13 @@ fn take_history_pushdown_predicates(
         let blocked_by_cross_bucket =
             part.has_bare_placeholder && has_cross_bucket_bare_placeholders;
         match part.extracted {
-            Some(ExtractedPredicate::Push(bucket, sql))
-                if !blocked_by_cross_bucket =>
+            Some(ExtractedPredicate::Push(bucket, sql)) if !blocked_by_cross_bucket => match bucket
             {
-                match bucket {
-                    HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
-                    HistoryPushdownBucket::Requested => pushdown.requested_predicates.push(sql),
-                    HistoryPushdownBucket::Cse => pushdown.cse_predicates.push(sql),
-                    HistoryPushdownBucket::Remaining => remaining.push(part.predicate),
-                }
-            }
+                HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
+                HistoryPushdownBucket::Requested => pushdown.requested_predicates.push(sql),
+                HistoryPushdownBucket::Cse => pushdown.cse_predicates.push(sql),
+                HistoryPushdownBucket::Remaining => remaining.push(part.predicate),
+            },
             Some(ExtractedPredicate::Push(HistoryPushdownBucket::Requested, _))
                 if blocked_by_cross_bucket =>
             {
