@@ -13,6 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_DIR = join(__dirname, "..");
 const OUTPUT_DIR = join(PACKAGE_DIR, "results");
 const DEFAULT_OUTPUT_PATH = join(OUTPUT_DIR, "fossil-vs-lix.bench.json");
+const DEFAULT_COMMIT_OUTPUT_PATH = join(OUTPUT_DIR, "fossil-vs-lix.commit.bench.json");
 const CACHE_ROOT = join(PACKAGE_DIR, ".cache");
 
 const DATASET_CLASSES = [
@@ -43,6 +44,24 @@ const LIX_STORAGE_TABLES = [
   "lix_internal_binary_file_version_ref",
 ];
 
+const LIX_COMMIT_TRACE_TABLES = [
+  "lix_internal_change",
+  "lix_internal_snapshot",
+  "lix_internal_binary_blob_manifest",
+  "lix_internal_binary_blob_manifest_chunk",
+  "lix_internal_binary_chunk_store",
+  "lix_internal_binary_file_version_ref",
+  "lix_internal_file_path_cache",
+  "lix_internal_state_untracked",
+  "lix_internal_commit_ancestry",
+  "lix_internal_state_materialized_v1_lix_file_descriptor",
+  "lix_internal_state_materialized_v1_lix_binary_blob_ref",
+  "lix_internal_state_materialized_v1_lix_commit",
+  "lix_internal_state_materialized_v1_lix_commit_edge",
+  "lix_internal_state_materialized_v1_lix_change_set_element",
+  "lix_internal_state_materialized_v1_lix_version_pointer",
+];
+
 const FOSSIL_STORAGE_TABLES = [
   "blob",
   "delta",
@@ -51,11 +70,14 @@ const FOSSIL_STORAGE_TABLES = [
   "filename",
 ];
 
+const FOSSIL_COMMIT_TRACE_TABLES = [...FOSSIL_STORAGE_TABLES, "plink", "tagxref"];
+
 const SQLITE_MAX_BIND_PARAMETERS = 32_766;
 const LIX_FILE_INSERT_PARAM_COUNT = 3;
 const LIX_FILE_UPDATE_PARAM_COUNT = 2;
 
 const CONFIG = {
+  scenario: parseScenario(process.env.BENCH_SCENARIO ?? "full"),
   target: parseTarget(process.env.BENCH_TARGET ?? "both"),
   filesPerClass: parsePositiveInt("BENCH_FILES_PER_CLASS", 12),
   updateRounds: parsePositiveInt("BENCH_UPDATE_ROUNDS", 3),
@@ -64,7 +86,11 @@ const CONFIG = {
   keepArtifacts: process.env.BENCH_KEEP_ARTIFACTS === "1",
   progress: parseBooleanFlag("BENCH_PROGRESS", true),
   progressSlices: parsePositiveInt("BENCH_PROGRESS_SLICES", 8),
-  outputPath: process.env.BENCH_RESULTS_PATH ?? DEFAULT_OUTPUT_PATH,
+  outputPath:
+    process.env.BENCH_RESULTS_PATH ??
+    (parseScenario(process.env.BENCH_SCENARIO ?? "full") === "commit"
+      ? DEFAULT_COMMIT_OUTPUT_PATH
+      : DEFAULT_OUTPUT_PATH),
 };
 
 const PATHS = {
@@ -77,7 +103,7 @@ const PATHS = {
 async function main() {
   const startedAt = new Date().toISOString();
   benchLog(
-    `start target=${CONFIG.target} files_per_class=${CONFIG.filesPerClass} update_rounds=${CONFIG.updateRounds} history_reads=${CONFIG.historyReads}`,
+    `start scenario=${CONFIG.scenario} target=${CONFIG.target} files_per_class=${CONFIG.filesPerClass} update_rounds=${CONFIG.updateRounds} history_reads=${CONFIG.historyReads}`,
   );
   const dataset = buildDataset({
     filesPerClass: CONFIG.filesPerClass,
@@ -96,6 +122,7 @@ async function main() {
     startedAt,
     config: {
       ...CONFIG,
+      scenario: String(CONFIG.scenario),
       target: String(CONFIG.target),
     },
     dataset: datasetSummary,
@@ -106,29 +133,56 @@ async function main() {
     comparison: null,
   };
 
-  if (CONFIG.target === "both" || CONFIG.target === "lix") {
-    benchLog("running target=lix");
-    const lixResult = await runLixBenchmark({
-      dataset: cloneDataset(dataset),
-      config: CONFIG,
-      dbPath: PATHS.lixDbPath,
-    });
-    report.targets.lix = lixResult;
-  }
+  if (CONFIG.scenario === "commit") {
+    if (CONFIG.target === "both" || CONFIG.target === "lix") {
+      benchLog("running target=lix");
+      const lixResult = await runLixCommitBenchmark({
+        dataset: cloneDataset(dataset),
+        config: CONFIG,
+        dbPath: PATHS.lixDbPath,
+      });
+      report.targets.lix = lixResult;
+    }
 
-  if (CONFIG.target === "both" || CONFIG.target === "fossil") {
-    benchLog("running target=fossil");
-    await ensureFossilAvailable();
-    const fossilResult = await runFossilBenchmark({
-      dataset: cloneDataset(dataset),
-      config: CONFIG,
-      paths: PATHS,
-    });
-    report.targets.fossil = fossilResult;
-  }
+    if (CONFIG.target === "both" || CONFIG.target === "fossil") {
+      benchLog("running target=fossil");
+      await ensureFossilAvailable();
+      const fossilResult = await runFossilCommitBenchmark({
+        dataset: cloneDataset(dataset),
+        config: CONFIG,
+        paths: PATHS,
+      });
+      report.targets.fossil = fossilResult;
+    }
 
-  if (report.targets.lix && report.targets.fossil) {
-    report.comparison = buildComparison(report.targets.lix, report.targets.fossil);
+    if (report.targets.lix && report.targets.fossil) {
+      report.comparison = buildCommitComparison(report.targets.lix, report.targets.fossil);
+    }
+  } else {
+    if (CONFIG.target === "both" || CONFIG.target === "lix") {
+      benchLog("running target=lix");
+      const lixResult = await runLixBenchmark({
+        dataset: cloneDataset(dataset),
+        config: CONFIG,
+        dbPath: PATHS.lixDbPath,
+      });
+      report.targets.lix = lixResult;
+    }
+
+    if (CONFIG.target === "both" || CONFIG.target === "fossil") {
+      benchLog("running target=fossil");
+      await ensureFossilAvailable();
+      const fossilResult = await runFossilBenchmark({
+        dataset: cloneDataset(dataset),
+        config: CONFIG,
+        paths: PATHS,
+      });
+      report.targets.fossil = fossilResult;
+    }
+
+    if (report.targets.lix && report.targets.fossil) {
+      report.comparison = buildComparison(report.targets.lix, report.targets.fossil);
+    }
   }
 
   await writeFile(CONFIG.outputPath, JSON.stringify(report, null, 2) + "\n", "utf8");
@@ -459,6 +513,198 @@ async function runFossilBenchmark(args) {
   };
 }
 
+async function runLixCommitBenchmark(args) {
+  const { dataset, config, dbPath } = args;
+  await mkdir(dirname(dbPath), { recursive: true });
+  await rm(dbPath, { force: true });
+  await rm(`${dbPath}-wal`, { force: true });
+  await rm(`${dbPath}-shm`, { force: true });
+
+  const seedLix = await openLixAtPath(dbPath, true);
+  await safeClose(seedLix);
+
+  // Setup baseline history with one ingest commit, then measure one update commit.
+  let lix = await openLixAtPath(dbPath, false);
+  try {
+    benchLog(`lix commit-setup ingest start files=${dataset.length}`);
+    await runLixIngest({ lix, dataset });
+    benchLog("lix commit-setup ingest done");
+  } finally {
+    await safeClose(lix);
+  }
+
+  const beforeCommitBytes = await sqliteArtifactBytes(dbPath);
+  const beforeRows = collectSqliteRowCounts(dbPath, LIX_COMMIT_TRACE_TABLES);
+  const commitPlan = buildLixSingleCommitUpdatePlan({
+    dataset,
+    maxBlobBytes: config.maxBlobBytes,
+    round: 0,
+  });
+
+  const sqlTraceCollector = createSqlTraceCollector();
+  lix = await openLixAtPathWithSqlTrace(dbPath, false, sqlTraceCollector);
+  let commitWorkload;
+  try {
+    sqlTraceCollector.calls.length = 0;
+    const opStarted = performance.now();
+    await lix.execute(commitPlan.sql, commitPlan.params);
+    const wallMs = performance.now() - opStarted;
+    commitWorkload = toWorkloadMetrics({
+      name: "single_commit",
+      operations: 1,
+      bytesWritten: commitPlan.bytesWritten,
+      bytesRead: 0,
+      wallMs,
+      samples: [wallMs],
+    });
+  } finally {
+    await safeClose(lix);
+  }
+
+  const afterCommitBytes = await sqliteArtifactBytes(dbPath);
+  const afterRows = collectSqliteRowCounts(dbPath, LIX_COMMIT_TRACE_TABLES);
+  const rowDelta = diffRowCounts(beforeRows, afterRows);
+
+  return {
+    target: "lix",
+    artifactPath: dbPath,
+    workloads: [commitWorkload],
+    storage: {
+      beforeCommitBytes,
+      afterCommitBytes,
+      commitByteDelta: afterCommitBytes - beforeCommitBytes,
+    },
+    trace: {
+      sql: summarizeSqlTrace(sqlTraceCollector.calls),
+      tableRowsBefore: beforeRows,
+      tableRowsAfter: afterRows,
+      tableRowDelta: rowDelta,
+      commitRowsDelta: rowDelta.lix_internal_state_materialized_v1_lix_commit ?? null,
+      sqliteBytes: {
+        before: beforeCommitBytes,
+        after: afterCommitBytes,
+        delta: afterCommitBytes - beforeCommitBytes,
+      },
+    },
+  };
+}
+
+async function runFossilCommitBenchmark(args) {
+  const { dataset, config, paths } = args;
+  benchLog(`fossil init repo=${paths.fossilRepoPath}`);
+  await rm(paths.fossilRoot, { recursive: true, force: true });
+  await mkdir(paths.fossilCheckoutPath, { recursive: true });
+
+  await runFossilCommand(["init", paths.fossilRepoPath], { cwd: paths.fossilRoot });
+  await runFossilCommand(["open", paths.fossilRepoPath], { cwd: paths.fossilCheckoutPath });
+  await configureFossilCheckout(paths.fossilCheckoutPath);
+
+  // Setup baseline history with one ingest commit.
+  benchLog(`fossil commit-setup ingest start files=${dataset.length}`);
+  await runFossilIngest({
+    checkoutPath: paths.fossilCheckoutPath,
+    dataset,
+  });
+  benchLog("fossil commit-setup ingest done");
+
+  // Prepare one commit worth of changes in the working checkout.
+  let bytesWritten = 0;
+  for (let index = 0; index < dataset.length; index++) {
+    const file = dataset[index];
+    const nextData = mutateData(file, 0, index, config.maxBlobBytes);
+    const destination = join(paths.fossilCheckoutPath, file.repoPath);
+    await writeFile(destination, nextData);
+    bytesWritten += nextData.byteLength;
+    file.data = nextData;
+  }
+
+  const beforeCommitBytes = await sqliteArtifactBytes(paths.fossilRepoPath);
+  const beforeRows = collectSqliteRowCounts(paths.fossilRepoPath, FOSSIL_COMMIT_TRACE_TABLES);
+
+  const opStarted = performance.now();
+  const commitResult = await runFossilCommit(paths.fossilCheckoutPath, "single commit bench");
+  const wallMs = performance.now() - opStarted;
+  const commitWorkload = toWorkloadMetrics({
+    name: "single_commit",
+    operations: 1,
+    bytesWritten,
+    bytesRead: 0,
+    wallMs,
+    samples: [wallMs],
+  });
+
+  const afterCommitBytes = await sqliteArtifactBytes(paths.fossilRepoPath);
+  const afterRows = collectSqliteRowCounts(paths.fossilRepoPath, FOSSIL_COMMIT_TRACE_TABLES);
+  const rowDelta = diffRowCounts(beforeRows, afterRows);
+
+  await runFossilCommand(["close", "--force"], {
+    cwd: paths.fossilCheckoutPath,
+    tolerateFailure: true,
+  });
+
+  return {
+    target: "fossil",
+    artifactPath: paths.fossilRepoPath,
+    workloads: [commitWorkload],
+    storage: {
+      beforeCommitBytes,
+      afterCommitBytes,
+      commitByteDelta: afterCommitBytes - beforeCommitBytes,
+    },
+    trace: {
+      tableRowsBefore: beforeRows,
+      tableRowsAfter: afterRows,
+      tableRowDelta: rowDelta,
+      commitRowsDelta: rowDelta.event ?? null,
+      sqliteBytes: {
+        before: beforeCommitBytes,
+        after: afterCommitBytes,
+        delta: afterCommitBytes - beforeCommitBytes,
+      },
+      commitStdoutBytes: Buffer.byteLength(String(commitResult.stdout ?? ""), "utf8"),
+      commitStderrBytes: Buffer.byteLength(String(commitResult.stderr ?? ""), "utf8"),
+    },
+  };
+}
+
+function buildLixSingleCommitUpdatePlan(args) {
+  const { dataset, maxBlobBytes, round } = args;
+  const maxRowsPerBatch = Math.max(
+    1,
+    Math.floor(SQLITE_MAX_BIND_PARAMETERS / LIX_FILE_UPDATE_PARAM_COUNT),
+  );
+  if (dataset.length > maxRowsPerBatch) {
+    throw new Error(
+      `single_commit scenario requires one UPDATE batch; dataset has ${dataset.length} rows but SQLite bind-safe limit is ${maxRowsPerBatch}. Reduce BENCH_FILES_PER_CLASS.`,
+    );
+  }
+
+  const whenClauses = [];
+  const whereIds = [];
+  const params = [];
+  let paramIndex = 1;
+  let bytesWritten = 0;
+  for (let index = 0; index < dataset.length; index++) {
+    const file = dataset[index];
+    const nextData = mutateData(file, round, index, maxBlobBytes);
+    whenClauses.push(`WHEN ?${paramIndex} THEN ?${paramIndex + 1}`);
+    whereIds.push(`?${paramIndex}`);
+    params.push(file.id, nextData);
+    paramIndex += LIX_FILE_UPDATE_PARAM_COUNT;
+    bytesWritten += nextData.byteLength;
+    file.data = nextData;
+  }
+
+  return {
+    bytesWritten,
+    sql:
+      "UPDATE lix_file " +
+      `SET data = CASE id ${whenClauses.join(" ")} ELSE data END ` +
+      `WHERE id IN (${whereIds.join(", ")})`,
+    params,
+  };
+}
+
 async function runFossilIngest(args) {
   const { checkoutPath, dataset } = args;
   const samples = [];
@@ -585,14 +831,13 @@ async function runFossilCommit(checkoutPath, message) {
     "bench",
   ];
   try {
-    await runFossilCommand(argsWithUserOverride, { cwd: checkoutPath });
+    return await runFossilCommand(argsWithUserOverride, { cwd: checkoutPath });
   } catch (error) {
     const errorMessage = String(error?.message ?? error);
     if (errorMessage.includes("--user-override")) {
-      await runFossilCommand(["commit", "-m", message, "--hash", "--no-warnings"], {
+      return await runFossilCommand(["commit", "-m", message, "--hash", "--no-warnings"], {
         cwd: checkoutPath,
       });
-      return;
     }
     throw error;
   }
@@ -792,6 +1037,25 @@ function buildComparison(lix, fossil) {
   };
 }
 
+function buildCommitComparison(lix, fossil) {
+  const lixWorkload = indexByName(lix.workloads);
+  const fossilWorkload = indexByName(fossil.workloads);
+  return {
+    singleCommitOpsRatioLixOverFossil: ratio(
+      lixWorkload.single_commit?.ops_per_sec ?? 0,
+      fossilWorkload.single_commit?.ops_per_sec ?? 0,
+    ),
+    singleCommitWallMsRatioLixOverFossil: ratio(
+      lixWorkload.single_commit?.wall_ms ?? 0,
+      fossilWorkload.single_commit?.wall_ms ?? 0,
+    ),
+    commitByteDeltaRatioLixOverFossil: ratio(
+      lix.storage?.commitByteDelta ?? 0,
+      fossil.storage?.commitByteDelta ?? 0,
+    ),
+  };
+}
+
 function indexByName(workloads) {
   const out = {};
   for (const workload of workloads) {
@@ -903,6 +1167,172 @@ async function openLixAtPath(dbPath, seedDeterministic) {
         ]
       : undefined,
   });
+}
+
+async function openLixAtPathWithSqlTrace(dbPath, seedDeterministic, traceCollector) {
+  const backend = await createBetterSqlite3Backend({ filename: dbPath });
+  const tracedBackend = wrapBackendWithSqlTrace(backend, traceCollector);
+  return openLix({
+    backend: tracedBackend,
+    keyValues: seedDeterministic
+      ? [
+          {
+            key: "lix_deterministic_mode",
+            value: { enabled: true },
+            lixcol_version_id: "global",
+          },
+        ]
+      : undefined,
+  });
+}
+
+function wrapBackendWithSqlTrace(backend, traceCollector) {
+  return {
+    dialect: backend.dialect,
+    async execute(sql, params) {
+      const started = performance.now();
+      const result = await backend.execute(sql, params);
+      traceCollector.calls.push({
+        source: "backend",
+        sql,
+        paramsCount: params.length,
+        elapsedMs: performance.now() - started,
+      });
+      return result;
+    },
+    async beginTransaction() {
+      const tx = await backend.beginTransaction();
+      return {
+        dialect: tx.dialect,
+        async execute(sql, params) {
+          const started = performance.now();
+          const result = await tx.execute(sql, params);
+          traceCollector.calls.push({
+            source: "transaction",
+            sql,
+            paramsCount: params.length,
+            elapsedMs: performance.now() - started,
+          });
+          return result;
+        },
+        async commit() {
+          return tx.commit();
+        },
+        async rollback() {
+          return tx.rollback();
+        },
+      };
+    },
+    async exportSnapshot() {
+      return backend.exportSnapshot();
+    },
+    async close() {
+      if (typeof backend.close === "function") {
+        await backend.close();
+      }
+    },
+  };
+}
+
+function createSqlTraceCollector() {
+  return { calls: [] };
+}
+
+function summarizeSqlTrace(calls) {
+  const byType = {
+    create_table: 0,
+    create_index: 0,
+    select: 0,
+    insert: 0,
+    update: 0,
+    delete: 0,
+    other: 0,
+  };
+  const statementMap = new Map();
+  const durations = [];
+  let totalSqlMs = 0;
+
+  for (const call of calls) {
+    const type = classifySqlType(call.sql);
+    byType[type] = (byType[type] ?? 0) + 1;
+    totalSqlMs += call.elapsedMs;
+    durations.push(call.elapsedMs);
+    const key = normalizeSqlForTrace(call.sql);
+    const existing = statementMap.get(key) ?? { count: 0, totalMs: 0 };
+    existing.count += 1;
+    existing.totalMs += call.elapsedMs;
+    statementMap.set(key, existing);
+  }
+
+  const topStatements = [...statementMap.entries()]
+    .map(([sql, value]) => ({
+      sql,
+      count: value.count,
+      total_ms: value.totalMs,
+    }))
+    .sort((a, b) => b.total_ms - a.total_ms || b.count - a.count)
+    .slice(0, 12);
+
+  return {
+    totalCalls: calls.length,
+    totalSqlMs,
+    p50Ms: percentile(durations, 0.5),
+    p95Ms: percentile(durations, 0.95),
+    byType,
+    topStatements,
+  };
+}
+
+function classifySqlType(sql) {
+  const normalized = String(sql).trim().toUpperCase();
+  if (normalized.startsWith("CREATE TABLE")) return "create_table";
+  if (normalized.startsWith("CREATE INDEX")) return "create_index";
+  if (normalized.startsWith("SELECT") || normalized.startsWith("WITH")) return "select";
+  if (normalized.startsWith("INSERT")) return "insert";
+  if (normalized.startsWith("UPDATE")) return "update";
+  if (normalized.startsWith("DELETE")) return "delete";
+  return "other";
+}
+
+function normalizeSqlForTrace(sql) {
+  return String(sql).replace(/\s+/g, " ").trim().slice(0, 220);
+}
+
+function collectSqliteRowCounts(dbPath, relationNames) {
+  const rows = {};
+  let db;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    for (const relationName of relationNames) {
+      try {
+        const row = db.prepare(`SELECT COUNT(*) AS c FROM "${relationName}"`).get();
+        rows[relationName] = Number(row?.c ?? 0);
+      } catch {
+        rows[relationName] = null;
+      }
+    }
+  } catch {
+    for (const relationName of relationNames) {
+      rows[relationName] = null;
+    }
+  } finally {
+    if (db) {
+      db.close();
+    }
+  }
+  return rows;
+}
+
+function diffRowCounts(before, after) {
+  const output = {};
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  for (const key of keys) {
+    const beforeValue = before[key];
+    const afterValue = after[key];
+    output[key] =
+      Number.isFinite(beforeValue) && Number.isFinite(afterValue) ? afterValue - beforeValue : null;
+  }
+  return output;
 }
 
 function fileBytesOrZero(path) {
@@ -1060,6 +1490,14 @@ function parseBooleanFlag(name, defaultValue) {
   throw new Error(`${name} must be a boolean-like value, got "${raw}"`);
 }
 
+function parseScenario(value) {
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === "full" || normalized === "commit") {
+    return normalized;
+  }
+  throw new Error(`BENCH_SCENARIO must be one of full|commit, got "${value}"`);
+}
+
 function parseTarget(value) {
   const normalized = String(value).trim().toLowerCase();
   if (normalized === "lix" || normalized === "fossil" || normalized === "both") {
@@ -1093,32 +1531,43 @@ async function safeClose(lix) {
 }
 
 function printSummary(report, outputPath) {
+  const commitScenario = report.config?.scenario === "commit";
   const lines = [];
   lines.push("");
-  lines.push("Fossil vs Lix benchmark");
+  lines.push(commitScenario ? "Fossil vs Lix single-commit benchmark" : "Fossil vs Lix benchmark");
   lines.push(`dataset files=${report.dataset.files} total_bytes=${report.dataset.totalBytes}`);
 
   if (report.targets.lix) {
-    lines.push(formatTargetSummary(report.targets.lix));
+    lines.push(commitScenario ? formatCommitTargetSummary(report.targets.lix) : formatTargetSummary(report.targets.lix));
   }
   if (report.targets.fossil) {
-    lines.push(formatTargetSummary(report.targets.fossil));
+    lines.push(commitScenario ? formatCommitTargetSummary(report.targets.fossil) : formatTargetSummary(report.targets.fossil));
   }
   if (report.comparison) {
     lines.push("");
     lines.push("comparison ratios (lix / fossil)");
-    lines.push(
-      `ingest=${report.comparison.ingestOpsRatioLixOverFossil.toFixed(3)} ` +
-        `update=${report.comparison.updateOpsRatioLixOverFossil.toFixed(3)} ` +
-        `read_latest=${report.comparison.latestReadOpsRatioLixOverFossil.toFixed(3)} ` +
-        `read_history=${report.comparison.historyReadOpsRatioLixOverFossil.toFixed(3)}`,
-    );
-    lines.push(
-      `storage_amp_ratio=${report.comparison.storageAmpRatioLixOverFossil.toFixed(3)}`,
-    );
-    lines.push(
-      `storage_amp_after_reads_ratio=${report.comparison.storageAmpAfterReadsRatioLixOverFossil.toFixed(3)}`,
-    );
+    if (commitScenario) {
+      lines.push(
+        `single_commit_ops=${report.comparison.singleCommitOpsRatioLixOverFossil.toFixed(3)} ` +
+          `single_commit_wall_ms=${report.comparison.singleCommitWallMsRatioLixOverFossil.toFixed(3)}`,
+      );
+      lines.push(
+        `commit_byte_delta_ratio=${report.comparison.commitByteDeltaRatioLixOverFossil.toFixed(3)}`,
+      );
+    } else {
+      lines.push(
+        `ingest=${report.comparison.ingestOpsRatioLixOverFossil.toFixed(3)} ` +
+          `update=${report.comparison.updateOpsRatioLixOverFossil.toFixed(3)} ` +
+          `read_latest=${report.comparison.latestReadOpsRatioLixOverFossil.toFixed(3)} ` +
+          `read_history=${report.comparison.historyReadOpsRatioLixOverFossil.toFixed(3)}`,
+      );
+      lines.push(
+        `storage_amp_ratio=${report.comparison.storageAmpRatioLixOverFossil.toFixed(3)}`,
+      );
+      lines.push(
+        `storage_amp_after_reads_ratio=${report.comparison.storageAmpAfterReadsRatioLixOverFossil.toFixed(3)}`,
+      );
+    }
   }
 
   lines.push("");
@@ -1137,6 +1586,21 @@ function formatTargetSummary(target) {
     `  read_history ops/s=${(byName.read_history?.ops_per_sec ?? 0).toFixed(2)}\n` +
     `  storage_amp_after_update=${(target.storage.storageAmpAfterUpdate ?? 0).toFixed(3)}\n` +
     `  storage_amp_after_reads=${(target.storage.storageAmpAfterReads ?? 0).toFixed(3)}\n` +
+    `  artifact=${target.artifactPath}`
+  );
+}
+
+function formatCommitTargetSummary(target) {
+  const byName = indexByName(target.workloads);
+  const commit = byName.single_commit;
+  const traceSqlCalls = target.trace?.sql?.totalCalls;
+  return (
+    "" +
+    `\n${target.target}\n` +
+    `  single_commit ops/s=${(commit?.ops_per_sec ?? 0).toFixed(2)}\n` +
+    `  single_commit wall_ms=${(commit?.wall_ms ?? 0).toFixed(2)}\n` +
+    `  commit_byte_delta=${target.storage?.commitByteDelta ?? 0}\n` +
+    `  trace_sql_calls=${traceSqlCalls ?? "n/a"}\n` +
     `  artifact=${target.artifactPath}`
   );
 }

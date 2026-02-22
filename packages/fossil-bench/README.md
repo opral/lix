@@ -13,12 +13,14 @@ Lix ingest and update use batched SQL writes (`INSERT` and `UPDATE ... CASE`) so
 
 ```bash
 pnpm -C packages/fossil-bench run bench
+pnpm -C packages/fossil-bench run bench:commit
 ```
 
 Quick smoke run:
 
 ```bash
 pnpm -C packages/fossil-bench run bench:quick
+pnpm -C packages/fossil-bench run bench:commit:quick
 ```
 
 Only one target:
@@ -40,10 +42,12 @@ Use `bench:lix-only:full` for the full default profile.
 ## Output
 
 - `packages/fossil-bench/results/fossil-vs-lix.bench.json`
+- `packages/fossil-bench/results/fossil-vs-lix.commit.bench.json` (when `BENCH_SCENARIO=commit`)
 
 ## Useful env vars
 
 - `BENCH_TARGET` = `both` | `lix` | `fossil` (default `both`)
+- `BENCH_SCENARIO` = `full` | `commit` (default `full`)
 - `BENCH_FILES_PER_CLASS` (default `12`)
 - `BENCH_UPDATE_ROUNDS` (default `3`)
 - `BENCH_HISTORY_READS` (default `24`)

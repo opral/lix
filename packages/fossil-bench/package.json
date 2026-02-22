@@ -8,6 +8,8 @@
     "bench": "pnpm --filter js-sdk run build && pnpm --filter js-sdk run build:dist && pnpm --filter @lix-js/better-sqlite3-backend run build && pnpm run bench:run",
     "bench:run": "node ./src/fossil-vs-lix.bench.js",
     "bench:quick": "BENCH_FILES_PER_CLASS=4 BENCH_UPDATE_ROUNDS=1 BENCH_HISTORY_READS=12 pnpm run bench",
+    "bench:commit": "BENCH_SCENARIO=commit pnpm run bench",
+    "bench:commit:quick": "BENCH_SCENARIO=commit BENCH_FILES_PER_CLASS=4 pnpm run bench",
     "bench:lix-only": "BENCH_TARGET=lix BENCH_FILES_PER_CLASS=2 BENCH_UPDATE_ROUNDS=1 BENCH_HISTORY_READS=6 pnpm run bench",
     "bench:lix-only:full": "BENCH_TARGET=lix pnpm run bench",
     "bench:fossil-only": "BENCH_TARGET=fossil pnpm run bench"
