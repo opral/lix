@@ -8,7 +8,7 @@ use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::sql::lowering::lower_statement;
-use crate::sql::steps::{lix_version_view_read, vtable_read};
+use crate::sql::read_views::{lix_version_view_read, vtable_read};
 use crate::sql::{
     bind_sql_with_state, escape_sql_string, object_name_matches, resolve_expr_cell_with_state,
     PlaceholderState, RowSourceResolver,

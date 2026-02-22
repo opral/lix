@@ -6,7 +6,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
-use crate::sql::steps::state_pushdown::{
+use crate::sql::read_views::state_pushdown::{
     select_projects_count_star, RankedPushdownPredicate, StateColumn, StatePushdown,
 };
 use crate::sql::{escape_sql_string, object_name_matches, parse_single_query, quote_ident};

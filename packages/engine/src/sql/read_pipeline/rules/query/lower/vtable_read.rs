@@ -1,6 +1,6 @@
 use sqlparser::ast::Query;
 
-use crate::sql::steps::vtable_read;
+use crate::sql::read_views::vtable_read;
 use crate::{LixBackend, LixError};
 
 pub(crate) fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {

@@ -9,7 +9,7 @@ use crate::account::{
     active_account_storage_version_id,
 };
 use crate::sql::lowering::lower_statement;
-use crate::sql::steps::{lix_active_account_view_read, vtable_read};
+use crate::sql::read_views::{lix_active_account_view_read, vtable_read};
 use crate::sql::{
     bind_sql_with_state, escape_sql_string, object_name_matches, resolve_insert_rows,
     PlaceholderState,

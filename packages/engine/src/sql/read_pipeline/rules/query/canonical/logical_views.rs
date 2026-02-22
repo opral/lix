@@ -1,12 +1,13 @@
 use sqlparser::ast::Query;
 
 use crate::sql::read_pipeline::registry::QueryRuleOutcome;
+use crate::sql::read_views::{
+    lix_active_account_view_read, lix_active_version_view_read, lix_state_by_version_view_read,
+    lix_state_history_view_read, lix_state_view_read, lix_version_view_read,
+};
 use crate::{LixBackend, LixError, Value};
 
-use super::{
-    entity_views, filesystem_views, lix_active_account, lix_active_version, lix_state,
-    lix_state_by_version, lix_state_history, lix_version,
-};
+use super::{entity_views, filesystem_views};
 
 pub(crate) fn rewrite_query(query: Query, params: &[Value]) -> Result<QueryRuleOutcome, LixError> {
     let mut current = query;
@@ -59,17 +60,17 @@ fn apply_standard_logical_view_rewrites(
     current: &mut Query,
     changed: &mut bool,
 ) -> Result<(), LixError> {
-    let rewritten = lix_version::rewrite_query(current.clone())?;
+    let rewritten = lix_version_view_read::rewrite_query(current.clone())?;
     *changed |= apply_step(current, rewritten);
-    let rewritten = lix_active_account::rewrite_query(current.clone())?;
+    let rewritten = lix_active_account_view_read::rewrite_query(current.clone())?;
     *changed |= apply_step(current, rewritten);
-    let rewritten = lix_active_version::rewrite_query(current.clone())?;
+    let rewritten = lix_active_version_view_read::rewrite_query(current.clone())?;
     *changed |= apply_step(current, rewritten);
-    let rewritten = lix_state::rewrite_query(current.clone())?;
+    let rewritten = lix_state_view_read::rewrite_query(current.clone())?;
     *changed |= apply_step(current, rewritten);
-    let rewritten = lix_state_by_version::rewrite_query(current.clone())?;
+    let rewritten = lix_state_by_version_view_read::rewrite_query(current.clone())?;
     *changed |= apply_step(current, rewritten);
-    let rewritten = lix_state_history::rewrite_query(current.clone())?;
+    let rewritten = lix_state_history_view_read::rewrite_query(current.clone())?;
     *changed |= apply_step(current, rewritten);
     Ok(())
 }

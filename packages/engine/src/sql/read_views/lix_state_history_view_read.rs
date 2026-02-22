@@ -7,7 +7,7 @@ use sqlparser::ast::{
 };
 
 use crate::backend::SqlDialect;
-use crate::sql::steps::state_pushdown::select_supports_count_fast_path;
+use crate::sql::read_views::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
     bind_sql_with_state, default_alias, escape_sql_string, object_name_matches, parse_single_query,
     parse_sql_statements_with_dialect, rewrite_query_with_select_rewriter, PlaceholderState,

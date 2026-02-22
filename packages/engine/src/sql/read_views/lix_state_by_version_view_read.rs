@@ -1,16 +1,16 @@
 use sqlparser::ast::{Expr, GroupByExpr, Query, Select, SelectItem, TableFactor, TableWithJoins};
 
-use crate::sql::steps::state_pushdown::{
+use crate::sql::read_views::state_pushdown::{
     select_supports_count_fast_path, take_pushdown_predicates,
 };
-use crate::sql::steps::vtable_read::build_effective_state_active_query;
+use crate::sql::read_views::vtable_read::build_effective_state_by_version_query;
 use crate::sql::{
     default_alias, expr_references_column_name, object_name_matches,
     rewrite_query_with_select_rewriter, ColumnReferenceOptions,
 };
 use crate::LixError;
 
-const LIX_STATE_VIEW_NAME: &str = "lix_state";
+const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     rewrite_query_with_select_rewriter(query, &mut rewrite_select)
@@ -72,41 +72,41 @@ fn rewrite_table_factor(
 ) -> Result<(), LixError> {
     match relation {
         TableFactor::Table { name, alias, .. }
-            if object_name_matches(name, LIX_STATE_VIEW_NAME) =>
+            if object_name_matches(name, LIX_STATE_BY_VERSION_VIEW_NAME) =>
         {
             let relation_name = alias
                 .as_ref()
                 .map(|value| value.name.value.clone())
-                .unwrap_or_else(|| LIX_STATE_VIEW_NAME.to_string());
+                .unwrap_or_else(|| LIX_STATE_BY_VERSION_VIEW_NAME.to_string());
             let pushdown = take_pushdown_predicates(selection, &relation_name, allow_unqualified);
-            let derived_query = build_effective_state_active_query(
+            let derived_query = build_effective_state_by_version_query(
                 &pushdown,
                 count_fast_path && selection.is_none(),
                 include_commit_mapping,
             )?;
-            let derived_alias = alias.clone().or_else(|| Some(default_lix_state_alias()));
+            let derived_alias = alias
+                .clone()
+                .or_else(|| Some(default_lix_state_by_version_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,
                 subquery: Box::new(derived_query),
                 alias: derived_alias,
             };
             *changed = true;
+            Ok(())
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => {
-            rewrite_table_with_joins(
-                table_with_joins,
-                selection,
-                allow_unqualified,
-                count_fast_path,
-                include_commit_mapping,
-                changed,
-            )?;
-        }
-        _ => {}
+        } => rewrite_table_with_joins(
+            table_with_joins,
+            selection,
+            allow_unqualified,
+            count_fast_path,
+            include_commit_mapping,
+            changed,
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn select_requires_commit_mapping(select: &Select) -> bool {
@@ -167,8 +167,8 @@ fn expr_requires_commit_mapping(expr: &Expr) -> bool {
         || expr_references_column_name(expr, "lixcol_commit_id", options)
 }
 
-fn default_lix_state_alias() -> sqlparser::ast::TableAlias {
-    default_alias(LIX_STATE_VIEW_NAME)
+fn default_lix_state_by_version_alias() -> sqlparser::ast::TableAlias {
+    default_alias(LIX_STATE_BY_VERSION_VIEW_NAME)
 }
 
 #[cfg(test)]
@@ -179,9 +179,10 @@ mod tests {
     use sqlparser::parser::Parser;
 
     #[test]
-    fn pushes_file_id_and_plugin_key_filters_into_lix_state_derived_query() {
+    fn pushes_alias_qualified_filters_into_lix_state_by_version_derived_query() {
         let query = parse_query(
-            "SELECT COUNT(*) FROM lix_state WHERE file_id = ? AND plugin_key = 'plugin_json'",
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.file_id = ?1 AND sv.plugin_key = 'plugin_json'",
         );
 
         let rewritten = rewrite_query(query)
@@ -189,9 +190,9 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.file_id = ?"));
+        assert!(sql.contains("s.file_id = ?1"));
         assert!(sql.contains("ranked.plugin_key = 'plugin_json'"));
-        assert!(!sql.contains("WHERE file_id = ?"));
+        assert!(!sql.contains("sv.file_id = ?1"));
         assert!(!sql.contains("commit_by_version"));
         assert!(!sql.contains("change_set_element_by_version"));
         assert!(!sql.contains("change_commit_by_change_id"));
@@ -199,8 +200,10 @@ mod tests {
 
     #[test]
     fn does_not_push_down_bare_placeholders_when_it_would_reorder_bindings() {
-        let query =
-            parse_query("SELECT COUNT(*) FROM lix_state WHERE plugin_key = ? AND file_id = ?");
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.plugin_key = ? AND sv.file_id = ?",
+        );
 
         let rewritten = rewrite_query(query)
             .expect("rewrite should succeed")
@@ -209,17 +212,125 @@ mod tests {
 
         assert!(!sql.contains("ranked.plugin_key = ?"));
         assert!(!sql.contains("s.file_id = ?"));
-        assert!(sql.contains("plugin_key = ?"));
-        assert!(sql.contains("file_id = ?"));
+        assert!(sql.contains("sv.plugin_key = ?"));
+        assert!(sql.contains("sv.file_id = ?"));
+    }
+
+    #[test]
+    fn pushes_version_id_eq_into_lix_state_by_version_source() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' AND sv.version_id = 'bench-v-023'",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("FROM version_descriptor WHERE version_id = 'bench-v-023'"));
+        assert!(sql.contains("FROM lix_internal_state_vtable WHERE version_id = 'bench-v-023'"));
+        assert!(!sql.contains("FROM all_target_versions"));
+        assert!(!sql.contains("ranked.version_id = 'bench-v-023'"));
+        assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
+    }
+
+    #[test]
+    fn pushes_version_id_in_list_into_lix_state_by_version_source() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' \
+               AND sv.version_id IN ('bench-v-022', 'bench-v-023')",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains(
+            "FROM version_descriptor WHERE version_id IN ('bench-v-022', 'bench-v-023')"
+        ));
+        assert!(sql.contains(
+            "FROM lix_internal_state_vtable WHERE version_id IN ('bench-v-022', 'bench-v-023')"
+        ));
+        assert!(!sql.contains("FROM all_target_versions"));
+        assert!(!sql.contains("ranked.version_id IN ('bench-v-022', 'bench-v-023')"));
+        assert!(!sql.contains("sv.version_id IN ('bench-v-022', 'bench-v-023')"));
+    }
+
+    #[test]
+    fn pushes_version_id_in_subquery_into_lix_state_by_version_source() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' \
+               AND sv.version_id IN ( \
+                 SELECT lix_json_text(snapshot_content, 'version_id') \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = 'lix_version_pointer' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+               )",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("FROM all_target_versions WHERE version_id IN (SELECT"));
+        assert!(!sql.contains("ranked.version_id IN (SELECT"));
+        assert!(sql.contains("FROM lix_internal_state_untracked"));
+        assert!(!sql.contains("sv.version_id IN (SELECT"));
+    }
+
+    #[test]
+    fn pushes_safe_bare_placeholders_for_schema_and_version() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = ? AND sv.version_id = ?",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.schema_key = ?"));
+        assert!(sql.contains("version_id = ?"));
+        assert!(!sql.contains("ranked.version_id = ?"));
+        assert!(!sql.contains("sv.schema_key = ?"));
+        assert!(!sql.contains("sv.version_id = ?"));
+    }
+
+    #[test]
+    fn pushes_safe_bare_placeholders_for_version_in_list() {
+        let query = parse_query(
+            "SELECT COUNT(*) FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = ? AND sv.version_id IN (?, ?)",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.schema_key = ?"));
+        assert!(sql.contains("version_id IN ("));
+        assert!(!sql.contains("ranked.version_id IN (?, ?)"));
+        assert!(!sql.contains("sv.schema_key = ?"));
+        assert!(!sql.contains("sv.version_id IN (?, ?)"));
     }
 
     #[test]
     fn non_count_query_without_commit_id_omits_commit_mapping_ctes() {
         let query = parse_query(
-            "SELECT entity_id, untracked \
-             FROM lix_state \
-             WHERE schema_key = 'lix_file_descriptor' \
-               AND entity_id = 'bench-file-1'",
+            "SELECT sv.entity_id, sv.untracked \
+             FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' \
+               AND sv.version_id = 'bench-v-023' \
+               AND sv.entity_id = 'bench-file-1'",
         );
 
         let rewritten = rewrite_query(query)
@@ -235,10 +346,11 @@ mod tests {
     #[test]
     fn non_count_query_with_commit_id_keeps_commit_mapping_ctes() {
         let query = parse_query(
-            "SELECT commit_id \
-             FROM lix_state \
-             WHERE schema_key = 'lix_file_descriptor' \
-               AND entity_id = 'bench-file-1'",
+            "SELECT sv.commit_id \
+             FROM lix_state_by_version AS sv \
+             WHERE sv.schema_key = 'lix_file_descriptor' \
+               AND sv.version_id = 'bench-v-023' \
+               AND sv.entity_id = 'bench-file-1'",
         );
 
         let rewritten = rewrite_query(query)

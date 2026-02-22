@@ -8,6 +8,7 @@ mod params;
 mod planner;
 mod preprocess;
 mod read_pipeline;
+mod read_views;
 mod rewrite;
 mod row_resolution;
 mod steps;
@@ -58,6 +59,7 @@ pub(crate) use read_pipeline::{
     rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
     ReadRewriteSession,
 };
+pub(crate) use read_views::lix_state_history_view_read::ensure_history_timeline_materialized_for_statement_with_state;
 #[cfg(test)]
 pub(crate) use rewrite::extract_explicit_transaction_script;
 pub(crate) use rewrite::extract_explicit_transaction_script_from_statements;
@@ -65,7 +67,6 @@ pub(crate) use row_resolution::{
     insert_values_rows_mut, materialize_vtable_insert_select_sources, resolve_expr_cell_with_state,
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
 };
-pub(crate) use steps::lix_state_history_view_read::ensure_history_timeline_materialized_for_statement_with_state;
 pub use steps::vtable_write::{
     build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
 };
