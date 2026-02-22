@@ -146,6 +146,7 @@ where
             statement_detected_file_domain_changes,
         ))
         .await?;
+        logical_plan.validate_plan_shape()?;
 
         if logical_plan.postprocess.is_some() {
             if has_postprocess {
