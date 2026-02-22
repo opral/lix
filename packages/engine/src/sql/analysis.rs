@@ -1,14 +1,17 @@
 use super::types::{MutationRow, UpdateValidationPlan};
-use crate::sql::{expr_references_column_name, ColumnReferenceOptions};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
 };
 use crate::{LixError, SqlDialect};
 use sqlparser::ast::{
-    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
-    TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
+    BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Statement, TableObject,
+    TableFactor, TableWithJoins,
 };
+#[cfg(test)]
+use sqlparser::ast::{Query, Select, SetExpr, TableFactor, Update, UpdateTableFromKind};
+#[cfg(test)]
+use crate::sql::{expr_references_column_name, ColumnReferenceOptions};
 
 #[cfg(test)]
 pub(crate) fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
@@ -119,6 +122,7 @@ pub(crate) fn file_read_materialization_scope_for_sql(
     file_read_materialization_scope_for_statements(&statements)
 }
 
+#[cfg(test)]
 pub(crate) fn file_read_materialization_scope_for_statements(
     statements: &[Statement],
 ) -> Option<FileReadMaterializationScope> {
@@ -147,6 +151,7 @@ pub(crate) fn file_history_read_materialization_required_for_sql(sql: &str) -> b
     file_history_read_materialization_required_for_statements(&statements)
 }
 
+#[cfg(test)]
 pub(crate) fn file_history_read_materialization_required_for_statements(
     statements: &[Statement],
 ) -> bool {
@@ -155,10 +160,12 @@ pub(crate) fn file_history_read_materialization_required_for_statements(
         .any(file_history_read_materialization_required_for_statement)
 }
 
+#[cfg(test)]
 fn file_history_read_materialization_required_for_statement(statement: &Statement) -> bool {
     statement_reads_table_name(statement, "lix_file_history")
 }
 
+#[cfg(test)]
 fn file_read_materialization_scope_for_statement(
     statement: &Statement,
 ) -> Option<FileReadMaterializationScope> {
@@ -172,6 +179,7 @@ fn file_read_materialization_scope_for_statement(
     None
 }
 
+#[cfg(test)]
 fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
     match statement {
         Statement::Query(query) => query_mentions_table_name(query, table_name),
@@ -211,6 +219,7 @@ fn statement_reads_table_name(statement: &Statement, table_name: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn update_references_data_column(update: &Update) -> bool {
     update
         .selection
@@ -222,6 +231,7 @@ fn update_references_data_column(update: &Update) -> bool {
             .any(|assignment| expr_references_data_column(&assignment.value))
 }
 
+#[cfg(test)]
 fn expr_references_data_column(expr: &Expr) -> bool {
     expr_references_column_name(
         expr,
@@ -232,6 +242,7 @@ fn expr_references_data_column(expr: &Expr) -> bool {
     )
 }
 
+#[cfg(test)]
 fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
     if query_set_expr_mentions_table_name(query.body.as_ref(), table_name) {
         return true;
@@ -273,6 +284,7 @@ fn query_mentions_table_name(query: &Query, table_name: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn query_set_expr_mentions_table_name(expr: &SetExpr, table_name: &str) -> bool {
     match expr {
         SetExpr::Select(select) => select_mentions_table_name(select, table_name),
@@ -297,6 +309,7 @@ fn query_set_expr_mentions_table_name(expr: &SetExpr, table_name: &str) -> bool 
     }
 }
 
+#[cfg(test)]
 fn select_mentions_table_name(select: &Select, table_name: &str) -> bool {
     if select
         .from
@@ -387,6 +400,7 @@ fn select_mentions_table_name(select: &Select, table_name: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn table_with_joins_mentions_table_name(table: &TableWithJoins, table_name: &str) -> bool {
     if table_factor_mentions_table_name(&table.relation, table_name) {
         return true;
@@ -398,6 +412,7 @@ fn table_with_joins_mentions_table_name(table: &TableWithJoins, table_name: &str
     })
 }
 
+#[cfg(test)]
 fn table_factor_mentions_table_name(table: &TableFactor, table_name: &str) -> bool {
     match table {
         TableFactor::Table { name, .. } => object_name_matches_table_name(name, table_name),
@@ -409,6 +424,7 @@ fn table_factor_mentions_table_name(table: &TableFactor, table_name: &str) -> bo
     }
 }
 
+#[cfg(test)]
 fn select_item_mentions_table_name(item: &sqlparser::ast::SelectItem, table_name: &str) -> bool {
     match item {
         sqlparser::ast::SelectItem::UnnamedExpr(expr)
@@ -423,6 +439,7 @@ fn select_item_mentions_table_name(item: &sqlparser::ast::SelectItem, table_name
     }
 }
 
+#[cfg(test)]
 fn group_by_expr_mentions_table_name(
     group_by: &sqlparser::ast::GroupByExpr,
     table_name: &str,
@@ -435,6 +452,7 @@ fn group_by_expr_mentions_table_name(
     }
 }
 
+#[cfg(test)]
 fn order_by_mentions_table_name(order_by: &sqlparser::ast::OrderBy, table_name: &str) -> bool {
     match &order_by.kind {
         sqlparser::ast::OrderByKind::All(_) => false,
@@ -444,6 +462,7 @@ fn order_by_mentions_table_name(order_by: &sqlparser::ast::OrderBy, table_name: 
     }
 }
 
+#[cfg(test)]
 fn order_by_expr_mentions_table_name(
     order_by_expr: &sqlparser::ast::OrderByExpr,
     table_name: &str,
@@ -468,6 +487,7 @@ fn order_by_expr_mentions_table_name(
     })
 }
 
+#[cfg(test)]
 fn limit_clause_mentions_table_name(
     limit_clause: &sqlparser::ast::LimitClause,
     table_name: &str,
@@ -495,6 +515,7 @@ fn limit_clause_mentions_table_name(
     }
 }
 
+#[cfg(test)]
 fn join_operator_mentions_table_name(
     join_operator: &sqlparser::ast::JoinOperator,
     table_name: &str,
@@ -529,6 +550,7 @@ fn join_operator_mentions_table_name(
             .is_some_and(|constraint| join_constraint_mentions_table_name(constraint, table_name))
 }
 
+#[cfg(test)]
 fn join_constraint_mentions_table_name(
     constraint: &sqlparser::ast::JoinConstraint,
     table_name: &str,
@@ -539,6 +561,7 @@ fn join_constraint_mentions_table_name(
     }
 }
 
+#[cfg(test)]
 fn expr_mentions_table_name(expr: &Expr, table_name: &str) -> bool {
     match expr {
         Expr::BinaryOp { left, right, .. } => {
@@ -626,6 +649,7 @@ fn expr_mentions_table_name(expr: &Expr, table_name: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn object_name_matches_table_name(name: &ObjectName, table_name: &str) -> bool {
     name.0
         .last()

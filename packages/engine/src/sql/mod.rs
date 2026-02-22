@@ -16,8 +16,7 @@ mod write_views;
 
 pub(crate) use analysis::{
     active_version_from_mutations, active_version_from_update_validations,
-    file_history_read_materialization_required_for_statements,
-    file_read_materialization_scope_for_statements, is_query_only_statements,
+    is_query_only_statements,
     should_invalidate_installed_plugins_cache_for_sql,
     should_invalidate_installed_plugins_cache_for_statements,
     should_refresh_file_cache_for_statements, FileReadMaterializationScope,
@@ -37,13 +36,14 @@ pub(crate) use ast_utils::{
 pub(crate) use escaping::escape_sql_string;
 pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
-    bind_sql, bind_sql_with_state, bind_statement, bind_statement_with_state,
-    bind_statement_with_state_and_appended_params, PlaceholderState,
+    bind_sql, bind_sql_with_state, bind_statement, bind_statement_with_state_and_appended_params,
+    PlaceholderState,
 };
 pub(crate) use planner::rewrite::query::rewrite_query_with_backend as rewrite_read_query_with_backend;
 pub(crate) use planner::rewrite::query::rewrite_query_with_backend_and_params as rewrite_read_query_with_backend_and_params;
 pub(crate) use planner::{
-    compile_statement_with_state, prepare_statement_block_with_transaction_flag, StatementBlock,
+    compile_statement_with_state, prepare_statement_block_with_transaction_flag,
+    ReadMaintenanceRequirements, StatementBlock,
 };
 #[cfg(test)]
 pub use preprocess::parse_sql_statements;

@@ -8,4 +8,4 @@ pub(crate) mod validate;
 
 pub(crate) use bind::prepare_statement_block_with_transaction_flag;
 pub(crate) use compile::compile_statement_with_state;
-pub(crate) use types::StatementBlock;
+pub(crate) use types::{ReadMaintenanceRequirements, StatementBlock};

@@ -101,6 +101,7 @@ where
         CompiledStatementPlan {
             prepared_statements,
             registrations: logical_plan.registrations,
+            maintenance_requirements: logical_plan.maintenance_requirements,
             postprocess: logical_plan.postprocess,
             mutations: logical_plan.mutations,
             update_validations: logical_plan.update_validations,

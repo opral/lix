@@ -1,8 +1,9 @@
 use super::super::*;
 use super::*;
 use crate::sql::{
-    bind_statement_with_state, ensure_history_timeline_materialized_for_statement_with_state,
-    PlaceholderState,
+    ensure_history_timeline_materialized_for_statement_with_state,
+    parse_sql_statements_with_dialect, PlaceholderState, PreparedStatement,
+    ReadMaintenanceRequirements, FileReadMaterializationScope,
 };
 use crate::SqlDialect;
 
@@ -20,39 +21,30 @@ enum FileDescriptorExecutionState {
 }
 
 impl Engine {
-    pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
+    pub(crate) async fn run_read_maintenance_with_backend_from_plan(
         &self,
         backend: &dyn LixBackend,
-        statements: &[Statement],
-        params: &[Value],
-        placeholder_state: PlaceholderState,
+        requirements: &ReadMaintenanceRequirements,
+        prepared_statements: &[PreparedStatement],
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        let mut statement_placeholder_state = placeholder_state;
-        for statement in statements {
-            ensure_history_timeline_materialized_for_statement_with_state(
-                backend,
-                statement,
-                params,
-                statement_placeholder_state,
-            )
-            .await?;
-            let bound = bind_statement_with_state(
-                statement.clone(),
-                params,
-                backend.dialect(),
-                statement_placeholder_state,
-            )
-            .map_err(|error| LixError {
-                message: format!(
-                    "history timeline maintenance placeholder binding failed for '{}': {}",
-                    statement, error.message
-                ),
-            })?;
-            statement_placeholder_state = bound.state;
+        if requirements.requires_history_timeline_materialization {
+            for prepared in prepared_statements {
+                let statements =
+                    parse_sql_statements_with_dialect(&prepared.sql, backend.dialect())?;
+                for statement in statements {
+                    ensure_history_timeline_materialized_for_statement_with_state(
+                        backend,
+                        &statement,
+                        prepared.params.as_slice(),
+                        PlaceholderState::new(),
+                    )
+                    .await?;
+                }
+            }
         }
 
-        if let Some(scope) = file_read_materialization_scope_for_statements(statements) {
+        if let Some(scope) = requirements.file_materialization_scope {
             let versions = match scope {
                 FileReadMaterializationScope::ActiveVersionOnly => {
                     let mut set = BTreeSet::new();
@@ -68,7 +60,7 @@ impl Engine {
             )
             .await?;
         }
-        if file_history_read_materialization_required_for_statements(statements) {
+        if requirements.requires_file_history_materialization {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
                 self.wasm_runtime.as_ref(),

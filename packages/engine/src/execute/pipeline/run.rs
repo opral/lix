@@ -142,14 +142,6 @@ impl Engine {
                 )
                 .await?;
             }
-            self.maybe_materialize_reads_with_backend_from_statements(
-                &backend,
-                statement_list,
-                params,
-                placeholder_state,
-                active_version_id,
-            )
-            .await?;
 
             let (settings, sequence_start, functions) = self
                 .prepare_runtime_functions_with_backend(&backend)
@@ -166,6 +158,14 @@ impl Engine {
             )
             .await?;
             let output = compiled;
+
+            self.run_read_maintenance_with_backend_from_plan(
+                &backend,
+                &output.maintenance_requirements,
+                &output.prepared_statements,
+                active_version_id.as_str(),
+            )
+            .await?;
 
             if !output.mutations.is_empty() {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;

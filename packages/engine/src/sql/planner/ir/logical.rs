@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::sql::planner::types::ReadMaintenanceRequirements;
 use crate::sql::types::{MutationRow, PostprocessPlan, SchemaRegistration, UpdateValidationPlan};
 use crate::LixError;
 use crate::Value;
@@ -17,6 +18,9 @@ pub(crate) enum LogicalReadOperator {
     State,
     StateByVersion,
     StateHistory,
+    File,
+    FileByVersion,
+    FileHistory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +65,7 @@ pub(crate) struct LogicalStatementPlan {
     pub(crate) emission_sql: Vec<String>,
     pub(crate) appended_params: Vec<Value>,
     pub(crate) registrations: Vec<SchemaRegistration>,
+    pub(crate) maintenance_requirements: ReadMaintenanceRequirements,
     pub(crate) postprocess: Option<PostprocessPlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
@@ -80,6 +85,7 @@ impl LogicalStatementPlan {
             emission_sql,
             appended_params: Vec::new(),
             registrations: Vec::new(),
+            maintenance_requirements: ReadMaintenanceRequirements::default(),
             postprocess: None,
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -99,6 +105,14 @@ impl LogicalStatementPlan {
         self.postprocess = postprocess;
         self.mutations = mutations;
         self.update_validations = update_validations;
+        self
+    }
+
+    pub(crate) fn with_maintenance_requirements(
+        mut self,
+        maintenance_requirements: ReadMaintenanceRequirements,
+    ) -> Self {
+        self.maintenance_requirements = maintenance_requirements;
         self
     }
 
@@ -152,6 +166,12 @@ impl LogicalStatementPlan {
                             .to_string(),
                     });
                 }
+                if !self.maintenance_requirements.is_empty() {
+                    return Err(LixError {
+                        message: "canonical write plans cannot carry read maintenance requirements"
+                            .to_string(),
+                    });
+                }
             }
             (LogicalStatementOperation::Passthrough, LogicalStatementSemantics::Passthrough) => {
                 let has_non_passthrough = self
@@ -161,6 +181,12 @@ impl LogicalStatementPlan {
                 if has_non_passthrough {
                     return Err(LixError {
                         message: "passthrough plans may only contain passthrough steps".to_string(),
+                    });
+                }
+                if !self.maintenance_requirements.is_empty() {
+                    return Err(LixError {
+                        message: "passthrough plans cannot carry read maintenance requirements"
+                            .to_string(),
                     });
                 }
             }

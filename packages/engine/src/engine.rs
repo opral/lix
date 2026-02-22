@@ -22,12 +22,10 @@ use crate::schema_registry::register_schema_sql_statements;
 use crate::sql::{
     active_version_from_mutations, active_version_from_update_validations,
     build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
-    file_history_read_materialization_required_for_statements,
-    file_read_materialization_scope_for_statements, is_query_only_statements, preprocess_sql,
-    should_invalidate_installed_plugins_cache_for_sql,
+    is_query_only_statements, preprocess_sql, should_invalidate_installed_plugins_cache_for_sql,
     should_invalidate_installed_plugins_cache_for_statements,
     should_refresh_file_cache_for_statements, DetectedFileDomainChange,
-    FileReadMaterializationScope, MutationRow, PostprocessPlan,
+    MutationRow, PostprocessPlan,
 };
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,

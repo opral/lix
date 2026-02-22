@@ -3,8 +3,10 @@ use std::collections::BTreeSet;
 use sqlparser::ast::{Query, Statement};
 
 use crate::functions::LixFunctionProvider;
+use crate::sql::planner::types::ReadMaintenanceRequirements;
 use crate::sql::planner::rewrite::write;
 use crate::sql::planner::validate::validate_statement_output_parts;
+use crate::sql::FileReadMaterializationScope;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
@@ -37,6 +39,7 @@ where
                 vec![LogicalStatementStep::QueryRead],
                 vec![rewritten.to_string()],
             )
+            .with_maintenance_requirements(read_maintenance_requirements_for_query(&rewritten))
         }
         Statement::Explain {
             describe_alias,
@@ -60,7 +63,7 @@ where
                         verbose,
                         query_plan,
                         estimate,
-                        statement: Box::new(Statement::Query(Box::new(rewritten))),
+                        statement: Box::new(Statement::Query(Box::new(rewritten.clone()))),
                         format,
                         options,
                     };
@@ -70,6 +73,9 @@ where
                         vec![LogicalStatementStep::ExplainRead],
                         vec![explain_statement.to_string()],
                     )
+                    .with_maintenance_requirements(read_maintenance_requirements_for_query(
+                        &rewritten,
+                    ))
                 }
                 other => {
                     let explain_statement = Statement::Explain {
@@ -174,10 +180,40 @@ fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {
             "lix_state_history" => {
                 operators.insert(LogicalReadOperator::StateHistory);
             }
+            "lix_file" => {
+                operators.insert(LogicalReadOperator::File);
+            }
+            "lix_file_by_version" => {
+                operators.insert(LogicalReadOperator::FileByVersion);
+            }
+            "lix_file_history" => {
+                operators.insert(LogicalReadOperator::FileHistory);
+            }
             _ => {}
         }
     }
     LogicalReadSemantics::from_operators(operators)
+}
+
+fn read_maintenance_requirements_for_query(query: &Query) -> ReadMaintenanceRequirements {
+    let semantics = read_semantics_for_query(query);
+    let mut requirements = ReadMaintenanceRequirements::default();
+
+    if semantics.operators.contains(&LogicalReadOperator::FileByVersion) {
+        requirements.file_materialization_scope = Some(FileReadMaterializationScope::AllVersions);
+    } else if semantics.operators.contains(&LogicalReadOperator::File) {
+        requirements.file_materialization_scope =
+            Some(FileReadMaterializationScope::ActiveVersionOnly);
+    }
+
+    if semantics.operators.contains(&LogicalReadOperator::FileHistory) {
+        requirements.requires_file_history_materialization = true;
+    }
+    if semantics.operators.contains(&LogicalReadOperator::StateHistory) {
+        requirements.requires_history_timeline_materialization = true;
+    }
+
+    requirements
 }
 
 #[cfg(test)]
