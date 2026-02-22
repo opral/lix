@@ -105,9 +105,9 @@ async function main() {
         applied += 1;
       }
 
-      for (const statement of statements) {
+      if (statements.length > 0) {
         try {
-          await lix.execute(statement.sql, statement.params ?? []);
+          await lix.executeTransaction(statements);
         } catch (error) {
           const payload = error && typeof error === "object" ? error.payload : undefined;
           const payloadJson =
@@ -120,24 +120,11 @@ async function main() {
                     return String(payload);
                   }
                 })();
-          const sqlPreview = statement.sql.replace(/\s+/g, " ").slice(0, 240);
-          const paramPreview = (statement.params ?? [])
-            .slice(0, 9)
-            .map((value) => {
-              if (value instanceof Uint8Array) {
-                return `blob(${value.byteLength})`;
-              }
-              if (typeof value === "string") {
-                return `text(${value.slice(0, 48)})`;
-              }
-              if (value === null) {
-                return "null";
-              }
-              return typeof value;
-            })
-            .join(", ");
+          const sqlPreview = String(statements[0]?.sql ?? "")
+            .replace(/\s+/g, " ")
+            .slice(0, 200);
           throw new Error(
-            `failed at commit ${commitSha} statement execution (sql chars=${statement.sql.length}, sql=${sqlPreview}, params=[${paramPreview}]): ${String(error?.message ?? error)}; payload=${payloadJson}`,
+            `failed at commit ${commitSha} replay transaction (statements=${statements.length}, firstSql=${sqlPreview}): ${String(error?.message ?? error)}; payload=${payloadJson}`,
           );
         }
       }
