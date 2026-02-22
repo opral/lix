@@ -706,10 +706,11 @@ fn build_lix_state_history_view_query(
 }
 
 fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
-    pushdown
-        .cse_predicates
-        .iter()
-        .any(|predicate| predicate.contains("rc.commit_id"))
+    pushdown.requested_pushdown_blocked_by_bare_placeholders
+        || pushdown
+            .cse_predicates
+            .iter()
+            .any(|predicate| predicate.contains("rc.commit_id"))
 }
 
 fn build_lix_state_history_view_query_phase1(
@@ -1499,6 +1500,8 @@ mod tests {
         assert!(!sql.contains("bp.schema_key = ?"));
         assert!(sql.contains("sh.schema_key = ?"));
         assert!(sql.contains("sh.root_commit_id = ?"));
+        assert!(!sql.contains("FROM lix_internal_entity_state_timeline_breakpoint"));
+        assert!(sql.contains("ranked_cse"));
     }
 
     #[test]

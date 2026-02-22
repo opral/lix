@@ -673,7 +673,7 @@ async fn ensure_commit_ancestry(
     commit_id: &str,
     parent_ids: &[String],
 ) -> Result<(), LixError> {
-    tx.execute(
+    tx.execute_internal(
         "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
          VALUES ($1, $1, 0) \
          ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
@@ -683,7 +683,7 @@ async fn ensure_commit_ancestry(
 
     let normalized_parents = normalize_parent_commit_ids(parent_ids.to_vec(), commit_id);
     for parent_id in normalized_parents {
-        tx.execute(
+        tx.execute_internal(
             "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
              SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
              FROM ( \
