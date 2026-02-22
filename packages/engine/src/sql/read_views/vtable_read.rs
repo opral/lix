@@ -1,6 +1,9 @@
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, Query, Select, SetExpr, TableAlias, TableFactor, TableWithJoins,
-    UnaryOperator, Value, ValueWithSpan,
+    BinaryOperator, Expr, Function, FunctionArg, FunctionArgumentList, FunctionArguments,
+    GroupByExpr, Ident, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor,
+    TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowSpec, WindowType,
 };
 
 use crate::backend::SqlDialect;
@@ -820,75 +823,336 @@ fn build_untracked_union_query(
     pushdown_predicate: Option<&Expr>,
 ) -> Result<Query, LixError> {
     let stripped_predicate = pushdown_predicate.and_then(|expr| strip_qualifiers(expr.clone()));
-    let predicate_sql = stripped_predicate.as_ref().map(ToString::to_string);
     let predicate_schema_keys = stripped_predicate
         .as_ref()
         .and_then(|expr| extract_column_keys_from_expr(expr, expr_is_schema_key_column));
     let effective_schema_keys = narrow_schema_keys(schema_keys, predicate_schema_keys.as_deref());
+    let mut union_branches = Vec::<Query>::new();
 
-    let schema_list = effective_schema_keys
-        .iter()
-        .map(|key| format!("'{}'", escape_string_literal(key)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let schema_filter = if effective_schema_keys.is_empty() {
+    let schema_filter_expr = if effective_schema_keys.is_empty() {
         None
     } else {
-        Some(format!("schema_key IN ({schema_list})"))
-    };
-    let untracked_where = match (schema_filter.as_ref(), predicate_sql.as_ref()) {
-        (Some(schema_filter), Some(predicate)) => {
-            format!("{schema_filter} AND ({predicate})")
-        }
-        (Some(schema_filter), None) => schema_filter.clone(),
-        (None, Some(predicate)) => format!("({predicate})"),
-        (None, None) => "1=1".to_string(),
+        Some(Expr::InList {
+            expr: Box::new(expr_ident("schema_key")),
+            list: effective_schema_keys
+                .iter()
+                .map(|key| expr_string(key))
+                .collect::<Vec<_>>(),
+            negated: false,
+        })
     };
 
-    let mut union_parts = Vec::new();
-    union_parts.push(format!(
-        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, NULL AS writer_key, 1 AS untracked, 1 AS priority \
-         FROM {untracked} \
-         WHERE {untracked_where}",
-        untracked = UNTRACKED_TABLE
+    let untracked_selection = and_exprs(
+        schema_filter_expr
+            .into_iter()
+            .chain(stripped_predicate.clone())
+            .collect(),
+    )
+    .unwrap_or_else(|| Expr::BinaryOp {
+        left: Box::new(expr_int(1)),
+        op: BinaryOperator::Eq,
+        right: Box::new(expr_int(1)),
+    });
+
+    union_branches.push(select_query_from_parts(
+        union_projection_untracked(),
+        vec![table_with_joins_for(UNTRACKED_TABLE)],
+        Some(untracked_selection),
     ));
 
     for key in &effective_schema_keys {
         let materialized_table = format!("{MATERIALIZED_PREFIX}{key}");
-        let materialized_ident = quote_ident(&materialized_table);
         let mut materialized_filters = vec![
-            "is_tombstone = 0".to_string(),
-            format!("schema_key = '{}'", escape_string_literal(key)),
-            "snapshot_content IS NOT NULL".to_string(),
+            Expr::BinaryOp {
+                left: Box::new(expr_ident("is_tombstone")),
+                op: BinaryOperator::Eq,
+                right: Box::new(expr_int(0)),
+            },
+            Expr::BinaryOp {
+                left: Box::new(expr_ident("schema_key")),
+                op: BinaryOperator::Eq,
+                right: Box::new(expr_string(key)),
+            },
+            Expr::IsNotNull(Box::new(expr_ident("snapshot_content"))),
         ];
-        if let Some(predicate) = predicate_sql.as_ref() {
-            materialized_filters.push(format!("({predicate})"));
+        if let Some(predicate) = stripped_predicate.as_ref() {
+            materialized_filters.push(predicate.clone());
         }
-        let materialized_where = format!(" WHERE {}", materialized_filters.join(" AND "));
-        union_parts.push(format!(
-            "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, inherited_from_version_id, change_id, writer_key, 0 AS untracked, 2 AS priority \
-             FROM {materialized}{materialized_where}",
-            materialized = materialized_ident,
-            materialized_where = materialized_where
+
+        union_branches.push(select_query_from_parts(
+            union_projection_materialized(),
+            vec![table_with_joins_for(&materialized_table)],
+            and_exprs(materialized_filters),
         ));
     }
 
-    let union_sql = union_parts.join(" UNION ALL ");
+    let mut union_expr = (*union_branches.remove(0).body).clone();
+    for branch in union_branches {
+        union_expr = SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            left: Box::new(union_expr),
+            right: Box::new(*branch.body),
+        };
+    }
 
-    let sql = format!(
-        "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, inherited_from_version_id, change_id, writer_key, untracked \
-         FROM (\
-             SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, inherited_from_version_id, change_id, writer_key, untracked, \
-                    ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
-             FROM ({union_sql}) AS lix_state_union\
-         ) AS lix_state_ranked \
-         WHERE rn = 1",
+    let union_query = Query {
+        with: None,
+        body: Box::new(union_expr),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    };
+
+    let ranked_query = select_query_from_parts(
+        ranked_projection_with_row_number(),
+        vec![TableWithJoins {
+            relation: TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(union_query),
+                alias: Some(explicit_alias("lix_state_union")),
+            },
+            joins: Vec::new(),
+        }],
+        None,
     );
-    parse_single_query(&sql)
+
+    Ok(select_query_from_parts(
+        ranked_projection_without_row_number(),
+        vec![TableWithJoins {
+            relation: TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(ranked_query),
+                alias: Some(explicit_alias("lix_state_ranked")),
+            },
+            joins: Vec::new(),
+        }],
+        Some(Expr::BinaryOp {
+            left: Box::new(expr_ident("rn")),
+            op: BinaryOperator::Eq,
+            right: Box::new(expr_int(1)),
+        }),
+    ))
+}
+
+fn select_query_from_parts(
+    projection: Vec<SelectItem>,
+    from: Vec<TableWithJoins>,
+    selection: Option<Expr>,
+) -> Query {
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection,
+            exclude: None,
+            into: None,
+            from,
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection,
+            group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: None,
+            flavor: SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    }
+}
+
+fn table_with_joins_for(table: &str) -> TableWithJoins {
+    TableWithJoins {
+        relation: TableFactor::Table {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+            alias: None,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+            json_path: None,
+            sample: None,
+            index_hints: Vec::new(),
+        },
+        joins: Vec::new(),
+    }
+}
+
+fn union_projection_untracked() -> Vec<SelectItem> {
+    vec![
+        select_ident("entity_id"),
+        select_ident("schema_key"),
+        select_ident("file_id"),
+        select_ident("version_id"),
+        select_ident("plugin_key"),
+        select_ident("snapshot_content"),
+        select_ident("metadata"),
+        select_ident("schema_version"),
+        select_ident("created_at"),
+        select_ident("updated_at"),
+        select_alias(expr_null(), "inherited_from_version_id"),
+        select_alias(expr_string("untracked"), "change_id"),
+        select_alias(expr_null(), "writer_key"),
+        select_alias(expr_int(1), "untracked"),
+        select_alias(expr_int(1), "priority"),
+    ]
+}
+
+fn union_projection_materialized() -> Vec<SelectItem> {
+    vec![
+        select_ident("entity_id"),
+        select_ident("schema_key"),
+        select_ident("file_id"),
+        select_ident("version_id"),
+        select_ident("plugin_key"),
+        select_ident("snapshot_content"),
+        select_ident("metadata"),
+        select_ident("schema_version"),
+        select_ident("created_at"),
+        select_ident("updated_at"),
+        select_ident("inherited_from_version_id"),
+        select_ident("change_id"),
+        select_ident("writer_key"),
+        select_alias(expr_int(0), "untracked"),
+        select_alias(expr_int(2), "priority"),
+    ]
+}
+
+fn ranked_projection_with_row_number() -> Vec<SelectItem> {
+    vec![
+        select_ident("entity_id"),
+        select_ident("schema_key"),
+        select_ident("file_id"),
+        select_ident("version_id"),
+        select_ident("plugin_key"),
+        select_ident("snapshot_content"),
+        select_ident("metadata"),
+        select_ident("schema_version"),
+        select_ident("created_at"),
+        select_ident("updated_at"),
+        select_ident("inherited_from_version_id"),
+        select_ident("change_id"),
+        select_ident("writer_key"),
+        select_ident("untracked"),
+        select_alias(row_number_partitioned_expr(), "rn"),
+    ]
+}
+
+fn ranked_projection_without_row_number() -> Vec<SelectItem> {
+    vec![
+        select_ident("entity_id"),
+        select_ident("schema_key"),
+        select_ident("file_id"),
+        select_ident("version_id"),
+        select_ident("plugin_key"),
+        select_ident("snapshot_content"),
+        select_ident("metadata"),
+        select_ident("schema_version"),
+        select_ident("created_at"),
+        select_ident("updated_at"),
+        select_ident("inherited_from_version_id"),
+        select_ident("change_id"),
+        select_ident("writer_key"),
+        select_ident("untracked"),
+    ]
+}
+
+fn row_number_partitioned_expr() -> Expr {
+    Expr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("ROW_NUMBER"))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: Vec::<FunctionArg>::new(),
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: Some(WindowType::WindowSpec(WindowSpec {
+            window_name: None,
+            partition_by: vec![
+                expr_ident("entity_id"),
+                expr_ident("schema_key"),
+                expr_ident("file_id"),
+                expr_ident("version_id"),
+            ],
+            order_by: vec![OrderByExpr {
+                expr: expr_ident("priority"),
+                options: OrderByOptions::default(),
+                with_fill: None,
+            }],
+            window_frame: None,
+        })),
+        within_group: Vec::new(),
+    })
+}
+
+fn select_ident(name: &str) -> SelectItem {
+    SelectItem::UnnamedExpr(expr_ident(name))
+}
+
+fn select_alias(expr: Expr, alias: &str) -> SelectItem {
+    SelectItem::ExprWithAlias {
+        expr,
+        alias: Ident::new(alias),
+    }
+}
+
+fn expr_ident(name: &str) -> Expr {
+    Expr::Identifier(Ident::new(name))
+}
+
+fn expr_string(value: &str) -> Expr {
+    Expr::Value(Value::SingleQuotedString(value.to_string()).into())
+}
+
+fn expr_int(value: i64) -> Expr {
+    Expr::Value(Value::Number(value.to_string(), false).into())
+}
+
+fn expr_null() -> Expr {
+    Expr::Value(Value::Null.into())
+}
+
+fn and_exprs(exprs: Vec<Expr>) -> Option<Expr> {
+    let mut iter = exprs.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::And,
+        right: Box::new(right),
+    }))
+}
+
+fn explicit_alias(name: &str) -> TableAlias {
+    TableAlias {
+        explicit: true,
+        name: Ident::new(name),
+        columns: Vec::new(),
+    }
 }
 
 fn query_targets_vtable(query: &Query) -> bool {
@@ -1359,10 +1623,6 @@ fn default_vtable_alias() -> TableAlias {
         name: Ident::new(VTABLE_NAME),
         columns: Vec::new(),
     }
-}
-
-fn escape_string_literal(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {

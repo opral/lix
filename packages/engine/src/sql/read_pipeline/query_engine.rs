@@ -18,23 +18,10 @@ const PHASE_ORDER: [RewritePhase; 4] = [
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ReadRewriteSession {
-    materialized_schema_keys_cache: Option<Vec<String>>,
     version_chain_cache: BTreeMap<String, Vec<String>>,
 }
 
 impl ReadRewriteSession {
-    fn seed_context(&self, context: &mut AnalysisContext) {
-        if let Some(keys) = &self.materialized_schema_keys_cache {
-            context.set_materialized_schema_keys_cache(keys.clone());
-        }
-    }
-
-    fn absorb_context(&mut self, context: &AnalysisContext) {
-        if let Some(keys) = context.materialized_schema_keys_cache() {
-            self.materialized_schema_keys_cache = Some(keys.to_vec());
-        }
-    }
-
     pub(crate) fn cached_version_chain(&self, version_id: &str) -> Option<&[String]> {
         self.version_chain_cache.get(version_id).map(Vec::as_slice)
     }
@@ -136,20 +123,14 @@ async fn run_query_engine_with_backend_and_params(
     backend: &dyn LixBackend,
     mut query: Query,
     params: &[Value],
-    mut session: Option<&mut ReadRewriteSession>,
+    _session: Option<&mut ReadRewriteSession>,
 ) -> Result<Query, LixError> {
     let mut context = AnalysisContext::from_query(&query);
-    if let Some(session) = session.as_mut() {
-        session.seed_context(&mut context);
-    }
 
     for phase in PHASE_ORDER {
         run_phase_with_backend(phase, backend, &mut query, params, &mut context).await?;
     }
 
-    if let Some(session) = session.as_mut() {
-        session.absorb_context(&context);
-    }
     validate_final_read_query(&query)?;
     Ok(query)
 }

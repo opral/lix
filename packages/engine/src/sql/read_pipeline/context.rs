@@ -19,7 +19,6 @@ pub(crate) struct AnalysisContext {
     has_cte: bool,
     has_derived_tables: bool,
     has_expression_subqueries: bool,
-    materialized_schema_keys_cache: Option<Vec<String>>,
 }
 
 impl AnalysisContext {
@@ -29,7 +28,6 @@ impl AnalysisContext {
             has_cte: false,
             has_derived_tables: false,
             has_expression_subqueries: false,
-            materialized_schema_keys_cache: None,
         };
         context.refresh_from_query(query);
         context
@@ -72,14 +70,6 @@ impl AnalysisContext {
             || self.references_relation("lix_state")
             || self.references_relation("lix_state_by_version")
             || self.references_relation("lix_state_history")
-    }
-
-    pub(crate) fn materialized_schema_keys_cache(&self) -> Option<&[String]> {
-        self.materialized_schema_keys_cache.as_deref()
-    }
-
-    pub(crate) fn set_materialized_schema_keys_cache(&mut self, keys: Vec<String>) {
-        self.materialized_schema_keys_cache = Some(keys);
     }
 }
 

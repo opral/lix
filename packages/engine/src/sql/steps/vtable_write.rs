@@ -1,13 +1,12 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, DoUpdate, Expr, Function,
-    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, OnConflict,
-    OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, Visitor,
+    Assignment, AssignmentTarget, BinaryOperator, CaseWhen, ConflictTarget, Delete, DoUpdate, Expr,
+    Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    Ident, ObjectName, ObjectNamePart, OnConflict, OnConflictAction, OnInsert, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, Visitor,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::{
@@ -25,9 +24,8 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    bind_sql_with_state, bind_statement, escape_sql_string, lowering::lower_statement,
-    object_name_matches, quote_ident, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
-    RowSourceResolver,
+    bind_sql_with_state, bind_statement, escape_sql_string, object_name_matches, quote_ident,
+    resolve_expr_cell_with_state, PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
@@ -1677,8 +1675,8 @@ async fn load_effective_scope_delete_rows(
         "WITH RECURSIVE \
            version_descriptor AS ( \
              SELECT \
-               lix_json_text(snapshot_content, 'id') AS version_id, \
-               lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+               {descriptor_id_expr} AS version_id, \
+               {descriptor_parent_expr} AS inherits_from_version_id \
              FROM {descriptor_table} \
              WHERE schema_key = '{descriptor_schema_key}' \
                AND file_id = '{descriptor_file_id}' \
@@ -1739,14 +1737,14 @@ async fn load_effective_scope_delete_rows(
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         schema_table = schema_table,
         schema_key = escape_sql_string(&plan.schema_key),
+        descriptor_id_expr = json_text_expr_sql("snapshot_content", "id", executor.dialect()),
+        descriptor_parent_expr = json_text_expr_sql(
+            "snapshot_content",
+            "inherits_from_version_id",
+            executor.dialect(),
+        ),
     );
-    let lowered_sql = lower_single_statement_for_dialect(&sql, executor.dialect())?;
-    let bound = bind_sql_with_state(
-        &lowered_sql,
-        params,
-        executor.dialect(),
-        PlaceholderState::new(),
-    )?;
+    let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
     let result = executor.execute(&bound.sql, &bound.params).await?;
 
     let mut resolved = Vec::with_capacity(result.rows.len());
@@ -1809,13 +1807,14 @@ async fn load_cascaded_file_delete_changes(
              FROM {materialized_table} m \
              WHERE m.version_id = '{version_id}' \
                AND m.is_tombstone = 0 \
-               AND lix_json_text(m.snapshot_content, 'directory_id') IN ({in_list})",
+               AND {directory_id_expr} IN ({in_list})",
             materialized_table = format!("{MATERIALIZED_PREFIX}{FILE_DESCRIPTOR_SCHEMA_KEY}"),
             version_id = escape_sql_string(&version_id),
             in_list = in_list,
+            directory_id_expr =
+                json_text_expr_sql("m.snapshot_content", "directory_id", executor.dialect()),
         );
-        let lowered_sql = lower_single_statement_for_dialect(&sql, executor.dialect())?;
-        let result = executor.execute(&lowered_sql, &[]).await?;
+        let result = executor.execute(&sql, &[]).await?;
         for row in result.rows {
             if row.len() < 6 {
                 return Err(LixError {
@@ -1853,18 +1852,13 @@ async fn load_cascaded_file_delete_changes(
     Ok(changes)
 }
 
-fn lower_single_statement_for_dialect(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single statement".to_string(),
-        });
+fn json_text_expr_sql(column: &str, field: &str, dialect: SqlDialect) -> String {
+    match dialect {
+        SqlDialect::Sqlite => format!("json_extract({column}, '$.\"{field}\"')"),
+        SqlDialect::Postgres => {
+            format!("jsonb_extract_path_text(CAST({column} AS JSONB), '{field}')")
+        }
     }
-    let statement = statements.remove(0);
-    let lowered = lower_statement(statement, dialect)?;
-    Ok(lowered.to_string())
 }
 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
@@ -2236,46 +2230,249 @@ fn append_commit_ancestry_statements(
         *next_placeholder += 1;
         params.push(EngineValue::Text(commit_id));
 
-        let self_insert_sql = format!(
-            "INSERT INTO {table} (commit_id, ancestor_id, depth) \
-             VALUES (${commit_placeholder}, ${commit_placeholder}, 0) \
-             ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
-            table = COMMIT_ANCESTRY_TABLE,
-            commit_placeholder = commit_placeholder,
-        );
-        statements.push(parse_single_statement_from_sql(&self_insert_sql)?);
+        statements.push(build_commit_ancestry_self_insert_statement(
+            commit_placeholder,
+        ));
 
         for parent_id in parent_ids {
             let parent_placeholder = *next_placeholder;
             *next_placeholder += 1;
             params.push(EngineValue::Text(parent_id));
 
-            let insert_parent_ancestry_sql = format!(
-                "INSERT INTO {table} (commit_id, ancestor_id, depth) \
-                 SELECT ${commit_placeholder} AS commit_id, candidate.ancestor_id, MIN(candidate.depth) AS depth \
-                 FROM ( \
-                   SELECT ${parent_placeholder} AS ancestor_id, 1 AS depth \
-                   UNION ALL \
-                   SELECT ancestor_id, depth + 1 AS depth \
-                   FROM {table} \
-                   WHERE commit_id = ${parent_placeholder} \
-                 ) AS candidate \
-                 GROUP BY candidate.ancestor_id \
-                 ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
-                 SET depth = CASE \
-                   WHEN excluded.depth < {table}.depth THEN excluded.depth \
-                   ELSE {table}.depth \
-                 END",
-                table = COMMIT_ANCESTRY_TABLE,
-                commit_placeholder = commit_placeholder,
-                parent_placeholder = parent_placeholder,
-            );
-            statements.push(parse_single_statement_from_sql(
-                &insert_parent_ancestry_sql,
-            )?);
+            statements.push(build_commit_ancestry_parent_insert_statement(
+                commit_placeholder,
+                parent_placeholder,
+            ));
         }
     }
     Ok(())
+}
+
+fn build_commit_ancestry_self_insert_statement(commit_placeholder: usize) -> Statement {
+    make_insert_statement(
+        COMMIT_ANCESTRY_TABLE,
+        commit_ancestry_insert_columns(),
+        vec![vec![
+            placeholder_expr(commit_placeholder),
+            placeholder_expr(commit_placeholder),
+            number_expr("0"),
+        ]],
+        Some(commit_ancestry_do_nothing_on_conflict()),
+    )
+}
+
+fn build_commit_ancestry_parent_insert_statement(
+    commit_placeholder: usize,
+    parent_placeholder: usize,
+) -> Statement {
+    let candidate_seed = select_query_from_parts(
+        vec![
+            expr_with_alias_select_item(placeholder_expr(parent_placeholder), "ancestor_id"),
+            expr_with_alias_select_item(number_expr("1"), "depth"),
+        ],
+        Vec::new(),
+        None,
+        Vec::new(),
+    );
+
+    let candidate_recursive = select_query_from_parts(
+        vec![
+            SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("ancestor_id"))),
+            expr_with_alias_select_item(
+                Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("depth"))),
+                    op: BinaryOperator::Plus,
+                    right: Box::new(number_expr("1")),
+                },
+                "depth",
+            ),
+        ],
+        vec![table_with_joins_for(COMMIT_ANCESTRY_TABLE)],
+        Some(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("commit_id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(placeholder_expr(parent_placeholder)),
+        }),
+        Vec::new(),
+    );
+
+    let candidate_query = Query {
+        with: None,
+        body: Box::new(SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier: SetQuantifier::All,
+            left: Box::new(SetExpr::Query(Box::new(candidate_seed))),
+            right: Box::new(SetExpr::Query(Box::new(candidate_recursive))),
+        }),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    };
+
+    let source_query = select_query_from_parts(
+        vec![
+            expr_with_alias_select_item(placeholder_expr(commit_placeholder), "commit_id"),
+            SelectItem::UnnamedExpr(qualified_column_expr("candidate", "ancestor_id")),
+            expr_with_alias_select_item(
+                function_expr("MIN", vec![qualified_column_expr("candidate", "depth")]),
+                "depth",
+            ),
+        ],
+        vec![TableWithJoins {
+            relation: TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(candidate_query),
+                alias: Some(table_alias("candidate")),
+            },
+            joins: Vec::new(),
+        }],
+        None,
+        vec![qualified_column_expr("candidate", "ancestor_id")],
+    );
+
+    make_insert_statement_with_source(
+        COMMIT_ANCESTRY_TABLE,
+        commit_ancestry_insert_columns(),
+        source_query,
+        Some(commit_ancestry_do_update_on_conflict()),
+    )
+}
+
+fn commit_ancestry_insert_columns() -> Vec<Ident> {
+    vec![
+        Ident::new("commit_id"),
+        Ident::new("ancestor_id"),
+        Ident::new("depth"),
+    ]
+}
+
+fn commit_ancestry_do_nothing_on_conflict() -> OnInsert {
+    OnInsert::OnConflict(OnConflict {
+        conflict_target: Some(ConflictTarget::Columns(commit_ancestry_conflict_columns())),
+        action: OnConflictAction::DoNothing,
+    })
+}
+
+fn commit_ancestry_do_update_on_conflict() -> OnInsert {
+    OnInsert::OnConflict(OnConflict {
+        conflict_target: Some(ConflictTarget::Columns(commit_ancestry_conflict_columns())),
+        action: OnConflictAction::DoUpdate(DoUpdate {
+            assignments: vec![Assignment {
+                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
+                    Ident::new("depth"),
+                )])),
+                value: Expr::Case {
+                    case_token: AttachedToken::empty(),
+                    end_token: AttachedToken::empty(),
+                    operand: None,
+                    conditions: vec![CaseWhen {
+                        condition: Expr::BinaryOp {
+                            left: Box::new(qualified_column_expr("excluded", "depth")),
+                            op: BinaryOperator::Lt,
+                            right: Box::new(qualified_column_expr(COMMIT_ANCESTRY_TABLE, "depth")),
+                        },
+                        result: qualified_column_expr("excluded", "depth"),
+                    }],
+                    else_result: Some(Box::new(qualified_column_expr(
+                        COMMIT_ANCESTRY_TABLE,
+                        "depth",
+                    ))),
+                },
+            }],
+            selection: None,
+        }),
+    })
+}
+
+fn commit_ancestry_conflict_columns() -> Vec<Ident> {
+    vec![Ident::new("commit_id"), Ident::new("ancestor_id")]
+}
+
+fn select_query_from_parts(
+    projection: Vec<SelectItem>,
+    from: Vec<TableWithJoins>,
+    selection: Option<Expr>,
+    group_by: Vec<Expr>,
+) -> Query {
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection,
+            exclude: None,
+            into: None,
+            from,
+            lateral_views: Vec::new(),
+            prewhere: None,
+            selection,
+            group_by: GroupByExpr::Expressions(group_by, Vec::new()),
+            cluster_by: Vec::new(),
+            distribute_by: Vec::new(),
+            sort_by: Vec::new(),
+            having: None,
+            named_window: Vec::new(),
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: None,
+            flavor: SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: Vec::new(),
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: Vec::new(),
+    }
+}
+
+fn expr_with_alias_select_item(expr: Expr, alias: &str) -> SelectItem {
+    SelectItem::ExprWithAlias {
+        expr,
+        alias: Ident::new(alias),
+    }
+}
+
+fn table_alias(name: &str) -> TableAlias {
+    TableAlias {
+        explicit: false,
+        name: Ident::new(name),
+        columns: Vec::new(),
+    }
+}
+
+fn qualified_column_expr(relation: &str, column: &str) -> Expr {
+    Expr::CompoundIdentifier(vec![Ident::new(relation), Ident::new(column)])
+}
+
+fn function_expr(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)))
+                .collect(),
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
 }
 
 fn collect_commit_parent_map_for_ancestry(
@@ -2326,18 +2523,6 @@ fn parse_commit_edge_snapshot_for_ancestry(
         (Some(parent_id), Some(child_id)) => Ok(Some((parent_id, child_id))),
         _ => Ok(None),
     }
-}
-
-fn parse_single_statement_from_sql(sql: &str) -> Result<Statement, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected a single statement".to_string(),
-        });
-    }
-    Ok(statements.remove(0))
 }
 
 fn text_param_expr(
@@ -2455,7 +2640,7 @@ fn make_insert_statement(
         value_keyword: false,
         rows,
     };
-    let query = Query {
+    let source = Query {
         with: None,
         body: Box::new(SetExpr::Values(values)),
         order_by: None,
@@ -2468,6 +2653,15 @@ fn make_insert_statement(
         pipe_operators: Vec::new(),
     };
 
+    make_insert_statement_with_source(table, columns, source, on)
+}
+
+fn make_insert_statement_with_source(
+    table: &str,
+    columns: Vec<Ident>,
+    source: Query,
+    on: Option<OnInsert>,
+) -> Statement {
     Statement::Insert(sqlparser::ast::Insert {
         insert_token: AttachedToken::empty(),
         or: None,
@@ -2479,7 +2673,7 @@ fn make_insert_statement(
         table_alias: None,
         columns,
         overwrite: false,
-        source: Some(Box::new(query)),
+        source: Some(Box::new(source)),
         assignments: Vec::new(),
         partitioned: None,
         after_columns: Vec::new(),

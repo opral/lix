@@ -3,9 +3,13 @@ use sqlparser::ast::{Query, Select, TableFactor};
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
+use crate::sql::read_views::query_builder::{
+    aliased_column_select_item, aliased_select_item, and_expr, column_eq_int, column_eq_text,
+    is_not_null_expr, lix_json_text_expr, select_query_from_table, unaliased_select_item,
+};
 use crate::sql::{
-    default_alias, escape_sql_string, object_name_matches, parse_single_query,
-    rewrite_query_selects, rewrite_table_factors_in_select_decision, RewriteDecision,
+    default_alias, object_name_matches, rewrite_query_selects,
+    rewrite_table_factors_in_select_decision, RewriteDecision,
 };
 use crate::LixError;
 
@@ -24,7 +28,7 @@ fn rewrite_table_factor(relation: &mut TableFactor) -> Result<RewriteDecision, L
         TableFactor::Table { name, alias, .. }
             if object_name_matches(name, LIX_ACTIVE_ACCOUNT_VIEW_NAME) =>
         {
-            let derived_query = build_lix_active_account_view_query()?;
+            let derived_query = build_lix_active_account_view_query();
             let derived_alias = alias
                 .clone()
                 .or_else(|| Some(default_lix_active_account_alias()));
@@ -39,30 +43,40 @@ fn rewrite_table_factor(relation: &mut TableFactor) -> Result<RewriteDecision, L
     }
 }
 
-fn build_lix_active_account_view_query() -> Result<Query, LixError> {
-    let sql = format!(
-        "SELECT \
-             lix_json_text(snapshot_content, 'account_id') AS account_id, \
-             schema_key, \
-             file_id, \
-             version_id AS lixcol_version_id, \
-             plugin_key, \
-             schema_version, \
-             untracked, \
-             created_at, \
-             updated_at, \
-             change_id AS lixcol_change_id \
-         FROM lix_internal_state_vtable \
-         WHERE schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{storage_version_id}' \
-           AND untracked = 1 \
-           AND snapshot_content IS NOT NULL",
-        schema_key = escape_sql_string(active_account_schema_key()),
-        file_id = escape_sql_string(active_account_file_id()),
-        storage_version_id = escape_sql_string(active_account_storage_version_id()),
+fn build_lix_active_account_view_query() -> Query {
+    let selection = and_expr(
+        and_expr(
+            and_expr(
+                and_expr(
+                    column_eq_text("schema_key", active_account_schema_key()),
+                    column_eq_text("file_id", active_account_file_id()),
+                ),
+                column_eq_text("version_id", active_account_storage_version_id()),
+            ),
+            column_eq_int("untracked", 1),
+        ),
+        is_not_null_expr("snapshot_content"),
     );
-    parse_single_query(&sql)
+
+    select_query_from_table(
+        vec![
+            aliased_select_item(
+                lix_json_text_expr("snapshot_content", "account_id"),
+                "account_id",
+            ),
+            unaliased_select_item("schema_key"),
+            unaliased_select_item("file_id"),
+            aliased_column_select_item("version_id", "lixcol_version_id"),
+            unaliased_select_item("plugin_key"),
+            unaliased_select_item("schema_version"),
+            unaliased_select_item("untracked"),
+            unaliased_select_item("created_at"),
+            unaliased_select_item("updated_at"),
+            aliased_column_select_item("change_id", "lixcol_change_id"),
+        ],
+        "lix_internal_state_vtable",
+        selection,
+    )
 }
 
 fn default_lix_active_account_alias() -> sqlparser::ast::TableAlias {

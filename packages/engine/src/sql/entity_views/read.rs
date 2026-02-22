@@ -1,10 +1,16 @@
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{ObjectName, ObjectNamePart, Query, Select, TableFactor};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    TableFactor, Value as AstValue,
+};
+
+use crate::sql::read_views::query_builder::{
+    column_eq_text, lix_json_text_expr, select_query_from_table,
+};
 
 use crate::sql::{
-    default_alias, escape_sql_string, parse_single_query, quote_ident, rewrite_query_selects,
-    rewrite_table_factors_in_select_decision, visit_query_selects, visit_table_factors_in_select,
-    RewriteDecision,
+    default_alias, rewrite_query_selects, rewrite_table_factors_in_select_decision,
+    visit_query_selects, visit_table_factors_in_select, RewriteDecision,
 };
 use crate::{LixBackend, LixError};
 
@@ -76,85 +82,103 @@ fn rewrite_table_factor(
 }
 
 fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError> {
-    let (source_sql, extra_predicates) = match target.variant {
+    let (source_table, extra_predicates) = match target.variant {
         EntityViewVariant::Base => {
             base_effective_state_source(target.version_id_override.as_deref())
         }
-        EntityViewVariant::ByVersion => {
-            ("lix_state_by_version".to_string(), vec!["1=1".to_string()])
-        }
-        EntityViewVariant::History => ("lix_state_history".to_string(), vec!["1=1".to_string()]),
+        EntityViewVariant::ByVersion => ("lix_state_by_version".to_string(), Vec::new()),
+        EntityViewVariant::History => ("lix_state_history".to_string(), Vec::new()),
     };
-    let mut select_parts = Vec::new();
-    for property in &target.properties {
-        select_parts.push(format!(
-            "lix_json_text(snapshot_content, '{property}') AS {alias}",
-            property = escape_sql_string(property),
-            alias = quote_ident(property),
-        ));
-    }
-    for (column, alias) in lixcol_aliases_for_variant(target.variant) {
-        select_parts.push(format!("{column} AS {alias}"));
-    }
-    let mut predicates = vec![format!(
-        "schema_key = '{schema_key}'",
-        schema_key = escape_sql_string(&target.schema_key)
-    )];
+
+    let mut projection = property_projection_items(&target.properties);
+    projection.extend(
+        lixcol_aliases_for_variant(target.variant)
+            .iter()
+            .map(|(column, alias)| SelectItem::ExprWithAlias {
+                expr: column_expr(column),
+                alias: Ident::new(*alias),
+            }),
+    );
+
+    let mut predicates = vec![column_eq_text("schema_key", &target.schema_key)];
     predicates.extend(extra_predicates);
     predicates.extend(override_predicates(target));
 
-    let sql = format!(
-        "SELECT {projection} \
-         FROM {source} \
-         WHERE {predicate}",
-        projection = select_parts.join(", "),
-        source = source_sql,
-        predicate = predicates.join(" AND "),
-    );
-    parse_single_query(&sql)
+    Ok(select_query_from_table(
+        projection,
+        &source_table,
+        conjunction(predicates),
+    ))
 }
 
-fn base_effective_state_source(version_id_override: Option<&str>) -> (String, Vec<String>) {
+fn property_projection_items(properties: &[String]) -> Vec<SelectItem> {
+    properties
+        .iter()
+        .map(|property| SelectItem::ExprWithAlias {
+            expr: lix_json_text_expr("snapshot_content", property),
+            alias: Ident::with_quote('"', property),
+        })
+        .collect()
+}
+
+fn column_expr(name: &str) -> Expr {
+    Expr::Identifier(Ident::new(name))
+}
+
+fn conjunction(mut predicates: Vec<Expr>) -> Expr {
+    if predicates.is_empty() {
+        return Expr::BinaryOp {
+            left: Box::new(Expr::Value(AstValue::Number("1".to_string(), false).into())),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Value(AstValue::Number("1".to_string(), false).into())),
+        };
+    }
+    let mut current = predicates.remove(0);
+    for predicate in predicates {
+        current = Expr::BinaryOp {
+            left: Box::new(current),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
+        };
+    }
+    current
+}
+
+fn base_effective_state_source(version_id_override: Option<&str>) -> (String, Vec<Expr>) {
     match version_id_override {
         // Base views represent effective state. With an explicit version override, the
         // effective-state source is still `lix_state_by_version`, scoped to that version.
         Some(version_id) => (
             "lix_state_by_version".to_string(),
-            vec![format!("version_id = '{}'", escape_sql_string(version_id))],
+            vec![column_eq_text("version_id", version_id)],
         ),
-        None => ("lix_state".to_string(), vec!["1=1".to_string()]),
+        None => ("lix_state".to_string(), Vec::new()),
     }
 }
 
-fn override_predicates(target: &EntityViewTarget) -> Vec<String> {
+fn override_predicates(target: &EntityViewTarget) -> Vec<Expr> {
     target
         .override_predicates
         .iter()
         .map(|predicate| match &predicate.value {
-            JsonValue::Null => format!("{column} IS NULL", column = predicate.column),
-            value => format!(
-                "{column} = {literal}",
-                column = predicate.column,
-                literal = render_literal(value)
-            ),
+            JsonValue::Null => Expr::IsNull(Box::new(column_expr(&predicate.column))),
+            value => Expr::BinaryOp {
+                left: Box::new(column_expr(&predicate.column)),
+                op: BinaryOperator::Eq,
+                right: Box::new(render_literal(value)),
+            },
         })
         .collect()
 }
 
-fn render_literal(value: &JsonValue) -> String {
+fn render_literal(value: &JsonValue) -> Expr {
     match value {
-        JsonValue::Null => "NULL".to_string(),
-        JsonValue::Bool(value) => {
-            if *value {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }
-        JsonValue::Number(value) => value.to_string(),
-        JsonValue::String(value) => format!("'{}'", escape_sql_string(value)),
+        JsonValue::Null => Expr::Value(AstValue::Null.into()),
+        JsonValue::Bool(value) => Expr::Value(AstValue::Boolean(*value).into()),
+        JsonValue::Number(value) => Expr::Value(AstValue::Number(value.to_string(), false).into()),
+        JsonValue::String(value) => Expr::Value(AstValue::SingleQuotedString(value.clone()).into()),
         JsonValue::Array(_) | JsonValue::Object(_) => {
-            format!("'{}'", escape_sql_string(&value.to_string()))
+            Expr::Value(AstValue::SingleQuotedString(value.to_string()).into())
         }
     }
 }
@@ -233,4 +257,63 @@ fn object_name_terminal(name: &ObjectName) -> Option<String> {
         .last()
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{build_entity_view_query, EntityViewVariant};
+    use crate::sql::entity_views::target::{EntityViewOverridePredicate, EntityViewTarget};
+
+    fn sample_target(variant: EntityViewVariant) -> EntityViewTarget {
+        EntityViewTarget {
+            view_name: "lix_demo".to_string(),
+            schema_key: "demo".to_string(),
+            variant,
+            schema: json!({"type":"object"}),
+            properties: vec!["name".to_string()],
+            primary_key_properties: Vec::new(),
+            schema_version: "1".to_string(),
+            file_id_override: None,
+            plugin_key_override: None,
+            version_id_override: None,
+            override_predicates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn base_view_with_version_override_uses_state_by_version_source() {
+        let mut target = sample_target(EntityViewVariant::Base);
+        target.version_id_override = Some("v42".to_string());
+
+        let query = build_entity_view_query(&target).expect("build entity view query");
+        let sql = query.to_string();
+
+        assert!(sql.contains("FROM lix_state_by_version"));
+        assert!(sql.contains("version_id = 'v42'"));
+    }
+
+    #[test]
+    fn projection_and_override_predicates_are_rendered_from_ast() {
+        let mut target = sample_target(EntityViewVariant::Base);
+        target.properties = vec!["my-prop".to_string()];
+        target.override_predicates = vec![
+            EntityViewOverridePredicate {
+                column: "plugin_key".to_string(),
+                value: serde_json::Value::Null,
+            },
+            EntityViewOverridePredicate {
+                column: "untracked".to_string(),
+                value: serde_json::Value::Bool(true),
+            },
+        ];
+
+        let query = build_entity_view_query(&target).expect("build entity view query");
+        let sql = query.to_string();
+
+        assert!(sql.contains("lix_json_text(snapshot_content, 'my-prop') AS \"my-prop\""));
+        assert!(sql.contains("plugin_key IS NULL"));
+        assert!(sql.contains("untracked = true"));
+    }
 }

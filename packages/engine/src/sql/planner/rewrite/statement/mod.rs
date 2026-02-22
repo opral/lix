@@ -5,7 +5,6 @@ use sqlparser::ast::{Query, Statement};
 use crate::functions::LixFunctionProvider;
 use crate::sql::planner::rewrite::write;
 use crate::sql::planner::validate::validate_statement_output_parts;
-use crate::sql::read_pipeline::rewrite_read_query_with_backend_and_params;
 use crate::sql::read_pipeline::walker::walk_query;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
@@ -14,6 +13,7 @@ use crate::sql::planner::ir::logical::{
     LogicalReadOperator, LogicalReadSemantics, LogicalStatementOperation, LogicalStatementPlan,
     LogicalStatementSemantics,
 };
+use crate::sql::planner::rewrite::query::rewrite_query_with_backend_and_params;
 
 pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
     backend: &dyn LixBackend,
@@ -29,8 +29,7 @@ where
     match statement {
         Statement::Query(query) => {
             let semantics = LogicalStatementSemantics::QueryRead(read_semantics_for_query(&query));
-            let rewritten =
-                rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
+            let rewritten = rewrite_query_with_backend_and_params(backend, *query, params).await?;
             Ok(LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
                 semantics,
@@ -56,7 +55,7 @@ where
             let rewritten_statement = match *statement {
                 Statement::Query(query) => {
                     let rewritten =
-                        rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
+                        rewrite_query_with_backend_and_params(backend, *query, params).await?;
                     Statement::Query(Box::new(rewritten))
                 }
                 other => other,
