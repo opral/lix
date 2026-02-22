@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
 
-use sqlparser::ast::{BinaryOperator, Expr, Query, Select, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+};
 
 use crate::backend::SqlDialect;
 use crate::sql::steps::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
     bind_sql, default_alias, escape_sql_string, object_name_matches, parse_single_query,
-    rewrite_query_with_select_rewriter,
+    parse_sql_statements, rewrite_query_with_select_rewriter,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -29,9 +31,7 @@ pub async fn rewrite_query_with_backend(
     let (rewritten, requests) = rewrite_query_collect_requests(query)?;
     let mut seen_requests = BTreeSet::new();
     for request in requests {
-        if should_fallback_to_phase1_query(&request)
-            || request.requested_pushdown_blocked_by_bare_placeholders
-        {
+        if should_fallback_to_phase1_query(&request) {
             continue;
         }
         let request_key = format!(
@@ -725,7 +725,8 @@ fn build_lix_state_history_view_query_phase1(
         pushdown
             .change_predicates
             .iter()
-            .map(|predicate| remap_change_predicate_for_phase1(predicate)),
+            .map(|predicate| remap_change_predicate_for_phase1(predicate))
+            .collect::<Result<Vec<_>, _>>()?,
     );
 
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
@@ -938,10 +939,58 @@ fn build_lix_state_history_view_query_phase1(
     parse_single_query(&sql)
 }
 
-fn remap_change_predicate_for_phase1(predicate: &str) -> String {
-    predicate
-        .replace("bp.change_id", "ic.id")
-        .replace("bp.", "ic.")
+fn remap_change_predicate_for_phase1(predicate: &str) -> Result<String, LixError> {
+    let mut expr = parse_phase1_predicate_expr(predicate)?;
+    remap_phase1_change_predicate_expr(&mut expr);
+    Ok(expr.to_string())
+}
+
+fn parse_phase1_predicate_expr(predicate: &str) -> Result<Expr, LixError> {
+    let sql = format!("SELECT 1 WHERE {predicate}");
+    let mut statements = parse_sql_statements(&sql)?;
+    let Some(statement) = statements.pop() else {
+        return Err(LixError {
+            message: "phase1 change predicate parse produced no statements".to_string(),
+        });
+    };
+    let Statement::Query(query) = statement else {
+        return Err(LixError {
+            message: "phase1 change predicate parse did not produce a query".to_string(),
+        });
+    };
+    let SetExpr::Select(select) = *query.body else {
+        return Err(LixError {
+            message: "phase1 change predicate parse did not produce a SELECT body".to_string(),
+        });
+    };
+    let Some(selection) = select.selection else {
+        return Err(LixError {
+            message: "phase1 change predicate parse produced no WHERE expression".to_string(),
+        });
+    };
+    Ok(selection)
+}
+
+fn remap_phase1_change_predicate_expr(expr: &mut Expr) {
+    match expr {
+        Expr::BinaryOp { left, .. } => remap_phase1_change_predicate_column(left.as_mut()),
+        Expr::InList { expr, .. } => remap_phase1_change_predicate_column(expr.as_mut()),
+        Expr::InSubquery { expr, .. } => remap_phase1_change_predicate_column(expr.as_mut()),
+        _ => {}
+    }
+}
+
+fn remap_phase1_change_predicate_column(expr: &mut Expr) {
+    let Expr::CompoundIdentifier(parts) = expr else {
+        return;
+    };
+    if parts.len() != 2 || !parts[0].value.eq_ignore_ascii_case("bp") {
+        return;
+    }
+    parts[0].value = "ic".to_string();
+    if parts[1].value.eq_ignore_ascii_case("change_id") {
+        parts[1].value = "id".to_string();
+    }
 }
 
 async fn ensure_history_timeline_materialized_for_request(
@@ -1562,6 +1611,25 @@ mod tests {
         assert!(sql.contains("cc_raw.commit_id = 'commit-a'"));
         assert!(sql.contains("ic.id = 'change-a'"));
         assert!(!sql.contains("ic.change_id = 'change-a'"));
+    }
+
+    #[test]
+    fn phase1_fallback_does_not_rewrite_bp_substrings_inside_literals() {
+        let query = parse_query(
+            "SELECT * \
+             FROM lix_state_history AS sh \
+             WHERE sh.commit_id = 'commit-a' \
+               AND sh.schema_key = 'bp.keep.this'",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("cc_raw.commit_id = 'commit-a'"));
+        assert!(sql.contains("ic.schema_key = 'bp.keep.this'"));
+        assert!(!sql.contains("'ic.keep.this'"));
     }
 
     #[test]
