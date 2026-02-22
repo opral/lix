@@ -1,21 +1,18 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Expr, Insert, ObjectNamePart, Statement, TableFactor,
-    TableWithJoins, Update,
+    Assignment, AssignmentTarget, Expr, Insert, ObjectNamePart, TableFactor, TableWithJoins, Update,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
-use crate::sql::{
-    escape_sql_string, object_name_matches, resolve_expr_cell_with_state, PlaceholderState,
-};
+use crate::sql::{object_name_matches, resolve_expr_cell_with_state, PlaceholderState};
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
     active_version_storage_version_id,
 };
 use crate::{LixBackend, LixError, Value as EngineValue};
+
+use super::insert_builder::{int_expr, make_values_insert, string_expr};
 
 const LIX_ACTIVE_VERSION_VIEW_NAME: &str = "lix_active_version";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
@@ -219,43 +216,35 @@ async fn query_lix_active_version_rows(
 
 fn build_vtable_insert(rows: Vec<InsertSnapshotRow>) -> Result<Insert, LixError> {
     let values = rows
-        .iter()
+        .into_iter()
         .map(|row| {
-            format!(
-                "('{entity_id}', '{schema_key}', '{file_id}', '{storage_version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', 1)",
-                entity_id = escape_sql_string(&row.entity_id),
-                schema_key = escape_sql_string(active_version_schema_key()),
-                file_id = escape_sql_string(active_version_file_id()),
-                storage_version_id = escape_sql_string(active_version_storage_version_id()),
-                plugin_key = escape_sql_string(active_version_plugin_key()),
-                snapshot_content = escape_sql_string(&row.snapshot_content.to_string()),
-                schema_version = escape_sql_string(active_version_schema_version()),
-            )
+            vec![
+                string_expr(&row.entity_id),
+                string_expr(active_version_schema_key()),
+                string_expr(active_version_file_id()),
+                string_expr(active_version_storage_version_id()),
+                string_expr(active_version_plugin_key()),
+                string_expr(&row.snapshot_content.to_string()),
+                string_expr(active_version_schema_version()),
+                int_expr(1),
+            ]
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "INSERT INTO {vtable} \
-         (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked) \
-         VALUES {values}",
-        vtable = VTABLE_NAME,
-        values = values,
-    );
-    let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: format!("failed to build vtable insert for lix_active_version rewrite: {error}"),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "lix_active_version rewrite expected one INSERT statement".to_string(),
-        });
-    }
-    let statement = statements.remove(0);
-    match statement {
-        Statement::Insert(insert) => Ok(insert),
-        _ => Err(LixError {
-            message: "lix_active_version rewrite expected generated INSERT statement".to_string(),
-        }),
-    }
+        .collect::<Vec<_>>();
+
+    Ok(make_values_insert(
+        VTABLE_NAME,
+        &[
+            "entity_id",
+            "schema_key",
+            "file_id",
+            "version_id",
+            "plugin_key",
+            "snapshot_content",
+            "schema_version",
+            "untracked",
+        ],
+        values,
+    ))
 }
 
 fn assignment_target_column(target: &AssignmentTarget) -> Option<String> {

@@ -12,6 +12,8 @@ use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
 use crate::sql::{escape_sql_string, object_name_matches, resolve_insert_rows, PlaceholderState};
 use crate::{LixBackend, LixError, Value as EngineValue};
 
+use super::insert_builder::{int_expr, make_values_insert, string_expr};
+
 const LIX_ACTIVE_ACCOUNT_VIEW_NAME: &str = "lix_active_account";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 
@@ -170,32 +172,35 @@ async fn query_entity_ids_for_delete(
 
 fn build_vtable_insert(rows: Vec<InsertRow>) -> Result<Insert, LixError> {
     let values = rows
-        .iter()
+        .into_iter()
         .map(|row| {
-            format!(
-                "('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', 1)",
-                entity_id = escape_sql_string(&row.entity_id),
-                schema_key = escape_sql_string(active_account_schema_key()),
-                file_id = escape_sql_string(active_account_file_id()),
-                version_id = escape_sql_string(active_account_storage_version_id()),
-                plugin_key = escape_sql_string(active_account_plugin_key()),
-                snapshot_content = escape_sql_string(&row.snapshot_content.to_string()),
-                schema_version = escape_sql_string(active_account_schema_version()),
-            )
+            vec![
+                string_expr(&row.entity_id),
+                string_expr(active_account_schema_key()),
+                string_expr(active_account_file_id()),
+                string_expr(active_account_storage_version_id()),
+                string_expr(active_account_plugin_key()),
+                string_expr(&row.snapshot_content.to_string()),
+                string_expr(active_account_schema_version()),
+                int_expr(1),
+            ]
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "INSERT INTO {vtable} \
-         (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked) \
-         VALUES {values}",
-        vtable = VTABLE_NAME,
-        values = values,
-    );
-    parse_insert(
-        &sql,
-        "lix_active_account rewrite expected generated INSERT statement",
-    )
+        .collect::<Vec<_>>();
+
+    Ok(make_values_insert(
+        VTABLE_NAME,
+        &[
+            "entity_id",
+            "schema_key",
+            "file_id",
+            "version_id",
+            "plugin_key",
+            "snapshot_content",
+            "schema_version",
+            "untracked",
+        ],
+        values,
+    ))
 }
 
 fn build_vtable_delete(entity_ids: Vec<String>) -> Result<Statement, LixError> {
@@ -227,16 +232,6 @@ fn build_noop_delete() -> Result<Statement, LixError> {
         &format!("DELETE FROM {VTABLE_NAME} WHERE 1 = 0"),
         "lix_active_account rewrite expected generated no-op DELETE statement",
     )
-}
-
-fn parse_insert(sql: &str, error_message: &str) -> Result<Insert, LixError> {
-    let statement = parse_statement(sql, error_message)?;
-    match statement {
-        Statement::Insert(insert) => Ok(insert),
-        _ => Err(LixError {
-            message: error_message.to_string(),
-        }),
-    }
 }
 
 fn parse_statement(sql: &str, error_message: &str) -> Result<Statement, LixError> {

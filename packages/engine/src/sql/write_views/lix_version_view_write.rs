@@ -1,16 +1,13 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, Delete, Expr, FromTable, Ident, Insert, ObjectNamePart,
-    Statement, TableFactor, TableObject, TableWithJoins, Update,
+    TableFactor, TableObject, TableWithJoins, Update,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
 use crate::sql::{
-    escape_sql_string, object_name_matches, resolve_expr_cell_with_state, PlaceholderState,
-    RowSourceResolver,
+    object_name_matches, resolve_expr_cell_with_state, PlaceholderState, RowSourceResolver,
 };
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -20,6 +17,8 @@ use crate::version::{
     version_pointer_storage_version_id,
 };
 use crate::{LixBackend, LixError, Value as EngineValue};
+
+use super::insert_builder::{make_values_insert, null_expr, string_expr};
 
 const LIX_VERSION_VIEW_NAME: &str = "lix_version";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
@@ -585,51 +584,37 @@ fn build_vtable_insert_for_schema(
     schema_version: &str,
     rows: &[InsertSnapshotRow],
 ) -> Result<Insert, LixError> {
-    let values_sql = rows
+    let values = rows
         .iter()
         .map(|row| {
-            let snapshot_sql = row
-                .snapshot_content
-                .as_ref()
-                .map(|value| format!("'{}'", escape_sql_string(&value.to_string())))
-                .unwrap_or_else(|| "NULL".to_string());
-            format!(
-                "('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', {snapshot}, '{schema_version}')",
-                entity_id = escape_sql_string(&row.entity_id),
-                schema_key = escape_sql_string(schema_key),
-                file_id = escape_sql_string(file_id),
-                version_id = escape_sql_string(version_id),
-                plugin_key = escape_sql_string(plugin_key),
-                snapshot = snapshot_sql,
-                schema_version = escape_sql_string(schema_version),
-            )
+            vec![
+                string_expr(&row.entity_id),
+                string_expr(schema_key),
+                string_expr(file_id),
+                string_expr(version_id),
+                string_expr(plugin_key),
+                row.snapshot_content
+                    .as_ref()
+                    .map(|value| string_expr(&value.to_string()))
+                    .unwrap_or_else(null_expr),
+                string_expr(schema_version),
+            ]
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
 
-    let sql = format!(
-        "INSERT INTO {vtable} (\
-         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-         ) VALUES {values}",
-        vtable = VTABLE_NAME,
-        values = values_sql
-    );
-
-    let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "failed to build vtable insert for lix_version rewrite".to_string(),
-        });
-    }
-    let Statement::Insert(insert) = statements.remove(0) else {
-        return Err(LixError {
-            message: "lix_version rewrite expected generated INSERT statement".to_string(),
-        });
-    };
-
-    Ok(insert)
+    Ok(make_values_insert(
+        VTABLE_NAME,
+        &[
+            "entity_id",
+            "schema_key",
+            "file_id",
+            "version_id",
+            "plugin_key",
+            "snapshot_content",
+            "schema_version",
+        ],
+        values,
+    ))
 }
 
 fn insert_field_map(columns: &[Ident]) -> Result<BTreeMap<String, usize>, LixError> {
