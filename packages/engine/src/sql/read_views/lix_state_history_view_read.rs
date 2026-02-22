@@ -11,7 +11,7 @@ use crate::backend::SqlDialect;
 use crate::sql::read_views::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
     bind_sql_with_state, default_alias, escape_sql_string, object_name_matches,
-    parse_expression_with_dialect, parse_single_query, parse_single_query_with_dialect,
+    parse_expression_with_dialect, parse_single_query_with_dialect,
     rewrite_query_selects, PlaceholderState, RewriteDecision,
 };
 use crate::version::GLOBAL_VERSION_ID;
@@ -23,6 +23,9 @@ const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
 const MAX_HISTORY_DEPTH: i64 = 512;
 static STATE_HISTORY_PHASE2_QUERY_TEMPLATE: OnceLock<Query> = OnceLock::new();
 static STATE_HISTORY_PHASE2_COUNT_TEMPLATE: OnceLock<Query> = OnceLock::new();
+static STATE_HISTORY_PHASE1_QUERY_TEMPLATE: OnceLock<Query> = OnceLock::new();
+static STATE_HISTORY_PHASE1_COUNT_TEMPLATE: OnceLock<Query> = OnceLock::new();
+static REQUESTED_ROOT_COMMITS_TEMPLATE: OnceLock<Query> = OnceLock::new();
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     let (rewritten, _requests) = rewrite_query_collect_requests(query)?;
@@ -620,14 +623,6 @@ impl Visitor for BarePlaceholderDetector {
     }
 }
 
-fn render_where_clause(predicates: &[String]) -> String {
-    if predicates.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", predicates.join(" AND "))
-    }
-}
-
 fn build_lix_state_history_view_query(
     pushdown: &HistoryPushdown,
     count_fast_path: bool,
@@ -920,204 +915,11 @@ fn build_lix_state_history_view_query_phase1(
             .map(|predicate| predicate.phase1_sql.clone()),
     );
 
-    let all_changes_where_sql = render_where_clause(&all_changes_predicates);
-    let requested_where_sql = render_where_clause(&requested_predicates);
-    let cse_where_sql = render_where_clause(&cse_predicates);
-
-    let all_changes_sql = if count_fast_path {
-        format!(
-            "SELECT \
-               ic.id, \
-               ic.created_at \
-             FROM lix_internal_change ic \
-             {all_changes_where}",
-            all_changes_where = all_changes_where_sql,
-        )
-    } else {
-        format!(
-            "SELECT \
-               ic.id, \
-               ic.entity_id, \
-               ic.schema_key, \
-               ic.file_id, \
-               ic.plugin_key, \
-               ic.schema_version, \
-               ic.created_at, \
-               CASE \
-                 WHEN ic.snapshot_id = 'no-content' THEN NULL \
-                 ELSE s.content \
-               END AS snapshot_content, \
-               ic.metadata AS metadata \
-             FROM lix_internal_change ic \
-             LEFT JOIN lix_internal_snapshot s ON s.id = ic.snapshot_id \
-             {all_changes_where}",
-            all_changes_where = all_changes_where_sql,
-        )
-    };
-
-    let ranked_select_sql = if count_fast_path {
-        "SELECT \
-           r.target_entity_id, \
-           r.target_file_id, \
-           r.target_schema_key, \
-           r.target_change_id, \
-           r.origin_commit_id, \
-           r.root_commit_id, \
-           r.commit_depth, \
-           ROW_NUMBER() OVER ( \
-             PARTITION BY \
-               r.target_entity_id, \
-               r.target_file_id, \
-               r.target_schema_key, \
-               r.root_commit_id, \
-               r.commit_depth \
-             ORDER BY \
-               target_change.created_at DESC, \
-               target_change.id DESC \
-           ) AS rn \
-         FROM cse_in_reachable_commits r \
-         JOIN all_changes_with_snapshots target_change \
-           ON target_change.id = r.target_change_id"
-            .to_string()
-    } else {
-        "SELECT \
-           target_change.entity_id AS entity_id, \
-           target_change.schema_key AS schema_key, \
-           target_change.file_id AS file_id, \
-           target_change.plugin_key AS plugin_key, \
-           target_change.snapshot_content AS snapshot_content, \
-           target_change.metadata AS metadata, \
-           target_change.schema_version AS schema_version, \
-           r.target_change_id AS target_change_id, \
-           r.origin_commit_id AS origin_commit_id, \
-           r.root_commit_id AS root_commit_id, \
-           r.commit_depth AS commit_depth, \
-           ROW_NUMBER() OVER ( \
-             PARTITION BY \
-               r.target_entity_id, \
-               r.target_file_id, \
-               r.target_schema_key, \
-               r.root_commit_id, \
-               r.commit_depth \
-             ORDER BY \
-               target_change.created_at DESC, \
-               target_change.id DESC \
-           ) AS rn \
-         FROM cse_in_reachable_commits r \
-         JOIN all_changes_with_snapshots target_change \
-           ON target_change.id = r.target_change_id"
-            .to_string()
-    };
-
-    let final_select_sql = if count_fast_path {
-        "SELECT COUNT(*) AS count \
-         FROM ranked_cse ranked \
-         WHERE ranked.rn = 1"
-            .to_string()
-    } else {
-        format!(
-            "SELECT \
-               ranked.entity_id AS entity_id, \
-               ranked.schema_key AS schema_key, \
-               ranked.file_id AS file_id, \
-               ranked.plugin_key AS plugin_key, \
-               ranked.snapshot_content AS snapshot_content, \
-               ranked.metadata AS metadata, \
-               ranked.schema_version AS schema_version, \
-               ranked.target_change_id AS change_id, \
-               ranked.origin_commit_id AS commit_id, \
-               ranked.root_commit_id AS root_commit_id, \
-               ranked.commit_depth AS depth, \
-               '{global_version}' AS version_id \
-             FROM ranked_cse ranked \
-             WHERE ranked.rn = 1 \
-               AND ranked.snapshot_content IS NOT NULL",
-            global_version = GLOBAL_VERSION_ID
-        )
-    };
-
-    let sql = format!(
-        "WITH \
-           commit_by_version AS ( \
-             SELECT \
-               entity_id AS id, \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-               version_id AS lixcol_version_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
-             WHERE schema_key = 'lix_commit' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           change_set_element_by_version AS ( \
-             SELECT \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_text(snapshot_content, 'change_id') AS change_id, \
-               lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-               lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-               lix_json_text(snapshot_content, 'file_id') AS file_id, \
-               version_id AS lixcol_version_id \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element \
-             WHERE schema_key = 'lix_change_set_element' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           all_changes_with_snapshots AS ( \
-             {all_changes_sql} \
-           ), \
-           requested_commits AS ( \
-             SELECT DISTINCT c.id AS commit_id \
-             FROM commit_by_version c \
-             {requested_where_sql} \
-           ), \
-           reachable_commits_from_requested(id, root_commit_id, depth) AS ( \
-             SELECT \
-               ancestry.ancestor_id AS id, \
-               requested.commit_id AS root_commit_id, \
-               ancestry.depth AS depth \
-             FROM requested_commits requested \
-             JOIN lix_internal_commit_ancestry ancestry \
-               ON ancestry.commit_id = requested.commit_id \
-             WHERE ancestry.depth <= {max_depth} \
-           ), \
-           commit_changesets AS ( \
-             SELECT \
-               c.id AS commit_id, \
-               c.change_set_id AS change_set_id, \
-               rc.root_commit_id, \
-               rc.depth AS commit_depth \
-             FROM commit_by_version c \
-             JOIN reachable_commits_from_requested rc ON c.id = rc.id \
-             WHERE c.lixcol_version_id = '{global_version}' \
-           ), \
-           cse_in_reachable_commits AS ( \
-             SELECT \
-               cse_raw.entity_id AS target_entity_id, \
-               cse_raw.file_id AS target_file_id, \
-               cse_raw.schema_key AS target_schema_key, \
-               cse_raw.change_id AS target_change_id, \
-               cc_raw.commit_id AS origin_commit_id, \
-               cc_raw.root_commit_id AS root_commit_id, \
-               cc_raw.commit_depth AS commit_depth \
-             FROM change_set_element_by_version cse_raw \
-             JOIN commit_changesets cc_raw \
-               ON cse_raw.change_set_id = cc_raw.change_set_id \
-             {cse_where_sql} \
-           ), \
-           ranked_cse AS ( \
-             {ranked_select_sql} \
-           ) \
-         {final_select_sql}",
-        global_version = GLOBAL_VERSION_ID,
-        max_depth = MAX_HISTORY_DEPTH,
-        all_changes_sql = all_changes_sql,
-        requested_where_sql = requested_where_sql,
-        cse_where_sql = cse_where_sql,
-        ranked_select_sql = ranked_select_sql,
-        final_select_sql = final_select_sql,
-    );
-    parse_single_query(&sql)
+    let mut query = state_history_phase1_template(count_fast_path);
+    append_predicates_to_history_cte(&mut query, "all_changes_with_snapshots", &all_changes_predicates)?;
+    append_predicates_to_history_cte(&mut query, "requested_commits", &requested_predicates)?;
+    append_predicates_to_history_cte(&mut query, "cse_in_reachable_commits", &cse_predicates)?;
+    Ok(query)
 }
 
 async fn ensure_history_timeline_materialized_for_request(
@@ -1143,24 +945,9 @@ async fn resolve_requested_root_commits(
 ) -> Result<Vec<String>, LixError> {
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
     requested_predicates.extend(pushdown.requested_predicates.clone());
-    let requested_where_sql = render_where_clause(&requested_predicates);
-    let sql = format!(
-        "WITH commit_by_version AS ( \
-           SELECT \
-             entity_id AS id, \
-             version_id AS lixcol_version_id \
-           FROM lix_internal_state_materialized_v1_lix_commit \
-           WHERE schema_key = 'lix_commit' \
-             AND version_id = '{global_version}' \
-             AND is_tombstone = 0 \
-             AND snapshot_content IS NOT NULL \
-         ) \
-         SELECT DISTINCT c.id \
-         FROM commit_by_version c \
-         {requested_where}",
-        global_version = GLOBAL_VERSION_ID,
-        requested_where = requested_where_sql,
-    );
+    let mut query = requested_root_commits_template();
+    append_predicates_to_history_top_level(&mut query, &requested_predicates)?;
+    let sql = query.to_string();
     let bound = bind_sql_with_state(&sql, params, backend.dialect(), placeholder_state)?;
     let rows = backend.execute(&bound.sql, &bound.params).await?;
     let mut roots = BTreeSet::new();
@@ -1171,6 +958,282 @@ async fn resolve_requested_root_commits(
     }
     Ok(roots.into_iter().collect())
 }
+
+fn state_history_phase1_template(count_fast_path: bool) -> Query {
+    let template = if count_fast_path {
+        STATE_HISTORY_PHASE1_COUNT_TEMPLATE.get_or_init(|| {
+            parse_single_query_with_dialect(STATE_HISTORY_PHASE1_COUNT_SQL, SqlDialect::Sqlite)
+                .expect("state history phase1 count template")
+        })
+    } else {
+        STATE_HISTORY_PHASE1_QUERY_TEMPLATE.get_or_init(|| {
+            parse_single_query_with_dialect(STATE_HISTORY_PHASE1_SQL, SqlDialect::Sqlite)
+                .expect("state history phase1 query template")
+        })
+    };
+    template.clone()
+}
+
+fn requested_root_commits_template() -> Query {
+    REQUESTED_ROOT_COMMITS_TEMPLATE
+        .get_or_init(|| {
+            parse_single_query_with_dialect(REQUESTED_ROOT_COMMITS_SQL, SqlDialect::Sqlite)
+                .expect("requested root commits template")
+        })
+        .clone()
+}
+
+fn append_predicates_to_history_top_level(
+    query: &mut Query,
+    predicates: &[String],
+) -> Result<(), LixError> {
+    let selection = &mut query_select_mut(query, "history top-level query")?.selection;
+    append_predicates_from_sql(selection, predicates)
+}
+
+fn query_select_mut<'a>(query: &'a mut Query, label: &str) -> Result<&'a mut Select, LixError> {
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(LixError {
+            message: format!("expected SELECT body for {label}"),
+        });
+    };
+    Ok(select.as_mut())
+}
+
+const STATE_HISTORY_PHASE1_SQL: &str = "WITH \
+  commit_by_version AS ( \
+    SELECT \
+      entity_id AS id, \
+      lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+      version_id AS lixcol_version_id \
+    FROM lix_internal_state_materialized_v1_lix_commit \
+    WHERE schema_key = 'lix_commit' \
+      AND version_id = 'global' \
+      AND is_tombstone = 0 \
+      AND snapshot_content IS NOT NULL \
+  ), \
+  change_set_element_by_version AS ( \
+    SELECT \
+      lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+      lix_json_text(snapshot_content, 'change_id') AS change_id, \
+      lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
+      lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
+      lix_json_text(snapshot_content, 'file_id') AS file_id, \
+      version_id AS lixcol_version_id \
+    FROM lix_internal_state_materialized_v1_lix_change_set_element \
+    WHERE schema_key = 'lix_change_set_element' \
+      AND version_id = 'global' \
+      AND is_tombstone = 0 \
+      AND snapshot_content IS NOT NULL \
+  ), \
+  all_changes_with_snapshots AS ( \
+    SELECT \
+      ic.id AS id, \
+      ic.entity_id AS entity_id, \
+      ic.schema_key AS schema_key, \
+      ic.file_id AS file_id, \
+      ic.plugin_key AS plugin_key, \
+      ic.schema_version AS schema_version, \
+      ic.created_at AS created_at, \
+      CASE \
+        WHEN ic.snapshot_id = 'no-content' THEN NULL \
+        ELSE s.content \
+      END AS snapshot_content, \
+      ic.metadata AS metadata \
+    FROM lix_internal_change ic \
+    LEFT JOIN lix_internal_snapshot s ON s.id = ic.snapshot_id \
+  ), \
+  requested_commits AS ( \
+    SELECT DISTINCT c.id AS commit_id \
+    FROM commit_by_version c \
+  ), \
+  reachable_commits_from_requested(id, root_commit_id, depth) AS ( \
+    SELECT \
+      ancestry.ancestor_id AS id, \
+      requested.commit_id AS root_commit_id, \
+      ancestry.depth AS depth \
+    FROM requested_commits requested \
+    JOIN lix_internal_commit_ancestry ancestry \
+      ON ancestry.commit_id = requested.commit_id \
+    WHERE ancestry.depth <= 512 \
+  ), \
+  commit_changesets AS ( \
+    SELECT \
+      c.id AS commit_id, \
+      c.change_set_id AS change_set_id, \
+      rc.root_commit_id, \
+      rc.depth AS commit_depth \
+    FROM commit_by_version c \
+    JOIN reachable_commits_from_requested rc ON c.id = rc.id \
+    WHERE c.lixcol_version_id = 'global' \
+  ), \
+  cse_in_reachable_commits AS ( \
+    SELECT \
+      cse_raw.entity_id AS target_entity_id, \
+      cse_raw.file_id AS target_file_id, \
+      cse_raw.schema_key AS target_schema_key, \
+      cse_raw.change_id AS target_change_id, \
+      cc_raw.commit_id AS origin_commit_id, \
+      cc_raw.root_commit_id AS root_commit_id, \
+      cc_raw.commit_depth AS commit_depth \
+    FROM change_set_element_by_version cse_raw \
+    JOIN commit_changesets cc_raw \
+      ON cse_raw.change_set_id = cc_raw.change_set_id \
+  ), \
+  ranked_cse AS ( \
+    SELECT \
+      target_change.entity_id AS entity_id, \
+      target_change.schema_key AS schema_key, \
+      target_change.file_id AS file_id, \
+      target_change.plugin_key AS plugin_key, \
+      target_change.snapshot_content AS snapshot_content, \
+      target_change.metadata AS metadata, \
+      target_change.schema_version AS schema_version, \
+      r.target_change_id AS target_change_id, \
+      r.origin_commit_id AS origin_commit_id, \
+      r.root_commit_id AS root_commit_id, \
+      r.commit_depth AS commit_depth, \
+      ROW_NUMBER() OVER ( \
+        PARTITION BY \
+          r.target_entity_id, \
+          r.target_file_id, \
+          r.target_schema_key, \
+          r.root_commit_id, \
+          r.commit_depth \
+        ORDER BY \
+          target_change.created_at DESC, \
+          target_change.id DESC \
+      ) AS rn \
+    FROM cse_in_reachable_commits r \
+    JOIN all_changes_with_snapshots target_change \
+      ON target_change.id = r.target_change_id \
+  ) \
+SELECT \
+  ranked.entity_id AS entity_id, \
+  ranked.schema_key AS schema_key, \
+  ranked.file_id AS file_id, \
+  ranked.plugin_key AS plugin_key, \
+  ranked.snapshot_content AS snapshot_content, \
+  ranked.metadata AS metadata, \
+  ranked.schema_version AS schema_version, \
+  ranked.target_change_id AS change_id, \
+  ranked.origin_commit_id AS commit_id, \
+  ranked.root_commit_id AS root_commit_id, \
+  ranked.commit_depth AS depth, \
+  'global' AS version_id \
+FROM ranked_cse ranked \
+WHERE ranked.rn = 1 \
+  AND ranked.snapshot_content IS NOT NULL";
+
+const STATE_HISTORY_PHASE1_COUNT_SQL: &str = "WITH \
+  commit_by_version AS ( \
+    SELECT \
+      entity_id AS id, \
+      lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+      version_id AS lixcol_version_id \
+    FROM lix_internal_state_materialized_v1_lix_commit \
+    WHERE schema_key = 'lix_commit' \
+      AND version_id = 'global' \
+      AND is_tombstone = 0 \
+      AND snapshot_content IS NOT NULL \
+  ), \
+  change_set_element_by_version AS ( \
+    SELECT \
+      lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+      lix_json_text(snapshot_content, 'change_id') AS change_id, \
+      lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
+      lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
+      lix_json_text(snapshot_content, 'file_id') AS file_id, \
+      version_id AS lixcol_version_id \
+    FROM lix_internal_state_materialized_v1_lix_change_set_element \
+    WHERE schema_key = 'lix_change_set_element' \
+      AND version_id = 'global' \
+      AND is_tombstone = 0 \
+      AND snapshot_content IS NOT NULL \
+  ), \
+  all_changes_with_snapshots AS ( \
+    SELECT \
+      ic.id AS id, \
+      ic.created_at AS created_at \
+    FROM lix_internal_change ic \
+  ), \
+  requested_commits AS ( \
+    SELECT DISTINCT c.id AS commit_id \
+    FROM commit_by_version c \
+  ), \
+  reachable_commits_from_requested(id, root_commit_id, depth) AS ( \
+    SELECT \
+      ancestry.ancestor_id AS id, \
+      requested.commit_id AS root_commit_id, \
+      ancestry.depth AS depth \
+    FROM requested_commits requested \
+    JOIN lix_internal_commit_ancestry ancestry \
+      ON ancestry.commit_id = requested.commit_id \
+    WHERE ancestry.depth <= 512 \
+  ), \
+  commit_changesets AS ( \
+    SELECT \
+      c.id AS commit_id, \
+      c.change_set_id AS change_set_id, \
+      rc.root_commit_id, \
+      rc.depth AS commit_depth \
+    FROM commit_by_version c \
+    JOIN reachable_commits_from_requested rc ON c.id = rc.id \
+    WHERE c.lixcol_version_id = 'global' \
+  ), \
+  cse_in_reachable_commits AS ( \
+    SELECT \
+      cse_raw.entity_id AS target_entity_id, \
+      cse_raw.file_id AS target_file_id, \
+      cse_raw.schema_key AS target_schema_key, \
+      cse_raw.change_id AS target_change_id, \
+      cc_raw.commit_id AS origin_commit_id, \
+      cc_raw.root_commit_id AS root_commit_id, \
+      cc_raw.commit_depth AS commit_depth \
+    FROM change_set_element_by_version cse_raw \
+    JOIN commit_changesets cc_raw \
+      ON cse_raw.change_set_id = cc_raw.change_set_id \
+  ), \
+  ranked_cse AS ( \
+    SELECT \
+      r.target_entity_id, \
+      r.target_file_id, \
+      r.target_schema_key, \
+      r.target_change_id, \
+      r.origin_commit_id, \
+      r.root_commit_id, \
+      r.commit_depth, \
+      ROW_NUMBER() OVER ( \
+        PARTITION BY \
+          r.target_entity_id, \
+          r.target_file_id, \
+          r.target_schema_key, \
+          r.root_commit_id, \
+          r.commit_depth \
+        ORDER BY \
+          target_change.created_at DESC, \
+          target_change.id DESC \
+      ) AS rn \
+    FROM cse_in_reachable_commits r \
+    JOIN all_changes_with_snapshots target_change \
+      ON target_change.id = r.target_change_id \
+  ) \
+SELECT COUNT(*) AS count \
+FROM ranked_cse ranked \
+WHERE ranked.rn = 1";
+
+const REQUESTED_ROOT_COMMITS_SQL: &str = "WITH commit_by_version AS ( \
+  SELECT \
+    entity_id AS id, \
+    version_id AS lixcol_version_id \
+  FROM lix_internal_state_materialized_v1_lix_commit \
+  WHERE schema_key = 'lix_commit' \
+    AND version_id = 'global' \
+    AND is_tombstone = 0 \
+    AND snapshot_content IS NOT NULL \
+) \
+SELECT DISTINCT c.id \
+FROM commit_by_version c";
 
 async fn ensure_history_timeline_materialized_for_root(
     backend: &dyn LixBackend,

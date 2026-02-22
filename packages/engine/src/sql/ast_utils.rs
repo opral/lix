@@ -26,10 +26,6 @@ pub(crate) fn default_alias(name: &str) -> TableAlias {
     }
 }
 
-pub(crate) fn parse_single_query(sql: &str) -> Result<Query, LixError> {
-    parse_single_query_with_dialect(sql, SqlDialect::Sqlite)
-}
-
 pub(crate) fn parse_expression_with_dialect(
     sql: &str,
     dialect: SqlDialect,
