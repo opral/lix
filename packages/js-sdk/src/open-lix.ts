@@ -446,7 +446,7 @@ function createUnsupportedWasmRuntime(): LixWasmRuntime {
   return {
     async initComponent(): Promise<never> {
       throw new Error(
-        "No default wasm runtime is available in this environment; provide openLix({ backend }) with a wasm runtime-capable setup",
+        "js-sdk default wasm runtime is unavailable in this environment; provide a custom wasm runtime",
       );
     },
   };
