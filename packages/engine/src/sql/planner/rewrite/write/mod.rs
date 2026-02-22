@@ -3,7 +3,10 @@ use std::collections::VecDeque;
 use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
-use crate::sql::steps::lix_state_history_view_write;
+use crate::sql::write_views::{
+    lix_active_account_view_write, lix_active_version_view_write, lix_state_by_version_view_write,
+    lix_state_history_view_write, lix_state_view_write, lix_version_view_write,
+};
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
@@ -11,11 +14,6 @@ pub(crate) mod context;
 pub(crate) mod entity_view_write;
 pub(crate) mod filesystem_write;
 pub(crate) mod helpers;
-pub(crate) mod lix_active_account_write;
-pub(crate) mod lix_active_version_write;
-pub(crate) mod lix_state_by_version_write;
-pub(crate) mod lix_state_write;
-pub(crate) mod lix_version_write;
 pub(crate) mod outcome;
 pub(crate) mod stored_schema_write;
 pub(crate) mod types;
@@ -155,7 +153,7 @@ where
                     insert
                 };
 
-                if let Some(version_inserts) = lix_version_write::rewrite_insert_with_backend(
+                if let Some(version_inserts) = lix_version_view_write::rewrite_insert_with_backend(
                     backend,
                     insert.clone(),
                     context.params,
@@ -175,7 +173,7 @@ where
                 }
 
                 if let Some(active_account_inserts) =
-                    lix_active_account_write::rewrite_insert(insert.clone(), context.params)?
+                    lix_active_account_view_write::rewrite_insert(insert.clone(), context.params)?
                 {
                     let output = rewrite_vtable_inserts_with_backend(
                         backend,
@@ -205,13 +203,15 @@ where
 
                 let mut current_insert = insert;
                 if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_insert(current_insert.clone())?
+                    lix_state_by_version_view_write::rewrite_insert(current_insert.clone())?
                 {
                     current_insert = rewritten;
                 }
-                if let Some(rewritten) =
-                    lix_state_write::rewrite_insert_with_backend(backend, current_insert.clone())
-                        .await?
+                if let Some(rewritten) = lix_state_view_write::rewrite_insert_with_backend(
+                    backend,
+                    current_insert.clone(),
+                )
+                .await?
                 {
                     current_insert = rewritten;
                 }
@@ -281,7 +281,7 @@ where
                 };
 
                 if let Some(active_version_inserts) =
-                    lix_active_version_write::rewrite_update_with_backend(
+                    lix_active_version_view_write::rewrite_update_with_backend(
                         backend,
                         update.clone(),
                         context.params,
@@ -300,13 +300,14 @@ where
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
-                if let Some(rewritten) = lix_state_by_version_write::rewrite_update(update.clone())?
+                if let Some(rewritten) =
+                    lix_state_by_version_view_write::rewrite_update(update.clone())?
                 {
                     current = Statement::Update(rewritten);
                     continue;
                 }
 
-                if let Some(rewritten) = lix_state_write::rewrite_update_with_backend(
+                if let Some(rewritten) = lix_state_view_write::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
@@ -317,7 +318,7 @@ where
                     continue;
                 }
 
-                if let Some(version_inserts) = lix_version_write::rewrite_update_with_backend(
+                if let Some(version_inserts) = lix_version_view_write::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
@@ -364,7 +365,7 @@ where
                 };
 
                 let delete = if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_delete(delete.clone())?
+                    lix_state_by_version_view_write::rewrite_delete(delete.clone())?
                 {
                     effective_scope_fallback = true;
                     rewritten
@@ -372,7 +373,7 @@ where
                     delete
                 };
 
-                if let Some(rewritten) = lix_active_account_write::rewrite_delete_with_backend(
+                if let Some(rewritten) = lix_active_account_view_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
                     context.params,
@@ -384,7 +385,8 @@ where
                 }
 
                 let delete = if let Some(rewritten) =
-                    lix_state_write::rewrite_delete_with_backend(backend, delete.clone()).await?
+                    lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone())
+                        .await?
                 {
                     effective_scope_fallback =
                         !vtable_write::selection_mentions_inherited_from_version_id(
@@ -395,7 +397,7 @@ where
                     delete
                 };
 
-                if let Some(version_inserts) = lix_version_write::rewrite_delete_with_backend(
+                if let Some(version_inserts) = lix_version_view_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
                     context.params,

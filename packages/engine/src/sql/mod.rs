@@ -13,6 +13,7 @@ mod rewrite;
 mod row_resolution;
 mod steps;
 mod types;
+mod write_views;
 
 pub(crate) use analysis::{
     active_version_from_mutations, active_version_from_update_validations,
