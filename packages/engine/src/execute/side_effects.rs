@@ -265,6 +265,7 @@ impl Engine {
                     version_id: write.version_id.clone(),
                     before_path: write.before_path.clone(),
                     after_path: write.after_path.clone(),
+                    data_is_authoritative: write.data_is_authoritative,
                     before_data: write.before_data.clone(),
                     after_data: write.after_data.clone(),
                 })
