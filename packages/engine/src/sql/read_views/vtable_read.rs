@@ -1,9 +1,7 @@
 use sqlparser::ast::{
-    BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    BinaryOperator, Expr, Ident, Query, Select, SetExpr, TableAlias, TableFactor, TableWithJoins,
+    UnaryOperator, Value, ValueWithSpan,
 };
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
 use crate::sql::read_views::state_pushdown::{
@@ -821,7 +819,6 @@ fn build_untracked_union_query(
     schema_keys: &[String],
     pushdown_predicate: Option<&Expr>,
 ) -> Result<Query, LixError> {
-    let dialect = GenericDialect {};
     let stripped_predicate = pushdown_predicate.and_then(|expr| strip_qualifiers(expr.clone()));
     let predicate_sql = stripped_predicate.as_ref().map(ToString::to_string);
     let predicate_schema_keys = stripped_predicate
@@ -891,23 +888,7 @@ fn build_untracked_union_query(
          ) AS lix_state_ranked \
          WHERE rn = 1",
     );
-
-    let mut statements = Parser::parse_sql(&dialect, &sql).map_err(|err| LixError {
-        message: err.to_string(),
-    })?;
-
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: "expected single derived query statement".to_string(),
-        });
-    }
-
-    match statements.remove(0) {
-        Statement::Query(query) => Ok(*query),
-        _ => Err(LixError {
-            message: "derived query did not parse as SELECT".to_string(),
-        }),
-    }
+    parse_single_query(&sql)
 }
 
 fn query_targets_vtable(query: &Query) -> bool {

@@ -1,9 +1,10 @@
 use sqlparser::ast::Query;
 
+use crate::sql::read_views;
 use crate::{LixBackend, LixError, Value};
 
 use super::context::AnalysisContext;
-use super::rules::query::{analyze, canonical, lower, optimize};
+use super::rules::query::{analyze, canonical, optimize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RewritePhase {
@@ -71,7 +72,7 @@ impl QueryRule {
                 optimize::projection_cleanup::rewrite_query(query)?,
             )),
             Self::VtableRead => Ok(QueryRuleOutcome::from_option(
-                lower::vtable_read::rewrite_query(query)?,
+                read_views::vtable_read::rewrite_query(query)?,
             )),
         }
     }
@@ -117,7 +118,7 @@ impl QueryRule {
             }
             Self::ProjectionCleanup => self.apply_sync_matched(query, params),
             Self::VtableRead => Ok(QueryRuleOutcome::from_option(
-                lower::vtable_read::rewrite_query_with_backend(backend, query).await?,
+                read_views::vtable_read::rewrite_query_with_backend(backend, query).await?,
             )),
         }
     }

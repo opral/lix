@@ -2,15 +2,15 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
-    Value as AstValue, Visit, Visitor,
+    BinaryOperator, Expr, Query, Select, Statement, TableFactor, TableWithJoins, Value as AstValue,
+    Visit, Visitor,
 };
 
 use crate::backend::SqlDialect;
 use crate::sql::read_views::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
     bind_sql_with_state, default_alias, escape_sql_string, object_name_matches, parse_single_query,
-    parse_sql_statements_with_dialect, rewrite_query_with_select_rewriter, PlaceholderState,
+    rewrite_query_with_select_rewriter, PlaceholderState,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -51,7 +51,12 @@ pub async fn ensure_history_timeline_materialized_for_statement_with_state(
         }
         let request_key = format!(
             "{}||{}||{}",
-            request.change_predicates.join("&&"),
+            request
+                .change_predicates
+                .iter()
+                .map(|predicate| predicate.breakpoint_sql.as_str())
+                .collect::<Vec<_>>()
+                .join("&&"),
             request.requested_predicates.join("&&"),
             request
                 .cse_predicates
@@ -185,7 +190,7 @@ fn rewrite_table_factor(
 
 #[derive(Default, Clone)]
 struct HistoryPushdown {
-    change_predicates: Vec<String>,
+    change_predicates: Vec<HistoryChangePredicate>,
     requested_predicates: Vec<String>,
     cse_predicates: Vec<HistoryCsePredicate>,
     requested_pushdown_blocked_by_bare_placeholders: bool,
@@ -200,7 +205,7 @@ enum HistoryPushdownBucket {
 }
 
 enum ExtractedPredicate {
-    PushChange(String),
+    PushChange(HistoryChangePredicate),
     PushRequested(String),
     PushCse(HistoryCsePredicate),
     Drop,
@@ -222,6 +227,12 @@ struct HistoryCsePredicate {
     reachable_sql: String,
     phase1_sql: String,
     constrains_commit_id: bool,
+}
+
+#[derive(Clone)]
+struct HistoryChangePredicate {
+    breakpoint_sql: String,
+    phase1_sql: String,
 }
 
 struct PredicatePart {
@@ -357,21 +368,26 @@ fn extract_binary_pushdown(
 ) -> Option<ExtractedPredicate> {
     let op_sql = operator.to_string();
     match column {
-        "schema_key" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.schema_key {op_sql} {rhs}"
-        ))),
-        "entity_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.entity_id {op_sql} {rhs}"
-        ))),
-        "file_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.file_id {op_sql} {rhs}"
-        ))),
-        "plugin_key" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.plugin_key {op_sql} {rhs}"
-        ))),
-        "change_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.change_id {op_sql} {rhs}"
-        ))),
+        "schema_key" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.schema_key {op_sql} {rhs}"),
+            phase1_sql: format!("ic.schema_key {op_sql} {rhs}"),
+        })),
+        "entity_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.entity_id {op_sql} {rhs}"),
+            phase1_sql: format!("ic.entity_id {op_sql} {rhs}"),
+        })),
+        "file_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.file_id {op_sql} {rhs}"),
+            phase1_sql: format!("ic.file_id {op_sql} {rhs}"),
+        })),
+        "plugin_key" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.plugin_key {op_sql} {rhs}"),
+            phase1_sql: format!("ic.plugin_key {op_sql} {rhs}"),
+        })),
+        "change_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.change_id {op_sql} {rhs}"),
+            phase1_sql: format!("ic.id {op_sql} {rhs}"),
+        })),
         "root_commit_id" => Some(ExtractedPredicate::PushRequested(format!(
             "c.id {op_sql} {rhs}"
         ))),
@@ -392,21 +408,26 @@ fn extract_binary_pushdown(
 fn extract_in_list_pushdown(column: &str, list: &[Expr]) -> Option<ExtractedPredicate> {
     let list_sql = render_in_list_sql(list);
     match column {
-        "schema_key" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.schema_key IN ({list_sql})"
-        ))),
-        "entity_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.entity_id IN ({list_sql})"
-        ))),
-        "file_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.file_id IN ({list_sql})"
-        ))),
-        "plugin_key" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.plugin_key IN ({list_sql})"
-        ))),
-        "change_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.change_id IN ({list_sql})"
-        ))),
+        "schema_key" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.schema_key IN ({list_sql})"),
+            phase1_sql: format!("ic.schema_key IN ({list_sql})"),
+        })),
+        "entity_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.entity_id IN ({list_sql})"),
+            phase1_sql: format!("ic.entity_id IN ({list_sql})"),
+        })),
+        "file_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.file_id IN ({list_sql})"),
+            phase1_sql: format!("ic.file_id IN ({list_sql})"),
+        })),
+        "plugin_key" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.plugin_key IN ({list_sql})"),
+            phase1_sql: format!("ic.plugin_key IN ({list_sql})"),
+        })),
+        "change_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.change_id IN ({list_sql})"),
+            phase1_sql: format!("ic.id IN ({list_sql})"),
+        })),
         "root_commit_id" => Some(ExtractedPredicate::PushRequested(format!(
             "c.id IN ({list_sql})"
         ))),
@@ -426,21 +447,26 @@ fn extract_in_list_pushdown(column: &str, list: &[Expr]) -> Option<ExtractedPred
 
 fn extract_in_subquery_pushdown(column: &str, subquery: &Query) -> Option<ExtractedPredicate> {
     match column {
-        "schema_key" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.schema_key IN ({subquery})"
-        ))),
-        "entity_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.entity_id IN ({subquery})"
-        ))),
-        "file_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.file_id IN ({subquery})"
-        ))),
-        "plugin_key" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.plugin_key IN ({subquery})"
-        ))),
-        "change_id" => Some(ExtractedPredicate::PushChange(format!(
-            "bp.change_id IN ({subquery})"
-        ))),
+        "schema_key" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.schema_key IN ({subquery})"),
+            phase1_sql: format!("ic.schema_key IN ({subquery})"),
+        })),
+        "entity_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.entity_id IN ({subquery})"),
+            phase1_sql: format!("ic.entity_id IN ({subquery})"),
+        })),
+        "file_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.file_id IN ({subquery})"),
+            phase1_sql: format!("ic.file_id IN ({subquery})"),
+        })),
+        "plugin_key" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.plugin_key IN ({subquery})"),
+            phase1_sql: format!("ic.plugin_key IN ({subquery})"),
+        })),
+        "change_id" => Some(ExtractedPredicate::PushChange(HistoryChangePredicate {
+            breakpoint_sql: format!("bp.change_id IN ({subquery})"),
+            phase1_sql: format!("ic.id IN ({subquery})"),
+        })),
         "root_commit_id" => Some(ExtractedPredicate::PushRequested(format!(
             "c.id IN ({subquery})"
         ))),
@@ -611,7 +637,13 @@ fn build_lix_state_history_view_query(
         .map(|predicate| predicate.reachable_sql.clone())
         .collect::<Vec<_>>();
     let reachable_where_sql = render_where_clause(&reachable_cse_predicates);
-    let breakpoint_where_sql = render_where_clause(&pushdown.change_predicates);
+    let breakpoint_where_sql = render_where_clause(
+        &pushdown
+            .change_predicates
+            .iter()
+            .map(|predicate| predicate.breakpoint_sql.clone())
+            .collect::<Vec<_>>(),
+    );
     let requested_where_sql = render_where_clause(&requested_predicates);
 
     let final_select_sql = if count_fast_path {
@@ -744,8 +776,7 @@ fn build_lix_state_history_view_query_phase1(
         pushdown
             .change_predicates
             .iter()
-            .map(|predicate| remap_change_predicate_for_phase1(predicate))
-            .collect::<Result<Vec<_>, _>>()?,
+            .map(|predicate| predicate.phase1_sql.clone()),
     );
 
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
@@ -957,61 +988,6 @@ fn build_lix_state_history_view_query_phase1(
         final_select_sql = final_select_sql,
     );
     parse_single_query(&sql)
-}
-
-fn remap_change_predicate_for_phase1(predicate: &str) -> Result<String, LixError> {
-    let mut expr = parse_phase1_predicate_expr(predicate)?;
-    remap_phase1_change_predicate_expr(&mut expr);
-    Ok(expr.to_string())
-}
-
-fn parse_phase1_predicate_expr(predicate: &str) -> Result<Expr, LixError> {
-    let sql = format!("SELECT 1 WHERE {predicate}");
-    let mut statements = parse_sql_statements_with_dialect(&sql, SqlDialect::Sqlite)
-        .or_else(|_| parse_sql_statements_with_dialect(&sql, SqlDialect::Postgres))?;
-    let Some(statement) = statements.pop() else {
-        return Err(LixError {
-            message: "phase1 change predicate parse produced no statements".to_string(),
-        });
-    };
-    let Statement::Query(query) = statement else {
-        return Err(LixError {
-            message: "phase1 change predicate parse did not produce a query".to_string(),
-        });
-    };
-    let SetExpr::Select(select) = *query.body else {
-        return Err(LixError {
-            message: "phase1 change predicate parse did not produce a SELECT body".to_string(),
-        });
-    };
-    let Some(selection) = select.selection else {
-        return Err(LixError {
-            message: "phase1 change predicate parse produced no WHERE expression".to_string(),
-        });
-    };
-    Ok(selection)
-}
-
-fn remap_phase1_change_predicate_expr(expr: &mut Expr) {
-    match expr {
-        Expr::BinaryOp { left, .. } => remap_phase1_change_predicate_column(left.as_mut()),
-        Expr::InList { expr, .. } => remap_phase1_change_predicate_column(expr.as_mut()),
-        Expr::InSubquery { expr, .. } => remap_phase1_change_predicate_column(expr.as_mut()),
-        _ => {}
-    }
-}
-
-fn remap_phase1_change_predicate_column(expr: &mut Expr) {
-    let Expr::CompoundIdentifier(parts) = expr else {
-        return;
-    };
-    if parts.len() != 2 || !parts[0].value.eq_ignore_ascii_case("bp") {
-        return;
-    }
-    parts[0].value = "ic".to_string();
-    if parts[1].value.eq_ignore_ascii_case("change_id") {
-        parts[1].value = "id".to_string();
-    }
 }
 
 async fn ensure_history_timeline_materialized_for_request(
