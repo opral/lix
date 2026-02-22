@@ -36,7 +36,8 @@ pub(crate) use ast_utils::{
 pub(crate) use escaping::escape_sql_string;
 pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
-    bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
+    bind_sql, bind_sql_with_state, bind_statement, bind_statement_with_state,
+    bind_statement_with_state_and_appended_params, PlaceholderState,
 };
 pub(crate) use planner::{
     compile_statement_with_state, prepare_statement_block_with_transaction_flag, StatementBlock,

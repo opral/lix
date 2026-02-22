@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use sqlparser::ast::Statement;
 
 use crate::sql::types::{MutationRow, PostprocessPlan, SchemaRegistration, UpdateValidationPlan};
@@ -11,9 +13,42 @@ pub(crate) enum LogicalStatementOperation {
     Passthrough,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LogicalReadOperator {
+    State,
+    StateByVersion,
+    StateHistory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogicalReadSemantics {
+    pub(crate) operators: BTreeSet<LogicalReadOperator>,
+}
+
+impl LogicalReadSemantics {
+    pub(crate) fn empty() -> Self {
+        Self {
+            operators: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn from_operators(operators: BTreeSet<LogicalReadOperator>) -> Self {
+        Self { operators }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LogicalStatementSemantics {
+    QueryRead(LogicalReadSemantics),
+    ExplainRead(LogicalReadSemantics),
+    CanonicalWrite,
+    Passthrough,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LogicalStatementPlan {
     pub(crate) operation: LogicalStatementOperation,
+    pub(crate) semantics: LogicalStatementSemantics,
     pub(crate) planned_statements: Vec<Statement>,
     pub(crate) appended_params: Vec<Value>,
     pub(crate) registrations: Vec<SchemaRegistration>,
@@ -25,10 +60,12 @@ pub(crate) struct LogicalStatementPlan {
 impl LogicalStatementPlan {
     pub(crate) fn new(
         operation: LogicalStatementOperation,
+        semantics: LogicalStatementSemantics,
         planned_statements: Vec<Statement>,
     ) -> Self {
         Self {
             operation,
+            semantics,
             planned_statements,
             appended_params: Vec::new(),
             registrations: Vec::new(),

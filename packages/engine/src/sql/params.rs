@@ -27,6 +27,14 @@ pub(crate) struct BoundSql {
     pub(crate) state: PlaceholderState,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BoundStatement {
+    pub(crate) statement: Statement,
+    pub(crate) sql: String,
+    pub(crate) params: Vec<Value>,
+    pub(crate) state: PlaceholderState,
+}
+
 pub(crate) fn bind_sql(
     sql: &str,
     params: &[Value],
@@ -49,14 +57,78 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
     base_params: &[Value],
     appended_params: &[Value],
     dialect: SqlDialect,
-    mut state: PlaceholderState,
+    state: PlaceholderState,
 ) -> Result<BoundSql, LixError> {
     let mut statements = parse_sql_statements(sql, dialect)?;
+    let (bound_params, state) = bind_statements_with_state_and_appended_params(
+        &mut statements,
+        base_params,
+        appended_params,
+        dialect,
+        state,
+    )?;
+    let sql = statements_to_sql(&statements);
+
+    Ok(BoundSql {
+        sql,
+        params: bound_params,
+        state,
+    })
+}
+
+pub(crate) fn bind_statement_with_state_and_appended_params(
+    mut statement: Statement,
+    base_params: &[Value],
+    appended_params: &[Value],
+    dialect: SqlDialect,
+    state: PlaceholderState,
+) -> Result<BoundStatement, LixError> {
+    let (bound_params, state) = bind_statements_with_state_and_appended_params(
+        std::slice::from_mut(&mut statement),
+        base_params,
+        appended_params,
+        dialect,
+        state,
+    )?;
+    let sql = statement.to_string();
+
+    Ok(BoundStatement {
+        statement,
+        sql,
+        params: bound_params,
+        state,
+    })
+}
+
+pub(crate) fn bind_statement_with_state(
+    statement: Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+    state: PlaceholderState,
+) -> Result<BoundStatement, LixError> {
+    bind_statement_with_state_and_appended_params(statement, params, &[], dialect, state)
+}
+
+pub(crate) fn bind_statement(
+    statement: Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+) -> Result<BoundStatement, LixError> {
+    bind_statement_with_state(statement, params, dialect, PlaceholderState::new())
+}
+
+fn bind_statements_with_state_and_appended_params(
+    statements: &mut [Statement],
+    base_params: &[Value],
+    appended_params: &[Value],
+    dialect: SqlDialect,
+    mut state: PlaceholderState,
+) -> Result<(Vec<Value>, PlaceholderState), LixError> {
     let mut used_source_indices = Vec::new();
     let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
     let total_params_len = base_params.len() + appended_params.len();
 
-    for statement in &mut statements {
+    for statement in statements {
         let mut visitor = PlaceholderBinder {
             params_len: total_params_len,
             dialect,
@@ -73,13 +145,7 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
         .into_iter()
         .map(|source_index| clone_param_from_sources(source_index, base_params, appended_params))
         .collect();
-    let sql = statements_to_sql(&statements);
-
-    Ok(BoundSql {
-        sql,
-        params: bound_params,
-        state,
-    })
+    Ok((bound_params, state))
 }
 
 fn clone_param_from_sources(

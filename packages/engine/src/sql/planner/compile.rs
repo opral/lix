@@ -97,7 +97,6 @@ where
 
     Ok((
         CompiledStatementPlan {
-            params: physical_plan.compatibility_params,
             prepared_statements: physical_plan.prepared_statements,
             registrations: logical_plan.registrations,
             postprocess: logical_plan.postprocess,

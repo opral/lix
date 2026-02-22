@@ -174,11 +174,15 @@ impl Engine {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }
             if !output.update_validations.is_empty() {
+                let validation_params = single_prepared_statement_params(
+                    &output.prepared_statements,
+                    "update validation",
+                )?;
                 validate_updates(
                     &backend,
                     &self.schema_cache,
                     &output.update_validations,
-                    &output.params,
+                    validation_params,
                 )
                 .await?;
             }
@@ -430,11 +434,15 @@ impl Engine {
                         .await?
                     }
                     PostprocessPlan::VtableDelete(plan) => {
+                        let followup_params = single_prepared_statement_params(
+                            &output.prepared_statements,
+                            "delete followup",
+                        )?;
                         build_delete_followup_sql(
                             transaction,
                             &plan,
                             &result.rows,
-                            &output.params,
+                            followup_params,
                             &detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
@@ -525,4 +533,19 @@ impl Engine {
 
         Ok((result, next_placeholder_state))
     }
+}
+
+fn single_prepared_statement_params<'a>(
+    prepared_statements: &'a [crate::sql::PreparedStatement],
+    context: &str,
+) -> Result<&'a [Value], LixError> {
+    if prepared_statements.len() != 1 {
+        return Err(LixError {
+            message: format!(
+                "{context} requires exactly one prepared statement, got {}",
+                prepared_statements.len()
+            ),
+        });
+    }
+    Ok(prepared_statements[0].params.as_slice())
 }

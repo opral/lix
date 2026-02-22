@@ -178,16 +178,10 @@ where
         .map(|statement| statement.sql.clone())
         .collect::<Vec<_>>()
         .join("; ");
-    let compatibility_params = if prepared_statements.len() == 1 {
-        prepared_statements[0].params.clone()
-    } else {
-        Vec::new()
-    };
 
     Ok((
         PreprocessOutput {
             sql: normalized_sql,
-            params: compatibility_params,
             prepared_statements,
         },
         placeholder_state,

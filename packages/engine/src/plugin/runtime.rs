@@ -1004,9 +1004,8 @@ async fn load_plugin_state_changes_for_file(
         &params,
     )
     .await?;
-    let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
-        .await?;
+    let prepared = preprocessed.require_single_statement("plugin state lookup for file")?;
+    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
 
     let mut changes = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
@@ -1153,9 +1152,8 @@ async fn load_active_state_context_rows(
     ];
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
-        .await?;
+    let prepared = preprocessed.require_single_statement("plugin active state context lookup")?;
+    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
 
     let mut result = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
@@ -1257,9 +1255,8 @@ async fn load_missing_file_descriptors(
     sql.push_str(" ORDER BY lixcol_version_id, id");
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
-        .await?;
+    let prepared = preprocessed.require_single_statement("missing file descriptor scan")?;
+    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
 
     let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
     for row in rows.rows {
@@ -1313,9 +1310,8 @@ async fn load_file_paths_for_descriptors(
     );
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
-        .await?;
+    let prepared = preprocessed.require_single_statement("descriptor path lookup")?;
+    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
 
     let mut out = BTreeMap::new();
     for row in rows.rows {
@@ -1348,9 +1344,8 @@ async fn load_missing_file_history_descriptors(
                ORDER BY lixcol_root_commit_id, lixcol_depth, id";
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
-    let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
-        .await?;
+    let prepared = preprocessed.require_single_statement("missing history descriptor scan")?;
+    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
 
     let mut descriptors: BTreeMap<(String, String, i64), FileHistoryDescriptorRow> =
         BTreeMap::new();
@@ -1411,9 +1406,8 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
         &params,
     )
     .await?;
-    let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
-        .await?;
+    let prepared = preprocessed.require_single_statement("history-slice plugin state lookup")?;
+    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
 
     let mut changes = Vec::new();
     let mut previous_entity_id: Option<String> = None;

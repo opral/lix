@@ -1,13 +1,19 @@
-use sqlparser::ast::Statement;
+use std::collections::BTreeSet;
+
+use sqlparser::ast::{Query, Statement};
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::planner::rewrite::write;
 use crate::sql::planner::validate::validate_statement_output_parts;
 use crate::sql::read_pipeline::rewrite_read_query_with_backend_and_params;
+use crate::sql::read_pipeline::walker::walk_query;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
-use crate::sql::planner::ir::logical::{LogicalStatementOperation, LogicalStatementPlan};
+use crate::sql::planner::ir::logical::{
+    LogicalReadOperator, LogicalReadSemantics, LogicalStatementOperation, LogicalStatementPlan,
+    LogicalStatementSemantics,
+};
 
 pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
     backend: &dyn LixBackend,
@@ -22,10 +28,12 @@ where
 {
     match statement {
         Statement::Query(query) => {
+            let semantics = LogicalStatementSemantics::QueryRead(read_semantics_for_query(&query));
             let rewritten =
                 rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
             Ok(LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
+                semantics,
                 vec![Statement::Query(Box::new(rewritten))],
             ))
         }
@@ -39,6 +47,12 @@ where
             format,
             options,
         } => {
+            let semantics = match statement.as_ref() {
+                Statement::Query(query) => {
+                    LogicalStatementSemantics::ExplainRead(read_semantics_for_query(query))
+                }
+                _ => LogicalStatementSemantics::ExplainRead(LogicalReadSemantics::empty()),
+            };
             let rewritten_statement = match *statement {
                 Statement::Query(query) => {
                     let rewritten =
@@ -50,6 +64,7 @@ where
 
             Ok(LogicalStatementPlan::new(
                 LogicalStatementOperation::ExplainRead,
+                semantics,
                 vec![Statement::Explain {
                     describe_alias,
                     analyze,
@@ -87,6 +102,7 @@ where
             )?;
             Ok(LogicalStatementPlan::new(
                 LogicalStatementOperation::CanonicalWrite,
+                LogicalStatementSemantics::CanonicalWrite,
                 rewrite_output.statements,
             )
             .with_rewrite_metadata(
@@ -99,9 +115,30 @@ where
         }
         other => Ok(LogicalStatementPlan::new(
             LogicalStatementOperation::Passthrough,
+            LogicalStatementSemantics::Passthrough,
             vec![other],
         )),
     }
+}
+
+fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {
+    let summary = walk_query(query);
+    let mut operators = BTreeSet::new();
+    for relation in summary.relation_names {
+        match relation.as_str() {
+            "lix_state" => {
+                operators.insert(LogicalReadOperator::State);
+            }
+            "lix_state_by_version" => {
+                operators.insert(LogicalReadOperator::StateByVersion);
+            }
+            "lix_state_history" => {
+                operators.insert(LogicalReadOperator::StateHistory);
+            }
+            _ => {}
+        }
+    }
+    LogicalReadSemantics::from_operators(operators)
 }
 
 #[cfg(test)]
@@ -109,7 +146,9 @@ mod tests {
     use super::rewrite_statement_to_logical_plan_with_backend;
     use crate::functions::SystemFunctionProvider;
     use crate::sql::parse_sql_statements_with_dialect;
-    use crate::sql::planner::ir::logical::LogicalStatementOperation;
+    use crate::sql::planner::ir::logical::{
+        LogicalReadOperator, LogicalStatementOperation, LogicalStatementSemantics,
+    };
     use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
 
@@ -161,6 +200,10 @@ mod tests {
         assert_eq!(plan.operation, LogicalStatementOperation::QueryRead);
         assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(plan.planned_statements[0], Statement::Query(_)));
+        let LogicalStatementSemantics::QueryRead(read) = plan.semantics else {
+            panic!("expected query read semantics");
+        };
+        assert!(read.operators.is_empty());
     }
 
     #[tokio::test]
@@ -186,6 +229,10 @@ mod tests {
             plan.planned_statements[0],
             Statement::Explain { .. }
         ));
+        let LogicalStatementSemantics::ExplainRead(read) = plan.semantics else {
+            panic!("expected explain read semantics");
+        };
+        assert!(read.operators.is_empty());
     }
 
     #[tokio::test]
@@ -208,6 +255,7 @@ mod tests {
         assert_eq!(plan.operation, LogicalStatementOperation::CanonicalWrite);
         assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(plan.planned_statements[0], Statement::Update(_)));
+        assert_eq!(plan.semantics, LogicalStatementSemantics::CanonicalWrite);
     }
 
     #[tokio::test]
@@ -233,5 +281,54 @@ mod tests {
             plan.planned_statements[0],
             Statement::CreateTable(_)
         ));
+        assert_eq!(plan.semantics, LogicalStatementSemantics::Passthrough);
+    }
+
+    #[tokio::test]
+    async fn tracks_state_read_semantic_operators() {
+        struct QueryRewriteBackend;
+
+        #[async_trait::async_trait(?Send)]
+        impl LixBackend for QueryRewriteBackend {
+            fn dialect(&self) -> SqlDialect {
+                SqlDialect::Sqlite
+            }
+
+            async fn execute(&self, _: &str, _: &[Value]) -> Result<QueryResult, LixError> {
+                Ok(QueryResult { rows: Vec::new() })
+            }
+
+            async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+                Err(LixError {
+                    message: "planner rewrite should not open transactions".to_string(),
+                })
+            }
+        }
+
+        let backend = QueryRewriteBackend;
+        let mut provider = SystemFunctionProvider;
+        let statement = parse_single_statement(
+            "SELECT COUNT(*) FROM lix_state_by_version \
+             UNION ALL SELECT COUNT(*) FROM lix_state_history",
+        );
+
+        let plan = rewrite_statement_to_logical_plan_with_backend(
+            &backend,
+            statement,
+            &[],
+            None,
+            &mut provider,
+            &[],
+        )
+        .await
+        .expect("rewrite query statement");
+
+        let LogicalStatementSemantics::QueryRead(read) = plan.semantics else {
+            panic!("expected query read semantics");
+        };
+        assert!(read
+            .operators
+            .contains(&LogicalReadOperator::StateByVersion));
+        assert!(read.operators.contains(&LogicalReadOperator::StateHistory));
     }
 }

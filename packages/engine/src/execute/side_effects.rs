@@ -1,7 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::sql::{
-    bind_sql_with_state, ensure_history_timeline_materialized_for_statement_with_state,
+    bind_statement_with_state, ensure_history_timeline_materialized_for_statement_with_state,
     PlaceholderState,
 };
 use crate::SqlDialect;
@@ -37,9 +37,8 @@ impl Engine {
                 statement_placeholder_state,
             )
             .await?;
-            let statement_sql = statement.to_string();
-            let bound = bind_sql_with_state(
-                &statement_sql,
+            let bound = bind_statement_with_state(
+                statement.clone(),
                 params,
                 backend.dialect(),
                 statement_placeholder_state,
@@ -47,7 +46,7 @@ impl Engine {
             .map_err(|error| LixError {
                 message: format!(
                     "history timeline maintenance placeholder binding failed for '{}': {}",
-                    statement_sql, error.message
+                    statement, error.message
                 ),
             })?;
             statement_placeholder_state = bound.state;

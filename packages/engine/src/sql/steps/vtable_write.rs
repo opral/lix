@@ -25,7 +25,7 @@ use crate::sql::types::{
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
-    bind_sql, bind_sql_with_state, escape_sql_string, lowering::lower_statement,
+    bind_sql_with_state, bind_statement, escape_sql_string, lowering::lower_statement,
     object_name_matches, quote_ident, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
     RowSourceResolver,
 };
@@ -562,9 +562,9 @@ fn bind_statement_batch_for_dialect(
 ) -> Result<Vec<crate::sql::types::PreparedStatement>, LixError> {
     let mut prepared = Vec::with_capacity(batch.statements.len());
     for statement in batch.statements {
-        let bound = bind_sql(&statement.to_string(), &batch.params, dialect)?;
+        let bound = bind_statement(statement, &batch.params, dialect)?;
         prepared.push(crate::sql::types::PreparedStatement {
-            statement,
+            statement: bound.statement,
             sql: bound.sql,
             params: bound.params,
         });

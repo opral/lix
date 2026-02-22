@@ -1867,7 +1867,8 @@ async fn execute_prefetch_query(
     // Keep the rewrite future on the heap to avoid stack blow-ups in deep
     // query rewrite paths on tokio test threads with smaller default stacks.
     let output = Box::pin(preprocess_sql(backend, &CelEvaluator::new(), sql, params)).await?;
-    let result = backend.execute(&output.sql, &output.params).await?;
+    let prepared = output.require_single_statement("file prefetch query")?;
+    let result = backend.execute(&prepared.sql, &prepared.params).await?;
     if trace {
         eprintln!(
             "[trace][file-prefetch] module=pending_file_writes label={label} source_sql_chars={} rewritten_sql_chars={} rows={}",

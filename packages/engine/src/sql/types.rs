@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::Value;
+use crate::{LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaRegistration {
@@ -76,6 +76,19 @@ pub struct PreparedStatement {
 #[derive(Debug, Clone)]
 pub struct PreprocessOutput {
     pub sql: String,
-    pub params: Vec<Value>,
     pub prepared_statements: Vec<PreparedStatement>,
+}
+
+impl PreprocessOutput {
+    pub fn require_single_statement(&self, context: &str) -> Result<&PreparedStatement, LixError> {
+        if self.prepared_statements.len() != 1 {
+            return Err(LixError {
+                message: format!(
+                    "{context} requires exactly one prepared statement, got {}",
+                    self.prepared_statements.len()
+                ),
+            });
+        }
+        Ok(&self.prepared_statements[0])
+    }
 }
