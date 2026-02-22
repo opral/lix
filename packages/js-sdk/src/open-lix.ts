@@ -80,6 +80,11 @@ export type ObserveQuery = {
   params?: ReadonlyArray<unknown>;
 };
 
+export type TransactionStatement = {
+  sql: string;
+  params?: ReadonlyArray<unknown>;
+};
+
 export type ObserveEvent = {
   sequence: number;
   rows: QueryResult;
@@ -101,6 +106,7 @@ export type OpenLixKeyValue = {
 
 export type Lix = {
   execute(sql: string, params?: ReadonlyArray<unknown>): Promise<QueryResult>;
+  executeTransaction(statements: ReadonlyArray<TransactionStatement>): Promise<QueryResult>;
   stateCommitStream(filter?: StateCommitStreamFilter): StateCommitStream;
   observe(query: ObserveQuery): ObserveEvents;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
@@ -113,7 +119,7 @@ export type Lix = {
 };
 
 let wasmReady: Promise<void> | null = null;
-let defaultWasmRuntime: Promise<LixWasmRuntime | undefined> | null = null;
+let defaultWasmRuntime: Promise<LixWasmRuntime> | null = null;
 
 async function ensureWasmReady(): Promise<void> {
   if (!wasmReady) {
@@ -157,6 +163,35 @@ export async function openLix(
   ): Promise<QueryResult> => {
     ensureOpen("execute");
     return wasmLix.execute(sql, params.map((param) => Value.from(param)));
+  };
+
+  const executeTransaction = async (
+    statements: ReadonlyArray<TransactionStatement>,
+  ): Promise<QueryResult> => {
+    ensureOpen("executeTransaction");
+    if (!Array.isArray(statements)) {
+      throw new Error("executeTransaction requires an array of statements");
+    }
+    if (typeof (wasmLix as any).executeTransaction !== "function") {
+      throw new Error("executeTransaction is not available in this wasm build");
+    }
+
+    const encoded = statements.map((statement, index) => {
+      const sql = String(statement?.sql ?? "").trim();
+      if (sql.length === 0) {
+        throw new Error(`executeTransaction statement ${index} has empty sql`);
+      }
+      const params = statement?.params ?? [];
+      if (!Array.isArray(params)) {
+        throw new Error(`executeTransaction statement ${index}.params must be an array`);
+      }
+      return {
+        sql,
+        params: params.map((param) => Value.from(param)),
+      };
+    });
+
+    return (wasmLix as any).executeTransaction(encoded);
   };
 
   const stateCommitStream = (
@@ -376,6 +411,7 @@ export async function openLix(
 
   return {
     execute,
+    executeTransaction,
     stateCommitStream,
     observe,
     createVersion,
@@ -387,16 +423,16 @@ export async function openLix(
   };
 }
 
-async function getDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+async function getDefaultWasmRuntime(): Promise<LixWasmRuntime> {
   if (!defaultWasmRuntime) {
     defaultWasmRuntime = loadDefaultWasmRuntime();
   }
   return await defaultWasmRuntime;
 }
 
-async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime> {
   if (!isNodeRuntime()) {
-    return undefined;
+    return createUnsupportedWasmRuntime();
   }
 
   const module = await import("./wasm-runtime/node.js");
@@ -404,6 +440,16 @@ async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
     throw new Error("js-sdk node runtime module is missing createNodeWasmRuntime()");
   }
   return module.createNodeWasmRuntime();
+}
+
+function createUnsupportedWasmRuntime(): LixWasmRuntime {
+  return {
+    async initComponent(): Promise<never> {
+      throw new Error(
+        "No default wasm runtime is available in this environment; provide openLix({ backend }) with a wasm runtime-capable setup",
+      );
+    },
+  };
 }
 
 function isNodeRuntime(): boolean {

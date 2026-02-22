@@ -123,6 +123,11 @@ export type ObserveQuery = {
   params?: LixValueLike[];
 };
 
+export type LixTransactionStatement = {
+  sql: string;
+  params?: LixValueLike[];
+};
+
 export type ObserveEvent = {
   sequence: number;
   rows: LixQueryResultLike;
@@ -172,6 +177,23 @@ export type LixObserveEvents = {
             let result = self
                 .engine
                 .execute(&sql, &values, ExecuteOptions::default())
+                .await
+                .map_err(js_error)?;
+            Ok(query_result_to_js(result))
+        }
+
+        #[wasm_bindgen(js_name = executeTransaction)]
+        pub async fn execute_transaction(&self, statements: JsValue) -> Result<JsValue, JsValue> {
+            let statements = parse_transaction_statements(statements).map_err(js_error)?;
+            let (transaction_sql, transaction_params) =
+                build_transaction_script_and_params(statements).map_err(js_error)?;
+            let result = self
+                .engine
+                .execute(
+                    &transaction_sql,
+                    &transaction_params,
+                    ExecuteOptions::default(),
+                )
                 .await
                 .map_err(js_error)?;
             Ok(query_result_to_js(result))
@@ -500,6 +522,82 @@ export type LixObserveEvents = {
             });
         };
         Ok(EngineObserveQuery { sql, params })
+    }
+
+    struct TransactionStatement {
+        sql: String,
+        params: Vec<EngineValue>,
+    }
+
+    fn parse_transaction_statements(input: JsValue) -> Result<Vec<TransactionStatement>, LixError> {
+        if !Array::is_array(&input) {
+            return Err(LixError {
+                message: "executeTransaction statements must be an array".to_string(),
+            });
+        }
+
+        let values = Array::from(&input);
+        let mut parsed = Vec::with_capacity(values.length() as usize);
+
+        for (index, entry) in values.iter().enumerate() {
+            if !entry.is_object() {
+                return Err(LixError {
+                    message: format!("executeTransaction statements[{index}] must be an object"),
+                });
+            }
+
+            let sql = read_required_string_property(
+                &entry,
+                "sql",
+                &format!("executeTransaction statements[{index}]"),
+            )?;
+            let params =
+                Reflect::get(&entry, &JsValue::from_str("params")).map_err(js_to_lix_error)?;
+            let params = if params.is_null() || params.is_undefined() {
+                Vec::new()
+            } else if Array::is_array(&params) {
+                let mut values = Vec::new();
+                for value in Array::from(&params).iter() {
+                    values.push(value_from_js(value)?);
+                }
+                values
+            } else {
+                return Err(LixError {
+                    message: format!(
+                        "executeTransaction statements[{index}].params must be an array"
+                    ),
+                });
+            };
+
+            parsed.push(TransactionStatement { sql, params });
+        }
+
+        Ok(parsed)
+    }
+
+    fn build_transaction_script_and_params(
+        statements: Vec<TransactionStatement>,
+    ) -> Result<(String, Vec<EngineValue>), LixError> {
+        let mut sql = String::from("BEGIN;");
+        let mut params = Vec::new();
+
+        for (index, statement) in statements.into_iter().enumerate() {
+            let normalized_sql = statement.sql.trim();
+            if normalized_sql.is_empty() {
+                return Err(LixError {
+                    message: format!("executeTransaction statements[{index}] has empty sql"),
+                });
+            }
+            sql.push(' ');
+            sql.push_str(normalized_sql);
+            if !normalized_sql.ends_with(';') {
+                sql.push(';');
+            }
+            params.extend(statement.params);
+        }
+
+        sql.push_str(" COMMIT;");
+        Ok((sql, params))
     }
 
     fn read_optional_string_array_property(
