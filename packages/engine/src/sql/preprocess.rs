@@ -15,13 +15,6 @@ use crate::sql::DetectedFileDomainChange;
 use crate::sql::PlaceholderState;
 use crate::{LixBackend, LixError, Value};
 
-pub(crate) mod context;
-pub(crate) mod query_engine;
-pub(crate) mod registry;
-pub(crate) mod rules;
-pub(crate) mod validator;
-pub(crate) mod walker;
-
 #[cfg(test)]
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite)

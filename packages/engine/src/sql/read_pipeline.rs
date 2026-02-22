@@ -1,7 +1,13 @@
 use sqlparser::ast::Query;
 
-use crate::sql::pipeline::query_engine;
 use crate::{LixBackend, LixError, Value};
+
+pub(crate) mod context;
+pub(crate) mod query_engine;
+pub(crate) mod registry;
+pub(crate) mod rules;
+pub(crate) mod validator;
+pub(crate) mod walker;
 
 pub(crate) use query_engine::ReadRewriteSession;
 
@@ -43,7 +49,7 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use super::rewrite_read_query;
-    use crate::sql::pipeline::validator::validate_no_unresolved_logical_read_views;
+    use crate::sql::read_pipeline::validator::validate_no_unresolved_logical_read_views;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use sqlparser::ast::{ObjectNamePart, Query, TableFactor};
 
-use crate::sql::pipeline::walker::walk_query;
+use crate::sql::read_pipeline::walker::walk_query;
 use crate::sql::{visit_query_selects, visit_table_factors_in_select};
 use crate::LixError;
 

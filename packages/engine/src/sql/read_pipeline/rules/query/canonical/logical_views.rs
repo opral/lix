@@ -1,6 +1,6 @@
 use sqlparser::ast::Query;
 
-use crate::sql::pipeline::registry::QueryRuleOutcome;
+use crate::sql::read_pipeline::registry::QueryRuleOutcome;
 use crate::{LixBackend, LixError, Value};
 
 use super::{

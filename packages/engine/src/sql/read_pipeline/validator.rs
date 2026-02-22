@@ -543,8 +543,8 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use crate::sql::pipeline::context::AnalysisContext;
-    use crate::sql::pipeline::registry::RewritePhase;
+    use crate::sql::read_pipeline::context::AnalysisContext;
+    use crate::sql::read_pipeline::registry::RewritePhase;
     use crate::sql::types::{PostprocessPlan, RewriteOutput, VtableDeletePlan, VtableUpdatePlan};
 
     use super::{validate_phase_invariants, validate_statement_output};

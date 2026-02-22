@@ -5,8 +5,8 @@ mod entity_views;
 mod escaping;
 mod lowering;
 mod params;
-mod pipeline;
 mod planner;
+mod preprocess;
 mod read_pipeline;
 mod rewrite;
 mod row_resolution;
@@ -38,20 +38,20 @@ pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
     bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
 };
+pub(crate) use planner::{
+    compile_statement_with_state, prepare_statement_block_with_transaction_flag, StatementBlock,
+};
 #[cfg(test)]
-pub use pipeline::parse_sql_statements;
+pub use preprocess::parse_sql_statements;
 #[cfg(test)]
-pub use pipeline::preprocess_sql_rewrite_only;
+pub use preprocess::preprocess_sql_rewrite_only;
 #[allow(unused_imports)]
-pub use pipeline::{
+pub use preprocess::{
     parse_sql_statements_with_dialect,
     preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
     preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_and_state,
     preprocess_sql, preprocess_sql_with_provider,
     preprocess_sql_with_provider_and_detected_file_domain_changes,
-};
-pub(crate) use planner::{
-    compile_statement_with_state, prepare_statement_block_with_transaction_flag, StatementBlock,
 };
 pub(crate) use read_pipeline::{
     rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
