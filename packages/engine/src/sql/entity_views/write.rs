@@ -16,9 +16,9 @@ use crate::cel::CelEvaluator;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::sql::planner::rewrite::query::rewrite_query_with_backend;
 #[cfg(test)]
 use crate::sql::read_pipeline::rewrite_read_query;
-use crate::sql::read_pipeline::rewrite_read_query_with_backend;
 use crate::sql::row_resolution::resolve_values_rows;
 use crate::sql::{resolve_expr_cell_with_state, PlaceholderState, ResolvedCell};
 use crate::{LixBackend, LixError, Value as EngineValue};
@@ -906,7 +906,7 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                 negated,
             } => Expr::InSubquery {
                 expr: Box::new(rewrite_subquery_expressions_with_backend(*expr, backend).await?),
-                subquery: Box::new(rewrite_read_query_with_backend(backend, *subquery).await?),
+                subquery: Box::new(rewrite_query_with_backend(backend, *subquery).await?),
                 negated,
             },
             Expr::Between {
@@ -982,11 +982,11 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                 right: Box::new(rewrite_subquery_expressions_with_backend(*right, backend).await?),
             },
             Expr::Exists { subquery, negated } => Expr::Exists {
-                subquery: Box::new(rewrite_read_query_with_backend(backend, *subquery).await?),
+                subquery: Box::new(rewrite_query_with_backend(backend, *subquery).await?),
                 negated,
             },
             Expr::Subquery(subquery) => Expr::Subquery(Box::new(
-                rewrite_read_query_with_backend(backend, *subquery).await?,
+                rewrite_query_with_backend(backend, *subquery).await?,
             )),
             Expr::Function(function) => {
                 let mut function = function;

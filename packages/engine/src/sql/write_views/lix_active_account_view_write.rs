@@ -6,7 +6,7 @@ use crate::account::{
     active_account_schema_version, active_account_snapshot_content,
     active_account_storage_version_id,
 };
-use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
+use crate::sql::planner::rewrite::query::execute_rewritten_read_sql_with_state;
 use crate::sql::{object_name_matches, resolve_insert_rows, PlaceholderState};
 use crate::{LixBackend, LixError, Value as EngineValue};
 

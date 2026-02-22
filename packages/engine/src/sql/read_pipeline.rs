@@ -11,18 +11,10 @@ pub(crate) mod validator;
 pub(crate) mod walker;
 
 pub(crate) use query_engine::ReadRewriteSession;
-pub(crate) use query_loader::execute_rewritten_read_sql_with_state;
 
 #[cfg(test)]
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
     query_engine::rewrite_read_query(query)
-}
-
-pub(crate) async fn rewrite_read_query_with_backend(
-    backend: &dyn LixBackend,
-    query: Query,
-) -> Result<Query, LixError> {
-    query_engine::rewrite_read_query_with_backend(backend, query).await
 }
 
 pub(crate) async fn rewrite_read_query_with_backend_and_params(

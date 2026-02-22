@@ -3,7 +3,7 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, Expr, Insert, ObjectNamePart, TableFactor, TableWithJoins, Update,
 };
 
-use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
+use crate::sql::planner::rewrite::query::execute_rewritten_read_sql_with_state;
 use crate::sql::{object_name_matches, resolve_expr_cell_with_state, PlaceholderState};
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,

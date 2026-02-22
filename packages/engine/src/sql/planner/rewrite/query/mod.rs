@@ -1,19 +1,36 @@
-use sqlparser::ast::Query;
+use std::collections::BTreeSet;
 
+use sqlparser::ast::{Expr, ObjectNamePart, Query, Select, SelectItem, TableFactor};
+
+use self::context::AnalysisContext;
+use self::validator::validate_final_read_query;
 use crate::sql::entity_views::read as entity_view_read;
-use crate::sql::read_pipeline::context::AnalysisContext;
-use crate::sql::read_pipeline::registry::RewritePhase;
-use crate::sql::read_pipeline::rules::query::analyze::relation_discovery;
-use crate::sql::read_pipeline::rules::query::optimize::projection_cleanup;
-use crate::sql::read_pipeline::validator::{validate_final_read_query, validate_phase_invariants};
 use crate::sql::read_views::{
     lix_active_account_view_read, lix_active_version_view_read, lix_state_by_version_view_read,
     lix_state_history_view_read, lix_state_view_read, lix_version_view_read, vtable_read,
 };
 use crate::sql::steps::filesystem_step;
+use crate::sql::{
+    rewrite_query_selects, visit_query_selects, visit_table_factors_in_select, RewriteDecision,
+};
 use crate::{LixBackend, LixError, Value};
 
+mod context;
+mod execute;
+mod validator;
+
+pub(crate) use execute::execute_rewritten_read_sql_with_state;
+
 const MAX_PASSES_PER_PHASE: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RewritePhase {
+    Analyze,
+    Canonicalize,
+    Optimize,
+    Lower,
+}
+
 const PHASE_ORDER: [RewritePhase; 4] = [
     RewritePhase::Analyze,
     RewritePhase::Canonicalize,
@@ -72,15 +89,13 @@ impl PlannerQueryRule {
 
         match self {
             Self::AnalyzeRelationDiscovery => {
-                relation_discovery::validate_relation_discovery_consistency(&query)?;
+                validate_relation_discovery_consistency(&query)?;
                 Ok(PlannerRuleOutcome::NoChange)
             }
             Self::CanonicalLogicalViews => Ok(outcome_from_option(
                 rewrite_canonical_logical_views_with_backend(backend, query, params).await?,
             )),
-            Self::ProjectionCleanup => Ok(outcome_from_option(projection_cleanup::rewrite_query(
-                query,
-            )?)),
+            Self::ProjectionCleanup => Ok(outcome_from_option(rewrite_projection_cleanup(query)?)),
             Self::VtableRead => Ok(outcome_from_option(
                 vtable_read::rewrite_query_with_backend(backend, query).await?,
             )),
@@ -148,6 +163,85 @@ fn apply_standard_logical_view_rewrites(
     Ok(())
 }
 
+fn validate_relation_discovery_consistency(query: &Query) -> Result<(), LixError> {
+    let walker_relations = collect_relation_names_via_walker(query);
+    let select_visit_relations = collect_relation_names_via_select_visit(query)?;
+
+    if select_visit_relations.is_subset(&walker_relations) {
+        return Ok(());
+    }
+
+    let missing_from_walker: BTreeSet<_> = select_visit_relations
+        .difference(&walker_relations)
+        .cloned()
+        .collect();
+
+    Err(LixError {
+        message: format!(
+            "planner analyze relation discovery mismatch: walker missing {:?} (walker={:?} select_visit={:?})",
+            missing_from_walker, walker_relations, select_visit_relations
+        ),
+    })
+}
+
+pub(crate) fn collect_relation_names_via_walker(query: &Query) -> BTreeSet<String> {
+    context::walk_query(query).relation_names
+}
+
+fn collect_relation_names_via_select_visit(query: &Query) -> Result<BTreeSet<String>, LixError> {
+    let mut names = BTreeSet::new();
+    visit_query_selects(query, &mut |select| {
+        visit_table_factors_in_select(select, &mut |relation| {
+            let TableFactor::Table { name, .. } = relation else {
+                return Ok(());
+            };
+            if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
+                names.insert(identifier.value.to_ascii_lowercase());
+            }
+            Ok(())
+        })
+    })?;
+    Ok(names)
+}
+
+fn rewrite_projection_cleanup(query: Query) -> Result<Option<Query>, LixError> {
+    rewrite_query_selects(query, &mut rewrite_projection_cleanup_select)
+}
+
+fn rewrite_projection_cleanup_select(select: &mut Select) -> Result<RewriteDecision, LixError> {
+    let mut changed = false;
+    for item in &mut select.projection {
+        let SelectItem::ExprWithAlias { expr, alias } = item else {
+            continue;
+        };
+
+        if alias.quote_style.is_some() {
+            continue;
+        }
+
+        let removable = match expr {
+            Expr::Identifier(ident) => {
+                ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case(&alias.value)
+            }
+            Expr::CompoundIdentifier(parts) => parts.last().is_some_and(|ident| {
+                ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case(&alias.value)
+            }),
+            _ => false,
+        };
+
+        if removable {
+            *item = SelectItem::UnnamedExpr(expr.clone());
+            changed = true;
+        }
+    }
+
+    if changed {
+        Ok(RewriteDecision::Changed)
+    } else {
+        Ok(RewriteDecision::Unchanged)
+    }
+}
+
 pub(crate) async fn rewrite_query_with_backend_and_params(
     backend: &dyn LixBackend,
     mut query: Query,
@@ -163,6 +257,13 @@ pub(crate) async fn rewrite_query_with_backend_and_params(
     Ok(query)
 }
 
+pub(crate) async fn rewrite_query_with_backend(
+    backend: &dyn LixBackend,
+    query: Query,
+) -> Result<Query, LixError> {
+    rewrite_query_with_backend_and_params(backend, query, &[]).await
+}
+
 async fn run_phase_with_backend(
     phase: RewritePhase,
     backend: &dyn LixBackend,
@@ -175,7 +276,7 @@ async fn run_phase_with_backend(
             apply_rules_for_phase_with_backend(phase, backend, query, params, context).await?;
 
         context.refresh_from_query(query);
-        validate_phase_invariants(phase, query, context)?;
+        validate_phase_invariants_for_planner(phase, query)?;
         if !changed {
             return Ok(());
         }
@@ -212,6 +313,18 @@ async fn apply_rules_for_phase_with_backend(
     }
 
     Ok(changed)
+}
+
+fn validate_phase_invariants_for_planner(
+    phase: RewritePhase,
+    query: &Query,
+) -> Result<(), LixError> {
+    match phase {
+        RewritePhase::Analyze => Ok(()),
+        RewritePhase::Canonicalize | RewritePhase::Optimize | RewritePhase::Lower => {
+            validate_final_read_query(query)
+        }
+    }
 }
 
 #[cfg(test)]

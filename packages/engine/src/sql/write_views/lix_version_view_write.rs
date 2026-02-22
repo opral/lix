@@ -5,7 +5,7 @@ use sqlparser::ast::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
+use crate::sql::planner::rewrite::query::execute_rewritten_read_sql_with_state;
 use crate::sql::{
     object_name_matches, resolve_expr_cell_with_state, PlaceholderState, RowSourceResolver,
 };

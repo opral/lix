@@ -31,13 +31,6 @@ impl ReadRewriteSession {
     }
 }
 
-pub(crate) async fn rewrite_read_query_with_backend(
-    backend: &dyn LixBackend,
-    query: Query,
-) -> Result<Query, LixError> {
-    run_query_engine_with_backend_and_params(backend, query, &[], None).await
-}
-
 pub(crate) async fn rewrite_read_query_with_backend_and_params(
     backend: &dyn LixBackend,
     query: Query,

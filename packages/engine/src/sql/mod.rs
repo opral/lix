@@ -40,6 +40,7 @@ pub(crate) use params::{
     bind_sql, bind_sql_with_state, bind_statement, bind_statement_with_state,
     bind_statement_with_state_and_appended_params, PlaceholderState,
 };
+pub(crate) use planner::rewrite::query::rewrite_query_with_backend as rewrite_read_query_with_backend;
 pub(crate) use planner::{
     compile_statement_with_state, prepare_statement_block_with_transaction_flag, StatementBlock,
 };
@@ -56,8 +57,7 @@ pub use preprocess::{
     preprocess_sql_with_provider_and_detected_file_domain_changes,
 };
 pub(crate) use read_pipeline::{
-    rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
-    ReadRewriteSession,
+    rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 pub(crate) use read_views::lix_state_history_view_read::ensure_history_timeline_materialized_for_statement_with_state;
 #[cfg(test)]

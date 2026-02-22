@@ -5,7 +5,6 @@ use sqlparser::ast::{Query, Statement};
 use crate::functions::LixFunctionProvider;
 use crate::sql::planner::rewrite::write;
 use crate::sql::planner::validate::validate_statement_output_parts;
-use crate::sql::read_pipeline::walker::walk_query;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
@@ -13,7 +12,9 @@ use crate::sql::planner::ir::logical::{
     LogicalReadOperator, LogicalReadSemantics, LogicalStatementOperation, LogicalStatementPlan,
     LogicalStatementSemantics,
 };
-use crate::sql::planner::rewrite::query::rewrite_query_with_backend_and_params;
+use crate::sql::planner::rewrite::query::{
+    collect_relation_names_via_walker, rewrite_query_with_backend_and_params,
+};
 
 pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
     backend: &dyn LixBackend,
@@ -121,9 +122,8 @@ where
 }
 
 fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {
-    let summary = walk_query(query);
     let mut operators = BTreeSet::new();
-    for relation in summary.relation_names {
+    for relation in collect_relation_names_via_walker(query) {
         match relation.as_str() {
             "lix_state" => {
                 operators.insert(LogicalReadOperator::State);
