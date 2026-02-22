@@ -113,7 +113,7 @@ export type Lix = {
 };
 
 let wasmReady: Promise<void> | null = null;
-let defaultWasmRuntime: Promise<LixWasmRuntime | undefined> | null = null;
+let defaultWasmRuntime: Promise<LixWasmRuntime> | null = null;
 
 async function ensureWasmReady(): Promise<void> {
   if (!wasmReady) {
@@ -387,16 +387,22 @@ export async function openLix(
   };
 }
 
-async function getDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+async function getDefaultWasmRuntime(): Promise<LixWasmRuntime> {
   if (!defaultWasmRuntime) {
     defaultWasmRuntime = loadDefaultWasmRuntime();
   }
   return await defaultWasmRuntime;
 }
 
-async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime | undefined> {
+async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime> {
   if (!isNodeRuntime()) {
-    return undefined;
+    return {
+      async initComponent() {
+        throw new Error(
+          "js-sdk default wasm runtime is unavailable in this environment; provide a custom wasm runtime",
+        );
+      },
+    };
   }
 
   const module = await import("./wasm-runtime/node.js");

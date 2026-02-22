@@ -261,7 +261,6 @@ test("observe stream remains usable after query error", async () => {
   await lix.execute(
     "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
     ["observe-recover-trigger-2", "x"],
-    [],
   );
 
   const recovered = await withTimeout(recoveredNext, 1500);
