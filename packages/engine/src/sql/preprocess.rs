@@ -10,6 +10,9 @@ use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::object_name_matches;
 use crate::sql::planner::emit::statement::emit_physical_statement_plan_with_state;
 use crate::sql::planner::rewrite::statement::rewrite_statement_to_logical_plan_with_backend;
+use crate::sql::planner::validate::{
+    ensure_postprocess_single_statement, PostprocessSingleStatementContext,
+};
 use crate::sql::types::PreprocessOutput;
 use crate::sql::DetectedFileDomainChange;
 use crate::sql::PlaceholderState;
@@ -166,12 +169,13 @@ where
         placeholder_state = next_placeholder_state;
     }
 
-    if has_postprocess && prepared_statements.len() != 1 {
-        return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
-        });
-    }
+    ensure_postprocess_single_statement(
+        has_postprocess,
+        prepared_statements.len(),
+        PostprocessSingleStatementContext::PreprocessOutput,
+    )?;
 
+    #[cfg(test)]
     let normalized_sql = prepared_statements
         .iter()
         .map(|statement| statement.sql.clone())
@@ -180,6 +184,7 @@ where
 
     Ok((
         PreprocessOutput {
+            #[cfg(test)]
             sql: normalized_sql,
             prepared_statements,
         },

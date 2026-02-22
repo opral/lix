@@ -5,12 +5,16 @@ use sqlparser::ast::{
     SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor,
     TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowSpec, WindowType,
 };
+use std::sync::OnceLock;
 
 use crate::backend::SqlDialect;
 use crate::sql::read_views::state_pushdown::{
-    select_projects_count_star, RankedPushdownPredicate, StateColumn, StatePushdown,
+    select_projects_count_star, RankedPushdownPredicate, StatePushdown,
 };
-use crate::sql::{escape_sql_string, object_name_matches, parse_single_query, quote_ident};
+use crate::sql::{
+    escape_sql_string, object_name_matches, parse_expression_with_dialect, parse_single_query,
+    parse_single_query_with_dialect, quote_ident,
+};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_file_id, version_descriptor_schema_key,
@@ -21,6 +25,9 @@ use crate::{LixBackend, LixError, Value as LixValue};
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
+static EFFECTIVE_STATE_BY_VERSION_VIEW_TEMPLATE_WITH_COMMIT: OnceLock<Query> = OnceLock::new();
+static EFFECTIVE_STATE_BY_VERSION_VIEW_TEMPLATE_NO_COMMIT: OnceLock<Query> = OnceLock::new();
+static EFFECTIVE_STATE_BY_VERSION_COUNT_TEMPLATE: OnceLock<Query> = OnceLock::new();
 
 pub(crate) fn build_effective_state_by_version_query(
     pushdown: &StatePushdown,
@@ -50,20 +57,68 @@ fn build_effective_state_by_version_view_query(
     pushdown: &StatePushdown,
     include_commit_mapping: bool,
 ) -> Result<Query, LixError> {
-    let (target_version_pushdown, ranked_predicates) =
-        split_effective_by_version_ranked_pushdown(pushdown);
-    let source_pushdown = if pushdown.source_predicates.is_empty() {
-        String::new()
+    let mut query = effective_state_by_version_view_template(include_commit_mapping);
+    append_effective_state_by_version_predicates(
+        &mut query,
+        &pushdown.source_predicates,
+        &pushdown
+            .ranked_predicates
+            .iter()
+            .map(|predicate| predicate.ranked_sql.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(query)
+}
+
+fn build_effective_state_by_version_count_query(
+    pushdown: &StatePushdown,
+) -> Result<Query, LixError> {
+    let mut query = effective_state_by_version_count_template();
+    append_effective_state_by_version_predicates(
+        &mut query,
+        &pushdown.source_predicates,
+        &pushdown
+            .ranked_predicates
+            .iter()
+            .map(|predicate| predicate.ranked_sql.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(query)
+}
+
+fn effective_state_by_version_view_template(include_commit_mapping: bool) -> Query {
+    let template = if include_commit_mapping {
+        EFFECTIVE_STATE_BY_VERSION_VIEW_TEMPLATE_WITH_COMMIT.get_or_init(|| {
+            let sql = build_effective_state_by_version_view_template_sql(true);
+            parse_single_query_with_dialect(&sql, SqlDialect::Sqlite)
+                .expect("effective state by-version template with commit maps")
+        })
     } else {
-        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
+        EFFECTIVE_STATE_BY_VERSION_VIEW_TEMPLATE_NO_COMMIT.get_or_init(|| {
+            let sql = build_effective_state_by_version_view_template_sql(false);
+            parse_single_query_with_dialect(&sql, SqlDialect::Sqlite)
+                .expect("effective state by-version template without commits")
+        })
     };
-    let ranked_pushdown = ranked_pushdown_from_sql_predicates(&ranked_predicates);
-    let target_versions_cte =
-        build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
+    template.clone()
+}
+
+fn effective_state_by_version_count_template() -> Query {
+    EFFECTIVE_STATE_BY_VERSION_COUNT_TEMPLATE
+        .get_or_init(|| {
+            let sql = build_effective_state_by_version_count_template_sql();
+            parse_single_query_with_dialect(&sql, SqlDialect::Sqlite)
+                .expect("effective state by-version count template")
+        })
+        .clone()
+}
+
+fn build_effective_state_by_version_view_template_sql(include_commit_mapping: bool) -> String {
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
     ));
+    let target_versions_cte = build_effective_state_all_target_versions_cte(VTABLE_NAME);
     let commit_ctes = if include_commit_mapping {
         format!(
             ", \
@@ -115,7 +170,7 @@ fn build_effective_state_by_version_view_query(
     } else {
         "CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END AS commit_id".to_string()
     };
-    let sql = format!(
+    format!(
         "SELECT \
              ranked.entity_id AS entity_id, \
              ranked.schema_key AS schema_key, \
@@ -192,44 +247,28 @@ fn build_effective_state_by_version_view_query(
            JOIN version_chain vc \
              ON vc.ancestor_version_id = s.version_id \
            {commit_join} \
-           {source_pushdown} \
          ) AS ranked \
          WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL\
-           {ranked_pushdown}",
+           AND ranked.snapshot_content IS NOT NULL",
         descriptor_table = descriptor_table,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
-        vtable_name = VTABLE_NAME,
-        source_pushdown = source_pushdown,
-        ranked_pushdown = ranked_pushdown,
         target_versions_cte = target_versions_cte,
+        vtable_name = VTABLE_NAME,
         commit_ctes = commit_ctes,
         commit_expr = commit_expr,
         commit_join = commit_join,
-    );
-    parse_single_query(&sql)
+    )
 }
 
-fn build_effective_state_by_version_count_query(
-    pushdown: &StatePushdown,
-) -> Result<Query, LixError> {
-    let (target_version_pushdown, ranked_predicates) =
-        split_effective_by_version_ranked_pushdown(pushdown);
-    let source_pushdown = if pushdown.source_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
-    };
-    let ranked_pushdown = ranked_pushdown_from_sql_predicates(&ranked_predicates);
-    let target_versions_cte =
-        build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
+fn build_effective_state_by_version_count_template_sql() -> String {
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
     ));
-    let sql = format!(
+    let target_versions_cte = build_effective_state_all_target_versions_cte(VTABLE_NAME);
+    format!(
         "SELECT \
              ranked.entity_id AS entity_id \
          FROM ( \
@@ -277,104 +316,84 @@ fn build_effective_state_by_version_count_query(
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.ancestor_version_id = s.version_id \
-           {source_pushdown} \
          ) AS ranked \
          WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL\
-           {ranked_pushdown}",
+           AND ranked.snapshot_content IS NOT NULL",
         descriptor_table = descriptor_table,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
-        vtable_name = VTABLE_NAME,
-        source_pushdown = source_pushdown,
-        ranked_pushdown = ranked_pushdown,
         target_versions_cte = target_versions_cte,
-    );
-    parse_single_query(&sql)
+        vtable_name = VTABLE_NAME,
+    )
 }
 
-fn build_effective_state_target_versions_cte(
-    target_version_pushdown: &[TargetVersionPredicate],
-    vtable_name: &str,
-) -> String {
-    if target_version_pushdown.is_empty() {
-        return format!(
-            "all_target_versions AS ( \
-               SELECT version_id FROM version_descriptor \
-               UNION \
-               SELECT DISTINCT version_id FROM {vtable_name} \
-             ), \
-             target_versions AS ( \
-               SELECT version_id \
-               FROM all_target_versions \
-             )",
-            vtable_name = vtable_name
-        );
-    }
-
-    let target_version_filter = target_version_pushdown
-        .iter()
-        .map(|predicate| predicate.sql.as_str())
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    if target_version_pushdown
-        .iter()
-        .any(|predicate| predicate.requires_all_target_versions_scan)
-    {
-        return format!(
-            "all_target_versions AS ( \
-               SELECT version_id FROM version_descriptor \
-               UNION \
-               SELECT DISTINCT version_id FROM {vtable_name} \
-             ), \
-             target_versions AS ( \
-               SELECT version_id \
-               FROM all_target_versions \
-               WHERE {target_version_filter} \
-             )",
-            vtable_name = vtable_name,
-            target_version_filter = target_version_filter
-        );
-    }
-
+fn build_effective_state_all_target_versions_cte(vtable_name: &str) -> String {
     format!(
-        "target_versions AS ( \
-           SELECT version_id \
-           FROM version_descriptor \
-           WHERE {target_version_filter} \
+        "all_target_versions AS ( \
+           SELECT version_id FROM version_descriptor \
            UNION \
-           SELECT DISTINCT version_id \
-           FROM {vtable_name} \
-           WHERE {target_version_filter} \
+           SELECT DISTINCT version_id FROM {vtable_name} \
+         ), \
+         target_versions AS ( \
+           SELECT version_id \
+           FROM all_target_versions \
          )",
-        target_version_filter = target_version_filter,
         vtable_name = vtable_name
     )
 }
 
-#[derive(Clone)]
-struct TargetVersionPredicate {
-    sql: String,
-    requires_all_target_versions_scan: bool,
+fn append_effective_state_by_version_predicates(
+    query: &mut Query,
+    source_predicates: &[String],
+    ranked_predicates: &[String],
+) -> Result<(), LixError> {
+    let outer_select = select_from_query_mut(query, "effective state by-version outer query")?;
+    append_predicates_from_sql(&mut outer_select.selection, ranked_predicates)?;
+
+    let Some(first_from) = outer_select.from.first_mut() else {
+        return Err(LixError {
+            message: "effective state by-version query missing outer FROM".to_string(),
+        });
+    };
+    let TableFactor::Derived { subquery, .. } = &mut first_from.relation else {
+        return Err(LixError {
+            message: "effective state by-version query expected derived outer relation".to_string(),
+        });
+    };
+    let inner_select = select_from_query_mut(
+        subquery.as_mut(),
+        "effective state by-version recursive inner query",
+    )?;
+    append_predicates_from_sql(&mut inner_select.selection, source_predicates)
 }
 
-fn split_effective_by_version_ranked_pushdown(
-    pushdown: &StatePushdown,
-) -> (Vec<TargetVersionPredicate>, Vec<String>) {
-    let mut target_version = Vec::new();
-    let mut ranked = Vec::new();
-    for predicate in &pushdown.ranked_predicates {
-        if predicate.column == StateColumn::VersionId {
-            target_version.push(TargetVersionPredicate {
-                sql: predicate.base_sql.clone(),
-                requires_all_target_versions_scan: predicate.requires_all_target_versions_scan(),
-            });
-            continue;
-        }
-        ranked.push(predicate.ranked_sql.clone());
+fn select_from_query_mut<'a>(query: &'a mut Query, label: &str) -> Result<&'a mut Select, LixError> {
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(LixError {
+            message: format!("expected SELECT body for {label}"),
+        });
+    };
+    Ok(select.as_mut())
+}
+
+fn append_predicates_from_sql(
+    selection: &mut Option<Expr>,
+    predicates: &[String],
+) -> Result<(), LixError> {
+    for predicate_sql in predicates {
+        let predicate = parse_expression_with_dialect(predicate_sql, SqlDialect::Sqlite)?;
+        let next = match selection.take() {
+            Some(existing) => Expr::BinaryOp {
+                left: Box::new(existing),
+                op: BinaryOperator::And,
+                right: Box::new(predicate),
+            },
+            None => predicate,
+        };
+        *selection = Some(next);
     }
-    (target_version, ranked)
+    Ok(())
 }
 
 fn ranked_pushdown_from_ranked_predicates(predicates: &[RankedPushdownPredicate]) -> String {
@@ -387,14 +406,6 @@ fn ranked_pushdown_from_ranked_predicates(predicates: &[RankedPushdownPredicate]
             .collect::<Vec<_>>()
             .join(" AND ");
         format!(" AND {sql}")
-    }
-}
-
-fn ranked_pushdown_from_sql_predicates(predicates: &[String]) -> String {
-    if predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", predicates.join(" AND "))
     }
 }
 
@@ -634,20 +645,6 @@ fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<
         ranked_pushdown = ranked_pushdown,
     );
     parse_single_query(&sql)
-}
-
-pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    let schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
-
-    let mut changed = false;
-    let mut new_query = query.clone();
-    rewrite_query_inner(&mut new_query, &schema_keys, &mut changed)?;
-
-    if changed {
-        Ok(Some(new_query))
-    } else {
-        Ok(None)
-    }
 }
 
 pub async fn rewrite_query_with_backend(

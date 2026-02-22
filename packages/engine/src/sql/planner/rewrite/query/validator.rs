@@ -28,6 +28,7 @@ const MATERIALIZED_STATE_TABLE_PREFIX: &str = "lix_internal_state_materialized_v
 pub(crate) fn validate_final_read_query(query: &Query) -> Result<(), LixError> {
     validate_no_unresolved_logical_read_views(query)?;
     validate_unique_explicit_relation_aliases(query)?;
+    validate_placeholder_mapping_contract(query)?;
     validate_materialized_state_semantics(query)
 }
 
@@ -465,6 +466,68 @@ fn expr_is_numeric_zero(expr: &Expr) -> bool {
         Expr::Cast { expr, .. } => expr_is_numeric_zero(expr),
         _ => false,
     }
+}
+
+fn validate_placeholder_mapping_contract(query: &Query) -> Result<(), LixError> {
+    struct PlaceholderContractVisitor {
+        has_bare: bool,
+        has_numbered: bool,
+        invalid_tokens: BTreeSet<String>,
+    }
+
+    impl Visitor for PlaceholderContractVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            let Expr::Value(ValueWithSpan {
+                value: AstValue::Placeholder(token),
+                ..
+            }) = expr
+            else {
+                return ControlFlow::Continue(());
+            };
+            let trimmed = token.trim();
+            if trimmed == "?" {
+                self.has_bare = true;
+                return ControlFlow::Continue(());
+            }
+            if let Some(rest) = trimmed.strip_prefix('$') {
+                match rest.parse::<usize>() {
+                    Ok(index) if index > 0 => {
+                        self.has_numbered = true;
+                    }
+                    _ => {
+                        self.invalid_tokens.insert(trimmed.to_string());
+                    }
+                }
+                return ControlFlow::Continue(());
+            }
+            self.invalid_tokens.insert(trimmed.to_string());
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = PlaceholderContractVisitor {
+        has_bare: false,
+        has_numbered: false,
+        invalid_tokens: BTreeSet::new(),
+    };
+    let _ = query.visit(&mut visitor);
+
+    if !visitor.invalid_tokens.is_empty() {
+        return Err(LixError {
+            message: format!(
+                "read rewrite produced invalid placeholder tokens: {}",
+                visitor.invalid_tokens.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
+    if visitor.has_bare && visitor.has_numbered {
+        return Err(LixError {
+            message: "read rewrite produced mixed bare and numbered placeholders".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_no_unresolved_logical_read_views_except(

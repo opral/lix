@@ -171,6 +171,7 @@ pub fn rewrite_insert(
     rewrite_insert_with_writer_key(insert, params, None, functions)
 }
 
+#[cfg(test)]
 pub fn rewrite_insert_with_writer_key(
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],
@@ -762,6 +763,7 @@ fn split_insert_rows(
     })
 }
 
+#[cfg(test)]
 fn rewrite_tracked_rows(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
@@ -2877,6 +2879,7 @@ fn null_expr() -> Expr {
     Expr::Value(Value::Null.into())
 }
 
+#[cfg(test)]
 fn is_null_literal(expr: &Expr) -> bool {
     matches!(
         expr,

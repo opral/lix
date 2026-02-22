@@ -1,20 +1,31 @@
+#[cfg(test)]
 use crate::cel::CelEvaluator;
 #[cfg(test)]
 use crate::sql::parse_sql_statements_with_dialect;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_expr_cell_with_state,
-    resolve_values_rows, PlaceholderState,
+    resolve_expr_cell_with_state, PlaceholderState,
 };
+#[cfg(test)]
+use crate::sql::{bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_values_rows};
+#[cfg(test)]
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
 };
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixError, Value};
+#[cfg(test)]
+use crate::QueryResult;
 use sqlparser::ast::{
-    Assignment, Expr, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
-    TableObject, Update,
+    Assignment, ObjectNamePart, Update,
 };
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use sqlparser::ast::{
+    Expr, FromTable, ObjectName, SetExpr, Statement, TableFactor, TableObject,
+};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
+#[cfg(test)]
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
@@ -28,6 +39,7 @@ pub(crate) struct PendingFileWrite {
     pub(crate) after_data: Vec<u8>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingFileWriteCollection {
     pub(crate) writes: Vec<PendingFileWrite>,
@@ -40,12 +52,14 @@ pub(crate) enum ResolvedFileDataAssignment {
     ById(BTreeMap<String, Vec<u8>>),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileWriteTarget {
     ActiveVersion,
     ExplicitVersion,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ExactFileUpdateTarget {
     file_id: String,
@@ -64,6 +78,7 @@ pub(crate) async fn collect_pending_file_writes(
         .await
 }
 
+#[cfg(test)]
 pub(crate) async fn collect_pending_file_writes_from_statements(
     backend: &dyn LixBackend,
     statements: &[Statement],
@@ -183,6 +198,7 @@ pub(crate) fn resolve_file_data_assignment_for_update(
     Ok(assignment)
 }
 
+#[cfg(test)]
 fn collect_insert_writes(
     insert: &sqlparser::ast::Insert,
     params: &[Value],
@@ -266,6 +282,7 @@ fn collect_insert_writes(
     Ok(())
 }
 
+#[cfg(test)]
 async fn collect_delete_writes(
     backend: &dyn LixBackend,
     delete: &sqlparser::ast::Delete,
@@ -399,6 +416,7 @@ async fn collect_delete_writes(
     Ok(pending)
 }
 
+#[cfg(test)]
 async fn collect_update_writes(
     backend: &dyn LixBackend,
     update: &Update,
@@ -682,15 +700,20 @@ async fn collect_update_writes(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct OverlayWriteState {
     path: String,
     data: Vec<u8>,
 }
 
+#[cfg(test)]
 const ACTIVE_VERSION_VIEW: &str = "lix_active_version";
+#[cfg(test)]
 const INTERNAL_STATE_VTABLE: &str = "lix_internal_state_vtable";
+#[cfg(test)]
 const INTERNAL_STATE_UNTRACKED: &str = "lix_internal_state_untracked";
 
+#[cfg(test)]
 fn apply_statement_writes_to_overlay(
     statement_writes: &[PendingFileWrite],
     overlay: &mut BTreeMap<(String, String), OverlayWriteState>,
@@ -709,6 +732,7 @@ fn apply_statement_writes_to_overlay(
     }
 }
 
+#[cfg(test)]
 async fn next_active_version_id_from_statement(
     backend: &dyn LixBackend,
     statement: &Statement,
@@ -738,6 +762,7 @@ async fn next_active_version_id_from_statement(
     }
 }
 
+#[cfg(test)]
 async fn active_version_id_from_lix_active_version_update(
     backend: &dyn LixBackend,
     update: &Update,
@@ -786,6 +811,7 @@ async fn active_version_id_from_lix_active_version_update(
     Ok(Some(next_active_version_id))
 }
 
+#[cfg(test)]
 async fn active_version_id_from_internal_state_update(
     backend: &dyn LixBackend,
     update: &Update,
@@ -859,6 +885,7 @@ async fn active_version_id_from_internal_state_update(
     Ok(Some(next_active_version_id))
 }
 
+#[cfg(test)]
 fn active_version_id_from_internal_state_insert(
     insert: &sqlparser::ast::Insert,
     params: &[Value],
@@ -956,6 +983,7 @@ fn active_version_id_from_internal_state_insert(
     Ok(next_active_version_id)
 }
 
+#[cfg(test)]
 fn extract_exact_file_update_target(
     selection: Option<&Expr>,
     params: &[Value],
@@ -984,6 +1012,7 @@ fn extract_exact_file_update_target(
     }))
 }
 
+#[cfg(test)]
 fn extract_exact_file_delete_targets(
     selection: Option<&Expr>,
     params: &[Value],
@@ -1037,6 +1066,7 @@ fn extract_exact_file_delete_targets(
     Ok(Some(targets))
 }
 
+#[cfg(test)]
 fn collect_exact_file_delete_predicates(
     expr: &Expr,
     params: &[Value],
@@ -1133,6 +1163,7 @@ fn collect_exact_file_delete_predicates(
     }
 }
 
+#[cfg(test)]
 fn apply_exact_file_delete_predicate(
     column: &str,
     values: BTreeSet<String>,
@@ -1154,6 +1185,7 @@ fn apply_exact_file_delete_predicate(
     false
 }
 
+#[cfg(test)]
 fn merge_exact_delete_constraint_values(
     slot: &mut Option<BTreeSet<String>>,
     values: BTreeSet<String>,
@@ -1165,6 +1197,7 @@ fn merge_exact_delete_constraint_values(
     *slot = Some(values);
 }
 
+#[cfg(test)]
 fn collect_exact_file_update_predicates(
     expr: &Expr,
     params: &[Value],
@@ -1228,6 +1261,7 @@ fn collect_exact_file_update_predicates(
     }
 }
 
+#[cfg(test)]
 fn apply_exact_file_update_predicate(
     column: &str,
     value: &str,
@@ -1258,6 +1292,7 @@ fn apply_exact_file_update_predicate(
     false
 }
 
+#[cfg(test)]
 fn active_version_id_from_snapshot_value(value: &Value) -> Option<String> {
     match value {
         Value::Text(text) => parse_active_version_snapshot(text).ok(),
@@ -1265,6 +1300,7 @@ fn active_version_id_from_snapshot_value(value: &Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn value_is_truthy(value: &Value) -> bool {
     match value {
         Value::Integer(value) => *value != 0,
@@ -1276,6 +1312,7 @@ fn value_is_truthy(value: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
 fn update_target_table_name(update: &Update) -> Option<String> {
     if !update.table.joins.is_empty() {
         return None;
@@ -1286,6 +1323,7 @@ fn update_target_table_name(update: &Update) -> Option<String> {
     object_name_terminal(name)
 }
 
+#[cfg(test)]
 fn insert_target_table_name(insert: &sqlparser::ast::Insert) -> Option<String> {
     let TableObject::TableName(name) = &insert.table else {
         return None;
@@ -1389,6 +1427,7 @@ pub(crate) async fn load_before_path_from_cache_batch(
     Ok(out)
 }
 
+#[cfg(test)]
 fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget> {
     let TableObject::TableName(name) = table else {
         return None;
@@ -1398,6 +1437,7 @@ fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget>
     file_write_target_from_name(&table_name)
 }
 
+#[cfg(test)]
 fn file_write_target_from_update(update: &Update) -> Option<FileWriteTarget> {
     if !update.table.joins.is_empty() {
         return None;
@@ -1410,6 +1450,7 @@ fn file_write_target_from_update(update: &Update) -> Option<FileWriteTarget> {
     file_write_target_from_name(&table_name)
 }
 
+#[cfg(test)]
 fn file_write_target_from_delete(delete: &sqlparser::ast::Delete) -> Option<FileWriteTarget> {
     let tables = match &delete.from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
@@ -1430,6 +1471,7 @@ fn file_write_target_from_delete(delete: &sqlparser::ast::Delete) -> Option<File
     file_write_target_from_name(&table_name)
 }
 
+#[cfg(test)]
 fn file_write_target_from_name(table_name: &str) -> Option<FileWriteTarget> {
     if table_name.eq_ignore_ascii_case("lix_file") {
         Some(FileWriteTarget::ActiveVersion)
@@ -1474,6 +1516,7 @@ fn resolve_case_assignment_text_or_blob_by_id(
     Ok(Some(values))
 }
 
+#[cfg(test)]
 fn resolve_case_assignment_text_by_id(
     expr: &sqlparser::ast::Expr,
     else_column_name: &str,
@@ -1541,6 +1584,7 @@ struct ExprCase<'a> {
     conditions: &'a [sqlparser::ast::CaseWhen],
 }
 
+#[cfg(test)]
 fn object_name_terminal(name: &ObjectName) -> Option<String> {
     name.0
         .last()
@@ -1548,6 +1592,7 @@ fn object_name_terminal(name: &ObjectName) -> Option<String> {
         .map(|ident| ident.value.clone())
 }
 
+#[cfg(test)]
 fn expr_column_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -1557,6 +1602,7 @@ fn expr_column_name(expr: &Expr) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn expr_text_literal_or_placeholder(
     expr: &Expr,
     params: &[Value],
@@ -1857,6 +1903,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 async fn execute_prefetch_query(
     backend: &dyn LixBackend,
     label: &str,
@@ -1880,6 +1927,7 @@ async fn execute_prefetch_query(
     Ok(result)
 }
 
+#[cfg(test)]
 fn file_prefetch_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1893,6 +1941,7 @@ fn file_prefetch_trace_enabled() -> bool {
     })
 }
 
+#[cfg(test)]
 async fn execute_delete_overlay_prefetch_query(
     backend: &dyn LixBackend,
     delete: &sqlparser::ast::Delete,
@@ -1952,6 +2001,7 @@ async fn execute_delete_overlay_prefetch_query(
     Ok(rows)
 }
 
+#[cfg(test)]
 fn overlay_rows_for_target(
     overlay: &BTreeMap<(String, String), OverlayWriteState>,
     active_version_id: &str,

@@ -46,6 +46,7 @@ pub(crate) struct EntityViewTarget {
     pub override_predicates: Vec<EntityViewOverridePredicate>,
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_target_from_object_name(
     name: &ObjectName,
 ) -> Result<Option<EntityViewTarget>, LixError> {
@@ -65,6 +66,7 @@ pub(crate) async fn resolve_target_from_object_name_with_backend(
     resolve_target_from_view_name_with_backend(backend, &view_name).await
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_target_from_view_name(
     view_name: &str,
 ) -> Result<Option<EntityViewTarget>, LixError> {

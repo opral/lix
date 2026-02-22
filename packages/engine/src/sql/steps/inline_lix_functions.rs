@@ -3,7 +3,9 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Value};
 use sqlparser::ast::{VisitMut, VisitorMut};
 
-use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+use crate::functions::LixFunctionProvider;
+#[cfg(test)]
+use crate::functions::SystemFunctionProvider;
 use crate::sql::object_name_matches;
 
 #[cfg(test)]

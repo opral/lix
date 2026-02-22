@@ -1,14 +1,78 @@
+use std::collections::BTreeSet;
+
 use sqlparser::ast::Statement;
 
 use crate::sql::types::{MutationRow, SchemaRegistration, UpdateValidationPlan};
 use crate::sql::PostprocessPlan;
 use crate::LixError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostprocessSingleStatementContext {
+    RewriteOutput,
+    CompilePlan,
+    PreprocessOutput,
+}
+
+impl PostprocessSingleStatementContext {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RewriteOutput => "rewrite output",
+            Self::CompilePlan => "compile plan",
+            Self::PreprocessOutput => "preprocess output",
+        }
+    }
+}
+
 pub(crate) fn ensure_single_statement_plan(statement_count: usize) -> Result<(), LixError> {
     if statement_count == 0 {
         return Err(LixError {
             message: "planner received empty statement block".to_string(),
         });
+    }
+    if statement_count > 1 {
+        return Err(LixError {
+            message: format!(
+                "planner expected a single statement after canonicalization, got {statement_count}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_postprocess_single_statement(
+    postprocess_present: bool,
+    statement_count: usize,
+    context: PostprocessSingleStatementContext,
+) -> Result<(), LixError> {
+    if !postprocess_present || statement_count == 1 {
+        return Ok(());
+    }
+    Err(LixError {
+        message: format!(
+            "postprocess single-statement invariant violated in {}: expected 1 statement, got {statement_count}",
+            context.label()
+        ),
+    })
+}
+
+fn ensure_unique_mutation_row_identities(mutations: &[MutationRow]) -> Result<(), LixError> {
+    let mut seen = BTreeSet::new();
+    for mutation in mutations {
+        let identity = format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            mutation.entity_id,
+            mutation.schema_key,
+            mutation.schema_version,
+            mutation.file_id,
+            mutation.version_id,
+            mutation.plugin_key,
+            mutation.untracked
+        );
+        if !seen.insert(identity) {
+            return Err(LixError {
+                message: "mutation rewrite emitted duplicate row identity".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -25,11 +89,11 @@ pub(crate) fn validate_statement_output_parts(
             message: "statement rewrite produced no statements".to_string(),
         });
     }
-    if postprocess.is_some() && statements.len() != 1 {
-        return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
-        });
-    }
+    ensure_postprocess_single_statement(
+        postprocess.is_some(),
+        statements.len(),
+        PostprocessSingleStatementContext::RewriteOutput,
+    )?;
     if postprocess.is_some() && !mutations.is_empty() {
         return Err(LixError {
             message: "postprocess rewrites cannot emit mutation rows".to_string(),
@@ -65,6 +129,7 @@ pub(crate) fn validate_statement_output_parts(
         validate_non_empty_field("mutation version_id", &mutation.version_id)?;
         validate_non_empty_field("mutation plugin_key", &mutation.plugin_key)?;
     }
+    ensure_unique_mutation_row_identities(mutations)?;
     for validation in update_validations {
         validate_non_empty_field("update validation table", &validation.table)?;
         if validation.snapshot_content.is_some() && validation.snapshot_patch.is_some() {

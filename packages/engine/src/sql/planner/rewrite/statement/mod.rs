@@ -9,8 +9,9 @@ use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
 use crate::sql::planner::ir::logical::{
-    LogicalExplainRead, LogicalReadOperator, LogicalReadSemantics, LogicalStatementOperation,
-    LogicalStatementPlan, LogicalStatementSemantics, LogicalStatementStep,
+    LogicalCanonicalWriteOperator, LogicalExplainRead, LogicalPassthroughOperator,
+    LogicalQueryReadOperator, LogicalReadOperator, LogicalReadSemantics,
+    LogicalStatementOperation, LogicalStatementPlan, LogicalStatementSemantics, LogicalStatementStep,
 };
 use crate::sql::planner::rewrite::query::{
     collect_relation_names_via_walker, rewrite_query_with_backend_and_params,
@@ -34,7 +35,9 @@ where
             LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
                 semantics,
-                vec![LogicalStatementStep::Query(rewritten)],
+                vec![LogicalStatementStep::QueryRead(LogicalQueryReadOperator {
+                    query: rewritten,
+                })],
             )
         }
         Statement::Explain {
@@ -47,43 +50,46 @@ where
             format,
             options,
         } => {
-            let semantics = match statement.as_ref() {
+            match *statement {
                 Statement::Query(query) => {
-                    LogicalStatementSemantics::ExplainRead(read_semantics_for_query(query))
+                    let semantics =
+                        LogicalStatementSemantics::ExplainRead(read_semantics_for_query(&query));
+                    let rewritten =
+                        rewrite_query_with_backend_and_params(backend, *query, params).await?;
+                    LogicalStatementPlan::new(
+                        LogicalStatementOperation::ExplainRead,
+                        semantics,
+                        vec![LogicalStatementStep::ExplainRead(LogicalExplainRead {
+                            describe_alias,
+                            analyze,
+                            verbose,
+                            query_plan,
+                            estimate,
+                            format,
+                            options,
+                            query: rewritten,
+                        })],
+                    )
                 }
-                _ => LogicalStatementSemantics::ExplainRead(LogicalReadSemantics::empty()),
-            };
-            let step = match *statement {
-                Statement::Query(query) => {
-                    let rewritten = rewrite_query_with_backend_and_params(backend, *query, params).await?;
-                    LogicalStatementStep::ExplainRead(LogicalExplainRead {
-                        describe_alias,
-                        analyze,
-                        verbose,
-                        query_plan,
-                        estimate,
-                        format,
-                        options,
-                        query: rewritten,
-                    })
-                }
-                other => LogicalStatementStep::Statement(Statement::Explain {
-                    describe_alias,
-                    analyze,
-                    verbose,
-                    query_plan,
-                    estimate,
-                    statement: Box::new(other),
-                    format,
-                    options,
-                }),
-            };
-
-            LogicalStatementPlan::new(
-                LogicalStatementOperation::ExplainRead,
-                semantics,
-                vec![step],
-            )
+                other => LogicalStatementPlan::new(
+                    LogicalStatementOperation::Passthrough,
+                    LogicalStatementSemantics::Passthrough,
+                    vec![LogicalStatementStep::Passthrough(
+                        LogicalPassthroughOperator {
+                            statement: Statement::Explain {
+                                describe_alias,
+                                analyze,
+                                verbose,
+                                query_plan,
+                                estimate,
+                                statement: Box::new(other),
+                                format,
+                                options,
+                            },
+                        },
+                    )],
+                ),
+            }
         }
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
             let Some(rewrite_output) = write::rewrite_backend_statement(
@@ -114,7 +120,11 @@ where
                 rewrite_output
                     .statements
                     .into_iter()
-                    .map(LogicalStatementStep::Statement)
+                    .map(|statement| {
+                        LogicalStatementStep::CanonicalWrite(LogicalCanonicalWriteOperator {
+                            statement,
+                        })
+                    })
                     .collect(),
             )
             .with_rewrite_metadata(
@@ -128,7 +138,9 @@ where
         other => LogicalStatementPlan::new(
             LogicalStatementOperation::Passthrough,
             LogicalStatementSemantics::Passthrough,
-            vec![LogicalStatementStep::Statement(other)],
+            vec![LogicalStatementStep::Passthrough(
+                LogicalPassthroughOperator { statement: other },
+            )],
         ),
     };
     logical_plan.validate_plan_shape()?;
@@ -160,7 +172,8 @@ mod tests {
     use crate::functions::SystemFunctionProvider;
     use crate::sql::parse_sql_statements_with_dialect;
     use crate::sql::planner::ir::logical::{
-        LogicalStatementOperation, LogicalStatementSemantics, LogicalStatementStep, LogicalReadOperator,
+        LogicalCanonicalWriteOperator, LogicalPassthroughOperator, LogicalReadOperator,
+        LogicalStatementOperation, LogicalStatementSemantics, LogicalStatementStep,
     };
     use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
@@ -214,7 +227,7 @@ mod tests {
         assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(
             plan.planned_statements[0],
-            LogicalStatementStep::Query(_)
+            LogicalStatementStep::QueryRead(_)
         ));
         let LogicalStatementSemantics::QueryRead(read) = plan.semantics else {
             panic!("expected query read semantics");
@@ -272,7 +285,9 @@ mod tests {
         assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(
             plan.planned_statements[0],
-            LogicalStatementStep::Statement(Statement::Update(_))
+            LogicalStatementStep::CanonicalWrite(LogicalCanonicalWriteOperator {
+                statement: Statement::Update(_),
+            })
         ));
         assert_eq!(plan.semantics, LogicalStatementSemantics::CanonicalWrite);
     }
@@ -298,7 +313,9 @@ mod tests {
         assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(
             plan.planned_statements[0],
-            LogicalStatementStep::Statement(Statement::CreateTable(_))
+            LogicalStatementStep::Passthrough(LogicalPassthroughOperator {
+                statement: Statement::CreateTable(_),
+            })
         ));
         assert_eq!(plan.semantics, LogicalStatementSemantics::Passthrough);
     }

@@ -1,8 +1,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query,
-    Select, SelectItem, Value as AstValue, Visit, Visitor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Select,
+    SelectItem, Value as AstValue, Visit, Visitor,
 };
 
 #[derive(Default)]
@@ -13,18 +13,7 @@ pub(crate) struct StatePushdown {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RankedPushdownPredicate {
-    pub(crate) column: StateColumn,
     pub(crate) ranked_sql: String,
-    pub(crate) base_sql: String,
-    pub(crate) kind: PushdownPredicateKind,
-    pub(crate) has_placeholder: bool,
-}
-
-impl RankedPushdownPredicate {
-    pub(crate) fn requires_all_target_versions_scan(&self) -> bool {
-        self.column == StateColumn::VersionId
-            && (self.has_placeholder || self.kind == PushdownPredicateKind::InSubquery)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,13 +56,6 @@ impl StateColumn {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PushdownPredicateKind {
-    Binary,
-    InList,
-    InSubquery,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PushdownBucket {
     Source = 0,
@@ -89,10 +71,7 @@ struct PredicatePart {
 
 struct ExtractedPushdownPredicate {
     bucket: PushdownBucket,
-    column: StateColumn,
     predicate_sql: String,
-    kind: PushdownPredicateKind,
-    has_placeholder: bool,
 }
 
 pub(crate) fn select_projects_count_star(select: &Select) -> bool {
@@ -196,11 +175,7 @@ pub(crate) fn take_pushdown_predicates(
                         .push(format!("s.{}", extracted.predicate_sql)),
                     PushdownBucket::Ranked => {
                         pushdown.ranked_predicates.push(RankedPushdownPredicate {
-                            column: extracted.column,
                             ranked_sql: format!("ranked.{}", extracted.predicate_sql),
-                            base_sql: extracted.predicate_sql,
-                            kind: extracted.kind,
-                            has_placeholder: extracted.has_placeholder,
                         })
                     }
                     PushdownBucket::Remaining => remaining.push(part.predicate),
@@ -294,10 +269,7 @@ fn extract_pushdown_predicate(
             let list_sql = render_in_list_sql(list);
             Some(ExtractedPushdownPredicate {
                 bucket,
-                column,
                 predicate_sql: format!("{} IN ({list_sql})", column.canonical_name()),
-                kind: PushdownPredicateKind::InList,
-                has_placeholder: list.iter().any(expr_contains_any_placeholder),
             })
         }
         Expr::InSubquery {
@@ -309,10 +281,7 @@ fn extract_pushdown_predicate(
             let bucket = pushdown_bucket_for_column(column)?;
             Some(ExtractedPushdownPredicate {
                 bucket,
-                column,
                 predicate_sql: format!("{} IN ({subquery})", column.canonical_name()),
-                kind: PushdownPredicateKind::InSubquery,
-                has_placeholder: query_contains_any_placeholder(subquery),
             })
         }
         _ => None,
@@ -326,10 +295,7 @@ fn build_binary_pushdown_predicate(
     let bucket = pushdown_bucket_for_column(column)?;
     Some(ExtractedPushdownPredicate {
         bucket,
-        column,
         predicate_sql: format!("{} = {rhs}", column.canonical_name()),
-        kind: PushdownPredicateKind::Binary,
-        has_placeholder: expr_contains_any_placeholder(rhs),
     })
 }
 
@@ -372,19 +338,6 @@ fn render_in_list_sql(list: &[Expr]) -> String {
 
 fn expr_contains_bare_placeholder(expr: &Expr) -> bool {
     expr_contains_placeholder(expr, true)
-}
-
-fn expr_contains_any_placeholder(expr: &Expr) -> bool {
-    expr_contains_placeholder(expr, false)
-}
-
-fn query_contains_any_placeholder(query: &Query) -> bool {
-    let mut detector = PlaceholderDetector {
-        bare_only: false,
-        found: false,
-    };
-    let _ = query.visit(&mut detector);
-    detector.found
 }
 
 fn expr_contains_placeholder(expr: &Expr, bare_only: bool) -> bool {

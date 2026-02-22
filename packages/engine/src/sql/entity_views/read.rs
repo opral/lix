@@ -15,13 +15,8 @@ use crate::sql::{
 use crate::{LixBackend, LixError};
 
 use super::target::{
-    resolve_target_from_object_name, resolve_targets_with_backend, EntityViewTarget,
-    EntityViewVariant,
+    resolve_targets_with_backend, EntityViewTarget, EntityViewVariant,
 };
-
-pub(crate) fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    rewrite_query_with_resolver(query, &mut |name| resolve_target_from_object_name(name))
-}
 
 pub(crate) async fn rewrite_query_with_backend(
     backend: &dyn LixBackend,

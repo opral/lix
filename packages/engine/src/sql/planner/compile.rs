@@ -10,7 +10,10 @@ use super::emit::statement::emit_physical_statement_plan_with_state;
 use super::ir::logical::LogicalStatementOperation;
 use super::rewrite::statement::rewrite_statement_to_logical_plan_with_backend;
 use super::types::CompiledStatementPlan;
-use super::validate::ensure_single_statement_plan;
+use super::validate::{
+    ensure_postprocess_single_statement, ensure_single_statement_plan,
+    PostprocessSingleStatementContext,
+};
 
 pub(crate) async fn compile_statement_with_state<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
@@ -71,11 +74,11 @@ where
         &[],
     )
     .await?;
-    if logical_plan.postprocess.is_some() && logical_plan.planned_statements.len() != 1 {
-        return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
-        });
-    }
+    ensure_postprocess_single_statement(
+        logical_plan.postprocess.is_some(),
+        logical_plan.planned_statements.len(),
+        PostprocessSingleStatementContext::CompilePlan,
+    )?;
 
     let (prepared_statements, next_placeholder_state) = emit_physical_statement_plan_with_state(
         &logical_plan,

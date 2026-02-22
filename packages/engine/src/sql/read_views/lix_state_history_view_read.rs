@@ -1,15 +1,17 @@
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
+use std::sync::OnceLock;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Query, Select, Statement, TableFactor, TableWithJoins, Value as AstValue,
-    Visit, Visitor,
+    BinaryOperator, Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+    Value as AstValue, Visit, Visitor,
 };
 
 use crate::backend::SqlDialect;
 use crate::sql::read_views::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
-    bind_sql_with_state, default_alias, escape_sql_string, object_name_matches, parse_single_query,
+    bind_sql_with_state, default_alias, escape_sql_string, object_name_matches,
+    parse_expression_with_dialect, parse_single_query, parse_single_query_with_dialect,
     rewrite_query_selects, PlaceholderState, RewriteDecision,
 };
 use crate::version::GLOBAL_VERSION_ID;
@@ -19,6 +21,8 @@ const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
 const TIMELINE_BREAKPOINT_TABLE: &str = "lix_internal_entity_state_timeline_breakpoint";
 const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
 const MAX_HISTORY_DEPTH: i64 = 512;
+static STATE_HISTORY_PHASE2_QUERY_TEMPLATE: OnceLock<Query> = OnceLock::new();
+static STATE_HISTORY_PHASE2_COUNT_TEMPLATE: OnceLock<Query> = OnceLock::new();
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     let (rewritten, _requests) = rewrite_query_collect_requests(query)?;
@@ -634,130 +638,253 @@ fn build_lix_state_history_view_query(
 
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
     requested_predicates.extend(pushdown.requested_predicates.clone());
-    let reachable_cse_predicates = pushdown
+    let reachable_predicates = pushdown
         .cse_predicates
         .iter()
         .map(|predicate| predicate.reachable_sql.clone())
         .collect::<Vec<_>>();
-    let reachable_where_sql = render_where_clause(&reachable_cse_predicates);
-    let breakpoint_where_sql = render_where_clause(
-        &pushdown
-            .change_predicates
-            .iter()
-            .map(|predicate| predicate.breakpoint_sql.clone())
-            .collect::<Vec<_>>(),
-    );
-    let requested_where_sql = render_where_clause(&requested_predicates);
+    let breakpoint_predicates = pushdown
+        .change_predicates
+        .iter()
+        .map(|predicate| predicate.breakpoint_sql.clone())
+        .collect::<Vec<_>>();
 
-    let final_select_sql = if count_fast_path {
-        "SELECT COUNT(*) AS count \
-         FROM history_rows h \
-         WHERE h.snapshot_id != 'no-content'"
-            .to_string()
-    } else {
-        format!(
-            "SELECT \
-               h.entity_id AS entity_id, \
-               h.schema_key AS schema_key, \
-               h.file_id AS file_id, \
-               h.plugin_key AS plugin_key, \
-               s.content AS snapshot_content, \
-               h.metadata AS metadata, \
-               h.schema_version AS schema_version, \
-               h.change_id AS change_id, \
-               h.commit_id AS commit_id, \
-               h.root_commit_id AS root_commit_id, \
-               h.depth AS depth, \
-               '{global_version}' AS version_id \
-             FROM history_rows h \
-             LEFT JOIN lix_internal_snapshot s \
-               ON s.id = h.snapshot_id \
-             WHERE h.snapshot_id != 'no-content'",
-            global_version = GLOBAL_VERSION_ID
-        )
-    };
-
-    let sql = format!(
-        "WITH \
-           commit_by_version AS ( \
-             SELECT \
-               entity_id AS id, \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-               version_id AS lixcol_version_id \
-             FROM lix_internal_state_materialized_v1_lix_commit \
-             WHERE schema_key = 'lix_commit' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           requested_commits AS ( \
-             SELECT DISTINCT c.id AS commit_id \
-             FROM commit_by_version c \
-             {requested_where_sql} \
-           ), \
-           reachable_commits AS ( \
-             SELECT \
-               ancestry.ancestor_id AS commit_id, \
-               requested.commit_id AS root_commit_id, \
-               ancestry.depth AS commit_depth \
-             FROM requested_commits requested \
-             JOIN lix_internal_commit_ancestry ancestry \
-               ON ancestry.commit_id = requested.commit_id \
-             WHERE ancestry.depth <= {max_depth} \
-           ), \
-           filtered_reachable_commits AS ( \
-             SELECT \
-               rc.commit_id, \
-               rc.root_commit_id, \
-               rc.commit_depth \
-             FROM reachable_commits rc \
-             {reachable_where_sql} \
-           ), \
-           breakpoint_rows AS ( \
-             SELECT \
-               bp.root_commit_id, \
-               bp.entity_id, \
-               bp.schema_key, \
-               bp.file_id, \
-               bp.plugin_key, \
-               bp.schema_version, \
-                bp.metadata, \
-                bp.snapshot_id, \
-                bp.change_id, \
-                bp.from_depth \
-             FROM lix_internal_entity_state_timeline_breakpoint bp \
-             JOIN requested_commits requested \
-               ON requested.commit_id = bp.root_commit_id \
-             {breakpoint_where_sql} \
-           ), \
-           history_rows AS ( \
-             SELECT \
-               bp.entity_id, \
-               bp.schema_key, \
-               bp.file_id, \
-               bp.plugin_key, \
-               bp.schema_version, \
-               bp.metadata, \
-               bp.snapshot_id, \
-               bp.change_id, \
-               rc.commit_id AS commit_id, \
-               rc.root_commit_id AS root_commit_id, \
-               rc.commit_depth AS depth \
-             FROM filtered_reachable_commits rc \
-             JOIN breakpoint_rows bp \
-               ON bp.root_commit_id = rc.root_commit_id \
-              AND rc.commit_depth = bp.from_depth \
-           ) \
-         {final_select_sql}",
-        global_version = GLOBAL_VERSION_ID,
-        max_depth = MAX_HISTORY_DEPTH,
-        requested_where_sql = requested_where_sql,
-        reachable_where_sql = reachable_where_sql,
-        breakpoint_where_sql = breakpoint_where_sql,
-        final_select_sql = final_select_sql,
-    );
-    parse_single_query(&sql)
+    let mut query = state_history_phase2_template(count_fast_path);
+    append_predicates_to_history_cte(
+        &mut query,
+        "requested_commits",
+        &requested_predicates,
+    )?;
+    append_predicates_to_history_cte(
+        &mut query,
+        "filtered_reachable_commits",
+        &reachable_predicates,
+    )?;
+    append_predicates_to_history_cte(&mut query, "breakpoint_rows", &breakpoint_predicates)?;
+    Ok(query)
 }
+
+fn state_history_phase2_template(count_fast_path: bool) -> Query {
+    let template = if count_fast_path {
+        STATE_HISTORY_PHASE2_COUNT_TEMPLATE.get_or_init(|| {
+            parse_single_query_with_dialect(STATE_HISTORY_PHASE2_COUNT_SQL, SqlDialect::Sqlite)
+                .expect("state history phase2 count template")
+        })
+    } else {
+        STATE_HISTORY_PHASE2_QUERY_TEMPLATE.get_or_init(|| {
+            parse_single_query_with_dialect(STATE_HISTORY_PHASE2_SQL, SqlDialect::Sqlite)
+                .expect("state history phase2 query template")
+        })
+    };
+    template.clone()
+}
+
+fn append_predicates_to_history_cte(
+    query: &mut Query,
+    cte_name: &str,
+    predicates: &[String],
+) -> Result<(), LixError> {
+    let selection = &mut cte_select_mut(query, cte_name)?.selection;
+    append_predicates_from_sql(selection, predicates)
+}
+
+fn cte_select_mut<'a>(query: &'a mut Query, cte_name: &str) -> Result<&'a mut Select, LixError> {
+    let Some(with_clause) = query.with.as_mut() else {
+        return Err(LixError {
+            message: "state history phase2 query missing WITH clause".to_string(),
+        });
+    };
+    let Some(cte) = with_clause
+        .cte_tables
+        .iter_mut()
+        .find(|cte| cte.alias.name.value.eq_ignore_ascii_case(cte_name))
+    else {
+        return Err(LixError {
+            message: format!("state history phase2 query missing CTE '{cte_name}'"),
+        });
+    };
+    let SetExpr::Select(select) = cte.query.body.as_mut() else {
+        return Err(LixError {
+            message: format!("state history CTE '{cte_name}' expected SELECT body"),
+        });
+    };
+    Ok(select.as_mut())
+}
+
+fn append_predicates_from_sql(
+    selection: &mut Option<Expr>,
+    predicates: &[String],
+) -> Result<(), LixError> {
+    for predicate_sql in predicates {
+        let predicate = parse_expression_with_dialect(predicate_sql, SqlDialect::Sqlite)?;
+        let next = match selection.take() {
+            Some(existing) => Expr::BinaryOp {
+                left: Box::new(existing),
+                op: BinaryOperator::And,
+                right: Box::new(predicate),
+            },
+            None => predicate,
+        };
+        *selection = Some(next);
+    }
+    Ok(())
+}
+
+const STATE_HISTORY_PHASE2_SQL: &str = "WITH \
+  commit_by_version AS ( \
+    SELECT \
+      entity_id AS id, \
+      lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+      version_id AS lixcol_version_id \
+    FROM lix_internal_state_materialized_v1_lix_commit \
+    WHERE schema_key = 'lix_commit' \
+      AND version_id = 'global' \
+      AND is_tombstone = 0 \
+      AND snapshot_content IS NOT NULL \
+  ), \
+  requested_commits AS ( \
+    SELECT DISTINCT c.id AS commit_id \
+    FROM commit_by_version c \
+  ), \
+  reachable_commits AS ( \
+    SELECT \
+      ancestry.ancestor_id AS commit_id, \
+      requested.commit_id AS root_commit_id, \
+      ancestry.depth AS commit_depth \
+    FROM requested_commits requested \
+    JOIN lix_internal_commit_ancestry ancestry \
+      ON ancestry.commit_id = requested.commit_id \
+    WHERE ancestry.depth <= 512 \
+  ), \
+  filtered_reachable_commits AS ( \
+    SELECT \
+      rc.commit_id, \
+      rc.root_commit_id, \
+      rc.commit_depth \
+    FROM reachable_commits rc \
+  ), \
+  breakpoint_rows AS ( \
+    SELECT \
+      bp.root_commit_id, \
+      bp.entity_id, \
+      bp.schema_key, \
+      bp.file_id, \
+      bp.plugin_key, \
+      bp.schema_version, \
+      bp.metadata, \
+      bp.snapshot_id, \
+      bp.change_id, \
+      bp.from_depth \
+    FROM lix_internal_entity_state_timeline_breakpoint bp \
+    JOIN requested_commits requested \
+      ON requested.commit_id = bp.root_commit_id \
+  ), \
+  history_rows AS ( \
+    SELECT \
+      bp.entity_id, \
+      bp.schema_key, \
+      bp.file_id, \
+      bp.plugin_key, \
+      bp.schema_version, \
+      bp.metadata, \
+      bp.snapshot_id, \
+      bp.change_id, \
+      rc.commit_id AS commit_id, \
+      rc.root_commit_id AS root_commit_id, \
+      rc.commit_depth AS depth \
+    FROM filtered_reachable_commits rc \
+    JOIN breakpoint_rows bp \
+      ON bp.root_commit_id = rc.root_commit_id \
+     AND rc.commit_depth = bp.from_depth \
+  ) \
+SELECT \
+  h.entity_id AS entity_id, \
+  h.schema_key AS schema_key, \
+  h.file_id AS file_id, \
+  h.plugin_key AS plugin_key, \
+  s.content AS snapshot_content, \
+  h.metadata AS metadata, \
+  h.schema_version AS schema_version, \
+  h.change_id AS change_id, \
+  h.commit_id AS commit_id, \
+  h.root_commit_id AS root_commit_id, \
+  h.depth AS depth, \
+  'global' AS version_id \
+FROM history_rows h \
+LEFT JOIN lix_internal_snapshot s \
+  ON s.id = h.snapshot_id \
+WHERE h.snapshot_id != 'no-content'";
+
+const STATE_HISTORY_PHASE2_COUNT_SQL: &str = "WITH \
+  commit_by_version AS ( \
+    SELECT \
+      entity_id AS id, \
+      lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+      version_id AS lixcol_version_id \
+    FROM lix_internal_state_materialized_v1_lix_commit \
+    WHERE schema_key = 'lix_commit' \
+      AND version_id = 'global' \
+      AND is_tombstone = 0 \
+      AND snapshot_content IS NOT NULL \
+  ), \
+  requested_commits AS ( \
+    SELECT DISTINCT c.id AS commit_id \
+    FROM commit_by_version c \
+  ), \
+  reachable_commits AS ( \
+    SELECT \
+      ancestry.ancestor_id AS commit_id, \
+      requested.commit_id AS root_commit_id, \
+      ancestry.depth AS commit_depth \
+    FROM requested_commits requested \
+    JOIN lix_internal_commit_ancestry ancestry \
+      ON ancestry.commit_id = requested.commit_id \
+    WHERE ancestry.depth <= 512 \
+  ), \
+  filtered_reachable_commits AS ( \
+    SELECT \
+      rc.commit_id, \
+      rc.root_commit_id, \
+      rc.commit_depth \
+    FROM reachable_commits rc \
+  ), \
+  breakpoint_rows AS ( \
+    SELECT \
+      bp.root_commit_id, \
+      bp.entity_id, \
+      bp.schema_key, \
+      bp.file_id, \
+      bp.plugin_key, \
+      bp.schema_version, \
+      bp.metadata, \
+      bp.snapshot_id, \
+      bp.change_id, \
+      bp.from_depth \
+    FROM lix_internal_entity_state_timeline_breakpoint bp \
+    JOIN requested_commits requested \
+      ON requested.commit_id = bp.root_commit_id \
+  ), \
+  history_rows AS ( \
+    SELECT \
+      bp.entity_id, \
+      bp.schema_key, \
+      bp.file_id, \
+      bp.plugin_key, \
+      bp.schema_version, \
+      bp.metadata, \
+      bp.snapshot_id, \
+      bp.change_id, \
+      rc.commit_id AS commit_id, \
+      rc.root_commit_id AS root_commit_id, \
+      rc.commit_depth AS depth \
+    FROM filtered_reachable_commits rc \
+    JOIN breakpoint_rows bp \
+      ON bp.root_commit_id = rc.root_commit_id \
+     AND rc.commit_depth = bp.from_depth \
+  ) \
+SELECT COUNT(*) AS count \
+FROM history_rows h \
+WHERE h.snapshot_id != 'no-content'";
 
 fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
     pushdown.requested_pushdown_blocked_by_bare_placeholders

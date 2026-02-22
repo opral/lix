@@ -1,10 +1,11 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
+    Expr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement,
+    TableAlias, TableFactor,
 };
 use sqlparser::ast::{Visit, VisitMut, Visitor, VisitorMut};
-use sqlparser::dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 use crate::{LixError, SqlDialect};
@@ -26,24 +27,60 @@ pub(crate) fn default_alias(name: &str) -> TableAlias {
 }
 
 pub(crate) fn parse_single_query(sql: &str) -> Result<Query, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })?;
-    parse_single_query_statement(&mut statements)
+    parse_single_query_with_dialect(sql, SqlDialect::Sqlite)
+}
+
+pub(crate) fn parse_expression_with_dialect(
+    sql: &str,
+    dialect: SqlDialect,
+) -> Result<Expr, LixError> {
+    let wrapper_sql = format!("SELECT {sql}");
+    let mut statements = parse_sql_with_dialect(&wrapper_sql, dialect)?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "expected a single expression statement".to_string(),
+        });
+    }
+    let statement = statements.remove(0);
+    let Statement::Query(query) = statement else {
+        return Err(LixError {
+            message: "expected SELECT expression statement".to_string(),
+        });
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(LixError {
+            message: "expected SELECT expression".to_string(),
+        });
+    };
+    let Some(item) = select.projection.first() else {
+        return Err(LixError {
+            message: "missing projected expression".to_string(),
+        });
+    };
+    match item {
+        SelectItem::UnnamedExpr(expr) => Ok(expr.clone()),
+        _ => Err(LixError {
+            message: "expected unnamed projected expression".to_string(),
+        }),
+    }
 }
 
 pub(crate) fn parse_single_query_with_dialect(
     sql: &str,
     dialect: SqlDialect,
 ) -> Result<Query, LixError> {
-    let mut statements = match dialect {
+    let mut statements = parse_sql_with_dialect(sql, dialect)?;
+    parse_single_query_statement(&mut statements)
+}
+
+fn parse_sql_with_dialect(sql: &str, dialect: SqlDialect) -> Result<Vec<Statement>, LixError> {
+    match dialect {
         SqlDialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, sql),
         SqlDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
     }
     .map_err(|error| LixError {
         message: error.to_string(),
-    })?;
-    parse_single_query_statement(&mut statements)
+    })
 }
 
 fn parse_single_query_statement(statements: &mut Vec<Statement>) -> Result<Query, LixError> {

@@ -27,6 +27,7 @@ pub(crate) struct LogicalReadSemantics {
 }
 
 impl LogicalReadSemantics {
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             operators: BTreeSet::new(),
@@ -48,9 +49,25 @@ pub(crate) enum LogicalStatementSemantics {
 
 #[derive(Debug, Clone)]
 pub(crate) enum LogicalStatementStep {
-    Query(Query),
+    QueryRead(LogicalQueryReadOperator),
     ExplainRead(LogicalExplainRead),
-    Statement(Statement),
+    CanonicalWrite(LogicalCanonicalWriteOperator),
+    Passthrough(LogicalPassthroughOperator),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalQueryReadOperator {
+    pub(crate) query: Query,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalCanonicalWriteOperator {
+    pub(crate) statement: Statement,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalPassthroughOperator {
+    pub(crate) statement: Statement,
 }
 
 #[derive(Debug, Clone)]
@@ -83,9 +100,10 @@ impl LogicalExplainRead {
 impl LogicalStatementStep {
     pub(crate) fn as_statement(&self) -> Statement {
         match self {
-            Self::Query(query) => Statement::Query(Box::new(query.clone())),
+            Self::QueryRead(read) => Statement::Query(Box::new(read.query.clone())),
             Self::ExplainRead(explain_read) => explain_read.clone().into_statement(),
-            Self::Statement(statement) => statement.clone(),
+            Self::CanonicalWrite(write) => write.statement.clone(),
+            Self::Passthrough(passthrough) => passthrough.statement.clone(),
         }
     }
 }
@@ -148,7 +166,7 @@ impl LogicalStatementPlan {
                 let has_non_query = self
                     .planned_statements
                     .iter()
-                    .any(|step| !matches!(step, LogicalStatementStep::Query(_)));
+                    .any(|step| !matches!(step, LogicalStatementStep::QueryRead(_)));
                 if has_non_query {
                     return Err(LixError {
                         message: "query read plans may only contain query steps".to_string(),
@@ -167,28 +185,25 @@ impl LogicalStatementPlan {
                 }
             }
             (LogicalStatementOperation::CanonicalWrite, LogicalStatementSemantics::CanonicalWrite) => {
-                let has_query = self
+                let has_non_canonical = self
                     .planned_statements
                     .iter()
-                    .any(|step| matches!(step, LogicalStatementStep::Query(_)));
-                let has_explain = self
-                    .planned_statements
-                    .iter()
-                    .any(|step| matches!(step, LogicalStatementStep::ExplainRead(_)));
-                if has_query || has_explain {
+                    .any(|step| !matches!(step, LogicalStatementStep::CanonicalWrite(_)));
+                if has_non_canonical {
                     return Err(LixError {
-                        message: "canonical write plans may not contain read steps".to_string(),
+                        message: "canonical write plans may only contain canonical write steps"
+                            .to_string(),
                     });
                 }
             }
             (LogicalStatementOperation::Passthrough, LogicalStatementSemantics::Passthrough) => {
-                let has_read = self
+                let has_non_passthrough = self
                     .planned_statements
                     .iter()
-                    .any(|step| matches!(step, LogicalStatementStep::Query(_)));
-                if has_read {
+                    .any(|step| !matches!(step, LogicalStatementStep::Passthrough(_)));
+                if has_non_passthrough {
                     return Err(LixError {
-                        message: "passthrough plans may not contain query plan steps".to_string(),
+                        message: "passthrough plans may only contain passthrough steps".to_string(),
                     });
                 }
             }
@@ -231,7 +246,9 @@ mod tests {
         let plan = LogicalStatementPlan::new(
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::QueryRead(LogicalReadSemantics::empty()),
-            vec![LogicalStatementStep::Query(query_from_sql("SELECT 1"))],
+            vec![LogicalStatementStep::QueryRead(LogicalQueryReadOperator {
+                query: query_from_sql("SELECT 1"),
+            })],
         );
 
         assert!(plan.validate_plan_shape().is_ok());
@@ -242,9 +259,9 @@ mod tests {
         let plan = LogicalStatementPlan::new(
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::Passthrough,
-            vec![LogicalStatementStep::Statement(statement_from_sql(
-                "CREATE TABLE t (id INTEGER)",
-            ))],
+            vec![LogicalStatementStep::Passthrough(LogicalPassthroughOperator {
+                statement: statement_from_sql("CREATE TABLE t (id INTEGER)"),
+            })],
         );
 
         assert!(matches!(plan.validate_plan_shape(), Err(LixError { message }) if message.contains("inconsistent")));
@@ -255,8 +272,10 @@ mod tests {
         let plan = LogicalStatementPlan::new(
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::QueryRead(LogicalReadSemantics::empty()),
-            vec![LogicalStatementStep::Statement(
-                statement_from_sql("INSERT INTO t (id) VALUES (1)"),
+            vec![LogicalStatementStep::CanonicalWrite(
+                LogicalCanonicalWriteOperator {
+                    statement: statement_from_sql("INSERT INTO t (id) VALUES (1)"),
+                },
             )],
         );
 
