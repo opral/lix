@@ -60,6 +60,29 @@ test("createCheckpoint returns checkpoint metadata and rotates working pointer",
   await lix.close();
 });
 
+test("executeTransaction applies multiple statements in one call", async () => {
+  const lix = await openLix();
+
+  await lix.executeTransaction([
+    {
+      sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
+      params: ["tx-batch-a", "value-a"],
+    },
+    {
+      sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
+      params: ["tx-batch-b", "value-b"],
+    },
+  ]);
+
+  const values = await lix.execute(
+    "SELECT key, value FROM lix_key_value WHERE key IN (?1, ?2) ORDER BY key",
+    ["tx-batch-a", "tx-batch-b"],
+  );
+  expect(values.rows.length).toBe(2);
+
+  await lix.close();
+});
+
 test("installPlugin stores plugin metadata", async () => {
   const lix = await openLix();
 
@@ -261,7 +284,6 @@ test("observe stream remains usable after query error", async () => {
   await lix.execute(
     "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
     ["observe-recover-trigger-2", "x"],
-    [],
   );
 
   const recovered = await withTimeout(recoveredNext, 1500);
