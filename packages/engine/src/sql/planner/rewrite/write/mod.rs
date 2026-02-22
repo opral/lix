@@ -4,7 +4,6 @@ use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::steps::lix_state_history_view_write;
-use crate::sql::types::RewriteOutput;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
@@ -19,11 +18,13 @@ pub(crate) mod lix_state_write;
 pub(crate) mod lix_version_write;
 pub(crate) mod outcome;
 pub(crate) mod stored_schema_write;
+pub(crate) mod types;
 pub(crate) mod vtable_write;
 
 use self::context::StatementContext;
 use self::helpers::{merge_rewrite_output, rewrite_vtable_inserts_with_backend};
 use self::outcome::StatementRuleOutcome;
+use self::types::WriteRewriteOutput;
 
 const MAX_REWRITE_PASSES: usize = 32;
 
@@ -34,17 +35,17 @@ pub(crate) async fn rewrite_backend_statement<P>(
     writer_key: Option<&str>,
     functions: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
-) -> Result<Option<RewriteOutput>, LixError>
+) -> Result<Option<WriteRewriteOutput>, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
     enum Pending {
         Statement(Statement),
-        Output(RewriteOutput),
+        Output(WriteRewriteOutput),
     }
 
     let mut queue = VecDeque::from([Pending::Statement(statement)]);
-    let mut final_output = RewriteOutput {
+    let mut final_output = WriteRewriteOutput {
         statements: Vec::new(),
         params: Vec::new(),
         registrations: Vec::new(),

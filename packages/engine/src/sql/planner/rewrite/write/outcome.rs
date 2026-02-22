@@ -1,9 +1,9 @@
 use sqlparser::ast::Statement;
 
-use crate::sql::types::RewriteOutput;
+use super::types::WriteRewriteOutput;
 
 pub(crate) enum StatementRuleOutcome {
     Continue(Statement),
-    Emit(RewriteOutput),
+    Emit(WriteRewriteOutput),
     NoMatch,
 }

@@ -2,9 +2,11 @@ use sqlparser::ast::{Delete, Insert, Statement, Update};
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::steps::vtable_write;
-use crate::sql::types::{PostprocessPlan, RewriteOutput, UpdateValidationPlan};
+use crate::sql::types::PostprocessPlan;
 use crate::sql::{expr_references_column_name, ColumnReferenceOptions, DetectedFileDomainChange};
 use crate::{LixBackend, LixError, Value};
+
+use super::types::WriteRewriteOutput;
 
 pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
@@ -27,10 +29,13 @@ pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
     .await
 }
 
-pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<RewriteOutput, LixError> {
+pub(crate) fn rewrite_update(
+    update: Update,
+    params: &[Value],
+) -> Result<WriteRewriteOutput, LixError> {
     let rewritten = vtable_write::rewrite_update(update.clone(), params)?;
     match rewritten {
-        Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
+        Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(WriteRewriteOutput {
             statements: vec![rewrite.statement],
             params: Vec::new(),
             registrations: Vec::new(),
@@ -38,7 +43,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
             mutations: Vec::new(),
             update_validations: rewrite.validation.into_iter().collect(),
         }),
-        Some(vtable_write::UpdateRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+        Some(vtable_write::UpdateRewrite::Planned(rewrite)) => Ok(WriteRewriteOutput {
             statements: vec![rewrite.statement],
             params: Vec::new(),
             registrations: Vec::new(),
@@ -46,13 +51,13 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
             mutations: Vec::new(),
             update_validations: rewrite.validation.into_iter().collect(),
         }),
-        None => Ok(RewriteOutput {
+        None => Ok(WriteRewriteOutput {
             statements: vec![Statement::Update(update)],
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
-            update_validations: Vec::<UpdateValidationPlan>::new(),
+            update_validations: Vec::new(),
         }),
     }
 }
@@ -60,7 +65,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
 pub(crate) fn rewrite_delete(
     delete: Delete,
     effective_scope_fallback: bool,
-) -> Result<RewriteOutput, LixError> {
+) -> Result<WriteRewriteOutput, LixError> {
     let rewritten = if effective_scope_fallback {
         vtable_write::rewrite_delete_with_options(delete.clone(), true)?
     } else {
@@ -68,7 +73,7 @@ pub(crate) fn rewrite_delete(
     };
 
     match rewritten {
-        Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
+        Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(WriteRewriteOutput {
             statements: vec![statement],
             params: Vec::new(),
             registrations: Vec::new(),
@@ -76,7 +81,7 @@ pub(crate) fn rewrite_delete(
             mutations: Vec::new(),
             update_validations: Vec::new(),
         }),
-        Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
+        Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(WriteRewriteOutput {
             statements: vec![rewrite.statement],
             params: Vec::new(),
             registrations: Vec::new(),
@@ -84,7 +89,7 @@ pub(crate) fn rewrite_delete(
             mutations: Vec::new(),
             update_validations: Vec::new(),
         }),
-        None => Ok(RewriteOutput {
+        None => Ok(WriteRewriteOutput {
             statements: vec![Statement::Delete(delete)],
             params: Vec::new(),
             registrations: Vec::new(),

@@ -1,10 +1,10 @@
 use sqlparser::ast::Statement;
 
-use crate::sql::types::{
-    MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
-};
+use crate::sql::types::{MutationRow, PostprocessPlan, SchemaRegistration, UpdateValidationPlan};
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, Value};
+
+use super::types::WriteRewriteOutput;
 
 pub(crate) struct StatementContext<'a> {
     pub(crate) params: &'a [Value],
@@ -40,8 +40,8 @@ impl<'a> StatementContext<'a> {
         }
     }
 
-    pub(crate) fn take_output(&mut self, statements: Vec<Statement>) -> RewriteOutput {
-        RewriteOutput {
+    pub(crate) fn take_output(&mut self, statements: Vec<Statement>) -> WriteRewriteOutput {
+        WriteRewriteOutput {
             statements,
             params: std::mem::take(&mut self.generated_params),
             registrations: std::mem::take(&mut self.registrations),

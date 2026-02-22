@@ -8,10 +8,7 @@ use crate::{LixBackend, LixError, Value};
 use crate::sql::pipeline::registry::StatementRule;
 
 pub(crate) mod canonical;
-pub(crate) mod context;
 pub(crate) mod explain_read;
-pub(crate) mod helpers;
-pub(crate) mod outcome;
 pub(crate) mod passthrough;
 pub(crate) mod query_read;
 

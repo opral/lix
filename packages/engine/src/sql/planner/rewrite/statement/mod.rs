@@ -2,7 +2,7 @@ use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
-use crate::sql::pipeline::validator::{validate_final_read_query, validate_statement_output};
+use crate::sql::pipeline::validator::{validate_final_read_query, validate_statement_output_parts};
 use crate::sql::planner::rewrite::write;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
@@ -80,7 +80,13 @@ where
                 });
             };
 
-            validate_statement_output(&rewrite_output)?;
+            validate_statement_output_parts(
+                &rewrite_output.statements,
+                &rewrite_output.registrations,
+                rewrite_output.postprocess.as_ref(),
+                &rewrite_output.mutations,
+                &rewrite_output.update_validations,
+            )?;
             Ok(LogicalStatementPlan::new(
                 LogicalStatementOperation::CanonicalWrite,
                 rewrite_output.statements,

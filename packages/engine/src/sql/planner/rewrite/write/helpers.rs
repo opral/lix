@@ -2,13 +2,14 @@ use sqlparser::ast::Insert;
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::steps::vtable_write;
-use crate::sql::types::RewriteOutput;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
+use super::types::WriteRewriteOutput;
+
 pub(crate) fn merge_rewrite_output(
-    base: &mut RewriteOutput,
-    mut next: RewriteOutput,
+    base: &mut WriteRewriteOutput,
+    mut next: WriteRewriteOutput,
 ) -> Result<(), LixError> {
     if base.postprocess.is_some() && next.postprocess.is_some() {
         return Err(LixError {
@@ -33,7 +34,7 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
     functions: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
-) -> Result<RewriteOutput, LixError> {
+) -> Result<WriteRewriteOutput, LixError> {
     let mut statements = Vec::new();
     let mut generated_params = Vec::new();
     let mut generated_param_offset = 0usize;
@@ -63,7 +64,7 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
         mutations.extend(rewritten.mutations);
     }
 
-    Ok(RewriteOutput {
+    Ok(WriteRewriteOutput {
         statements,
         params: generated_params,
         registrations,
