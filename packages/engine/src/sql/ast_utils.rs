@@ -111,22 +111,6 @@ pub(crate) fn visit_query_selects(
     Ok(())
 }
 
-// Compatibility wrapper for existing rewrite steps.
-pub(crate) fn rewrite_query_with_select_rewriter(
-    query: Query,
-    rewrite_select: &mut dyn FnMut(&mut Select, &mut bool) -> Result<(), LixError>,
-) -> Result<Option<Query>, LixError> {
-    rewrite_query_selects(query, &mut |select| {
-        let mut changed = false;
-        rewrite_select(select, &mut changed)?;
-        if changed {
-            Ok(RewriteDecision::Changed)
-        } else {
-            Ok(RewriteDecision::Unchanged)
-        }
-    })
-}
-
 pub(crate) fn rewrite_table_factors_in_select_decision(
     select: &mut Select,
     rewrite_table_factor: &mut dyn FnMut(&mut TableFactor) -> Result<RewriteDecision, LixError>,
@@ -156,27 +140,6 @@ pub(crate) fn visit_table_factors_in_select(
         for join in &table.joins {
             visit_table_factor_in_place(&join.relation, visit_table_factor)?;
         }
-    }
-    Ok(())
-}
-
-// Compatibility wrapper for existing rewrite steps.
-pub(crate) fn rewrite_table_factors_in_select(
-    select: &mut Select,
-    rewrite_table_factor: &mut dyn FnMut(&mut TableFactor, &mut bool) -> Result<(), LixError>,
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    let decision = rewrite_table_factors_in_select_decision(select, &mut |relation| {
-        let mut local_changed = false;
-        rewrite_table_factor(relation, &mut local_changed)?;
-        if local_changed {
-            Ok(RewriteDecision::Changed)
-        } else {
-            Ok(RewriteDecision::Unchanged)
-        }
-    })?;
-    if decision == RewriteDecision::Changed {
-        *changed = true;
     }
     Ok(())
 }

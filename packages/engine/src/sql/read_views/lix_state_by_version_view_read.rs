@@ -5,21 +5,22 @@ use crate::sql::read_views::state_pushdown::{
 };
 use crate::sql::read_views::vtable_read::build_effective_state_by_version_query;
 use crate::sql::{
-    default_alias, expr_references_column_name, object_name_matches,
-    rewrite_query_with_select_rewriter, ColumnReferenceOptions,
+    default_alias, expr_references_column_name, object_name_matches, rewrite_query_selects,
+    ColumnReferenceOptions, RewriteDecision,
 };
 use crate::LixError;
 
 const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    rewrite_query_with_select_rewriter(query, &mut rewrite_select)
+    rewrite_query_selects(query, &mut rewrite_select)
 }
 
-fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
+fn rewrite_select(select: &mut Select) -> Result<RewriteDecision, LixError> {
     let count_fast_path = select_supports_count_fast_path(select);
     let include_commit_mapping = select_requires_commit_mapping(select);
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
+    let mut changed = false;
     for table in &mut select.from {
         rewrite_table_with_joins(
             table,
@@ -27,10 +28,14 @@ fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixErro
             allow_unqualified,
             count_fast_path,
             include_commit_mapping,
-            changed,
+            &mut changed,
         )?;
     }
-    Ok(())
+    Ok(if changed {
+        RewriteDecision::Changed
+    } else {
+        RewriteDecision::Unchanged
+    })
 }
 
 fn rewrite_table_with_joins(

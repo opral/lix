@@ -2,7 +2,7 @@ use sqlparser::ast::{Query, Select, TableFactor};
 
 use crate::sql::{
     default_alias, escape_sql_string, object_name_matches, parse_single_query,
-    rewrite_query_with_select_rewriter, rewrite_table_factors_in_select,
+    rewrite_query_selects, rewrite_table_factors_in_select_decision, RewriteDecision,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -12,14 +12,14 @@ use crate::LixError;
 const LIX_ACTIVE_VERSION_VIEW_NAME: &str = "lix_active_version";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    rewrite_query_with_select_rewriter(query, &mut rewrite_select)
+    rewrite_query_selects(query, &mut rewrite_select)
 }
 
-fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
-    rewrite_table_factors_in_select(select, &mut rewrite_table_factor, changed)
+fn rewrite_select(select: &mut Select) -> Result<RewriteDecision, LixError> {
+    rewrite_table_factors_in_select_decision(select, &mut rewrite_table_factor)
 }
 
-fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Result<(), LixError> {
+fn rewrite_table_factor(relation: &mut TableFactor) -> Result<RewriteDecision, LixError> {
     match relation {
         TableFactor::Table { name, alias, .. }
             if object_name_matches(name, LIX_ACTIVE_VERSION_VIEW_NAME) =>
@@ -33,11 +33,10 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
                 subquery: Box::new(derived_query),
                 alias: derived_alias,
             };
-            *changed = true;
+            Ok(RewriteDecision::Changed)
         }
-        _ => {}
+        _ => Ok(RewriteDecision::Unchanged),
     }
-    Ok(())
 }
 
 fn build_lix_active_version_view_query() -> Result<Query, LixError> {

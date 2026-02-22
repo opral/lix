@@ -31,9 +31,8 @@ pub(crate) use analysis::{
 pub(crate) use ast_ref::{expr_references_column_name, ColumnReferenceOptions};
 pub(crate) use ast_utils::{
     default_alias, object_name_matches, parse_single_query, parse_single_query_with_dialect,
-    quote_ident, rewrite_query_selects, rewrite_query_with_select_rewriter,
-    rewrite_table_factors_in_select, rewrite_table_factors_in_select_decision, visit_query_selects,
-    visit_table_factors_in_select, RewriteDecision,
+    quote_ident, rewrite_query_selects, rewrite_table_factors_in_select_decision,
+    visit_query_selects, visit_table_factors_in_select, RewriteDecision,
 };
 pub(crate) use escaping::escape_sql_string;
 pub(crate) use lowering::lower_statement;

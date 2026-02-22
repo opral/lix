@@ -10,7 +10,7 @@ use crate::backend::SqlDialect;
 use crate::sql::read_views::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
     bind_sql_with_state, default_alias, escape_sql_string, object_name_matches, parse_single_query,
-    rewrite_query_with_select_rewriter, PlaceholderState,
+    rewrite_query_selects, PlaceholderState, RewriteDecision,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -83,30 +83,33 @@ fn rewrite_query_collect_requests(
     query: Query,
 ) -> Result<(Option<Query>, Vec<HistoryPushdown>), LixError> {
     let mut requests = Vec::new();
-    let rewritten = rewrite_query_with_select_rewriter(query, &mut |select, changed| {
-        rewrite_select(select, changed, &mut requests)
-    })?;
+    let rewritten =
+        rewrite_query_selects(query, &mut |select| rewrite_select(select, &mut requests))?;
     Ok((rewritten, requests))
 }
 
 fn rewrite_select(
     select: &mut Select,
-    changed: &mut bool,
     requests: &mut Vec<HistoryPushdown>,
-) -> Result<(), LixError> {
+) -> Result<RewriteDecision, LixError> {
     let count_fast_path = select_supports_count_fast_path(select);
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
+    let mut changed = false;
     for table in &mut select.from {
         rewrite_table_with_joins(
             table,
             &mut select.selection,
             allow_unqualified,
             count_fast_path,
-            changed,
+            &mut changed,
             requests,
         )?;
     }
-    Ok(())
+    Ok(if changed {
+        RewriteDecision::Changed
+    } else {
+        RewriteDecision::Unchanged
+    })
 }
 
 fn rewrite_table_with_joins(
