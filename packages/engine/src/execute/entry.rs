@@ -87,7 +87,7 @@ impl Engine {
             extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
         {
             return self
-                .execute_transaction_script_with_options(statements, options)
+                .execute_transaction_script_with_options(statements, params, options)
                 .await;
         }
 
@@ -179,7 +179,7 @@ impl Engine {
                 self.backend.as_ref(),
                 &self.schema_cache,
                 &output.update_validations,
-                &output.params,
+                params,
             )
             .await?;
         }

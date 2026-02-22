@@ -39,15 +39,26 @@ pub(crate) fn bind_sql_with_state(
     sql: &str,
     params: &[Value],
     dialect: SqlDialect,
+    state: PlaceholderState,
+) -> Result<BoundSql, LixError> {
+    bind_sql_with_state_and_appended_params(sql, params, &[], dialect, state)
+}
+
+pub(crate) fn bind_sql_with_state_and_appended_params(
+    sql: &str,
+    base_params: &[Value],
+    appended_params: &[Value],
+    dialect: SqlDialect,
     mut state: PlaceholderState,
 ) -> Result<BoundSql, LixError> {
     let mut statements = parse_sql_statements(sql)?;
     let mut used_source_indices = Vec::new();
     let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
+    let total_params_len = base_params.len() + appended_params.len();
 
     for statement in &mut statements {
         let mut visitor = PlaceholderBinder {
-            params_len: params.len(),
+            params_len: total_params_len,
             dialect,
             state: &mut state,
             source_to_dense: &mut source_to_dense,
@@ -60,7 +71,7 @@ pub(crate) fn bind_sql_with_state(
 
     let bound_params = used_source_indices
         .into_iter()
-        .map(|source_index| params[source_index].clone())
+        .map(|source_index| clone_param_from_sources(source_index, base_params, appended_params))
         .collect();
     let sql = statements_to_sql(&statements);
 
@@ -69,6 +80,18 @@ pub(crate) fn bind_sql_with_state(
         params: bound_params,
         state,
     })
+}
+
+fn clone_param_from_sources(
+    source_index: usize,
+    base_params: &[Value],
+    appended_params: &[Value],
+) -> Value {
+    if source_index < base_params.len() {
+        return base_params[source_index].clone();
+    }
+
+    appended_params[source_index - base_params.len()].clone()
 }
 
 struct PlaceholderBinder<'a> {
@@ -185,7 +208,9 @@ fn statements_to_sql(statements: &[Statement]) -> String {
 #[cfg(test)]
 mod tests {
     use crate::backend::SqlDialect;
-    use crate::sql::params::{bind_sql, bind_sql_with_state};
+    use crate::sql::params::{
+        bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params,
+    };
     use crate::Value;
 
     #[test]
@@ -301,5 +326,27 @@ mod tests {
 
         assert_eq!(bound.sql, "SELECT 'L''été', \"Schrödinger\"\"猫\", ?1");
         assert_eq!(bound.params, vec![Value::Integer(1)]);
+    }
+
+    #[test]
+    fn bind_with_appended_params_resolves_placeholders_across_base_and_appended() {
+        let bound = bind_sql_with_state_and_appended_params(
+            "SELECT ?, ?, ?3",
+            &[Value::Text("base-a".to_string()), Value::Text("base-b".to_string())],
+            &[Value::Text("extra-c".to_string())],
+            SqlDialect::Sqlite,
+            crate::sql::PlaceholderState::new(),
+        )
+        .expect("bind should succeed");
+
+        assert_eq!(bound.sql, "SELECT ?1, ?2, ?3");
+        assert_eq!(
+            bound.params,
+            vec![
+                Value::Text("base-a".to_string()),
+                Value::Text("base-b".to_string()),
+                Value::Text("extra-c".to_string())
+            ]
+        );
     }
 }
