@@ -21,6 +21,7 @@ pub struct DeterministicSettings {
     pub enabled: bool,
     pub uuid_v7_enabled: bool,
     pub timestamp_enabled: bool,
+    pub timestamp_shuffle_enabled: bool,
 }
 
 impl DeterministicSettings {
@@ -29,6 +30,7 @@ impl DeterministicSettings {
             enabled: false,
             uuid_v7_enabled: true,
             timestamp_enabled: true,
+            timestamp_shuffle_enabled: false,
         }
     }
 }
@@ -71,12 +73,28 @@ impl LixFunctionProvider for RuntimeFunctionProvider {
     fn timestamp(&mut self) -> String {
         if self.settings.enabled && self.settings.timestamp_enabled {
             let counter = self.take_sequence();
-            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(counter)
+            let millis = if self.settings.timestamp_shuffle_enabled {
+                shuffled_timestamp_millis(counter)
+            } else {
+                counter
+            };
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
                 .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
             return dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         }
         timestamp()
     }
+}
+
+fn shuffled_timestamp_millis(counter: i64) -> i64 {
+    const WINDOW: i64 = 1000;
+    const MULTIPLIER: i64 = 733;
+    const OFFSET: i64 = 271;
+
+    let cycle = counter.div_euclid(WINDOW);
+    let within = counter.rem_euclid(WINDOW);
+    let shuffled = (within * MULTIPLIER + OFFSET).rem_euclid(WINDOW);
+    cycle * WINDOW + shuffled
 }
 
 pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSettings, LixError> {
@@ -102,11 +120,16 @@ pub async fn load_settings(backend: &dyn LixBackend) -> Result<DeterministicSett
         .get("timestamp")
         .map(loosely_false)
         .unwrap_or(false);
+    let timestamp_shuffle_enabled = mode_value
+        .get("timestamp_shuffle")
+        .map(loosely_true)
+        .unwrap_or(false);
 
     Ok(DeterministicSettings {
         enabled,
         uuid_v7_enabled,
         timestamp_enabled,
+        timestamp_shuffle_enabled,
     })
 }
 

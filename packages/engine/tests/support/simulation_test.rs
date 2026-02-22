@@ -30,6 +30,7 @@ pub struct Simulation {
 pub enum SimulationBehavior {
     Base,
     Rematerialization,
+    TimestampShuffle,
 }
 
 pub struct SimulationArgs {
@@ -196,7 +197,10 @@ impl SimulationArgs {
         if let Some(setup) = &self.setup {
             setup().await?;
         }
-        let args = args.unwrap_or_else(default_simulation_boot_args);
+        let mut args = args.unwrap_or_else(default_simulation_boot_args);
+        if self.behavior == SimulationBehavior::TimestampShuffle {
+            enable_timestamp_shuffle_mode(&mut args.key_values);
+        }
         Ok(SimulationEngine {
             engine: boot(BootArgs {
                 backend: (self.backend_factory)(),
@@ -241,6 +245,36 @@ fn default_simulation_boot_args() -> SimulationBootArgs {
         wasm_runtime: default_simulation_wasm_runtime(),
         access_to_internal: true,
     }
+}
+
+fn enable_timestamp_shuffle_mode(key_values: &mut Vec<BootKeyValue>) {
+    const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
+    if let Some(existing) = key_values
+        .iter_mut()
+        .find(|entry| entry.key == DETERMINISTIC_MODE_KEY && entry.version_id.is_none())
+    {
+        let mut object = existing
+            .value
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        object.insert("enabled".to_string(), serde_json::Value::Bool(true));
+        object.insert(
+            "timestamp_shuffle".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        existing.value = serde_json::Value::Object(object);
+        return;
+    }
+
+    key_values.push(BootKeyValue {
+        key: DETERMINISTIC_MODE_KEY.to_string(),
+        value: serde_json::json!({
+            "enabled": true,
+            "timestamp_shuffle": true
+        }),
+        version_id: None,
+    });
 }
 
 fn default_simulation_wasm_runtime() -> Arc<dyn WasmRuntime> {
@@ -550,7 +584,7 @@ impl SharedExpectDeterministic {
                 .or_insert_with(|| {
                     Arc::new(SharedDeterministicCase {
                         state: Mutex::new(SharedDeterministicCaseState {
-                            baseline_backend: Some("sqlite".to_string()),
+                            baseline_backend: None,
                             baseline_finished: false,
                             baseline_failed: false,
                             baseline_call_count: None,
@@ -571,10 +605,13 @@ impl SharedExpectDeterministic {
             if let Some(existing) = state.role_by_backend.get(backend_name) {
                 *existing
             } else {
-                let is_baseline = state
-                    .baseline_backend
-                    .as_deref()
-                    .is_some_and(|baseline| baseline == backend_name);
+                let is_baseline = match state.baseline_backend.as_deref() {
+                    Some(baseline) => baseline == backend_name,
+                    None => {
+                        state.baseline_backend = Some(backend_name.to_string());
+                        true
+                    }
+                };
                 state
                     .role_by_backend
                     .insert(backend_name.to_string(), is_baseline);
