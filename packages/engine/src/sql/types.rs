@@ -57,15 +57,6 @@ pub enum PostprocessPlan {
     VtableDelete(VtableDeletePlan),
 }
 
-#[derive(Debug, Clone)]
-pub struct RewriteOutput {
-    pub statements: Vec<Statement>,
-    pub registrations: Vec<SchemaRegistration>,
-    pub postprocess: Option<PostprocessPlan>,
-    pub mutations: Vec<MutationRow>,
-    pub update_validations: Vec<UpdateValidationPlan>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {
     pub statement: Statement,

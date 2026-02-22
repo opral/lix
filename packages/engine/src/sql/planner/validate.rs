@@ -1,6 +1,6 @@
 use sqlparser::ast::Statement;
 
-use crate::sql::types::{MutationRow, RewriteOutput, SchemaRegistration, UpdateValidationPlan};
+use crate::sql::types::{MutationRow, SchemaRegistration, UpdateValidationPlan};
 use crate::sql::PostprocessPlan;
 use crate::LixError;
 
@@ -11,16 +11,6 @@ pub(crate) fn ensure_single_statement_plan(statement_count: usize) -> Result<(),
         });
     }
     Ok(())
-}
-
-pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
-    validate_statement_output_parts(
-        &output.statements,
-        &output.registrations,
-        output.postprocess.as_ref(),
-        &output.mutations,
-        &output.update_validations,
-    )
 }
 
 pub(crate) fn validate_statement_output_parts(
