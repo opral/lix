@@ -1,7 +1,5 @@
 use std::collections::BTreeSet;
 
-use sqlparser::ast::{AnalyzeFormatKind, DescribeAlias, Query, Statement, UtilityOption};
-
 use crate::sql::types::{MutationRow, PostprocessPlan, SchemaRegistration, UpdateValidationPlan};
 use crate::LixError;
 use crate::Value;
@@ -49,63 +47,10 @@ pub(crate) enum LogicalStatementSemantics {
 
 #[derive(Debug, Clone)]
 pub(crate) enum LogicalStatementStep {
-    QueryRead(LogicalQueryReadOperator),
-    ExplainRead(LogicalExplainRead),
-    CanonicalWrite(LogicalCanonicalWriteOperator),
-    Passthrough(LogicalPassthroughOperator),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LogicalQueryReadOperator {
-    pub(crate) query: Query,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LogicalCanonicalWriteOperator {
-    pub(crate) statement: Statement,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LogicalPassthroughOperator {
-    pub(crate) statement: Statement,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct LogicalExplainRead {
-    pub(crate) describe_alias: DescribeAlias,
-    pub(crate) analyze: bool,
-    pub(crate) verbose: bool,
-    pub(crate) query_plan: bool,
-    pub(crate) estimate: bool,
-    pub(crate) format: Option<AnalyzeFormatKind>,
-    pub(crate) options: Option<Vec<UtilityOption>>,
-    pub(crate) query: Query,
-}
-
-impl LogicalExplainRead {
-    pub(crate) fn into_statement(self) -> Statement {
-        Statement::Explain {
-            describe_alias: self.describe_alias,
-            analyze: self.analyze,
-            verbose: self.verbose,
-            query_plan: self.query_plan,
-            estimate: self.estimate,
-            statement: Box::new(Statement::Query(Box::new(self.query))),
-            format: self.format,
-            options: self.options,
-        }
-    }
-}
-
-impl LogicalStatementStep {
-    pub(crate) fn as_statement(&self) -> Statement {
-        match self {
-            Self::QueryRead(read) => Statement::Query(Box::new(read.query.clone())),
-            Self::ExplainRead(explain_read) => explain_read.clone().into_statement(),
-            Self::CanonicalWrite(write) => write.statement.clone(),
-            Self::Passthrough(passthrough) => passthrough.statement.clone(),
-        }
-    }
+    QueryRead,
+    ExplainRead,
+    CanonicalWrite,
+    Passthrough,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +58,7 @@ pub(crate) struct LogicalStatementPlan {
     pub(crate) operation: LogicalStatementOperation,
     pub(crate) semantics: LogicalStatementSemantics,
     pub(crate) planned_statements: Vec<LogicalStatementStep>,
+    pub(crate) emission_sql: Vec<String>,
     pub(crate) appended_params: Vec<Value>,
     pub(crate) registrations: Vec<SchemaRegistration>,
     pub(crate) postprocess: Option<PostprocessPlan>,
@@ -125,11 +71,13 @@ impl LogicalStatementPlan {
         operation: LogicalStatementOperation,
         semantics: LogicalStatementSemantics,
         planned_statements: Vec<LogicalStatementStep>,
+        emission_sql: Vec<String>,
     ) -> Self {
         Self {
             operation,
             semantics,
             planned_statements,
+            emission_sql,
             appended_params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
@@ -160,13 +108,22 @@ impl LogicalStatementPlan {
                 message: "logical plan has no planned statements".to_string(),
             });
         }
+        if self.planned_statements.len() != self.emission_sql.len() {
+            return Err(LixError {
+                message: format!(
+                    "logical plan step count ({}) must match emission SQL count ({})",
+                    self.planned_statements.len(),
+                    self.emission_sql.len()
+                ),
+            });
+        }
 
         match (self.operation, &self.semantics) {
             (LogicalStatementOperation::QueryRead, LogicalStatementSemantics::QueryRead(_)) => {
                 let has_non_query = self
                     .planned_statements
                     .iter()
-                    .any(|step| !matches!(step, LogicalStatementStep::QueryRead(_)));
+                    .any(|step| !matches!(step, LogicalStatementStep::QueryRead));
                 if has_non_query {
                     return Err(LixError {
                         message: "query read plans may only contain query steps".to_string(),
@@ -177,7 +134,7 @@ impl LogicalStatementPlan {
                 let has_non_explain = self
                     .planned_statements
                     .iter()
-                    .any(|step| !matches!(step, LogicalStatementStep::ExplainRead(_)));
+                    .any(|step| !matches!(step, LogicalStatementStep::ExplainRead));
                 if has_non_explain {
                     return Err(LixError {
                         message: "explain plans may only contain explain read steps".to_string(),
@@ -188,7 +145,7 @@ impl LogicalStatementPlan {
                 let has_non_canonical = self
                     .planned_statements
                     .iter()
-                    .any(|step| !matches!(step, LogicalStatementStep::CanonicalWrite(_)));
+                    .any(|step| !matches!(step, LogicalStatementStep::CanonicalWrite));
                 if has_non_canonical {
                     return Err(LixError {
                         message: "canonical write plans may only contain canonical write steps"
@@ -200,7 +157,7 @@ impl LogicalStatementPlan {
                 let has_non_passthrough = self
                     .planned_statements
                     .iter()
-                    .any(|step| !matches!(step, LogicalStatementStep::Passthrough(_)));
+                    .any(|step| !matches!(step, LogicalStatementStep::Passthrough));
                 if has_non_passthrough {
                     return Err(LixError {
                         message: "passthrough plans may only contain passthrough steps".to_string(),
@@ -221,34 +178,15 @@ impl LogicalStatementPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::parse_sql_statements_with_dialect;
-    use crate::{LixError, SqlDialect};
-
-    fn query_from_sql(sql: &str) -> Query {
-        let mut statements =
-            parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite).expect("parse statements");
-        assert_eq!(statements.len(), 1);
-        let Statement::Query(query) = statements.remove(0) else {
-            panic!("expected single query statement");
-        };
-        *query
-    }
-
-    fn statement_from_sql(sql: &str) -> Statement {
-        let mut statements =
-            parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite).expect("parse statements");
-        assert_eq!(statements.len(), 1);
-        statements.remove(0)
-    }
+    use crate::LixError;
 
     #[test]
     fn validates_query_read_plan_shape() {
         let plan = LogicalStatementPlan::new(
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::QueryRead(LogicalReadSemantics::empty()),
-            vec![LogicalStatementStep::QueryRead(LogicalQueryReadOperator {
-                query: query_from_sql("SELECT 1"),
-            })],
+            vec![LogicalStatementStep::QueryRead],
+            vec!["SELECT 1".to_string()],
         );
 
         assert!(plan.validate_plan_shape().is_ok());
@@ -259,9 +197,8 @@ mod tests {
         let plan = LogicalStatementPlan::new(
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::Passthrough,
-            vec![LogicalStatementStep::Passthrough(LogicalPassthroughOperator {
-                statement: statement_from_sql("CREATE TABLE t (id INTEGER)"),
-            })],
+            vec![LogicalStatementStep::Passthrough],
+            vec!["CREATE TABLE t (id INTEGER)".to_string()],
         );
 
         assert!(matches!(plan.validate_plan_shape(), Err(LixError { message }) if message.contains("inconsistent")));
@@ -272,11 +209,8 @@ mod tests {
         let plan = LogicalStatementPlan::new(
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::QueryRead(LogicalReadSemantics::empty()),
-            vec![LogicalStatementStep::CanonicalWrite(
-                LogicalCanonicalWriteOperator {
-                    statement: statement_from_sql("INSERT INTO t (id) VALUES (1)"),
-                },
-            )],
+            vec![LogicalStatementStep::CanonicalWrite],
+            vec!["INSERT INTO t (id) VALUES (1)".to_string()],
         );
 
         assert!(matches!(plan.validate_plan_shape(), Err(LixError { message }) if message.contains("only contain query steps")));
