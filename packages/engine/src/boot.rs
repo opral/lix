@@ -70,10 +70,15 @@ pub(crate) fn infer_boot_deterministic_settings(
         }
         let uuid_v7_enabled = !object.get("uuid_v7").map(loosely_false).unwrap_or(false);
         let timestamp_enabled = !object.get("timestamp").map(loosely_false).unwrap_or(false);
+        let timestamp_shuffle_enabled = object
+            .get("timestamp_shuffle")
+            .map(loosely_true)
+            .unwrap_or(false);
         Some(DeterministicSettings {
             enabled,
             uuid_v7_enabled,
             timestamp_enabled,
+            timestamp_shuffle_enabled,
         })
     })
 }

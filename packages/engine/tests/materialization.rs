@@ -7,6 +7,26 @@ use lix_engine::{
     MaterializationWrite, MaterializationWriteOp, Value,
 };
 
+fn scrub_timestamp_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if key == "created_at" || key == "updated_at" || key == "timestamp" {
+                    *entry = serde_json::Value::String("__timestamp__".to_string());
+                } else {
+                    scrub_timestamp_fields(entry);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_timestamp_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -37,6 +57,7 @@ async fn main_version_id(engine: &support::simulation_test::SimulationEngine) ->
 
 simulation_test!(
     materialization_plan_exposes_debug_trace_and_is_deterministic,
+    simulations = [sqlite, postgres, materialization, timestamp_shuffle],
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -103,29 +124,79 @@ simulation_test!(
             "expected traversed commits"
         );
 
-        let deterministic_payload = serde_json::to_string(&plan).unwrap();
+        let mut deterministic_payload = serde_json::to_value(&plan).unwrap();
+        scrub_timestamp_fields(&mut deterministic_payload);
+        let deterministic_payload = serde_json::to_string(&deterministic_payload).unwrap();
         sim.assert_deterministic(deterministic_payload);
     }
 );
 
-simulation_test!(apply_materialization_plan_upserts_rows, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine_deterministic()
-        .await
-        .expect("boot_simulated_engine_deterministic should succeed");
-    engine.init().await.unwrap();
+simulation_test!(
+    apply_materialization_plan_upserts_rows,
+    simulations = [sqlite, postgres, materialization, timestamp_shuffle],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
 
-    register_test_schema(&engine).await;
-    let main_version_id = main_version_id(&engine).await;
+        register_test_schema(&engine).await;
+        let main_version_id = main_version_id(&engine).await;
 
-    engine
+        engine
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_state_by_version (\
+                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                         ) VALUES (\
+                         'entity-2', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
+                         )",
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+
+        let plan = engine
+            .materialization_plan(&MaterializationRequest {
+                scope: MaterializationScope::Full,
+                debug: MaterializationDebugMode::Summary,
+                debug_row_limit: 128,
+            })
+            .await
+            .unwrap();
+
+        let first_report = engine.apply_materialization_plan(&plan).await.unwrap();
+
+        assert_eq!(first_report.rows_written, plan.writes.len());
+        assert!(first_report.rows_written > 0);
+        sim.assert_deterministic(first_report.rows_written as i64);
+
+        let next_plan = engine
+            .materialization_plan(&MaterializationRequest {
+                scope: MaterializationScope::Full,
+                debug: MaterializationDebugMode::Summary,
+                debug_row_limit: 128,
+            })
+            .await
+            .unwrap();
+        let report = engine.apply_materialization_plan(&next_plan).await.unwrap();
+        assert!(report.rows_deleted > 0);
+        assert!(report.rows_written > 0);
+        sim.assert_deterministic(vec![report.rows_written as i64, report.rows_deleted as i64]);
+
+        let rows = engine
             .execute(
                 &format!(
-                    "INSERT INTO lix_state_by_version (\
-                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                     ) VALUES (\
-                     'entity-2', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
-                     )",
+                    "SELECT snapshot_content, change_id \
+                         FROM lix_internal_state_vtable \
+                         WHERE schema_key = 'materialization_test_schema' \
+                           AND entity_id = 'entity-2' \
+                           AND version_id = '{}' \
+                           AND snapshot_content IS NOT NULL \
+                         LIMIT 1",
                     main_version_id
                 ),
                 &[],
@@ -133,67 +204,23 @@ simulation_test!(apply_materialization_plan_upserts_rows, |sim| async move {
             .await
             .unwrap();
 
-    let plan = engine
-        .materialization_plan(&MaterializationRequest {
-            scope: MaterializationScope::Full,
-            debug: MaterializationDebugMode::Summary,
-            debug_row_limit: 128,
-        })
-        .await
-        .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        match &rows.rows[0][0] {
+            Value::Text(text) => assert_eq!(text, "{\"value\":\"B\"}"),
+            other => panic!("expected text snapshot_content, got {other:?}"),
+        }
+        match &rows.rows[0][1] {
+            Value::Text(text) => assert!(!text.is_empty()),
+            other => panic!("expected text change_id, got {other:?}"),
+        }
 
-    let first_report = engine.apply_materialization_plan(&plan).await.unwrap();
-
-    assert_eq!(first_report.rows_written, plan.writes.len());
-    assert!(first_report.rows_written > 0);
-    sim.assert_deterministic(first_report.rows_written as i64);
-
-    let next_plan = engine
-        .materialization_plan(&MaterializationRequest {
-            scope: MaterializationScope::Full,
-            debug: MaterializationDebugMode::Summary,
-            debug_row_limit: 128,
-        })
-        .await
-        .unwrap();
-    let report = engine.apply_materialization_plan(&next_plan).await.unwrap();
-    assert!(report.rows_deleted > 0);
-    assert!(report.rows_written > 0);
-    sim.assert_deterministic(vec![report.rows_written as i64, report.rows_deleted as i64]);
-
-    let rows = engine
-        .execute(
-            &format!(
-                "SELECT snapshot_content, change_id \
-                     FROM lix_internal_state_vtable \
-                     WHERE schema_key = 'materialization_test_schema' \
-                       AND entity_id = 'entity-2' \
-                       AND version_id = '{}' \
-                       AND snapshot_content IS NOT NULL \
-                     LIMIT 1",
-                main_version_id
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
-        Value::Text(text) => assert_eq!(text, "{\"value\":\"B\"}"),
-        other => panic!("expected text snapshot_content, got {other:?}"),
+        sim.assert_deterministic(rows.rows.clone());
     }
-    match &rows.rows[0][1] {
-        Value::Text(text) => assert!(!text.is_empty()),
-        other => panic!("expected text change_id, got {other:?}"),
-    }
-
-    sim.assert_deterministic(rows.rows.clone());
-});
+);
 
 simulation_test!(
     apply_materialization_plan_full_scope_clears_existing_rows_in_schema_tables,
-    simulations = [sqlite, postgres],
+    simulations = [sqlite, postgres, timestamp_shuffle],
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
