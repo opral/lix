@@ -4,10 +4,10 @@ use sqlparser::ast::{
     Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
 };
 use sqlparser::ast::{Visit, VisitMut, Visitor, VisitorMut};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
-use crate::LixError;
+use crate::{LixError, SqlDialect};
 
 pub(crate) fn object_name_matches(name: &ObjectName, target: &str) -> bool {
     name.0
@@ -29,13 +29,30 @@ pub(crate) fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         message: error.to_string(),
     })?;
+    parse_single_query_statement(&mut statements)
+}
+
+pub(crate) fn parse_single_query_with_dialect(
+    sql: &str,
+    dialect: SqlDialect,
+) -> Result<Query, LixError> {
+    let mut statements = match dialect {
+        SqlDialect::Sqlite => Parser::parse_sql(&SQLiteDialect {}, sql),
+        SqlDialect::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+    }
+    .map_err(|error| LixError {
+        message: error.to_string(),
+    })?;
+    parse_single_query_statement(&mut statements)
+}
+
+fn parse_single_query_statement(statements: &mut Vec<Statement>) -> Result<Query, LixError> {
     if statements.len() != 1 {
         return Err(LixError {
             message: "expected a single SELECT statement".to_string(),
         });
     }
-    let statement = statements.remove(0);
-    match statement {
+    match statements.remove(0) {
         Statement::Query(query) => Ok(*query),
         _ => Err(LixError {
             message: "expected SELECT statement".to_string(),
@@ -278,10 +295,11 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use crate::sql::{
-        default_alias, object_name_matches, parse_single_query, rewrite_query_selects,
-        rewrite_table_factors_in_select_decision, visit_query_selects,
+        default_alias, object_name_matches, parse_single_query, parse_single_query_with_dialect,
+        rewrite_query_selects, rewrite_table_factors_in_select_decision, visit_query_selects,
         visit_table_factors_in_select, RewriteDecision,
     };
+    use crate::SqlDialect;
 
     fn parse_query(sql: &str) -> Query {
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
@@ -384,5 +402,18 @@ mod tests {
         })
         .expect("visit should succeed");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn dialect_parser_rejects_postgres_backtick_identifier() {
+        let err = parse_single_query_with_dialect("SELECT `id` FROM t", SqlDialect::Postgres)
+            .expect_err("postgres parser should reject backtick identifiers");
+        assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn dialect_parser_accepts_sqlite_backtick_identifier() {
+        parse_single_query_with_dialect("SELECT `id` FROM t", SqlDialect::Sqlite)
+            .expect("sqlite parser should accept backtick identifiers");
     }
 }

@@ -1,6 +1,8 @@
 use sqlparser::ast::Statement;
 
-use crate::sql::{bind_sql_with_state, lower_statement, parse_single_query, PlaceholderState};
+use crate::sql::{
+    bind_sql_with_state, lower_statement, parse_single_query_with_dialect, PlaceholderState,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 use super::rewrite_read_query_with_backend_and_params;
@@ -12,9 +14,10 @@ pub(crate) async fn execute_rewritten_read_sql_with_state(
     placeholder_state: PlaceholderState,
     query_context: &str,
 ) -> Result<QueryResult, LixError> {
-    let query = parse_single_query(sql).map_err(|error| LixError {
-        message: format!("failed to parse {query_context}: {}", error.message),
-    })?;
+    let query =
+        parse_single_query_with_dialect(sql, backend.dialect()).map_err(|error| LixError {
+            message: format!("failed to parse {query_context}: {}", error.message),
+        })?;
     let rewritten = rewrite_read_query_with_backend_and_params(backend, query, params).await?;
     let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
     let Statement::Query(lowered_query) = lowered else {
