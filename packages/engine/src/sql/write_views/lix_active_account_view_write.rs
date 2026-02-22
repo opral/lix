@@ -1,7 +1,5 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Delete, Expr, Insert, Statement, TableFactor, TableObject, TableWithJoins};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::account::{
     active_account_file_id, active_account_plugin_key, active_account_schema_key,
@@ -9,10 +7,12 @@ use crate::account::{
     active_account_storage_version_id,
 };
 use crate::sql::read_pipeline::execute_rewritten_read_sql_with_state;
-use crate::sql::{escape_sql_string, object_name_matches, resolve_insert_rows, PlaceholderState};
+use crate::sql::{object_name_matches, resolve_insert_rows, PlaceholderState};
 use crate::{LixBackend, LixError, Value as EngineValue};
 
-use super::insert_builder::{int_expr, make_values_insert, string_expr};
+use super::insert_builder::{
+    and_expr, column_expr, eq_expr, int_expr, make_delete, make_values_insert, string_expr,
+};
 
 const LIX_ACTIVE_ACCOUNT_VIEW_NAME: &str = "lix_active_account";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
@@ -204,46 +204,41 @@ fn build_vtable_insert(rows: Vec<InsertRow>) -> Result<Insert, LixError> {
 }
 
 fn build_vtable_delete(entity_ids: Vec<String>) -> Result<Statement, LixError> {
-    let in_values = entity_ids
-        .iter()
-        .map(|entity_id| format!("'{}'", escape_sql_string(entity_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "DELETE FROM {vtable} \
-         WHERE schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{version_id}' \
-           AND untracked = 1 \
-           AND entity_id IN ({in_values})",
-        vtable = VTABLE_NAME,
-        schema_key = escape_sql_string(active_account_schema_key()),
-        file_id = escape_sql_string(active_account_file_id()),
-        version_id = escape_sql_string(active_account_storage_version_id()),
+    let entity_in_list = Expr::InList {
+        expr: Box::new(column_expr("entity_id")),
+        list: entity_ids
+            .iter()
+            .map(|entity_id| string_expr(entity_id))
+            .collect(),
+        negated: false,
+    };
+    let selection = and_expr(
+        and_expr(
+            and_expr(
+                and_expr(
+                    eq_expr(
+                        column_expr("schema_key"),
+                        string_expr(active_account_schema_key()),
+                    ),
+                    eq_expr(
+                        column_expr("file_id"),
+                        string_expr(active_account_file_id()),
+                    ),
+                ),
+                eq_expr(
+                    column_expr("version_id"),
+                    string_expr(active_account_storage_version_id()),
+                ),
+            ),
+            eq_expr(column_expr("untracked"), int_expr(1)),
+        ),
+        entity_in_list,
     );
-    parse_statement(
-        &sql,
-        "lix_active_account rewrite expected generated DELETE statement",
-    )
+    Ok(make_delete(VTABLE_NAME, selection))
 }
 
 fn build_noop_delete() -> Result<Statement, LixError> {
-    parse_statement(
-        &format!("DELETE FROM {VTABLE_NAME} WHERE 1 = 0"),
-        "lix_active_account rewrite expected generated no-op DELETE statement",
-    )
-}
-
-fn parse_statement(sql: &str, error_message: &str) -> Result<Statement, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: format!("failed to build lix_active_account rewrite statement: {error}"),
-    })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            message: error_message.to_string(),
-        });
-    }
-    Ok(statements.remove(0))
+    Ok(make_delete(VTABLE_NAME, eq_expr(int_expr(1), int_expr(0))))
 }
 
 fn table_object_is_lix_active_account(table: &TableObject) -> bool {

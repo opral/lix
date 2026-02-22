@@ -1,6 +1,7 @@
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    Expr, Ident, Insert, ObjectName, ObjectNamePart, Query, SetExpr, TableObject, Value, Values,
+    BinaryOperator, Delete, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, Query,
+    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, Value, Values,
 };
 
 pub(crate) fn make_values_insert(
@@ -61,4 +62,55 @@ pub(crate) fn int_expr(value: i64) -> Expr {
 
 pub(crate) fn null_expr() -> Expr {
     Expr::Value(Value::Null.into())
+}
+
+pub(crate) fn column_expr(name: &str) -> Expr {
+    Expr::Identifier(Ident::new(name))
+}
+
+pub(crate) fn eq_expr(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::Eq,
+        right: Box::new(right),
+    }
+}
+
+pub(crate) fn and_expr(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::And,
+        right: Box::new(right),
+    }
+}
+
+pub(crate) fn table_with_joins_for(table: &str) -> TableWithJoins {
+    TableWithJoins {
+        relation: TableFactor::Table {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+            alias: None,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+            json_path: None,
+            sample: None,
+            index_hints: Vec::new(),
+        },
+        joins: Vec::new(),
+    }
+}
+
+pub(crate) fn make_delete(table: &str, selection: Expr) -> Statement {
+    Statement::Delete(Delete {
+        delete_token: AttachedToken::empty(),
+        tables: Vec::new(),
+        from: FromTable::WithFromKeyword(vec![table_with_joins_for(table)]),
+        using: None,
+        selection: Some(selection),
+        returning: None,
+        order_by: Vec::new(),
+        limit: None,
+    })
 }
