@@ -17,6 +17,14 @@ pub(crate) async fn rewrite_read_query_with_backend(
     query_engine::rewrite_read_query_with_backend(backend, query).await
 }
 
+pub(crate) async fn rewrite_read_query_with_backend_and_params(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    query_engine::rewrite_read_query_with_backend_and_params(backend, query, params).await
+}
+
 pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session(
     backend: &dyn LixBackend,
     query: Query,

@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, JoinConstraint, JoinOperator, ObjectName, Query, Select, Statement,
-    TableFactor, TableWithJoins, UnaryOperator, Value as AstValue, ValueWithSpan, Visit, Visitor,
+    BinaryOperator, Expr, JoinConstraint, JoinOperator, ObjectName, Query, Select, TableFactor,
+    TableWithJoins, UnaryOperator, Value as AstValue, ValueWithSpan, Visit, Visitor,
 };
 
-use crate::sql::types::{MutationRow, RewriteOutput, SchemaRegistration, UpdateValidationPlan};
-use crate::sql::PostprocessPlan;
+use crate::sql::planner::validate::validate_statement_output as validate_planner_statement_output;
+use crate::sql::types::RewriteOutput;
 use crate::sql::{object_name_matches, visit_query_selects, visit_table_factors_in_select};
 use crate::LixError;
 
@@ -63,115 +63,7 @@ pub(crate) fn validate_phase_invariants(
 }
 
 pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
-    validate_statement_output_parts(
-        &output.statements,
-        &output.registrations,
-        output.postprocess.as_ref(),
-        &output.mutations,
-        &output.update_validations,
-    )
-}
-
-pub(crate) fn validate_statement_output_parts(
-    statements: &[Statement],
-    registrations: &[SchemaRegistration],
-    postprocess: Option<&PostprocessPlan>,
-    mutations: &[MutationRow],
-    update_validations: &[UpdateValidationPlan],
-) -> Result<(), LixError> {
-    if statements.is_empty() {
-        return Err(LixError {
-            message: "statement rewrite produced no statements".to_string(),
-        });
-    }
-    if postprocess.is_some() && statements.len() != 1 {
-        return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
-        });
-    }
-    if postprocess.is_some() && !mutations.is_empty() {
-        return Err(LixError {
-            message: "postprocess rewrites cannot emit mutation rows".to_string(),
-        });
-    }
-    if !update_validations.is_empty() && statements.len() != 1 {
-        return Err(LixError {
-            message: "update validation rewrites require a single statement".to_string(),
-        });
-    }
-    if !mutations.is_empty() && !update_validations.is_empty() {
-        return Err(LixError {
-            message: "mutation rewrites cannot emit update validations".to_string(),
-        });
-    }
-    if !update_validations.is_empty() && !matches!(statements[0], Statement::Update(_)) {
-        return Err(LixError {
-            message: "update validations require an UPDATE statement output".to_string(),
-        });
-    }
-    for registration in registrations {
-        if registration.schema_key.trim().is_empty() {
-            return Err(LixError {
-                message: "schema registration cannot have an empty schema_key".to_string(),
-            });
-        }
-    }
-    for mutation in mutations {
-        validate_non_empty_field("mutation entity_id", &mutation.entity_id)?;
-        validate_non_empty_field("mutation schema_key", &mutation.schema_key)?;
-        validate_non_empty_field("mutation schema_version", &mutation.schema_version)?;
-        validate_non_empty_field("mutation file_id", &mutation.file_id)?;
-        validate_non_empty_field("mutation version_id", &mutation.version_id)?;
-        validate_non_empty_field("mutation plugin_key", &mutation.plugin_key)?;
-    }
-    for validation in update_validations {
-        validate_non_empty_field("update validation table", &validation.table)?;
-        if validation.snapshot_content.is_some() && validation.snapshot_patch.is_some() {
-            return Err(LixError {
-                message:
-                    "update validations cannot define both snapshot_content and snapshot_patch"
-                        .to_string(),
-            });
-        }
-    }
-    if let Some(postprocess) = postprocess {
-        match postprocess {
-            PostprocessPlan::VtableUpdate(plan) => {
-                validate_non_empty_field("vtable update schema_key", &plan.schema_key)?;
-                if !matches!(statements[0], Statement::Update(_)) {
-                    return Err(LixError {
-                        message: "vtable update postprocess requires an UPDATE statement"
-                            .to_string(),
-                    });
-                }
-            }
-            PostprocessPlan::VtableDelete(plan) => {
-                validate_non_empty_field("vtable delete schema_key", &plan.schema_key)?;
-                if !plan.effective_scope_fallback && plan.effective_scope_selection_sql.is_some() {
-                    return Err(LixError {
-                        message: "vtable delete postprocess cannot emit effective scope selection SQL without fallback"
-                            .to_string(),
-                    });
-                }
-                if !matches!(statements[0], Statement::Update(_) | Statement::Delete(_)) {
-                    return Err(LixError {
-                        message: "vtable delete postprocess requires an UPDATE or DELETE statement"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_non_empty_field(field: &str, value: &str) -> Result<(), LixError> {
-    if value.trim().is_empty() {
-        return Err(LixError {
-            message: format!("{field} cannot be empty"),
-        });
-    }
-    Ok(())
+    validate_planner_statement_output(output)
 }
 
 pub(crate) fn validate_no_unresolved_logical_read_views(query: &Query) -> Result<(), LixError> {
@@ -768,7 +660,6 @@ mod tests {
     fn statement_validator_rejects_postprocess_with_mutations() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: "schema".to_string(),
@@ -797,7 +688,6 @@ mod tests {
     fn statement_validator_rejects_multi_statement_update_validation() {
         let output = RewriteOutput {
             statements: vec![empty_statement(), empty_statement()],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -820,7 +710,6 @@ mod tests {
     fn statement_validator_rejects_update_validation_on_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -843,7 +732,6 @@ mod tests {
     fn statement_validator_rejects_vtable_update_postprocess_on_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
                 schema_key: "schema".to_string(),
@@ -866,7 +754,6 @@ mod tests {
     fn statement_validator_rejects_vtable_delete_postprocess_on_non_delete_or_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: "schema".to_string(),
@@ -888,7 +775,6 @@ mod tests {
     fn statement_validator_rejects_empty_mutation_identity_fields() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: vec![crate::sql::types::MutationRow {
@@ -913,7 +799,6 @@ mod tests {
     fn statement_validator_rejects_update_validation_with_conflicting_snapshot_fields() {
         let output = RewriteOutput {
             statements: vec![parse_statement("UPDATE table_name SET value = 1")],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
@@ -936,7 +821,6 @@ mod tests {
     fn statement_validator_rejects_delete_postprocess_scope_sql_without_fallback() {
         let output = RewriteOutput {
             statements: vec![parse_statement("DELETE FROM table_name")],
-            params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: "schema".to_string(),

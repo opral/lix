@@ -60,7 +60,6 @@ pub enum PostprocessPlan {
 #[derive(Debug, Clone)]
 pub struct RewriteOutput {
     pub statements: Vec<Statement>,
-    pub params: Vec<Value>,
     pub registrations: Vec<SchemaRegistration>,
     pub postprocess: Option<PostprocessPlan>,
     pub mutations: Vec<MutationRow>,

@@ -1,9 +1,9 @@
 use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
-use crate::sql::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
-use crate::sql::pipeline::validator::{validate_final_read_query, validate_statement_output_parts};
 use crate::sql::planner::rewrite::write;
+use crate::sql::planner::validate::validate_statement_output_parts;
+use crate::sql::read_pipeline::rewrite_read_query_with_backend_and_params;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
@@ -24,7 +24,6 @@ where
         Statement::Query(query) => {
             let rewritten =
                 rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
-            validate_final_read_query(&rewritten)?;
             Ok(LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
                 vec![Statement::Query(Box::new(rewritten))],
@@ -44,7 +43,6 @@ where
                 Statement::Query(query) => {
                     let rewritten =
                         rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
-                    validate_final_read_query(&rewritten)?;
                     Statement::Query(Box::new(rewritten))
                 }
                 other => other,

@@ -28,14 +28,6 @@ pub(crate) enum QueryRuleOutcome {
     Changed(Query),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatementRule {
-    QueryRead,
-    ExplainRead,
-    VtableWriteCanonical,
-    Passthrough,
-}
-
 const ANALYZE_RULES: &[QueryRule] = &[QueryRule::AnalyzeRelationDiscovery];
 
 const CANONICALIZE_RULES: &[QueryRule] = &[QueryRule::CanonicalLogicalViews];
@@ -44,13 +36,6 @@ const OPTIMIZE_RULES: &[QueryRule] = &[QueryRule::ProjectionCleanup];
 
 const LOWER_RULES: &[QueryRule] = &[QueryRule::VtableRead];
 
-const STATEMENT_RULES: &[StatementRule] = &[
-    StatementRule::QueryRead,
-    StatementRule::ExplainRead,
-    StatementRule::VtableWriteCanonical,
-    StatementRule::Passthrough,
-];
-
 pub(crate) fn rules_for_phase(phase: RewritePhase) -> &'static [QueryRule] {
     match phase {
         RewritePhase::Analyze => ANALYZE_RULES,
@@ -58,10 +43,6 @@ pub(crate) fn rules_for_phase(phase: RewritePhase) -> &'static [QueryRule] {
         RewritePhase::Optimize => OPTIMIZE_RULES,
         RewritePhase::Lower => LOWER_RULES,
     }
-}
-
-pub(crate) fn statement_rules() -> &'static [StatementRule] {
-    STATEMENT_RULES
 }
 
 impl QueryRuleOutcome {
