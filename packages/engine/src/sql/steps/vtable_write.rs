@@ -164,7 +164,7 @@ pub struct DetectedFileDomainChange {
     pub writer_key: Option<String>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn rewrite_insert(
     insert: sqlparser::ast::Insert,
     params: &[EngineValue],

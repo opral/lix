@@ -860,10 +860,15 @@ fn build_untracked_union_query(
     for key in &effective_schema_keys {
         let materialized_table = format!("{MATERIALIZED_PREFIX}{key}");
         let materialized_ident = quote_ident(&materialized_table);
-        let materialized_where = predicate_sql
-            .as_ref()
-            .map(|predicate| format!(" WHERE is_tombstone = 0 AND ({predicate})"))
-            .unwrap_or_else(|| " WHERE is_tombstone = 0".to_string());
+        let mut materialized_filters = vec![
+            "is_tombstone = 0".to_string(),
+            format!("schema_key = '{}'", escape_string_literal(key)),
+            "snapshot_content IS NOT NULL".to_string(),
+        ];
+        if let Some(predicate) = predicate_sql.as_ref() {
+            materialized_filters.push(format!("({predicate})"));
+        }
+        let materialized_where = format!(" WHERE {}", materialized_filters.join(" AND "));
         union_parts.push(format!(
             "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                     created_at, updated_at, inherited_from_version_id, change_id, writer_key, 0 AS untracked, 2 AS priority \
@@ -1544,6 +1549,9 @@ mod tests {
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
             &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
                 "schema_keyIN('schema_a','schema_b')",
                 "entity_id='entity-1'",
             ],
@@ -1553,6 +1561,8 @@ mod tests {
             r#"FROM"lix_internal_state_materialized_v1_schema_b"#,
             &[
                 "is_tombstone=0",
+                "schema_key='schema_b'",
+                "snapshot_contentISNOTNULL",
                 "schema_keyIN('schema_a','schema_b')",
                 "entity_id='entity-1'",
             ],
@@ -1574,7 +1584,12 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["entity_idLIKE'entity-%'"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "entity_idLIKE'entity-%'",
+            ],
         );
     }
 
@@ -1597,12 +1612,22 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["entity_id='entity-1'ORfile_id='file-1'"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "entity_id='entity-1'ORfile_id='file-1'",
+            ],
         );
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_b"#,
-            &["entity_id='entity-1'ORfile_id='file-1'"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_b'",
+                "snapshot_contentISNOTNULL",
+                "entity_id='entity-1'ORfile_id='file-1'",
+            ],
         );
     }
 
@@ -1662,7 +1687,13 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["file_id>='file-2'", "entity_id<>'entity-1'"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "file_id>='file-2'",
+                "entity_id<>'entity-1'",
+            ],
         );
     }
 
@@ -1684,7 +1715,12 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["entity_idNOTIN('entity-1','entity-2')"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "entity_idNOTIN('entity-1','entity-2')",
+            ],
         );
     }
 
@@ -1703,7 +1739,12 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["snapshot_contentISNULL"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "snapshot_contentISNULL",
+            ],
         );
     }
 
@@ -1722,7 +1763,12 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["entity_idBETWEEN'a'AND'm'"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "entity_idBETWEEN'a'AND'm'",
+            ],
         );
     }
 
@@ -1741,7 +1787,12 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
-            &["NOT(entity_id='entity-1')"],
+            &[
+                "is_tombstone=0",
+                "schema_key='schema_a'",
+                "snapshot_contentISNOTNULL",
+                "NOT(entity_id='entity-1')",
+            ],
         );
     }
 

@@ -6,7 +6,7 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
 use crate::sql::object_name_matches;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn inline_lix_functions(statement: Statement) -> Statement {
     let mut provider = SystemFunctionProvider;
     inline_lix_functions_with_provider(statement, &mut provider)

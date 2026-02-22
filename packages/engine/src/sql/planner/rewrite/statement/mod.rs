@@ -1,13 +1,13 @@
 use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
-use crate::sql::pipeline::registry::statement_rules;
-use crate::sql::pipeline::rules::statement::apply_backend_rule;
-use crate::sql::pipeline::validator::validate_statement_output;
+use crate::sql::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
+use crate::sql::pipeline::validator::{validate_final_read_query, validate_statement_output};
+use crate::sql::planner::rewrite::write;
 use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
-use crate::sql::planner::ir::logical::LogicalStatementPlan;
+use crate::sql::planner::ir::logical::{LogicalStatementOperation, LogicalStatementPlan};
 
 pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
     backend: &dyn LixBackend,
@@ -20,27 +20,84 @@ pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    for rule in statement_rules() {
-        // Keep this large async rewrite future on the heap to prevent stack overflows.
-        let rewrite_output = Box::pin(apply_backend_rule(
-            *rule,
-            backend,
-            statement.clone(),
-            params,
-            writer_key,
-            provider,
-            detected_file_domain_changes,
-        ))
-        .await?;
-        if let Some(rewrite_output) = rewrite_output {
-            validate_statement_output(&rewrite_output)?;
-            return Ok(LogicalStatementPlan::from_rewrite_output(rewrite_output));
+    match statement {
+        Statement::Query(query) => {
+            let rewritten =
+                rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
+            validate_final_read_query(&rewritten)?;
+            Ok(LogicalStatementPlan::new(
+                LogicalStatementOperation::QueryRead,
+                vec![Statement::Query(Box::new(rewritten))],
+            ))
         }
-    }
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            let rewritten_statement = match *statement {
+                Statement::Query(query) => {
+                    let rewritten =
+                        rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
+                    validate_final_read_query(&rewritten)?;
+                    Statement::Query(Box::new(rewritten))
+                }
+                other => other,
+            };
 
-    Err(LixError {
-        message: "statement backend rewrite engine could not match statement rule".to_string(),
-    })
+            Ok(LogicalStatementPlan::new(
+                LogicalStatementOperation::ExplainRead,
+                vec![Statement::Explain {
+                    describe_alias,
+                    analyze,
+                    verbose,
+                    query_plan,
+                    estimate,
+                    statement: Box::new(rewritten_statement),
+                    format,
+                    options,
+                }],
+            ))
+        }
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            let Some(rewrite_output) = write::rewrite_backend_statement(
+                backend,
+                statement,
+                params,
+                writer_key,
+                provider,
+                detected_file_domain_changes,
+            )
+            .await?
+            else {
+                return Err(LixError {
+                    message: "planner canonical write rewrite produced no output".to_string(),
+                });
+            };
+
+            validate_statement_output(&rewrite_output)?;
+            Ok(LogicalStatementPlan::new(
+                LogicalStatementOperation::CanonicalWrite,
+                rewrite_output.statements,
+            )
+            .with_rewrite_metadata(
+                rewrite_output.params,
+                rewrite_output.registrations,
+                rewrite_output.postprocess,
+                rewrite_output.mutations,
+                rewrite_output.update_validations,
+            ))
+        }
+        other => Ok(LogicalStatementPlan::new(
+            LogicalStatementOperation::Passthrough,
+            vec![other],
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -48,6 +105,7 @@ mod tests {
     use super::rewrite_statement_to_logical_plan_with_backend;
     use crate::functions::SystemFunctionProvider;
     use crate::sql::parse_sql_statements_with_dialect;
+    use crate::sql::planner::ir::logical::LogicalStatementOperation;
     use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
 
@@ -96,8 +154,9 @@ mod tests {
         .await
         .expect("rewrite query statement");
 
-        assert_eq!(plan.statements.len(), 1);
-        assert!(matches!(plan.statements[0].statement, Statement::Query(_)));
+        assert_eq!(plan.operation, LogicalStatementOperation::QueryRead);
+        assert_eq!(plan.planned_statements.len(), 1);
+        assert!(matches!(plan.planned_statements[0], Statement::Query(_)));
     }
 
     #[tokio::test]
@@ -117,9 +176,10 @@ mod tests {
         .await
         .expect("rewrite explain statement");
 
-        assert_eq!(plan.statements.len(), 1);
+        assert_eq!(plan.operation, LogicalStatementOperation::ExplainRead);
+        assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(
-            plan.statements[0].statement,
+            plan.planned_statements[0],
             Statement::Explain { .. }
         ));
     }
@@ -141,8 +201,9 @@ mod tests {
         .await
         .expect("rewrite update statement");
 
-        assert_eq!(plan.statements.len(), 1);
-        assert!(matches!(plan.statements[0].statement, Statement::Update(_)));
+        assert_eq!(plan.operation, LogicalStatementOperation::CanonicalWrite);
+        assert_eq!(plan.planned_statements.len(), 1);
+        assert!(matches!(plan.planned_statements[0], Statement::Update(_)));
     }
 
     #[tokio::test]
@@ -162,9 +223,10 @@ mod tests {
         .await
         .expect("rewrite passthrough statement");
 
-        assert_eq!(plan.statements.len(), 1);
+        assert_eq!(plan.operation, LogicalStatementOperation::Passthrough);
+        assert_eq!(plan.planned_statements.len(), 1);
         assert!(matches!(
-            plan.statements[0].statement,
+            plan.planned_statements[0],
             Statement::CreateTable(_)
         ));
     }

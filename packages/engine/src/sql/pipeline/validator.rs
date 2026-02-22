@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, JoinConstraint, JoinOperator, ObjectName, Query, Select, TableFactor,
-    TableWithJoins, Value as AstValue, ValueWithSpan, Visit, Visitor,
+    TableWithJoins, UnaryOperator, Value as AstValue, ValueWithSpan, Visit, Visitor,
 };
 
 use crate::sql::types::RewriteOutput;
@@ -33,7 +33,7 @@ const MATERIALIZED_STATE_TABLE_PREFIX: &str = "lix_internal_state_materialized_v
 pub(crate) fn validate_final_read_query(query: &Query) -> Result<(), LixError> {
     validate_no_unresolved_logical_read_views(query)?;
     validate_unique_explicit_relation_aliases(query)?;
-    validate_materialized_state_live_filters(query)
+    validate_materialized_state_semantics(query)
 }
 
 pub(crate) fn validate_phase_invariants(
@@ -46,18 +46,18 @@ pub(crate) fn validate_phase_invariants(
         RewritePhase::Canonicalize => {
             validate_no_unresolved_logical_read_views(query)?;
             validate_unique_explicit_relation_aliases(query)?;
-            validate_materialized_state_live_filters(query)
+            validate_materialized_state_semantics(query)
         }
         RewritePhase::Optimize => {
             validate_no_unresolved_logical_read_views(query)?;
             validate_unique_explicit_relation_aliases(query)?;
-            validate_materialized_state_live_filters(query)
+            validate_materialized_state_semantics(query)
         }
         // Lower can expand SQL substantially; final invariant check covers output.
         RewritePhase::Lower => {
             validate_no_unresolved_logical_read_views(query)?;
             validate_unique_explicit_relation_aliases(query)?;
-            validate_materialized_state_live_filters(query)
+            validate_materialized_state_semantics(query)
         }
     }
 }
@@ -192,7 +192,7 @@ fn validate_unique_explicit_relation_aliases(query: &Query) -> Result<(), LixErr
     })
 }
 
-fn validate_materialized_state_live_filters(query: &Query) -> Result<(), LixError> {
+fn validate_materialized_state_semantics(query: &Query) -> Result<(), LixError> {
     visit_query_selects(query, &mut |select| {
         let materialized_relations = collect_materialized_relations(select);
         if materialized_relations.is_empty() {
@@ -214,6 +214,41 @@ fn validate_materialized_state_live_filters(query: &Query) -> Result<(), LixErro
                     ),
                 });
             }
+
+            let has_schema_key_filter = predicates.iter().any(|predicate| {
+                expr_contains_schema_key_filter(
+                    predicate,
+                    Some(&relation.qualifier),
+                    &relation.expected_schema_key,
+                ) || (allow_unqualified
+                    && expr_contains_schema_key_filter(
+                        predicate,
+                        None,
+                        &relation.expected_schema_key,
+                    ))
+            });
+            if !has_schema_key_filter {
+                return Err(LixError {
+                    message: format!(
+                        "read rewrite produced materialized relation '{}' without schema_key = '{}' filter",
+                        relation.display_name, relation.expected_schema_key
+                    ),
+                });
+            }
+
+            let has_snapshot_filter = predicates.iter().any(|predicate| {
+                expr_contains_snapshot_content_not_null_filter(predicate, Some(&relation.qualifier))
+                    || (allow_unqualified
+                        && expr_contains_snapshot_content_not_null_filter(predicate, None))
+            });
+            if !has_snapshot_filter {
+                return Err(LixError {
+                    message: format!(
+                        "read rewrite produced materialized relation '{}' without snapshot_content IS NOT NULL filter",
+                        relation.display_name
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -224,6 +259,7 @@ fn validate_materialized_state_live_filters(query: &Query) -> Result<(), LixErro
 struct MaterializedRelation {
     display_name: String,
     qualifier: String,
+    expected_schema_key: String,
 }
 
 fn collect_materialized_relations(select: &Select) -> Vec<MaterializedRelation> {
@@ -254,12 +290,9 @@ fn collect_materialized_relations_from_table_factor(
     let Some(base_name) = object_name_last_identifier(name) else {
         return;
     };
-    if !base_name
-        .to_ascii_lowercase()
-        .starts_with(MATERIALIZED_STATE_TABLE_PREFIX)
-    {
+    let Some(expected_schema_key) = materialized_schema_key_for_table_name(&base_name) else {
         return;
-    }
+    };
 
     let qualifier = alias
         .as_ref()
@@ -268,7 +301,16 @@ fn collect_materialized_relations_from_table_factor(
     relations.push(MaterializedRelation {
         display_name: base_name,
         qualifier,
+        expected_schema_key,
     });
+}
+
+fn materialized_schema_key_for_table_name(base_name: &str) -> Option<String> {
+    let lowercase = base_name.to_ascii_lowercase();
+    if !lowercase.starts_with(MATERIALIZED_STATE_TABLE_PREFIX) {
+        return None;
+    }
+    Some(lowercase[MATERIALIZED_STATE_TABLE_PREFIX.len()..].to_string())
 }
 
 fn object_name_last_identifier(name: &ObjectName) -> Option<String> {
@@ -373,6 +415,165 @@ fn expr_is_tombstone_column(expr: &Expr, qualifier: Option<&str>) -> bool {
                 return false;
             };
             if !last.value.eq_ignore_ascii_case("is_tombstone") {
+                return false;
+            }
+            let Some(qualifier) = qualifier else {
+                return true;
+            };
+            identifiers.len() < 2
+                || identifiers[identifiers.len() - 2]
+                    .value
+                    .eq_ignore_ascii_case(qualifier)
+        }
+        _ => false,
+    }
+}
+
+fn expr_contains_schema_key_filter(
+    expr: &Expr,
+    qualifier: Option<&str>,
+    expected_schema_key: &str,
+) -> bool {
+    struct SchemaKeyFilterVisitor<'a> {
+        qualifier: Option<&'a str>,
+        expected_schema_key: &'a str,
+        found: bool,
+    }
+
+    impl Visitor for SchemaKeyFilterVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if self.found {
+                return ControlFlow::Break(());
+            }
+            match expr {
+                Expr::BinaryOp { left, op, right }
+                    if *op == BinaryOperator::Eq
+                        && ((expr_is_schema_key_column(left, self.qualifier)
+                            && expr_is_expected_schema_key_literal(
+                                right,
+                                self.expected_schema_key,
+                            ))
+                            || (expr_is_schema_key_column(right, self.qualifier)
+                                && expr_is_expected_schema_key_literal(
+                                    left,
+                                    self.expected_schema_key,
+                                ))) =>
+                {
+                    self.found = true;
+                    ControlFlow::Break(())
+                }
+                Expr::InList {
+                    expr,
+                    list,
+                    negated: false,
+                } if expr_is_schema_key_column(expr, self.qualifier)
+                    && list.iter().any(|item| {
+                        expr_is_expected_schema_key_literal(item, self.expected_schema_key)
+                    }) =>
+                {
+                    self.found = true;
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    let mut visitor = SchemaKeyFilterVisitor {
+        qualifier,
+        expected_schema_key,
+        found: false,
+    };
+    let _ = expr.visit(&mut visitor);
+    visitor.found
+}
+
+fn expr_is_schema_key_column(expr: &Expr, qualifier: Option<&str>) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("schema_key"),
+        Expr::CompoundIdentifier(identifiers) => {
+            let Some(last) = identifiers.last() else {
+                return false;
+            };
+            if !last.value.eq_ignore_ascii_case("schema_key") {
+                return false;
+            }
+            let Some(qualifier) = qualifier else {
+                return true;
+            };
+            identifiers.len() < 2
+                || identifiers[identifiers.len() - 2]
+                    .value
+                    .eq_ignore_ascii_case(qualifier)
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_expected_schema_key_literal(expr: &Expr, expected_schema_key: &str) -> bool {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::SingleQuotedString(value),
+            ..
+        }) => value.eq_ignore_ascii_case(expected_schema_key),
+        Expr::Cast { expr, .. } => expr_is_expected_schema_key_literal(expr, expected_schema_key),
+        _ => false,
+    }
+}
+
+fn expr_contains_snapshot_content_not_null_filter(expr: &Expr, qualifier: Option<&str>) -> bool {
+    struct SnapshotContentFilterVisitor<'a> {
+        qualifier: Option<&'a str>,
+        found: bool,
+    }
+
+    impl Visitor for SnapshotContentFilterVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if self.found {
+                return ControlFlow::Break(());
+            }
+            match expr {
+                Expr::IsNotNull(expr) if expr_is_snapshot_content_column(expr, self.qualifier) => {
+                    self.found = true;
+                    ControlFlow::Break(())
+                }
+                Expr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr,
+                } => {
+                    if let Expr::IsNull(inner) = expr.as_ref() {
+                        if expr_is_snapshot_content_column(inner, self.qualifier) {
+                            self.found = true;
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    ControlFlow::Continue(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    let mut visitor = SnapshotContentFilterVisitor {
+        qualifier,
+        found: false,
+    };
+    let _ = expr.visit(&mut visitor);
+    visitor.found
+}
+
+fn expr_is_snapshot_content_column(expr: &Expr, qualifier: Option<&str>) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("snapshot_content"),
+        Expr::CompoundIdentifier(identifiers) => {
+            let Some(last) = identifiers.last() else {
+                return false;
+            };
+            if !last.value.eq_ignore_ascii_case("snapshot_content") {
                 return false;
             }
             let Some(qualifier) = qualifier else {
@@ -503,11 +704,44 @@ mod tests {
             "SELECT * \
              FROM lix_internal_state_materialized_v1_example AS s \
              WHERE s.schema_key = 'example' \
-               AND s.is_tombstone = 0",
+               AND s.is_tombstone = 0 \
+               AND s.snapshot_content IS NOT NULL",
         );
         let context = AnalysisContext::from_query(&query);
         validate_phase_invariants(RewritePhase::Canonicalize, &query, &context)
             .expect("canonical phase should accept materialized state reads with tombstone filter");
+    }
+
+    #[test]
+    fn canonical_phase_rejects_materialized_state_without_schema_key_filter() {
+        let query = parse_query(
+            "SELECT * \
+             FROM lix_internal_state_materialized_v1_example AS s \
+             WHERE s.is_tombstone = 0 \
+               AND s.snapshot_content IS NOT NULL",
+        );
+        let context = AnalysisContext::from_query(&query);
+        let err = validate_phase_invariants(RewritePhase::Canonicalize, &query, &context)
+            .expect_err(
+                "canonical phase should reject materialized state reads without schema_key filter",
+            );
+        assert!(err.message.contains("without schema_key"));
+    }
+
+    #[test]
+    fn canonical_phase_rejects_materialized_state_without_snapshot_content_filter() {
+        let query = parse_query(
+            "SELECT * \
+             FROM lix_internal_state_materialized_v1_example AS s \
+             WHERE s.schema_key = 'example' \
+               AND s.is_tombstone = 0",
+        );
+        let context = AnalysisContext::from_query(&query);
+        let err = validate_phase_invariants(RewritePhase::Canonicalize, &query, &context)
+            .expect_err(
+                "canonical phase should reject materialized state reads without snapshot_content filter",
+            );
+        assert!(err.message.contains("snapshot_content IS NOT NULL"));
     }
 
     #[test]
