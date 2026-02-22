@@ -1,14 +1,16 @@
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+    Value as AstValue, Visit, Visitor,
 };
 
 use crate::backend::SqlDialect;
 use crate::sql::steps::state_pushdown::select_supports_count_fast_path;
 use crate::sql::{
-    bind_sql, default_alias, escape_sql_string, object_name_matches, parse_single_query,
-    parse_sql_statements, rewrite_query_with_select_rewriter,
+    bind_sql_with_state, default_alias, escape_sql_string, object_name_matches, parse_single_query,
+    parse_sql_statements_with_dialect, rewrite_query_with_select_rewriter, PlaceholderState,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -23,12 +25,25 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     Ok(rewritten)
 }
 
+#[cfg(test)]
 pub async fn rewrite_query_with_backend(
-    backend: &dyn LixBackend,
+    _backend: &dyn LixBackend,
     query: Query,
-    params: &[Value],
+    _params: &[Value],
 ) -> Result<Option<Query>, LixError> {
-    let (rewritten, requests) = rewrite_query_collect_requests(query)?;
+    rewrite_query(query)
+}
+
+pub async fn ensure_history_timeline_materialized_for_statement_with_state(
+    backend: &dyn LixBackend,
+    statement: &Statement,
+    params: &[Value],
+    placeholder_state: PlaceholderState,
+) -> Result<(), LixError> {
+    let Statement::Query(query) = statement else {
+        return Ok(());
+    };
+    let (_rewritten, requests) = rewrite_query_collect_requests(*query.clone())?;
     let mut seen_requests = BTreeSet::new();
     for request in requests {
         if should_fallback_to_phase1_query(&request) {
@@ -38,14 +53,25 @@ pub async fn rewrite_query_with_backend(
             "{}||{}||{}",
             request.change_predicates.join("&&"),
             request.requested_predicates.join("&&"),
-            request.cse_predicates.join("&&")
+            request
+                .cse_predicates
+                .iter()
+                .map(|predicate| predicate.reachable_sql.as_str())
+                .collect::<Vec<_>>()
+                .join("&&")
         );
         if !seen_requests.insert(request_key) {
             continue;
         }
-        ensure_history_timeline_materialized_for_request(backend, &request, params).await?;
+        ensure_history_timeline_materialized_for_request(
+            backend,
+            &request,
+            params,
+            placeholder_state,
+        )
+        .await?;
     }
-    Ok(rewritten)
+    Ok(())
 }
 
 fn rewrite_query_collect_requests(
@@ -161,7 +187,7 @@ fn rewrite_table_factor(
 struct HistoryPushdown {
     change_predicates: Vec<String>,
     requested_predicates: Vec<String>,
-    cse_predicates: Vec<String>,
+    cse_predicates: Vec<HistoryCsePredicate>,
     requested_pushdown_blocked_by_bare_placeholders: bool,
 }
 
@@ -174,8 +200,28 @@ enum HistoryPushdownBucket {
 }
 
 enum ExtractedPredicate {
-    Push(HistoryPushdownBucket, String),
+    PushChange(String),
+    PushRequested(String),
+    PushCse(HistoryCsePredicate),
     Drop,
+}
+
+impl ExtractedPredicate {
+    fn bucket(&self) -> HistoryPushdownBucket {
+        match self {
+            Self::PushChange(_) => HistoryPushdownBucket::Change,
+            Self::PushRequested(_) => HistoryPushdownBucket::Requested,
+            Self::PushCse(_) => HistoryPushdownBucket::Cse,
+            Self::Drop => HistoryPushdownBucket::Remaining,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HistoryCsePredicate {
+    reachable_sql: String,
+    phase1_sql: String,
+    constrains_commit_id: bool,
 }
 
 struct PredicatePart {
@@ -213,16 +259,16 @@ fn take_history_pushdown_predicates(
         let blocked_by_cross_bucket =
             part.has_bare_placeholder && has_cross_bucket_bare_placeholders;
         match part.extracted {
-            Some(ExtractedPredicate::Push(bucket, sql)) if !blocked_by_cross_bucket => match bucket
-            {
-                HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
-                HistoryPushdownBucket::Requested => pushdown.requested_predicates.push(sql),
-                HistoryPushdownBucket::Cse => pushdown.cse_predicates.push(sql),
-                HistoryPushdownBucket::Remaining => remaining.push(part.predicate),
-            },
-            Some(ExtractedPredicate::Push(HistoryPushdownBucket::Requested, _))
-                if blocked_by_cross_bucket =>
-            {
+            Some(ExtractedPredicate::PushChange(sql)) if !blocked_by_cross_bucket => {
+                pushdown.change_predicates.push(sql);
+            }
+            Some(ExtractedPredicate::PushRequested(sql)) if !blocked_by_cross_bucket => {
+                pushdown.requested_predicates.push(sql);
+            }
+            Some(ExtractedPredicate::PushCse(predicate)) if !blocked_by_cross_bucket => {
+                pushdown.cse_predicates.push(predicate);
+            }
+            Some(ExtractedPredicate::PushRequested(_)) if blocked_by_cross_bucket => {
                 pushdown.requested_pushdown_blocked_by_bare_placeholders = true;
                 remaining.push(part.predicate);
             }
@@ -242,8 +288,8 @@ fn has_cross_bucket_bare_placeholders(parts: &[PredicatePart]) -> bool {
             continue;
         }
         let bucket = match &part.extracted {
-            Some(ExtractedPredicate::Push(bucket, _)) => *bucket,
-            Some(ExtractedPredicate::Drop) | None => HistoryPushdownBucket::Remaining,
+            Some(extracted) => extracted.bucket(),
+            None => HistoryPushdownBucket::Remaining,
         };
         match first_bucket {
             None => first_bucket = Some(bucket),
@@ -311,38 +357,34 @@ fn extract_binary_pushdown(
 ) -> Option<ExtractedPredicate> {
     let op_sql = operator.to_string();
     match column {
-        "schema_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.schema_key {op_sql} {rhs}"),
-        )),
-        "entity_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.entity_id {op_sql} {rhs}"),
-        )),
-        "file_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.file_id {op_sql} {rhs}"),
-        )),
-        "plugin_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.plugin_key {op_sql} {rhs}"),
-        )),
-        "change_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.change_id {op_sql} {rhs}"),
-        )),
-        "root_commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Requested,
-            format!("c.id {op_sql} {rhs}"),
-        )),
-        "commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_id {op_sql} {rhs}"),
-        )),
-        "depth" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_depth {op_sql} {rhs}"),
-        )),
+        "schema_key" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.schema_key {op_sql} {rhs}"
+        ))),
+        "entity_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.entity_id {op_sql} {rhs}"
+        ))),
+        "file_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.file_id {op_sql} {rhs}"
+        ))),
+        "plugin_key" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.plugin_key {op_sql} {rhs}"
+        ))),
+        "change_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.change_id {op_sql} {rhs}"
+        ))),
+        "root_commit_id" => Some(ExtractedPredicate::PushRequested(format!(
+            "c.id {op_sql} {rhs}"
+        ))),
+        "commit_id" => Some(ExtractedPredicate::PushCse(HistoryCsePredicate {
+            reachable_sql: format!("rc.commit_id {op_sql} {rhs}"),
+            phase1_sql: format!("cc_raw.commit_id {op_sql} {rhs}"),
+            constrains_commit_id: true,
+        })),
+        "depth" => Some(ExtractedPredicate::PushCse(HistoryCsePredicate {
+            reachable_sql: format!("rc.commit_depth {op_sql} {rhs}"),
+            phase1_sql: format!("cc_raw.commit_depth {op_sql} {rhs}"),
+            constrains_commit_id: false,
+        })),
         _ => None,
     }
 }
@@ -350,76 +392,68 @@ fn extract_binary_pushdown(
 fn extract_in_list_pushdown(column: &str, list: &[Expr]) -> Option<ExtractedPredicate> {
     let list_sql = render_in_list_sql(list);
     match column {
-        "schema_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.schema_key IN ({list_sql})"),
-        )),
-        "entity_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.entity_id IN ({list_sql})"),
-        )),
-        "file_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.file_id IN ({list_sql})"),
-        )),
-        "plugin_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.plugin_key IN ({list_sql})"),
-        )),
-        "change_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.change_id IN ({list_sql})"),
-        )),
-        "root_commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Requested,
-            format!("c.id IN ({list_sql})"),
-        )),
-        "commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_id IN ({list_sql})"),
-        )),
-        "depth" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_depth IN ({list_sql})"),
-        )),
+        "schema_key" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.schema_key IN ({list_sql})"
+        ))),
+        "entity_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.entity_id IN ({list_sql})"
+        ))),
+        "file_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.file_id IN ({list_sql})"
+        ))),
+        "plugin_key" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.plugin_key IN ({list_sql})"
+        ))),
+        "change_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.change_id IN ({list_sql})"
+        ))),
+        "root_commit_id" => Some(ExtractedPredicate::PushRequested(format!(
+            "c.id IN ({list_sql})"
+        ))),
+        "commit_id" => Some(ExtractedPredicate::PushCse(HistoryCsePredicate {
+            reachable_sql: format!("rc.commit_id IN ({list_sql})"),
+            phase1_sql: format!("cc_raw.commit_id IN ({list_sql})"),
+            constrains_commit_id: true,
+        })),
+        "depth" => Some(ExtractedPredicate::PushCse(HistoryCsePredicate {
+            reachable_sql: format!("rc.commit_depth IN ({list_sql})"),
+            phase1_sql: format!("cc_raw.commit_depth IN ({list_sql})"),
+            constrains_commit_id: false,
+        })),
         _ => None,
     }
 }
 
 fn extract_in_subquery_pushdown(column: &str, subquery: &Query) -> Option<ExtractedPredicate> {
     match column {
-        "schema_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.schema_key IN ({subquery})"),
-        )),
-        "entity_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.entity_id IN ({subquery})"),
-        )),
-        "file_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.file_id IN ({subquery})"),
-        )),
-        "plugin_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.plugin_key IN ({subquery})"),
-        )),
-        "change_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.change_id IN ({subquery})"),
-        )),
-        "root_commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Requested,
-            format!("c.id IN ({subquery})"),
-        )),
-        "commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_id IN ({subquery})"),
-        )),
-        "depth" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_depth IN ({subquery})"),
-        )),
+        "schema_key" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.schema_key IN ({subquery})"
+        ))),
+        "entity_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.entity_id IN ({subquery})"
+        ))),
+        "file_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.file_id IN ({subquery})"
+        ))),
+        "plugin_key" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.plugin_key IN ({subquery})"
+        ))),
+        "change_id" => Some(ExtractedPredicate::PushChange(format!(
+            "bp.change_id IN ({subquery})"
+        ))),
+        "root_commit_id" => Some(ExtractedPredicate::PushRequested(format!(
+            "c.id IN ({subquery})"
+        ))),
+        "commit_id" => Some(ExtractedPredicate::PushCse(HistoryCsePredicate {
+            reachable_sql: format!("rc.commit_id IN ({subquery})"),
+            phase1_sql: format!("cc_raw.commit_id IN ({subquery})"),
+            constrains_commit_id: true,
+        })),
+        "depth" => Some(ExtractedPredicate::PushCse(HistoryCsePredicate {
+            reachable_sql: format!("rc.commit_depth IN ({subquery})"),
+            phase1_sql: format!("cc_raw.commit_depth IN ({subquery})"),
+            constrains_commit_id: false,
+        })),
         _ => None,
     }
 }
@@ -486,18 +520,36 @@ fn extract_target_column(
 }
 
 fn normalize_history_column(raw: &str) -> Option<String> {
-    match raw.to_ascii_lowercase().as_str() {
-        "entity_id" | "lixcol_entity_id" => Some("entity_id".to_string()),
-        "schema_key" | "lixcol_schema_key" => Some("schema_key".to_string()),
-        "file_id" | "lixcol_file_id" => Some("file_id".to_string()),
-        "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
-        "change_id" | "lixcol_change_id" => Some("change_id".to_string()),
-        "commit_id" | "lixcol_commit_id" => Some("commit_id".to_string()),
-        "root_commit_id" | "lixcol_root_commit_id" => Some("root_commit_id".to_string()),
-        "depth" | "lixcol_depth" => Some("depth".to_string()),
-        "snapshot_content" => Some("snapshot_content".to_string()),
-        _ => None,
+    if raw.eq_ignore_ascii_case("entity_id") || raw.eq_ignore_ascii_case("lixcol_entity_id") {
+        return Some("entity_id".to_string());
     }
+    if raw.eq_ignore_ascii_case("schema_key") || raw.eq_ignore_ascii_case("lixcol_schema_key") {
+        return Some("schema_key".to_string());
+    }
+    if raw.eq_ignore_ascii_case("file_id") || raw.eq_ignore_ascii_case("lixcol_file_id") {
+        return Some("file_id".to_string());
+    }
+    if raw.eq_ignore_ascii_case("plugin_key") || raw.eq_ignore_ascii_case("lixcol_plugin_key") {
+        return Some("plugin_key".to_string());
+    }
+    if raw.eq_ignore_ascii_case("change_id") || raw.eq_ignore_ascii_case("lixcol_change_id") {
+        return Some("change_id".to_string());
+    }
+    if raw.eq_ignore_ascii_case("commit_id") || raw.eq_ignore_ascii_case("lixcol_commit_id") {
+        return Some("commit_id".to_string());
+    }
+    if raw.eq_ignore_ascii_case("root_commit_id")
+        || raw.eq_ignore_ascii_case("lixcol_root_commit_id")
+    {
+        return Some("root_commit_id".to_string());
+    }
+    if raw.eq_ignore_ascii_case("depth") || raw.eq_ignore_ascii_case("lixcol_depth") {
+        return Some("depth".to_string());
+    }
+    if raw.eq_ignore_ascii_case("snapshot_content") {
+        return Some("snapshot_content".to_string());
+    }
+    None
 }
 
 fn render_in_list_sql(list: &[Expr]) -> String {
@@ -508,66 +560,31 @@ fn render_in_list_sql(list: &[Expr]) -> String {
 }
 
 fn expr_contains_bare_placeholder(expr: &Expr) -> bool {
-    let sql = expr.to_string();
-    sql_contains_bare_placeholder(&sql)
+    let mut detector = BarePlaceholderDetector { found: false };
+    let _ = expr.visit(&mut detector);
+    detector.found
 }
 
-fn sql_contains_bare_placeholder(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut index = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
+struct BarePlaceholderDetector {
+    found: bool,
+}
 
-    while index < bytes.len() {
-        let byte = bytes[index];
+impl Visitor for BarePlaceholderDetector {
+    type Break = ();
 
-        if in_single_quote {
-            if byte == b'\'' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    index += 2;
-                    continue;
-                }
-                in_single_quote = false;
-            }
-            index += 1;
-            continue;
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Value(value) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let AstValue::Placeholder(token) = &value.value else {
+            return ControlFlow::Continue(());
+        };
+        if token == "?" {
+            self.found = true;
+            return ControlFlow::Break(());
         }
-
-        if in_double_quote {
-            if byte == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    index += 2;
-                    continue;
-                }
-                in_double_quote = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'\'' => {
-                in_single_quote = true;
-                index += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                index += 1;
-            }
-            b'?' => {
-                let mut lookahead = index + 1;
-                while lookahead < bytes.len() && bytes[lookahead].is_ascii_digit() {
-                    lookahead += 1;
-                }
-                if lookahead == index + 1 {
-                    return true;
-                }
-                index = lookahead;
-            }
-            _ => index += 1,
-        }
+        ControlFlow::Continue(())
     }
-    false
 }
 
 fn render_where_clause(predicates: &[String]) -> String {
@@ -588,7 +605,12 @@ fn build_lix_state_history_view_query(
 
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
     requested_predicates.extend(pushdown.requested_predicates.clone());
-    let reachable_where_sql = render_where_clause(&pushdown.cse_predicates);
+    let reachable_cse_predicates = pushdown
+        .cse_predicates
+        .iter()
+        .map(|predicate| predicate.reachable_sql.clone())
+        .collect::<Vec<_>>();
+    let reachable_where_sql = render_where_clause(&reachable_cse_predicates);
     let breakpoint_where_sql = render_where_clause(&pushdown.change_predicates);
     let requested_where_sql = render_where_clause(&requested_predicates);
 
@@ -707,7 +729,7 @@ fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
         || pushdown
             .cse_predicates
             .iter()
-            .any(|predicate| predicate.contains("rc.commit_id"))
+            .any(|predicate| predicate.constrains_commit_id)
 }
 
 fn build_lix_state_history_view_query_phase1(
@@ -730,11 +752,12 @@ fn build_lix_state_history_view_query_phase1(
     requested_predicates.extend(pushdown.requested_predicates.clone());
 
     let mut cse_predicates = vec![format!("cse_raw.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
-    cse_predicates.extend(pushdown.cse_predicates.iter().map(|predicate| {
-        predicate
-            .replace("rc.commit_depth", "cc_raw.commit_depth")
-            .replace("rc.commit_id", "cc_raw.commit_id")
-    }));
+    cse_predicates.extend(
+        pushdown
+            .cse_predicates
+            .iter()
+            .map(|predicate| predicate.phase1_sql.clone()),
+    );
 
     let all_changes_where_sql = render_where_clause(&all_changes_predicates);
     let requested_where_sql = render_where_clause(&requested_predicates);
@@ -944,7 +967,8 @@ fn remap_change_predicate_for_phase1(predicate: &str) -> Result<String, LixError
 
 fn parse_phase1_predicate_expr(predicate: &str) -> Result<Expr, LixError> {
     let sql = format!("SELECT 1 WHERE {predicate}");
-    let mut statements = parse_sql_statements(&sql)?;
+    let mut statements = parse_sql_statements_with_dialect(&sql, SqlDialect::Sqlite)
+        .or_else(|_| parse_sql_statements_with_dialect(&sql, SqlDialect::Postgres))?;
     let Some(statement) = statements.pop() else {
         return Err(LixError {
             message: "phase1 change predicate parse produced no statements".to_string(),
@@ -994,8 +1018,10 @@ async fn ensure_history_timeline_materialized_for_request(
     backend: &dyn LixBackend,
     pushdown: &HistoryPushdown,
     params: &[Value],
+    placeholder_state: PlaceholderState,
 ) -> Result<(), LixError> {
-    let requested_roots = resolve_requested_root_commits(backend, pushdown, params).await?;
+    let requested_roots =
+        resolve_requested_root_commits(backend, pushdown, params, placeholder_state).await?;
     for root_commit_id in requested_roots {
         ensure_history_timeline_materialized_for_root(backend, &root_commit_id, MAX_HISTORY_DEPTH)
             .await?;
@@ -1007,6 +1033,7 @@ async fn resolve_requested_root_commits(
     backend: &dyn LixBackend,
     pushdown: &HistoryPushdown,
     params: &[Value],
+    placeholder_state: PlaceholderState,
 ) -> Result<Vec<String>, LixError> {
     let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
     requested_predicates.extend(pushdown.requested_predicates.clone());
@@ -1028,7 +1055,7 @@ async fn resolve_requested_root_commits(
         global_version = GLOBAL_VERSION_ID,
         requested_where = requested_where_sql,
     );
-    let bound = bind_sql(&sql, params, backend.dialect())?;
+    let bound = bind_sql_with_state(&sql, params, backend.dialect(), placeholder_state)?;
     let rows = backend.execute(&bound.sql, &bound.params).await?;
     let mut roots = BTreeSet::new();
     for row in &rows.rows {
@@ -1478,10 +1505,63 @@ fn default_lix_state_history_alias() -> sqlparser::ast::TableAlias {
 
 #[cfg(test)]
 mod tests {
-    use super::{rewrite_query, rewrite_query_collect_requests};
+    use super::{
+        ensure_history_timeline_materialized_for_statement_with_state, rewrite_query,
+        rewrite_query_collect_requests,
+    };
+    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::{LixError, QueryResult, Value};
+    use async_trait::async_trait;
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct CountingBackend {
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    struct NoopTransaction;
+
+    #[async_trait(?Send)]
+    impl LixBackend for CountingBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(NoopTransaction))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixTransaction for NoopTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult { rows: Vec::new() })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn pushes_history_schema_and_root_commit_filters_into_ctes_for_count_fast_path() {
@@ -1653,6 +1733,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn backend_rewrite_path_is_side_effect_free() {
+        let query = parse_query(
+            "SELECT COUNT(*) \
+             FROM lix_state_history AS sh \
+             WHERE sh.root_commit_id = 'root-a'",
+        );
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            execute_calls: Arc::clone(&execute_calls),
+        };
+
+        let rewritten = super::rewrite_query_with_backend(&backend, query, &[])
+            .await
+            .expect("backend rewrite should succeed");
+        assert!(rewritten.is_some(), "query should be rewritten");
+        assert_eq!(
+            execute_calls.load(Ordering::SeqCst),
+            0,
+            "rewrite path must not execute maintenance SQL"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_timeline_materialization_runs_in_explicit_maintenance_stage() {
+        let statement = parse_statement(
+            "SELECT COUNT(*) \
+             FROM lix_state_history AS sh \
+             WHERE sh.root_commit_id = 'root-a'",
+        );
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let backend = CountingBackend {
+            execute_calls: Arc::clone(&execute_calls),
+        };
+
+        ensure_history_timeline_materialized_for_statement_with_state(
+            &backend,
+            &statement,
+            &[],
+            crate::sql::PlaceholderState::new(),
+        )
+        .await
+        .expect("maintenance stage should succeed");
+
+        assert!(
+            execute_calls.load(Ordering::SeqCst) > 0,
+            "maintenance stage should execute SQL when history view is referenced"
+        );
+    }
+
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
         assert_eq!(statements.len(), 1);
@@ -1660,5 +1790,11 @@ mod tests {
             Statement::Query(query) => *query,
             _ => panic!("expected query"),
         }
+    }
+
+    fn parse_statement(sql: &str) -> Statement {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("valid SQL");
+        assert_eq!(statements.len(), 1);
+        statements.remove(0)
     }
 }

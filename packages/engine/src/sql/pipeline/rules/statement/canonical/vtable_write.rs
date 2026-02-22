@@ -6,15 +6,6 @@ use crate::sql::types::{PostprocessPlan, RewriteOutput, UpdateValidationPlan};
 use crate::sql::{expr_references_column_name, ColumnReferenceOptions, DetectedFileDomainChange};
 use crate::{LixBackend, LixError, Value};
 
-pub(crate) fn rewrite_insert_with_writer_key<P: LixFunctionProvider>(
-    insert: Insert,
-    params: &[Value],
-    writer_key: Option<&str>,
-    functions: &mut P,
-) -> Result<Option<vtable_write::VtableWriteRewrite>, LixError> {
-    vtable_write::rewrite_insert_with_writer_key(insert, params, writer_key, functions)
-}
-
 pub(crate) async fn rewrite_insert_with_backend<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
     insert: Insert,

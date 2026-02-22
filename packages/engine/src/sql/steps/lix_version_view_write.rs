@@ -26,45 +26,6 @@ const LIX_VERSION_VIEW_NAME: &str = "lix_version";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 
-pub fn rewrite_insert(
-    insert: Insert,
-    params: &[EngineValue],
-) -> Result<Option<Vec<Insert>>, LixError> {
-    if !table_object_is_lix_version(&insert.table) {
-        return Ok(None);
-    }
-    if insert.columns.is_empty() {
-        return Err(LixError {
-            message: "lix_version insert requires explicit columns".to_string(),
-        });
-    }
-    if insert.on.is_some() {
-        return Err(LixError {
-            message: "lix_version insert does not support ON CONFLICT".to_string(),
-        });
-    }
-
-    let field_map = insert_field_map(&insert.columns)?;
-    let rows_source =
-        RowSourceResolver::new(params).resolve_insert_required(&insert, "lix_version insert")?;
-    let parsed_rows = parse_insert_rows(
-        &field_map,
-        rows_source.rows,
-        rows_source.resolved_rows,
-        "lix_version insert",
-    )?;
-    let descriptor_rows = parsed_rows
-        .iter()
-        .map(|row| row.descriptor_row.clone())
-        .collect::<Vec<_>>();
-    let tip_rows = parsed_rows
-        .iter()
-        .map(|row| row.tip_row.clone())
-        .collect::<Vec<_>>();
-
-    Ok(Some(build_vtable_inserts(descriptor_rows, tip_rows)?))
-}
-
 pub async fn rewrite_insert_with_backend(
     backend: &dyn LixBackend,
     insert: Insert,

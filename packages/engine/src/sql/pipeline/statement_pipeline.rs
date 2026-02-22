@@ -6,7 +6,9 @@ use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
 use super::registry::statement_rules;
-use super::rules::statement::{apply_backend_rule, apply_sync_rule};
+use super::rules::statement::apply_backend_rule;
+#[cfg(test)]
+use super::rules::statement::apply_sync_rule;
 use super::validator::validate_statement_output;
 
 pub(crate) struct StatementPipeline<'a> {
@@ -19,11 +21,15 @@ impl<'a> StatementPipeline<'a> {
         Self { params, writer_key }
     }
 
-    pub(crate) fn rewrite_statement<P: LixFunctionProvider>(
+    #[cfg(test)]
+    pub(crate) fn rewrite_statement<P>(
         &self,
         statement: Statement,
         provider: &mut P,
-    ) -> Result<RewriteOutput, LixError> {
+    ) -> Result<RewriteOutput, LixError>
+    where
+        P: LixFunctionProvider + Clone + Send + 'static,
+    {
         let output = StatementRuleEngine::new(self.params, self.writer_key)
             .rewrite_statement(statement, provider)?;
         validate_statement_output(&output)?;
@@ -63,11 +69,15 @@ impl<'a> StatementRuleEngine<'a> {
         Self { params, writer_key }
     }
 
-    fn rewrite_statement<P: LixFunctionProvider>(
+    #[cfg(test)]
+    fn rewrite_statement<P>(
         &self,
         statement: Statement,
         provider: &mut P,
-    ) -> Result<RewriteOutput, LixError> {
+    ) -> Result<RewriteOutput, LixError>
+    where
+        P: LixFunctionProvider + Clone + Send + 'static,
+    {
         for rule in statement_rules() {
             if let Some(output) = apply_sync_rule(
                 *rule,

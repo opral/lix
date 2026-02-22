@@ -21,7 +21,7 @@ use crate::commit::{
 };
 use crate::functions::LixFunctionProvider;
 use crate::sql::types::{
-    MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
+    FileDataAssignmentPlan, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::sql::SchemaRegistration;
 use crate::sql::{
@@ -375,6 +375,7 @@ pub fn rewrite_update(
         .iter()
         .any(|assignment| assignment_target_is_column(&assignment.target, "writer_key"));
     let explicit_writer_key = extract_explicit_writer_key_assignment(&update.assignments, params)?;
+    let file_data_assignment = extract_file_data_assignment_plan(&update, params)?;
 
     let mut new_update = update.clone();
     replace_table_with_materialized(&mut new_update.table, &schema_key);
@@ -395,6 +396,7 @@ pub fn rewrite_update(
             schema_key,
             explicit_writer_key,
             writer_key_assignment_present,
+            file_data_assignment,
         },
         validation,
     })))
@@ -562,6 +564,7 @@ fn bind_statement_batch_for_dialect(
     for statement in batch.statements {
         let bound = bind_sql(&statement.to_string(), &batch.params, dialect)?;
         prepared.push(crate::sql::types::PreparedStatement {
+            statement,
             sql: bound.sql,
             params: bound.params,
         });
@@ -873,7 +876,6 @@ fn rewrite_tracked_rows(
             .push(resolved_row);
 
         mutations.push(MutationRow {
-            operation: MutationOperation::Insert,
             entity_id: resolved_string_required(
                 materialized.get(entity_idx),
                 row.get(entity_idx),
@@ -1063,7 +1065,6 @@ async fn rewrite_tracked_rows_with_backend(
         });
 
         mutations.push(MutationRow {
-            operation: MutationOperation::Insert,
             entity_id,
             schema_key,
             schema_version,
@@ -1353,7 +1354,6 @@ fn build_untracked_insert(
         ]);
 
         mutations.push(MutationRow {
-            operation: MutationOperation::Insert,
             entity_id: resolved_string_required(
                 materialized.get(entity_idx),
                 row.get(entity_idx),
@@ -1917,6 +1917,24 @@ fn extract_explicit_writer_key_assignment(
     Ok(None)
 }
 
+fn extract_file_data_assignment_plan(
+    update: &Update,
+    params: &[EngineValue],
+) -> Result<Option<FileDataAssignmentPlan>, LixError> {
+    let assignment =
+        crate::filesystem::pending_file_writes::resolve_file_data_assignment_for_update(
+            update, params,
+        )?;
+    Ok(assignment.map(|resolved| match resolved {
+        crate::filesystem::pending_file_writes::ResolvedFileDataAssignment::Uniform(bytes) => {
+            FileDataAssignmentPlan::Uniform(bytes)
+        }
+        crate::filesystem::pending_file_writes::ResolvedFileDataAssignment::ById(by_file_id) => {
+            FileDataAssignmentPlan::ByFileId(by_file_id)
+        }
+    }))
+}
+
 fn resolve_assignment_with_placeholder_state(
     expr: &Expr,
     params: &[EngineValue],
@@ -2220,7 +2238,7 @@ fn append_commit_ancestry_statements(
 
         let self_insert_sql = format!(
             "INSERT INTO {table} (commit_id, ancestor_id, depth) \
-             VALUES (?{commit_placeholder}, ?{commit_placeholder}, 0) \
+             VALUES (${commit_placeholder}, ${commit_placeholder}, 0) \
              ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
             table = COMMIT_ANCESTRY_TABLE,
             commit_placeholder = commit_placeholder,
@@ -2234,13 +2252,13 @@ fn append_commit_ancestry_statements(
 
             let insert_parent_ancestry_sql = format!(
                 "INSERT INTO {table} (commit_id, ancestor_id, depth) \
-                 SELECT ?{commit_placeholder} AS commit_id, candidate.ancestor_id, MIN(candidate.depth) AS depth \
+                 SELECT ${commit_placeholder} AS commit_id, candidate.ancestor_id, MIN(candidate.depth) AS depth \
                  FROM ( \
-                   SELECT ?{parent_placeholder} AS ancestor_id, 1 AS depth \
+                   SELECT ${parent_placeholder} AS ancestor_id, 1 AS depth \
                    UNION ALL \
                    SELECT ancestor_id, depth + 1 AS depth \
                    FROM {table} \
-                   WHERE commit_id = ?{parent_placeholder} \
+                   WHERE commit_id = ${parent_placeholder} \
                  ) AS candidate \
                  GROUP BY candidate.ancestor_id \
                  ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
@@ -3391,6 +3409,7 @@ mod tests {
     use crate::backend::SqlDialect;
     use crate::commit::{ChangeRow, GenerateCommitResult, MaterializedStateRow};
     use crate::functions::SystemFunctionProvider;
+    use crate::sql::FileDataAssignmentPlan;
     use crate::Value as EngineValue;
     use serde_json::json;
     use sqlparser::ast::{
@@ -3640,6 +3659,78 @@ mod tests {
         assert!(sql.contains("DO UPDATE"));
         assert!(sql.contains("SET depth = CASE"));
         assert!(sql.contains("GROUP BY candidate.ancestor_id"));
+    }
+
+    #[test]
+    fn commit_ancestry_upserts_use_dollar_placeholders_for_postgres_binding() {
+        let mut provider = SystemFunctionProvider;
+        let batch = build_statements_from_generate_commit_result(
+            GenerateCommitResult {
+                changes: Vec::new(),
+                materialized_state: vec![
+                    MaterializedStateRow {
+                        id: "change-commit".to_string(),
+                        entity_id: "child-commit".to_string(),
+                        schema_key: "lix_commit".to_string(),
+                        schema_version: "1".to_string(),
+                        file_id: "lix".to_string(),
+                        plugin_key: "lix".to_string(),
+                        snapshot_content: Some(
+                            json!({
+                                "id": "child-commit",
+                                "change_set_id": "child-change-set",
+                                "parent_commit_ids": ["parent-commit"],
+                                "change_ids": [],
+                            })
+                            .to_string(),
+                        ),
+                        metadata: None,
+                        created_at: "2025-01-01T00:00:00.000Z".to_string(),
+                        lixcol_version_id: "global".to_string(),
+                        lixcol_commit_id: "child-commit".to_string(),
+                        writer_key: None,
+                    },
+                    MaterializedStateRow {
+                        id: "change-edge".to_string(),
+                        entity_id: "parent-commit~child-commit".to_string(),
+                        schema_key: "lix_commit_edge".to_string(),
+                        schema_version: "1".to_string(),
+                        file_id: "lix".to_string(),
+                        plugin_key: "lix".to_string(),
+                        snapshot_content: Some(
+                            json!({
+                                "parent_id": "parent-commit",
+                                "child_id": "child-commit",
+                            })
+                            .to_string(),
+                        ),
+                        metadata: None,
+                        created_at: "2025-01-01T00:00:00.000Z".to_string(),
+                        lixcol_version_id: "global".to_string(),
+                        lixcol_commit_id: "child-commit".to_string(),
+                        writer_key: None,
+                    },
+                ],
+            },
+            &mut provider,
+            0,
+            SqlDialect::Postgres,
+        )
+        .expect("build statements");
+
+        let sql = batch
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(sql.contains("INSERT INTO lix_internal_commit_ancestry"));
+        assert!(sql.contains('$'));
+        assert!(
+            !sql.contains('?'),
+            "postgres ancestry SQL must not emit sqlite-style placeholders: {sql}"
+        );
     }
 
     #[test]
@@ -3900,6 +3991,74 @@ mod tests {
             Some(Some("editor:explicit".to_string()))
         );
         assert!(planned.plan.writer_key_assignment_present);
+    }
+
+    #[test]
+    fn rewrite_update_extracts_uniform_file_data_assignment_plan() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET data = ?
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(update, &[EngineValue::Blob(vec![1, 2, 3])])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(
+            planned.plan.file_data_assignment,
+            Some(FileDataAssignmentPlan::Uniform(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn rewrite_update_extracts_file_data_case_assignment_after_prior_placeholders() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET path = ?, data = CASE id WHEN ? THEN ? ELSE data END
+            WHERE schema_key = 'test_schema' AND id = ?"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(
+            update,
+            &[
+                EngineValue::Text("/docs/new.md".to_string()),
+                EngineValue::Text("file-1".to_string()),
+                EngineValue::Blob(vec![9, 8, 7]),
+                EngineValue::Text("file-1".to_string()),
+            ],
+        )
+        .expect("rewrite ok")
+        .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(
+            planned.plan.file_data_assignment,
+            Some(FileDataAssignmentPlan::ByFileId(
+                [("file-1".to_string(), vec![9, 8, 7])]
+                    .into_iter()
+                    .collect()
+            ))
+        );
     }
 
     #[test]

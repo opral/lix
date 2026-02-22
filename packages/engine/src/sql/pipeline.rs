@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
@@ -12,7 +12,7 @@ use crate::sql::lowering::lower_statement;
 use crate::sql::materialize_vtable_insert_select_sources;
 use crate::sql::object_name_matches;
 use crate::sql::steps::inline_lix_functions::inline_lix_functions_with_provider;
-use crate::sql::types::{PostprocessPlan, PreparedStatement, PreprocessOutput, SchemaRegistration};
+use crate::sql::types::{PreparedStatement, PreprocessOutput};
 use crate::sql::DetectedFileDomainChange;
 use crate::sql::{bind_sql_with_state_and_appended_params, PlaceholderState};
 use crate::{LixBackend, LixError, Value};
@@ -32,13 +32,32 @@ struct RewrittenStatementBinding {
     appended_params: Arc<Vec<Value>>,
 }
 
+#[cfg(test)]
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
-    let dialect = GenericDialect {};
-    Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
-        message: err.to_string(),
-    })
+    parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite)
 }
 
+pub fn parse_sql_statements_with_dialect(
+    sql: &str,
+    dialect: SqlDialect,
+) -> Result<Vec<Statement>, LixError> {
+    match dialect {
+        SqlDialect::Sqlite => {
+            let dialect = SQLiteDialect {};
+            Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
+                message: err.to_string(),
+            })
+        }
+        SqlDialect::Postgres => {
+            let dialect = PostgreSqlDialect {};
+            Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
+                message: err.to_string(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn preprocess_statements(
     statements: Vec<Statement>,
     params: &[Value],
@@ -48,41 +67,43 @@ pub fn preprocess_statements(
     preprocess_statements_with_provider(statements, params, &mut provider, dialect)
 }
 
-pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
+#[cfg(test)]
+pub fn preprocess_statements_with_provider<P>(
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
     dialect: SqlDialect,
-) -> Result<PreprocessOutput, LixError> {
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Clone + Send + 'static,
+{
     preprocess_statements_with_provider_and_writer_key(statements, params, provider, dialect, None)
 }
 
-pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
+#[cfg(test)]
+pub fn preprocess_statements_with_provider_and_writer_key<P>(
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
     dialect: SqlDialect,
     writer_key: Option<&str>,
-) -> Result<PreprocessOutput, LixError> {
+) -> Result<PreprocessOutput, LixError>
+where
+    P: LixFunctionProvider + Clone + Send + 'static,
+{
     let statement_pipeline = StatementPipeline::new(params, writer_key);
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
-    let mut postprocess: Option<PostprocessPlan> = None;
+    let mut has_postprocess = false;
     let mut rewritten = Vec::with_capacity(statements.len());
-    let mut mutations = Vec::new();
-    let mut update_validations = Vec::new();
     for statement in statements {
         let output = statement_pipeline.rewrite_statement(statement, provider)?;
-        registrations.extend(output.registrations);
-        if let Some(plan) = output.postprocess {
-            if postprocess.is_some() {
+        if output.postprocess.is_some() {
+            if has_postprocess {
                 return Err(LixError {
                     message: "only one postprocess rewrite is supported per query".to_string(),
                 });
             }
-            postprocess = Some(plan);
+            has_postprocess = true;
         }
-        mutations.extend(output.mutations);
-        update_validations.extend(output.update_validations);
         let appended_params = Arc::new(output.params);
         for rewritten_statement in output.statements {
             let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
@@ -93,7 +114,7 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         }
     }
 
-    if postprocess.is_some() && rewritten.len() != 1 {
+    if has_postprocess && rewritten.len() != 1 {
         return Err(LixError {
             message: "postprocess rewrites require a single statement".to_string(),
         });
@@ -106,30 +127,24 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         sql: normalized_sql,
         params,
         prepared_statements,
-        registrations,
-        postprocess,
-        mutations,
-        update_validations,
     })
 }
 
-async fn preprocess_statements_with_provider_and_backend<P>(
+async fn preprocess_statements_with_provider_and_backend_and_state<P>(
     backend: &dyn LixBackend,
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
     detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
     writer_key: Option<&str>,
-) -> Result<PreprocessOutput, LixError>
+    initial_placeholder_state: PlaceholderState,
+) -> Result<(PreprocessOutput, PlaceholderState), LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
     let statement_pipeline = StatementPipeline::new(params, writer_key);
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
-    let mut postprocess: Option<PostprocessPlan> = None;
+    let mut has_postprocess = false;
     let mut rewritten = Vec::with_capacity(statements.len());
-    let mut mutations = Vec::new();
-    let mut update_validations = Vec::new();
     for (statement_index, statement) in statements.into_iter().enumerate() {
         let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
             .get(statement_index)
@@ -144,17 +159,14 @@ where
             statement_detected_file_domain_changes,
         ))
         .await?;
-        registrations.extend(output.registrations);
-        if let Some(plan) = output.postprocess {
-            if postprocess.is_some() {
+        if output.postprocess.is_some() {
+            if has_postprocess {
                 return Err(LixError {
                     message: "only one postprocess rewrite is supported per query".to_string(),
                 });
             }
-            postprocess = Some(plan);
+            has_postprocess = true;
         }
-        mutations.extend(output.mutations);
-        update_validations.extend(output.update_validations);
         let appended_params = Arc::new(output.params);
         for rewritten_statement in output.statements {
             let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
@@ -165,27 +177,30 @@ where
         }
     }
 
-    if postprocess.is_some() && rewritten.len() != 1 {
+    if has_postprocess && rewritten.len() != 1 {
         return Err(LixError {
             message: "postprocess rewrites require a single statement".to_string(),
         });
     }
 
-    let (normalized_sql, params, prepared_statements) =
-        render_statements_with_params(&rewritten, params, backend.dialect())?;
+    let (normalized_sql, params, prepared_statements, next_placeholder_state) =
+        render_statements_with_params_from_state(
+            &rewritten,
+            params,
+            backend.dialect(),
+            initial_placeholder_state,
+        )?;
 
-    Ok(PreprocessOutput {
-        sql: normalized_sql,
-        params,
-        prepared_statements,
-        registrations,
-        postprocess,
-        mutations,
-        update_validations,
-    })
+    Ok((
+        PreprocessOutput {
+            sql: normalized_sql,
+            params,
+            prepared_statements,
+        },
+        next_placeholder_state,
+    ))
 }
 
-#[allow(dead_code)]
 pub async fn preprocess_sql(
     backend: &dyn LixBackend,
     evaluator: &CelEvaluator,
@@ -233,7 +248,7 @@ where
     preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
         backend,
         evaluator,
-        parse_sql_statements(sql)?,
+        parse_sql_statements_with_dialect(sql, backend.dialect())?,
         params,
         functions,
         detected_file_domain_changes_by_statement,
@@ -256,6 +271,36 @@ pub async fn preprocess_parsed_statements_with_provider_and_detected_file_domain
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    let (output, _) =
+        preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_and_state(
+            backend,
+            evaluator,
+            statements,
+            params,
+            functions,
+            detected_file_domain_changes_by_statement,
+            writer_key,
+            PlaceholderState::new(),
+        )
+        .await?;
+    Ok(output)
+}
+
+pub async fn preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_and_state<
+    P: LixFunctionProvider,
+>(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    statements: Vec<Statement>,
+    params: &[Value],
+    functions: SharedFunctionProvider<P>,
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    writer_key: Option<&str>,
+    initial_placeholder_state: PlaceholderState,
+) -> Result<(PreprocessOutput, PlaceholderState), LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let params = params.to_vec();
     let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
@@ -268,30 +313,52 @@ where
     )
     .await?;
     let mut provider = functions.clone();
-    preprocess_statements_with_provider_and_backend(
+    preprocess_statements_with_provider_and_backend_and_state(
         backend,
         statements,
         &params,
         &mut provider,
         detected_file_domain_changes_by_statement,
         writer_key,
+        initial_placeholder_state,
     )
     .await
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn preprocess_sql_rewrite_only(sql: &str) -> Result<PreprocessOutput, LixError> {
-    preprocess_statements(parse_sql_statements(sql)?, &[], SqlDialect::Sqlite)
+    preprocess_statements(
+        parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite)?,
+        &[],
+        SqlDialect::Sqlite,
+    )
 }
 
+#[cfg(test)]
 fn render_statements_with_params(
     statements: &[RewrittenStatementBinding],
     base_params: &[Value],
     dialect: SqlDialect,
 ) -> Result<(String, Vec<Value>, Vec<PreparedStatement>), LixError> {
+    let (normalized_sql, params, prepared_statements, _) =
+        render_statements_with_params_from_state(
+            statements,
+            base_params,
+            dialect,
+            PlaceholderState::new(),
+        )?;
+
+    Ok((normalized_sql, params, prepared_statements))
+}
+
+fn render_statements_with_params_from_state(
+    statements: &[RewrittenStatementBinding],
+    base_params: &[Value],
+    dialect: SqlDialect,
+    mut placeholder_state: PlaceholderState,
+) -> Result<(String, Vec<Value>, Vec<PreparedStatement>, PlaceholderState), LixError> {
     let mut rendered = Vec::with_capacity(statements.len());
     let mut prepared_statements = Vec::with_capacity(statements.len());
-    let mut placeholder_state = PlaceholderState::new();
 
     for statement in statements {
         let bound = bind_sql_with_state_and_appended_params(
@@ -304,6 +371,7 @@ fn render_statements_with_params(
         placeholder_state = bound.state;
         rendered.push(bound.sql.clone());
         prepared_statements.push(PreparedStatement {
+            statement: statement.statement.clone(),
             sql: bound.sql,
             params: bound.params,
         });
@@ -316,7 +384,12 @@ fn render_statements_with_params(
         Vec::new()
     };
 
-    Ok((normalized_sql, compatibility_params, prepared_statements))
+    Ok((
+        normalized_sql,
+        compatibility_params,
+        prepared_statements,
+        placeholder_state,
+    ))
 }
 
 fn coalesce_vtable_inserts_in_transactions(
@@ -339,37 +412,6 @@ fn coalesce_vtable_inserts_in_transactions(
                 result.push(statement);
             }
             Statement::Insert(insert) if in_transaction => {
-                if let Some(existing) = pending_insert.as_mut() {
-                    if can_merge_vtable_insert(existing, &insert) {
-                        append_insert_rows(existing, &insert)?;
-                    } else {
-                        flush_pending_insert(&mut result, &mut pending_insert);
-                        pending_insert = Some(insert);
-                    }
-                } else {
-                    pending_insert = Some(insert);
-                }
-            }
-            other => {
-                flush_pending_insert(&mut result, &mut pending_insert);
-                result.push(other);
-            }
-        }
-    }
-
-    flush_pending_insert(&mut result, &mut pending_insert);
-    Ok(result)
-}
-
-pub(crate) fn coalesce_vtable_inserts_in_statement_list(
-    statements: Vec<Statement>,
-) -> Result<Vec<Statement>, LixError> {
-    let mut result = Vec::with_capacity(statements.len());
-    let mut pending_insert: Option<Insert> = None;
-
-    for statement in statements {
-        match statement {
-            Statement::Insert(insert) => {
                 if let Some(existing) = pending_insert.as_mut() {
                     if can_merge_vtable_insert(existing, &insert) {
                         append_insert_rows(existing, &insert)?;
@@ -509,7 +551,10 @@ fn query_is_plain_values(query: &Query) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sql_statements, preprocess_sql_rewrite_only, preprocess_statements};
+    use super::{
+        parse_sql_statements, parse_sql_statements_with_dialect, preprocess_sql_rewrite_only,
+        preprocess_statements,
+    };
     use crate::backend::SqlDialect;
     use crate::Value;
 
@@ -542,6 +587,20 @@ mod tests {
         assert!(
             rewritten.sql.contains("jsonb_extract_path_text("),
             "postgres lowering should emit jsonb_extract_path_text()"
+        );
+    }
+
+    #[test]
+    fn dialect_aware_parser_rejects_backtick_identifiers_for_postgres() {
+        parse_sql_statements_with_dialect("SELECT `id` FROM `files`", SqlDialect::Sqlite)
+            .expect("sqlite parser should accept backtick identifiers");
+
+        let error =
+            parse_sql_statements_with_dialect("SELECT `id` FROM `files`", SqlDialect::Postgres)
+                .expect_err("postgres parser should reject backtick identifiers");
+        assert!(
+            !error.message.is_empty(),
+            "parser error message should include context"
         );
     }
 

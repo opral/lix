@@ -3,7 +3,6 @@ use std::collections::VecDeque;
 use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
-use crate::sql::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
 use crate::sql::steps::lix_state_history_view_write;
 use crate::sql::types::RewriteOutput;
 use crate::sql::DetectedFileDomainChange;
@@ -20,32 +19,10 @@ pub(crate) mod stored_schema_write;
 pub(crate) mod vtable_write;
 
 use super::context::StatementContext;
-use super::helpers::{
-    merge_rewrite_output, rewrite_vtable_inserts, rewrite_vtable_inserts_with_backend,
-};
+use super::helpers::{merge_rewrite_output, rewrite_vtable_inserts_with_backend};
 use super::outcome::StatementRuleOutcome;
 
 const MAX_REWRITE_PASSES: usize = 32;
-
-pub(crate) fn rewrite_sync_statement<P: LixFunctionProvider>(
-    statement: Statement,
-    params: &[Value],
-    writer_key: Option<&str>,
-    functions: &mut P,
-) -> Result<Option<RewriteOutput>, LixError> {
-    let mut context = StatementContext::new_sync(params, writer_key);
-    let outcome = rewrite_sync_loop(statement, &mut context, functions)?;
-
-    match outcome {
-        StatementRuleOutcome::Emit(output) => Ok(Some(output)),
-        StatementRuleOutcome::Continue(statement) => Err(LixError {
-            message: format!(
-                "write canonical sync rewrite terminated without convergence for statement: {statement}"
-            ),
-        }),
-        StatementRuleOutcome::NoMatch => Ok(None),
-    }
-}
 
 pub(crate) async fn rewrite_backend_statement<P>(
     backend: &dyn LixBackend,
@@ -113,205 +90,6 @@ where
     } else {
         Ok(Some(final_output))
     }
-}
-
-fn rewrite_sync_loop<P: LixFunctionProvider>(
-    statement: Statement,
-    context: &mut StatementContext<'_>,
-    functions: &mut P,
-) -> Result<StatementRuleOutcome, LixError> {
-    let mut current = statement;
-
-    if !matches!(
-        current,
-        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-    ) {
-        return Ok(StatementRuleOutcome::NoMatch);
-    }
-
-    for _ in 0..MAX_REWRITE_PASSES {
-        match current {
-            Statement::Insert(insert) => {
-                lix_state_history_view_write::reject_insert(&insert)?;
-
-                if let Some(rewritten) = filesystem_write::rewrite_insert(insert.clone())? {
-                    current = Statement::Insert(rewritten);
-                    continue;
-                }
-                if let Some(version_inserts) =
-                    lix_version_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    let output = rewrite_vtable_inserts(
-                        version_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )?;
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-                if let Some(active_account_inserts) =
-                    lix_active_account_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    let output = rewrite_vtable_inserts(
-                        active_account_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )?;
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-                if let Some(rewritten) =
-                    entity_view_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    current = Statement::Insert(rewritten);
-                    continue;
-                }
-
-                let mut current_insert = insert;
-                if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_insert(current_insert.clone())?
-                {
-                    current_insert = rewritten;
-                }
-                if let Some(rewritten) =
-                    stored_schema_write::rewrite_insert(current_insert.clone(), context.params)?
-                {
-                    context.registrations.push(rewritten.registration);
-                    context.mutations.push(rewritten.mutation);
-                    let Statement::Insert(insert_statement) = rewritten.statement else {
-                        return Err(LixError {
-                            message: "stored schema rewrite expected insert statement".to_string(),
-                        });
-                    };
-                    current_insert = insert_statement;
-                }
-                let mut statements = Vec::new();
-                if let Some(rewritten) = vtable_write::rewrite_insert_with_writer_key(
-                    current_insert.clone(),
-                    context.params,
-                    context.writer_key,
-                    functions,
-                )? {
-                    context.registrations.extend(rewritten.registrations);
-                    context.generated_params.extend(rewritten.params);
-                    context.mutations.extend(rewritten.mutations);
-                    statements = rewritten.statements;
-                }
-                if statements.is_empty() {
-                    statements.push(Statement::Insert(current_insert));
-                }
-
-                return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
-            }
-            Statement::Update(update) => {
-                lix_state_history_view_write::reject_update(&update)?;
-
-                if let Some(rewritten) = filesystem_write::rewrite_update(update.clone())? {
-                    current = rewritten;
-                    continue;
-                }
-                if let Some(rewritten) =
-                    entity_view_write::rewrite_update(update.clone(), context.params)?
-                {
-                    current = Statement::Update(rewritten);
-                    continue;
-                }
-
-                let update = if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_update(update.clone())?
-                {
-                    rewritten
-                } else {
-                    update
-                };
-
-                let output = vtable_write::rewrite_update(update, context.params)?;
-                return Ok(StatementRuleOutcome::Emit(output));
-            }
-            Statement::Delete(delete) => {
-                lix_state_history_view_write::reject_delete(&delete)?;
-
-                if let Some(rewritten) = filesystem_write::rewrite_delete(delete.clone())? {
-                    current = Statement::Delete(rewritten);
-                    continue;
-                }
-                if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
-                    current = Statement::Delete(rewritten);
-                    continue;
-                }
-
-                let mut effective_scope_fallback = false;
-                let delete = if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_delete(delete.clone())?
-                {
-                    effective_scope_fallback = true;
-                    rewritten
-                } else {
-                    delete
-                };
-
-                let output = vtable_write::rewrite_delete(delete, effective_scope_fallback)?;
-                return Ok(StatementRuleOutcome::Emit(output));
-            }
-            Statement::Query(query) => {
-                let query = crate::sql::pipeline::query_engine::rewrite_read_query(*query)?;
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Query(Box::new(query))],
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-            Statement::Explain {
-                describe_alias,
-                analyze,
-                verbose,
-                query_plan,
-                estimate,
-                statement,
-                format,
-                options,
-            } => {
-                let statement = match *statement {
-                    Statement::Query(query) => Statement::Query(Box::new(
-                        crate::sql::pipeline::query_engine::rewrite_read_query(*query)?,
-                    )),
-                    other => other,
-                };
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Explain {
-                        describe_alias,
-                        analyze,
-                        verbose,
-                        query_plan,
-                        estimate,
-                        statement: Box::new(statement),
-                        format,
-                        options,
-                    }],
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-            other => {
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![other],
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-        }
-    }
-
-    Ok(StatementRuleOutcome::Continue(current))
 }
 
 async fn rewrite_backend_loop<P>(
@@ -635,63 +413,10 @@ where
                 let output = vtable_write::rewrite_delete(delete, effective_scope_fallback)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
-            Statement::Query(query) => {
-                let query =
-                    rewrite_read_query_with_backend_and_params(backend, *query, context.params)
-                        .await?;
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Query(Box::new(query))],
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-            Statement::Explain {
-                describe_alias,
-                analyze,
-                verbose,
-                query_plan,
-                estimate,
-                statement,
-                format,
-                options,
-            } => {
-                let statement = match *statement {
-                    Statement::Query(query) => Statement::Query(Box::new(
-                        rewrite_read_query_with_backend_and_params(backend, *query, context.params)
-                            .await?,
-                    )),
-                    other => other,
-                };
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![Statement::Explain {
-                        describe_alias,
-                        analyze,
-                        verbose,
-                        query_plan,
-                        estimate,
-                        statement: Box::new(statement),
-                        format,
-                        options,
-                    }],
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
-            }
-            other => {
-                return Ok(StatementRuleOutcome::Emit(RewriteOutput {
-                    statements: vec![other],
-                    params: Vec::new(),
-                    registrations: Vec::new(),
-                    postprocess: None,
-                    mutations: Vec::new(),
-                    update_validations: Vec::new(),
-                }));
+            _ => {
+                return Ok(StatementRuleOutcome::Emit(
+                    context.take_output(vec![current]),
+                ));
             }
         }
     }

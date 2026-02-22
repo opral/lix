@@ -1,23 +1,11 @@
-#[cfg(debug_assertions)]
 use std::collections::BTreeSet;
 
-use sqlparser::ast::Query;
-#[cfg(debug_assertions)]
-use sqlparser::ast::{ObjectNamePart, TableFactor};
+use sqlparser::ast::{ObjectNamePart, Query, TableFactor};
 
-#[cfg(debug_assertions)]
+use crate::sql::pipeline::walker::walk_query;
 use crate::sql::{visit_query_selects, visit_table_factors_in_select};
 use crate::LixError;
 
-#[cfg(debug_assertions)]
-use crate::sql::pipeline::walker::walk_query;
-
-#[cfg(not(debug_assertions))]
-pub(crate) fn validate_relation_discovery_consistency(_query: &Query) -> Result<(), LixError> {
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
 pub(crate) fn validate_relation_discovery_consistency(query: &Query) -> Result<(), LixError> {
     let walker_relations = walk_query(query).relation_names;
     let select_visit_relations = collect_relation_names_via_select_visit(query)?;
@@ -39,7 +27,6 @@ pub(crate) fn validate_relation_discovery_consistency(query: &Query) -> Result<(
     })
 }
 
-#[cfg(debug_assertions)]
 fn collect_relation_names_via_select_visit(query: &Query) -> Result<BTreeSet<String>, LixError> {
     let mut names = BTreeSet::new();
     visit_query_selects(query, &mut |select| {

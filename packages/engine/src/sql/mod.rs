@@ -6,6 +6,7 @@ mod escaping;
 mod lowering;
 mod params;
 mod pipeline;
+mod planner;
 mod read_pipeline;
 mod rewrite;
 mod row_resolution;
@@ -37,14 +38,20 @@ pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
     bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
 };
-pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
+#[cfg(test)]
+pub use pipeline::parse_sql_statements;
+#[cfg(test)]
+pub use pipeline::preprocess_sql_rewrite_only;
 #[allow(unused_imports)]
 pub use pipeline::{
-    parse_sql_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
-    preprocess_sql_rewrite_only, preprocess_sql_with_provider,
-    preprocess_sql_with_provider_and_detected_file_domain_changes, preprocess_statements,
-    preprocess_statements_with_provider, preprocess_statements_with_provider_and_writer_key,
+    parse_sql_statements_with_dialect,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_and_state,
+    preprocess_sql, preprocess_sql_with_provider,
+    preprocess_sql_with_provider_and_detected_file_domain_changes,
+};
+pub(crate) use planner::{
+    compile_statement_with_state, prepare_statement_block_with_transaction_flag, StatementBlock,
 };
 pub(crate) use read_pipeline::{
     rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
@@ -52,18 +59,18 @@ pub(crate) use read_pipeline::{
 };
 #[cfg(test)]
 pub(crate) use rewrite::extract_explicit_transaction_script;
-pub(crate) use rewrite::{
-    coalesce_lix_file_transaction_statements, extract_explicit_transaction_script_from_statements,
-};
+pub(crate) use rewrite::extract_explicit_transaction_script_from_statements;
 pub(crate) use row_resolution::{
     insert_values_rows_mut, materialize_vtable_insert_select_sources, resolve_expr_cell_with_state,
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
 };
+pub(crate) use steps::lix_state_history_view_read::ensure_history_timeline_materialized_for_statement_with_state;
 pub use steps::vtable_write::{
     build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
 };
 pub(crate) use steps::working_projection_refresh::refresh_working_projection_for_read_query;
+pub(crate) use types::FileDataAssignmentPlan;
 pub use types::PostprocessPlan;
 pub(crate) use types::PreparedStatement;
 pub use types::SchemaRegistration;
-pub use types::{MutationOperation, MutationRow, UpdateValidationPlan};
+pub use types::{MutationRow, UpdateValidationPlan};

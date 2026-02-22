@@ -1,4 +1,4 @@
-use crate::sql::{MutationOperation, MutationRow};
+use crate::sql::MutationRow;
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
@@ -469,7 +469,7 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
     mutations
         .iter()
         .map(|mutation| StateCommitStreamChange {
-            operation: map_mutation_operation(&mutation.operation),
+            operation: map_mutation_operation(mutation),
             entity_id: mutation.entity_id.clone(),
             schema_key: mutation.schema_key.clone(),
             schema_version: mutation.schema_version.clone(),
@@ -483,10 +483,10 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
         .collect()
 }
 
-fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
-    match operation {
-        MutationOperation::Insert => StateCommitStreamOperation::Insert,
-        MutationOperation::Update => StateCommitStreamOperation::Update,
-        MutationOperation::Delete => StateCommitStreamOperation::Delete,
+fn map_mutation_operation(mutation: &MutationRow) -> StateCommitStreamOperation {
+    if mutation.snapshot_content.is_none() {
+        StateCommitStreamOperation::Delete
+    } else {
+        StateCommitStreamOperation::Insert
     }
 }

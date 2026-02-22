@@ -14,25 +14,20 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::materialization::{
-    MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
-    MaterializationReport, MaterializationRequest, MaterializationScope,
+    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
-use crate::schema_registry::{register_schema, register_schema_sql_statements};
+use crate::schema_registry::register_schema_sql_statements;
 use crate::sql::{
-    active_version_from_mutations, active_version_from_update_validations, bind_sql_with_state,
-    build_delete_followup_sql, build_update_followup_sql, coalesce_lix_file_transaction_statements,
-    coalesce_vtable_inserts_in_statement_list, escape_sql_string,
-    extract_explicit_transaction_script_from_statements,
+    active_version_from_mutations, active_version_from_update_validations,
+    build_delete_followup_sql, build_update_followup_sql, escape_sql_string,
     file_history_read_materialization_required_for_statements,
-    file_read_materialization_scope_for_statements, is_query_only_statements, parse_sql_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
+    file_read_materialization_scope_for_statements, is_query_only_statements, preprocess_sql,
     should_invalidate_installed_plugins_cache_for_sql,
     should_invalidate_installed_plugins_cache_for_statements,
     should_refresh_file_cache_for_statements, DetectedFileDomainChange,
-    FileReadMaterializationScope, MutationOperation, MutationRow, PlaceholderState,
-    PostprocessPlan,
+    FileReadMaterializationScope, MutationRow, PostprocessPlan,
 };
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,
@@ -75,9 +70,6 @@ mod init_seed;
 mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
-
-#[cfg(test)]
-use self::execute::should_sequentialize_postprocess_multi_statement;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -151,7 +143,6 @@ impl<'a> EngineTransaction<'a> {
                 params,
                 &self.options,
                 &mut self.active_version_id,
-                None,
                 false,
                 &mut self.pending_state_commit_stream_changes,
             )
@@ -159,7 +150,7 @@ impl<'a> EngineTransaction<'a> {
         if self.active_version_id != previous_active_version_id {
             self.active_version_changed = true;
         }
-        if should_invalidate_installed_plugins_cache_for_sql(sql) {
+        if should_invalidate_installed_plugins_cache_for_sql(sql, self.engine.dialect()) {
             self.installed_plugins_cache_invalidation_pending = true;
         }
         Ok(result)
@@ -208,18 +199,8 @@ struct TransactionBackendAdapter<'a> {
 pub(crate) struct CollectedExecutionSideEffects {
     pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
     pending_file_delete_targets: BTreeSet<(String, String)>,
-    detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
     detected_file_domain_changes: Vec<DetectedFileDomainChange>,
     untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
-}
-
-#[derive(Default)]
-pub(crate) struct DeferredTransactionSideEffects {
-    pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pending_file_delete_targets: BTreeSet<(String, String)>,
-    detected_file_domain_changes: Vec<DetectedFileDomainChange>,
-    untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
-    file_cache_invalidation_targets: BTreeSet<(String, String)>,
 }
 
 fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
@@ -293,6 +274,10 @@ impl Engine {
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
         }
     }
+
+    pub(crate) fn dialect(&self) -> crate::SqlDialect {
+        self.backend.dialect()
+    }
 }
 
 fn file_name_and_extension_from_path(path: &str) -> Option<(String, Option<String>)> {
@@ -324,39 +309,6 @@ fn file_name_and_extension_from_path(path: &str) -> Option<(String, Option<Strin
     Some((name, extension))
 }
 
-fn collapse_pending_file_writes_for_transaction(
-    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-) -> Vec<crate::filesystem::pending_file_writes::PendingFileWrite> {
-    let mut collapsed =
-        Vec::<crate::filesystem::pending_file_writes::PendingFileWrite>::with_capacity(
-            writes.len(),
-        );
-    let mut index_by_key = BTreeMap::<(String, String), usize>::new();
-
-    for write in writes {
-        let key = (write.file_id.clone(), write.version_id.clone());
-        if let Some(index) = index_by_key.get(&key).copied() {
-            let existing = &mut collapsed[index];
-            existing.after_path = write.after_path.clone();
-            existing.after_data = write.after_data.clone();
-            existing.data_is_authoritative =
-                existing.data_is_authoritative || write.data_is_authoritative;
-            if existing.before_path.is_none() {
-                existing.before_path = write.before_path.clone();
-            }
-            if existing.before_data.is_none() {
-                existing.before_data = write.before_data.clone();
-            }
-            continue;
-        }
-
-        index_by_key.insert(key, collapsed.len());
-        collapsed.push(write.clone());
-    }
-
-    collapsed
-}
-
 fn direct_state_file_cache_refresh_targets(
     mutations: &[MutationRow],
 ) -> BTreeSet<(String, String)> {
@@ -375,10 +327,7 @@ fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet
         .iter()
         .filter(|mutation| !mutation.untracked)
         .filter(|mutation| mutation.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-        .filter(|mutation| {
-            matches!(mutation.operation, MutationOperation::Delete)
-                || mutation.snapshot_content.is_none()
-        })
+        .filter(|mutation| mutation.snapshot_content.is_none())
         .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
 }
@@ -513,6 +462,7 @@ fn detected_file_domain_changes_from_detected_file_changes(
         .collect()
 }
 
+#[cfg(test)]
 fn detected_file_domain_changes_with_writer_key(
     changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
@@ -525,72 +475,6 @@ fn detected_file_domain_changes_with_writer_key(
             next
         })
         .collect()
-}
-
-async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
-    backend: &dyn LixBackend,
-    statements: &[Statement],
-    params: &[Value],
-) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let mut placeholder_state = PlaceholderState::new();
-    let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
-    let mut untracked_changes = Vec::new();
-    for statement in statements {
-        match statement {
-            Statement::Update(update) => {
-                let side_effects =
-                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                        backend,
-                        &update,
-                        params,
-                        &mut placeholder_state,
-                    )
-                    .await?;
-                let statement_tracked_changes =
-                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
-                tracked_changes_by_statement.push(statement_tracked_changes);
-                untracked_changes.extend(side_effects.untracked_directory_changes);
-            }
-            other => {
-                tracked_changes_by_statement.push(Vec::new());
-                advance_placeholder_state_for_statement(
-                    &other,
-                    params,
-                    backend.dialect(),
-                    &mut placeholder_state,
-                )?;
-            }
-        }
-    }
-
-    Ok(FilesystemUpdateDomainChangeCollection {
-        untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
-        tracked_changes_by_statement,
-    })
-}
-
-struct FilesystemUpdateDomainChangeCollection {
-    untracked_changes: Vec<DetectedFileDomainChange>,
-    tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
-}
-
-fn advance_placeholder_state_for_statement(
-    statement: &Statement,
-    params: &[Value],
-    dialect: crate::backend::SqlDialect,
-    placeholder_state: &mut PlaceholderState,
-) -> Result<(), LixError> {
-    let statement_sql = statement.to_string();
-    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
-        |error| LixError {
-            message: format!(
-                "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.message
-            ),
-        },
-    )?;
-    *placeholder_state = bound.state;
-    Ok(())
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -613,20 +497,18 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_placeholder_state_for_statement, boot,
-        detected_file_domain_changes_from_detected_file_changes,
+        boot, detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
-        should_sequentialize_postprocess_multi_statement, BootArgs, ExecuteOptions,
+        BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::sql::{
-        active_version_from_update_validations, bind_sql_with_state,
-        coalesce_lix_file_transaction_statements, extract_explicit_transaction_script,
+        active_version_from_update_validations, extract_explicit_transaction_script,
         file_history_read_materialization_required_for_sql,
         file_read_materialization_scope_for_sql, is_query_only_sql, parse_sql_statements,
         should_invalidate_installed_plugins_cache_for_sql, should_refresh_file_cache_for_sql,
-        FileReadMaterializationScope, MutationOperation, MutationRow, PlaceholderState,
+        FileReadMaterializationScope, MutationRow,
     };
     use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
     use crate::version::active_version_schema_key;
@@ -637,17 +519,22 @@ mod tests {
     use serde_json::json;
     use sqlparser::ast::{Expr, Statement};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, Mutex, RwLock};
     struct TestBackend {
+        dialect: SqlDialect,
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
         active_version_snapshot: Arc<RwLock<String>>,
         restored_active_version_snapshot: String,
+        transaction_exec_log: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
+        file_descriptor_execution_rows: Arc<RwLock<Vec<(String, String, Option<String>)>>>,
     }
 
     struct TestTransaction {
+        dialect: SqlDialect,
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
+        transaction_exec_log: Arc<Mutex<Vec<(String, Vec<Value>)>>>,
     }
 
     #[derive(Default)]
@@ -662,7 +549,7 @@ mod tests {
     #[async_trait(?Send)]
     impl LixBackend for TestBackend {
         fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
+            self.dialect
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
@@ -678,13 +565,37 @@ mod tests {
                     rows: vec![vec![Value::Text(snapshot)]],
                 });
             }
+            if sql.contains("FROM lix_internal_state_vtable")
+                && sql.contains("schema_key = 'lix_file_descriptor'")
+                && sql.contains("untracked = 0")
+            {
+                let rows = self
+                    .file_descriptor_execution_rows
+                    .read()
+                    .expect("file_descriptor_execution_rows lock")
+                    .iter()
+                    .map(|(entity_id, version_id, snapshot_content)| {
+                        vec![
+                            Value::Text(entity_id.clone()),
+                            Value::Text(version_id.clone()),
+                            match snapshot_content {
+                                Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+                                None => Value::Null,
+                            },
+                        ]
+                    })
+                    .collect();
+                return Ok(QueryResult { rows });
+            }
             Ok(QueryResult { rows: Vec::new() })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
             Ok(Box::new(TestTransaction {
+                dialect: self.dialect,
                 commit_called: Arc::clone(&self.commit_called),
                 rollback_called: Arc::clone(&self.rollback_called),
+                transaction_exec_log: Arc::clone(&self.transaction_exec_log),
             }))
         }
 
@@ -705,14 +616,14 @@ mod tests {
     #[async_trait(?Send)]
     impl LixTransaction for TestTransaction {
         fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
+            self.dialect
         }
 
-        async fn execute(
-            &mut self,
-            _sql: &str,
-            _params: &[Value],
-        ) -> Result<QueryResult, LixError> {
+        async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+            self.transaction_exec_log
+                .lock()
+                .expect("transaction_exec_log lock")
+                .push((sql.to_string(), params.to_vec()));
             Ok(QueryResult { rows: Vec::new() })
         }
 
@@ -823,96 +734,537 @@ mod tests {
     #[test]
     fn plugin_cache_invalidation_detects_internal_plugin_mutations_only() {
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "INSERT INTO lix_internal_plugin (key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
+            "INSERT INTO lix_internal_plugin (key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')",
+            SqlDialect::Sqlite,
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "UPDATE lix_internal_plugin SET match_path_glob = '*.md' WHERE key = 'k'"
+            "UPDATE lix_internal_plugin SET match_path_glob = '*.md' WHERE key = 'k'",
+            SqlDialect::Sqlite,
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "DELETE FROM lix_internal_plugin WHERE key = 'k'"
+            "DELETE FROM lix_internal_plugin WHERE key = 'k'",
+            SqlDialect::Sqlite,
         ));
         assert!(!should_invalidate_installed_plugins_cache_for_sql(
-            "SELECT * FROM lix_internal_plugin WHERE key = 'k'"
-        ));
-    }
-
-    #[test]
-    fn sequentialize_postprocess_multi_statement_detects_both_pipeline_errors() {
-        let sql =
-            "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'";
-        for message in [
-            "postprocess rewrites require a single statement",
-            "only one postprocess rewrite is supported per query",
-        ] {
-            let error = LixError {
-                message: message.to_string(),
-            };
-            assert!(
-                should_sequentialize_postprocess_multi_statement(sql, &[], &error),
-                "expected sequentialization for error message: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn sequentialize_postprocess_multi_statement_rejects_params_and_explicit_transaction_wrappers()
-    {
-        let error = LixError {
-            message: "only one postprocess rewrite is supported per query".to_string(),
-        };
-        assert!(!should_sequentialize_postprocess_multi_statement(
-            "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'",
-            &[Value::Text("f1".to_string())],
-            &error,
-        ));
-        assert!(!should_sequentialize_postprocess_multi_statement(
-            "BEGIN; UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; COMMIT;",
-            &[],
-            &error,
+            "SELECT * FROM lix_internal_plugin WHERE key = 'k'",
+            SqlDialect::Sqlite,
         ));
     }
 
     #[tokio::test]
-    async fn sequential_multi_statement_fallback_executes_inside_single_transaction() {
+    async fn unified_execute_multi_statement_runs_inside_single_transaction() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
         let engine = boot(BootArgs::new(
             Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
                 commit_called: Arc::clone(&commit_called),
                 rollback_called: Arc::clone(&rollback_called),
                 active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
                     "global",
                 ))),
                 restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
             }),
             Arc::new(NoopWasmRuntime),
         ));
 
         engine
-            .execute_multi_statement_sequential_with_options(
-                "SELECT 1; SELECT 2;",
-                &[],
-                &ExecuteOptions::default(),
-            )
+            .execute("SELECT 1; SELECT 2;", &[], ExecuteOptions::default())
             .await
-            .expect("sequential multi-statement execution should succeed");
+            .expect("multi-statement execution should succeed");
 
         assert!(commit_called.load(Ordering::SeqCst));
         assert!(!rollback_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
+    async fn side_effect_collection_is_derived_from_execution_state_for_mutated_targets() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(vec![
+                    (
+                        "file-placeholder-state".to_string(),
+                        "global".to_string(),
+                        Some("{\"path\":\"/from-execution-state.txt\"}".to_string()),
+                    ),
+                    ("deleted-file".to_string(), "global".to_string(), None),
+                ])),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let side_effects = engine
+            .collect_execution_side_effects_with_backend_from_mutations(
+                engine.backend.as_ref(),
+                &[
+                    MutationRow {
+                        entity_id: "file-placeholder-state".to_string(),
+                        schema_key: "lix_file_descriptor".to_string(),
+                        schema_version: "1".to_string(),
+                        file_id: "lix".to_string(),
+                        version_id: "global".to_string(),
+                        plugin_key: "lix".to_string(),
+                        snapshot_content: Some(serde_json::json!({
+                            "path": "/from-mutation-plan.txt"
+                        })),
+                        untracked: false,
+                    },
+                    MutationRow {
+                        entity_id: "deleted-file".to_string(),
+                        schema_key: "lix_file_descriptor".to_string(),
+                        schema_version: "1".to_string(),
+                        file_id: "lix".to_string(),
+                        version_id: "global".to_string(),
+                        plugin_key: "lix".to_string(),
+                        snapshot_content: Some(serde_json::json!({
+                            "path": "/from-mutation-plan-delete-ignored.txt"
+                        })),
+                        untracked: false,
+                    },
+                ],
+                None,
+            )
+            .await
+            .expect("side-effect collection should be derived from executed descriptor state");
+
+        assert_eq!(side_effects.pending_file_writes.len(), 2);
+        assert!(side_effects.pending_file_writes.iter().any(|write| {
+            write.file_id == "file-placeholder-state"
+                && write.version_id == "global"
+                && write.after_path.as_deref() == Some("/from-execution-state.txt")
+                && !write.data_is_authoritative
+        }));
+        assert!(side_effects.pending_file_writes.iter().any(|write| {
+            write.file_id == "deleted-file"
+                && write.version_id == "global"
+                && write.after_path.is_none()
+                && write.data_is_authoritative
+        }));
+        assert!(side_effects
+            .pending_file_delete_targets
+            .contains(&("deleted-file".to_string(), "global".to_string())));
+        assert!(side_effects
+            .untracked_filesystem_update_domain_changes
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn filesystem_update_side_effects_are_derived_from_update_returning_rows() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let rows = vec![vec![
+            Value::Text("entity-1".to_string()),
+            Value::Text("file-1".to_string()),
+            Value::Text("version-1".to_string()),
+            Value::Text("plugin-1".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("{\"path\":\"/docs/archive/file.json\"}".to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-01-01T00:00:00.000Z".to_string()),
+        ]];
+        let (tracked, untracked) = engine
+            .collect_filesystem_update_detected_file_domain_changes_from_update_rows(
+                engine.backend.as_ref(),
+                "lix_file_descriptor",
+                &rows,
+                Some("writer-1"),
+            )
+            .await
+            .expect("filesystem update row side-effects should succeed");
+
+        assert_eq!(tracked.len(), 2);
+        assert!(tracked
+            .iter()
+            .all(|change| change.schema_key == "lix_directory_descriptor"));
+        assert!(tracked
+            .iter()
+            .all(|change| change.version_id == "version-1"));
+        assert!(tracked
+            .iter()
+            .all(|change| change.writer_key.as_deref() == Some("writer-1")));
+        assert!(untracked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filesystem_update_pending_writes_are_derived_from_update_returning_rows() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let rows = vec![vec![
+            Value::Text("entity-1".to_string()),
+            Value::Text("file-1".to_string()),
+            Value::Text("version-1".to_string()),
+            Value::Text("plugin-1".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("{\"path\":\"/docs/report.md\"}".to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-01-01T00:00:00.000Z".to_string()),
+        ]];
+        let writes = engine
+            .collect_filesystem_update_pending_file_writes_from_update_rows(
+                engine.backend.as_ref(),
+                "lix_file_descriptor",
+                &rows,
+            )
+            .await
+            .expect("filesystem update pending writes should be derivable from rows");
+
+        assert_eq!(writes.len(), 1);
+        let write = &writes[0];
+        assert_eq!(write.file_id, "file-1");
+        assert_eq!(write.version_id, "version-1");
+        assert_eq!(write.after_path.as_deref(), Some("/docs/report.md"));
+        assert!(!write.data_is_authoritative);
+    }
+
+    #[tokio::test]
+    async fn filesystem_update_data_pending_writes_are_derived_from_rows_and_plan() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let rows = vec![vec![
+            Value::Text("entity-1".to_string()),
+            Value::Text("file-1".to_string()),
+            Value::Text("version-1".to_string()),
+            Value::Text("plugin-1".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("{\"path\":\"/docs/report.md\"}".to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-01-01T00:00:00.000Z".to_string()),
+        ]];
+        let file_data_assignment = crate::sql::FileDataAssignmentPlan::Uniform(vec![1, 2, 3, 4]);
+        let writes = engine
+            .collect_filesystem_update_data_pending_file_writes_from_rows(
+                engine.backend.as_ref(),
+                "lix_file_descriptor",
+                Some(&file_data_assignment),
+                &rows,
+            )
+            .await
+            .expect("filesystem data writes should be derivable from rows and plan");
+
+        assert_eq!(writes.len(), 1);
+        let write = &writes[0];
+        assert_eq!(write.file_id, "file-1");
+        assert_eq!(write.version_id, "version-1");
+        assert_eq!(write.after_path.as_deref(), Some("/docs/report.md"));
+        assert!(write.data_is_authoritative);
+        assert_eq!(write.after_data, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn filesystem_update_data_pending_writes_apply_by_file_id_plan() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let rows = vec![vec![
+            Value::Text("entity-1".to_string()),
+            Value::Text("file-1".to_string()),
+            Value::Text("version-1".to_string()),
+            Value::Text("plugin-1".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("{\"path\":\"/docs/report.md\"}".to_string()),
+            Value::Null,
+            Value::Null,
+            Value::Text("2026-01-01T00:00:00.000Z".to_string()),
+        ]];
+        let file_data_assignment = crate::sql::FileDataAssignmentPlan::ByFileId(
+            [("file-1".to_string(), vec![9, 8, 7])]
+                .into_iter()
+                .collect(),
+        );
+        let writes = engine
+            .collect_filesystem_update_data_pending_file_writes_from_rows(
+                engine.backend.as_ref(),
+                "lix_file_descriptor",
+                Some(&file_data_assignment),
+                &rows,
+            )
+            .await
+            .expect("filesystem case data writes should derive from by-file-id plan");
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].file_id, "file-1");
+        assert!(writes[0].data_is_authoritative);
+        assert_eq!(writes[0].after_data, vec![9, 8, 7]);
+    }
+
+    #[tokio::test]
+    async fn filesystem_delete_side_effects_are_derived_from_delete_returning_rows() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let rows = vec![vec![
+            Value::Text("entity-1".to_string()),
+            Value::Text("file-1".to_string()),
+            Value::Text("version-1".to_string()),
+        ]];
+        let (writes, delete_targets) = engine
+            .collect_filesystem_delete_side_effects_from_delete_rows(
+                engine.backend.as_ref(),
+                "lix_file_descriptor",
+                &rows,
+            )
+            .await
+            .expect("filesystem delete side-effects should be derivable from rows");
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].file_id, "file-1");
+        assert_eq!(writes[0].version_id, "version-1");
+        assert!(writes[0].after_path.is_none());
+        assert!(writes[0].data_is_authoritative);
+        assert!(delete_targets.contains(&("file-1".to_string(), "version-1".to_string())));
+    }
+
+    #[tokio::test]
+    async fn unified_execute_sqlite_keeps_placeholder_progression_across_script_statements() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log: Arc::clone(&transaction_exec_log),
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        engine
+            .execute(
+                "BEGIN; SELECT ?3; SELECT ?; COMMIT;",
+                &[
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                    Value::Integer(4),
+                ],
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("script execution should succeed");
+
+        let executed_params = transaction_exec_log
+            .lock()
+            .expect("transaction_exec_log lock")
+            .iter()
+            .map(|(_, params)| params.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            executed_params.contains(&vec![Value::Integer(3)]),
+            "first statement should bind ?3 to the third provided value"
+        );
+        assert!(
+            executed_params.contains(&vec![Value::Integer(4)]),
+            "second statement should continue ordinal progression for anonymous placeholders"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_execute_postgres_keeps_explicit_placeholder_binding_per_statement() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Postgres,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log: Arc::clone(&transaction_exec_log),
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        engine
+            .execute(
+                "BEGIN; SELECT $2; SELECT $1; COMMIT;",
+                &[Value::Integer(10), Value::Integer(20)],
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("script execution should succeed");
+
+        let executed_params = transaction_exec_log
+            .lock()
+            .expect("transaction_exec_log lock")
+            .iter()
+            .map(|(_, params)| params.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            executed_params.contains(&vec![Value::Integer(20)]),
+            "first statement should bind $2 to the second provided value"
+        );
+        assert!(
+            executed_params.contains(&vec![Value::Integer(10)]),
+            "second statement should bind $1 to the first provided value"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_execute_sqlite_deduplicates_explicit_placeholders_per_statement() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log: Arc::clone(&transaction_exec_log),
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        engine
+            .execute(
+                "BEGIN; SELECT ?1, ?1; SELECT ?; COMMIT;",
+                &[Value::Integer(10), Value::Integer(20)],
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("script execution should succeed");
+
+        let executed_params = transaction_exec_log
+            .lock()
+            .expect("transaction_exec_log lock")
+            .iter()
+            .map(|(_, params)| params.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            executed_params.contains(&vec![Value::Integer(10)]),
+            "first statement should deduplicate ?1 references"
+        );
+        assert!(
+            executed_params.contains(&vec![Value::Integer(20)]),
+            "second statement should continue from the next ordinal after ?1"
+        );
+    }
+
+    #[tokio::test]
     async fn transaction_plugin_cache_invalidation_happens_after_commit() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
         let engine = boot(BootArgs::new(
             Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
                 commit_called: Arc::clone(&commit_called),
                 rollback_called: Arc::clone(&rollback_called),
                 active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
                     "global",
                 ))),
                 restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
             }),
             Arc::new(NoopWasmRuntime),
         ));
@@ -957,14 +1309,18 @@ mod tests {
     async fn transaction_plugin_cache_invalidation_skips_rollback() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
         let engine = boot(BootArgs::new(
             Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
                 commit_called: Arc::clone(&commit_called),
                 rollback_called: Arc::clone(&rollback_called),
                 active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
                     "global",
                 ))),
                 restored_active_version_snapshot: active_version_snapshot_json("global"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
             }),
             Arc::new(NoopWasmRuntime),
         ));
@@ -1000,13 +1356,17 @@ mod tests {
     async fn restore_from_snapshot_refreshes_active_version_and_plugin_caches() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
+        let transaction_exec_log = Arc::new(Mutex::new(Vec::new()));
         let active_version_snapshot = Arc::new(RwLock::new(active_version_snapshot_json("before")));
         let engine = boot(BootArgs::new(
             Box::new(TestBackend {
+                dialect: SqlDialect::Sqlite,
                 commit_called,
                 rollback_called,
                 active_version_snapshot: Arc::clone(&active_version_snapshot),
                 restored_active_version_snapshot: active_version_snapshot_json("after"),
+                transaction_exec_log,
+                file_descriptor_execution_rows: Arc::new(RwLock::new(Vec::new())),
             }),
             Arc::new(NoopWasmRuntime),
         ));
@@ -1071,34 +1431,6 @@ mod tests {
                 .is_empty(),
             "plugin component cache should be cleared after restore"
         );
-    }
-
-    #[test]
-    fn filesystem_side_effect_scan_advances_placeholder_state_across_statements() {
-        let mut statements = parse_sql_statements(
-            "UPDATE lix_file SET path = ? WHERE id = 'file-a'; \
-             UPDATE lix_file SET path = ? WHERE id = 'file-b'",
-        )
-        .expect("parse sql");
-        assert_eq!(statements.len(), 2);
-
-        let params = vec![
-            Value::Text("/docs/a.json".to_string()),
-            Value::Text("/archive/b.json".to_string()),
-        ];
-        let mut placeholder_state = PlaceholderState::new();
-        advance_placeholder_state_for_statement(
-            &statements.remove(0),
-            &params,
-            SqlDialect::Sqlite,
-            &mut placeholder_state,
-        )
-        .expect("advance placeholder state for first statement");
-
-        let bound = bind_sql_with_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
-            .expect("bind placeholder with carried state");
-        assert_eq!(bound.params.len(), 1);
-        assert_eq!(bound.params[0], Value::Text("/archive/b.json".to_string()));
     }
 
     #[test]
@@ -1338,7 +1670,6 @@ mod tests {
     fn descriptor_delete_targets_cache_eviction_by_entity_id_and_version_id() {
         let targets = file_descriptor_cache_eviction_targets(&[
             MutationRow {
-                operation: MutationOperation::Delete,
                 entity_id: "file-a".to_string(),
                 schema_key: "lix_file_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1349,7 +1680,6 @@ mod tests {
                 untracked: false,
             },
             MutationRow {
-                operation: MutationOperation::Delete,
                 entity_id: "ignored-dir".to_string(),
                 schema_key: "lix_directory_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1360,7 +1690,6 @@ mod tests {
                 untracked: false,
             },
             MutationRow {
-                operation: MutationOperation::Delete,
                 entity_id: "ignored-untracked".to_string(),
                 schema_key: "lix_file_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1387,61 +1716,6 @@ mod tests {
         let statements = parsed.expect("expected explicit transaction script");
         assert_eq!(statements.len(), 1);
         assert!(matches!(statements[0], Statement::Insert(_)));
-    }
-
-    #[test]
-    fn coalesce_lix_file_transaction_statements_rewrites_replay_shape() {
-        let statements = parse_sql_statements(
-            "DELETE FROM lix_file WHERE id IN ('d1');\
-             INSERT INTO lix_file (id, path, data) VALUES ('i1', '/inserted.txt', x'01');\
-             UPDATE lix_file SET path = '/updated-a.txt', data = x'0A' WHERE id = 'u1';\
-             UPDATE lix_file SET path = '/updated-b.txt', data = x'0B' WHERE id = 'u2';",
-        )
-        .expect("parse");
-
-        let rewritten =
-            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite))
-                .expect("expected coalesced rewrite");
-
-        assert_eq!(rewritten.len(), 3);
-        assert!(rewritten[0].starts_with("DELETE FROM lix_file WHERE id IN ('d1')"));
-        assert!(rewritten[1].starts_with("INSERT INTO lix_file (id, path, data) VALUES "));
-        assert!(rewritten[1].contains("('i1', '/inserted.txt', X'01')"));
-        assert!(rewritten[2].starts_with("UPDATE lix_file SET path = CASE id "));
-        assert!(rewritten[2].contains("WHEN 'u1' THEN '/updated-a.txt'"));
-        assert!(rewritten[2].contains("WHEN 'u2' THEN '/updated-b.txt'"));
-        assert!(rewritten[2].contains("WHEN 'u1' THEN X'0A'"));
-        assert!(rewritten[2].contains("WHEN 'u2' THEN X'0B'"));
-        assert!(rewritten[2].contains("WHERE id IN ('u1', 'u2')"));
-    }
-
-    #[test]
-    fn coalesce_lix_file_transaction_statements_returns_none_for_duplicate_ids() {
-        let statements = parse_sql_statements(
-            "UPDATE lix_file SET path = '/updated-a.txt', data = x'0A' WHERE id = 'u1';\
-             UPDATE lix_file SET path = '/updated-b.txt', data = x'0B' WHERE id = 'u1';",
-        )
-        .expect("parse");
-
-        let rewritten =
-            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
-        assert!(rewritten.is_none());
-    }
-
-    #[test]
-    fn coalesce_lix_file_transaction_statements_returns_none_for_insert_with_extra_columns() {
-        let statements = parse_sql_statements(
-            "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('i1', '/inserted.txt', x'01', '{\"owner\":\"sam\"}');",
-        )
-        .expect("parse");
-
-        let rewritten =
-            coalesce_lix_file_transaction_statements(&statements, Some(SqlDialect::Sqlite));
-        assert!(
-            rewritten.is_none(),
-            "coalescer must not drop non-replay columns from lix_file inserts"
-        );
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {

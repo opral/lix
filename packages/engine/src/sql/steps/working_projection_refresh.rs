@@ -4,9 +4,15 @@ use crate::version::{
     GLOBAL_VERSION_ID,
 };
 use crate::working_projection::WORKING_PROJECTION_METADATA;
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
+const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
+const COMMIT_TABLE: &str = "lix_internal_state_materialized_v1_lix_commit";
+const COMMIT_EDGE_TABLE: &str = "lix_internal_state_materialized_v1_lix_commit_edge";
+const CHANGE_SET_ELEMENT_TABLE: &str = "lix_internal_state_materialized_v1_lix_change_set_element";
 
 pub async fn refresh_working_projection_for_read_query(
     backend: &dyn LixBackend,
@@ -23,6 +29,10 @@ async fn refresh_working_change_projection_with_backend(
     backend: &dyn LixBackend,
     active_version_id: &str,
 ) -> Result<(), LixError> {
+    if !internal_table_exists(backend, UNTRACKED_TABLE).await? {
+        return Ok(());
+    }
+
     let version_pointer_untracked = backend
         .execute(
             "SELECT \
@@ -51,6 +61,10 @@ async fn refresh_working_change_projection_with_backend(
     {
         (working_commit_id, tip_commit_id)
     } else {
+        if !internal_table_exists(backend, VERSION_POINTER_TABLE).await? {
+            return Ok(());
+        }
+
         let version_pointer_table = format!(
             "lix_internal_state_materialized_v1_{}",
             version_pointer_schema_key()
@@ -154,6 +168,10 @@ async fn refresh_working_change_projection_with_backend(
         )
         .await?;
 
+    if !internal_table_exists(backend, COMMIT_TABLE).await? {
+        return Ok(());
+    }
+
     let commit_rows = backend
         .execute(
             "SELECT \
@@ -175,6 +193,10 @@ async fn refresh_working_change_projection_with_backend(
         }
     }
     if change_set_by_commit_id.is_empty() {
+        return Ok(());
+    }
+
+    if !internal_table_exists(backend, COMMIT_EDGE_TABLE).await? {
         return Ok(());
     }
 
@@ -227,6 +249,10 @@ async fn refresh_working_change_projection_with_backend(
         }
     }
     if depth_by_commit_id.is_empty() {
+        return Ok(());
+    }
+
+    if !internal_table_exists(backend, CHANGE_SET_ELEMENT_TABLE).await? {
         return Ok(());
     }
 
@@ -724,6 +750,30 @@ fn is_missing_internal_relation_error(error: &LixError) -> bool {
         && (message.contains("lix_internal_state_materialized_v1_")
             || message.contains("lix_internal_state_untracked")
             || message.contains("lix_internal_state_vtable"))
+}
+
+async fn internal_table_exists(
+    backend: &dyn LixBackend,
+    table_name: &str,
+) -> Result<bool, LixError> {
+    let sql = match backend.dialect() {
+        SqlDialect::Sqlite => format!(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' \
+               AND name = '{table_name}' \
+             LIMIT 1",
+            table_name = escape_sql_string(table_name),
+        ),
+        SqlDialect::Postgres => format!(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() \
+               AND table_name = '{table_name}' \
+             LIMIT 1",
+            table_name = escape_sql_string(table_name),
+        ),
+    };
+    let result = backend.execute(&sql, &[]).await?;
+    Ok(!result.rows.is_empty())
 }
 
 async fn upsert_working_projection_row(

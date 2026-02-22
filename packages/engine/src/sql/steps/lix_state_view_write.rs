@@ -3,8 +3,8 @@ use sqlparser::ast::{
     ObjectNamePart, SetExpr, TableFactor, TableObject, TableWithJoins, Update, Value,
 };
 
-use crate::sql::object_name_matches;
 use crate::sql::bind_sql;
+use crate::sql::object_name_matches;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,

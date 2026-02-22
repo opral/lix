@@ -44,10 +44,6 @@ impl ReadRewriteSession {
     }
 }
 
-pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
-    run_query_engine_sync(query, &[])
-}
-
 pub(crate) async fn rewrite_read_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
@@ -72,6 +68,12 @@ pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session(
     run_query_engine_with_backend_and_params(backend, query, params, Some(session)).await
 }
 
+#[cfg(test)]
+pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
+    run_query_engine_sync(query, &[])
+}
+
+#[cfg(test)]
 fn run_query_engine_sync(mut query: Query, params: &[Value]) -> Result<Query, LixError> {
     let mut context = AnalysisContext::from_query(&query);
 
@@ -83,6 +85,7 @@ fn run_query_engine_sync(mut query: Query, params: &[Value]) -> Result<Query, Li
     Ok(query)
 }
 
+#[cfg(test)]
 fn run_phase_sync(
     phase: RewritePhase,
     query: &mut Query,
@@ -106,6 +109,7 @@ fn run_phase_sync(
     })
 }
 
+#[cfg(test)]
 fn apply_rules_for_phase_sync(
     phase: RewritePhase,
     query: &mut Query,

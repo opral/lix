@@ -55,12 +55,7 @@ pub struct FilesystemInsertSideEffects {
     pub active_version_id: Option<String>,
 }
 
-#[derive(Debug, Default)]
-pub struct FilesystemUpdateSideEffects {
-    pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
-    pub untracked_directory_changes: Vec<DetectedFileDomainChange>,
-}
-
+#[cfg(test)]
 pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
         return Ok(None);
@@ -358,107 +353,7 @@ pub async fn insert_side_effect_statements_with_backend(
     Ok(side_effects)
 }
 
-pub async fn update_side_effects_with_backend(
-    backend: &dyn LixBackend,
-    update: &Update,
-    params: &[EngineValue],
-    placeholder_state: &mut PlaceholderState,
-) -> Result<FilesystemUpdateSideEffects, LixError> {
-    let statement_start_state = *placeholder_state;
-    let statement_sql = update.to_string();
-    let bound = bind_sql_with_state(
-        &statement_sql,
-        params,
-        backend.dialect(),
-        statement_start_state,
-    )
-    .map_err(|error| LixError {
-        message: format!(
-            "filesystem update placeholder binding failed for '{}': {}",
-            statement_sql, error.message
-        ),
-    })?;
-    *placeholder_state = bound.state;
-
-    let Some(target) = target_from_update_table(&update.table) else {
-        return Ok(FilesystemUpdateSideEffects::default());
-    };
-    if target.read_only || !target.is_file {
-        return Ok(FilesystemUpdateSideEffects::default());
-    }
-    let mut read_rewrite_session = ReadRewriteSession::default();
-
-    let mut statement_placeholder_state = statement_start_state;
-    let mut next_path: Option<String> = None;
-    for assignment in &update.assignments {
-        let Some(column) = assignment_target_name(assignment) else {
-            continue;
-        };
-        let resolved = resolve_expr_cell_with_state(
-            &assignment.value,
-            params,
-            &mut statement_placeholder_state,
-        )?;
-        if column.eq_ignore_ascii_case("path") {
-            next_path = resolve_text_expr(Some(&assignment.value), Some(&resolved), "file path")?;
-        }
-    }
-
-    let Some(raw_path) = next_path else {
-        return Ok(FilesystemUpdateSideEffects::default());
-    };
-
-    let selection_placeholder_state = statement_placeholder_state;
-    let mut version_predicate_state = selection_placeholder_state;
-    let version_id = resolve_update_version_id(
-        backend,
-        update,
-        params,
-        target,
-        &mut version_predicate_state,
-    )
-    .await?;
-    let matching_file_ids = file_ids_matching_update(
-        backend,
-        update,
-        target,
-        params,
-        selection_placeholder_state,
-        &mut read_rewrite_session,
-    )
-    .await?;
-    if matching_file_ids.is_empty() {
-        return Ok(FilesystemUpdateSideEffects::default());
-    }
-    let all_untracked = matching_file_ids.iter().all(|row| row.untracked);
-    let parsed = parse_file_path(&raw_path)?;
-    let mut ancestor_paths = file_ancestor_directory_paths(&parsed.normalized_path);
-    if ancestor_paths.is_empty() {
-        return Ok(FilesystemUpdateSideEffects::default());
-    }
-
-    ancestor_paths.sort_by(|left, right| {
-        path_depth(left)
-            .cmp(&path_depth(right))
-            .then_with(|| left.cmp(right))
-    });
-    ancestor_paths.dedup();
-    let directory_changes =
-        tracked_missing_directory_changes(backend, &version_id, &ancestor_paths).await?;
-
-    if all_untracked {
-        Ok(FilesystemUpdateSideEffects {
-            tracked_directory_changes: Vec::new(),
-            untracked_directory_changes: directory_changes,
-        })
-    } else {
-        Ok(FilesystemUpdateSideEffects {
-            tracked_directory_changes: directory_changes,
-            untracked_directory_changes: Vec::new(),
-        })
-    }
-}
-
+#[cfg(test)]
 pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
     let Some(target) = target_from_update_table(&update.table) else {
         return Ok(None);
@@ -527,6 +422,7 @@ pub async fn rewrite_update_with_backend(
     Ok(Some(Statement::Update(update)))
 }
 
+#[cfg(test)]
 pub fn rewrite_delete(mut delete: Delete) -> Result<Option<Delete>, LixError> {
     let Some(target) = target_from_delete(&delete) else {
         return Ok(None);
@@ -1232,6 +1128,14 @@ async fn tracked_missing_directory_changes(
     }
 
     Ok(tracked_directory_changes)
+}
+
+pub(crate) async fn tracked_missing_directory_changes_for_paths(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    ancestor_paths: &[String],
+) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+    tracked_missing_directory_changes(backend, version_id, ancestor_paths).await
 }
 
 async fn rewrite_directory_update_assignments_with_backend(
@@ -2778,7 +2682,6 @@ async fn directory_rows_matching_delete(
 #[derive(Debug, Clone)]
 struct ScopedFileUpdateRow {
     id: String,
-    untracked: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2859,15 +2762,7 @@ async fn file_ids_matching_update(
                 message: format!("file update id lookup expected text, got {id_value:?}"),
             });
         };
-        let untracked = row
-            .get(1)
-            .map(parse_untracked_value)
-            .transpose()?
-            .unwrap_or(false);
-        out.push(ScopedFileUpdateRow {
-            id: id.clone(),
-            untracked,
-        });
+        out.push(ScopedFileUpdateRow { id: id.clone() });
     }
 
     out.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2948,15 +2843,7 @@ async fn try_file_ids_matching_update_fast(
                 message: format!("file update id lookup expected text, got {id_value:?}"),
             });
         };
-        let untracked = row
-            .get(1)
-            .map(parse_untracked_value)
-            .transpose()?
-            .unwrap_or(false);
-        out.push(ScopedFileUpdateRow {
-            id: id.clone(),
-            untracked,
-        });
+        out.push(ScopedFileUpdateRow { id: id.clone() });
     }
     Ok(Some(out))
 }
@@ -3034,7 +2921,7 @@ fn parse_exact_file_descriptor_lookup_rows(
             message: format!("file update id lookup expected text, got {id_value:?}"),
         });
     };
-    let untracked = row
+    let _untracked = row
         .get(1)
         .map(parse_untracked_value)
         .transpose()?
@@ -3045,10 +2932,7 @@ fn parse_exact_file_descriptor_lookup_rows(
     if is_tombstone {
         return Ok(Some(Vec::new()));
     }
-    Ok(Some(vec![ScopedFileUpdateRow {
-        id: id.clone(),
-        untracked,
-    }]))
+    Ok(Some(vec![ScopedFileUpdateRow { id: id.clone() }]))
 }
 
 fn extract_exact_file_update_selection_with_state(
@@ -3681,7 +3565,6 @@ mod tests {
         let parsed = parsed.expect("live row should exist");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "file-b");
-        assert!(parsed[0].untracked);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
 };
-use crate::LixError;
+use crate::{LixError, SqlDialect};
 use sqlparser::ast::{
     BinaryOperator, Expr, FromTable, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement,
     TableFactor, TableObject, TableWithJoins, Update, UpdateTableFromKind,
@@ -44,8 +44,11 @@ fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
         || statement_targets_table_name(statement, "lix_state_by_version")
 }
 
-pub(crate) fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
-    let Ok(statements) = crate::sql::parse_sql_statements(sql) else {
+pub(crate) fn should_invalidate_installed_plugins_cache_for_sql(
+    sql: &str,
+    dialect: SqlDialect,
+) -> bool {
+    let Ok(statements) = crate::sql::parse_sql_statements_with_dialect(sql, dialect) else {
         return false;
     };
     should_invalidate_installed_plugins_cache_for_statements(&statements)

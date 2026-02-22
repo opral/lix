@@ -20,21 +20,6 @@ pub(crate) struct StatementContext<'a> {
 }
 
 impl<'a> StatementContext<'a> {
-    pub(crate) fn new_sync(params: &'a [Value], writer_key: Option<&'a str>) -> Self {
-        Self {
-            params,
-            writer_key,
-            backend: None,
-            detected_file_domain_changes: &[],
-            side_effects: Vec::new(),
-            registrations: Vec::new(),
-            generated_params: Vec::new(),
-            mutations: Vec::new(),
-            update_validations: Vec::new(),
-            postprocess: None,
-        }
-    }
-
     pub(crate) fn new_backend(
         backend: &'a dyn LixBackend,
         params: &'a [Value],

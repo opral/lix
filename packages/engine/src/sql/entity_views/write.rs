@@ -13,20 +13,26 @@ use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::sql::read_pipeline::{rewrite_read_query, rewrite_read_query_with_backend};
+#[cfg(test)]
+use crate::functions::SystemFunctionProvider;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+#[cfg(test)]
+use crate::sql::read_pipeline::rewrite_read_query;
+use crate::sql::read_pipeline::rewrite_read_query_with_backend;
 use crate::sql::row_resolution::resolve_values_rows;
 use crate::sql::{resolve_expr_cell_with_state, PlaceholderState, ResolvedCell};
 use crate::{LixBackend, LixError, Value as EngineValue};
 
+#[cfg(test)]
+use super::target::resolve_target_from_object_name;
 use super::target::{
-    resolve_target_from_object_name, resolve_target_from_object_name_with_backend,
-    EntityViewTarget, EntityViewVariant,
+    resolve_target_from_object_name_with_backend, EntityViewTarget, EntityViewVariant,
 };
 
 const LIX_STATE_VIEW_NAME: &str = "lix_state";
 const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
 
+#[cfg(test)]
 pub(crate) fn rewrite_insert(
     insert: Insert,
     params: &[EngineValue],
@@ -75,6 +81,7 @@ where
     )?))
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_update(
     update: Update,
     params: &[EngineValue],
@@ -118,6 +125,7 @@ pub(crate) async fn rewrite_update_with_backend(
     Ok(Some(rewritten))
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_delete(delete: Delete) -> Result<Option<Delete>, LixError> {
     let Some(target_name) = delete_target_name(&delete) else {
         return Ok(None);
@@ -689,6 +697,7 @@ fn rewrite_expression(
     })
 }
 
+#[cfg(test)]
 fn rewrite_subquery_expressions(expr: Expr) -> Result<Expr, LixError> {
     Ok(match expr {
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {

@@ -1,5 +1,5 @@
 use crate::engine::{Engine, ExecuteOptions};
-use crate::sql::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
+use crate::sql::{bind_sql_with_state, parse_sql_statements_with_dialect, PlaceholderState};
 use crate::state_commit_stream::{StateCommitStream, StateCommitStreamFilter};
 use crate::{LixError, QueryResult, SqlDialect, Value};
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,8 @@ pub fn observe_owned(
 }
 
 fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveState, LixError> {
-    let statements = parse_sql_statements(&query.sql)?;
+    let dialect = engine.dialect();
+    let statements = parse_sql_statements_with_dialect(&query.sql, dialect)?;
     if statements.is_empty()
         || !statements
             .iter()
@@ -184,7 +185,7 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
         });
     }
 
-    let filter = derive_state_commit_stream_filter(&statements, &query.params)?;
+    let filter = derive_state_commit_stream_filter(&statements, &query.params, dialect)?;
     let state_commits = engine.state_commit_stream(filter);
 
     Ok(ObserveState {
@@ -209,6 +210,7 @@ struct DerivedObserveFilter {
 fn derive_state_commit_stream_filter(
     statements: &[Statement],
     params: &[Value],
+    dialect: SqlDialect,
 ) -> Result<StateCommitStreamFilter, LixError> {
     let mut derived = DerivedObserveFilter::default();
     let mut placeholder_state = PlaceholderState::new();
@@ -217,15 +219,10 @@ fn derive_state_commit_stream_filter(
 
     for statement in statements {
         let statement_sql = statement.to_string();
-        let bound = bind_sql_with_state(
-            &statement_sql,
-            params,
-            SqlDialect::Sqlite,
-            placeholder_state,
-        )?;
+        let bound = bind_sql_with_state(&statement_sql, params, dialect, placeholder_state)?;
         placeholder_state = bound.state;
 
-        let mut rebound_statements = parse_sql_statements(&bound.sql)?;
+        let mut rebound_statements = parse_sql_statements_with_dialect(&bound.sql, dialect)?;
         if rebound_statements.len() != 1 {
             continue;
         }
@@ -556,8 +553,14 @@ fn add_filter_literal(out: &mut DerivedObserveFilter, column: FilterColumn, valu
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_state_commit_stream_filter, parse_sql_statements};
-    use crate::Value;
+    use super::derive_state_commit_stream_filter;
+    use crate::sql::parse_sql_statements_with_dialect;
+    use crate::{LixError, SqlDialect, Value};
+    use sqlparser::ast::Statement;
+
+    fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
+        parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite)
+    }
 
     #[test]
     fn derive_filter_extracts_schema_entity_and_version_literals() {
@@ -573,6 +576,7 @@ mod tests {
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("entity-a".to_string()),
             ],
+            SqlDialect::Sqlite,
         )
         .expect("derive filter");
 
@@ -590,7 +594,8 @@ mod tests {
             parse_sql_statements("SELECT id, path FROM lix_file WHERE path = '/docs/a.md'")
                 .expect("parse sql");
 
-        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[], SqlDialect::Sqlite)
+            .expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_file_descriptor".to_string()]);
     }
 
@@ -599,7 +604,8 @@ mod tests {
         let statements =
             parse_sql_statements("SELECT entity_id FROM lix_key_value LIMIT 1").expect("parse sql");
 
-        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[], SqlDialect::Sqlite)
+            .expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
     }
 
@@ -611,7 +617,8 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[], SqlDialect::Sqlite)
+            .expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
     }
 
@@ -623,7 +630,8 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[], SqlDialect::Sqlite)
+            .expect("derive filter");
         assert!(filter.schema_keys.is_empty());
         assert!(filter.entity_ids.is_empty());
         assert!(filter.file_ids.is_empty());
@@ -638,7 +646,8 @@ mod tests {
         )
         .expect("parse sql");
 
-        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        let filter = derive_state_commit_stream_filter(&statements, &[], SqlDialect::Sqlite)
+            .expect("derive filter");
         assert!(filter.schema_keys.is_empty());
         assert!(filter.entity_ids.is_empty());
         assert!(filter.file_ids.is_empty());

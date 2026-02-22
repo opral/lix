@@ -16,18 +16,7 @@ pub(crate) fn rewrite_query(query: Query, params: &[Value]) -> Result<QueryRuleO
     changed |= apply_step(&mut current, rewritten);
     let rewritten = entity_views::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_version::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_active_account::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_active_version::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_state::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_state_by_version::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_state_history::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
+    apply_standard_logical_view_rewrites(&mut current, &mut changed)?;
 
     if changed {
         Ok(QueryRuleOutcome::Changed(current))
@@ -48,19 +37,7 @@ pub(crate) async fn rewrite_query_with_backend(
     changed |= apply_step(&mut current, rewritten);
     let rewritten = entity_views::rewrite_query_with_backend(backend, current.clone()).await?;
     changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_version::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_active_account::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_active_version::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_state::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten = lix_state_by_version::rewrite_query(current.clone())?;
-    changed |= apply_step(&mut current, rewritten);
-    let rewritten =
-        lix_state_history::rewrite_query_with_backend(backend, current.clone(), params).await?;
-    changed |= apply_step(&mut current, rewritten);
+    apply_standard_logical_view_rewrites(&mut current, &mut changed)?;
 
     if changed {
         Ok(QueryRuleOutcome::Changed(current))
@@ -76,4 +53,23 @@ fn apply_step(current: &mut Query, rewritten: Option<Query>) -> bool {
     } else {
         false
     }
+}
+
+fn apply_standard_logical_view_rewrites(
+    current: &mut Query,
+    changed: &mut bool,
+) -> Result<(), LixError> {
+    let rewritten = lix_version::rewrite_query(current.clone())?;
+    *changed |= apply_step(current, rewritten);
+    let rewritten = lix_active_account::rewrite_query(current.clone())?;
+    *changed |= apply_step(current, rewritten);
+    let rewritten = lix_active_version::rewrite_query(current.clone())?;
+    *changed |= apply_step(current, rewritten);
+    let rewritten = lix_state::rewrite_query(current.clone())?;
+    *changed |= apply_step(current, rewritten);
+    let rewritten = lix_state_by_version::rewrite_query(current.clone())?;
+    *changed |= apply_step(current, rewritten);
+    let rewritten = lix_state_history::rewrite_query(current.clone())?;
+    *changed |= apply_step(current, rewritten);
+    Ok(())
 }

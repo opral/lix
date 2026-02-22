@@ -6,7 +6,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
-use crate::sql::steps::state_pushdown::StatePushdown;
+use crate::sql::steps::state_pushdown::{
+    select_projects_count_star, RankedPushdownPredicate, StateColumn, StatePushdown,
+};
 use crate::sql::{escape_sql_string, object_name_matches, parse_single_query, quote_ident};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -54,11 +56,7 @@ fn build_effective_state_by_version_view_query(
     } else {
         format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
     };
-    let ranked_pushdown = if ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", ranked_predicates.join(" AND "))
-    };
+    let ranked_pushdown = ranked_pushdown_from_sql_predicates(&ranked_predicates);
     let target_versions_cte =
         build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
     let descriptor_table = quote_ident(&format!(
@@ -223,11 +221,7 @@ fn build_effective_state_by_version_count_query(
     } else {
         format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
     };
-    let ranked_pushdown = if ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", ranked_predicates.join(" AND "))
-    };
+    let ranked_pushdown = ranked_pushdown_from_sql_predicates(&ranked_predicates);
     let target_versions_cte =
         build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
     let descriptor_table = quote_ident(&format!(
@@ -300,7 +294,7 @@ fn build_effective_state_by_version_count_query(
 }
 
 fn build_effective_state_target_versions_cte(
-    target_version_pushdown: &[String],
+    target_version_pushdown: &[TargetVersionPredicate],
     vtable_name: &str,
 ) -> String {
     if target_version_pushdown.is_empty() {
@@ -318,10 +312,15 @@ fn build_effective_state_target_versions_cte(
         );
     }
 
-    let target_version_filter = target_version_pushdown.join(" AND ");
-    if target_version_pushdown.iter().any(|predicate| {
-        predicate.contains('?') || predicate.to_ascii_lowercase().contains("select")
-    }) {
+    let target_version_filter = target_version_pushdown
+        .iter()
+        .map(|predicate| predicate.sql.as_str())
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    if target_version_pushdown
+        .iter()
+        .any(|predicate| predicate.requires_all_target_versions_scan)
+    {
         return format!(
             "all_target_versions AS ( \
                SELECT version_id FROM version_descriptor \
@@ -353,19 +352,49 @@ fn build_effective_state_target_versions_cte(
     )
 }
 
+#[derive(Clone)]
+struct TargetVersionPredicate {
+    sql: String,
+    requires_all_target_versions_scan: bool,
+}
+
 fn split_effective_by_version_ranked_pushdown(
     pushdown: &StatePushdown,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<TargetVersionPredicate>, Vec<String>) {
     let mut target_version = Vec::new();
     let mut ranked = Vec::new();
     for predicate in &pushdown.ranked_predicates {
-        if let Some(stripped) = predicate.strip_prefix("ranked.version_id ") {
-            target_version.push(format!("version_id {stripped}"));
+        if predicate.column == StateColumn::VersionId {
+            target_version.push(TargetVersionPredicate {
+                sql: predicate.base_sql.clone(),
+                requires_all_target_versions_scan: predicate.requires_all_target_versions_scan(),
+            });
             continue;
         }
-        ranked.push(predicate.clone());
+        ranked.push(predicate.ranked_sql.clone());
     }
     (target_version, ranked)
+}
+
+fn ranked_pushdown_from_ranked_predicates(predicates: &[RankedPushdownPredicate]) -> String {
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        let sql = predicates
+            .iter()
+            .map(|predicate| predicate.ranked_sql.as_str())
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!(" AND {sql}")
+    }
+}
+
+fn ranked_pushdown_from_sql_predicates(predicates: &[String]) -> String {
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", predicates.join(" AND "))
+    }
 }
 
 fn build_effective_state_active_view_query(
@@ -377,11 +406,7 @@ fn build_effective_state_active_view_query(
     } else {
         format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
     };
-    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
-    };
+    let ranked_pushdown = ranked_pushdown_from_ranked_predicates(&pushdown.ranked_predicates);
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
@@ -540,11 +565,7 @@ fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<
     } else {
         format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
     };
-    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
-    };
+    let ranked_pushdown = ranked_pushdown_from_ranked_predicates(&pushdown.ranked_predicates);
     let descriptor_table = quote_ident(&format!(
         "lix_internal_state_materialized_v1_{}",
         version_descriptor_schema_key()
@@ -841,8 +862,8 @@ fn build_untracked_union_query(
         let materialized_ident = quote_ident(&materialized_table);
         let materialized_where = predicate_sql
             .as_ref()
-            .map(|predicate| format!(" WHERE ({predicate})"))
-            .unwrap_or_default();
+            .map(|predicate| format!(" WHERE is_tombstone = 0 AND ({predicate})"))
+            .unwrap_or_else(|| " WHERE is_tombstone = 0".to_string());
         union_parts.push(format!(
             "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                     created_at, updated_at, inherited_from_version_id, change_id, writer_key, 0 AS untracked, 2 AS priority \
@@ -982,16 +1003,7 @@ fn extract_plugin_keys_from_top_level_derived_subquery(query: &Query) -> Option<
         SetExpr::Select(select) => select,
         _ => return None,
     };
-    if select.projection.len() != 1 {
-        return None;
-    }
-    let projection_normalized = select.projection[0]
-        .to_string()
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if projection_normalized != "count(*)" {
+    if !select_projects_count_star(select) {
         return None;
     }
     if select.selection.is_some() {
@@ -1540,6 +1552,7 @@ mod tests {
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_b"#,
             &[
+                "is_tombstone=0",
                 "schema_keyIN('schema_a','schema_b')",
                 "entity_id='entity-1'",
             ],

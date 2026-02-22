@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use sqlparser::ast::Query;
 
 use crate::sql::pipeline::query_engine;
@@ -7,16 +5,9 @@ use crate::{LixBackend, LixError, Value};
 
 pub(crate) use query_engine::ReadRewriteSession;
 
+#[cfg(test)]
 pub(crate) fn rewrite_read_query(query: Query) -> Result<Query, LixError> {
     query_engine::rewrite_read_query(query)
-}
-
-pub(crate) async fn rewrite_read_query_with_backend_and_params(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-) -> Result<Query, LixError> {
-    query_engine::rewrite_read_query_with_backend_and_params(backend, query, params).await
 }
 
 pub(crate) async fn rewrite_read_query_with_backend(

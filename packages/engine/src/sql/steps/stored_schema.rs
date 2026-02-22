@@ -4,8 +4,7 @@ use sqlparser::ast::{
 };
 
 use crate::sql::{
-    object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
-    SchemaRegistration,
+    object_name_matches, MutationRow, ResolvedCell, RowSourceResolver, SchemaRegistration,
 };
 use crate::{LixError, Value as EngineValue};
 
@@ -212,7 +211,6 @@ pub fn rewrite_insert(
             schema_key: schema_key_value,
         },
         mutation: MutationRow {
-            operation: MutationOperation::Insert,
             entity_id,
             schema_key: STORED_SCHEMA_KEY.to_string(),
             schema_version: schema_version_value,

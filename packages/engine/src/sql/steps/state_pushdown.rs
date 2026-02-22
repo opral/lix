@@ -1,9 +1,77 @@
-use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, Select};
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query,
+    Select, SelectItem, Value as AstValue, Visit, Visitor,
+};
 
 #[derive(Default)]
 pub(crate) struct StatePushdown {
     pub(crate) source_predicates: Vec<String>,
-    pub(crate) ranked_predicates: Vec<String>,
+    pub(crate) ranked_predicates: Vec<RankedPushdownPredicate>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RankedPushdownPredicate {
+    pub(crate) column: StateColumn,
+    pub(crate) ranked_sql: String,
+    pub(crate) base_sql: String,
+    pub(crate) kind: PushdownPredicateKind,
+    pub(crate) has_placeholder: bool,
+}
+
+impl RankedPushdownPredicate {
+    pub(crate) fn requires_all_target_versions_scan(&self) -> bool {
+        self.column == StateColumn::VersionId
+            && (self.has_placeholder || self.kind == PushdownPredicateKind::InSubquery)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StateColumn {
+    EntityId,
+    SchemaKey,
+    FileId,
+    VersionId,
+    PluginKey,
+}
+
+impl StateColumn {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::EntityId => "entity_id",
+            Self::SchemaKey => "schema_key",
+            Self::FileId => "file_id",
+            Self::VersionId => "version_id",
+            Self::PluginKey => "plugin_key",
+        }
+    }
+
+    fn from_identifier(raw: &str) -> Option<Self> {
+        if raw.eq_ignore_ascii_case("entity_id") || raw.eq_ignore_ascii_case("lixcol_entity_id") {
+            return Some(Self::EntityId);
+        }
+        if raw.eq_ignore_ascii_case("schema_key") || raw.eq_ignore_ascii_case("lixcol_schema_key") {
+            return Some(Self::SchemaKey);
+        }
+        if raw.eq_ignore_ascii_case("file_id") || raw.eq_ignore_ascii_case("lixcol_file_id") {
+            return Some(Self::FileId);
+        }
+        if raw.eq_ignore_ascii_case("version_id") || raw.eq_ignore_ascii_case("lixcol_version_id") {
+            return Some(Self::VersionId);
+        }
+        if raw.eq_ignore_ascii_case("plugin_key") || raw.eq_ignore_ascii_case("lixcol_plugin_key") {
+            return Some(Self::PluginKey);
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushdownPredicateKind {
+    Binary,
+    InList,
+    InSubquery,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -15,21 +83,54 @@ enum PushdownBucket {
 
 struct PredicatePart {
     predicate: Expr,
-    extracted: Option<(PushdownBucket, String)>,
+    extracted: Option<ExtractedPushdownPredicate>,
     has_bare_placeholder: bool,
 }
 
-pub(crate) fn select_supports_count_fast_path(select: &Select) -> bool {
+struct ExtractedPushdownPredicate {
+    bucket: PushdownBucket,
+    column: StateColumn,
+    predicate_sql: String,
+    kind: PushdownPredicateKind,
+    has_placeholder: bool,
+}
+
+pub(crate) fn select_projects_count_star(select: &Select) -> bool {
     if select.projection.len() != 1 {
         return false;
     }
-    let projection_normalized = select.projection[0]
-        .to_string()
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if projection_normalized != "count(*)" {
+
+    let SelectItem::UnnamedExpr(Expr::Function(function)) = &select.projection[0] else {
+        return false;
+    };
+    if function.uses_odbc_syntax
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return false;
+    }
+    if !function_name_is_count(function) {
+        return false;
+    }
+    if !matches!(function.parameters, FunctionArguments::None) {
+        return false;
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return false;
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() || list.args.len() != 1 {
+        return false;
+    }
+    matches!(
+        &list.args[0],
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+    )
+}
+
+pub(crate) fn select_supports_count_fast_path(select: &Select) -> bool {
+    if !select_projects_count_star(select) {
         return false;
     }
 
@@ -73,18 +174,7 @@ pub(crate) fn take_pushdown_predicates(
 
     let mut parts = Vec::new();
     for predicate in split_conjunction(selection_expr) {
-        let extracted = extract_pushdown_predicate(&predicate, relation_name, allow_unqualified)
-            .and_then(|(column, predicate_sql)| match column.as_str() {
-                "entity_id" | "schema_key" | "file_id" => {
-                    Some((PushdownBucket::Source, format!("s.{predicate_sql}")))
-                }
-                "version_id" => Some((PushdownBucket::Ranked, format!("ranked.{predicate_sql}"))),
-                "plugin_key" => {
-                    // Keep plugin filtering after winner selection to preserve row-choice semantics.
-                    Some((PushdownBucket::Ranked, format!("ranked.{predicate_sql}")))
-                }
-                _ => None,
-            });
+        let extracted = extract_pushdown_predicate(&predicate, relation_name, allow_unqualified);
         let has_bare_placeholder = expr_contains_bare_placeholder(&predicate);
         parts.push(PredicatePart {
             predicate,
@@ -99,12 +189,20 @@ pub(crate) fn take_pushdown_predicates(
     let mut remaining = Vec::new();
     for part in parts {
         match part.extracted {
-            Some((bucket, sql))
-                if !(part.has_bare_placeholder && has_bare_placeholder_reordering) =>
-            {
-                match bucket {
-                    PushdownBucket::Source => pushdown.source_predicates.push(sql),
-                    PushdownBucket::Ranked => pushdown.ranked_predicates.push(sql),
+            Some(extracted) if !(part.has_bare_placeholder && has_bare_placeholder_reordering) => {
+                match extracted.bucket {
+                    PushdownBucket::Source => pushdown
+                        .source_predicates
+                        .push(format!("s.{}", extracted.predicate_sql)),
+                    PushdownBucket::Ranked => {
+                        pushdown.ranked_predicates.push(RankedPushdownPredicate {
+                            column: extracted.column,
+                            ranked_sql: format!("ranked.{}", extracted.predicate_sql),
+                            base_sql: extracted.predicate_sql,
+                            kind: extracted.kind,
+                            has_placeholder: extracted.has_placeholder,
+                        })
+                    }
                     PushdownBucket::Remaining => remaining.push(part.predicate),
                 }
             }
@@ -126,7 +224,7 @@ fn has_bare_placeholder_reordering(parts: &[PredicatePart]) -> bool {
         let bucket = part
             .extracted
             .as_ref()
-            .map(|(bucket, _)| *bucket)
+            .map(|extracted| extracted.bucket)
             .unwrap_or(PushdownBucket::Remaining);
         if saw_any && bucket < last_bucket {
             return true;
@@ -171,7 +269,7 @@ fn extract_pushdown_predicate(
     predicate: &Expr,
     relation_name: &str,
     allow_unqualified: bool,
-) -> Option<(String, String)> {
+) -> Option<ExtractedPushdownPredicate> {
     match predicate {
         Expr::BinaryOp {
             left,
@@ -179,10 +277,10 @@ fn extract_pushdown_predicate(
             right,
         } => {
             if let Some(column) = extract_target_column(left, relation_name, allow_unqualified) {
-                return Some((column.clone(), format!("{column} = {}", right)));
+                return build_binary_pushdown_predicate(column, right);
             }
             if let Some(column) = extract_target_column(right, relation_name, allow_unqualified) {
-                return Some((column.clone(), format!("{column} = {}", left)));
+                return build_binary_pushdown_predicate(column, left);
             }
             None
         }
@@ -192,8 +290,15 @@ fn extract_pushdown_predicate(
             negated: false,
         } => {
             let column = extract_target_column(expr, relation_name, allow_unqualified)?;
+            let bucket = pushdown_bucket_for_column(column)?;
             let list_sql = render_in_list_sql(list);
-            Some((column.clone(), format!("{column} IN ({list_sql})")))
+            Some(ExtractedPushdownPredicate {
+                bucket,
+                column,
+                predicate_sql: format!("{} IN ({list_sql})", column.canonical_name()),
+                kind: PushdownPredicateKind::InList,
+                has_placeholder: list.iter().any(expr_contains_any_placeholder),
+            })
         }
         Expr::InSubquery {
             expr,
@@ -201,9 +306,40 @@ fn extract_pushdown_predicate(
             negated: false,
         } => {
             let column = extract_target_column(expr, relation_name, allow_unqualified)?;
-            Some((column.clone(), format!("{column} IN ({subquery})")))
+            let bucket = pushdown_bucket_for_column(column)?;
+            Some(ExtractedPushdownPredicate {
+                bucket,
+                column,
+                predicate_sql: format!("{} IN ({subquery})", column.canonical_name()),
+                kind: PushdownPredicateKind::InSubquery,
+                has_placeholder: query_contains_any_placeholder(subquery),
+            })
         }
         _ => None,
+    }
+}
+
+fn build_binary_pushdown_predicate(
+    column: StateColumn,
+    rhs: &Expr,
+) -> Option<ExtractedPushdownPredicate> {
+    let bucket = pushdown_bucket_for_column(column)?;
+    Some(ExtractedPushdownPredicate {
+        bucket,
+        column,
+        predicate_sql: format!("{} = {rhs}", column.canonical_name()),
+        kind: PushdownPredicateKind::Binary,
+        has_placeholder: expr_contains_any_placeholder(rhs),
+    })
+}
+
+fn pushdown_bucket_for_column(column: StateColumn) -> Option<PushdownBucket> {
+    match column {
+        StateColumn::EntityId | StateColumn::SchemaKey | StateColumn::FileId => {
+            Some(PushdownBucket::Source)
+        }
+        // Keep plugin filtering after winner selection to preserve row-choice semantics.
+        StateColumn::VersionId | StateColumn::PluginKey => Some(PushdownBucket::Ranked),
     }
 }
 
@@ -211,29 +347,18 @@ fn extract_target_column(
     expr: &Expr,
     relation_name: &str,
     allow_unqualified: bool,
-) -> Option<String> {
+) -> Option<StateColumn> {
     match expr {
-        Expr::Identifier(ident) if allow_unqualified => normalize_state_column(&ident.value),
+        Expr::Identifier(ident) if allow_unqualified => StateColumn::from_identifier(&ident.value),
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let qualifier = &parts[parts.len() - 2].value;
             if !qualifier.eq_ignore_ascii_case(relation_name) {
                 return None;
             }
             let column = &parts[parts.len() - 1].value;
-            normalize_state_column(column)
+            StateColumn::from_identifier(column)
         }
         Expr::Nested(inner) => extract_target_column(inner, relation_name, allow_unqualified),
-        _ => None,
-    }
-}
-
-fn normalize_state_column(raw: &str) -> Option<String> {
-    match raw.to_ascii_lowercase().as_str() {
-        "entity_id" | "lixcol_entity_id" => Some("entity_id".to_string()),
-        "schema_key" | "lixcol_schema_key" => Some("schema_key".to_string()),
-        "file_id" | "lixcol_file_id" => Some("file_id".to_string()),
-        "version_id" | "lixcol_version_id" => Some("version_id".to_string()),
-        "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
         _ => None,
     }
 }
@@ -246,64 +371,59 @@ fn render_in_list_sql(list: &[Expr]) -> String {
 }
 
 fn expr_contains_bare_placeholder(expr: &Expr) -> bool {
-    let sql = expr.to_string();
-    sql_contains_bare_placeholder(&sql)
+    expr_contains_placeholder(expr, true)
 }
 
-fn sql_contains_bare_placeholder(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut index = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
+fn expr_contains_any_placeholder(expr: &Expr) -> bool {
+    expr_contains_placeholder(expr, false)
+}
 
-    while index < bytes.len() {
-        let byte = bytes[index];
+fn query_contains_any_placeholder(query: &Query) -> bool {
+    let mut detector = PlaceholderDetector {
+        bare_only: false,
+        found: false,
+    };
+    let _ = query.visit(&mut detector);
+    detector.found
+}
 
-        if in_single_quote {
-            if byte == b'\'' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    index += 2;
-                    continue;
-                }
-                in_single_quote = false;
-            }
-            index += 1;
-            continue;
+fn expr_contains_placeholder(expr: &Expr, bare_only: bool) -> bool {
+    let mut detector = PlaceholderDetector {
+        bare_only,
+        found: false,
+    };
+    let _ = expr.visit(&mut detector);
+    detector.found
+}
+
+struct PlaceholderDetector {
+    bare_only: bool,
+    found: bool,
+}
+
+impl Visitor for PlaceholderDetector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Value(value) = expr else {
+            return ControlFlow::Continue(());
+        };
+        let AstValue::Placeholder(token) = &value.value else {
+            return ControlFlow::Continue(());
+        };
+        if !self.bare_only || token == "?" {
+            self.found = true;
+            return ControlFlow::Break(());
         }
-
-        if in_double_quote {
-            if byte == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    index += 2;
-                    continue;
-                }
-                in_double_quote = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'\'' => {
-                in_single_quote = true;
-                index += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                index += 1;
-            }
-            b'?' => {
-                let mut lookahead = index + 1;
-                while lookahead < bytes.len() && bytes[lookahead].is_ascii_digit() {
-                    lookahead += 1;
-                }
-                if lookahead == index + 1 {
-                    return true;
-                }
-                index = lookahead;
-            }
-            _ => index += 1,
-        }
+        ControlFlow::Continue(())
     }
-    false
+}
+
+fn function_name_is_count(function: &sqlparser::ast::Function) -> bool {
+    function
+        .name
+        .0
+        .last()
+        .and_then(sqlparser::ast::ObjectNamePart::as_ident)
+        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("count"))
 }

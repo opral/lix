@@ -1,6 +1,6 @@
 use crate::cel::CelEvaluator;
 #[cfg(test)]
-use crate::sql::parse_sql_statements;
+use crate::sql::parse_sql_statements_with_dialect;
 use crate::sql::{
     bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_expr_cell_with_state,
     resolve_values_rows, PlaceholderState,
@@ -34,6 +34,12 @@ pub(crate) struct PendingFileWriteCollection {
     pub(crate) writes_by_statement: Vec<Vec<PendingFileWrite>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedFileDataAssignment {
+    Uniform(Vec<u8>),
+    ById(BTreeMap<String, Vec<u8>>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileWriteTarget {
     ActiveVersion,
@@ -53,7 +59,7 @@ pub(crate) async fn collect_pending_file_writes(
     params: &[Value],
     active_version_id: &str,
 ) -> Result<PendingFileWriteCollection, LixError> {
-    let statements = parse_sql_statements(sql)?;
+    let statements = parse_sql_statements_with_dialect(sql, backend.dialect())?;
     collect_pending_file_writes_from_statements(backend, &statements, params, active_version_id)
         .await
 }
@@ -127,65 +133,54 @@ pub(crate) async fn collect_pending_file_writes_from_statements(
     })
 }
 
-pub(crate) async fn collect_pending_file_delete_targets_from_statements(
-    backend: &dyn LixBackend,
-    statements: &[Statement],
+pub(crate) fn resolve_file_data_assignment_for_update(
+    update: &Update,
     params: &[Value],
-    active_version_id: &str,
-) -> Result<BTreeSet<(String, String)>, LixError> {
-    let mut targets = BTreeSet::new();
-    let mut overlay = BTreeMap::<(String, String), OverlayWriteState>::new();
-    let mut writes = Vec::new();
-    let mut effective_active_version_id = active_version_id.to_string();
+) -> Result<Option<ResolvedFileDataAssignment>, LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    let mut assignment = None;
 
-    for statement in statements {
-        let start_len = writes.len();
-        match &statement {
-            Statement::Insert(insert) => {
-                collect_insert_writes(insert, params, &effective_active_version_id, &mut writes)?;
-                apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
-            }
-            Statement::Update(update) => {
-                collect_update_writes(
-                    backend,
-                    update,
-                    params,
-                    &effective_active_version_id,
-                    &overlay,
-                    &mut writes,
-                )
-                .await?;
-                apply_statement_writes_to_overlay(&writes[start_len..], &mut overlay);
-            }
-            Statement::Delete(delete) => {
-                let statement_targets = collect_delete_targets(
-                    backend,
-                    delete,
-                    params,
-                    &effective_active_version_id,
-                    &overlay,
-                    &mut targets,
-                )
-                .await?;
-                for target in statement_targets {
-                    overlay.remove(&target);
-                }
-            }
-            _ => {}
+    for update_assignment in &update.assignments {
+        let Some(column) = assignment_target_name(update_assignment) else {
+            let _ = resolve_expr_cell_with_state(
+                &update_assignment.value,
+                params,
+                &mut placeholder_state,
+            )?;
+            continue;
+        };
+        if !column.eq_ignore_ascii_case("data") {
+            let _ = resolve_expr_cell_with_state(
+                &update_assignment.value,
+                params,
+                &mut placeholder_state,
+            )?;
+            continue;
         }
-        if let Some(next_active_version_id) = next_active_version_id_from_statement(
-            backend,
-            &statement,
+
+        if let Some(case_values) = resolve_case_assignment_text_or_blob_by_id(
+            &update_assignment.value,
+            "data",
             params,
-            &effective_active_version_id,
-        )
-        .await?
-        {
-            effective_active_version_id = next_active_version_id;
+            &mut placeholder_state,
+        )? {
+            assignment = Some(ResolvedFileDataAssignment::ById(case_values));
+            continue;
         }
+        let resolved =
+            resolve_expr_cell_with_state(&update_assignment.value, params, &mut placeholder_state)?;
+        let Some(after_data) = resolved_cell_blob_or_text_bytes(Some(&resolved)) else {
+            return Err(LixError {
+                message: format!(
+                    "unsupported file data update expression '{}': only literal/blob or bound placeholder values are supported",
+                    update_assignment.value
+                ),
+            });
+        };
+        assignment = Some(ResolvedFileDataAssignment::Uniform(after_data));
     }
 
-    Ok(targets)
+    Ok(assignment)
 }
 
 fn collect_insert_writes(
@@ -684,173 +679,6 @@ async fn collect_update_writes(
     writes.extend(pending);
 
     Ok(())
-}
-
-async fn collect_delete_targets(
-    backend: &dyn LixBackend,
-    delete: &sqlparser::ast::Delete,
-    params: &[Value],
-    active_version_id: &str,
-    overlay: &BTreeMap<(String, String), OverlayWriteState>,
-    targets: &mut BTreeSet<(String, String)>,
-) -> Result<BTreeSet<(String, String)>, LixError> {
-    let Some(target) = file_write_target_from_delete(delete) else {
-        return Ok(BTreeSet::new());
-    };
-    let mut statement_targets = BTreeSet::new();
-
-    let mut exact_placeholder_state = PlaceholderState::new();
-    if let Some(exact_targets) = extract_exact_file_delete_targets(
-        delete.selection.as_ref(),
-        params,
-        &mut exact_placeholder_state,
-        target,
-        active_version_id,
-    )? {
-        for key in exact_targets {
-            statement_targets.insert(key.clone());
-            targets.insert(key);
-        }
-
-        let overlay_rows = execute_delete_overlay_prefetch_query(
-            backend,
-            delete,
-            params,
-            active_version_id,
-            target,
-            overlay,
-        )
-        .await?;
-        for row in overlay_rows {
-            let Some(file_id) = row.first().and_then(value_as_text) else {
-                continue;
-            };
-            let version_id = row
-                .get(1)
-                .and_then(value_as_text)
-                .unwrap_or_else(|| active_version_id.to_string());
-            let key = (file_id, version_id);
-            statement_targets.insert(key.clone());
-            targets.insert(key);
-        }
-
-        return Ok(statement_targets);
-    }
-
-    let selection_uses_id_projection_only = delete
-        .selection
-        .as_ref()
-        .is_none_or(delete_selection_supports_id_projection);
-    let mut query_sql = match (target, selection_uses_id_projection_only) {
-        (FileWriteTarget::ActiveVersion, true) => format!(
-            "SELECT id, lixcol_version_id, \
-                    'pending.collect_delete_targets.id_projection' AS __lix_trace \
-             FROM (\
-                 SELECT \
-                     lix_json_text(snapshot_content, 'id') AS id, \
-                     version_id AS lixcol_version_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND snapshot_content IS NOT NULL\
-             ) AS file_descriptor_ids \
-             WHERE lixcol_version_id = '{}'",
-            escape_sql_string(active_version_id)
-        ),
-        (FileWriteTarget::ExplicitVersion, true) => "SELECT id, lixcol_version_id, \
-                    'pending.collect_delete_targets.id_projection' AS __lix_trace \
-             FROM (\
-                 SELECT \
-                     lix_json_text(snapshot_content, 'id') AS id, \
-                     version_id AS lixcol_version_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND snapshot_content IS NOT NULL\
-             ) AS file_descriptor_ids"
-            .to_string(),
-        (FileWriteTarget::ActiveVersion, false) => format!(
-            "SELECT id, lixcol_version_id, \
-                    'pending.collect_delete_targets' AS __lix_trace \
-             FROM lix_file_by_version \
-             WHERE lixcol_version_id = '{}'",
-            escape_sql_string(active_version_id)
-        ),
-        (FileWriteTarget::ExplicitVersion, false) => "SELECT id, lixcol_version_id, \
-                    'pending.collect_delete_targets' AS __lix_trace \
-             FROM lix_file_by_version"
-            .to_string(),
-    };
-    if let Some(selection) = delete.selection.as_ref() {
-        query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
-            " AND "
-        } else {
-            " WHERE "
-        });
-        query_sql.push_str(&selection.to_string());
-    }
-
-    let bound = bind_sql_with_state(
-        &query_sql,
-        params,
-        backend.dialect(),
-        PlaceholderState::new(),
-    )?;
-    let rows = execute_prefetch_query(
-        backend,
-        "pending.collect_delete_targets",
-        &bound.sql,
-        &bound.params,
-    )
-    .await
-    .map_err(|error| LixError {
-        message: format!(
-            "pending_file_writes delete prefetch failed for '{}': {}",
-            bound.sql, error.message
-        ),
-    })?
-    .rows;
-
-    for row in rows {
-        let Some(file_id) = row.first().and_then(value_as_text) else {
-            continue;
-        };
-        let version_id = match target {
-            FileWriteTarget::ActiveVersion => row
-                .get(1)
-                .and_then(value_as_text)
-                .unwrap_or_else(|| active_version_id.to_string()),
-            FileWriteTarget::ExplicitVersion => row
-                .get(1)
-                .and_then(value_as_text)
-                .unwrap_or_else(|| active_version_id.to_string()),
-        };
-        let key = (file_id, version_id);
-        statement_targets.insert(key.clone());
-        targets.insert(key);
-    }
-
-    let overlay_rows = execute_delete_overlay_prefetch_query(
-        backend,
-        delete,
-        params,
-        active_version_id,
-        target,
-        overlay,
-    )
-    .await?;
-    for row in overlay_rows {
-        let Some(file_id) = row.first().and_then(value_as_text) else {
-            continue;
-        };
-        let version_id = row
-            .get(1)
-            .and_then(value_as_text)
-            .unwrap_or_else(|| active_version_id.to_string());
-        let key = (file_id, version_id);
-        statement_targets.insert(key.clone());
-        targets.insert(key);
-    }
-
-    Ok(statement_targets)
 }
 
 #[derive(Debug, Clone)]
@@ -1465,7 +1293,7 @@ fn insert_target_table_name(insert: &sqlparser::ast::Insert) -> Option<String> {
     object_name_terminal(name)
 }
 
-async fn load_before_data_from_cache_batch(
+pub(crate) async fn load_before_data_from_cache_batch(
     backend: &dyn LixBackend,
     keys: &[(String, String)],
 ) -> Result<BTreeMap<(String, String), Vec<u8>>, LixError> {
@@ -1513,7 +1341,7 @@ async fn load_before_data_from_cache_batch(
     Ok(out)
 }
 
-async fn load_before_path_from_cache_batch(
+pub(crate) async fn load_before_path_from_cache_batch(
     backend: &dyn LixBackend,
     keys: &[(String, String)],
 ) -> Result<BTreeMap<(String, String), String>, LixError> {
@@ -1610,85 +1438,6 @@ fn file_write_target_from_name(table_name: &str) -> Option<FileWriteTarget> {
     } else {
         None
     }
-}
-
-fn delete_selection_supports_id_projection(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identifier(ident) => delete_projection_column_allowed(&ident.value),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .is_some_and(|ident| delete_projection_column_allowed(&ident.value)),
-        Expr::BinaryOp { left, right, .. } => {
-            delete_selection_supports_id_projection(left)
-                && delete_selection_supports_id_projection(right)
-        }
-        Expr::UnaryOp { expr, .. } => delete_selection_supports_id_projection(expr),
-        Expr::Nested(inner) => delete_selection_supports_id_projection(inner),
-        Expr::InList { expr, list, .. } => {
-            delete_selection_supports_id_projection(expr)
-                && list.iter().all(delete_selection_supports_id_projection)
-        }
-        Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::Exists { .. } => false,
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            delete_selection_supports_id_projection(expr)
-                && delete_selection_supports_id_projection(low)
-                && delete_selection_supports_id_projection(high)
-        }
-        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
-            delete_selection_supports_id_projection(expr)
-                && delete_selection_supports_id_projection(pattern)
-        }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            delete_selection_supports_id_projection(inner)
-        }
-        Expr::Cast { expr, .. } => delete_selection_supports_id_projection(expr),
-        Expr::Function(function) => match &function.args {
-            sqlparser::ast::FunctionArguments::List(list) => {
-                list.args.iter().all(|arg| match arg {
-                    sqlparser::ast::FunctionArg::Unnamed(
-                        sqlparser::ast::FunctionArgExpr::Expr(expr),
-                    ) => delete_selection_supports_id_projection(expr),
-                    sqlparser::ast::FunctionArg::Named { arg, .. }
-                    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => match arg {
-                        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                            delete_selection_supports_id_projection(expr)
-                        }
-                        _ => true,
-                    },
-                    _ => true,
-                })
-            }
-            _ => false,
-        },
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand
-                .as_ref()
-                .is_none_or(|expr| delete_selection_supports_id_projection(expr))
-                && conditions.iter().all(|when| {
-                    delete_selection_supports_id_projection(&when.condition)
-                        && delete_selection_supports_id_projection(&when.result)
-                })
-                && else_result
-                    .as_ref()
-                    .is_none_or(|expr| delete_selection_supports_id_projection(expr))
-        }
-        Expr::Tuple(items) => items.iter().all(delete_selection_supports_id_projection),
-        Expr::Value(_) => true,
-        _ => false,
-    }
-}
-
-fn delete_projection_column_allowed(column: &str) -> bool {
-    column.eq_ignore_ascii_case("id")
-        || column.eq_ignore_ascii_case("lixcol_version_id")
-        || column.eq_ignore_ascii_case("version_id")
 }
 
 fn assignment_target_name(assignment: &Assignment) -> Option<String> {

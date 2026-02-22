@@ -1,11 +1,12 @@
 use sqlparser::ast::Statement;
 
-use crate::sql::pipeline::query_engine::{
-    rewrite_read_query, rewrite_read_query_with_backend_and_params,
-};
+#[cfg(test)]
+use crate::sql::pipeline::query_engine::rewrite_read_query;
+use crate::sql::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
 use crate::sql::types::RewriteOutput;
 use crate::{LixBackend, LixError, Value};
 
+#[cfg(test)]
 pub(crate) fn apply_sync(statement: Statement) -> Result<Option<RewriteOutput>, LixError> {
     let Statement::Explain {
         describe_alias,

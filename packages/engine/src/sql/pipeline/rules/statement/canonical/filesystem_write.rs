@@ -5,10 +5,6 @@ use crate::sql::steps::filesystem_step;
 use crate::LixBackend;
 use crate::{LixError, Value};
 
-pub(crate) fn rewrite_insert(insert: Insert) -> Result<Option<Insert>, LixError> {
-    filesystem_step::rewrite_insert(insert)
-}
-
 pub(crate) async fn insert_side_effects_with_backend(
     backend: &dyn LixBackend,
     insert: &Insert,
@@ -34,20 +30,12 @@ pub(crate) async fn rewrite_insert_with_backend(
     .await
 }
 
-pub(crate) fn rewrite_update(update: Update) -> Result<Option<Statement>, LixError> {
-    filesystem_step::rewrite_update(update)
-}
-
 pub(crate) async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     update: Update,
     params: &[Value],
 ) -> Result<Option<Statement>, LixError> {
     filesystem_step::rewrite_update_with_backend(backend, update, params).await
-}
-
-pub(crate) fn rewrite_delete(delete: Delete) -> Result<Option<Delete>, LixError> {
-    filesystem_step::rewrite_delete(delete)
 }
 
 pub(crate) async fn rewrite_delete_with_backend(

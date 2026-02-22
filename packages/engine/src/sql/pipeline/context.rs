@@ -53,10 +53,6 @@ impl AnalysisContext {
             .any(|name| self.references_relation(name))
     }
 
-    pub(crate) fn references_state_views(&self) -> bool {
-        self.references_relation("lix_state") || self.references_relation("lix_state_by_version")
-    }
-
     pub(crate) fn references_entity_views(&self) -> bool {
         self.relation_names
             .iter()

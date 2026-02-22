@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{Statement, Value as SqlValue};
 use sqlparser::ast::{VisitMut, VisitorMut};
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
@@ -51,7 +51,7 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
     dialect: SqlDialect,
     mut state: PlaceholderState,
 ) -> Result<BoundSql, LixError> {
-    let mut statements = parse_sql_statements(sql)?;
+    let mut statements = parse_sql_statements(sql, dialect)?;
     let mut used_source_indices = Vec::new();
     let mut source_to_dense: HashMap<usize, usize> = HashMap::new();
     let total_params_len = base_params.len() + appended_params.len();
@@ -191,10 +191,21 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     Ok(parsed)
 }
 
-fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
-    Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
-    })
+fn parse_sql_statements(sql: &str, dialect: SqlDialect) -> Result<Vec<Statement>, LixError> {
+    match dialect {
+        SqlDialect::Sqlite => {
+            let dialect = SQLiteDialect {};
+            Parser::parse_sql(&dialect, sql).map_err(|error| LixError {
+                message: error.to_string(),
+            })
+        }
+        SqlDialect::Postgres => {
+            let dialect = PostgreSqlDialect {};
+            Parser::parse_sql(&dialect, sql).map_err(|error| LixError {
+                message: error.to_string(),
+            })
+        }
+    }
 }
 
 fn statements_to_sql(statements: &[Statement]) -> String {
@@ -281,7 +292,7 @@ mod tests {
     #[test]
     fn ignores_placeholders_inside_string_literals() {
         let bound = bind_sql(
-            "SELECT '$1', \"?\", ? FROM t WHERE x = '$2'",
+            "SELECT '$1', \"?\", $1 FROM t WHERE x = '$2'",
             &[Value::Integer(5)],
             SqlDialect::Postgres,
         )
@@ -302,7 +313,7 @@ mod tests {
     #[test]
     fn preserves_utf8_characters_while_binding() {
         let bound = bind_sql(
-            "SELECT 'é🙂', \"名字\", ? FROM t WHERE note = 'München'",
+            "SELECT 'é🙂', \"名字\", $1 FROM t WHERE note = 'München'",
             &[Value::Text("ok".to_string())],
             SqlDialect::Postgres,
         )
@@ -332,7 +343,10 @@ mod tests {
     fn bind_with_appended_params_resolves_placeholders_across_base_and_appended() {
         let bound = bind_sql_with_state_and_appended_params(
             "SELECT ?, ?, ?3",
-            &[Value::Text("base-a".to_string()), Value::Text("base-b".to_string())],
+            &[
+                Value::Text("base-a".to_string()),
+                Value::Text("base-b".to_string()),
+            ],
             &[Value::Text("extra-c".to_string())],
             SqlDialect::Sqlite,
             crate::sql::PlaceholderState::new(),

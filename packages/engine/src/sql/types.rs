@@ -11,10 +11,17 @@ pub struct SchemaRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileDataAssignmentPlan {
+    Uniform(Vec<u8>),
+    ByFileId(BTreeMap<String, Vec<u8>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VtableUpdatePlan {
     pub schema_key: String,
     pub explicit_writer_key: Option<Option<String>>,
     pub writer_key_assignment_present: bool,
+    pub file_data_assignment: Option<FileDataAssignmentPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,17 +39,8 @@ pub struct UpdateValidationPlan {
     pub snapshot_patch: Option<BTreeMap<String, JsonValue>>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MutationOperation {
-    Insert,
-    Update,
-    Delete,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MutationRow {
-    pub operation: MutationOperation,
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
@@ -71,6 +69,7 @@ pub struct RewriteOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {
+    pub statement: Statement,
     pub sql: String,
     pub params: Vec<Value>,
 }
@@ -80,8 +79,4 @@ pub struct PreprocessOutput {
     pub sql: String,
     pub params: Vec<Value>,
     pub prepared_statements: Vec<PreparedStatement>,
-    pub registrations: Vec<SchemaRegistration>,
-    pub postprocess: Option<PostprocessPlan>,
-    pub mutations: Vec<MutationRow>,
-    pub update_validations: Vec<UpdateValidationPlan>,
 }

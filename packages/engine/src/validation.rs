@@ -9,7 +9,7 @@ use crate::schema::{
     schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
     SchemaProvider, SqlStoredSchemaProvider,
 };
-use crate::sql::{bind_sql, MutationOperation, MutationRow, UpdateValidationPlan};
+use crate::sql::{bind_sql, MutationRow, UpdateValidationPlan};
 use crate::{LixBackend, LixError, Value};
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
@@ -35,10 +35,6 @@ pub async fn validate_inserts(
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
 
     for row in mutations {
-        if row.operation != MutationOperation::Insert {
-            continue;
-        }
-
         if row.schema_key == STORED_SCHEMA_KEY {
             validate_stored_schema_insert(&mut schema_provider, row).await?;
             if let Some(snapshot) = row.snapshot_content.as_ref() {
