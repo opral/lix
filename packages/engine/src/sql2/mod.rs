@@ -3,6 +3,7 @@ pub(crate) mod ast;
 pub(crate) mod contracts;
 pub(crate) mod execution;
 pub(crate) mod fallback;
+pub(crate) mod history;
 pub(crate) mod in_transaction;
 pub(crate) mod planning;
 pub(crate) mod prepared;
