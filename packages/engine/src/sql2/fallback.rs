@@ -13,6 +13,7 @@ impl Engine {
             .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn execute_multi_statement_sequential_with_options_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
