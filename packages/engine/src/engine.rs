@@ -21,17 +21,8 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql::{
-    active_version_from_mutations, active_version_from_update_validations, bind_sql_with_state,
-    build_delete_followup_sql, build_update_followup_sql, coalesce_lix_file_transaction_statements,
-    coalesce_vtable_inserts_in_statement_list, escape_sql_string,
-    extract_explicit_transaction_script_from_statements, is_query_only_statements,
-    parse_sql_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
-    should_invalidate_installed_plugins_cache_for_sql,
-    should_invalidate_installed_plugins_cache_for_statements,
-    should_refresh_file_cache_for_statements, DetectedFileDomainChange,
-    FileReadMaterializationScope, MutationOperation, MutationRow, PlaceholderState,
-    PostprocessPlan,
+    bind_sql_with_state, escape_sql_string, should_invalidate_installed_plugins_cache_for_sql,
+    DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState,
 };
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,

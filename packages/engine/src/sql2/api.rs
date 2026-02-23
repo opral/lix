@@ -6,6 +6,7 @@ use super::planning::derive_requirements::derive_plan_requirements;
 use super::planning::parse::parse_sql;
 use super::planning::plan::build_execution_plan;
 use super::type_bridge::{to_sql_mutations, to_sql_update_validations};
+use crate::sql::extract_explicit_transaction_script_from_statements;
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {

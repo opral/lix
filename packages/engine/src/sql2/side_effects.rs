@@ -8,6 +8,7 @@ use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
 };
 use crate::SqlDialect;
+use crate::sql::{preprocess_sql, FileReadMaterializationScope};
 
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
