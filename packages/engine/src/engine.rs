@@ -19,7 +19,7 @@ use crate::materialization::{
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
-use crate::schema_registry::{register_schema, register_schema_sql_statements};
+use crate::schema_registry::register_schema_sql_statements;
 use crate::sql::{
     active_version_from_mutations, active_version_from_update_validations, bind_sql_with_state,
     build_delete_followup_sql, build_update_followup_sql, coalesce_lix_file_transaction_statements,
@@ -63,8 +63,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-#[path = "execute/mod.rs"]
-mod execute;
 #[path = "init/active_version.rs"]
 mod init_active_version;
 #[path = "init/bootstrap.rs"]
@@ -79,7 +77,7 @@ mod runtime_functions;
 mod sql2;
 
 #[cfg(test)]
-use self::execute::should_sequentialize_postprocess_multi_statement;
+use self::sql2::should_sequentialize_postprocess_multi_statement;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 

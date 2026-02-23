@@ -1,5 +1,6 @@
 use super::super::*;
 
+#[allow(dead_code)]
 pub(crate) async fn execute_prepared_with_backend(
     backend: &dyn LixBackend,
     statements: &[crate::sql::PreparedStatement],
