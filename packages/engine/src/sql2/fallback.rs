@@ -46,21 +46,18 @@ impl Engine {
 pub(crate) fn should_sequentialize_postprocess_multi_statement(
     sql: &str,
     params: &[Value],
-    error: &LixError,
 ) -> bool {
     let Ok(statements) = parse_sql_statements(sql) else {
         return false;
     };
-    should_sequentialize_postprocess_multi_statement_with_statements(&statements, params, error)
+    should_sequentialize_postprocess_multi_statement_with_statements(&statements, params)
 }
 
 #[cfg(test)]
 pub(crate) fn should_sequentialize_postprocess_multi_statement_with_statements(
     statements: &[Statement],
     params: &[Value],
-    error: &LixError,
 ) -> bool {
-    let _ = error;
     if !params.is_empty() {
         return false;
     }
