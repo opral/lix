@@ -223,7 +223,7 @@ impl Engine {
 
         apply_effects_tx::apply_sql_backed_effects(
             self,
-            &sql_mutations,
+            &plan.preprocess.mutations,
             &pending_file_writes,
             &pending_file_delete_targets,
             &detected_file_domain_changes,

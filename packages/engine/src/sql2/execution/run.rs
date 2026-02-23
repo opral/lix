@@ -4,15 +4,15 @@ use crate::deterministic_mode::DeterministicSettings;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::schema_registry::register_schema_sql_statements;
-use crate::sql::{build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange};
 use crate::{Engine, LixError, QueryResult};
 
+use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
 use super::super::contracts::planned_statement::MutationOperation;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::type_bridge::{
-    from_sql_prepared_statements, to_sql_vtable_delete_plan, to_sql_vtable_update_plan,
+    build_delete_followup_statements, build_update_followup_statements,
 };
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
 
@@ -123,10 +123,9 @@ pub(crate) async fn execute_plan_sql(
             let mut followup_functions = functions.clone();
             let followup_statements = match postprocess_plan {
                 PostprocessPlan::VtableUpdate(update_plan) => {
-                    let update_plan = to_sql_vtable_update_plan(update_plan);
-                    match build_update_followup_sql(
+                    match build_update_followup_statements(
                         transaction.as_mut(),
-                        &update_plan,
+                        update_plan,
                         &result.rows,
                         detected_file_domain_changes,
                         writer_key,
@@ -142,10 +141,9 @@ pub(crate) async fn execute_plan_sql(
                     }
                 }
                 PostprocessPlan::VtableDelete(delete_plan) => {
-                    let delete_plan = to_sql_vtable_delete_plan(delete_plan);
-                    match build_delete_followup_sql(
+                    match build_delete_followup_statements(
                         transaction.as_mut(),
-                        &delete_plan,
+                        delete_plan,
                         &result.rows,
                         &plan.preprocess.params,
                         detected_file_domain_changes,
@@ -162,7 +160,6 @@ pub(crate) async fn execute_plan_sql(
                     }
                 }
             };
-            let followup_statements = from_sql_prepared_statements(followup_statements);
 
             if let Err(error) =
                 execute_prepared_with_transaction(transaction.as_mut(), &followup_statements).await
