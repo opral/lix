@@ -4,7 +4,6 @@ use crate::{Engine, LixError};
 
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::MutationRow;
-use super::super::type_bridge::{to_sql_detected_file_domain_changes, to_sql_mutations};
 
 pub(crate) async fn apply_sql_backed_effects(
     engine: &Engine,
@@ -16,22 +15,17 @@ pub(crate) async fn apply_sql_backed_effects(
     plugin_changes_committed: bool,
     file_cache_invalidation_targets: &BTreeSet<(String, String)>,
 ) -> Result<(), LixError> {
-    let sql_mutations = to_sql_mutations(mutations);
-    let sql_detected_file_domain_changes =
-        to_sql_detected_file_domain_changes(detected_file_domain_changes);
-    let sql_untracked_filesystem_update_domain_changes =
-        to_sql_detected_file_domain_changes(untracked_filesystem_update_domain_changes);
     let should_run_binary_gc =
-        crate::engine::should_run_binary_cas_gc(&sql_mutations, &sql_detected_file_domain_changes);
+        crate::engine::should_run_binary_cas_gc(mutations, detected_file_domain_changes);
 
     if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
         engine
-            .persist_detected_file_domain_changes(&sql_detected_file_domain_changes)
+            .persist_detected_file_domain_changes(detected_file_domain_changes)
             .await?;
     }
     if !untracked_filesystem_update_domain_changes.is_empty() {
         engine
-            .persist_untracked_file_domain_changes(&sql_untracked_filesystem_update_domain_changes)
+            .persist_untracked_file_domain_changes(untracked_filesystem_update_domain_changes)
             .await?;
     }
     engine

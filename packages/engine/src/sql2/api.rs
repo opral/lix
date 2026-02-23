@@ -6,10 +6,6 @@ use super::planning::derive_requirements::derive_plan_requirements;
 use super::planning::parse::parse_sql;
 use super::planning::plan::build_execution_plan;
 use super::planning::script::extract_explicit_transaction_script_from_statements;
-use super::type_bridge::{
-    from_sql_detected_file_domain_changes, from_sql_detected_file_domain_changes_by_statement,
-    to_sql_mutations,
-};
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -168,15 +164,10 @@ impl Engine {
             .prepare_runtime_functions_with_backend(self.backend.as_ref())
             .await?;
         let contract_detected_file_domain_changes_by_statement =
-            from_sql_detected_file_domain_changes_by_statement(
-                detected_file_domain_changes_by_statement.clone(),
-            );
-        let contract_detected_file_domain_changes =
-            from_sql_detected_file_domain_changes(detected_file_domain_changes.clone());
+            detected_file_domain_changes_by_statement.clone();
+        let contract_detected_file_domain_changes = detected_file_domain_changes.clone();
         let contract_untracked_filesystem_update_domain_changes =
-            from_sql_detected_file_domain_changes(
-                untracked_filesystem_update_domain_changes.clone(),
-            );
+            untracked_filesystem_update_domain_changes.clone();
 
         let plan = build_execution_plan(
             self.backend.as_ref(),
@@ -189,8 +180,6 @@ impl Engine {
         )
         .await
         .map_err(LixError::from)?;
-        let sql_mutations = to_sql_mutations(&plan.preprocess.mutations);
-
         if !plan.preprocess.mutations.is_empty() {
             validate_inserts(
                 self.backend.as_ref(),
@@ -227,14 +216,14 @@ impl Engine {
         }
 
         let file_cache_refresh_targets = if plan.requirements.should_refresh_file_cache {
-            let mut targets = direct_state_file_cache_refresh_targets(&sql_mutations);
+            let mut targets = direct_state_file_cache_refresh_targets(&plan.preprocess.mutations);
             targets.extend(execution.postprocess_file_cache_targets);
             targets
         } else {
             BTreeSet::new()
         };
         let descriptor_cache_eviction_targets =
-            file_descriptor_cache_eviction_targets(&sql_mutations);
+            file_descriptor_cache_eviction_targets(&plan.preprocess.mutations);
         let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets.clone());

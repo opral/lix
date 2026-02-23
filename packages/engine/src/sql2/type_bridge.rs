@@ -3,6 +3,8 @@ use crate::{LixBackend, LixError, LixTransaction, Value};
 use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFunctionProvider};
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
+use crate::SqlDialect;
+use sqlparser::ast::Update;
 
 use super::ast::nodes::Statement;
 use super::contracts::effects::DetectedFileDomainChange;
@@ -15,6 +17,78 @@ use super::contracts::prepared_statement::PreparedStatement;
 pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> String {
     let sql_output = to_sql_preprocess_output(output);
     sql::preprocess_plan_fingerprint(&sql_output)
+}
+
+pub(crate) type SqlBridgePlaceholderState = sql::PlaceholderState;
+
+pub(crate) struct SqlBridgeBoundSql {
+    pub(crate) sql: String,
+    pub(crate) params: Vec<Value>,
+    pub(crate) state: SqlBridgePlaceholderState,
+}
+
+pub(crate) fn new_sql_bridge_placeholder_state() -> SqlBridgePlaceholderState {
+    sql::PlaceholderState::new()
+}
+
+pub(crate) fn bind_sql_with_sql_bridge_state(
+    statement_sql: &str,
+    params: &[Value],
+    dialect: SqlDialect,
+    state: SqlBridgePlaceholderState,
+) -> Result<SqlBridgeBoundSql, LixError> {
+    let bound = sql::bind_sql_with_state(statement_sql, params, dialect, state)?;
+    Ok(SqlBridgeBoundSql {
+        sql: bound.sql,
+        params: bound.params,
+        state: bound.state,
+    })
+}
+
+pub(crate) fn advance_sql_bridge_placeholder_state(
+    statement: &Statement,
+    params: &[Value],
+    dialect: SqlDialect,
+    placeholder_state: &mut SqlBridgePlaceholderState,
+) -> Result<(), LixError> {
+    let statement_sql = statement.to_string();
+    let bound = bind_sql_with_sql_bridge_state(&statement_sql, params, dialect, *placeholder_state)
+        .map_err(|error| LixError {
+            message: format!(
+                "filesystem side-effect placeholder binding failed for '{}': {}",
+                statement_sql, error.message
+            ),
+        })?;
+    *placeholder_state = bound.state;
+    Ok(())
+}
+
+pub(crate) struct FilesystemUpdateSideEffects {
+    pub(crate) tracked_directory_changes: Vec<DetectedFileDomainChange>,
+    pub(crate) untracked_directory_changes: Vec<DetectedFileDomainChange>,
+}
+
+pub(crate) async fn collect_filesystem_update_side_effects_with_sql_bridge(
+    backend: &dyn LixBackend,
+    update: &Update,
+    params: &[Value],
+    placeholder_state: &mut SqlBridgePlaceholderState,
+) -> Result<FilesystemUpdateSideEffects, LixError> {
+    let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
+        backend,
+        update,
+        params,
+        placeholder_state,
+    )
+    .await?;
+    Ok(FilesystemUpdateSideEffects {
+        tracked_directory_changes: from_sql_detected_file_domain_changes(
+            side_effects.tracked_directory_changes,
+        ),
+        untracked_directory_changes: from_sql_detected_file_domain_changes(
+            side_effects.untracked_directory_changes,
+        ),
+    })
 }
 
 pub(crate) async fn preprocess_with_sql_surfaces<P: LixFunctionProvider>(

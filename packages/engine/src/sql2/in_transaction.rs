@@ -12,10 +12,6 @@ use super::semantics::state_resolution::effects::{
 };
 use super::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
 use super::surfaces::registry::preprocess_with_surfaces;
-use super::type_bridge::{
-    from_sql_detected_file_domain_changes, from_sql_detected_file_domain_changes_by_statement,
-    to_sql_mutations,
-};
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(
@@ -90,9 +86,7 @@ impl Engine {
                 .prepare_runtime_functions_with_backend(&backend)
                 .await?;
             let contract_detected_file_domain_changes_by_statement =
-                from_sql_detected_file_domain_changes_by_statement(
-                    detected_file_domain_changes_by_statement.clone(),
-                );
+                detected_file_domain_changes_by_statement.clone();
             let output = preprocess_with_surfaces(
                 &backend,
                 &self.cel_evaluator,
@@ -120,7 +114,7 @@ impl Engine {
                 pending_file_writes,
                 pending_file_delete_targets,
                 detected_file_domain_changes.clone(),
-                from_sql_detected_file_domain_changes(detected_file_domain_changes),
+                detected_file_domain_changes,
                 untracked_filesystem_update_domain_changes,
                 settings,
                 sequence_start,
@@ -236,22 +230,21 @@ impl Engine {
         {
             *active_version_id = version_id;
         }
-        let sql_mutations = to_sql_mutations(&output.mutations);
 
         let file_cache_refresh_targets = if should_refresh_file_cache {
-            let mut targets = direct_state_file_cache_refresh_targets(&sql_mutations);
+            let mut targets = direct_state_file_cache_refresh_targets(&output.mutations);
             targets.extend(postprocess_file_cache_targets);
             targets
         } else {
             BTreeSet::new()
         };
         let descriptor_cache_eviction_targets =
-            file_descriptor_cache_eviction_targets(&sql_mutations);
+            file_descriptor_cache_eviction_targets(&output.mutations);
         let mut file_cache_invalidation_targets = file_cache_refresh_targets;
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
         let should_run_binary_gc =
-            should_run_binary_cas_gc(&sql_mutations, &detected_file_domain_changes);
+            should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{Value as SqlValue, VisitMut, VisitorMut};
+use sqlparser::ast::{Expr, Insert, SetExpr, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -25,6 +25,12 @@ pub(crate) struct BoundSql {
     pub(crate) sql: String,
     pub(crate) params: Vec<Value>,
     pub(crate) state: PlaceholderState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedCell {
+    pub(crate) value: Option<Value>,
+    pub(crate) placeholder_index: Option<usize>,
 }
 
 pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
@@ -81,6 +87,46 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
         params: bound_params,
         state,
     })
+}
+
+pub(crate) fn resolve_values_rows(
+    rows: &[Vec<Expr>],
+    params: &[Value],
+) -> Result<Vec<Vec<ResolvedCell>>, LixError> {
+    let mut state = PlaceholderState::default();
+    let mut resolved_rows = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let mut resolved = Vec::with_capacity(row.len());
+        for expr in row {
+            resolved.push(resolve_expr(expr, params, &mut state)?);
+        }
+        resolved_rows.push(resolved);
+    }
+
+    Ok(resolved_rows)
+}
+
+pub(crate) fn resolve_insert_rows(
+    insert: &Insert,
+    params: &[Value],
+) -> Result<Option<Vec<Vec<ResolvedCell>>>, LixError> {
+    let Some(source) = &insert.source else {
+        return Ok(None);
+    };
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Ok(None);
+    };
+
+    resolve_values_rows(&values.rows, params).map(Some)
+}
+
+pub(crate) fn insert_values_rows_mut(insert: &mut Insert) -> Option<&mut [Vec<Expr>]> {
+    let source = insert.source.as_mut()?;
+    let SetExpr::Values(values) = source.body.as_mut() else {
+        return None;
+    };
+    Some(values.rows.as_mut_slice())
 }
 
 fn clone_param_from_sources(
@@ -190,6 +236,104 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
         });
     }
     Ok(parsed)
+}
+
+fn resolve_expr(
+    expr: &Expr,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<ResolvedCell, LixError> {
+    let Expr::Value(value) = expr else {
+        return Ok(ResolvedCell {
+            value: None,
+            placeholder_index: None,
+        });
+    };
+
+    match &value.value {
+        SqlValue::Placeholder(token) => {
+            let index = resolve_placeholder_index(token, params.len(), state)?;
+            Ok(ResolvedCell {
+                value: Some(params[index].clone()),
+                placeholder_index: Some(index),
+            })
+        }
+        other => Ok(ResolvedCell {
+            value: Some(sql_literal_to_engine_value(other)?),
+            placeholder_index: None,
+        }),
+    }
+}
+
+fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
+    match value {
+        SqlValue::Number(raw, _) => {
+            if let Ok(int) = raw.parse::<i64>() {
+                Ok(Value::Integer(int))
+            } else if let Ok(real) = raw.parse::<f64>() {
+                Ok(Value::Real(real))
+            } else {
+                Err(LixError {
+                    message: format!("unsupported numeric literal '{raw}'"),
+                })
+            }
+        }
+        SqlValue::SingleQuotedString(text)
+        | SqlValue::DoubleQuotedString(text)
+        | SqlValue::TripleSingleQuotedString(text)
+        | SqlValue::TripleDoubleQuotedString(text)
+        | SqlValue::EscapedStringLiteral(text)
+        | SqlValue::UnicodeStringLiteral(text)
+        | SqlValue::NationalStringLiteral(text)
+        | SqlValue::SingleQuotedRawStringLiteral(text)
+        | SqlValue::DoubleQuotedRawStringLiteral(text)
+        | SqlValue::TripleSingleQuotedRawStringLiteral(text)
+        | SqlValue::TripleDoubleQuotedRawStringLiteral(text)
+        | SqlValue::SingleQuotedByteStringLiteral(text)
+        | SqlValue::DoubleQuotedByteStringLiteral(text)
+        | SqlValue::TripleSingleQuotedByteStringLiteral(text)
+        | SqlValue::TripleDoubleQuotedByteStringLiteral(text) => Ok(Value::Text(text.clone())),
+        SqlValue::HexStringLiteral(text) => Ok(Value::Blob(parse_hex_literal(text)?)),
+        SqlValue::DollarQuotedString(text) => Ok(Value::Text(text.value.clone())),
+        SqlValue::Boolean(value) => Ok(Value::Integer(if *value { 1 } else { 0 })),
+        SqlValue::Null => Ok(Value::Null),
+        SqlValue::Placeholder(token) => Err(LixError {
+            message: format!("unexpected placeholder '{token}' while resolving row"),
+        }),
+    }
+}
+
+fn parse_hex_literal(text: &str) -> Result<Vec<u8>, LixError> {
+    if text.len() % 2 != 0 {
+        return Err(LixError {
+            message: format!(
+                "hex literal must contain an even number of digits, got {}",
+                text.len()
+            ),
+        });
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = hex_nibble(bytes[index])?;
+        let lo = hex_nibble(bytes[index + 1])?;
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, LixError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(LixError {
+            message: format!("invalid hex digit '{}'", char::from(byte)),
+        }),
+    }
 }
 
 fn statements_to_sql(statements: &[Statement]) -> String {

@@ -20,11 +20,6 @@ use crate::materialization::{
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::register_schema_sql_statements;
-use crate::sql::{
-    bind_sql_with_state,
-    escape_sql_string, should_invalidate_installed_plugins_cache_for_sql,
-    DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState,
-};
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,
     StateCommitStreamChange, StateCommitStreamFilter,
@@ -69,6 +64,14 @@ pub(crate) mod sql2;
 
 #[cfg(test)]
 use self::sql2::should_sequentialize_postprocess_multi_statement;
+use self::sql2::ast::utils::parse_sql_statements;
+use self::sql2::contracts::effects::DetectedFileDomainChange;
+use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
+use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+use self::sql2::type_bridge::{
+    advance_sql_bridge_placeholder_state, collect_filesystem_update_side_effects_with_sql_bridge,
+    new_sql_bridge_placeholder_state, SqlBridgePlaceholderState,
+};
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -222,6 +225,17 @@ fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
         });
     }
     Ok(())
+}
+
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql_statements(sql) else {
+        return false;
+    };
+    should_invalidate_installed_plugins_cache_for_statements(&statements)
 }
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
@@ -523,20 +537,19 @@ async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
     statements: &[Statement],
     params: &[Value],
 ) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let mut placeholder_state = PlaceholderState::new();
+    let mut placeholder_state = new_sql_bridge_placeholder_state();
     let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
     let mut untracked_changes = Vec::new();
     for statement in statements {
         match statement {
             Statement::Update(update) => {
-                let side_effects =
-                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                        backend,
-                        &update,
-                        params,
-                        &mut placeholder_state,
-                    )
-                    .await?;
+                let side_effects = collect_filesystem_update_side_effects_with_sql_bridge(
+                    backend,
+                    &update,
+                    params,
+                    &mut placeholder_state,
+                )
+                .await?;
                 let statement_tracked_changes =
                     dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
                 tracked_changes_by_statement.push(statement_tracked_changes);
@@ -569,19 +582,9 @@ fn advance_placeholder_state_for_statement(
     statement: &Statement,
     params: &[Value],
     dialect: crate::backend::SqlDialect,
-    placeholder_state: &mut PlaceholderState,
+    placeholder_state: &mut SqlBridgePlaceholderState,
 ) -> Result<(), LixError> {
-    let statement_sql = statement.to_string();
-    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
-        |error| LixError {
-            message: format!(
-                "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.message
-            ),
-        },
-    )?;
-    *placeholder_state = bound.state;
-    Ok(())
+    advance_sql_bridge_placeholder_state(statement, params, dialect, placeholder_state)
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -607,19 +610,29 @@ mod tests {
         advance_placeholder_state_for_statement, boot,
         detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
+        should_invalidate_installed_plugins_cache_for_sql,
         should_sequentialize_postprocess_multi_statement, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
-    use crate::sql::{
-        active_version_from_update_validations, bind_sql_with_state,
-        coalesce_lix_file_transaction_statements, extract_explicit_transaction_script,
-        file_history_read_materialization_required_for_sql,
-        file_read_materialization_scope_for_sql, is_query_only_sql, parse_sql_statements,
-        should_invalidate_installed_plugins_cache_for_sql, should_refresh_file_cache_for_sql,
-        FileReadMaterializationScope, MutationOperation, MutationRow, PlaceholderState,
+    use crate::engine::sql2::ast::utils::parse_sql_statements;
+    use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
+    use crate::engine::sql2::contracts::planned_statement::{
+        MutationOperation, MutationRow, UpdateValidationPlan,
     };
-    use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
+    use crate::engine::sql2::history::plugin_inputs::{
+        file_history_read_materialization_required_for_statements,
+        file_read_materialization_scope_for_statements, FileReadMaterializationScope,
+    };
+    use crate::engine::sql2::planning::script::{
+        coalesce_lix_file_transaction_statements, extract_explicit_transaction_script_from_statements,
+    };
+    use crate::engine::sql2::semantics::state_resolution::canonical::is_query_only_statements;
+    use crate::engine::sql2::semantics::state_resolution::effects::active_version_from_update_validations;
+    use crate::engine::sql2::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::engine::sql2::type_bridge::{
+        bind_sql_with_sql_bridge_state, new_sql_bridge_placeholder_state,
+    };
+    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
         LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
@@ -1063,7 +1076,7 @@ mod tests {
             Value::Text("/docs/a.json".to_string()),
             Value::Text("/archive/b.json".to_string()),
         ];
-        let mut placeholder_state = PlaceholderState::new();
+        let mut placeholder_state = new_sql_bridge_placeholder_state();
         advance_placeholder_state_for_statement(
             &statements.remove(0),
             &params,
@@ -1072,8 +1085,10 @@ mod tests {
         )
         .expect("advance placeholder state for first statement");
 
-        let bound = bind_sql_with_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
-            .expect("bind placeholder with carried state");
+        let bound =
+            bind_sql_with_sql_bridge_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
+                .expect("bind placeholder with carried state");
+        assert_eq!(bound.sql, "SELECT ?1");
         assert_eq!(bound.params.len(), 1);
         assert_eq!(bound.params[0], Value::Text("/archive/b.json".to_string()));
     }
@@ -1419,6 +1434,38 @@ mod tests {
             rewritten.is_none(),
             "coalescer must not drop non-replay columns from lix_file inserts"
         );
+    }
+
+    fn is_query_only_sql(sql: &str) -> bool {
+        parse_sql_statements(sql)
+            .map(|statements| is_query_only_statements(&statements))
+            .unwrap_or(false)
+    }
+
+    fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
+        parse_sql_statements(sql)
+            .map(|statements| should_refresh_file_cache_for_statements(&statements))
+            .unwrap_or(false)
+    }
+
+    fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterializationScope> {
+        parse_sql_statements(sql)
+            .ok()
+            .and_then(|statements| file_read_materialization_scope_for_statements(&statements))
+    }
+
+    fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
+        parse_sql_statements(sql)
+            .map(|statements| file_history_read_materialization_required_for_statements(&statements))
+            .unwrap_or(false)
+    }
+
+    fn extract_explicit_transaction_script(
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<Vec<Statement>>, LixError> {
+        let statements = parse_sql_statements(sql)?;
+        extract_explicit_transaction_script_from_statements(&statements, params)
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {
