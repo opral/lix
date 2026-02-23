@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::Value;
+use crate::{LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaRegistration {
@@ -84,4 +84,16 @@ pub struct PreprocessOutput {
     pub postprocess: Option<PostprocessPlan>,
     pub mutations: Vec<MutationRow>,
     pub update_validations: Vec<UpdateValidationPlan>,
+}
+
+impl PreprocessOutput {
+    pub fn single_statement_params(&self) -> Result<&[Value], LixError> {
+        match self.prepared_statements.as_slice() {
+            [statement] => Ok(statement.params.as_slice()),
+            [] => Ok(&[]),
+            _ => Err(LixError {
+                message: "preprocess output expected a single prepared statement".to_string(),
+            }),
+        }
+    }
 }

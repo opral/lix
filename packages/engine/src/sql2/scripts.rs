@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::sql::bind_sql_with_state;
+use super::planning::bind_once::bind_script_placeholders_once;
 
 impl Engine {
     pub(crate) async fn execute_transaction_script_with_options(
@@ -112,19 +112,8 @@ impl Engine {
                 .map(|statement| (statement.to_string(), Vec::new()))
                 .collect::<Vec<_>>()
         } else {
-            let mut placeholder_state = PlaceholderState::new();
-            let mut bound_statements = Vec::with_capacity(original_statements.len());
-            for statement in original_statements {
-                let bound = bind_sql_with_state(
-                    &statement.to_string(),
-                    params,
-                    transaction.dialect(),
-                    placeholder_state,
-                )?;
-                placeholder_state = bound.state;
-                bound_statements.push((bound.sql, bound.params));
-            }
-            bound_statements
+            bind_script_placeholders_once(&original_statements, params, transaction.dialect())
+                .map_err(LixError::from)?
         };
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 

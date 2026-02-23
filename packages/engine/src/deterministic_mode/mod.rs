@@ -174,7 +174,10 @@ pub async fn persist_sequence_highest(
     let statements = parse_sql_statements(&sql)?;
     let rewritten =
         preprocess_statements_with_provider(statements, &[], &mut provider, backend.dialect())?;
-    if let Err(err) = backend.execute(&rewritten.sql, &rewritten.params).await {
+    if let Err(err) = backend
+        .execute(&rewritten.sql, rewritten.single_statement_params()?)
+        .await
+    {
         if is_missing_relation_error(&err) {
             return Ok(());
         }
@@ -203,7 +206,9 @@ async fn load_key_value_payload(
     let mut provider = SystemFunctionProvider;
     let rewritten =
         preprocess_statements_with_provider(statements, &[], &mut provider, backend.dialect())?;
-    let result = backend.execute(&rewritten.sql, &rewritten.params).await?;
+    let result = backend
+        .execute(&rewritten.sql, rewritten.single_statement_params()?)
+        .await?;
     parse_first_payload(result.rows.first())
 }
 

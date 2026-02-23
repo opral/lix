@@ -423,11 +423,7 @@ fn render_statements_with_params(
     }
 
     let normalized_sql = rendered.join("; ");
-    let compatibility_params = if prepared_statements.len() == 1 {
-        prepared_statements[0].params.clone()
-    } else {
-        Vec::new()
-    };
+    let compatibility_params = Vec::new();
 
     Ok((normalized_sql, compatibility_params, prepared_statements))
 }
@@ -734,6 +730,23 @@ mod tests {
         assert_eq!(
             rewritten.prepared_statements[1].params,
             vec![Value::Integer(2)]
+        );
+    }
+
+    #[test]
+    fn preprocess_output_params_no_longer_flattens_single_statement_params() {
+        let statements = parse_sql_statements("SELECT ?").expect("parse should succeed");
+        let rewritten =
+            preprocess_statements(statements, &[Value::Integer(7)], SqlDialect::Sqlite)
+                .expect("rewrite should succeed");
+
+        assert!(
+            rewritten.params.is_empty(),
+            "compatibility param flattening must stay removed"
+        );
+        assert_eq!(
+            rewritten.prepared_statements[0].params,
+            vec![Value::Integer(7)]
         );
     }
 
