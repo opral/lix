@@ -4,10 +4,12 @@ use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
 use super::super::ast::nodes::Statement;
+use super::super::vtable;
 use super::{entity, filesystem, lix_state, lix_state_by_version, lix_state_history};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceKind {
+    Vtable,
     LixState,
     LixStateByVersion,
     LixStateHistory,
@@ -18,6 +20,7 @@ pub(crate) enum SurfaceKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SurfaceCoverage {
+    pub(crate) vtable: usize,
     pub(crate) lix_state: usize,
     pub(crate) lix_state_by_version: usize,
     pub(crate) lix_state_history: usize,
@@ -27,6 +30,9 @@ pub(crate) struct SurfaceCoverage {
 }
 
 pub(crate) fn classify_statement(statement: &Statement) -> SurfaceKind {
+    if vtable::registry::detect_registered_vtable(statement).is_some() {
+        return SurfaceKind::Vtable;
+    }
     if lix_state_by_version::planner::matches(statement) {
         return SurfaceKind::LixStateByVersion;
     }
@@ -49,6 +55,12 @@ pub(crate) fn collect_surface_coverage(statements: &[Statement]) -> SurfaceCover
     let mut coverage = SurfaceCoverage::default();
     for statement in statements {
         match classify_statement(statement) {
+            SurfaceKind::Vtable => {
+                let _ = vtable::registry::capabilities_for_statement(statement);
+                let _ = vtable::internal_state_vtable::lower_read::supports_internal_state_vtable_read(statement);
+                let _ = vtable::internal_state_vtable::lower_write::supports_internal_state_vtable_write(statement);
+                coverage.vtable += 1;
+            }
             SurfaceKind::LixState => {
                 let _ = lix_state::lower::lowering_kind(statement);
                 coverage.lix_state += 1;
@@ -129,5 +141,15 @@ mod tests {
             Parser::parse_sql(&GenericDialect {}, "SELECT * FROM lix_file WHERE id = 'f'")
                 .expect("parse SQL");
         assert_eq!(classify_statement(&statements[0]), SurfaceKind::Filesystem);
+    }
+
+    #[test]
+    fn classifies_internal_state_vtable_surface() {
+        let statements = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM lix_internal_state_vtable WHERE schema_key = 'x'",
+        )
+        .expect("parse SQL");
+        assert_eq!(classify_statement(&statements[0]), SurfaceKind::Vtable);
     }
 }
