@@ -121,6 +121,12 @@ pub(crate) async fn execute_plan_sql(
             }
 
             let mut followup_functions = functions.clone();
+            let followup_params = plan
+                .preprocess
+                .prepared_statements
+                .first()
+                .map(|statement| statement.params.as_slice())
+                .unwrap_or(&[]);
             let followup_statements = match postprocess_plan {
                 PostprocessPlan::VtableUpdate(update_plan) => {
                     match build_update_followup_statements(
@@ -145,7 +151,7 @@ pub(crate) async fn execute_plan_sql(
                         transaction.as_mut(),
                         delete_plan,
                         &result.rows,
-                        &plan.preprocess.params,
+                        followup_params,
                         detected_file_domain_changes,
                         writer_key,
                         &mut followup_functions,

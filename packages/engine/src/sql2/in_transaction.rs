@@ -114,7 +114,7 @@ impl Engine {
             active_version_from_mutations(&output.mutations)?;
         let next_active_version_id_from_updates =
             active_version_from_update_validations(&output.update_validations)?;
-        for registration in output.registrations {
+        for registration in &output.registrations {
             for statement in
                 register_schema_sql_statements(&registration.schema_key, transaction.dialect())
             {
@@ -124,7 +124,7 @@ impl Engine {
 
         let mut postprocess_file_cache_targets = BTreeSet::new();
         let mut plugin_changes_committed = false;
-        let result = match output.postprocess {
+        let result = match output.postprocess.as_ref() {
             None => {
                 let result =
                     execute_prepared_with_transaction(transaction, &output.prepared_statements)
@@ -141,7 +141,7 @@ impl Engine {
                 let result =
                     execute_prepared_with_transaction(transaction, &output.prepared_statements)
                         .await?;
-                match &postprocess_plan {
+                match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         if should_refresh_file_cache {
                             postprocess_file_cache_targets.extend(
@@ -175,11 +175,12 @@ impl Engine {
                     }
                 }
                 let mut followup_functions = functions.clone();
+                let followup_params = output.single_statement_params()?;
                 let followup_statements = match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         build_update_followup_sql(
                             transaction,
-                            &plan,
+                            plan,
                             &result.rows,
                             &detected_file_domain_changes,
                             writer_key,
@@ -190,9 +191,9 @@ impl Engine {
                     PostprocessPlan::VtableDelete(plan) => {
                         build_delete_followup_sql(
                             transaction,
-                            &plan,
+                            plan,
                             &result.rows,
-                            &output.params,
+                            followup_params,
                             &detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
