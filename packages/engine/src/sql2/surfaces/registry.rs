@@ -1,11 +1,13 @@
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::DetectedFileDomainChange;
 use crate::{LixBackend, LixError, Value};
 
 use super::super::ast::nodes::Statement;
 use super::super::vtable;
 use super::{entity, filesystem, lix_state, lix_state_by_version, lix_state_history};
+
+pub(crate) type DetectedFileDomainChangesByStatement =
+    [Vec<crate::sql::DetectedFileDomainChange>];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceKind {
@@ -57,7 +59,10 @@ pub(crate) fn collect_surface_coverage(statements: &[Statement]) -> SurfaceCover
         match classify_statement(statement) {
             SurfaceKind::Vtable => {
                 let _ = vtable::registry::capabilities_for_statement(statement);
-                let _ = vtable::internal_state_vtable::lower_read::supports_internal_state_vtable_read(statement);
+                let _ =
+                    vtable::internal_state_vtable::lower_read::supports_internal_state_vtable_read(
+                        statement,
+                    );
                 let _ = vtable::internal_state_vtable::lower_write::supports_internal_state_vtable_write(statement);
                 coverage.vtable += 1;
             }
@@ -95,7 +100,7 @@ pub(crate) async fn preprocess_with_surfaces<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    detected_file_domain_changes_by_statement: &DetectedFileDomainChangesByStatement,
     writer_key: Option<&str>,
 ) -> Result<crate::sql::PreprocessOutput, LixError>
 where
