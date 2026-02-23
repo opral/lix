@@ -69,3 +69,4 @@ pub(crate) use types::PreparedStatement;
 pub(crate) use types::PreprocessOutput;
 pub use types::SchemaRegistration;
 pub use types::{MutationOperation, MutationRow, UpdateValidationPlan};
+pub(crate) use types::{VtableDeletePlan, VtableUpdatePlan};
