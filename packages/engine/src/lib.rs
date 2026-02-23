@@ -21,6 +21,7 @@ mod schema;
 mod schema_registry;
 mod snapshot;
 mod sql;
+mod sql2;
 mod state_commit_stream;
 mod types;
 mod validation;

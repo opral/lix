@@ -152,3 +152,94 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    state_commit_stream_does_not_emit_before_transaction_commit,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        let events = engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    let events = events;
+                    tx.execute(
+                        &insert_key_value_sql("state-commit-events-f", "\"v0\""),
+                        &[],
+                    )
+                    .await?;
+                    assert!(
+                        events.try_next().is_none(),
+                        "no state commit batch should be visible before commit"
+                    );
+                    Ok::<_, LixError>(events)
+                })
+            })
+            .await
+            .unwrap();
+
+        let committed = events
+            .try_next()
+            .expect("commit should flush one batched state commit event");
+        assert!(committed
+            .changes
+            .iter()
+            .any(|change| change.entity_id == "state-commit-events-f"));
+        assert!(
+            events.try_next().is_none(),
+            "exactly one post-commit batch should be emitted"
+        );
+    }
+);
+
+simulation_test!(
+    state_commit_stream_rollback_drops_pending_transaction_changes,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        let error = engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async {
+                    tx.execute(
+                        &insert_key_value_sql("state-commit-events-g", "\"v0\""),
+                        &[],
+                    )
+                    .await?;
+                    Err::<(), LixError>(LixError {
+                        message: "rollback state commit stream test".to_string(),
+                    })
+                })
+            })
+            .await
+            .expect_err("transaction should roll back on callback error");
+        assert!(
+            error.message.contains("rollback state commit stream test"),
+            "unexpected rollback error: {}",
+            error.message
+        );
+
+        assert!(
+            events.try_next().is_none(),
+            "rollback must drop queued state commit batches"
+        );
+    }
+);
