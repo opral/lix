@@ -833,18 +833,21 @@ mod tests {
     use crate::sql::parse_sql_statements;
     use crate::Value;
 
-    #[test]
-    fn rewrites_file_view_reads_to_descriptor_projection() {
-        let sql = "SELECT id, data FROM lix_file WHERE path = '/src/index.ts'";
+    fn rewrite_single_query_sql(sql: &str) -> String {
         let statements = parse_sql_statements(sql).expect("parse");
         let query = match statements.into_iter().next().expect("statement") {
             sqlparser::ast::Statement::Query(query) => *query,
             _ => panic!("expected query"),
         };
-        let rewritten = rewrite_query(query)
+        rewrite_query(query)
             .expect("rewrite")
             .expect("query should be rewritten")
-            .to_string();
+            .to_string()
+    }
+
+    #[test]
+    fn rewrites_file_view_reads_to_descriptor_projection() {
+        let rewritten = rewrite_single_query_sql("SELECT id, data FROM lix_file WHERE path = '/src/index.ts'");
 
         assert!(rewritten.contains("COALESCE(fd.data, lix_empty_blob()) AS data"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
@@ -854,16 +857,7 @@ mod tests {
 
     #[test]
     fn rewrites_simple_file_path_data_query_to_projection() {
-        let sql = "SELECT path, data FROM lix_file ORDER BY path";
-        let statements = parse_sql_statements(sql).expect("parse");
-        let query = match statements.into_iter().next().expect("statement") {
-            sqlparser::ast::Statement::Query(query) => *query,
-            _ => panic!("expected query"),
-        };
-        let rewritten = rewrite_query(query)
-            .expect("rewrite")
-            .expect("query should be rewritten")
-            .to_string();
+        let rewritten = rewrite_single_query_sql("SELECT path, data FROM lix_file ORDER BY path");
 
         assert!(rewritten.contains("COALESCE(fd.data, lix_empty_blob()) AS data"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
@@ -903,5 +897,60 @@ mod tests {
         };
         let rewritten = rewrite_query(query).expect("rewrite");
         assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn rewrites_file_history_with_descriptor_rows_from_state_history() {
+        let rewritten = rewrite_single_query_sql(
+            "SELECT id, path, data, lixcol_root_commit_id, lixcol_depth FROM lix_file_history",
+        );
+
+        assert!(rewritten.contains("file_history_descriptor_rows AS ("));
+        assert!(rewritten.contains("FROM lix_state_history"));
+        assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
+        assert!(rewritten.contains("root_commit_id AS lixcol_root_commit_id"));
+        assert!(rewritten.contains("depth AS lixcol_depth"));
+        assert!(rewritten.contains("LEFT JOIN lix_internal_file_history_data_cache fd"));
+    }
+
+    #[test]
+    fn rewrites_file_history_with_content_only_root_fallback_rows() {
+        let rewritten = rewrite_single_query_sql(
+            "SELECT id, lixcol_root_commit_id, lixcol_depth FROM lix_file_history",
+        );
+
+        assert!(rewritten.contains("descriptor_depth_zero_roots AS ("));
+        assert!(rewritten.contains("content_only_roots AS ("));
+        assert!(rewritten.contains("content_history_rows AS ("));
+        assert!(rewritten.contains("SELECT * FROM file_history_descriptor_rows"));
+        assert!(rewritten.contains("UNION ALL"));
+        assert!(rewritten.contains("SELECT * FROM content_history_rows"));
+        assert!(rewritten.contains("file_history_ranked_rows AS ("));
+    }
+
+    #[test]
+    fn file_history_rewrite_does_not_scope_to_active_version_only() {
+        let rewritten = rewrite_single_query_sql(
+            "SELECT id, lixcol_root_commit_id, lixcol_depth FROM lix_file_history WHERE lixcol_root_commit_id = 'commit-root-a'",
+        );
+
+        assert!(rewritten.contains("root_commit_id AS lixcol_root_commit_id"));
+        assert!(rewritten.contains("FROM lix_state_history"));
+        assert!(!rewritten.contains("FROM lix_internal_state_untracked"));
+    }
+
+    #[test]
+    fn file_history_rewrite_keeps_next_shape_anchors_for_root_depth_path_joining() {
+        let rewritten = rewrite_single_query_sql(
+            "SELECT id, path, lixcol_root_commit_id, lixcol_depth FROM lix_file_history",
+        );
+
+        assert!(rewritten.contains("directory_history_path_walk"));
+        assert!(rewritten.contains("candidate.lixcol_depth >= walk.target_depth"));
+        assert!(rewritten.contains("fhr.lixcol_depth AS lixcol_raw_depth"));
+        assert!(rewritten.contains("ROW_NUMBER() OVER ("));
+        assert!(rewritten.contains("PARTITION BY fhr.id, fhr.lixcol_root_commit_id"));
+        assert!(rewritten.contains("fd.root_commit_id = f.lixcol_root_commit_id"));
+        assert!(rewritten.contains("fd.depth = f.lixcol_depth"));
     }
 }
