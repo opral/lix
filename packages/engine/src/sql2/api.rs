@@ -5,6 +5,7 @@ use super::execution::{apply_effects_post_commit, apply_effects_tx, run};
 use super::planning::derive_requirements::derive_plan_requirements;
 use super::planning::parse::parse_sql;
 use super::planning::plan::build_execution_plan;
+use super::type_bridge::{to_sql_mutations, to_sql_update_validations};
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -169,20 +170,17 @@ impl Engine {
         )
         .await
         .map_err(LixError::from)?;
+        let sql_mutations = to_sql_mutations(&plan.preprocess.mutations);
+        let sql_update_validations = to_sql_update_validations(&plan.preprocess.update_validations);
 
-        if !plan.preprocess.mutations.is_empty() {
-            validate_inserts(
-                self.backend.as_ref(),
-                &self.schema_cache,
-                &plan.preprocess.mutations,
-            )
-            .await?;
+        if !sql_mutations.is_empty() {
+            validate_inserts(self.backend.as_ref(), &self.schema_cache, &sql_mutations).await?;
         }
-        if !plan.preprocess.update_validations.is_empty() {
+        if !sql_update_validations.is_empty() {
             validate_updates(
                 self.backend.as_ref(),
                 &self.schema_cache,
-                &plan.preprocess.update_validations,
+                &sql_update_validations,
                 params,
             )
             .await?;
@@ -206,21 +204,21 @@ impl Engine {
         }
 
         let file_cache_refresh_targets = if plan.requirements.should_refresh_file_cache {
-            let mut targets = direct_state_file_cache_refresh_targets(&plan.preprocess.mutations);
+            let mut targets = direct_state_file_cache_refresh_targets(&sql_mutations);
             targets.extend(execution.postprocess_file_cache_targets);
             targets
         } else {
             BTreeSet::new()
         };
         let descriptor_cache_eviction_targets =
-            file_descriptor_cache_eviction_targets(&plan.preprocess.mutations);
+            file_descriptor_cache_eviction_targets(&sql_mutations);
         let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets.clone());
 
         apply_effects_tx::apply_sql_backed_effects(
             self,
-            &plan.preprocess.mutations,
+            &sql_mutations,
             &pending_file_writes,
             &pending_file_delete_targets,
             &detected_file_domain_changes,
