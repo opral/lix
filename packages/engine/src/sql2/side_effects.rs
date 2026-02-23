@@ -1,4 +1,8 @@
 use super::super::*;
+use super::storage::queries::{
+    filesystem as filesystem_queries, history as history_queries, state as state_queries,
+};
+use super::storage::tables;
 use super::*;
 use crate::SqlDialect;
 
@@ -345,99 +349,7 @@ impl Engine {
             return Ok(());
         }
 
-        let (sql, params) = if untracked {
-            let mut params = Vec::with_capacity(deduped_changes.len() * 10);
-            let mut rows = Vec::with_capacity(deduped_changes.len());
-            for (row_index, change) in deduped_changes.iter().enumerate() {
-                let base = row_index * 10;
-                rows.push(format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8,
-                    base + 9,
-                    base + 10
-                ));
-                params.push(Value::Text(change.entity_id.clone()));
-                params.push(Value::Text(change.schema_key.clone()));
-                params.push(Value::Text(change.file_id.clone()));
-                params.push(Value::Text(change.version_id.clone()));
-                params.push(Value::Text(change.plugin_key.clone()));
-                params.push(match &change.snapshot_content {
-                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                    None => Value::Null,
-                });
-                params.push(Value::Text(change.schema_version.clone()));
-                params.push(match &change.metadata {
-                    Some(metadata) => Value::Text(metadata.clone()),
-                    None => Value::Null,
-                });
-                params.push(match &change.writer_key {
-                    Some(writer_key) => Value::Text(writer_key.clone()),
-                    None => Value::Null,
-                });
-                params.push(Value::Integer(1));
-            }
-            (
-                format!(
-                    "INSERT INTO lix_internal_state_vtable (\
-                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
-                     ) VALUES {}",
-                    rows.join(", ")
-                ),
-                params,
-            )
-        } else {
-            let mut params = Vec::with_capacity(deduped_changes.len() * 9);
-            let mut rows = Vec::with_capacity(deduped_changes.len());
-            for (row_index, change) in deduped_changes.iter().enumerate() {
-                let base = row_index * 9;
-                rows.push(format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8,
-                    base + 9
-                ));
-                params.push(Value::Text(change.entity_id.clone()));
-                params.push(Value::Text(change.schema_key.clone()));
-                params.push(Value::Text(change.file_id.clone()));
-                params.push(Value::Text(change.version_id.clone()));
-                params.push(Value::Text(change.plugin_key.clone()));
-                params.push(match &change.snapshot_content {
-                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                    None => Value::Null,
-                });
-                params.push(Value::Text(change.schema_version.clone()));
-                params.push(match &change.metadata {
-                    Some(metadata) => Value::Text(metadata.clone()),
-                    None => Value::Null,
-                });
-                params.push(match &change.writer_key {
-                    Some(writer_key) => Value::Text(writer_key.clone()),
-                    None => Value::Null,
-                });
-            }
-            (
-                format!(
-                    "INSERT INTO lix_state_by_version (\
-                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
-                     ) VALUES {}",
-                    rows.join(", ")
-                ),
-                params,
-            )
-        };
+        let (sql, params) = build_detected_file_domain_changes_insert(&deduped_changes, untracked);
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.active_version_id.read().unwrap().clone();
         let previous_active_version_id = active_version_id.clone();
@@ -482,99 +394,7 @@ impl Engine {
             return Ok(());
         }
 
-        let (sql, params) = if untracked {
-            let mut params = Vec::with_capacity(deduped_changes.len() * 10);
-            let mut rows = Vec::with_capacity(deduped_changes.len());
-            for (row_index, change) in deduped_changes.iter().enumerate() {
-                let base = row_index * 10;
-                rows.push(format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8,
-                    base + 9,
-                    base + 10
-                ));
-                params.push(Value::Text(change.entity_id.clone()));
-                params.push(Value::Text(change.schema_key.clone()));
-                params.push(Value::Text(change.file_id.clone()));
-                params.push(Value::Text(change.version_id.clone()));
-                params.push(Value::Text(change.plugin_key.clone()));
-                params.push(match &change.snapshot_content {
-                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                    None => Value::Null,
-                });
-                params.push(Value::Text(change.schema_version.clone()));
-                params.push(match &change.metadata {
-                    Some(metadata) => Value::Text(metadata.clone()),
-                    None => Value::Null,
-                });
-                params.push(match &change.writer_key {
-                    Some(writer_key) => Value::Text(writer_key.clone()),
-                    None => Value::Null,
-                });
-                params.push(Value::Integer(1));
-            }
-            (
-                format!(
-                    "INSERT INTO lix_internal_state_vtable (\
-                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
-                     ) VALUES {}",
-                    rows.join(", ")
-                ),
-                params,
-            )
-        } else {
-            let mut params = Vec::with_capacity(deduped_changes.len() * 9);
-            let mut rows = Vec::with_capacity(deduped_changes.len());
-            for (row_index, change) in deduped_changes.iter().enumerate() {
-                let base = row_index * 9;
-                rows.push(format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8,
-                    base + 9
-                ));
-                params.push(Value::Text(change.entity_id.clone()));
-                params.push(Value::Text(change.schema_key.clone()));
-                params.push(Value::Text(change.file_id.clone()));
-                params.push(Value::Text(change.version_id.clone()));
-                params.push(Value::Text(change.plugin_key.clone()));
-                params.push(match &change.snapshot_content {
-                    Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-                    None => Value::Null,
-                });
-                params.push(Value::Text(change.schema_version.clone()));
-                params.push(match &change.metadata {
-                    Some(metadata) => Value::Text(metadata.clone()),
-                    None => Value::Null,
-                });
-                params.push(match &change.writer_key {
-                    Some(writer_key) => Value::Text(writer_key.clone()),
-                    None => Value::Null,
-                });
-            }
-            (
-                format!(
-                    "INSERT INTO lix_state_by_version (\
-                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
-                     ) VALUES {}",
-                    rows.join(", ")
-                ),
-                params,
-            )
-        };
+        let (sql, params) = build_detected_file_domain_changes_insert(&deduped_changes, untracked);
         let output = {
             let backend = TransactionBackendAdapter::new(transaction);
             preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?
@@ -641,6 +461,7 @@ impl Engine {
         &self,
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
     ) -> Result<(), LixError> {
+        let upsert_sql = filesystem_queries::upsert_file_path_cache_sql();
         let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
             latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
@@ -656,14 +477,7 @@ impl Engine {
             };
             self.backend
                 .execute(
-                    "INSERT INTO lix_internal_file_path_cache \
-                     (file_id, version_id, directory_id, name, extension, path) \
-                     VALUES ($1, $2, NULL, $3, $4, $5) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     directory_id = EXCLUDED.directory_id, \
-                     name = EXCLUDED.name, \
-                     extension = EXCLUDED.extension, \
-                     path = EXCLUDED.path",
+                    &upsert_sql,
                     &[
                         Value::Text(write.file_id.clone()),
                         Value::Text(write.version_id.clone()),
@@ -685,6 +499,7 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
     ) -> Result<(), LixError> {
+        let upsert_sql = filesystem_queries::upsert_file_path_cache_sql();
         let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
             latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
@@ -700,14 +515,7 @@ impl Engine {
             };
             transaction
                 .execute(
-                    "INSERT INTO lix_internal_file_path_cache \
-                     (file_id, version_id, directory_id, name, extension, path) \
-                     VALUES ($1, $2, NULL, $3, $4, $5) \
-                     ON CONFLICT (file_id, version_id) DO UPDATE SET \
-                     directory_id = EXCLUDED.directory_id, \
-                     name = EXCLUDED.name, \
-                     extension = EXCLUDED.extension, \
-                     path = EXCLUDED.path",
+                    &upsert_sql,
                     &[
                         Value::Text(write.file_id.clone()),
                         Value::Text(write.version_id.clone()),
@@ -879,17 +687,10 @@ impl Engine {
                 params.push(Value::Text(file_id.clone()));
                 params.push(Value::Text(version_id.clone()));
             }
+            let sql =
+                filesystem_queries::delete_file_data_cache_where_sql(&predicates.join(" OR "));
 
-            self.backend
-                .execute(
-                    &format!(
-                        "DELETE FROM lix_internal_file_data_cache \
-                         WHERE {}",
-                        predicates.join(" OR ")
-                    ),
-                    &params,
-                )
-                .await?;
+            self.backend.execute(&sql, &params).await?;
         }
         Ok(())
     }
@@ -918,17 +719,10 @@ impl Engine {
                 params.push(Value::Text(file_id.clone()));
                 params.push(Value::Text(version_id.clone()));
             }
+            let sql =
+                filesystem_queries::delete_file_data_cache_where_sql(&predicates.join(" OR "));
 
-            transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM lix_internal_file_data_cache \
-                         WHERE {}",
-                        predicates.join(" OR ")
-                    ),
-                    &params,
-                )
-                .await?;
+            transaction.execute(&sql, &params).await?;
         }
         Ok(())
     }
@@ -956,17 +750,10 @@ impl Engine {
                 params.push(Value::Text(file_id.clone()));
                 params.push(Value::Text(version_id.clone()));
             }
+            let sql =
+                filesystem_queries::delete_file_path_cache_where_sql(&predicates.join(" OR "));
 
-            self.backend
-                .execute(
-                    &format!(
-                        "DELETE FROM lix_internal_file_path_cache \
-                         WHERE {}",
-                        predicates.join(" OR ")
-                    ),
-                    &params,
-                )
-                .await?;
+            self.backend.execute(&sql, &params).await?;
         }
         Ok(())
     }
@@ -995,17 +782,10 @@ impl Engine {
                 params.push(Value::Text(file_id.clone()));
                 params.push(Value::Text(version_id.clone()));
             }
+            let sql =
+                filesystem_queries::delete_file_path_cache_where_sql(&predicates.join(" OR "));
 
-            transaction
-                .execute(
-                    &format!(
-                        "DELETE FROM lix_internal_file_path_cache \
-                         WHERE {}",
-                        predicates.join(" OR ")
-                    ),
-                    &params,
-                )
-                .await?;
+            transaction.execute(&sql, &params).await?;
         }
         Ok(())
     }
@@ -1040,6 +820,52 @@ impl Engine {
     }
 }
 
+fn build_detected_file_domain_changes_insert(
+    changes: &[DetectedFileDomainChange],
+    untracked: bool,
+) -> (String, Vec<Value>) {
+    let values_per_row = if untracked { 10 } else { 9 };
+    let mut params = Vec::with_capacity(changes.len() * values_per_row);
+    let mut rows = Vec::with_capacity(changes.len());
+
+    for (row_index, change) in changes.iter().enumerate() {
+        rows.push(values_row_placeholders_sql(row_index, values_per_row));
+        params.push(Value::Text(change.entity_id.clone()));
+        params.push(Value::Text(change.schema_key.clone()));
+        params.push(Value::Text(change.file_id.clone()));
+        params.push(Value::Text(change.version_id.clone()));
+        params.push(Value::Text(change.plugin_key.clone()));
+        params.push(match &change.snapshot_content {
+            Some(snapshot_content) => Value::Text(snapshot_content.clone()),
+            None => Value::Null,
+        });
+        params.push(Value::Text(change.schema_version.clone()));
+        params.push(match &change.metadata {
+            Some(metadata) => Value::Text(metadata.clone()),
+            None => Value::Null,
+        });
+        params.push(match &change.writer_key {
+            Some(writer_key) => Value::Text(writer_key.clone()),
+            None => Value::Null,
+        });
+        if untracked {
+            params.push(Value::Integer(1));
+        }
+    }
+
+    let sql = state_queries::insert_detected_file_domain_changes_sql(&rows.join(", "), untracked);
+    (sql, params)
+}
+
+fn values_row_placeholders_sql(row_index: usize, values_per_row: usize) -> String {
+    let base = row_index * values_per_row;
+    let placeholders = (1..=values_per_row)
+        .map(|offset| format!("${}", base + offset))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({placeholders})")
+}
+
 fn parse_builtin_binary_blob_ref_snapshot(
     raw: &str,
 ) -> Result<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot, LixError> {
@@ -1055,17 +881,10 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
+    let sql = state_queries::select_builtin_binary_blob_ref_snapshot_sql();
     let result = backend
         .execute(
-            "SELECT snapshot_content \
-             FROM lix_internal_state_materialized_v1_lix_binary_blob_ref \
-             WHERE file_id = $1 \
-               AND version_id = $2 \
-               AND plugin_key = $3 \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
+            &sql,
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(version_id.to_string()),
@@ -1094,17 +913,10 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
+    let sql = state_queries::select_builtin_binary_blob_ref_snapshot_sql();
     let result = transaction
         .execute(
-            "SELECT snapshot_content \
-             FROM lix_internal_state_materialized_v1_lix_binary_blob_ref \
-             WHERE file_id = $1 \
-               AND version_id = $2 \
-               AND plugin_key = $3 \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1",
+            &sql,
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(version_id.to_string()),
@@ -1129,18 +941,9 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
 }
 
 async fn binary_blob_exists(backend: &dyn LixBackend, blob_hash: &str) -> Result<bool, LixError> {
+    let sql = filesystem_queries::binary_blob_exists_sql();
     let result = backend
-        .execute(
-            "SELECT 1 \
-             FROM (\
-                 SELECT blob_hash FROM lix_internal_binary_blob_store \
-                 UNION ALL \
-                 SELECT blob_hash FROM lix_internal_binary_blob_manifest\
-             ) AS blobs \
-             WHERE blob_hash = $1 \
-             LIMIT 1",
-            &[Value::Text(blob_hash.to_string())],
-        )
+        .execute(&sql, &[Value::Text(blob_hash.to_string())])
         .await?;
     Ok(!result.rows.is_empty())
 }
@@ -1149,18 +952,9 @@ async fn binary_blob_exists_in_transaction(
     transaction: &mut dyn LixTransaction,
     blob_hash: &str,
 ) -> Result<bool, LixError> {
+    let sql = filesystem_queries::binary_blob_exists_sql();
     let result = transaction
-        .execute(
-            "SELECT 1 \
-             FROM (\
-                 SELECT blob_hash FROM lix_internal_binary_blob_store \
-                 UNION ALL \
-                 SELECT blob_hash FROM lix_internal_binary_blob_manifest\
-             ) AS blobs \
-             WHERE blob_hash = $1 \
-             LIMIT 1",
-            &[Value::Text(blob_hash.to_string())],
-        )
+        .execute(&sql, &[Value::Text(blob_hash.to_string())])
         .await?;
     Ok(!result.rows.is_empty())
 }
@@ -1170,13 +964,10 @@ async fn load_file_cache_blob(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
+    let sql = filesystem_queries::select_file_data_cache_blob_sql();
     let result = backend
         .execute(
-            "SELECT data \
-             FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 \
-               AND version_id = $2 \
-             LIMIT 1",
+            &sql,
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(version_id.to_string()),
@@ -1194,13 +985,10 @@ async fn load_file_cache_blob_in_transaction(
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
+    let sql = filesystem_queries::select_file_data_cache_blob_sql();
     let result = transaction
         .execute(
-            "SELECT data \
-             FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 \
-               AND version_id = $2 \
-             LIMIT 1",
+            &sql,
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(version_id.to_string()),
@@ -1296,6 +1084,11 @@ async fn persist_binary_blob_with_fastcdc(
     version_id: &str,
     data: &[u8],
 ) -> Result<(), LixError> {
+    let insert_manifest_sql = filesystem_queries::insert_binary_blob_manifest_sql();
+    let insert_chunk_store_sql = filesystem_queries::insert_binary_chunk_store_sql();
+    let insert_manifest_chunk_sql = filesystem_queries::insert_binary_blob_manifest_chunk_sql();
+    let upsert_file_version_ref_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
+
     let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
     let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
         message: format!(
@@ -1314,9 +1107,7 @@ async fn persist_binary_blob_with_fastcdc(
 
     executor
         .execute_sql(
-            "INSERT INTO lix_internal_binary_blob_manifest (blob_hash, size_bytes, chunk_count, created_at) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (blob_hash) DO NOTHING",
+            &insert_manifest_sql,
             &[
                 Value::Text(blob_hash.clone()),
                 Value::Integer(size_bytes),
@@ -1351,9 +1142,7 @@ async fn persist_binary_blob_with_fastcdc(
 
         executor
             .execute_sql(
-                "INSERT INTO lix_internal_binary_chunk_store (chunk_hash, data, size_bytes, codec, codec_dict_id, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (chunk_hash) DO NOTHING",
+                &insert_chunk_store_sql,
                 &[
                     Value::Text(chunk_hash.clone()),
                     Value::Blob(encoded_chunk.data),
@@ -1369,9 +1158,7 @@ async fn persist_binary_blob_with_fastcdc(
             .await?;
         executor
             .execute_sql(
-                "INSERT INTO lix_internal_binary_blob_manifest_chunk (blob_hash, chunk_index, chunk_hash, chunk_size) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (blob_hash, chunk_index) DO NOTHING",
+                &insert_manifest_chunk_sql,
                 &[
                     Value::Text(blob_hash.clone()),
                     Value::Integer(chunk_index),
@@ -1384,12 +1171,7 @@ async fn persist_binary_blob_with_fastcdc(
 
     executor
         .execute_sql(
-            "INSERT INTO lix_internal_binary_file_version_ref (file_id, version_id, blob_hash, size_bytes, updated_at) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (file_id, version_id) DO UPDATE SET \
-             blob_hash = EXCLUDED.blob_hash, \
-             size_bytes = EXCLUDED.size_bytes, \
-             updated_at = EXCLUDED.updated_at",
+            &upsert_file_version_ref_sql,
             &[
                 Value::Text(file_id.to_string()),
                 Value::Text(version_id.to_string()),
@@ -1501,99 +1283,35 @@ async fn garbage_collect_unreachable_binary_cas_with_executor(
     }
 
     let state_blob_hash_expr = binary_blob_hash_extract_expr_sql(executor.dialect());
+    let delete_unreferenced_file_ref_sql =
+        history_queries::delete_unreferenced_binary_file_version_ref_sql(state_blob_hash_expr);
+    let delete_unreferenced_manifest_chunk_sql =
+        history_queries::delete_unreferenced_binary_blob_manifest_chunk_sql(state_blob_hash_expr);
+    let delete_unreferenced_chunk_store_sql =
+        filesystem_queries::delete_unreferenced_binary_chunk_store_sql();
+    let delete_unreferenced_manifest_sql =
+        history_queries::delete_unreferenced_binary_blob_manifest_sql(state_blob_hash_expr);
+    let delete_unreferenced_blob_store_sql =
+        history_queries::delete_unreferenced_binary_blob_store_sql();
 
     executor
-        .execute_sql(
-            &format!(
-                "WITH referenced AS (\
-                     SELECT file_id, version_id, {state_blob_hash_expr} AS blob_hash \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND snapshot_content IS NOT NULL \
-                       AND {state_blob_hash_expr} IS NOT NULL\
-                 ) \
-                 DELETE FROM lix_internal_binary_file_version_ref \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM referenced r \
-                 WHERE r.file_id = lix_internal_binary_file_version_ref.file_id \
-                   AND r.version_id = lix_internal_binary_file_version_ref.version_id \
-                   AND r.blob_hash = lix_internal_binary_file_version_ref.blob_hash\
-             )"
-            ),
-            &[],
-        )
+        .execute_sql(&delete_unreferenced_file_ref_sql, &[])
         .await?;
 
     executor
-        .execute_sql(
-            &format!(
-                "WITH referenced AS (\
-                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND snapshot_content IS NOT NULL \
-                       AND {state_blob_hash_expr} IS NOT NULL\
-                 ) \
-                 DELETE FROM lix_internal_binary_blob_manifest_chunk \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM referenced r \
-                 WHERE r.blob_hash = lix_internal_binary_blob_manifest_chunk.blob_hash\
-             )"
-            ),
-            &[],
-        )
+        .execute_sql(&delete_unreferenced_manifest_chunk_sql, &[])
         .await?;
 
     executor
-        .execute_sql(
-            "DELETE FROM lix_internal_binary_chunk_store \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM lix_internal_binary_blob_manifest_chunk mc \
-                 WHERE mc.chunk_hash = lix_internal_binary_chunk_store.chunk_hash\
-             )",
-            &[],
-        )
+        .execute_sql(&delete_unreferenced_chunk_store_sql, &[])
         .await?;
 
     executor
-        .execute_sql(
-            &format!(
-                "WITH referenced AS (\
-                     SELECT DISTINCT {state_blob_hash_expr} AS blob_hash \
-                     FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_binary_blob_ref' \
-                       AND snapshot_content IS NOT NULL \
-                       AND {state_blob_hash_expr} IS NOT NULL\
-                 ) \
-                 DELETE FROM lix_internal_binary_blob_manifest \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM referenced r \
-                 WHERE r.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
-             ) \
-             AND NOT EXISTS (\
-                 SELECT 1 \
-                 FROM lix_internal_binary_blob_manifest_chunk mc \
-                 WHERE mc.blob_hash = lix_internal_binary_blob_manifest.blob_hash\
-             )"
-            ),
-            &[],
-        )
+        .execute_sql(&delete_unreferenced_manifest_sql, &[])
         .await?;
 
     executor
-        .execute_sql(
-            "DELETE FROM lix_internal_binary_blob_store \
-             WHERE NOT EXISTS (\
-                 SELECT 1 \
-                 FROM lix_internal_binary_file_version_ref r \
-                 WHERE r.blob_hash = lix_internal_binary_blob_store.blob_hash\
-             )",
-            &[],
-        )
+        .execute_sql(&delete_unreferenced_blob_store_sql, &[])
         .await?;
 
     Ok(())
@@ -1611,7 +1329,7 @@ async fn binary_blob_ref_relation_exists_with_backend(
                      WHERE name = $1 \
                        AND type IN ('table', 'view') \
                      LIMIT 1",
-                    &[Value::Text("lix_state_by_version".to_string())],
+                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
                 )
                 .await?;
             Ok(!result.rows.is_empty())
@@ -1625,7 +1343,7 @@ async fn binary_blob_ref_relation_exists_with_backend(
                      WHERE n.nspname = current_schema() \
                        AND c.relname = $1 \
                      LIMIT 1",
-                    &[Value::Text("lix_state_by_version".to_string())],
+                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
                 )
                 .await?;
             Ok(!result.rows.is_empty())
@@ -1645,7 +1363,7 @@ async fn binary_blob_ref_relation_exists_in_transaction(
                      WHERE name = $1 \
                        AND type IN ('table', 'view') \
                      LIMIT 1",
-                    &[Value::Text("lix_state_by_version".to_string())],
+                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
                 )
                 .await?;
             Ok(!result.rows.is_empty())
@@ -1659,7 +1377,7 @@ async fn binary_blob_ref_relation_exists_in_transaction(
                      WHERE n.nspname = current_schema() \
                        AND c.relname = $1 \
                      LIMIT 1",
-                    &[Value::Text("lix_state_by_version".to_string())],
+                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
                 )
                 .await?;
             Ok(!result.rows.is_empty())

@@ -9,6 +9,7 @@ pub(crate) mod prepared;
 pub(crate) mod scripts;
 pub(crate) mod semantics;
 pub(crate) mod side_effects;
+pub(crate) mod storage;
 pub(crate) mod surfaces;
 pub(crate) mod transaction;
 pub(crate) mod type_bridge;

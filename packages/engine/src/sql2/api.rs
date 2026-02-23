@@ -108,6 +108,11 @@ impl Engine {
                 .execute_transaction_script_with_options(statements, params, options)
                 .await;
         }
+        if parsed_statements.len() > 1 {
+            return self
+                .execute_statement_script_with_options(parsed_statements, params, &options)
+                .await;
+        }
 
         let requirements = derive_plan_requirements(&parsed_statements);
         let active_version_id = self.active_version_id.read().unwrap().clone();
