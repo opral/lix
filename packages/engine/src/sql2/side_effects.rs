@@ -4,6 +4,9 @@ use super::storage::queries::{
 };
 use super::storage::tables;
 use super::*;
+use super::{
+    history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
+};
 use crate::SqlDialect;
 
 impl Engine {
@@ -13,7 +16,9 @@ impl Engine {
         statements: &[Statement],
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        if let Some(scope) = file_read_materialization_scope_for_statements(statements) {
+        if let Some(scope) =
+            history_plugin_inputs::file_read_materialization_scope_for_statements(statements)
+        {
             let versions = match scope {
                 FileReadMaterializationScope::ActiveVersionOnly => {
                     let mut set = BTreeSet::new();
@@ -29,7 +34,9 @@ impl Engine {
             )
             .await?;
         }
-        if file_history_read_materialization_required_for_statements(statements) {
+        if history_plugin_inputs::file_history_read_materialization_required_for_statements(
+            statements,
+        ) {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
                 self.wasm_runtime.as_ref(),
@@ -44,7 +51,8 @@ impl Engine {
         backend: &dyn LixBackend,
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        crate::sql::refresh_working_projection_for_read_query(backend, active_version_id).await
+        history_projections::refresh_working_projection_for_read_query(backend, active_version_id)
+            .await
     }
 
     pub(crate) async fn collect_execution_side_effects_with_backend_from_statements(
