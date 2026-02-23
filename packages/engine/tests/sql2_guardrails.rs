@@ -39,6 +39,29 @@ fn guardrail_engine_module_is_not_wired_to_legacy_execute_mod() {
 }
 
 #[test]
+fn guardrail_execute_entrypoints_route_through_sql2_api() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let engine_source = fs::read_to_string(root.join("src/engine.rs"))
+        .expect("engine.rs should be readable");
+    let sql2_api_source = fs::read_to_string(root.join("src/sql2/api.rs"))
+        .expect("sql2/api.rs should be readable");
+
+    assert!(
+        engine_source.contains("[path = \"sql2/mod.rs\"]"),
+        "engine module must wire sql2 runtime module"
+    );
+    assert!(
+        sql2_api_source.contains("pub(crate) async fn execute_impl")
+            && sql2_api_source.contains("self.execute_impl_sql2(sql, params, options, allow_internal_tables)"),
+        "engine execute entrypoint must delegate to sql2"
+    );
+    assert!(
+        sql2_api_source.contains("pub(crate) async fn execute_impl_sql2"),
+        "sql2 api must expose execute_impl_sql2 entrypoint"
+    );
+}
+
+#[test]
 fn guardrail_forbids_string_matched_postprocess_fallback() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
