@@ -13,7 +13,7 @@ pub(crate) fn derive_effects_from_state_resolution(
     let sql_mutations = to_sql_mutations(&preprocess.mutations);
     let sql_update_validations = to_sql_update_validations(&preprocess.update_validations);
     let state_commit_stream_changes =
-        state_commit_stream_changes_from_mutations(&sql_mutations, writer_key);
+        state_commit_stream_changes_from_mutations(&preprocess.mutations, writer_key);
     let next_active_version_id = active_version_from_mutations(&sql_mutations)
         .map_err(PlannerError::preprocess)?
         .or(

@@ -3,11 +3,12 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::{LixBackend, LixError, Value};
 
 use super::super::ast::nodes::Statement;
+use super::super::contracts::effects::DetectedFileDomainChange;
+use super::super::type_bridge::to_sql_detected_file_domain_changes_by_statement;
 use super::super::vtable;
 use super::{entity, filesystem, lix_state, lix_state_by_version, lix_state_history};
 
-pub(crate) type DetectedFileDomainChangesByStatement =
-    [Vec<crate::sql::DetectedFileDomainChange>];
+pub(crate) type DetectedFileDomainChangesByStatement = [Vec<DetectedFileDomainChange>];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceKind {
@@ -107,6 +108,8 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     let _coverage = collect_surface_coverage(&statements);
+    let sql_detected_file_domain_changes_by_statement =
+        to_sql_detected_file_domain_changes_by_statement(detected_file_domain_changes_by_statement);
 
     crate::sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
         backend,
@@ -114,7 +117,7 @@ where
         statements,
         params,
         functions,
-        detected_file_domain_changes_by_statement,
+        &sql_detected_file_domain_changes_by_statement,
         writer_key,
     )
     .await

@@ -2,13 +2,15 @@ use super::super::*;
 use super::ast::utils::parse_sql_statements;
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::execution::postprocess::{
-    build_delete_followup_statements_from_sql_plan,
-    build_update_followup_statements_from_sql_plan,
+    build_delete_followup_statements_from_sql_plan, build_update_followup_statements_from_sql_plan,
 };
-use super::type_bridge::from_sql_prepared_statements;
+use super::type_bridge::{
+    from_sql_mutations, from_sql_prepared_statements, from_sql_update_validations,
+};
 use crate::sql::{
     active_version_from_mutations, active_version_from_update_validations,
-    is_query_only_statements, preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
+    is_query_only_statements,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
     should_refresh_file_cache_for_statements, MutationOperation, PostprocessPlan,
 };
 
@@ -39,6 +41,7 @@ impl Engine {
             sequence_start,
             functions,
             output,
+            contract_mutations,
         ) = {
             let backend = TransactionBackendAdapter::new(transaction);
             if read_only_query {
@@ -94,14 +97,17 @@ impl Engine {
                     writer_key,
                 )
                 .await?;
-            if !output.mutations.is_empty() {
-                validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
+            let contract_mutations = from_sql_mutations(output.mutations.clone());
+            if !contract_mutations.is_empty() {
+                validate_inserts(&backend, &self.schema_cache, &contract_mutations).await?;
             }
-            if !output.update_validations.is_empty() {
+            let contract_update_validations =
+                from_sql_update_validations(output.update_validations.clone());
+            if !contract_update_validations.is_empty() {
                 validate_updates(
                     &backend,
                     &self.schema_cache,
-                    &output.update_validations,
+                    &contract_update_validations,
                     params,
                 )
                 .await?;
@@ -116,10 +122,11 @@ impl Engine {
                 sequence_start,
                 functions,
                 output,
+                contract_mutations,
             )
         };
         let state_commit_stream_changes =
-            state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
+            state_commit_stream_changes_from_mutations(&contract_mutations, writer_key);
 
         let next_active_version_id_from_mutations =
             active_version_from_mutations(&output.mutations)?;
@@ -138,8 +145,8 @@ impl Engine {
         let prepared_statements = from_sql_prepared_statements(output.prepared_statements.clone());
         let result = match output.postprocess.as_ref() {
             None => {
-                let result = execute_prepared_with_transaction(transaction, &prepared_statements)
-                    .await?;
+                let result =
+                    execute_prepared_with_transaction(transaction, &prepared_statements).await?;
                 let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
                     mutation.operation == MutationOperation::Insert && !mutation.untracked
                 });
@@ -149,8 +156,8 @@ impl Engine {
                 result
             }
             Some(postprocess_plan) => {
-                let result = execute_prepared_with_transaction(transaction, &prepared_statements)
-                    .await?;
+                let result =
+                    execute_prepared_with_transaction(transaction, &prepared_statements).await?;
                 match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         if should_refresh_file_cache {

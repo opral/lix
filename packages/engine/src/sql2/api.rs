@@ -5,7 +5,10 @@ use super::execution::{apply_effects_post_commit, apply_effects_tx, run};
 use super::planning::derive_requirements::derive_plan_requirements;
 use super::planning::parse::parse_sql;
 use super::planning::plan::build_execution_plan;
-use super::type_bridge::{to_sql_mutations, to_sql_update_validations};
+use super::type_bridge::{
+    from_sql_detected_file_domain_changes, from_sql_detected_file_domain_changes_by_statement,
+    to_sql_mutations,
+};
 use crate::sql::extract_explicit_transaction_script_from_statements;
 
 impl Engine {
@@ -164,6 +167,16 @@ impl Engine {
         let (settings, sequence_start, functions) = self
             .prepare_runtime_functions_with_backend(self.backend.as_ref())
             .await?;
+        let contract_detected_file_domain_changes_by_statement =
+            from_sql_detected_file_domain_changes_by_statement(
+                detected_file_domain_changes_by_statement.clone(),
+            );
+        let contract_detected_file_domain_changes =
+            from_sql_detected_file_domain_changes(detected_file_domain_changes.clone());
+        let contract_untracked_filesystem_update_domain_changes =
+            from_sql_detected_file_domain_changes(
+                untracked_filesystem_update_domain_changes.clone(),
+            );
 
         let plan = build_execution_plan(
             self.backend.as_ref(),
@@ -171,22 +184,26 @@ impl Engine {
             parsed_statements.clone(),
             params,
             functions.clone(),
-            &detected_file_domain_changes_by_statement,
+            &contract_detected_file_domain_changes_by_statement,
             writer_key,
         )
         .await
         .map_err(LixError::from)?;
         let sql_mutations = to_sql_mutations(&plan.preprocess.mutations);
-        let sql_update_validations = to_sql_update_validations(&plan.preprocess.update_validations);
 
-        if !sql_mutations.is_empty() {
-            validate_inserts(self.backend.as_ref(), &self.schema_cache, &sql_mutations).await?;
+        if !plan.preprocess.mutations.is_empty() {
+            validate_inserts(
+                self.backend.as_ref(),
+                &self.schema_cache,
+                &plan.preprocess.mutations,
+            )
+            .await?;
         }
-        if !sql_update_validations.is_empty() {
+        if !plan.preprocess.update_validations.is_empty() {
             validate_updates(
                 self.backend.as_ref(),
                 &self.schema_cache,
-                &sql_update_validations,
+                &plan.preprocess.update_validations,
                 params,
             )
             .await?;
@@ -195,7 +212,7 @@ impl Engine {
         let execution = run::execute_plan_sql(
             self,
             &plan,
-            &detected_file_domain_changes,
+            &contract_detected_file_domain_changes,
             plan.requirements.should_refresh_file_cache,
             &functions,
             writer_key,
@@ -227,8 +244,8 @@ impl Engine {
             &plan.preprocess.mutations,
             &pending_file_writes,
             &pending_file_delete_targets,
-            &detected_file_domain_changes,
-            &untracked_filesystem_update_domain_changes,
+            &contract_detected_file_domain_changes,
+            &contract_untracked_filesystem_update_domain_changes,
             execution.plugin_changes_committed,
             &file_cache_invalidation_targets,
         )
