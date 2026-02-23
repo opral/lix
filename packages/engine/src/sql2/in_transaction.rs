@@ -14,7 +14,7 @@ use super::semantics::state_resolution::optimize::should_refresh_file_cache_for_
 use super::surfaces::registry::preprocess_with_surfaces;
 use super::type_bridge::{
     from_sql_detected_file_domain_changes, from_sql_detected_file_domain_changes_by_statement,
-    from_sql_preprocess_output, to_sql_mutations,
+    to_sql_mutations,
 };
 
 impl Engine {
@@ -103,7 +103,6 @@ impl Engine {
                 writer_key,
             )
             .await?;
-            let output = from_sql_preprocess_output(output);
             if !output.mutations.is_empty() {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }

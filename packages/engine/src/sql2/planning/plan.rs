@@ -9,7 +9,6 @@ use super::super::contracts::planner_error::PlannerError;
 use super::super::surfaces::registry::{
     preprocess_with_surfaces, DetectedFileDomainChangesByStatement,
 };
-use super::super::type_bridge::from_sql_preprocess_output;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::invariants::validate_execution_plan;
@@ -38,7 +37,6 @@ where
     )
     .await
     .map_err(PlannerError::preprocess)?;
-    let preprocess = from_sql_preprocess_output(preprocess);
 
     let requirements = derive_plan_requirements(&parsed_statements);
     let effects = derive_plan_effects(&preprocess, writer_key)?;

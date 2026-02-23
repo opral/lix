@@ -1,5 +1,10 @@
 use crate::sql;
+use crate::{LixBackend, LixError, LixTransaction, Value};
+use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFunctionProvider};
+use crate::cel::CelEvaluator;
+use crate::functions::LixFunctionProvider;
 
+use super::ast::nodes::Statement;
 use super::contracts::effects::DetectedFileDomainChange;
 use super::contracts::planned_statement::{
     MutationOperation, MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
@@ -10,6 +15,81 @@ use super::contracts::prepared_statement::PreparedStatement;
 pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> String {
     let sql_output = to_sql_preprocess_output(output);
     sql::preprocess_plan_fingerprint(&sql_output)
+}
+
+pub(crate) async fn preprocess_with_sql_surfaces<P: LixFunctionProvider>(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    statements: Vec<Statement>,
+    params: &[Value],
+    functions: SharedFunctionProvider<P>,
+    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
+    writer_key: Option<&str>,
+) -> Result<PlannedStatementSet, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let sql_detected_file_domain_changes_by_statement =
+        to_sql_detected_file_domain_changes_by_statement(detected_file_domain_changes_by_statement);
+    let output = sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+        backend,
+        evaluator,
+        statements,
+        params,
+        functions,
+        &sql_detected_file_domain_changes_by_statement,
+        writer_key,
+    )
+    .await?;
+    Ok(from_sql_preprocess_output(output))
+}
+
+pub(crate) async fn build_update_followup_statements_with_sql_bridge(
+    transaction: &mut dyn LixTransaction,
+    plan: &VtableUpdatePlan,
+    rows: &[Vec<Value>],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
+    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
+) -> Result<Vec<PreparedStatement>, LixError> {
+    let sql_plan = to_sql_vtable_update_plan(plan);
+    let sql_detected_file_domain_changes =
+        to_sql_detected_file_domain_changes(detected_file_domain_changes);
+    let statements = sql::build_update_followup_sql(
+        transaction,
+        &sql_plan,
+        rows,
+        &sql_detected_file_domain_changes,
+        writer_key,
+        functions,
+    )
+    .await?;
+    Ok(from_sql_prepared_statements(statements))
+}
+
+pub(crate) async fn build_delete_followup_statements_with_sql_bridge(
+    transaction: &mut dyn LixTransaction,
+    plan: &VtableDeletePlan,
+    rows: &[Vec<Value>],
+    params: &[Value],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
+    writer_key: Option<&str>,
+    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
+) -> Result<Vec<PreparedStatement>, LixError> {
+    let sql_plan = to_sql_vtable_delete_plan(plan);
+    let sql_detected_file_domain_changes =
+        to_sql_detected_file_domain_changes(detected_file_domain_changes);
+    let statements = sql::build_delete_followup_sql(
+        transaction,
+        &sql_plan,
+        rows,
+        params,
+        &sql_detected_file_domain_changes,
+        writer_key,
+        functions,
+    )
+    .await?;
+    Ok(from_sql_prepared_statements(statements))
 }
 
 pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> PlannedStatementSet {
