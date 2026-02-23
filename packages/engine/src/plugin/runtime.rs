@@ -4,7 +4,10 @@ use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::types::{
     InstalledPlugin, PluginContentType, PluginManifest, PluginRuntime, StateContextColumn,
 };
-use crate::sql::preprocess_sql;
+use crate::sql::{
+    missing_file_history_cache_descriptor_selection_sql,
+    plugin_history_state_changes_for_slice_sql, preprocess_sql,
+};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1330,24 +1333,13 @@ async fn load_file_paths_for_descriptors(
 async fn load_missing_file_history_descriptors(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
-    let sql = "SELECT \
-                 id AS file_id, \
-                 lixcol_root_commit_id AS root_commit_id, \
-                 lixcol_depth AS depth, \
-                 lixcol_commit_id AS commit_id, \
-                 path \
-               FROM lix_file_history \
-               WHERE path IS NOT NULL \
-                 AND NOT EXISTS (\
-                   SELECT 1 \
-                   FROM lix_internal_file_history_data_cache cache \
-                   WHERE cache.file_id = id \
-                     AND cache.root_commit_id = lixcol_root_commit_id \
-                     AND cache.depth = lixcol_depth\
-                 ) \
-               ORDER BY lixcol_root_commit_id, lixcol_depth, id";
-
-    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
+    let preprocessed = preprocess_sql(
+        backend,
+        &CelEvaluator::new(),
+        missing_file_history_cache_descriptor_selection_sql(),
+        &[],
+    )
+    .await?;
     let rows = backend
         .execute(&preprocessed.sql, &preprocessed.params)
         .await?;
@@ -1392,22 +1384,7 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     let preprocessed = preprocess_sql(
         backend,
         &CelEvaluator::new(),
-        "WITH target_commit_depth AS (\
-            SELECT COALESCE((\
-              SELECT depth \
-              FROM lix_internal_commit_ancestry \
-              WHERE commit_id = $3 \
-                AND ancestor_id = $4 \
-              LIMIT 1\
-            ), $5) AS raw_depth\
-         ) \
-         SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
-         FROM lix_state_history \
-         WHERE file_id = $1 \
-           AND plugin_key = $2 \
-           AND root_commit_id = $3 \
-           AND depth >= (SELECT raw_depth FROM target_commit_depth) \
-         ORDER BY entity_id ASC, depth ASC",
+        plugin_history_state_changes_for_slice_sql(),
         &params,
     )
     .await?;

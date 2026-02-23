@@ -234,3 +234,67 @@ pub(crate) fn file_history_projection_sql() -> String {
                   AND fd.depth = f.lixcol_depth"
                 .to_string()
 }
+
+pub(crate) fn missing_file_history_cache_descriptor_selection_sql() -> &'static str {
+    "SELECT \
+       id AS file_id, \
+       lixcol_root_commit_id AS root_commit_id, \
+       lixcol_depth AS depth, \
+       lixcol_commit_id AS commit_id, \
+       path \
+     FROM lix_file_history \
+     WHERE path IS NOT NULL \
+       AND NOT EXISTS (\
+         SELECT 1 \
+         FROM lix_internal_file_history_data_cache cache \
+         WHERE cache.file_id = id \
+           AND cache.root_commit_id = lixcol_root_commit_id \
+           AND cache.depth = lixcol_depth\
+       ) \
+     ORDER BY lixcol_root_commit_id, lixcol_depth, id"
+}
+
+pub(crate) fn plugin_history_state_changes_for_slice_sql() -> &'static str {
+    // Depth contract: resolve the effective lower-bound depth from
+    // commit ancestry for (root_commit_id, commit_id), falling back to
+    // the requested descriptor depth ($5) when ancestry linkage is missing.
+    "WITH target_commit_depth AS (\
+       SELECT COALESCE((\
+         SELECT depth \
+         FROM lix_internal_commit_ancestry \
+         WHERE commit_id = $3 \
+           AND ancestor_id = $4 \
+         LIMIT 1\
+       ), $5) AS raw_depth\
+     ) \
+     SELECT entity_id, schema_key, schema_version, snapshot_content, depth \
+     FROM lix_state_history \
+     WHERE file_id = $1 \
+       AND plugin_key = $2 \
+       AND root_commit_id = $3 \
+       AND depth >= (SELECT raw_depth FROM target_commit_depth) \
+     ORDER BY entity_id ASC, depth ASC"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        missing_file_history_cache_descriptor_selection_sql,
+        plugin_history_state_changes_for_slice_sql,
+    };
+
+    #[test]
+    fn missing_history_cache_descriptor_sql_uses_shared_file_history_projection() {
+        let sql = missing_file_history_cache_descriptor_selection_sql();
+        assert!(sql.contains("FROM lix_file_history"));
+        assert!(sql.contains("lix_internal_file_history_data_cache"));
+    }
+
+    #[test]
+    fn plugin_history_slice_sql_enforces_shared_depth_contract() {
+        let sql = plugin_history_state_changes_for_slice_sql();
+        assert!(sql.contains("FROM lix_internal_commit_ancestry"));
+        assert!(sql.contains("COALESCE(("));
+        assert!(sql.contains("depth >= (SELECT raw_depth FROM target_commit_depth)"));
+    }
+}
