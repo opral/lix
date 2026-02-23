@@ -1,7 +1,6 @@
-use crate::sql::should_refresh_file_cache_for_statements;
 use super::super::super::ast::nodes::Statement;
 
-use super::canonical::CanonicalStateResolution;
+use super::canonical::{statement_targets_table_name, CanonicalStateResolution};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OptimizedStateResolution {
@@ -21,4 +20,15 @@ pub(crate) fn optimize_state_resolution(
         should_invalidate_installed_plugins_cache: canonical
             .should_invalidate_installed_plugins_cache,
     }
+}
+
+pub(crate) fn should_refresh_file_cache_for_statements(statements: &[Statement]) -> bool {
+    statements
+        .iter()
+        .any(statement_targets_file_cache_refresh_table)
+}
+
+fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
+    statement_targets_table_name(statement, "lix_state")
+        || statement_targets_table_name(statement, "lix_state_by_version")
 }

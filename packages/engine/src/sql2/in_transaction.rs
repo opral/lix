@@ -1,17 +1,20 @@
 use super::super::*;
 use super::ast::utils::parse_sql_statements;
+use super::contracts::planned_statement::MutationOperation;
+use super::contracts::postprocess_actions::PostprocessPlan;
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::execution::postprocess::{
-    build_delete_followup_statements_from_sql_plan, build_update_followup_statements_from_sql_plan,
+    build_delete_followup_statements, build_update_followup_statements,
 };
-use super::type_bridge::{
-    from_sql_mutations, from_sql_prepared_statements, from_sql_update_validations,
-};
-use crate::sql::{
+use super::semantics::state_resolution::canonical::is_query_only_statements;
+use super::semantics::state_resolution::effects::{
     active_version_from_mutations, active_version_from_update_validations,
-    is_query_only_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
-    should_refresh_file_cache_for_statements, MutationOperation, PostprocessPlan,
+};
+use super::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
+use super::surfaces::registry::preprocess_with_surfaces;
+use super::type_bridge::{
+    from_sql_detected_file_domain_changes, from_sql_detected_file_domain_changes_by_statement,
+    from_sql_preprocess_output, to_sql_mutations,
 };
 
 impl Engine {
@@ -36,12 +39,12 @@ impl Engine {
             pending_file_writes,
             pending_file_delete_targets,
             detected_file_domain_changes,
+            contract_detected_file_domain_changes,
             untracked_filesystem_update_domain_changes,
             settings,
             sequence_start,
             functions,
             output,
-            contract_mutations,
         ) = {
             let backend = TransactionBackendAdapter::new(transaction);
             if read_only_query {
@@ -86,28 +89,29 @@ impl Engine {
             let (settings, sequence_start, functions) = self
                 .prepare_runtime_functions_with_backend(&backend)
                 .await?;
-            let output =
-                preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
-                    &backend,
-                    &self.cel_evaluator,
-                    parsed_statements.clone(),
-                    params,
-                    functions.clone(),
-                    &detected_file_domain_changes_by_statement,
-                    writer_key,
-                )
-                .await?;
-            let contract_mutations = from_sql_mutations(output.mutations.clone());
-            if !contract_mutations.is_empty() {
-                validate_inserts(&backend, &self.schema_cache, &contract_mutations).await?;
+            let contract_detected_file_domain_changes_by_statement =
+                from_sql_detected_file_domain_changes_by_statement(
+                    detected_file_domain_changes_by_statement.clone(),
+                );
+            let output = preprocess_with_surfaces(
+                &backend,
+                &self.cel_evaluator,
+                parsed_statements.clone(),
+                params,
+                functions.clone(),
+                &contract_detected_file_domain_changes_by_statement,
+                writer_key,
+            )
+            .await?;
+            let output = from_sql_preprocess_output(output);
+            if !output.mutations.is_empty() {
+                validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }
-            let contract_update_validations =
-                from_sql_update_validations(output.update_validations.clone());
-            if !contract_update_validations.is_empty() {
+            if !output.update_validations.is_empty() {
                 validate_updates(
                     &backend,
                     &self.schema_cache,
-                    &contract_update_validations,
+                    &output.update_validations,
                     params,
                 )
                 .await?;
@@ -116,17 +120,17 @@ impl Engine {
             (
                 pending_file_writes,
                 pending_file_delete_targets,
-                detected_file_domain_changes,
+                detected_file_domain_changes.clone(),
+                from_sql_detected_file_domain_changes(detected_file_domain_changes),
                 untracked_filesystem_update_domain_changes,
                 settings,
                 sequence_start,
                 functions,
                 output,
-                contract_mutations,
             )
         };
         let state_commit_stream_changes =
-            state_commit_stream_changes_from_mutations(&contract_mutations, writer_key);
+            state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
 
         let next_active_version_id_from_mutations =
             active_version_from_mutations(&output.mutations)?;
@@ -142,7 +146,7 @@ impl Engine {
 
         let mut postprocess_file_cache_targets = BTreeSet::new();
         let mut plugin_changes_committed = false;
-        let prepared_statements = from_sql_prepared_statements(output.prepared_statements.clone());
+        let prepared_statements = output.prepared_statements.clone();
         let result = match output.postprocess.as_ref() {
             None => {
                 let result =
@@ -192,26 +196,30 @@ impl Engine {
                     }
                 }
                 let mut followup_functions = functions.clone();
-                let followup_params = output.single_statement_params()?;
+                let followup_params = output
+                    .prepared_statements
+                    .first()
+                    .map(|statement| statement.params.as_slice())
+                    .unwrap_or(&[]);
                 let followup_statements = match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
-                        build_update_followup_statements_from_sql_plan(
+                        build_update_followup_statements(
                             transaction,
                             plan,
                             &result.rows,
-                            &detected_file_domain_changes,
+                            &contract_detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
                         )
                         .await?
                     }
                     PostprocessPlan::VtableDelete(plan) => {
-                        build_delete_followup_statements_from_sql_plan(
+                        build_delete_followup_statements(
                             transaction,
                             plan,
                             &result.rows,
                             followup_params,
-                            &detected_file_domain_changes,
+                            &contract_detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
                         )
@@ -229,21 +237,22 @@ impl Engine {
         {
             *active_version_id = version_id;
         }
+        let sql_mutations = to_sql_mutations(&output.mutations);
 
         let file_cache_refresh_targets = if should_refresh_file_cache {
-            let mut targets = direct_state_file_cache_refresh_targets(&output.mutations);
+            let mut targets = direct_state_file_cache_refresh_targets(&sql_mutations);
             targets.extend(postprocess_file_cache_targets);
             targets
         } else {
             BTreeSet::new()
         };
         let descriptor_cache_eviction_targets =
-            file_descriptor_cache_eviction_targets(&output.mutations);
+            file_descriptor_cache_eviction_targets(&sql_mutations);
         let mut file_cache_invalidation_targets = file_cache_refresh_targets;
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
         let should_run_binary_gc =
-            should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
+            should_run_binary_cas_gc(&sql_mutations, &detected_file_domain_changes);
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without

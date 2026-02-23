@@ -1,9 +1,9 @@
 use super::super::*;
 use super::planning::bind_once::bind_script_placeholders_once;
-use crate::sql::{
+use super::planning::script::{
     coalesce_lix_file_transaction_statements, coalesce_vtable_inserts_in_statement_list,
-    should_invalidate_installed_plugins_cache_for_statements,
 };
+use super::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 
 impl Engine {
     pub(crate) async fn execute_transaction_script_with_options(
