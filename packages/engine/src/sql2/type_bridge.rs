@@ -1,8 +1,5 @@
 use crate::sql;
-use crate::{LixError, LixTransaction, Value};
-use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFunctionProvider};
 
-use super::contracts::effects::DetectedFileDomainChange;
 use super::contracts::planned_statement::{
     MutationOperation, MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
 };
@@ -12,50 +9,6 @@ use super::contracts::prepared_statement::PreparedStatement;
 pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> String {
     let sql_output = to_sql_preprocess_output(output);
     sql::preprocess_plan_fingerprint(&sql_output)
-}
-
-pub(crate) async fn build_update_followup_statements(
-    transaction: &mut dyn LixTransaction,
-    plan: &VtableUpdatePlan,
-    rows: &[Vec<Value>],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    let sql_plan = to_sql_vtable_update_plan(plan);
-    let statements = sql::build_update_followup_sql(
-        transaction,
-        &sql_plan,
-        rows,
-        detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await?;
-    Ok(from_sql_prepared_statements(statements))
-}
-
-pub(crate) async fn build_delete_followup_statements(
-    transaction: &mut dyn LixTransaction,
-    plan: &VtableDeletePlan,
-    rows: &[Vec<Value>],
-    params: &[Value],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    let sql_plan = to_sql_vtable_delete_plan(plan);
-    let statements = sql::build_delete_followup_sql(
-        transaction,
-        &sql_plan,
-        rows,
-        params,
-        detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await?;
-    Ok(from_sql_prepared_statements(statements))
 }
 
 pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> PlannedStatementSet {

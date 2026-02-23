@@ -11,7 +11,7 @@ use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
 use super::super::contracts::planned_statement::MutationOperation;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
-use super::super::type_bridge::{
+use super::postprocess::{
     build_delete_followup_statements, build_update_followup_statements,
 };
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
