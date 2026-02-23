@@ -5,11 +5,11 @@ use super::execution::{apply_effects_post_commit, apply_effects_tx, run};
 use super::planning::derive_requirements::derive_plan_requirements;
 use super::planning::parse::parse_sql;
 use super::planning::plan::build_execution_plan;
+use super::planning::script::extract_explicit_transaction_script_from_statements;
 use super::type_bridge::{
     from_sql_detected_file_domain_changes, from_sql_detected_file_domain_changes_by_statement,
     to_sql_mutations,
 };
-use crate::sql::extract_explicit_transaction_script_from_statements;
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
