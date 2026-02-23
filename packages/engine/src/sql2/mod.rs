@@ -12,6 +12,7 @@ pub(crate) mod side_effects;
 pub(crate) mod surfaces;
 pub(crate) mod transaction;
 pub(crate) mod type_bridge;
+pub(crate) mod vtable;
 
 #[cfg(test)]
 pub(super) use fallback::should_sequentialize_postprocess_multi_statement;

@@ -1,5 +1,6 @@
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::planner_error::PlannerError;
+use super::super::vtable::registry::validate_postprocess_plan;
 
 pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), PlannerError> {
     if plan.preprocess.prepared_statements.is_empty() {
@@ -16,6 +17,9 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
         return Err(PlannerError::invariant(
             "sql2 planner produced postprocess plan with unexpected mutation rows",
         ));
+    }
+    if let Some(postprocess) = plan.preprocess.postprocess.as_ref() {
+        validate_postprocess_plan(postprocess).map_err(PlannerError::preprocess)?;
     }
     Ok(())
 }
