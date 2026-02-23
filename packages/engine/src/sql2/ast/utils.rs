@@ -1,3 +1,6 @@
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+
 use crate::{LixError, SqlDialect, Value};
 
 use super::nodes::Statement;
@@ -11,7 +14,9 @@ pub(crate) struct BoundSql {
 }
 
 pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
-    crate::sql::parse_sql_statements(sql)
+    Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        message: error.to_string(),
+    })
 }
 
 pub(crate) fn bind_sql_with_state(

@@ -1,5 +1,7 @@
 use super::super::super::ast::nodes::Statement;
-use crate::sql::{object_name_matches, visit_query_selects, visit_table_factors_in_select};
+use super::super::super::ast::walk::{
+    object_name_matches, visit_query_selects, visit_table_factors_in_select,
+};
 use sqlparser::ast::{FromTable, ObjectName, TableFactor, TableObject, TableWithJoins};
 
 const STATE_HISTORY_VIEW: &str = "lix_state_history";

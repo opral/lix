@@ -830,7 +830,7 @@ fn default_alias(view_name: &str) -> TableAlias {
 #[cfg(test)]
 mod tests {
     use super::{rewrite_query, rewrite_query_with_params};
-    use crate::sql::parse_sql_statements;
+    use crate::engine::sql2::ast::utils::parse_sql_statements;
     use crate::Value;
 
     #[test]
