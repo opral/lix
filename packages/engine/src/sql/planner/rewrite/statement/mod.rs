@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use sqlparser::ast::{Query, Statement};
 
 use crate::functions::LixFunctionProvider;
+use crate::sql::planner::catalog::PlannerCatalogSnapshot;
 use crate::sql::planner::types::ReadMaintenanceRequirements;
 use crate::sql::planner::rewrite::write;
 use crate::sql::planner::validate::validate_statement_output_parts;
@@ -15,11 +16,12 @@ use crate::sql::planner::ir::logical::{
     LogicalStatementSemantics, LogicalStatementStep,
 };
 use crate::sql::planner::rewrite::query::{
-    collect_relation_names_via_walker, rewrite_query_with_backend_and_params,
+    collect_relation_names_via_walker, rewrite_query_with_backend_and_params_and_catalog,
 };
 
 pub(crate) async fn rewrite_statement_to_logical_plan_with_backend<P>(
     backend: &dyn LixBackend,
+    catalog_snapshot: &PlannerCatalogSnapshot,
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
@@ -32,7 +34,13 @@ where
     let logical_plan = match statement {
         Statement::Query(query) => {
             let semantics = LogicalStatementSemantics::QueryRead(read_semantics_for_query(&query));
-            let rewritten = rewrite_query_with_backend_and_params(backend, *query, params).await?;
+            let rewritten = rewrite_query_with_backend_and_params_and_catalog(
+                backend,
+                *query,
+                params,
+                catalog_snapshot,
+            )
+            .await?;
             LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
                 semantics,
@@ -55,8 +63,13 @@ where
                 Statement::Query(query) => {
                     let semantics =
                         LogicalStatementSemantics::ExplainRead(read_semantics_for_query(&query));
-                    let rewritten =
-                        rewrite_query_with_backend_and_params(backend, *query, params).await?;
+                    let rewritten = rewrite_query_with_backend_and_params_and_catalog(
+                        backend,
+                        *query,
+                        params,
+                        catalog_snapshot,
+                    )
+                    .await?;
                     let explain_statement = Statement::Explain {
                         describe_alias,
                         analyze,
@@ -216,6 +229,7 @@ fn read_maintenance_requirements_for_query(query: &Query) -> ReadMaintenanceRequ
 mod tests {
     use super::rewrite_statement_to_logical_plan_with_backend;
     use crate::functions::SystemFunctionProvider;
+    use crate::sql::planner::catalog::PlannerCatalogSnapshot;
     use crate::sql::parse_sql_statements_with_dialect;
     use crate::sql::planner::ir::logical::{
         LogicalReadOperator, LogicalStatementOperation, LogicalStatementSemantics,
@@ -260,6 +274,7 @@ mod tests {
 
         let plan = rewrite_statement_to_logical_plan_with_backend(
             &backend,
+            &PlannerCatalogSnapshot::default(),
             statement,
             &[],
             None,
@@ -289,6 +304,7 @@ mod tests {
 
         let plan = rewrite_statement_to_logical_plan_with_backend(
             &backend,
+            &PlannerCatalogSnapshot::default(),
             statement,
             &[],
             None,
@@ -318,6 +334,7 @@ mod tests {
 
         let plan = rewrite_statement_to_logical_plan_with_backend(
             &backend,
+            &PlannerCatalogSnapshot::default(),
             statement,
             &[],
             None,
@@ -344,6 +361,7 @@ mod tests {
 
         let plan = rewrite_statement_to_logical_plan_with_backend(
             &backend,
+            &PlannerCatalogSnapshot::default(),
             statement,
             &[],
             None,
@@ -392,6 +410,7 @@ mod tests {
 
         let plan = rewrite_statement_to_logical_plan_with_backend(
             &backend,
+            &PlannerCatalogSnapshot::default(),
             statement,
             &[],
             None,

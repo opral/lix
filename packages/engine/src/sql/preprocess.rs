@@ -16,6 +16,7 @@ use crate::sql::planner::validate::{
 use crate::sql::types::PreprocessOutput;
 use crate::sql::DetectedFileDomainChange;
 use crate::sql::PlaceholderState;
+use crate::sql::PlannerCatalogSnapshot;
 use crate::{LixBackend, LixError, Value};
 
 #[cfg(test)]
@@ -133,6 +134,7 @@ where
     let mut prepared_statements = Vec::new();
     let mut has_postprocess = false;
     let mut placeholder_state = initial_placeholder_state;
+    let planner_catalog_snapshot = PlannerCatalogSnapshot::default();
 
     for (statement_index, statement) in statements.into_iter().enumerate() {
         let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
@@ -142,6 +144,7 @@ where
 
         let logical_plan = Box::pin(rewrite_statement_to_logical_plan_with_backend(
             backend,
+            &planner_catalog_snapshot,
             statement,
             params,
             writer_key,

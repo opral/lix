@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use super::super::super::*;
 use super::super::execute_prepared_with_transaction;
 use crate::sql::{
-    compile_statement_with_state, parse_sql_statements_with_dialect,
-    prepare_statement_block_with_transaction_flag, PlaceholderState, StatementBlock,
+    compile_statement_with_state, load_planner_catalog_snapshot,
+    parse_sql_statements_with_dialect, prepare_statement_block_with_transaction_flag,
+    PlaceholderState, PlannerCatalogSnapshot, StatementBlock,
 };
 
 impl Engine {
@@ -94,11 +95,16 @@ impl Engine {
         let StatementBlock { statements } = prepare_statement_block_with_transaction_flag(parsed_statements)?;
         let mut last_result = QueryResult { rows: Vec::new() };
         let mut placeholder_state = PlaceholderState::new();
+        let planner_catalog_snapshot = {
+            let backend = TransactionBackendAdapter::new(transaction);
+            load_planner_catalog_snapshot(&backend).await?
+        };
 
         for statement in statements {
             let (result, next_placeholder_state) = self
                 .execute_statement_with_options_in_transaction(
                     transaction,
+                    &planner_catalog_snapshot,
                     statement,
                     params,
                     placeholder_state,
@@ -118,6 +124,7 @@ impl Engine {
     async fn execute_statement_with_options_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
+        planner_catalog_snapshot: &PlannerCatalogSnapshot,
         statement: Statement,
         params: &[Value],
         placeholder_state: PlaceholderState,
@@ -149,6 +156,7 @@ impl Engine {
 
             let (compiled, next_placeholder_state) = compile_statement_with_state(
                 &backend,
+                planner_catalog_snapshot,
                 &self.cel_evaluator,
                 statement,
                 params,

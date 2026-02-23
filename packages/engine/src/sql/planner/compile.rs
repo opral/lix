@@ -6,6 +6,7 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::{materialize_vtable_insert_select_sources, PlaceholderState};
 use crate::{LixBackend, LixError, Value};
 
+use super::catalog::PlannerCatalogSnapshot;
 use super::emit::statement::emit_physical_statement_plan_with_state;
 use super::ir::logical::LogicalStatementOperation;
 use super::rewrite::statement::rewrite_statement_to_logical_plan_with_backend;
@@ -17,6 +18,7 @@ use super::validate::{
 
 pub(crate) async fn compile_statement_with_state<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
+    catalog_snapshot: &PlannerCatalogSnapshot,
     evaluator: &CelEvaluator,
     statement: Statement,
     params: &[Value],
@@ -29,6 +31,7 @@ where
 {
     compile_statement_plan_with_state(
         backend,
+        catalog_snapshot,
         evaluator,
         statement,
         params,
@@ -41,6 +44,7 @@ where
 
 async fn compile_statement_plan_with_state<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
+    catalog_snapshot: &PlannerCatalogSnapshot,
     evaluator: &CelEvaluator,
     statement: Statement,
     params: &[Value],
@@ -67,6 +71,7 @@ where
     let mut provider = functions.clone();
     let logical_plan = rewrite_statement_to_logical_plan_with_backend(
         backend,
+        catalog_snapshot,
         statement,
         params,
         writer_key,

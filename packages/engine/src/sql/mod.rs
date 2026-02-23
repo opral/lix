@@ -43,7 +43,8 @@ pub(crate) use planner::rewrite::query::rewrite_query_with_backend as rewrite_re
 pub(crate) use planner::rewrite::query::rewrite_query_with_backend_and_params as rewrite_read_query_with_backend_and_params;
 pub(crate) use planner::{
     compile_statement_with_state, prepare_statement_block_with_transaction_flag,
-    ReadMaintenanceRequirements, StatementBlock,
+    load_planner_catalog_snapshot, PlannerCatalogSnapshot, ReadMaintenanceRequirements,
+    StatementBlock,
 };
 #[cfg(test)]
 pub use preprocess::parse_sql_statements;

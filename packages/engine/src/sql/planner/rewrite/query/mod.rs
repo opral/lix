@@ -5,6 +5,7 @@ use sqlparser::ast::{Expr, ObjectNamePart, Query, Select, SelectItem, TableFacto
 use self::context::AnalysisContext;
 use self::validator::validate_final_read_query;
 use crate::sql::entity_views::read as entity_view_read;
+use crate::sql::planner::catalog::{load_planner_catalog_snapshot, PlannerCatalogSnapshot};
 use crate::sql::read_views::{
     lix_active_account_view_read, lix_active_version_view_read, lix_state_by_version_view_read,
     lix_state_history_view_read, lix_state_view_read, lix_version_view_read, vtable_read,
@@ -82,6 +83,7 @@ impl PlannerQueryRule {
         query: Query,
         params: &[Value],
         context: &AnalysisContext,
+        catalog_snapshot: &PlannerCatalogSnapshot,
     ) -> Result<PlannerRuleOutcome, LixError> {
         if !self.matches_context(context) {
             return Ok(PlannerRuleOutcome::NoChange);
@@ -97,7 +99,7 @@ impl PlannerQueryRule {
             )),
             Self::ProjectionCleanup => Ok(outcome_from_option(rewrite_projection_cleanup(query)?)),
             Self::VtableRead => Ok(outcome_from_option(
-                vtable_read::rewrite_query_with_backend(backend, query).await?,
+                vtable_read::rewrite_query_with_catalog(query, catalog_snapshot)?,
             )),
         }
     }
@@ -244,13 +246,32 @@ fn rewrite_projection_cleanup_select(select: &mut Select) -> Result<RewriteDecis
 
 pub(crate) async fn rewrite_query_with_backend_and_params(
     backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    let catalog_snapshot = load_planner_catalog_snapshot(backend).await?;
+    rewrite_query_with_backend_and_params_and_catalog(backend, query, params, &catalog_snapshot)
+        .await
+}
+
+pub(crate) async fn rewrite_query_with_backend_and_params_and_catalog(
+    backend: &dyn LixBackend,
     mut query: Query,
     params: &[Value],
+    catalog_snapshot: &PlannerCatalogSnapshot,
 ) -> Result<Query, LixError> {
     let mut context = AnalysisContext::from_query(&query);
 
     for phase in PHASE_ORDER {
-        run_phase_with_backend(phase, backend, &mut query, params, &mut context).await?;
+        run_phase_with_backend(
+            phase,
+            backend,
+            &mut query,
+            params,
+            &mut context,
+            catalog_snapshot,
+        )
+        .await?;
     }
 
     validate_final_read_query(&query)?;
@@ -270,10 +291,18 @@ async fn run_phase_with_backend(
     query: &mut Query,
     params: &[Value],
     context: &mut AnalysisContext,
+    catalog_snapshot: &PlannerCatalogSnapshot,
 ) -> Result<(), LixError> {
     for _ in 0..MAX_PASSES_PER_PHASE {
-        let changed =
-            apply_rules_for_phase_with_backend(phase, backend, query, params, context).await?;
+        let changed = apply_rules_for_phase_with_backend(
+            phase,
+            backend,
+            query,
+            params,
+            context,
+            catalog_snapshot,
+        )
+        .await?;
 
         context.refresh_from_query(query);
         validate_phase_invariants_for_planner(phase, query)?;
@@ -295,12 +324,19 @@ async fn apply_rules_for_phase_with_backend(
     query: &mut Query,
     params: &[Value],
     context: &mut AnalysisContext,
+    catalog_snapshot: &PlannerCatalogSnapshot,
 ) -> Result<bool, LixError> {
     let mut changed = false;
 
     for rule in rules_for_phase(phase) {
         match rule
-            .apply_with_backend_and_params(backend, query.clone(), params, context)
+            .apply_with_backend_and_params(
+                backend,
+                query.clone(),
+                params,
+                context,
+                catalog_snapshot,
+            )
             .await?
         {
             PlannerRuleOutcome::NoChange => {}

@@ -8,6 +8,7 @@ use sqlparser::ast::{
 use std::sync::OnceLock;
 
 use crate::backend::SqlDialect;
+use crate::sql::planner::catalog::PlannerCatalogSnapshot;
 use crate::sql::read_views::state_pushdown::{
     select_projects_count_star, StatePushdown,
 };
@@ -20,7 +21,7 @@ use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
     version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, Value as LixValue};
+use crate::LixError;
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
@@ -695,24 +696,21 @@ fn append_effective_state_read_predicates(
     append_predicates_from_sql(&mut inner_select.selection, source_predicates)
 }
 
-pub async fn rewrite_query_with_backend(
-    backend: &dyn LixBackend,
+pub fn rewrite_query_with_catalog(
     query: Query,
+    catalog: &PlannerCatalogSnapshot,
 ) -> Result<Option<Query>, LixError> {
     let mut schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
-
-    // If no schema-key literal is available, fall back to plugin-key derived
-    // schema resolution and finally to all materialized schema tables.
     if schema_keys.is_empty() {
         let plugin_keys = extract_plugin_keys_from_query(&query)
             .or_else(|| extract_plugin_keys_from_top_level_derived_subquery(&query))
             .unwrap_or_default();
         if !plugin_keys.is_empty() {
-            schema_keys = fetch_schema_keys_for_plugins(backend, &plugin_keys).await?;
+            schema_keys = catalog.schema_keys_for_plugins(&plugin_keys);
         }
     }
     if schema_keys.is_empty() {
-        schema_keys = fetch_materialized_schema_keys(backend).await?;
+        schema_keys = catalog.materialized_schema_keys.clone();
     }
 
     let mut changed = false;
@@ -1668,95 +1666,6 @@ fn default_vtable_alias() -> TableAlias {
         name: Ident::new(VTABLE_NAME),
         columns: Vec::new(),
     }
-}
-
-async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {
-    let sql = match backend.dialect() {
-        SqlDialect::Sqlite => {
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'lix_internal_state_materialized_v1_%'"
-        }
-        SqlDialect::Postgres => {
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = current_schema() \
-               AND table_type = 'BASE TABLE' \
-               AND table_name LIKE 'lix_internal_state_materialized_v1_%'"
-        }
-    };
-    let result = backend.execute(sql, &[]).await?;
-
-    let mut keys = Vec::new();
-    for row in &result.rows {
-        let Some(LixValue::Text(name)) = row.first() else {
-            continue;
-        };
-        let Some(schema_key) = name.strip_prefix(MATERIALIZED_PREFIX) else {
-            continue;
-        };
-        if schema_key.is_empty() {
-            continue;
-        }
-        if !keys.iter().any(|existing| existing == schema_key) {
-            keys.push(schema_key.to_string());
-        }
-    }
-
-    keys.sort();
-    Ok(keys)
-}
-
-async fn fetch_schema_keys_for_plugins(
-    backend: &dyn LixBackend,
-    plugin_keys: &[String],
-) -> Result<Vec<String>, LixError> {
-    if plugin_keys.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let changes_placeholders = numbered_placeholders(1, plugin_keys.len());
-    let untracked_placeholders = numbered_placeholders(plugin_keys.len() + 1, plugin_keys.len());
-    let sql = format!(
-        "SELECT DISTINCT schema_key \
-         FROM lix_internal_change \
-         WHERE plugin_key IN ({changes_placeholders}) \
-         UNION \
-         SELECT DISTINCT schema_key \
-         FROM {untracked_table} \
-         WHERE plugin_key IN ({untracked_placeholders})",
-        untracked_table = UNTRACKED_TABLE,
-    );
-
-    let mut params = Vec::with_capacity(plugin_keys.len() * 2);
-    for key in plugin_keys {
-        params.push(LixValue::Text(key.clone()));
-    }
-    for key in plugin_keys {
-        params.push(LixValue::Text(key.clone()));
-    }
-
-    let result = backend.execute(&sql, &params).await?;
-
-    let mut keys = Vec::new();
-    for row in &result.rows {
-        let Some(LixValue::Text(schema_key)) = row.first() else {
-            continue;
-        };
-        if schema_key.is_empty() {
-            continue;
-        }
-        if !keys.iter().any(|existing| existing == schema_key) {
-            keys.push(schema_key.clone());
-        }
-    }
-
-    keys.sort();
-    Ok(keys)
-}
-
-fn numbered_placeholders(start: usize, count: usize) -> String {
-    (0..count)
-        .map(|offset| format!("${}", start + offset))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]
