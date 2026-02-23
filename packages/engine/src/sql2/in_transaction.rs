@@ -1,5 +1,4 @@
 use super::super::*;
-use super::*;
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::type_bridge::from_sql_prepared_statements;
 use crate::sql::{

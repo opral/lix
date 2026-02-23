@@ -88,7 +88,6 @@ pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> Plann
 pub(crate) fn to_sql_preprocess_output(output: &PlannedStatementSet) -> sql::PreprocessOutput {
     sql::PreprocessOutput {
         sql: output.sql.clone(),
-        params: Vec::new(),
         prepared_statements: output
             .prepared_statements
             .iter()
