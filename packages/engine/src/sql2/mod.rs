@@ -7,6 +7,7 @@ pub(crate) mod in_transaction;
 pub(crate) mod planning;
 pub(crate) mod prepared;
 pub(crate) mod scripts;
+pub(crate) mod semantics;
 pub(crate) mod side_effects;
 pub(crate) mod surfaces;
 pub(crate) mod transaction;
