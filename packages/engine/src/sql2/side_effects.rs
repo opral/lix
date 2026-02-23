@@ -8,8 +8,8 @@ use super::type_bridge::from_sql_prepared_statements;
 use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
 };
+use crate::sql::preprocess_sql;
 use crate::SqlDialect;
-use crate::sql::{preprocess_sql, FileReadMaterializationScope};
 
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
@@ -22,12 +22,12 @@ impl Engine {
             history_plugin_inputs::file_read_materialization_scope_for_statements(statements)
         {
             let versions = match scope {
-                FileReadMaterializationScope::ActiveVersionOnly => {
+                history_plugin_inputs::FileReadMaterializationScope::ActiveVersionOnly => {
                     let mut set = BTreeSet::new();
                     set.insert(active_version_id.to_string());
                     Some(set)
                 }
-                FileReadMaterializationScope::AllVersions => None,
+                history_plugin_inputs::FileReadMaterializationScope::AllVersions => None,
             };
             crate::plugin::runtime::materialize_missing_file_data_with_plugins(
                 backend,
