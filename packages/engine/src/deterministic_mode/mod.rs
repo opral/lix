@@ -7,7 +7,8 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::sql::{escape_sql_string, parse_sql_statements, preprocess_statements_with_provider};
+use crate::engine::sql2::ast::utils::parse_sql_statements;
+use crate::sql::{escape_sql_string, preprocess_statements_with_provider};
 use crate::LixBackend;
 use crate::{LixError, Value};
 

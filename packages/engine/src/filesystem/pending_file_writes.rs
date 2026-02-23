@@ -1,6 +1,6 @@
 use crate::cel::CelEvaluator;
 #[cfg(test)]
-use crate::sql::parse_sql_statements;
+use crate::engine::sql2::ast::utils::parse_sql_statements;
 use crate::sql::{
     bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_expr_cell_with_state,
     resolve_values_rows, PlaceholderState,
@@ -1978,7 +1978,7 @@ mod tests {
     }
 
     fn parse_delete(sql: &str) -> sqlparser::ast::Delete {
-        let statements = crate::sql::parse_sql_statements(sql).expect("parse SQL");
+        let statements = parse_sql_statements(sql).expect("parse SQL");
         let statement = statements.into_iter().next().expect("statement");
         let Statement::Delete(delete) = statement else {
             panic!("expected delete statement");

@@ -64,7 +64,7 @@ mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
 #[path = "sql2/mod.rs"]
-mod sql2;
+pub(crate) mod sql2;
 
 #[cfg(test)]
 use self::sql2::should_sequentialize_postprocess_multi_statement;

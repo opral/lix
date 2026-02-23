@@ -1,10 +1,11 @@
 use super::super::*;
+use super::ast::utils::parse_sql_statements;
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::type_bridge::from_sql_prepared_statements;
 use crate::sql::{
     active_version_from_mutations, active_version_from_update_validations,
     build_delete_followup_sql, build_update_followup_sql, is_query_only_statements,
-    parse_sql_statements, preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
     should_refresh_file_cache_for_statements, MutationOperation, PostprocessPlan,
 };
 

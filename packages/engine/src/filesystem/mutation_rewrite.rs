@@ -3461,7 +3461,7 @@ mod tests {
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
         rewrite_update, select_effective_entity_tombstone_state,
     };
-    use crate::sql::parse_sql_statements;
+    use crate::engine::sql2::ast::utils::parse_sql_statements;
     use crate::sql::resolve_expr_cell_with_state;
     use crate::sql::PlaceholderState;
     use crate::SqlDialect;

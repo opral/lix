@@ -251,8 +251,8 @@ mod tests {
     use sqlparser::ast::{Expr, SetExpr, Statement};
 
     use crate::cel::CelEvaluator;
+    use crate::engine::sql2::ast::utils::parse_sql_statements;
     use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-    use crate::sql::parse_sql_statements;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
     use super::{apply_defaults_to_snapshot, apply_vtable_insert_defaults};
