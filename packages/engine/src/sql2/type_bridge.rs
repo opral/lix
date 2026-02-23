@@ -61,7 +61,6 @@ pub(crate) async fn build_delete_followup_statements(
 pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> PlannedStatementSet {
     PlannedStatementSet {
         sql: output.sql,
-        params: output.params,
         prepared_statements: output
             .prepared_statements
             .into_iter()
@@ -89,7 +88,7 @@ pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> Plann
 pub(crate) fn to_sql_preprocess_output(output: &PlannedStatementSet) -> sql::PreprocessOutput {
     sql::PreprocessOutput {
         sql: output.sql.clone(),
-        params: output.params.clone(),
+        params: Vec::new(),
         prepared_statements: output
             .prepared_statements
             .iter()

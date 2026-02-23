@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::Value;
-
 use super::super::ast::nodes::Expr;
 use super::postprocess_actions::PostprocessPlan;
 use super::prepared_statement::PreparedStatement;
@@ -44,7 +42,6 @@ pub(crate) struct UpdateValidationPlan {
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedStatementSet {
     pub(crate) sql: String,
-    pub(crate) params: Vec<Value>,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) registrations: Vec<SchemaRegistration>,
     pub(crate) postprocess: Option<PostprocessPlan>,
