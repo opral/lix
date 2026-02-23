@@ -1,18 +1,7 @@
-use crate::sql::{
-    is_query_only_statements, should_invalidate_installed_plugins_cache_for_statements,
-    should_refresh_file_cache_for_statements,
-};
-
 use super::super::ast::nodes::Statement;
 use super::super::contracts::requirements::PlanRequirements;
+use super::super::semantics::state_resolution::requirements::derive_requirements_from_state_resolution;
 
 pub(crate) fn derive_plan_requirements(statements: &[Statement]) -> PlanRequirements {
-    let read_only_query = is_query_only_statements(statements);
-    PlanRequirements {
-        read_only_query,
-        should_refresh_file_cache: !read_only_query
-            && should_refresh_file_cache_for_statements(statements),
-        should_invalidate_installed_plugins_cache:
-            should_invalidate_installed_plugins_cache_for_statements(statements),
-    }
+    derive_requirements_from_state_resolution(statements)
 }
