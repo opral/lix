@@ -329,7 +329,54 @@ Goal: make `sql2` and engine runtime consume only `sql2`-owned APIs/types while 
 2. Remove `sql2/contracts/*` aliases to `crate::sql::*`.
 3. Verification: `cargo test -p lix_engine --test commit --test stored_schema --test deterministic_mode -- --test-threads=1`.
 
-#### Phase 5.6: External Import Zero Gate
+#### Phase 5.6: External Import Zero Gate (Microphases)
+
+##### Phase 5.6.1: `sql2` Runtime Modules First
+
+1. Remove `crate::sql::*` usage from `sql2` runtime modules that are not bridge-only:
+   - `sql2/api.rs`
+   - `sql2/scripts.rs`
+   - `sql2/in_transaction.rs`
+   - `sql2/semantics/state_resolution/{canonical,optimize,effects}.rs`
+   - `sql2/history/rewrite/state_history.rs`
+2. Move required helpers into `sql2/*` ownership (`planning`, `history`, `semantics`) instead of re-exporting from `sql`.
+3. Verification: `cargo test -p lix_engine --test execute --test transaction_execution --test observe -- --test-threads=1`.
+
+##### Phase 5.6.2: `sql2` Bridge Surface Cleanup
+
+1. Remove `crate::sql::*` usage from remaining `sql2` bridge surfaces:
+   - `sql2/surfaces/registry.rs`
+   - `sql2/execution/postprocess.rs`
+2. Keep conversions in `sql2/type_bridge.rs` only for still-unmigrated paths after this step.
+3. Verification: `cargo test -p lix_engine --test schema_provider --test commit -- --test-threads=1`.
+
+##### Phase 5.6.3: Shared Runtime Helper Cleanup
+
+1. Remove `crate::sql::*` usage from shared runtime modules:
+   - `engine.rs`
+   - `default_values.rs`
+   - `state_commit_stream.rs` (if any remains)
+2. Replace helper/type dependencies with `sql2/{ast,contracts,planning}` equivalents.
+3. Verification: `cargo test -p lix_engine --test deterministic_mode --test commit -- --test-threads=1`.
+
+##### Phase 5.6.4: Filesystem/Plugin/Schema Utility Cleanup
+
+1. Remove `crate::sql::*` usage from utility modules still outside `sql2`:
+   - `filesystem/{mutation_rewrite,pending_file_writes,select_rewrite}.rs`
+   - `plugin/runtime.rs`
+   - `schema/provider.rs`
+   - `materialization/apply.rs`
+   - `deterministic_mode/mod.rs`
+2. Move required escaping/AST/rewrite helpers under `sql2/{ast,history,storage}` and import from there.
+3. Verification: `cargo test -p lix_engine --test file_materialization --test file_history_view --test state_commit_stream -- --test-threads=1`.
+
+##### Phase 5.6.5: `sql2/type_bridge` Final Drain
+
+1. Eliminate remaining `crate::sql::*` dependencies in `sql2/type_bridge.rs`.
+2. Ensure `type_bridge` only converts between `sql2/contracts` and internal `sql2` structs (or remove bridge functions entirely if obsolete).
+3. Verification: `cargo test -p lix_engine --test sql2_guardrails --test transaction_execution -- --test-threads=1`.
+
+##### Phase 5.6.6: Zero-Import Gate + Full Integration
 
 1. Reach zero `crate::sql::*` imports outside `packages/engine/src/sql/**`.
 2. Keep `src/sql` compiling temporarily only as a still-present directory, not as a dependency of runtime code.
