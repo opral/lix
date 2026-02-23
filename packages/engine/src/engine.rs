@@ -21,7 +21,8 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql::{
-    bind_sql_with_state, escape_sql_string, should_invalidate_installed_plugins_cache_for_sql,
+    bind_sql_with_state,
+    escape_sql_string, should_invalidate_installed_plugins_cache_for_sql,
     DetectedFileDomainChange, MutationOperation, MutationRow, PlaceholderState,
 };
 use crate::state_commit_stream::{
