@@ -365,11 +365,15 @@ fn validate_phase_invariants_for_planner(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use super::rewrite_query_with_backend_and_params;
+    use super::{rewrite_query_with_backend_and_params, rewrite_query_with_backend_and_params_and_catalog};
+    use crate::sql::PlannerCatalogSnapshot;
     use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
 
     #[derive(Default)]
@@ -417,5 +421,63 @@ mod tests {
 
         assert!(!sql.contains("FROM lix_active_version"));
         assert!(sql.contains("lix_internal_state_vtable"));
+    }
+
+    struct NoIoBackend {
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LixBackend for NoIoBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Err(LixError {
+                message: "rewrite attempted backend I/O".to_string(),
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError {
+                message: "test backend does not support transactions".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn planner_query_rewrite_with_catalog_does_not_execute_backend_for_vtable_lowering() {
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let backend = NoIoBackend {
+            execute_calls: Arc::clone(&execute_calls),
+        };
+        let query = parse_query(
+            "SELECT entity_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'schema_a'",
+        );
+        let snapshot = PlannerCatalogSnapshot {
+            materialized_schema_keys: vec!["schema_a".to_string()],
+            schema_keys_by_plugin: Default::default(),
+        };
+
+        let rewritten = rewrite_query_with_backend_and_params_and_catalog(
+            &backend,
+            query,
+            &[],
+            &snapshot,
+        )
+        .await
+        .expect("planner query rewrite with catalog");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("lix_internal_state_untracked"));
+        assert_eq!(
+            execute_calls.load(Ordering::SeqCst),
+            0,
+            "catalog-driven rewrite should not call backend.execute()",
+        );
     }
 }

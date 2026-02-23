@@ -179,3 +179,75 @@ fn validate_non_empty_field(field: &str, value: &str) -> Result<(), LixError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ensure_postprocess_single_statement, validate_statement_output_parts,
+        PostprocessSingleStatementContext,
+    };
+    use crate::sql::parse_sql_statements_with_dialect;
+    use crate::sql::types::{MutationRow, VtableDeletePlan, VtableUpdatePlan};
+    use crate::sql::PostprocessPlan;
+    use crate::{LixError, SqlDialect};
+    use sqlparser::ast::Statement;
+
+    fn statement_from_sql(sql: &str) -> Statement {
+        let mut statements =
+            parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite).expect("parse statement");
+        assert_eq!(statements.len(), 1);
+        statements.remove(0)
+    }
+
+    fn mutation_row() -> MutationRow {
+        MutationRow {
+            entity_id: "entity".to_string(),
+            schema_key: "schema".to_string(),
+            schema_version: "1".to_string(),
+            file_id: "file".to_string(),
+            version_id: "global".to_string(),
+            plugin_key: "plugin".to_string(),
+            snapshot_content: None,
+            untracked: false,
+        }
+    }
+
+    #[test]
+    fn postprocess_single_statement_invariant_rejects_multi_statement_plan() {
+        let result = ensure_postprocess_single_statement(
+            true,
+            2,
+            PostprocessSingleStatementContext::CompilePlan,
+        );
+        assert!(matches!(result, Err(LixError { message }) if message.contains("single-statement invariant")));
+    }
+
+    #[test]
+    fn postprocess_invariant_rejects_mutations_when_postprocess_present() {
+        let statements = vec![statement_from_sql("UPDATE t SET x = 1")];
+        let postprocess = PostprocessPlan::VtableUpdate(VtableUpdatePlan {
+            schema_key: "schema".to_string(),
+            explicit_writer_key: None,
+            writer_key_assignment_present: false,
+            file_data_assignment: None,
+        });
+        let mutations = vec![mutation_row()];
+
+        let result =
+            validate_statement_output_parts(&statements, &[], Some(&postprocess), &mutations, &[]);
+        assert!(matches!(result, Err(LixError { message }) if message.contains("cannot emit mutation rows")));
+    }
+
+    #[test]
+    fn postprocess_invariant_rejects_delete_scope_selection_without_fallback() {
+        let statements = vec![statement_from_sql("DELETE FROM t")];
+        let postprocess = PostprocessPlan::VtableDelete(VtableDeletePlan {
+            schema_key: "schema".to_string(),
+            effective_scope_fallback: false,
+            effective_scope_selection_sql: Some("SELECT 1".to_string()),
+        });
+
+        let result = validate_statement_output_parts(&statements, &[], Some(&postprocess), &[], &[]);
+        assert!(matches!(result, Err(LixError { message }) if message.contains("effective scope selection SQL without fallback")));
+    }
+}

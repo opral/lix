@@ -429,4 +429,56 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn enforces_single_binding_contract_across_multi_statement_block() {
+        let bound = bind_sql(
+            "SELECT ?2 AS first; SELECT ?1 AS second; SELECT ?2 AS third",
+            &[Value::Text("p1".to_string()), Value::Text("p2".to_string())],
+            SqlDialect::Sqlite,
+        )
+        .expect("bind should succeed");
+
+        assert_eq!(
+            bound.sql,
+            "SELECT ?1 AS first; SELECT ?2 AS second; SELECT ?1 AS third"
+        );
+        assert_eq!(
+            bound.params,
+            vec![Value::Text("p2".to_string()), Value::Text("p1".to_string())]
+        );
+    }
+
+    #[test]
+    fn placeholder_monotonicity_survives_explicit_then_implicit_sequence() {
+        let first = bind_sql_with_state(
+            "SELECT ?3",
+            &[
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(4),
+            ],
+            SqlDialect::Sqlite,
+            crate::sql::PlaceholderState::new(),
+        )
+        .expect("first bind should succeed");
+        let second = bind_sql_with_state(
+            "SELECT ?",
+            &[
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(4),
+            ],
+            SqlDialect::Sqlite,
+            first.state,
+        )
+        .expect("second bind should succeed");
+
+        assert_eq!(first.sql, "SELECT ?1");
+        assert_eq!(first.params, vec![Value::Integer(3)]);
+        assert_eq!(second.sql, "SELECT ?1");
+        assert_eq!(second.params, vec![Value::Integer(4)]);
+    }
 }
