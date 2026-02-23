@@ -124,6 +124,17 @@ impl<'a> EngineTransaction<'a> {
         self.execute_with_access(sql, params).await
     }
 
+    pub(crate) async fn execute_raw_internal(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
+            message: "transaction is no longer active".to_string(),
+        })?;
+        transaction.execute(sql, params).await
+    }
+
     async fn execute_with_access(
         &mut self,
         sql: &str,

@@ -161,6 +161,14 @@ pub async fn insert_side_effect_statements_with_backend(
     let Some(path_index) = path_index else {
         return Ok(FilesystemInsertSideEffects::default());
     };
+    let id_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("id"));
+    let data_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("data"));
 
     let by_version_index = insert.columns.iter().position(|column| {
         column.value.eq_ignore_ascii_case("lixcol_version_id")
@@ -182,6 +190,7 @@ pub async fn insert_side_effect_statements_with_backend(
             || column.value.eq_ignore_ascii_case("untracked")
     });
     let mut directory_requests: BTreeMap<(String, String), bool> = BTreeMap::new();
+    let mut staged_file_data_by_target = BTreeMap::<(String, String), Vec<u8>>::new();
 
     for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
         if row.len() != insert.columns.len() {
@@ -230,6 +239,20 @@ pub async fn insert_side_effect_statements_with_backend(
             .transpose()?
             .flatten()
             .unwrap_or(false);
+        if target.is_file {
+            if let Some(data_index) = data_index {
+                if let Some(file_id) = id_index
+                    .and_then(|index| resolve_cell_text(resolved_row.get(index)))
+                {
+                    if let Some(data_bytes) = resolve_cell_blob_or_text_bytes(
+                        resolved_row.get(data_index),
+                        "filesystem insert data",
+                    )? {
+                        staged_file_data_by_target.insert((file_id, version_id.clone()), data_bytes);
+                    }
+                }
+            }
+        }
 
         if target.is_file {
             for ancestor in file_ancestor_directory_paths(&normalized_path) {
@@ -248,6 +271,13 @@ pub async fn insert_side_effect_statements_with_backend(
                     .or_insert(untracked);
             }
         }
+    }
+
+    if !staged_file_data_by_target.is_empty() {
+        side_effects.statements.push(build_file_data_cache_upsert_statement(
+            backend.dialect(),
+            &staged_file_data_by_target,
+        )?);
     }
 
     if directory_requests.is_empty() {
@@ -365,6 +395,65 @@ pub async fn insert_side_effect_statements_with_backend(
     side_effects.resolved_directory_ids = known_ids;
 
     Ok(side_effects)
+}
+
+fn build_file_data_cache_upsert_statement(
+    dialect: crate::SqlDialect,
+    rows: &BTreeMap<(String, String), Vec<u8>>,
+) -> Result<Statement, LixError> {
+    let values_sql = rows
+        .iter()
+        .map(|((file_id, version_id), data)| {
+            format!(
+                "('{}', '{}', {})",
+                escape_sql_string(file_id),
+                escape_sql_string(version_id),
+                blob_literal_sql(dialect, data),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    parse_single_statement(&format!(
+        "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
+         VALUES {values_sql} \
+         ON CONFLICT (file_id, version_id) DO UPDATE SET data = EXCLUDED.data"
+    ))
+}
+
+fn blob_literal_sql(dialect: crate::SqlDialect, bytes: &[u8]) -> String {
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    match dialect {
+        crate::SqlDialect::Sqlite => format!("X'{hex}'"),
+        crate::SqlDialect::Postgres => format!("decode('{hex}', 'hex')"),
+    }
+}
+
+fn resolve_cell_blob_or_text_bytes(
+    cell: Option<&crate::sql::ResolvedCell>,
+    context: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let Some(value) = cell.and_then(|cell| cell.value.as_ref()) else {
+        return Ok(None);
+    };
+    match value {
+        EngineValue::Blob(bytes) => Ok(Some(bytes.clone())),
+        EngineValue::Text(text) => Ok(Some(text.as_bytes().to_vec())),
+        EngineValue::Null => Ok(None),
+        other => Err(LixError {
+            message: format!("{context} does not support value type {other:?}"),
+        }),
+    }
+}
+
+fn resolve_cell_text(cell: Option<&crate::sql::ResolvedCell>) -> Option<String> {
+    let value = cell.and_then(|cell| cell.value.as_ref())?;
+    match value {
+        EngineValue::Text(text) => Some(text.clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

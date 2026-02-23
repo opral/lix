@@ -26,10 +26,20 @@ const LOGICAL_READ_VIEW_NAMES: &[&str] = &[
 const MATERIALIZED_STATE_TABLE_PREFIX: &str = "lix_internal_state_materialized_v1_";
 
 pub(crate) fn validate_final_read_query(query: &Query) -> Result<(), LixError> {
+    validate_final_read_query_with_options(query, true)
+}
+
+pub(crate) fn validate_final_read_query_with_options(
+    query: &Query,
+    enforce_materialized_state_semantics: bool,
+) -> Result<(), LixError> {
     validate_no_unresolved_logical_read_views(query)?;
     validate_unique_explicit_relation_aliases(query)?;
     validate_placeholder_mapping_contract(query)?;
-    validate_materialized_state_semantics(query)
+    if enforce_materialized_state_semantics {
+        validate_materialized_state_semantics(query)?;
+    }
+    Ok(())
 }
 
 fn validate_no_unresolved_logical_read_views(query: &Query) -> Result<(), LixError> {
@@ -71,17 +81,36 @@ fn validate_materialized_state_semantics(query: &Query) -> Result<(), LixError> 
         let predicates = collect_select_predicates(select);
         for relation in &materialized_relations {
             let allow_unqualified = materialized_relations.len() == 1;
-            let has_live_filter = predicates.iter().any(|predicate| {
-                expr_contains_live_tombstone_filter(predicate, Some(&relation.qualifier))
-                    || (allow_unqualified && expr_contains_live_tombstone_filter(predicate, None))
+            let has_live_row_filter = predicates.iter().any(|predicate| {
+                expr_contains_tombstone_filter_value(
+                    predicate,
+                    Some(&relation.qualifier),
+                    0,
+                ) || (allow_unqualified
+                    && expr_contains_tombstone_filter_value(predicate, None, 0))
             });
-            if !has_live_filter {
+            let has_tombstone_row_filter = predicates.iter().any(|predicate| {
+                expr_contains_tombstone_filter_value(
+                    predicate,
+                    Some(&relation.qualifier),
+                    1,
+                ) || expr_contains_snapshot_content_null_filter(
+                    predicate,
+                    Some(&relation.qualifier),
+                ) || (allow_unqualified
+                    && (expr_contains_tombstone_filter_value(predicate, None, 1)
+                        || expr_contains_snapshot_content_null_filter(predicate, None)))
+            });
+            if !has_live_row_filter && !has_tombstone_row_filter {
                 return Err(LixError {
                     message: format!(
                         "read rewrite produced materialized relation '{}' without live-row tombstone filter",
                         relation.display_name
                     ),
                 });
+            }
+            if has_tombstone_row_filter && !has_live_row_filter {
+                continue;
             }
 
             let has_schema_key_filter = predicates.iter().any(|predicate| {
@@ -250,8 +279,18 @@ fn collect_join_operator_predicates<'a>(
 }
 
 fn expr_contains_live_tombstone_filter(expr: &Expr, qualifier: Option<&str>) -> bool {
+    expr_contains_tombstone_filter_value(expr, qualifier, 0)
+        || expr_contains_tombstone_filter_value(expr, qualifier, 1)
+}
+
+fn expr_contains_tombstone_filter_value(
+    expr: &Expr,
+    qualifier: Option<&str>,
+    expected_value: i64,
+) -> bool {
     struct LiveTombstoneFilterVisitor<'a> {
         qualifier: Option<&'a str>,
+        expected_value: i64,
         found: bool,
     }
 
@@ -265,9 +304,9 @@ fn expr_contains_live_tombstone_filter(expr: &Expr, qualifier: Option<&str>) -> 
             if let Expr::BinaryOp { left, op, right } = expr {
                 if *op == BinaryOperator::Eq
                     && ((expr_is_tombstone_column(left, self.qualifier)
-                        && expr_is_numeric_zero(right))
+                        && expr_is_numeric_value(right, self.expected_value))
                         || (expr_is_tombstone_column(right, self.qualifier)
-                            && expr_is_numeric_zero(left)))
+                            && expr_is_numeric_value(left, self.expected_value)))
                 {
                     self.found = true;
                     return ControlFlow::Break(());
@@ -279,6 +318,7 @@ fn expr_contains_live_tombstone_filter(expr: &Expr, qualifier: Option<&str>) -> 
 
     let mut visitor = LiveTombstoneFilterVisitor {
         qualifier,
+        expected_value,
         found: false,
     };
     let _ = expr.visit(&mut visitor);
@@ -444,6 +484,49 @@ fn expr_contains_snapshot_content_not_null_filter(expr: &Expr, qualifier: Option
     visitor.found
 }
 
+fn expr_contains_snapshot_content_null_filter(expr: &Expr, qualifier: Option<&str>) -> bool {
+    struct SnapshotContentNullFilterVisitor<'a> {
+        qualifier: Option<&'a str>,
+        found: bool,
+    }
+
+    impl Visitor for SnapshotContentNullFilterVisitor<'_> {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if self.found {
+                return ControlFlow::Break(());
+            }
+            match expr {
+                Expr::IsNull(expr) if expr_is_snapshot_content_column(expr, self.qualifier) => {
+                    self.found = true;
+                    ControlFlow::Break(())
+                }
+                Expr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr,
+                } => {
+                    if let Expr::IsNotNull(inner) = expr.as_ref() {
+                        if expr_is_snapshot_content_column(inner, self.qualifier) {
+                            self.found = true;
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    ControlFlow::Continue(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+
+    let mut visitor = SnapshotContentNullFilterVisitor {
+        qualifier,
+        found: false,
+    };
+    let _ = expr.visit(&mut visitor);
+    visitor.found
+}
+
 fn expr_is_snapshot_content_column(expr: &Expr, qualifier: Option<&str>) -> bool {
     match expr {
         Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("snapshot_content"),
@@ -473,6 +556,32 @@ fn expr_is_numeric_zero(expr: &Expr) -> bool {
             ..
         }) => number.parse::<i64>().ok() == Some(0),
         Expr::Cast { expr, .. } => expr_is_numeric_zero(expr),
+        _ => false,
+    }
+}
+
+fn expr_is_numeric_one(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::Number(number, _),
+            ..
+        }) => number.parse::<i64>().ok() == Some(1),
+        Expr::Cast { expr, .. } => expr_is_numeric_one(expr),
+        _ => false,
+    }
+}
+
+fn expr_is_numeric_zero_or_one(expr: &Expr) -> bool {
+    expr_is_numeric_zero(expr) || expr_is_numeric_one(expr)
+}
+
+fn expr_is_numeric_value(expr: &Expr, expected: i64) -> bool {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::Number(number, _),
+            ..
+        }) => number.parse::<i64>().ok() == Some(expected),
+        Expr::Cast { expr, .. } => expr_is_numeric_value(expr, expected),
         _ => false,
     }
 }

@@ -122,7 +122,6 @@ pub(crate) fn validate_statement_output_parts(
         }
     }
     for mutation in mutations {
-        validate_non_empty_field("mutation entity_id", &mutation.entity_id)?;
         validate_non_empty_field("mutation schema_key", &mutation.schema_key)?;
         validate_non_empty_field("mutation schema_version", &mutation.schema_version)?;
         validate_non_empty_field("mutation file_id", &mutation.file_id)?;

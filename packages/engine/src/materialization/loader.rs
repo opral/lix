@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::builtin_schema::types::{
     LixCommit, LixCommitEdge, LixVersionDescriptor, LixVersionPointer,
 };
+use crate::working_projection::WORKING_PROJECTION_METADATA;
 
 use crate::{LixBackend, LixError, Value};
 
@@ -90,6 +91,12 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         let snapshot_content = text_optional(&row, 6, "snapshot_content")?;
         let metadata = text_optional(&row, 7, "metadata")?;
         let created_at = text_required(&row, 8, "created_at")?;
+
+        // Working-projection rows are transient read-time overlays and should not
+        // influence durable rematerialization planning.
+        if metadata.as_deref() == Some(WORKING_PROJECTION_METADATA) {
+            continue;
+        }
 
         let change = ChangeRecord {
             id: id.clone(),

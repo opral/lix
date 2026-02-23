@@ -1,6 +1,6 @@
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgumentList, FunctionArguments,
+    BinaryOperator, CaseWhen, Expr, Function, FunctionArg, FunctionArgumentList, FunctionArguments,
     GroupByExpr, Ident, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions, Query, Select,
     SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor,
     TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowSpec, WindowType,
@@ -19,7 +19,7 @@ use crate::sql::{
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_file_id, version_descriptor_schema_key,
-    version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
+    version_descriptor_storage_version_id, version_pointer_schema_key, GLOBAL_VERSION_ID,
 };
 use crate::LixError;
 
@@ -245,12 +245,19 @@ fn build_effective_state_by_version_view_template_sql(include_commit_mapping: bo
              s.metadata AS metadata, \
              ROW_NUMBER() OVER ( \
                PARTITION BY vc.target_version_id, s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
+               ORDER BY \
+                 vc.depth ASC, \
+                 s.untracked DESC, \
+                 s.created_at DESC, \
+                 s.change_id DESC, \
+                 CASE WHEN s.snapshot_content IS NULL THEN 1 ELSE 0 END DESC \
              ) AS rn \
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.ancestor_version_id = s.version_id \
            {commit_join} \
+           WHERE snapshot_content IS NULL \
+              OR snapshot_content IS NOT NULL \
          ) AS ranked \
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL",
@@ -315,11 +322,18 @@ fn build_effective_state_by_version_count_template_sql() -> String {
              s.snapshot_content AS snapshot_content, \
              ROW_NUMBER() OVER ( \
                PARTITION BY vc.target_version_id, s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
+               ORDER BY \
+                 vc.depth ASC, \
+                 s.untracked DESC, \
+                 s.created_at DESC, \
+                 s.change_id DESC, \
+                 CASE WHEN s.snapshot_content IS NULL THEN 1 ELSE 0 END DESC \
              ) AS rn \
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.ancestor_version_id = s.version_id \
+           WHERE snapshot_content IS NULL \
+              OR snapshot_content IS NOT NULL \
          ) AS ranked \
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL",
@@ -543,13 +557,20 @@ fn build_effective_state_active_view_template_sql(include_commit_mapping: bool) 
              s.metadata AS metadata, \
              ROW_NUMBER() OVER ( \
                PARTITION BY s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
+               ORDER BY \
+                 vc.depth ASC, \
+                 s.untracked DESC, \
+                 s.created_at DESC, \
+                 s.change_id DESC, \
+                 CASE WHEN s.snapshot_content IS NULL THEN 1 ELSE 0 END DESC \
              ) AS rn \
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.version_id = s.version_id \
            {commit_join} \
            CROSS JOIN active_version av \
+           WHERE snapshot_content IS NULL \
+              OR snapshot_content IS NOT NULL \
          ) AS ranked \
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL",
@@ -644,12 +665,19 @@ fn build_effective_state_active_count_template_sql() -> String {
              s.snapshot_content AS snapshot_content, \
              ROW_NUMBER() OVER ( \
                PARTITION BY s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
+               ORDER BY \
+                 vc.depth ASC, \
+                 s.untracked DESC, \
+                 s.created_at DESC, \
+                 s.change_id DESC, \
+                 CASE WHEN s.snapshot_content IS NULL THEN 1 ELSE 0 END DESC \
              ) AS rn \
            FROM {vtable_name} s \
            JOIN version_chain vc \
              ON vc.version_id = s.version_id \
            CROSS JOIN active_version av \
+           WHERE snapshot_content IS NULL \
+              OR snapshot_content IS NOT NULL \
          ) AS ranked \
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL",
@@ -869,6 +897,17 @@ fn build_untracked_union_query(
     let predicate_schema_keys = stripped_predicate
         .as_ref()
         .and_then(|expr| extract_column_keys_from_expr(expr, expr_is_schema_key_column));
+    let include_tombstones = stripped_predicate
+        .as_ref()
+        .map(|predicate| {
+            predicate_requests_tombstones(predicate)
+                || predicate_targets_exact_state_row(predicate)
+                || predicate_targets_version_entity_tombstones(
+                    predicate,
+                    predicate_schema_keys.as_deref(),
+                )
+        })
+        .unwrap_or(false);
     let effective_schema_keys = narrow_schema_keys(schema_keys, predicate_schema_keys.as_deref());
     let mut union_branches = Vec::<Query>::new();
 
@@ -905,19 +944,19 @@ fn build_untracked_union_query(
 
     for key in &effective_schema_keys {
         let materialized_table = format!("{MATERIALIZED_PREFIX}{key}");
-        let mut materialized_filters = vec![
-            Expr::BinaryOp {
+        let mut materialized_filters = vec![Expr::BinaryOp {
+            left: Box::new(expr_ident("schema_key")),
+            op: BinaryOperator::Eq,
+            right: Box::new(expr_string(key)),
+        }];
+        if !include_tombstones {
+            materialized_filters.push(Expr::BinaryOp {
                 left: Box::new(expr_ident("is_tombstone")),
                 op: BinaryOperator::Eq,
                 right: Box::new(expr_int(0)),
-            },
-            Expr::BinaryOp {
-                left: Box::new(expr_ident("schema_key")),
-                op: BinaryOperator::Eq,
-                right: Box::new(expr_string(key)),
-            },
-            Expr::IsNotNull(Box::new(expr_ident("snapshot_content"))),
-        ];
+            });
+            materialized_filters.push(Expr::IsNotNull(Box::new(expr_ident("snapshot_content"))));
+        }
         if let Some(predicate) = stripped_predicate.as_ref() {
             materialized_filters.push(predicate.clone());
         }
@@ -1070,7 +1109,23 @@ fn union_projection_materialized() -> Vec<SelectItem> {
         select_ident("file_id"),
         select_ident("version_id"),
         select_ident("plugin_key"),
-        select_ident("snapshot_content"),
+        select_alias(
+            Expr::Case {
+                case_token: AttachedToken::empty(),
+                end_token: AttachedToken::empty(),
+                operand: None,
+                conditions: vec![CaseWhen {
+                    condition: Expr::BinaryOp {
+                        left: Box::new(expr_ident("is_tombstone")),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(expr_int(1)),
+                    },
+                    result: expr_null(),
+                }],
+                else_result: Some(Box::new(expr_ident("snapshot_content"))),
+            },
+            "snapshot_content",
+        ),
         select_ident("metadata"),
         select_ident("schema_version"),
         select_ident("created_at"),
@@ -1081,6 +1136,145 @@ fn union_projection_materialized() -> Vec<SelectItem> {
         select_alias(expr_int(0), "untracked"),
         select_alias(expr_int(2), "priority"),
     ]
+}
+
+fn predicate_requests_tombstones(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsNull(inner) => expr_is_column(inner.as_ref(), "snapshot_content"),
+        Expr::BinaryOp { left, op, right } => {
+            if *op == BinaryOperator::Eq {
+                if expr_is_column(left.as_ref(), "is_tombstone")
+                    && expr_is_numeric_literal(right.as_ref(), "1")
+                {
+                    return true;
+                }
+                if expr_is_column(right.as_ref(), "is_tombstone")
+                    && expr_is_numeric_literal(left.as_ref(), "1")
+                {
+                    return true;
+                }
+            }
+            predicate_requests_tombstones(left) || predicate_requests_tombstones(right)
+        }
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            predicate_requests_tombstones(inner)
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            predicate_requests_tombstones(inner)
+                || predicate_requests_tombstones(low)
+                || predicate_requests_tombstones(high)
+        }
+        Expr::InList { expr: inner, list, .. } => {
+            predicate_requests_tombstones(inner)
+                || list.iter().any(predicate_requests_tombstones)
+        }
+        _ => false,
+    }
+}
+
+fn predicate_targets_exact_state_row(expr: &Expr) -> bool {
+    let mut conjuncts = Vec::new();
+    if !collect_and_conjuncts(expr, &mut conjuncts) {
+        return false;
+    }
+
+    let has_schema_key = conjuncts
+        .iter()
+        .any(|conjunct| conjunct_has_column_equality(conjunct, "schema_key"));
+    let has_entity_id = conjuncts
+        .iter()
+        .any(|conjunct| conjunct_has_column_equality(conjunct, "entity_id"));
+
+    has_schema_key && has_entity_id
+}
+
+fn predicate_targets_version_entity_tombstones(
+    expr: &Expr,
+    schema_keys: Option<&[String]>,
+) -> bool {
+    let Some(schema_keys) = schema_keys else {
+        return false;
+    };
+    if schema_keys.is_empty() {
+        return false;
+    }
+
+    let allowed_schema_keys = [version_descriptor_schema_key(), version_pointer_schema_key()];
+    let is_version_scope = schema_keys.iter().all(|key| {
+        allowed_schema_keys
+            .iter()
+            .any(|allowed| key.eq_ignore_ascii_case(allowed))
+    });
+    if !is_version_scope {
+        return false;
+    }
+
+    let mut conjuncts = Vec::new();
+    if !collect_and_conjuncts(expr, &mut conjuncts) {
+        return false;
+    }
+    conjuncts
+        .iter()
+        .any(|conjunct| conjunct_has_column_equality(conjunct, "entity_id"))
+}
+
+fn collect_and_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) -> bool {
+    match expr {
+        Expr::Nested(inner) => collect_and_conjuncts(inner, out),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                collect_and_conjuncts(left, out) && collect_and_conjuncts(right, out)
+            }
+            BinaryOperator::Or => false,
+            _ => {
+                out.push(expr);
+                true
+            }
+        },
+        _ => {
+            out.push(expr);
+            true
+        }
+    }
+}
+
+fn conjunct_has_column_equality(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+            (expr_is_column(left.as_ref(), column) && !expr_is_column(right.as_ref(), column))
+                || (expr_is_column(right.as_ref(), column)
+                    && !expr_is_column(left.as_ref(), column))
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_column(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(name),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case(name))
+            .unwrap_or(false),
+        Expr::Nested(inner) => expr_is_column(inner, name),
+        _ => false,
+    }
+}
+
+fn expr_is_numeric_literal(expr: &Expr, expected: &str) -> bool {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(value, _),
+            ..
+        }) => value == expected,
+        Expr::Nested(inner) => expr_is_numeric_literal(inner, expected),
+        _ => false,
+    }
 }
 
 fn ranked_projection_with_row_number() -> Vec<SelectItem> {
@@ -1123,6 +1317,11 @@ fn ranked_projection_without_row_number() -> Vec<SelectItem> {
 }
 
 fn row_number_partitioned_expr() -> Expr {
+    let mut updated_desc = OrderByOptions::default();
+    updated_desc.asc = Some(false);
+    let mut change_desc = OrderByOptions::default();
+    change_desc.asc = Some(false);
+
     Expr::Function(Function {
         name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("ROW_NUMBER"))]),
         uses_odbc_syntax: false,
@@ -1142,11 +1341,23 @@ fn row_number_partitioned_expr() -> Expr {
                 expr_ident("file_id"),
                 expr_ident("version_id"),
             ],
-            order_by: vec![OrderByExpr {
-                expr: expr_ident("priority"),
-                options: OrderByOptions::default(),
-                with_fill: None,
-            }],
+            order_by: vec![
+                OrderByExpr {
+                    expr: expr_ident("priority"),
+                    options: OrderByOptions::default(),
+                    with_fill: None,
+                },
+                OrderByExpr {
+                    expr: expr_ident("updated_at"),
+                    options: updated_desc,
+                    with_fill: None,
+                },
+                OrderByExpr {
+                    expr: expr_ident("change_id"),
+                    options: change_desc,
+                    with_fill: None,
+                },
+            ],
             window_frame: None,
         })),
         within_group: Vec::new(),
@@ -1466,7 +1677,20 @@ fn strip_qualifiers(expr: Expr) -> Option<Expr> {
                 None
             }
         }
-        Expr::CompoundIdentifier(_) => None,
+        Expr::CompoundIdentifier(parts) => {
+            let (ident, qualifiers) = parts.split_last()?;
+            if !is_pushdown_column(ident) {
+                return None;
+            }
+            let qualifier_allowed = qualifiers.len() == 1
+                && (qualifiers[0].value.eq_ignore_ascii_case(VTABLE_NAME)
+                    || qualifiers[0].value.eq_ignore_ascii_case("s"));
+            if qualifier_allowed {
+                Some(Expr::Identifier(ident.clone()))
+            } else {
+                None
+            }
+        }
         Expr::BinaryOp { left, op, right } => {
             if !is_simple_binary_op(&op) {
                 return None;
@@ -1934,12 +2158,79 @@ mod tests {
         assert_branch_contains_all(
             &compact,
             r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
+            &["schema_key='schema_a'", "snapshot_contentISNULL"],
+        );
+        assert_branch_not_contains(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
+            "is_tombstone=0",
+        );
+        assert_branch_not_contains(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
+            "snapshot_contentISNOTNULL",
+        );
+    }
+
+    #[test]
+    fn rewrite_includes_tombstones_for_exact_identity_predicate() {
+        let sql = "SELECT snapshot_content FROM lix_internal_state_vtable \
+            WHERE schema_key = 'schema_a' \
+              AND entity_id = 'entity-1' \
+              AND file_id = 'file-1' \
+              AND version_id = 'v-1'";
+        let output = preprocess_sql(sql).expect("preprocess_sql");
+        let compact = compact_sql(&output.sql);
+
+        assert_branch_contains_all(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
             &[
-                "is_tombstone=0",
                 "schema_key='schema_a'",
-                "snapshot_contentISNOTNULL",
-                "snapshot_contentISNULL",
+                "entity_id='entity-1'",
+                "file_id='file-1'",
+                "version_id='v-1'",
             ],
+        );
+        assert_branch_not_contains(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
+            "is_tombstone=0",
+        );
+        assert_branch_not_contains(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_schema_a"#,
+            "snapshot_contentISNOTNULL",
+        );
+    }
+
+    #[test]
+    fn rewrite_includes_tombstones_for_version_entity_scoped_schema_in_predicate() {
+        let sql = "SELECT schema_key, snapshot_content FROM lix_internal_state_vtable \
+            WHERE entity_id = 'entity-1' \
+              AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer')";
+        let output = preprocess_sql(sql).expect("preprocess_sql");
+        let compact = compact_sql(&output.sql);
+
+        assert_branch_contains_all(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_lix_version_descriptor"#,
+            &["schema_key='lix_version_descriptor'", "entity_id='entity-1'"],
+        );
+        assert_branch_contains_all(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_lix_version_pointer"#,
+            &["schema_key='lix_version_pointer'", "entity_id='entity-1'"],
+        );
+        assert_branch_not_contains(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_lix_version_descriptor"#,
+            "is_tombstone=0",
+        );
+        assert_branch_not_contains(
+            &compact,
+            r#"FROM"lix_internal_state_materialized_v1_lix_version_descriptor"#,
+            "snapshot_contentISNOTNULL",
         );
     }
 

@@ -117,6 +117,23 @@ pub(crate) fn bind_statement(
     bind_statement_with_state(statement, params, dialect, PlaceholderState::new())
 }
 
+pub(crate) fn normalize_statement_placeholders_with_state(
+    statement: &mut Statement,
+    params_len: usize,
+    dialect: SqlDialect,
+    mut state: PlaceholderState,
+) -> Result<PlaceholderState, LixError> {
+    let mut visitor = PlaceholderNormalizer {
+        params_len,
+        dialect,
+        state: &mut state,
+    };
+    if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
+        return Err(error);
+    }
+    Ok(state)
+}
+
 fn bind_statements_with_state_and_appended_params(
     statements: &mut [Statement],
     base_params: &[Value],
@@ -168,6 +185,12 @@ struct PlaceholderBinder<'a> {
     used_source_indices: &'a mut Vec<usize>,
 }
 
+struct PlaceholderNormalizer<'a> {
+    params_len: usize,
+    dialect: SqlDialect,
+    state: &'a mut PlaceholderState,
+}
+
 impl VisitorMut for PlaceholderBinder<'_> {
     type Break = LixError;
 
@@ -182,6 +205,22 @@ impl VisitorMut for PlaceholderBinder<'_> {
         let dense_index =
             dense_index_for_source(source_index, self.source_to_dense, self.used_source_indices);
         *value = SqlValue::Placeholder(placeholder_for_dialect(self.dialect, dense_index + 1));
+        ControlFlow::Continue(())
+    }
+}
+
+impl VisitorMut for PlaceholderNormalizer<'_> {
+    type Break = LixError;
+
+    fn pre_visit_value(&mut self, value: &mut SqlValue) -> ControlFlow<Self::Break> {
+        let SqlValue::Placeholder(token) = value else {
+            return ControlFlow::Continue(());
+        };
+        let source_index = match resolve_placeholder_index(token, self.params_len, self.state) {
+            Ok(index) => index,
+            Err(error) => return ControlFlow::Break(error),
+        };
+        *value = SqlValue::Placeholder(placeholder_for_dialect(self.dialect, source_index + 1));
         ControlFlow::Continue(())
     }
 }
@@ -267,11 +306,71 @@ fn parse_sql_statements(sql: &str, dialect: SqlDialect) -> Result<Vec<Statement>
         }
         SqlDialect::Postgres => {
             let dialect = PostgreSqlDialect {};
-            Parser::parse_sql(&dialect, sql).map_err(|error| LixError {
-                message: error.to_string(),
-            })
+            match Parser::parse_sql(&dialect, sql) {
+                Ok(statements) => Ok(statements),
+                Err(primary_error) if contains_sqlite_placeholders(sql) => {
+                    let sqlite_dialect = SQLiteDialect {};
+                    Parser::parse_sql(&sqlite_dialect, sql).map_err(|_| LixError {
+                        message: primary_error.to_string(),
+                    })
+                }
+                Err(primary_error) => Err(LixError {
+                    message: primary_error.to_string(),
+                }),
+            }
         }
     }
+}
+
+fn contains_sqlite_placeholders(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_single_quote {
+            if byte == b'\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                    index += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    index += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if byte == b'\'' {
+            in_single_quote = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_double_quote = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'?' {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
 }
 
 fn statements_to_sql(statements: &[Statement]) -> String {
@@ -332,6 +431,19 @@ mod tests {
             "SELECT * FROM t WHERE a = $1 OR b = $1 OR c = $2"
         );
         assert_eq!(bound.params, vec![Value::Integer(20), Value::Integer(10)]);
+    }
+
+    #[test]
+    fn binds_postgres_sqlite_anonymous_placeholders_via_fallback_parser() {
+        let bound = bind_sql(
+            "SELECT ? + ?",
+            &[Value::Integer(10), Value::Integer(20)],
+            SqlDialect::Postgres,
+        )
+        .expect("bind should succeed");
+
+        assert_eq!(bound.sql, "SELECT $1 + $2");
+        assert_eq!(bound.params, vec![Value::Integer(10), Value::Integer(20)]);
     }
 
     #[test]

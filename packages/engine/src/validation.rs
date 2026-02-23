@@ -9,7 +9,7 @@ use crate::schema::{
     schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
     SchemaProvider, SqlStoredSchemaProvider,
 };
-use crate::sql::{bind_sql, MutationRow, UpdateValidationPlan};
+use crate::sql::{bind_sql_with_state, MutationRow, PlaceholderState, UpdateValidationPlan};
 use crate::{LixBackend, LixError, Value};
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
@@ -67,6 +67,7 @@ pub async fn validate_updates(
     cache: &SchemaCache,
     plans: &[UpdateValidationPlan],
     params: &[Value],
+    placeholder_state: PlaceholderState,
 ) -> Result<(), LixError> {
     let mut schema_provider = SqlStoredSchemaProvider::new(backend);
 
@@ -80,7 +81,7 @@ pub async fn validate_updates(
             sql.push_str(&where_clause.to_string());
         }
 
-        let bound = bind_sql(&sql, params, backend.dialect())?;
+        let bound = bind_sql_with_state(&sql, params, backend.dialect(), placeholder_state)?;
         let result = backend.execute(&bound.sql, &bound.params).await?;
         if result.rows.is_empty() {
             continue;

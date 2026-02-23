@@ -57,6 +57,7 @@ struct FileHistoryDescriptorRow {
     root_commit_id: String,
     depth: i64,
     commit_id: String,
+    plugin_key: String,
     path: String,
 }
 
@@ -191,6 +192,35 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
             write.after_path.is_none() && write.after_data.is_empty();
         let after_uses_builtin_fallback =
             !is_delete_without_after_path && write.after_path.is_some() && after_plugin.is_none();
+
+        if !has_before_context {
+            let active_plugin_key = after_plugin.map(|plugin| plugin.key.as_str());
+            let mut plugin_keys_to_tombstone = BTreeSet::<String>::new();
+            for plugin in installed_plugins {
+                if Some(plugin.key.as_str()) != active_plugin_key {
+                    plugin_keys_to_tombstone.insert(plugin.key.clone());
+                }
+            }
+            if active_plugin_key != Some(BUILTIN_BINARY_FALLBACK_PLUGIN_KEY) {
+                plugin_keys_to_tombstone.insert(BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string());
+            }
+            for plugin_key in plugin_keys_to_tombstone {
+                for existing in
+                    load_existing_plugin_entities(backend, &write.file_id, &write.version_id, &plugin_key)
+                        .await?
+                {
+                    detected.push(DetectedFileChange {
+                        entity_id: existing.entity_id,
+                        schema_key: existing.schema_key,
+                        schema_version: existing.schema_version,
+                        file_id: write.file_id.clone(),
+                        version_id: write.version_id.clone(),
+                        plugin_key: plugin_key.clone(),
+                        snapshot_content: None,
+                    });
+                }
+            }
+        }
 
         if let Some(previous_plugin) = before_plugin {
             let plugin_changed = after_plugin
@@ -754,8 +784,8 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
         BTreeMap::new();
 
     for descriptor in descriptors.values() {
-        let plugin = select_plugin_for_path(&descriptor.path, None, &installed_plugins);
-        if plugin.is_none() {
+        let plugin_key = descriptor.plugin_key.as_str();
+        if plugin_key == BUILTIN_BINARY_FALLBACK_PLUGIN_KEY {
             let changes = load_plugin_state_changes_for_file_at_history_slice(
                 backend,
                 &descriptor.file_id,
@@ -791,7 +821,13 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
             .await?;
             continue;
         }
-        let plugin = plugin.expect("plugin must be present");
+        let Some(plugin) = installed_plugins
+            .iter()
+            .find(|candidate| candidate.key == plugin_key)
+            .or_else(|| select_plugin_for_path(&descriptor.path, None, &installed_plugins))
+        else {
+            continue;
+        };
 
         let changes = load_plugin_state_changes_for_file_at_history_slice(
             backend,
@@ -1015,14 +1051,18 @@ async fn load_plugin_state_changes_for_file(
     );
     for schema_key in schema_keys {
         let table = quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+        let schema_key_literal = schema_key.replace('\'', "''");
         union_branches.push(format!(
             "SELECT \
                entity_id, schema_key, file_id, version_id, plugin_key, schema_version, \
-               CASE WHEN is_tombstone = 1 THEN NULL ELSE snapshot_content END AS snapshot_content, \
+               snapshot_content, \
                updated_at, 0 AS untracked \
              FROM {table} \
              WHERE file_id = $1 \
-               AND plugin_key = $3",
+               AND plugin_key = $3 \
+               AND schema_key = '{schema_key_literal}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL",
         ));
     }
     let union_sql = union_branches.join(" UNION ALL ");
@@ -1435,6 +1475,7 @@ async fn load_missing_file_history_descriptors(
                    bp.root_commit_id AS root_commit_id, \
                    bp.from_depth AS depth, \
                    ancestry.ancestor_id AS commit_id, \
+                   bp.plugin_key AS plugin_key, \
                    bp.change_id AS change_id, \
                    ROW_NUMBER() OVER (\
                      PARTITION BY bp.file_id, bp.root_commit_id, bp.from_depth \
@@ -1460,21 +1501,52 @@ async fn load_missing_file_history_descriptors(
                    file_id, \
                    root_commit_id, \
                    depth, \
-                   commit_id \
+                   commit_id, \
+                   plugin_key \
                  FROM history_candidates \
                  WHERE row_num = 1\
+               ), \
+               descriptor_candidates AS (\
+                 SELECT \
+                   target.file_id AS file_id, \
+                   target.root_commit_id AS root_commit_id, \
+                   target.depth AS depth, \
+                   s.content AS snapshot_content, \
+                   ROW_NUMBER() OVER (\
+                     PARTITION BY target.file_id, target.root_commit_id, target.depth \
+                     ORDER BY bp.from_depth ASC, bp.change_id DESC\
+                   ) AS row_num \
+                 FROM history_targets target \
+                 JOIN lix_internal_entity_state_timeline_breakpoint bp \
+                   ON bp.entity_id = target.file_id \
+                  AND bp.schema_key = 'lix_file_descriptor' \
+                  AND bp.root_commit_id = target.root_commit_id \
+                  AND bp.from_depth >= target.depth \
+                  AND bp.snapshot_id != 'no-content' \
+                 JOIN lix_internal_snapshot s \
+                   ON s.id = bp.snapshot_id \
                ) \
                SELECT \
                  target.file_id AS file_id, \
                  target.root_commit_id AS root_commit_id, \
                  target.depth AS depth, \
                  target.commit_id AS commit_id, \
-                 file_at_commit.path AS path \
+                 target.plugin_key AS plugin_key, \
+                 CASE \
+                   WHEN descriptor.snapshot_content IS NULL THEN NULL \
+                   WHEN lix_json_text(descriptor.snapshot_content, 'name') IS NULL THEN NULL \
+                   WHEN COALESCE(lix_json_text(descriptor.snapshot_content, 'extension'), '') = '' THEN \
+                     '/' || lix_json_text(descriptor.snapshot_content, 'name') \
+                   ELSE \
+                     '/' || lix_json_text(descriptor.snapshot_content, 'name') || '.' || \
+                     lix_json_text(descriptor.snapshot_content, 'extension') \
+                 END AS path \
                FROM history_targets target \
-               LEFT JOIN lix_file_by_version file_at_commit \
-                 ON file_at_commit.id = target.file_id \
-                AND file_at_commit.lixcol_commit_id = target.commit_id \
-               WHERE file_at_commit.path IS NOT NULL \
+               LEFT JOIN descriptor_candidates descriptor \
+                 ON descriptor.file_id = target.file_id \
+                AND descriptor.root_commit_id = target.root_commit_id \
+                AND descriptor.depth = target.depth \
+                AND descriptor.row_num = 1 \
                ORDER BY target.root_commit_id, target.depth, target.file_id";
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
@@ -1496,7 +1568,8 @@ async fn load_missing_file_history_descriptors(
         let root_commit_id = text_required(&row, 1, "root_commit_id")?;
         let depth = i64_required(&row, 2, "depth")?;
         let commit_id = text_required(&row, 3, "commit_id")?;
-        let path = text_required(&row, 4, "path")?;
+        let plugin_key = text_required(&row, 4, "plugin_key")?;
+        let path = nullable_text(&row, 5, "path")?.unwrap_or_else(|| format!("/{file_id}"));
         descriptors.insert(
             (root_commit_id.clone(), file_id.clone(), depth),
             FileHistoryDescriptorRow {
@@ -1504,6 +1577,7 @@ async fn load_missing_file_history_descriptors(
                 root_commit_id,
                 depth,
                 commit_id,
+                plugin_key,
                 path,
             },
         );
@@ -1561,21 +1635,62 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
 
     let mut changes = Vec::new();
     let mut previous_entity_id: Option<String> = None;
+    let mut fallback_root_change: Option<PluginEntityChange> = None;
     for row in rows.rows {
         let entity_id = text_required(&row, 0, "entity_id")?;
-        if previous_entity_id
-            .as_ref()
-            .is_some_and(|previous| previous == &entity_id)
-        {
-            continue;
-        }
-        previous_entity_id = Some(entity_id.clone());
-        changes.push(PluginEntityChange {
+        let change = PluginEntityChange {
             entity_id,
             schema_key: text_required(&row, 1, "schema_key")?,
             schema_version: text_required(&row, 2, "schema_version")?,
             snapshot_content: nullable_text(&row, 3, "snapshot_content")?,
-        });
+        };
+        if change.entity_id.is_empty()
+            && change.snapshot_content.is_some()
+            && fallback_root_change.is_none()
+        {
+            fallback_root_change = Some(change.clone());
+        }
+        if previous_entity_id
+            .as_ref()
+            .is_some_and(|previous| previous == &change.entity_id)
+        {
+            continue;
+        }
+        previous_entity_id = Some(change.entity_id.clone());
+        changes.push(change);
+    }
+
+    let has_non_root_live = changes
+        .iter()
+        .any(|change| !change.entity_id.is_empty() && change.snapshot_content.is_some());
+    if has_non_root_live {
+        let root_index = changes.iter().position(|change| change.entity_id.is_empty());
+        let root_missing_or_tombstoned = root_index
+            .map(|index| changes[index].snapshot_content.is_none())
+            .unwrap_or(true);
+
+        if root_missing_or_tombstoned {
+            if let Some(fallback) = fallback_root_change {
+                match root_index {
+                    Some(index) => changes[index] = fallback,
+                    None => changes.insert(0, fallback),
+                }
+            } else if let Some(template) = changes
+                .iter()
+                .find(|change| change.entity_id.starts_with('/') && change.snapshot_content.is_some())
+            {
+                let synthetic_root = PluginEntityChange {
+                    entity_id: String::new(),
+                    schema_key: template.schema_key.clone(),
+                    schema_version: template.schema_version.clone(),
+                    snapshot_content: Some("{\"path\":\"\",\"value\":{}}".to_string()),
+                };
+                match root_index {
+                    Some(index) => changes[index] = synthetic_root,
+                    None => changes.insert(0, synthetic_root),
+                }
+            }
+        }
     }
     Ok(changes)
 }

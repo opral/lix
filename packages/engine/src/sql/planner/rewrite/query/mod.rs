@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use sqlparser::ast::{Expr, ObjectNamePart, Query, Select, SelectItem, TableFactor};
 
 use self::context::AnalysisContext;
-use self::validator::validate_final_read_query;
+use self::validator::validate_final_read_query_with_options;
 use crate::sql::entity_views::read as entity_view_read;
 use crate::sql::planner::catalog::{load_planner_catalog_snapshot, PlannerCatalogSnapshot};
 use crate::sql::read_views::{
@@ -261,6 +261,7 @@ pub(crate) async fn rewrite_query_with_backend_and_params_and_catalog(
     catalog_snapshot: &PlannerCatalogSnapshot,
 ) -> Result<Query, LixError> {
     let mut context = AnalysisContext::from_query(&query);
+    let enforce_materialized_state_semantics = context.references_any_logical_read_view();
 
     for phase in PHASE_ORDER {
         run_phase_with_backend(
@@ -270,11 +271,12 @@ pub(crate) async fn rewrite_query_with_backend_and_params_and_catalog(
             params,
             &mut context,
             catalog_snapshot,
+            enforce_materialized_state_semantics,
         )
         .await?;
     }
 
-    validate_final_read_query(&query)?;
+    validate_final_read_query_with_options(&query, enforce_materialized_state_semantics)?;
     Ok(query)
 }
 
@@ -292,6 +294,7 @@ async fn run_phase_with_backend(
     params: &[Value],
     context: &mut AnalysisContext,
     catalog_snapshot: &PlannerCatalogSnapshot,
+    enforce_materialized_state_semantics: bool,
 ) -> Result<(), LixError> {
     for _ in 0..MAX_PASSES_PER_PHASE {
         let changed = apply_rules_for_phase_with_backend(
@@ -305,7 +308,7 @@ async fn run_phase_with_backend(
         .await?;
 
         context.refresh_from_query(query);
-        validate_phase_invariants_for_planner(phase, query)?;
+        validate_phase_invariants_for_planner(phase, query, enforce_materialized_state_semantics)?;
         if !changed {
             return Ok(());
         }
@@ -354,11 +357,12 @@ async fn apply_rules_for_phase_with_backend(
 fn validate_phase_invariants_for_planner(
     phase: RewritePhase,
     query: &Query,
+    enforce_materialized_state_semantics: bool,
 ) -> Result<(), LixError> {
     match phase {
         RewritePhase::Analyze => Ok(()),
         RewritePhase::Canonicalize | RewritePhase::Optimize | RewritePhase::Lower => {
-            validate_final_read_query(query)
+            validate_final_read_query_with_options(query, enforce_materialized_state_semantics)
         }
     }
 }

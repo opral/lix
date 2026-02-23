@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use sqlparser::ast::{ObjectNamePart, SetExpr, Statement, TableFactor};
 
 use super::super::super::*;
 use super::super::execute_prepared_with_transaction;
@@ -6,7 +7,8 @@ use crate::sql::{
     compile_statement_with_state, load_planner_catalog_snapshot,
     load_effective_scope_update_rows_for_postprocess,
     parse_sql_statements_with_dialect, prepare_statement_block_with_transaction_flag,
-    PlaceholderState, PlannerCatalogSnapshot, StatementBlock,
+    FileReadMaterializationScope, PlaceholderState, PlannerCatalogSnapshot, StatementBlock,
+    visit_query_selects, visit_table_factors_in_select,
 };
 
 impl Engine {
@@ -135,6 +137,7 @@ impl Engine {
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<(QueryResult, PlaceholderState), LixError> {
         let writer_key = options.writer_key.as_deref();
+        let statement_placeholder_state = placeholder_state;
         let statement_list = std::slice::from_ref(&statement);
         let read_only_query = is_query_only_statements(statement_list);
         let should_refresh_file_cache =
@@ -147,6 +150,23 @@ impl Engine {
                 self.maybe_refresh_working_change_projection_for_read_query(
                     &backend,
                     active_version_id.as_str(),
+                )
+                .await?;
+            }
+            if let Some(scope) = vtable_insert_select_source_file_materialization_scope(&statement)
+            {
+                let versions = match scope {
+                    FileReadMaterializationScope::ActiveVersionOnly => {
+                        let mut set = BTreeSet::new();
+                        set.insert(active_version_id.clone());
+                        Some(set)
+                    }
+                    FileReadMaterializationScope::AllVersions => None,
+                };
+                crate::plugin::runtime::materialize_missing_file_data_with_plugins(
+                    &backend,
+                    self.wasm_runtime.as_ref(),
+                    versions.as_ref(),
                 )
                 .await?;
             }
@@ -180,15 +200,12 @@ impl Engine {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }
             if !output.update_validations.is_empty() {
-                let validation_params = single_prepared_statement_params(
-                    &output.prepared_statements,
-                    "update validation",
-                )?;
                 validate_updates(
                     &backend,
                     &self.schema_cache,
                     &output.update_validations,
-                    validation_params,
+                    params,
+                    statement_placeholder_state,
                 )
                 .await?;
             }
@@ -251,6 +268,21 @@ impl Engine {
                     detected_file_domain_changes = collected_detected_file_domain_changes;
                     untracked_filesystem_update_domain_changes =
                         collected_untracked_filesystem_update_domain_changes;
+                    let validation_untracked_changes = {
+                        let backend = TransactionBackendAdapter::new(transaction);
+                        self.collect_untracked_filesystem_update_domain_changes_from_update_validations(
+                            &backend,
+                            &output.update_validations,
+                            params,
+                            statement_placeholder_state,
+                            writer_key,
+                        )
+                        .await?
+                    };
+                    untracked_filesystem_update_domain_changes.extend(validation_untracked_changes);
+                    untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
+                        &untracked_filesystem_update_domain_changes,
+                    );
                 }
                 result
             }
@@ -259,15 +291,14 @@ impl Engine {
                     execute_prepared_with_transaction(transaction, &output.prepared_statements)
                         .await?;
                 let postprocess_rows = match &postprocess_plan {
-                    PostprocessPlan::VtableUpdate(plan) if result.rows.is_empty() => {
-                        let update_params = single_prepared_statement_params(
-                            &output.prepared_statements,
-                            "update effective scope fallback",
-                        )?;
+                    PostprocessPlan::VtableUpdate(plan)
+                        if plan.effective_scope_fallback && result.rows.is_empty() =>
+                    {
                         load_effective_scope_update_rows_for_postprocess(
                             transaction,
                             plan,
-                            update_params,
+                            params,
+                            statement_placeholder_state,
                         )
                         .await?
                     }
@@ -455,15 +486,12 @@ impl Engine {
                         .await?
                     }
                     PostprocessPlan::VtableDelete(plan) => {
-                        let followup_params = single_prepared_statement_params(
-                            &output.prepared_statements,
-                            "delete followup",
-                        )?;
                         build_delete_followup_sql(
                             transaction,
                             &plan,
                             &postprocess_rows,
-                            followup_params,
+                            params,
+                            statement_placeholder_state,
                             &detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
@@ -492,9 +520,22 @@ impl Engine {
         };
         let descriptor_cache_eviction_targets =
             file_descriptor_cache_eviction_targets(&output.mutations);
-        let mut file_cache_invalidation_targets = file_cache_refresh_targets;
-        file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
-        file_cache_invalidation_targets.extend(pending_file_delete_targets);
+        let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
+        file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets.clone());
+        file_cache_invalidation_targets.extend(pending_file_delete_targets.clone());
+        file_cache_invalidation_targets.extend(
+            pending_file_writes
+                .iter()
+                .map(|write| (write.file_id.clone(), write.version_id.clone())),
+        );
+        let mut file_path_cache_invalidation_targets = file_cache_refresh_targets;
+        file_path_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
+        file_path_cache_invalidation_targets.extend(pending_file_delete_targets);
+        file_path_cache_invalidation_targets.extend(
+            pending_file_writes
+                .iter()
+                .map(|write| (write.file_id.clone(), write.version_id.clone())),
+        );
         let should_run_binary_gc =
             should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
 
@@ -503,6 +544,7 @@ impl Engine {
                 self.persist_detected_file_domain_changes_in_transaction(
                     transaction,
                     &detected_file_domain_changes,
+                    functions.clone(),
                 )
                 .await?;
             }
@@ -510,6 +552,7 @@ impl Engine {
                 self.persist_untracked_file_domain_changes_in_transaction(
                     transaction,
                     &untracked_filesystem_update_domain_changes,
+                    functions.clone(),
                 )
                 .await?;
             }
@@ -539,7 +582,7 @@ impl Engine {
             .await?;
             self.invalidate_file_path_cache_entries_in_transaction(
                 transaction,
-                &file_cache_invalidation_targets,
+                &file_path_cache_invalidation_targets,
             )
             .await?;
         }
@@ -556,17 +599,49 @@ impl Engine {
     }
 }
 
-fn single_prepared_statement_params<'a>(
-    prepared_statements: &'a [crate::sql::PreparedStatement],
-    context: &str,
-) -> Result<&'a [Value], LixError> {
-    if prepared_statements.len() != 1 {
-        return Err(LixError {
-            message: format!(
-                "{context} requires exactly one prepared statement, got {}",
-                prepared_statements.len()
-            ),
-        });
+fn vtable_insert_select_source_file_materialization_scope(
+    statement: &Statement,
+) -> Option<FileReadMaterializationScope> {
+    let Statement::Insert(insert) = statement else {
+        return None;
+    };
+    let sqlparser::ast::TableObject::TableName(table_name) = &insert.table else {
+        return None;
+    };
+    if !crate::sql::object_name_matches(table_name, "lix_internal_state_vtable") {
+        return None;
     }
-    Ok(prepared_statements[0].params.as_slice())
+
+    let source = insert.source.as_ref()?;
+    if matches!(source.body.as_ref(), SetExpr::Values(_)) {
+        return None;
+    }
+
+    let mut mentions_file = false;
+    let mut mentions_file_by_version = false;
+    let _ = visit_query_selects(source, &mut |select| {
+        visit_table_factors_in_select(select, &mut |relation| {
+            let TableFactor::Table { name, .. } = relation else {
+                return Ok(());
+            };
+            let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) else {
+                return Ok(());
+            };
+            let relation_name = identifier.value.to_ascii_lowercase();
+            if relation_name == "lix_file_by_version" {
+                mentions_file_by_version = true;
+            } else if relation_name == "lix_file" {
+                mentions_file = true;
+            }
+            Ok(())
+        })
+    });
+
+    if mentions_file_by_version {
+        Some(FileReadMaterializationScope::AllVersions)
+    } else if mentions_file {
+        Some(FileReadMaterializationScope::ActiveVersionOnly)
+    } else {
+        None
+    }
 }

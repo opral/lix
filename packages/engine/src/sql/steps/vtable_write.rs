@@ -539,9 +539,10 @@ pub async fn load_effective_scope_update_rows_for_postprocess(
     transaction: &mut dyn LixTransaction,
     plan: &VtableUpdatePlan,
     params: &[EngineValue],
+    placeholder_state: PlaceholderState,
 ) -> Result<Vec<Vec<EngineValue>>, LixError> {
     let mut executor = TransactionExecutor { transaction };
-    load_effective_scope_update_rows(&mut executor, plan, params).await
+    load_effective_scope_update_rows(&mut executor, plan, params, placeholder_state).await
 }
 
 pub async fn build_delete_followup_sql(
@@ -549,6 +550,7 @@ pub async fn build_delete_followup_sql(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     params: &[EngineValue],
+    placeholder_state: PlaceholderState,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -559,6 +561,7 @@ pub async fn build_delete_followup_sql(
         plan,
         rows,
         params,
+        placeholder_state,
         detected_file_domain_changes,
         writer_key,
         functions,
@@ -1521,6 +1524,7 @@ async fn build_delete_followup_statements(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     params: &[EngineValue],
+    placeholder_state: PlaceholderState,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -1567,7 +1571,9 @@ async fn build_delete_followup_statements(
     }
 
     if plan.effective_scope_fallback {
-        for fallback_row in load_effective_scope_delete_rows(executor, plan, params).await? {
+        for fallback_row in
+            load_effective_scope_delete_rows(executor, plan, params, placeholder_state).await?
+        {
             let key = (
                 fallback_row.entity_id.clone(),
                 fallback_row.file_id.clone(),
@@ -1675,10 +1681,12 @@ async fn load_effective_scope_delete_rows(
     executor: &mut dyn SqlExecutor,
     plan: &VtableDeletePlan,
     params: &[EngineValue],
+    placeholder_state: PlaceholderState,
 ) -> Result<Vec<EffectiveScopeDeleteRow>, LixError> {
     let Some(selection_sql) = plan.effective_scope_selection_sql.as_deref() else {
         return Ok(Vec::new());
     };
+    let selection_sql = lower_effective_scope_selection_sql(selection_sql, executor.dialect())?;
 
     let schema_table = quote_ident(&format!("{MATERIALIZED_PREFIX}{}", plan.schema_key));
     let descriptor_table = quote_ident(&format!(
@@ -1744,12 +1752,21 @@ async fn load_effective_scope_delete_rows(
          WHERE rn = 1 \
            AND snapshot_content IS NOT NULL \
            AND ({selection_sql}) \
+           AND NOT EXISTS ( \
+             SELECT 1 \
+             FROM {untracked_table} u \
+             WHERE u.schema_key = '{schema_key}' \
+               AND u.entity_id = ranked.entity_id \
+               AND u.file_id = ranked.file_id \
+               AND u.version_id = ranked.version_id \
+           ) \
            AND untracked = 0",
         descriptor_table = descriptor_table,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         schema_table = schema_table,
+        untracked_table = UNTRACKED_TABLE,
         schema_key = escape_sql_string(&plan.schema_key),
         descriptor_id_expr = json_text_expr_sql("snapshot_content", "id", executor.dialect()),
         descriptor_parent_expr = json_text_expr_sql(
@@ -1758,7 +1775,7 @@ async fn load_effective_scope_delete_rows(
             executor.dialect(),
         ),
     );
-    let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
+    let bound = bind_sql_with_state(&sql, params, executor.dialect(), placeholder_state)?;
     let result = executor.execute(&bound.sql, &bound.params).await?;
 
     let mut resolved = Vec::with_capacity(result.rows.len());
@@ -1784,6 +1801,7 @@ async fn load_effective_scope_update_rows(
     executor: &mut dyn SqlExecutor,
     plan: &VtableUpdatePlan,
     params: &[EngineValue],
+    placeholder_state: PlaceholderState,
 ) -> Result<Vec<Vec<EngineValue>>, LixError> {
     if !plan.effective_scope_fallback {
         return Ok(Vec::new());
@@ -1791,6 +1809,7 @@ async fn load_effective_scope_update_rows(
     let Some(selection_sql) = plan.effective_scope_selection_sql.as_deref() else {
         return Ok(Vec::new());
     };
+    let selection_sql = lower_effective_scope_selection_sql(selection_sql, executor.dialect())?;
 
     let schema_table = quote_ident(&format!("{MATERIALIZED_PREFIX}{}", plan.schema_key));
     let descriptor_table = quote_ident(&format!(
@@ -1867,12 +1886,21 @@ async fn load_effective_scope_update_rows(
          WHERE rn = 1 \
            AND snapshot_content IS NOT NULL \
            AND ({selection_sql}) \
+           AND NOT EXISTS ( \
+             SELECT 1 \
+             FROM {untracked_table} u \
+             WHERE u.schema_key = '{schema_key}' \
+               AND u.entity_id = ranked.entity_id \
+               AND u.file_id = ranked.file_id \
+               AND u.version_id = ranked.version_id \
+           ) \
            AND untracked = 0",
         descriptor_table = descriptor_table,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         schema_table = schema_table,
+        untracked_table = UNTRACKED_TABLE,
         schema_key = escape_sql_string(&plan.schema_key),
         descriptor_id_expr = json_text_expr_sql("snapshot_content", "id", executor.dialect()),
         descriptor_parent_expr = json_text_expr_sql(
@@ -1881,7 +1909,7 @@ async fn load_effective_scope_update_rows(
             executor.dialect(),
         ),
     );
-    let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
+    let bound = bind_sql_with_state(&sql, params, executor.dialect(), placeholder_state)?;
     let result = executor.execute(&bound.sql, &bound.params).await?;
 
     for row in &result.rows {
@@ -1892,6 +1920,36 @@ async fn load_effective_scope_update_rows(
         }
     }
     Ok(result.rows)
+}
+
+fn lower_effective_scope_selection_sql(
+    selection_sql: &str,
+    dialect: SqlDialect,
+) -> Result<String, LixError> {
+    let wrapper_sql = format!("SELECT {selection_sql}");
+    let mut statements = crate::sql::parse_sql_statements_with_dialect(&wrapper_sql, dialect)?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            message: "effective scope selection lowering expected a single statement".to_string(),
+        });
+    }
+    let lowered = crate::sql::lower_statement(statements.remove(0), dialect)?;
+    let Statement::Query(query) = lowered else {
+        return Err(LixError {
+            message: "effective scope selection lowering expected query statement".to_string(),
+        });
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(LixError {
+            message: "effective scope selection lowering expected SELECT body".to_string(),
+        });
+    };
+    let Some(SelectItem::UnnamedExpr(expr)) = select.projection.first() else {
+        return Err(LixError {
+            message: "effective scope selection lowering expected expression projection".to_string(),
+        });
+    };
+    Ok(expr.to_string())
 }
 
 async fn load_cascaded_file_delete_changes(

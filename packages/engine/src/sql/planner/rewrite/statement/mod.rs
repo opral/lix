@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value as SqlValue};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Query, SetExpr, Statement, Value as SqlValue, Visit, Visitor,
+};
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::planner::catalog::PlannerCatalogSnapshot;
@@ -34,6 +37,7 @@ where
     let logical_plan = match statement {
         Statement::Query(query) => {
             let source_semantics = read_semantics_for_query(&query);
+            let source_requirements = read_maintenance_requirements_for_query(&query);
             let semantics = LogicalStatementSemantics::QueryRead(source_semantics.clone());
             let rewritten = rewrite_query_with_backend_and_params_and_catalog(
                 backend,
@@ -42,9 +46,10 @@ where
                 catalog_snapshot,
             )
             .await?;
+            let rewritten_semantics = read_semantics_for_query(&rewritten);
             let requirements = merge_read_maintenance_requirements(
-                read_maintenance_requirements_for_semantics(&source_semantics),
-                read_maintenance_requirements_for_query(&rewritten),
+                source_requirements,
+                read_maintenance_requirements_for_semantics(&rewritten_semantics),
             );
             LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
@@ -67,6 +72,7 @@ where
             match *statement {
                 Statement::Query(query) => {
                     let source_semantics = read_semantics_for_query(&query);
+                    let source_requirements = read_maintenance_requirements_for_query(&query);
                     let semantics =
                         LogicalStatementSemantics::ExplainRead(source_semantics.clone());
                     let rewritten = rewrite_query_with_backend_and_params_and_catalog(
@@ -76,9 +82,10 @@ where
                         catalog_snapshot,
                     )
                     .await?;
+                    let rewritten_semantics = read_semantics_for_query(&rewritten);
                     let requirements = merge_read_maintenance_requirements(
-                        read_maintenance_requirements_for_semantics(&source_semantics),
-                        read_maintenance_requirements_for_query(&rewritten),
+                        source_requirements,
+                        read_maintenance_requirements_for_semantics(&rewritten_semantics),
                     );
                     let explain_statement = Statement::Explain {
                         describe_alias,
@@ -247,6 +254,16 @@ fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {
             "lix_file_history" => {
                 operators.insert(LogicalReadOperator::FileHistory);
             }
+            _ if relation.starts_with("lix_")
+                && relation.ends_with("_history")
+                && relation != "lix_directory_history"
+                && relation != "lix_file_history"
+                && relation != "lix_state_history" =>
+            {
+                // Entity history views (e.g. lix_key_value_history) lower through
+                // lix_state_history and require timeline maintenance before execution.
+                operators.insert(LogicalReadOperator::StateHistory);
+            }
             _ => {}
         }
     }
@@ -254,7 +271,12 @@ fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {
 }
 
 fn read_maintenance_requirements_for_query(query: &Query) -> ReadMaintenanceRequirements {
-    read_maintenance_requirements_for_semantics(&read_semantics_for_query(query))
+    let semantics = read_semantics_for_query(query);
+    let mut requirements = read_maintenance_requirements_for_semantics(&semantics);
+    if requirements.requires_history_timeline_materialization {
+        requirements.history_roots = collect_history_root_commit_literals(query);
+    }
+    requirements
 }
 
 fn read_maintenance_requirements_for_semantics(
@@ -280,6 +302,79 @@ fn read_maintenance_requirements_for_semantics(
     }
 
     requirements
+}
+
+fn collect_history_root_commit_literals(query: &Query) -> BTreeSet<String> {
+    let mut collector = HistoryRootCommitLiteralCollector::default();
+    let _ = query.visit(&mut collector);
+    collector.roots
+}
+
+#[derive(Default)]
+struct HistoryRootCommitLiteralCollector {
+    roots: BTreeSet<String>,
+}
+
+impl Visitor for HistoryRootCommitLiteralCollector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        match expr {
+            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
+                if is_history_root_commit_column(left) {
+                    if let Some(root) = extract_string_literal(right) {
+                        self.roots.insert(root);
+                    }
+                } else if is_history_root_commit_column(right) {
+                    if let Some(root) = extract_string_literal(left) {
+                        self.roots.insert(root);
+                    }
+                }
+            }
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } if is_history_root_commit_column(expr) => {
+                for candidate in list {
+                    if let Some(root) = extract_string_literal(candidate) {
+                        self.roots.insert(root);
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn is_history_root_commit_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(ident) => is_history_root_commit_column_name(&ident.value),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|ident| is_history_root_commit_column_name(&ident.value))
+            .unwrap_or(false),
+        Expr::Nested(inner) => is_history_root_commit_column(inner),
+        _ => false,
+    }
+}
+
+fn is_history_root_commit_column_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("root_commit_id")
+        || name.eq_ignore_ascii_case("lixcol_root_commit_id")
+}
+
+fn extract_string_literal(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::SingleQuotedString(value) => Some(value.clone()),
+            SqlValue::DoubleQuotedString(value) => Some(value.clone()),
+            _ => None,
+        },
+        Expr::Nested(inner) => extract_string_literal(inner),
+        _ => None,
+    }
 }
 
 fn merge_read_maintenance_requirements(

@@ -428,24 +428,31 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                   AND bp.snapshot_id != 'no-content' \
                   AND s.content IS NOT NULL\
              ), \
-             content_only_roots AS (\
+             content_history_slices AS (\
                 SELECT \
                     ranked.id, \
                     ranked.lixcol_root_commit_id, \
                     ranked.lixcol_commit_id, \
-                    ranked.lixcol_change_id \
+                    ranked.lixcol_change_id, \
+                    ranked.lixcol_depth, \
+                    ranked.has_root_projection \
                 FROM (\
                     SELECT \
                         sh.file_id AS id, \
                         sh.root_commit_id AS lixcol_root_commit_id, \
                         sh.commit_id AS lixcol_commit_id, \
                         sh.change_id AS lixcol_change_id, \
+                        sh.depth AS lixcol_depth, \
+                        MAX(CASE WHEN sh.entity_id = '' THEN 1 ELSE 0 END) OVER (\
+                            PARTITION BY sh.file_id, sh.root_commit_id, sh.depth\
+                        ) AS has_root_projection, \
                         ROW_NUMBER() OVER (\
-                            PARTITION BY sh.file_id, sh.root_commit_id \
+                            PARTITION BY sh.file_id, sh.root_commit_id, sh.depth \
                             ORDER BY ic.created_at DESC, sh.change_id DESC\
                         ) AS row_num \
                     FROM (\
                         SELECT \
+                            bp.entity_id AS entity_id, \
                             bp.file_id AS file_id, \
                             bp.root_commit_id AS root_commit_id, \
                             ancestry.ancestor_id AS commit_id, \
@@ -460,8 +467,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     ) sh \
                     JOIN lix_internal_change ic \
                       ON ic.id = sh.change_id \
-                    WHERE sh.depth = 0 \
-                      AND sh.file_id IS NOT NULL \
+                    WHERE sh.file_id IS NOT NULL \
                       AND sh.file_id != 'lix' \
                       AND sh.schema_key != 'lix_file_descriptor' \
                       AND sh.snapshot_id != 'no-content'\
@@ -476,9 +482,19 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     d.extension, \
                     d.metadata, \
                     d.hidden, \
-                    c.id AS lixcol_entity_id, \
+                    d.lixcol_entity_id, \
                     d.lixcol_schema_key, \
-                    c.id AS lixcol_file_id, \
+                    CASE \
+                        WHEN c.lixcol_depth = 0 \
+                             AND NOT EXISTS (\
+                                 SELECT 1 \
+                                 FROM content_history_slices older \
+                                 WHERE older.id = c.id \
+                                   AND older.lixcol_root_commit_id = c.lixcol_root_commit_id \
+                                   AND older.lixcol_depth > 0\
+                             ) THEN d.lixcol_file_id \
+                        ELSE c.id \
+                    END AS lixcol_file_id, \
                     d.lixcol_version_id, \
                     d.lixcol_plugin_key, \
                     d.lixcol_schema_version, \
@@ -486,8 +502,8 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     d.lixcol_metadata, \
                     c.lixcol_commit_id, \
                     c.lixcol_root_commit_id, \
-                    0 AS lixcol_depth \
-                FROM content_only_roots c \
+                    c.lixcol_depth AS lixcol_depth \
+                FROM content_history_slices c \
                 JOIN file_history_descriptor_rows d \
                   ON d.id = c.id \
                  AND d.lixcol_root_commit_id = c.lixcol_root_commit_id \
@@ -495,7 +511,8 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                       SELECT MIN(candidate.lixcol_depth) \
                       FROM file_history_descriptor_rows candidate \
                       WHERE candidate.id = c.id \
-                        AND candidate.lixcol_root_commit_id = c.lixcol_root_commit_id\
+                        AND candidate.lixcol_root_commit_id = c.lixcol_root_commit_id \
+                        AND candidate.lixcol_depth >= c.lixcol_depth\
                  )\
              ), \
              content_history_rows_fallback AS (\
@@ -516,14 +533,42 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     fbv.lixcol_metadata, \
                     c.lixcol_commit_id, \
                     c.lixcol_root_commit_id, \
-                    0 AS lixcol_depth \
-                FROM content_only_roots c \
+                    c.lixcol_depth AS lixcol_depth \
+                FROM content_history_slices c \
                 JOIN lix_file_by_version fbv \
                   ON fbv.id = c.id \
-                 AND fbv.lixcol_commit_id = c.lixcol_commit_id\
+                 AND fbv.lixcol_commit_id = c.lixcol_commit_id \
+                WHERE NOT EXISTS (\
+                    SELECT 1 \
+                    FROM file_history_descriptor_rows d \
+                    WHERE d.id = c.id \
+                      AND d.lixcol_root_commit_id = c.lixcol_root_commit_id\
+                )\
              ), \
              file_history_rows AS (\
-                SELECT * FROM file_history_descriptor_rows \
+                SELECT * \
+                FROM file_history_descriptor_rows d \
+                WHERE NOT EXISTS (\
+                    SELECT 1 \
+                    FROM content_history_slices c \
+                    WHERE c.id = d.id \
+                      AND c.lixcol_root_commit_id = d.lixcol_root_commit_id \
+                      AND c.lixcol_depth = d.lixcol_depth\
+                ) \
+                  AND (\
+                    NOT EXISTS (\
+                        SELECT 1 \
+                        FROM content_history_slices c \
+                        WHERE c.id = d.id \
+                          AND c.lixcol_root_commit_id = d.lixcol_root_commit_id\
+                    ) \
+                    OR d.lixcol_depth <= (\
+                        SELECT MAX(c.lixcol_depth) \
+                        FROM content_history_slices c \
+                        WHERE c.id = d.id \
+                          AND c.lixcol_root_commit_id = d.lixcol_root_commit_id\
+                    )\
+                  ) \
                 UNION ALL \
                 SELECT * FROM content_history_rows \
                 UNION ALL \
@@ -603,7 +648,13 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              LEFT JOIN lix_internal_file_history_data_cache fd \
                ON fd.file_id = f.id \
               AND fd.root_commit_id = f.lixcol_root_commit_id \
-              AND fd.depth = f.lixcol_depth"
+              AND fd.depth = (\
+                  SELECT MIN(candidate.depth) \
+                  FROM lix_internal_file_history_data_cache candidate \
+                  WHERE candidate.file_id = f.id \
+                    AND candidate.root_commit_id = f.lixcol_root_commit_id \
+                    AND candidate.depth >= f.lixcol_raw_depth\
+              )"
             .to_string(),
         DIRECTORY_VIEW => format!(
             "WITH RECURSIVE directory_descriptor_rows AS (\

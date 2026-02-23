@@ -37,7 +37,7 @@ pub(crate) use escaping::escape_sql_string;
 pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
     bind_sql, bind_sql_with_state, bind_statement, bind_statement_with_state_and_appended_params,
-    PlaceholderState,
+    normalize_statement_placeholders_with_state, PlaceholderState,
 };
 pub(crate) use planner::rewrite::query::rewrite_query_with_backend as rewrite_read_query_with_backend;
 pub(crate) use planner::rewrite::query::rewrite_query_with_backend_and_params as rewrite_read_query_with_backend_and_params;

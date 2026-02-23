@@ -283,13 +283,19 @@ async fn create_checkpoint_in_transaction(
     .await?;
 
     tx.execute(
-        "UPDATE lix_version \
-         SET commit_id = $1, working_commit_id = $2 \
-         WHERE id = $3",
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES ($1, 'lix_version_pointer', 'lix', 'global', 'lix', $2, '1')",
         &[
-            Value::Text(working_commit_id.clone()),
-            Value::Text(new_working_commit_id),
-            Value::Text(version_id),
+            Value::Text(version_id.clone()),
+            Value::Text(
+                serde_json::json!({
+                    "id": version_id,
+                    "commit_id": working_commit_id.clone(),
+                    "working_commit_id": new_working_commit_id,
+                })
+                .to_string(),
+            ),
         ],
     )
     .await?;
@@ -515,7 +521,7 @@ async fn ensure_change_exists_for_checkpoint(
     change_id: &str,
 ) -> Result<(), LixError> {
     let existing = tx
-        .execute_internal(
+        .execute_raw_internal(
             "SELECT 1 \
              FROM lix_internal_state_materialized_v1_lix_change \
              WHERE entity_id = $1 \
@@ -523,6 +529,7 @@ async fn ensure_change_exists_for_checkpoint(
                AND file_id = 'lix' \
                AND version_id = 'global' \
                AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
              LIMIT 1",
             &[Value::Text(change_id.to_string())],
         )
@@ -602,22 +609,39 @@ async fn ensure_change_exists_for_checkpoint(
     );
     change_snapshot.insert(
         "created_at".to_string(),
-        serde_json::Value::String(created_at),
+        serde_json::Value::String(created_at.clone()),
     );
     if let Some(snapshot_content) = snapshot_content {
         change_snapshot.insert("snapshot_content".to_string(), snapshot_content);
     }
-    if let Some(metadata) = metadata {
-        change_snapshot.insert("metadata".to_string(), metadata);
+    if let Some(metadata_value) = metadata.clone() {
+        change_snapshot.insert("metadata".to_string(), metadata_value);
     }
 
-    tx.execute(
-        "INSERT INTO lix_state_by_version (\
-         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-         ) VALUES ($1, 'lix_change', 'lix', 'global', 'lix', $2, '1')",
+    tx.execute_raw_internal(
+        "INSERT INTO lix_internal_state_materialized_v1_lix_change (\
+         entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, inherited_from_version_id, \
+         change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+         ) VALUES ($1, 'lix_change', '1', 'lix', 'global', 'lix', $2, NULL, $3, $4, NULL, 0, $5, $5) \
+         ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
+           schema_key = EXCLUDED.schema_key, \
+           schema_version = EXCLUDED.schema_version, \
+           plugin_key = EXCLUDED.plugin_key, \
+           snapshot_content = EXCLUDED.snapshot_content, \
+           inherited_from_version_id = EXCLUDED.inherited_from_version_id, \
+           change_id = EXCLUDED.change_id, \
+           metadata = EXCLUDED.metadata, \
+           writer_key = EXCLUDED.writer_key, \
+           is_tombstone = EXCLUDED.is_tombstone, \
+           updated_at = EXCLUDED.updated_at",
         &[
-            Value::Text(id),
+            Value::Text(id.clone()),
             Value::Text(serde_json::Value::Object(change_snapshot).to_string()),
+            Value::Text(id),
+            metadata
+                .map(|value| Value::Text(value.to_string()))
+                .unwrap_or(Value::Null),
+            Value::Text(created_at),
         ],
     )
     .await?;

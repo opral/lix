@@ -3,7 +3,10 @@ use sqlparser::ast::Statement;
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::{materialize_vtable_insert_select_sources, PlaceholderState};
+use crate::sql::{
+    materialize_vtable_insert_select_sources, normalize_statement_placeholders_with_state,
+    PlaceholderState,
+};
 use crate::{LixBackend, LixError, Value};
 
 use super::catalog::PlannerCatalogSnapshot;
@@ -55,6 +58,14 @@ async fn compile_statement_plan_with_state<P: LixFunctionProvider>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
+    let mut statement = statement;
+    let next_placeholder_state = normalize_statement_placeholders_with_state(
+        &mut statement,
+        params.len(),
+        backend.dialect(),
+        initial_placeholder_state,
+    )?;
+
     let mut statements = vec![statement];
     materialize_vtable_insert_select_sources(backend, &mut statements, params).await?;
     apply_vtable_insert_defaults(
@@ -85,7 +96,7 @@ where
         PostprocessSingleStatementContext::CompilePlan,
     )?;
 
-    let (prepared_statements, next_placeholder_state) = emit_physical_statement_plan_with_state(
+    let (prepared_statements, _) = emit_physical_statement_plan_with_state(
         &logical_plan,
         params,
         backend.dialect(),

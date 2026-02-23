@@ -37,11 +37,71 @@ pub fn parse_sql_statements_with_dialect(
         }
         SqlDialect::Postgres => {
             let dialect = PostgreSqlDialect {};
-            Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
-                message: err.to_string(),
-            })
+            match Parser::parse_sql(&dialect, sql) {
+                Ok(statements) => Ok(statements),
+                Err(primary_error) if contains_sqlite_placeholders(sql) => {
+                    let sqlite_dialect = SQLiteDialect {};
+                    Parser::parse_sql(&sqlite_dialect, sql).map_err(|_| LixError {
+                        message: primary_error.to_string(),
+                    })
+                }
+                Err(primary_error) => Err(LixError {
+                    message: primary_error.to_string(),
+                }),
+            }
         }
     }
+}
+
+fn contains_sqlite_placeholders(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_single_quote {
+            if byte == b'\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                    index += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    index += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if byte == b'\'' {
+            in_single_quote = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_double_quote = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'?' {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -136,7 +196,14 @@ where
     let mut placeholder_state = initial_placeholder_state;
     let planner_catalog_snapshot = PlannerCatalogSnapshot::default();
 
-    for (statement_index, statement) in statements.into_iter().enumerate() {
+    for (statement_index, mut statement) in statements.into_iter().enumerate() {
+        let next_placeholder_state = crate::sql::params::normalize_statement_placeholders_with_state(
+            &mut statement,
+            params.len(),
+            backend.dialect(),
+            placeholder_state,
+        )?;
+
         let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
             .get(statement_index)
             .map(Vec::as_slice)
@@ -161,7 +228,7 @@ where
             has_postprocess = true;
         }
 
-        let (statement_prepared, next_placeholder_state) = emit_physical_statement_plan_with_state(
+        let (statement_prepared, _) = emit_physical_statement_plan_with_state(
             &logical_plan,
             params,
             backend.dialect(),
@@ -538,6 +605,17 @@ mod tests {
             !error.message.is_empty(),
             "parser error message should include context"
         );
+    }
+
+    #[test]
+    fn dialect_aware_parser_accepts_sqlite_anonymous_placeholders_for_postgres() {
+        let statements = parse_sql_statements_with_dialect(
+            "SELECT ?; SELECT ?",
+            SqlDialect::Postgres,
+        )
+        .expect("postgres parser should fallback to sqlite placeholders");
+
+        assert_eq!(statements.len(), 2);
     }
 
     #[test]

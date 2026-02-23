@@ -18,6 +18,13 @@ impl Engine {
         )
         .await?;
         self.invalidate_installed_plugins_cache()?;
+        let loaded_plugins = self
+            .load_installed_plugins_with_backend(self.backend.as_ref(), false)
+            .await?;
+        let mut cache_guard = self.installed_plugins_cache.write().map_err(|_| LixError {
+            message: "installed plugin cache lock poisoned".to_string(),
+        })?;
+        *cache_guard = Some(loaded_plugins);
         Ok(())
     }
 }
