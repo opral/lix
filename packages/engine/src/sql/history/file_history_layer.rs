@@ -288,6 +288,18 @@ mod tests {
         let sql = missing_file_history_cache_descriptor_selection_sql();
         assert!(sql.contains("FROM lix_file_history"));
         assert!(sql.contains("lix_internal_file_history_data_cache"));
+        assert!(sql.contains("lixcol_root_commit_id AS root_commit_id"));
+        assert!(sql.contains("lixcol_depth AS depth"));
+        assert!(sql.contains("lixcol_commit_id AS commit_id"));
+        assert!(sql.contains("ORDER BY lixcol_root_commit_id, lixcol_depth, id"));
+    }
+
+    #[test]
+    fn file_history_projection_sql_keeps_root_depth_cache_join_contract() {
+        let sql = super::file_history_projection_sql();
+        assert!(sql.contains("LEFT JOIN lix_internal_file_history_data_cache fd"));
+        assert!(sql.contains("fd.root_commit_id = f.lixcol_root_commit_id"));
+        assert!(sql.contains("fd.depth = f.lixcol_depth"));
     }
 
     #[test]
@@ -295,6 +307,7 @@ mod tests {
         let sql = plugin_history_state_changes_for_slice_sql();
         assert!(sql.contains("FROM lix_internal_commit_ancestry"));
         assert!(sql.contains("COALESCE(("));
+        assert!(sql.contains("root_commit_id = $3"));
         assert!(sql.contains("depth >= (SELECT raw_depth FROM target_commit_depth)"));
     }
 }

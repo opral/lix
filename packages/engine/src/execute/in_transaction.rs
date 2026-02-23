@@ -114,17 +114,6 @@ impl Engine {
                     }
                     Err(error) => return Err(error),
                 };
-            if output
-                .history_requirements
-                .requires_file_history_data_materialization
-                && !history_requirements.requires_file_history_data_materialization
-            {
-                crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
-                    &backend,
-                    self.wasm_runtime.as_ref(),
-                )
-                .await?;
-            }
             if !output.mutations.is_empty() {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }

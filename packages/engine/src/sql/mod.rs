@@ -15,7 +15,6 @@ mod types;
 
 pub(crate) use analysis::{
     active_version_from_mutations, active_version_from_update_validations,
-    file_history_read_materialization_required_for_statements,
     file_read_materialization_scope_for_statements, is_query_only_statements,
     should_invalidate_installed_plugins_cache_for_sql,
     should_invalidate_installed_plugins_cache_for_statements,
@@ -34,6 +33,7 @@ pub(crate) use ast_utils::{
     RewriteDecision,
 };
 pub(crate) use escaping::escape_sql_string;
+pub(crate) use history::directory_history_layer::directory_history_projection_sql;
 pub(crate) use history::file_history_layer::{
     file_history_projection_sql, missing_file_history_cache_descriptor_selection_sql,
     plugin_history_state_changes_for_slice_sql,
@@ -41,7 +41,6 @@ pub(crate) use history::file_history_layer::{
 pub(crate) use history::maintenance::ensure_history_timelines_materialized_for_requirements;
 pub(crate) use history::requests::resolve_requested_root_commits_from_predicates;
 pub(crate) use history::requirements::{
-    collect_history_requirements_for_statements,
     collect_history_requirements_for_statements_with_backend, HistoryRequirements,
 };
 pub(crate) use lowering::lower_statement;

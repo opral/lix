@@ -25,7 +25,6 @@ use crate::sql::{
     build_delete_followup_sql, build_update_followup_sql, coalesce_lix_file_transaction_statements,
     coalesce_vtable_inserts_in_statement_list, escape_sql_string,
     extract_explicit_transaction_script_from_statements,
-    file_history_read_materialization_required_for_statements,
     file_read_materialization_scope_for_statements, is_query_only_statements, parse_sql_statements,
     preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
     should_invalidate_installed_plugins_cache_for_sql,

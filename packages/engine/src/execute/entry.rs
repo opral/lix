@@ -173,17 +173,6 @@ impl Engine {
                 }
                 Err(error) => return Err(error),
             };
-        if output
-            .history_requirements
-            .requires_file_history_data_materialization
-            && !history_requirements.requires_file_history_data_materialization
-        {
-            crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
-                self.backend.as_ref(),
-                self.wasm_runtime.as_ref(),
-            )
-            .await?;
-        }
         let state_commit_stream_changes =
             state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
         let next_active_version_id_from_mutations =

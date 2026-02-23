@@ -31,9 +31,7 @@ impl Engine {
             )
             .await?;
         }
-        if history_requirements.requires_file_history_data_materialization
-            || file_history_read_materialization_required_for_statements(statements)
-        {
+        if history_requirements.requires_file_history_data_materialization {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
                 self.wasm_runtime.as_ref(),
