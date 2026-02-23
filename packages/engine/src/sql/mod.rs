@@ -34,6 +34,8 @@ pub(crate) use ast_utils::{
     RewriteDecision,
 };
 pub(crate) use escaping::escape_sql_string;
+pub(crate) use history::maintenance::ensure_history_timelines_materialized_for_requirements;
+pub(crate) use history::requests::resolve_requested_root_commits_from_predicates;
 pub(crate) use history::requirements::{
     collect_history_requirements_for_statements,
     collect_history_requirements_for_statements_with_backend, HistoryRequirements,

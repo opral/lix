@@ -3,6 +3,8 @@ use std::collections::BTreeSet;
 use sqlparser::ast::{Query, Statement};
 
 use crate::sql::analysis::file_history_read_materialization_required_for_statements;
+use crate::sql::entity_views::read as entity_view_read;
+use crate::sql::steps::filesystem_step;
 use crate::sql::steps::lix_state_history_view_read;
 use crate::{LixBackend, LixError, Value};
 
@@ -27,7 +29,8 @@ pub(crate) fn collect_history_requirements_for_statements(
     statements: &[Statement],
 ) -> HistoryRequirements {
     HistoryRequirements {
-        requires_file_history_data_materialization: file_history_read_materialization_required_for_statements(statements),
+        requires_file_history_data_materialization:
+            file_history_read_materialization_required_for_statements(statements),
         ..HistoryRequirements::default()
     }
 }
@@ -40,9 +43,13 @@ pub(crate) async fn collect_history_requirements_for_statements_with_backend(
     let mut requirements = collect_history_requirements_for_statements(statements);
     for statement in statements {
         if let Some(query) = query_from_statement(statement) {
+            let history_query =
+                rewrite_query_for_history_requirements(backend, query, params).await?;
             let state_requirements =
                 lix_state_history_view_read::collect_history_requirements_with_backend(
-                    backend, query, params,
+                    backend,
+                    &history_query,
+                    params,
                 )
                 .await?;
             for state_requirement in state_requirements {
@@ -64,6 +71,25 @@ fn query_from_statement(statement: &Statement) -> Option<&Query> {
         Statement::Insert(insert) => insert.source.as_deref(),
         _ => None,
     }
+}
+
+async fn rewrite_query_for_history_requirements(
+    backend: &dyn LixBackend,
+    query: &Query,
+    params: &[Value],
+) -> Result<Query, LixError> {
+    let filesystem_rewritten = if params.is_empty() {
+        filesystem_step::rewrite_query(query.clone())?
+    } else {
+        filesystem_step::rewrite_query_with_params(query.clone(), params)?
+    };
+    let mut current = filesystem_rewritten.unwrap_or_else(|| query.clone());
+    if let Some(entity_rewritten) =
+        entity_view_read::rewrite_query_with_backend(backend, current.clone()).await?
+    {
+        current = entity_rewritten;
+    }
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -113,7 +139,11 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
             Ok(QueryResult { rows: Vec::new() })
         }
 
@@ -157,8 +187,69 @@ mod tests {
                 .expect("collect requirements");
 
         assert_eq!(
-            requirements.requested_root_commit_ids.into_iter().collect::<Vec<_>>(),
+            requirements
+                .requested_root_commit_ids
+                .into_iter()
+                .collect::<Vec<_>>(),
             vec!["root-a".to_string(), "root-b".to_string()]
+        );
+        assert_eq!(requirements.required_max_depth, 512);
+        assert!(!requirements.requires_file_history_data_materialization);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_collection_resolves_file_history_roots_after_filesystem_rewrite() {
+        let backend = RequirementTestBackend {
+            roots: vec!["root-a".to_string()],
+        };
+        let statements = parse_sql_statements(
+            "SELECT id \
+             FROM lix_file_history \
+             WHERE root_commit_id = 'root-a' \
+               AND id = 'file-a'",
+        )
+        .expect("parse");
+
+        let requirements =
+            collect_history_requirements_for_statements_with_backend(&backend, &statements, &[])
+                .await
+                .expect("collect requirements");
+
+        assert_eq!(
+            requirements
+                .requested_root_commit_ids
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["root-a".to_string()]
+        );
+        assert_eq!(requirements.required_max_depth, 512);
+        assert!(requirements.requires_file_history_data_materialization);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_collection_resolves_entity_history_roots_after_entity_view_rewrite() {
+        let backend = RequirementTestBackend {
+            roots: vec!["root-a".to_string()],
+        };
+        let statements = parse_sql_statements(
+            "SELECT key \
+             FROM lix_key_value_history \
+             WHERE key = 'history-key' \
+               AND lixcol_root_commit_id = 'root-a'",
+        )
+        .expect("parse");
+
+        let requirements =
+            collect_history_requirements_for_statements_with_backend(&backend, &statements, &[])
+                .await
+                .expect("collect requirements");
+
+        assert_eq!(
+            requirements
+                .requested_root_commit_ids
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["root-a".to_string()]
         );
         assert_eq!(requirements.required_max_depth, 512);
         assert!(!requirements.requires_file_history_data_materialization);

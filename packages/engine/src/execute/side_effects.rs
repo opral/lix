@@ -10,6 +10,11 @@ impl Engine {
         active_version_id: &str,
         history_requirements: &crate::sql::HistoryRequirements,
     ) -> Result<(), LixError> {
+        crate::sql::ensure_history_timelines_materialized_for_requirements(
+            backend,
+            history_requirements,
+        )
+        .await?;
         if let Some(scope) = file_read_materialization_scope_for_statements(statements) {
             let versions = match scope {
                 FileReadMaterializationScope::ActiveVersionOnly => {
