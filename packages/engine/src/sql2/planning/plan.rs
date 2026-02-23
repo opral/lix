@@ -1,5 +1,3 @@
-use sqlparser::ast::Statement;
-
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::{
@@ -9,6 +7,7 @@ use crate::sql::{
 use crate::LixBackend;
 use crate::Value;
 
+use super::super::ast::nodes::Statement;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::planner_error::PlannerError;
 use super::super::type_bridge::from_sql_preprocess_output;

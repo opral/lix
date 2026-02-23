@@ -1,4 +1,10 @@
 use super::super::*;
+use super::ast::utils::parse_sql_statements;
+
+#[cfg(test)]
+use super::ast::nodes::Statement;
+#[cfg(test)]
+use super::ast::walk::contains_transaction_control_statement;
 
 impl Engine {
     #[cfg(test)]
@@ -62,12 +68,5 @@ pub(crate) fn should_sequentialize_postprocess_multi_statement_with_statements(
         return false;
     }
 
-    !statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::StartTransaction { .. }
-                | Statement::Commit { .. }
-                | Statement::Rollback { .. }
-        )
-    })
+    !contains_transaction_control_statement(statements)
 }

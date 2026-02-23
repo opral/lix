@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
-use sqlparser::ast::Expr;
 
 use crate::Value;
 
+use super::super::ast::nodes::Expr;
 use super::postprocess_actions::PostprocessPlan;
 use super::prepared_statement::PreparedStatement;
 

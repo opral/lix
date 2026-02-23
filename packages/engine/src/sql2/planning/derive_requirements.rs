@@ -1,10 +1,9 @@
-use sqlparser::ast::Statement;
-
 use crate::sql::{
     is_query_only_statements, should_invalidate_installed_plugins_cache_for_statements,
     should_refresh_file_cache_for_statements,
 };
 
+use super::super::ast::nodes::Statement;
 use super::super::contracts::requirements::PlanRequirements;
 
 pub(crate) fn derive_plan_requirements(statements: &[Statement]) -> PlanRequirements {
