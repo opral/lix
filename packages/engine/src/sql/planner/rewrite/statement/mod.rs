@@ -37,7 +37,7 @@ where
                 LogicalStatementOperation::QueryRead,
                 semantics,
                 vec![LogicalStatementStep::QueryRead],
-                vec![rewritten.to_string()],
+                vec![Statement::Query(Box::new(rewritten.clone()))],
             )
             .with_maintenance_requirements(read_maintenance_requirements_for_query(&rewritten))
         }
@@ -71,7 +71,7 @@ where
                         LogicalStatementOperation::ExplainRead,
                         semantics,
                         vec![LogicalStatementStep::ExplainRead],
-                        vec![explain_statement.to_string()],
+                        vec![explain_statement],
                     )
                     .with_maintenance_requirements(read_maintenance_requirements_for_query(
                         &rewritten,
@@ -92,7 +92,7 @@ where
                         LogicalStatementOperation::Passthrough,
                         LogicalStatementSemantics::Passthrough,
                         vec![LogicalStatementStep::Passthrough],
-                        vec![explain_statement.to_string()],
+                        vec![explain_statement],
                     )
                 }
             }
@@ -120,11 +120,7 @@ where
                 &rewrite_output.mutations,
                 &rewrite_output.update_validations,
             )?;
-            let emission_sql = rewrite_output
-                .statements
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
+            let emission_statements = rewrite_output.statements.clone();
             let planned_statements = rewrite_output
                 .statements
                 .iter()
@@ -137,7 +133,7 @@ where
                 LogicalStatementOperation::CanonicalWrite,
                 LogicalStatementSemantics::CanonicalWrite,
                 planned_statements,
-                emission_sql,
+                emission_statements,
             )
             .with_rewrite_metadata(
                 rewrite_output.params,
@@ -151,7 +147,7 @@ where
             LogicalStatementOperation::Passthrough,
             LogicalStatementSemantics::Passthrough,
             vec![LogicalStatementStep::Passthrough],
-            vec![other.to_string()],
+            vec![other],
         ),
     };
     logical_plan.validate_plan_shape()?;

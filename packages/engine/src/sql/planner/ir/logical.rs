@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use sqlparser::ast::Statement;
 
 use crate::sql::planner::types::ReadMaintenanceRequirements;
 use crate::sql::types::{MutationRow, PostprocessPlan, SchemaRegistration, UpdateValidationPlan};
@@ -62,7 +63,7 @@ pub(crate) struct LogicalStatementPlan {
     pub(crate) operation: LogicalStatementOperation,
     pub(crate) semantics: LogicalStatementSemantics,
     pub(crate) planned_statements: Vec<LogicalStatementStep>,
-    pub(crate) emission_sql: Vec<String>,
+    pub(crate) emission_statements: Vec<Statement>,
     pub(crate) appended_params: Vec<Value>,
     pub(crate) registrations: Vec<SchemaRegistration>,
     pub(crate) maintenance_requirements: ReadMaintenanceRequirements,
@@ -76,13 +77,13 @@ impl LogicalStatementPlan {
         operation: LogicalStatementOperation,
         semantics: LogicalStatementSemantics,
         planned_statements: Vec<LogicalStatementStep>,
-        emission_sql: Vec<String>,
+        emission_statements: Vec<Statement>,
     ) -> Self {
         Self {
             operation,
             semantics,
             planned_statements,
-            emission_sql,
+            emission_statements,
             appended_params: Vec::new(),
             registrations: Vec::new(),
             maintenance_requirements: ReadMaintenanceRequirements::default(),
@@ -122,12 +123,12 @@ impl LogicalStatementPlan {
                 message: "logical plan has no planned statements".to_string(),
             });
         }
-        if self.planned_statements.len() != self.emission_sql.len() {
+        if self.planned_statements.len() != self.emission_statements.len() {
             return Err(LixError {
                 message: format!(
-                    "logical plan step count ({}) must match emission SQL count ({})",
+                    "logical plan step count ({}) must match emission statement count ({})",
                     self.planned_statements.len(),
-                    self.emission_sql.len()
+                    self.emission_statements.len()
                 ),
             });
         }
@@ -204,7 +205,14 @@ impl LogicalStatementPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LixError;
+    use crate::{parse_sql_statements_with_dialect, LixError, SqlDialect};
+
+    fn statement_from_sql(sql: &str) -> Statement {
+        let mut statements =
+            parse_sql_statements_with_dialect(sql, SqlDialect::Sqlite).expect("parse statements");
+        assert_eq!(statements.len(), 1);
+        statements.remove(0)
+    }
 
     #[test]
     fn validates_query_read_plan_shape() {
@@ -212,7 +220,7 @@ mod tests {
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::QueryRead(LogicalReadSemantics::empty()),
             vec![LogicalStatementStep::QueryRead],
-            vec!["SELECT 1".to_string()],
+            vec![statement_from_sql("SELECT 1")],
         );
 
         assert!(plan.validate_plan_shape().is_ok());
@@ -224,7 +232,7 @@ mod tests {
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::Passthrough,
             vec![LogicalStatementStep::Passthrough],
-            vec!["CREATE TABLE t (id INTEGER)".to_string()],
+            vec![statement_from_sql("CREATE TABLE t (id INTEGER)")],
         );
 
         assert!(matches!(plan.validate_plan_shape(), Err(LixError { message }) if message.contains("inconsistent")));
@@ -236,7 +244,7 @@ mod tests {
             LogicalStatementOperation::QueryRead,
             LogicalStatementSemantics::QueryRead(LogicalReadSemantics::empty()),
             vec![LogicalStatementStep::CanonicalWrite],
-            vec!["INSERT INTO t (id) VALUES (1)".to_string()],
+            vec![statement_from_sql("INSERT INTO t (id) VALUES (1)")],
         );
 
         assert!(matches!(plan.validate_plan_shape(), Err(LixError { message }) if message.contains("only contain query steps")));
