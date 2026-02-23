@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
+use crate::sql::history::requirements::HistoryRequirements;
 use crate::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,4 +85,5 @@ pub struct PreprocessOutput {
     pub postprocess: Option<PostprocessPlan>,
     pub mutations: Vec<MutationRow>,
     pub update_validations: Vec<UpdateValidationPlan>,
+    pub history_requirements: HistoryRequirements,
 }

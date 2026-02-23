@@ -64,6 +64,7 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     dialect: SqlDialect,
     writer_key: Option<&str>,
 ) -> Result<PreprocessOutput, LixError> {
+    let history_requirements = crate::sql::collect_history_requirements_for_statements(&statements);
     let statement_pipeline = StatementPipeline::new(params, writer_key);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
@@ -110,6 +111,7 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         postprocess,
         mutations,
         update_validations,
+        history_requirements,
     })
 }
 
@@ -124,6 +126,11 @@ async fn preprocess_statements_with_provider_and_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
+    let history_requirements =
+        crate::sql::collect_history_requirements_for_statements_with_backend(
+            backend, &statements, params,
+        )
+        .await?;
     let statement_pipeline = StatementPipeline::new(params, writer_key);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
@@ -182,6 +189,7 @@ where
         postprocess,
         mutations,
         update_validations,
+        history_requirements,
     })
 }
 

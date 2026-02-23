@@ -94,6 +94,13 @@ impl Engine {
         let read_only_query = is_query_only_statements(&parsed_statements);
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
+        let history_requirements =
+            crate::sql::collect_history_requirements_for_statements_with_backend(
+                self.backend.as_ref(),
+                &parsed_statements,
+                params,
+            )
+            .await?;
         if read_only_query {
             self.maybe_refresh_working_change_projection_for_read_query(
                 self.backend.as_ref(),
@@ -105,6 +112,7 @@ impl Engine {
             self.backend.as_ref(),
             &parsed_statements,
             &active_version_id,
+            &history_requirements,
         )
         .await?;
         let should_refresh_file_cache =
@@ -165,6 +173,17 @@ impl Engine {
                 }
                 Err(error) => return Err(error),
             };
+        if output
+            .history_requirements
+            .requires_file_history_data_materialization
+            && !history_requirements.requires_file_history_data_materialization
+        {
+            crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
+                self.backend.as_ref(),
+                self.wasm_runtime.as_ref(),
+            )
+            .await?;
+        }
         let state_commit_stream_changes =
             state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
         let next_active_version_id_from_mutations =

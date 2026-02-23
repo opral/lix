@@ -3,6 +3,7 @@ mod ast_ref;
 mod ast_utils;
 mod entity_views;
 mod escaping;
+mod history;
 mod lowering;
 mod params;
 mod pipeline;
@@ -33,6 +34,10 @@ pub(crate) use ast_utils::{
     RewriteDecision,
 };
 pub(crate) use escaping::escape_sql_string;
+pub(crate) use history::requirements::{
+    collect_history_requirements_for_statements,
+    collect_history_requirements_for_statements_with_backend, HistoryRequirements,
+};
 pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
     bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,

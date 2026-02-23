@@ -8,6 +8,7 @@ impl Engine {
         backend: &dyn LixBackend,
         statements: &[Statement],
         active_version_id: &str,
+        history_requirements: &crate::sql::HistoryRequirements,
     ) -> Result<(), LixError> {
         if let Some(scope) = file_read_materialization_scope_for_statements(statements) {
             let versions = match scope {
@@ -25,7 +26,9 @@ impl Engine {
             )
             .await?;
         }
-        if file_history_read_materialization_required_for_statements(statements) {
+        if history_requirements.requires_file_history_data_materialization
+            || file_history_read_materialization_required_for_statements(statements)
+        {
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
                 self.wasm_runtime.as_ref(),

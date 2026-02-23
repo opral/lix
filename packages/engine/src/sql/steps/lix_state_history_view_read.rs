@@ -18,9 +18,43 @@ const TIMELINE_BREAKPOINT_TABLE: &str = "lix_internal_entity_state_timeline_brea
 const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
 const MAX_HISTORY_DEPTH: i64 = 512;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateHistoryRequirement {
+    pub requested_root_commit_ids: BTreeSet<String>,
+    pub required_max_depth: i64,
+}
+
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     let (rewritten, _requests) = rewrite_query_collect_requests(query)?;
     Ok(rewritten)
+}
+
+pub(crate) async fn collect_history_requirements_with_backend(
+    backend: &dyn LixBackend,
+    query: &Query,
+    params: &[Value],
+) -> Result<Vec<StateHistoryRequirement>, LixError> {
+    let (_rewritten, requests) = rewrite_query_collect_requests(query.clone())?;
+    let mut out = Vec::new();
+    let mut seen_requests = BTreeSet::new();
+    for request in requests {
+        if should_fallback_to_phase1_query(&request) {
+            continue;
+        }
+        let request_key = request_dedup_key(&request);
+        if !seen_requests.insert(request_key) {
+            continue;
+        }
+        let requested_root_commit_ids = resolve_requested_root_commits(backend, &request, params)
+            .await?
+            .into_iter()
+            .collect();
+        out.push(StateHistoryRequirement {
+            requested_root_commit_ids,
+            required_max_depth: MAX_HISTORY_DEPTH,
+        });
+    }
+    Ok(out)
 }
 
 pub async fn rewrite_query_with_backend(
@@ -34,12 +68,7 @@ pub async fn rewrite_query_with_backend(
         if should_fallback_to_phase1_query(&request) {
             continue;
         }
-        let request_key = format!(
-            "{}||{}||{}",
-            request.change_predicates.join("&&"),
-            request.requested_predicates.join("&&"),
-            request.cse_predicates.join("&&")
-        );
+        let request_key = request_dedup_key(&request);
         if !seen_requests.insert(request_key) {
             continue;
         }
@@ -700,6 +729,15 @@ fn build_lix_state_history_view_query(
         final_select_sql = final_select_sql,
     );
     parse_single_query(&sql)
+}
+
+fn request_dedup_key(request: &HistoryPushdown) -> String {
+    format!(
+        "{}||{}||{}",
+        request.change_predicates.join("&&"),
+        request.requested_predicates.join("&&"),
+        request.cse_predicates.join("&&")
+    )
 }
 
 fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
