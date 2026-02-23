@@ -1,5 +1,6 @@
 use super::super::*;
 use super::*;
+use super::type_bridge::from_sql_prepared_statements;
 use crate::sql::{
     active_version_from_mutations, active_version_from_update_validations,
     build_delete_followup_sql, build_update_followup_sql, is_query_only_statements,
@@ -130,11 +131,11 @@ impl Engine {
 
         let mut postprocess_file_cache_targets = BTreeSet::new();
         let mut plugin_changes_committed = false;
+        let prepared_statements = from_sql_prepared_statements(output.prepared_statements.clone());
         let result = match output.postprocess.as_ref() {
             None => {
-                let result =
-                    execute_prepared_with_transaction(transaction, &output.prepared_statements)
-                        .await?;
+                let result = execute_prepared_with_transaction(transaction, &prepared_statements)
+                    .await?;
                 let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
                     mutation.operation == MutationOperation::Insert && !mutation.untracked
                 });
@@ -144,9 +145,8 @@ impl Engine {
                 result
             }
             Some(postprocess_plan) => {
-                let result =
-                    execute_prepared_with_transaction(transaction, &output.prepared_statements)
-                        .await?;
+                let result = execute_prepared_with_transaction(transaction, &prepared_statements)
+                    .await?;
                 match postprocess_plan {
                     PostprocessPlan::VtableUpdate(plan) => {
                         if should_refresh_file_cache {
@@ -207,6 +207,7 @@ impl Engine {
                         .await?
                     }
                 };
+                let followup_statements = from_sql_prepared_statements(followup_statements);
                 execute_prepared_with_transaction(transaction, &followup_statements).await?;
                 plugin_changes_committed = true;
                 result

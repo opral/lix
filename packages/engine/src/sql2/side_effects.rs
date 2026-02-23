@@ -4,6 +4,7 @@ use super::storage::queries::{
 };
 use super::storage::tables;
 use super::*;
+use super::type_bridge::from_sql_prepared_statements;
 use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
 };
@@ -408,7 +409,8 @@ impl Engine {
             let backend = TransactionBackendAdapter::new(transaction);
             preprocess_sql(&backend, &self.cel_evaluator, &sql, &params).await?
         };
-        execute_prepared_with_transaction(transaction, &output.prepared_statements).await?;
+        let prepared_statements = from_sql_prepared_statements(output.prepared_statements);
+        execute_prepared_with_transaction(transaction, &prepared_statements).await?;
 
         Ok(())
     }
