@@ -100,12 +100,11 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         });
     }
 
-    let (normalized_sql, params, prepared_statements) =
+    let (normalized_sql, prepared_statements) =
         render_statements_with_params(&rewritten, params, dialect)?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
-        params,
         prepared_statements,
         registrations,
         postprocess,
@@ -172,12 +171,11 @@ where
         });
     }
 
-    let (normalized_sql, params, prepared_statements) =
+    let (normalized_sql, prepared_statements) =
         render_statements_with_params(&rewritten, params, backend.dialect())?;
 
     Ok(PreprocessOutput {
         sql: normalized_sql,
-        params,
         prepared_statements,
         registrations,
         postprocess,
@@ -401,7 +399,7 @@ fn render_statements_with_params(
     statements: &[RewrittenStatementBinding],
     base_params: &[Value],
     dialect: SqlDialect,
-) -> Result<(String, Vec<Value>, Vec<PreparedStatement>), LixError> {
+) -> Result<(String, Vec<PreparedStatement>), LixError> {
     let mut rendered = Vec::with_capacity(statements.len());
     let mut prepared_statements = Vec::with_capacity(statements.len());
     let mut placeholder_state = PlaceholderState::new();
@@ -423,9 +421,7 @@ fn render_statements_with_params(
     }
 
     let normalized_sql = rendered.join("; ");
-    let compatibility_params = Vec::new();
-
-    Ok((normalized_sql, compatibility_params, prepared_statements))
+    Ok((normalized_sql, prepared_statements))
 }
 
 fn coalesce_vtable_inserts_in_transactions(
@@ -734,16 +730,12 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_output_params_no_longer_flattens_single_statement_params() {
+    fn preprocess_output_uses_prepared_statement_params() {
         let statements = parse_sql_statements("SELECT ?").expect("parse should succeed");
         let rewritten =
             preprocess_statements(statements, &[Value::Integer(7)], SqlDialect::Sqlite)
                 .expect("rewrite should succeed");
 
-        assert!(
-            rewritten.params.is_empty(),
-            "compatibility param flattening must stay removed"
-        );
         assert_eq!(
             rewritten.prepared_statements[0].params,
             vec![Value::Integer(7)]

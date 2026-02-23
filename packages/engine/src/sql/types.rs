@@ -78,7 +78,6 @@ pub struct PreparedStatement {
 #[derive(Debug, Clone)]
 pub struct PreprocessOutput {
     pub sql: String,
-    pub params: Vec<Value>,
     pub prepared_statements: Vec<PreparedStatement>,
     pub registrations: Vec<SchemaRegistration>,
     pub postprocess: Option<PostprocessPlan>,

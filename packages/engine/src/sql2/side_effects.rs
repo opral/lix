@@ -4,7 +4,6 @@ use super::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use super::storage::tables;
-use super::*;
 use super::type_bridge::from_sql_prepared_statements;
 use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
