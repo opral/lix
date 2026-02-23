@@ -1,4 +1,5 @@
 use super::super::*;
+use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };

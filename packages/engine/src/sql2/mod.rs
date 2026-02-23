@@ -17,4 +17,3 @@ pub(crate) mod vtable;
 
 #[cfg(test)]
 pub(super) use fallback::should_sequentialize_postprocess_multi_statement;
-pub(super) use execution::execute_prepared::execute_prepared_with_transaction;
