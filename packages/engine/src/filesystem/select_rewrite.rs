@@ -206,7 +206,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                COALESCE(fd.data, fbv.data, lix_empty_blob()) AS data, \
+                COALESCE(fd.data, lix_empty_blob()) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \

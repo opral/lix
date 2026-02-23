@@ -9,8 +9,10 @@ use crate::sql::{
 use crate::SqlDialect;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const UPDATE_ROW_FILE_ID_INDEX: usize = 1;
 const UPDATE_ROW_VERSION_ID_INDEX: usize = 2;
 const UPDATE_ROW_SNAPSHOT_CONTENT_INDEX: usize = 5;
+const DELETE_ROW_FILE_ID_INDEX: usize = 1;
 const DELETE_ROW_VERSION_ID_INDEX: usize = 2;
 
 #[derive(Debug, Clone)]
@@ -441,12 +443,9 @@ impl Engine {
 
         let mut writes_by_target = BTreeMap::<(String, String), Option<String>>::new();
         for row in rows {
-            let Some(file_id) = row
-                .first()
-                .and_then(value_as_text_column)
-            else {
+            let Some(file_id) = row.get(UPDATE_ROW_FILE_ID_INDEX).and_then(value_as_text_column) else {
                 return Err(LixError {
-                    message: "filesystem update side-effect row missing text entity_id at index 0"
+                    message: "filesystem update side-effect row missing text file_id at index 1"
                         .to_string(),
                 });
             };
@@ -543,12 +542,9 @@ impl Engine {
 
         let mut writes_by_target = BTreeMap::<(String, String), Option<String>>::new();
         for row in rows {
-            let Some(file_id) = row
-                .first()
-                .and_then(value_as_text_column)
-            else {
+            let Some(file_id) = row.get(UPDATE_ROW_FILE_ID_INDEX).and_then(value_as_text_column) else {
                 return Err(LixError {
-                    message: "filesystem update side-effect row missing text entity_id at index 0"
+                    message: "filesystem update side-effect row missing text file_id at index 1"
                         .to_string(),
                 });
             };
@@ -652,12 +648,9 @@ impl Engine {
 
         let mut targets = BTreeSet::<(String, String)>::new();
         for row in rows {
-            let Some(file_id) = row
-                .first()
-                .and_then(value_as_text_column)
-            else {
+            let Some(file_id) = row.get(DELETE_ROW_FILE_ID_INDEX).and_then(value_as_text_column) else {
                 return Err(LixError {
-                    message: "filesystem delete side-effect row missing text entity_id at index 0"
+                    message: "filesystem delete side-effect row missing text file_id at index 1"
                         .to_string(),
                 });
             };

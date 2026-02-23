@@ -378,9 +378,27 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
         });
     }
     reject_immutable_id_update(&update, target)?;
+    if target.is_file && update_assignments_are_data_only(&update) {
+        return Ok(Some(noop_statement()?));
+    }
 
     replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
     Ok(Some(Statement::Update(update)))
+}
+
+#[cfg(test)]
+fn update_assignments_are_data_only(update: &Update) -> bool {
+    let mut saw_assignment = false;
+    for assignment in &update.assignments {
+        let Some(column) = assignment_target_name(assignment) else {
+            return false;
+        };
+        if !column.eq_ignore_ascii_case("data") {
+            return false;
+        }
+        saw_assignment = true;
+    }
+    saw_assignment
 }
 
 pub async fn rewrite_update_with_backend(
@@ -3305,6 +3323,7 @@ fn table_name(name: &str) -> ObjectName {
     ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))])
 }
 
+#[cfg(test)]
 fn noop_statement() -> Result<Statement, LixError> {
     let mut statements =
         Parser::parse_sql(&GenericDialect {}, "SELECT 0 WHERE 1 = 0").map_err(|error| {
