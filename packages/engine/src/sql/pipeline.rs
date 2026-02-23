@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::{fmt::Write as _, string::String};
 
-use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement};
+use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement, Value as SqlAstValue};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -515,6 +515,9 @@ fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
     if !insert_targets_vtable(left) || !insert_targets_vtable(right) {
         return false;
     }
+    if insert_targets_stored_schema(left) || insert_targets_stored_schema(right) {
+        return false;
+    }
     if left.columns != right.columns {
         return false;
     }
@@ -586,6 +589,36 @@ fn insert_targets_vtable(insert: &Insert) -> bool {
     }
 }
 
+fn insert_targets_stored_schema(insert: &Insert) -> bool {
+    let schema_key_index = insert
+        .columns
+        .iter()
+        .position(|column| column.value.eq_ignore_ascii_case("schema_key"));
+    let Some(schema_key_index) = schema_key_index else {
+        return false;
+    };
+
+    let Some(rows) = plain_values_rows(insert) else {
+        return false;
+    };
+
+    rows.iter().any(|row| {
+        row.get(schema_key_index)
+            .is_some_and(expr_is_stored_schema_literal)
+    })
+}
+
+fn expr_is_stored_schema_literal(expr: &Expr) -> bool {
+    let Expr::Value(value) = expr else {
+        return false;
+    };
+    let literal = match &value.value {
+        SqlAstValue::SingleQuotedString(text) | SqlAstValue::DoubleQuotedString(text) => text,
+        _ => return false,
+    };
+    literal.eq_ignore_ascii_case("lix_stored_schema")
+}
+
 fn plain_values_rows(insert: &Insert) -> Option<&Vec<Vec<Expr>>> {
     let source = insert.source.as_ref()?;
     if !query_is_plain_values(source) {
@@ -623,11 +656,12 @@ fn query_is_plain_values(query: &Query) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_sql_statements, preprocess_plan_fingerprint, preprocess_sql_rewrite_only,
-        preprocess_statements,
+        coalesce_vtable_inserts_in_statement_list, parse_sql_statements, plain_values_rows,
+        preprocess_plan_fingerprint, preprocess_sql_rewrite_only, preprocess_statements,
     };
     use crate::backend::SqlDialect;
     use crate::Value;
+    use sqlparser::ast::Statement;
 
     #[test]
     fn rewrite_only_path_lowers_lix_json_text_functions() {
@@ -752,5 +786,48 @@ mod tests {
             preprocess_plan_fingerprint(&output_b),
             "fingerprint must change when bound statement params change"
         );
+    }
+
+    #[test]
+    fn coalesce_vtable_inserts_keeps_stored_schema_rows_separate() {
+        let statements = parse_sql_statements(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES \
+             ('lix_stored_schema', '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\"}}'); \
+             INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES \
+             ('lix_stored_schema', '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\"}}')",
+        )
+        .expect("parse should succeed");
+
+        let coalesced = coalesce_vtable_inserts_in_statement_list(statements)
+            .expect("coalescing should succeed");
+
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "stored schema inserts must remain separate statements"
+        );
+    }
+
+    #[test]
+    fn coalesce_vtable_inserts_merges_non_stored_schema_rows() {
+        let statements = parse_sql_statements(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES ('entity-a', 'test_schema', 'file-1', 'version-main', 'lix', '{}', '1'); \
+             INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES ('entity-b', 'test_schema', 'file-1', 'version-main', 'lix', '{}', '1')",
+        )
+        .expect("parse should succeed");
+
+        let coalesced = coalesce_vtable_inserts_in_statement_list(statements)
+            .expect("coalescing should succeed");
+        assert_eq!(coalesced.len(), 1, "non-stored schema inserts should merge");
+
+        let Statement::Insert(insert) = &coalesced[0] else {
+            panic!("expected merged insert statement");
+        };
+        let rows = plain_values_rows(insert).expect("merged statement should keep VALUES rows");
+        assert_eq!(rows.len(), 2, "merged insert should contain both rows");
     }
 }
