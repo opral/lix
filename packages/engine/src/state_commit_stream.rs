@@ -1,4 +1,4 @@
-use crate::sql::{MutationOperation, MutationRow};
+use crate::engine::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use serde::{Deserialize, Serialize};

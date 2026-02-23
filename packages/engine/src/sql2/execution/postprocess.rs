@@ -7,7 +7,8 @@ use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::postprocess_actions::{VtableDeletePlan, VtableUpdatePlan};
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::super::type_bridge::{
-    from_sql_prepared_statements, to_sql_vtable_delete_plan, to_sql_vtable_update_plan,
+    from_sql_prepared_statements, to_sql_detected_file_domain_changes, to_sql_vtable_delete_plan,
+    to_sql_vtable_update_plan,
 };
 
 pub(crate) async fn build_update_followup_statements(
@@ -19,11 +20,13 @@ pub(crate) async fn build_update_followup_statements(
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<Vec<PreparedStatement>, LixError> {
     let sql_plan = to_sql_vtable_update_plan(plan);
+    let sql_detected_file_domain_changes =
+        to_sql_detected_file_domain_changes(detected_file_domain_changes);
     build_update_followup_statements_from_sql_plan(
         transaction,
         &sql_plan,
         rows,
-        detected_file_domain_changes,
+        &sql_detected_file_domain_changes,
         writer_key,
         functions,
     )
@@ -40,12 +43,14 @@ pub(crate) async fn build_delete_followup_statements(
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<Vec<PreparedStatement>, LixError> {
     let sql_plan = to_sql_vtable_delete_plan(plan);
+    let sql_detected_file_domain_changes =
+        to_sql_detected_file_domain_changes(detected_file_domain_changes);
     build_delete_followup_statements_from_sql_plan(
         transaction,
         &sql_plan,
         rows,
         params,
-        detected_file_domain_changes,
+        &sql_detected_file_domain_changes,
         writer_key,
         functions,
     )

@@ -1,5 +1,6 @@
 use crate::sql;
 
+use super::contracts::effects::DetectedFileDomainChange;
 use super::contracts::planned_statement::{
     MutationOperation, MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
 };
@@ -78,6 +79,19 @@ pub(crate) fn from_sql_prepared_statements(
         .collect()
 }
 
+pub(crate) fn from_sql_mutations(mutations: Vec<sql::MutationRow>) -> Vec<MutationRow> {
+    mutations.into_iter().map(from_sql_mutation_row).collect()
+}
+
+pub(crate) fn from_sql_update_validations(
+    plans: Vec<sql::UpdateValidationPlan>,
+) -> Vec<UpdateValidationPlan> {
+    plans
+        .into_iter()
+        .map(from_sql_update_validation_plan)
+        .collect()
+}
+
 pub(crate) fn to_sql_mutations(mutations: &[MutationRow]) -> Vec<sql::MutationRow> {
     mutations.iter().cloned().map(to_sql_mutation_row).collect()
 }
@@ -89,6 +103,43 @@ pub(crate) fn to_sql_update_validations(
         .iter()
         .cloned()
         .map(to_sql_update_validation_plan)
+        .collect()
+}
+
+pub(crate) fn to_sql_detected_file_domain_changes(
+    changes: &[DetectedFileDomainChange],
+) -> Vec<sql::DetectedFileDomainChange> {
+    changes
+        .iter()
+        .cloned()
+        .map(to_sql_detected_file_domain_change)
+        .collect()
+}
+
+pub(crate) fn to_sql_detected_file_domain_changes_by_statement(
+    changes_by_statement: &[Vec<DetectedFileDomainChange>],
+) -> Vec<Vec<sql::DetectedFileDomainChange>> {
+    changes_by_statement
+        .iter()
+        .map(|changes| to_sql_detected_file_domain_changes(changes))
+        .collect()
+}
+
+pub(crate) fn from_sql_detected_file_domain_changes(
+    changes: Vec<sql::DetectedFileDomainChange>,
+) -> Vec<DetectedFileDomainChange> {
+    changes
+        .into_iter()
+        .map(from_sql_detected_file_domain_change)
+        .collect()
+}
+
+pub(crate) fn from_sql_detected_file_domain_changes_by_statement(
+    changes_by_statement: Vec<Vec<sql::DetectedFileDomainChange>>,
+) -> Vec<Vec<DetectedFileDomainChange>> {
+    changes_by_statement
+        .into_iter()
+        .map(from_sql_detected_file_domain_changes)
         .collect()
 }
 
@@ -223,5 +274,37 @@ fn to_sql_update_validation_plan(plan: UpdateValidationPlan) -> sql::UpdateValid
         where_clause: plan.where_clause,
         snapshot_content: plan.snapshot_content,
         snapshot_patch: plan.snapshot_patch,
+    }
+}
+
+fn to_sql_detected_file_domain_change(
+    change: DetectedFileDomainChange,
+) -> sql::DetectedFileDomainChange {
+    sql::DetectedFileDomainChange {
+        entity_id: change.entity_id,
+        schema_key: change.schema_key,
+        schema_version: change.schema_version,
+        file_id: change.file_id,
+        version_id: change.version_id,
+        plugin_key: change.plugin_key,
+        snapshot_content: change.snapshot_content,
+        metadata: change.metadata,
+        writer_key: change.writer_key,
+    }
+}
+
+fn from_sql_detected_file_domain_change(
+    change: sql::DetectedFileDomainChange,
+) -> DetectedFileDomainChange {
+    DetectedFileDomainChange {
+        entity_id: change.entity_id,
+        schema_key: change.schema_key,
+        schema_version: change.schema_version,
+        file_id: change.file_id,
+        version_id: change.version_id,
+        plugin_key: change.plugin_key,
+        snapshot_content: change.snapshot_content,
+        metadata: change.metadata,
+        writer_key: change.writer_key,
     }
 }
