@@ -79,6 +79,11 @@ impl Engine {
         options: ExecuteOptions,
         allow_internal_tables: bool,
     ) -> Result<QueryResult, LixError> {
+        if super::super::sql2::api::sql2_routing_enabled() {
+            return self
+                .execute_impl_sql2(sql, params, options, allow_internal_tables)
+                .await;
+        }
         if !allow_internal_tables && !self.access_to_internal {
             reject_internal_table_access(sql)?;
         }
@@ -188,7 +193,7 @@ impl Engine {
         }
         let mut postprocess_file_cache_targets = BTreeSet::new();
         let mut plugin_changes_committed = false;
-        let result = match output.postprocess {
+        let result: QueryResult = match output.postprocess {
             None => {
                 let result = execute_prepared_with_backend(
                     self.backend.as_ref(),
@@ -201,7 +206,7 @@ impl Engine {
                 if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
                     plugin_changes_committed = true;
                 }
-                Ok(result)
+                Ok::<QueryResult, LixError>(result)
             }
             Some(postprocess_plan) => {
                 let mut transaction = self.backend.begin_transaction().await?;
@@ -308,7 +313,7 @@ impl Engine {
                 }
                 transaction.commit().await?;
                 plugin_changes_committed = true;
-                Ok(result)
+                Ok::<QueryResult, LixError>(result)
             }
         }?;
 
