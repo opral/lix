@@ -17,6 +17,16 @@ fn collect_rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn read_runtime_engine_section() -> String {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let engine_source = fs::read_to_string(root.join("src/engine.rs"))
+        .expect("engine.rs should be readable");
+    let boundary = engine_source
+        .find("mod tests {")
+        .expect("engine.rs should contain test module");
+    engine_source[..boundary].to_string()
+}
+
 #[test]
 fn guardrail_legacy_execute_directory_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -36,6 +46,24 @@ fn guardrail_engine_module_is_not_wired_to_legacy_execute_mod() {
         !engine_source.contains("[path = \"execute/mod.rs\"]"),
         "engine.rs must not wire the removed execute module"
     );
+}
+
+#[test]
+fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
+    let runtime_source = read_runtime_engine_section();
+    for forbidden in [
+        "preprocess_sql",
+        "preprocess_parsed_statements_with_provider_and_detected_file_domain_changes",
+        "is_query_only_statements",
+        "parse_sql_statements",
+        "coalesce_vtable_inserts_in_statement_list",
+        "coalesce_lix_file_transaction_statements",
+    ] {
+        assert!(
+            !runtime_source.contains(forbidden),
+            "engine runtime section must not import legacy sql pipeline symbol: {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -72,6 +100,23 @@ fn guardrail_forbids_string_matched_postprocess_fallback() {
         assert!(
             !source.contains("is_postprocess_multi_statement_error"),
             "string-matched postprocess fallback helper must not be reintroduced: {}",
+            file.display()
+        );
+    }
+}
+
+#[test]
+fn guardrail_sql2_planning_and_execution_forbid_direct_sql_runtime_imports() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql2");
+    let mut files = Vec::new();
+    collect_rust_sources(&root.join("planning"), &mut files);
+    collect_rust_sources(&root.join("execution"), &mut files);
+
+    for file in files {
+        let source = fs::read_to_string(&file).expect("source file should be readable");
+        assert!(
+            !source.contains("crate::sql::"),
+            "sql2 planning/execution must not directly depend on crate::sql::*: {}",
             file.display()
         );
     }
