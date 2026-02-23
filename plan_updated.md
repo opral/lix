@@ -295,12 +295,82 @@ Phase 4 exit criteria:
 3. Final runtime flow matches:
    `parse -> bind_once -> plan -> derive_requirements/effects -> lower_sql -> execute -> postprocess`.
 
+### Phase 5: Eliminate `crate::sql::*` Dependencies (No Deletion Yet)
+
+Goal: make `sql2` and engine runtime consume only `sql2`-owned APIs/types while `src/sql` still exists.
+
+#### Phase 5.1: Parse/AST Helper Migration
+
+1. Move parser/AST helper usage (`parse_sql_statements`, table-name matching, AST visitors) to `sql2/ast`.
+2. Update runtime callers (`observe`, filesystem rewrites, `sql2/vtable`, `sql2/history`) to use `sql2/ast`.
+3. Verification: `cargo test -p lix_engine --test execute --test file_history_view --test vtable_read -- --test-threads=1`.
+
+#### Phase 5.2: Placeholder Binding Migration
+
+1. Move SQL binding/placeholder state helpers (`bind_sql*`, `PlaceholderState`) behind `sql2/planning/bind_once` + `sql2/ast/utils`.
+2. Update `observe`, `validation`, `sql2/scripts`, `sql2/in_transaction` and related callers to use `sql2` binding APIs.
+3. Verification: `cargo test -p lix_engine --test transaction_execution --test observe -- --test-threads=1`.
+
+#### Phase 5.3: Postprocess Followup Builder Migration
+
+1. Move followup SQL builders (`build_update_followup_sql`, `build_delete_followup_sql`) under `sql2/execution/postprocess` ownership.
+2. Remove `sql2/type_bridge` dependence on `crate::sql::*` for followup generation.
+3. Verification: `cargo test -p lix_engine --test schema_provider --test transaction_execution -- --test-threads=1`.
+
+#### Phase 5.4: Materialization/History Signal Migration
+
+1. Move read-materialization scope + history-read detection helpers into `sql2/history/plugin_inputs`.
+2. Move working projection refresh helpers into `sql2/history/projections` (no `crate::sql::*` passthrough).
+3. Verification: `cargo test -p lix_engine --test file_materialization --test file_history_view --test state_commit_stream -- --test-threads=1`.
+
+#### Phase 5.5: Type/Contract Migration
+
+1. Replace remaining `crate::sql` type usage in non-`sql` runtime modules (`MutationRow`, `MutationOperation`, update validation plans, detected file change aliases) with `sql2/contracts` types.
+2. Remove `sql2/contracts/*` aliases to `crate::sql::*`.
+3. Verification: `cargo test -p lix_engine --test commit --test stored_schema --test deterministic_mode -- --test-threads=1`.
+
+#### Phase 5.6: External Import Zero Gate
+
+1. Reach zero `crate::sql::*` imports outside `packages/engine/src/sql/**`.
+2. Keep `src/sql` compiling temporarily only as a still-present directory, not as a dependency of runtime code.
+3. Verification:
+   - `rg -n "\\bcrate::sql::|\\bsql::" packages/engine/src --glob '!packages/engine/src/sql/**'` returns no runtime dependencies.
+   - `cargo test -p lix_engine --tests`.
+
+Phase 5 exit criteria:
+
+1. Runtime and `sql2` flow are independent of `crate::sql::*`.
+2. `src/sql` is no longer imported by non-`sql` runtime modules.
+3. Integration tests are green.
+
+### Phase 6: Delete `src/sql` and Lock Final Runtime
+
+#### Phase 6.1: Physical Deletion
+
+1. Delete `packages/engine/src/sql/**`.
+2. Remove `mod sql;` wiring and any leftover references.
+3. Verification: `cargo test -p lix_engine --tests --no-run`.
+
+#### Phase 6.2: Final Flow Lock and Validation
+
+1. Add/extend guardrails to fail if `src/sql` or `crate::sql::*` reappears in runtime code.
+2. Reconfirm runtime path is:
+   `parse -> bind_once -> plan -> derive_requirements/effects -> lower_sql -> execute -> postprocess`.
+3. Verification: `cargo test -p lix_engine --tests`.
+
+Phase 6 exit criteria:
+
+1. `packages/engine/src/sql` is removed.
+2. Build graph contains only `sql2` planner/executor implementation.
+3. Full `lix_engine` integration suite is green.
+
 ## Definition of Done
 
 1. Engine executes through one planner API and one executor pipeline (`sql2` only).
-2. Placeholder rebinding loops are eliminated.
-3. String-based fallback control flow is eliminated.
-4. Planner is pure; side effects are driven by typed contracts.
-5. Postprocess ordering is enforced and test-covered:
+2. `packages/engine/src/sql` is deleted.
+3. Placeholder rebinding loops are eliminated.
+4. String-based fallback control flow is eliminated.
+5. Planner is pure; side effects are driven by typed contracts.
+6. Postprocess ordering is enforced and test-covered:
    `postprocess_sql -> apply_effects_tx -> commit boundary -> apply_effects_post_commit`.
-6. Full `lix_engine` integration tests pass.
+7. Full `lix_engine` integration tests pass.
