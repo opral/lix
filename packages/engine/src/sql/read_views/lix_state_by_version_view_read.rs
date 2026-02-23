@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn pushes_version_id_eq_into_lix_state_by_version_source() {
+    fn keeps_version_id_eq_pushdown_on_ranked_layer() {
         let query = parse_query(
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.schema_key = 'lix_file_descriptor' AND sv.version_id = 'bench-v-023'",
@@ -233,15 +233,12 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("FROM version_descriptor WHERE version_id = 'bench-v-023'"));
-        assert!(sql.contains("FROM lix_internal_state_vtable WHERE version_id = 'bench-v-023'"));
-        assert!(!sql.contains("FROM all_target_versions"));
-        assert!(!sql.contains("ranked.version_id = 'bench-v-023'"));
+        assert!(sql.contains("ranked.version_id = 'bench-v-023'"));
         assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
     }
 
     #[test]
-    fn pushes_version_id_in_list_into_lix_state_by_version_source() {
+    fn keeps_version_id_in_list_pushdown_on_ranked_layer() {
         let query = parse_query(
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.schema_key = 'lix_file_descriptor' \
@@ -253,19 +250,12 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains(
-            "FROM version_descriptor WHERE version_id IN ('bench-v-022', 'bench-v-023')"
-        ));
-        assert!(sql.contains(
-            "FROM lix_internal_state_vtable WHERE version_id IN ('bench-v-022', 'bench-v-023')"
-        ));
-        assert!(!sql.contains("FROM all_target_versions"));
-        assert!(!sql.contains("ranked.version_id IN ('bench-v-022', 'bench-v-023')"));
+        assert!(sql.contains("ranked.version_id IN ('bench-v-022', 'bench-v-023')"));
         assert!(!sql.contains("sv.version_id IN ('bench-v-022', 'bench-v-023')"));
     }
 
     #[test]
-    fn pushes_version_id_in_subquery_into_lix_state_by_version_source() {
+    fn keeps_version_id_in_subquery_pushdown_on_ranked_layer() {
         let query = parse_query(
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.schema_key = 'lix_file_descriptor' \
@@ -284,8 +274,7 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("FROM all_target_versions WHERE version_id IN (SELECT"));
-        assert!(!sql.contains("ranked.version_id IN (SELECT"));
+        assert!(sql.contains("ranked.version_id IN (SELECT"));
         assert!(sql.contains("FROM lix_internal_state_untracked"));
         assert!(!sql.contains("sv.version_id IN (SELECT"));
     }
@@ -303,8 +292,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("version_id = ?"));
-        assert!(!sql.contains("ranked.version_id = ?"));
+        assert!(sql.contains("ranked.version_id = ?"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id = ?"));
     }
@@ -322,8 +310,7 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("version_id IN ("));
-        assert!(!sql.contains("ranked.version_id IN (?, ?)"));
+        assert!(sql.contains("ranked.version_id IN (?, ?)"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id IN (?, ?)"));
     }

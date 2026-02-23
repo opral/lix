@@ -4,7 +4,7 @@ use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::types::{
     InstalledPlugin, PluginContentType, PluginManifest, PluginRuntime, StateContextColumn,
 };
-use crate::sql::preprocess_sql;
+use crate::sql::{load_planner_catalog_snapshot, preprocess_sql, quote_ident};
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -986,26 +986,105 @@ async fn load_plugin_state_changes_for_file(
     version_id: &str,
     plugin_key: &str,
 ) -> Result<Vec<PluginEntityChange>, LixError> {
+    let catalog = load_planner_catalog_snapshot(backend).await?;
+    let mut schema_keys = catalog.schema_keys_for_plugins(&[plugin_key.to_string()]);
+    if schema_keys.is_empty() {
+        schema_keys = catalog.materialized_schema_keys.clone();
+    }
+
+    let json_extract: fn(&str, &str) -> String = match backend.dialect() {
+        crate::SqlDialect::Sqlite => {
+            |column: &str, field: &str| format!("json_extract({column}, '$.\"{field}\"')")
+        }
+        crate::SqlDialect::Postgres => {
+            |column: &str, field: &str| {
+                format!("jsonb_extract_path_text(CAST({column} AS JSONB), '{field}')")
+            }
+        }
+    };
+
+    let mut union_branches = Vec::new();
+    union_branches.push(
+        "SELECT \
+           entity_id, schema_key, file_id, version_id, plugin_key, schema_version, \
+           snapshot_content, updated_at, 1 AS untracked \
+         FROM lix_internal_state_untracked \
+         WHERE file_id = $1 \
+           AND plugin_key = $3"
+            .to_string(),
+    );
+    for schema_key in schema_keys {
+        let table = quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+        union_branches.push(format!(
+            "SELECT \
+               entity_id, schema_key, file_id, version_id, plugin_key, schema_version, \
+               CASE WHEN is_tombstone = 1 THEN NULL ELSE snapshot_content END AS snapshot_content, \
+               updated_at, 0 AS untracked \
+             FROM {table} \
+             WHERE file_id = $1 \
+               AND plugin_key = $3",
+        ));
+    }
+    let union_sql = union_branches.join(" UNION ALL ");
+
+    let sql = format!(
+        "WITH RECURSIVE \
+           version_descriptor AS ( \
+             SELECT \
+               {id_extract} AS version_id, \
+               {parent_extract} AS inherits_from_version_id \
+             FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+             WHERE schema_key = 'lix_version_descriptor' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           version_chain(ancestor_version_id, depth) AS ( \
+             SELECT $2 AS ancestor_version_id, 0 AS depth \
+             UNION ALL \
+             SELECT \
+               vd.inherits_from_version_id AS ancestor_version_id, \
+               vc.depth + 1 AS depth \
+             FROM version_chain vc \
+             JOIN version_descriptor vd \
+               ON vd.version_id = vc.ancestor_version_id \
+             WHERE vd.inherits_from_version_id IS NOT NULL \
+               AND vc.depth < 64 \
+           ), \
+           state_union AS ( \
+             {union_sql} \
+           ), \
+           ranked AS ( \
+             SELECT \
+               s.entity_id AS entity_id, \
+               s.schema_key AS schema_key, \
+               s.schema_version AS schema_version, \
+               s.snapshot_content AS snapshot_content, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY s.entity_id, s.schema_key, s.file_id \
+                 ORDER BY s.untracked DESC, vc.depth ASC, s.updated_at DESC \
+               ) AS rn \
+             FROM state_union s \
+             JOIN version_chain vc \
+               ON vc.ancestor_version_id = s.version_id \
+           ) \
+         SELECT entity_id, schema_key, schema_version, snapshot_content \
+         FROM ranked \
+         WHERE rn = 1 \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY entity_id",
+        id_extract = json_extract("snapshot_content", "id"),
+        parent_extract = json_extract("snapshot_content", "inherits_from_version_id"),
+        union_sql = union_sql,
+    );
+
     let params = vec![
         Value::Text(file_id.to_string()),
         Value::Text(version_id.to_string()),
         Value::Text(plugin_key.to_string()),
     ];
-    let preprocessed = preprocess_sql(
-        backend,
-        &CelEvaluator::new(),
-        "SELECT entity_id, schema_key, schema_version, snapshot_content \
-         FROM lix_state_by_version \
-         WHERE file_id = $1 \
-           AND version_id = $2 \
-           AND plugin_key = $3 \
-           AND snapshot_content IS NOT NULL \
-         ORDER BY entity_id",
-        &params,
-    )
-    .await?;
-    let prepared = preprocessed.require_single_statement("plugin state lookup for file")?;
-    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
+    let rows = backend.execute(&sql, &params).await?;
 
     let mut changes = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
@@ -1153,7 +1232,15 @@ async fn load_active_state_context_rows(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let prepared = preprocessed.require_single_statement("plugin active state context lookup")?;
-    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
+    let rows = backend
+        .execute(&prepared.sql, &prepared.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "plugin active state context lookup failed: {} | sql: {}",
+                error.message, prepared.sql
+            ),
+        })?;
 
     let mut result = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
@@ -1256,7 +1343,15 @@ async fn load_missing_file_descriptors(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let prepared = preprocessed.require_single_statement("missing file descriptor scan")?;
-    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
+    let rows = backend
+        .execute(&prepared.sql, &prepared.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "missing file descriptor scan failed: {} | sql: {}",
+                error.message, prepared.sql
+            ),
+        })?;
 
     let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
     for row in rows.rows {
@@ -1311,7 +1406,15 @@ async fn load_file_paths_for_descriptors(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let prepared = preprocessed.require_single_statement("descriptor path lookup")?;
-    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
+    let rows = backend
+        .execute(&prepared.sql, &prepared.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "descriptor path lookup failed: {} | sql: {}",
+                error.message, prepared.sql
+            ),
+        })?;
 
     let mut out = BTreeMap::new();
     for row in rows.rows {
@@ -1326,26 +1429,65 @@ async fn load_file_paths_for_descriptors(
 async fn load_missing_file_history_descriptors(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
-    let sql = "SELECT \
-                 id AS file_id, \
-                 lixcol_root_commit_id AS root_commit_id, \
-                 lixcol_depth AS depth, \
-                 lixcol_commit_id AS commit_id, \
-                 path \
-               FROM lix_file_history \
-               WHERE path IS NOT NULL \
-                 AND NOT EXISTS (\
-                   SELECT 1 \
-                   FROM lix_internal_file_history_data_cache cache \
-                   WHERE cache.file_id = id \
-                     AND cache.root_commit_id = lixcol_root_commit_id \
-                     AND cache.depth = lixcol_depth\
-                 ) \
-               ORDER BY lixcol_root_commit_id, lixcol_depth, id";
+    let sql = "WITH history_candidates AS (\
+                 SELECT \
+                   bp.file_id AS file_id, \
+                   bp.root_commit_id AS root_commit_id, \
+                   bp.from_depth AS depth, \
+                   ancestry.ancestor_id AS commit_id, \
+                   bp.change_id AS change_id, \
+                   ROW_NUMBER() OVER (\
+                     PARTITION BY bp.file_id, bp.root_commit_id, bp.from_depth \
+                     ORDER BY bp.change_id DESC\
+                   ) AS row_num \
+                 FROM lix_internal_entity_state_timeline_breakpoint bp \
+                 JOIN lix_internal_commit_ancestry ancestry \
+                   ON ancestry.commit_id = bp.root_commit_id \
+                  AND ancestry.depth = bp.from_depth \
+                 WHERE bp.file_id IS NOT NULL \
+                   AND bp.file_id != 'lix' \
+                   AND bp.snapshot_id != 'no-content' \
+                   AND NOT EXISTS (\
+                     SELECT 1 \
+                     FROM lix_internal_file_history_data_cache cache \
+                     WHERE cache.file_id = bp.file_id \
+                       AND cache.root_commit_id = bp.root_commit_id \
+                       AND cache.depth = bp.from_depth\
+                   ) \
+               ), \
+               history_targets AS (\
+                 SELECT \
+                   file_id, \
+                   root_commit_id, \
+                   depth, \
+                   commit_id \
+                 FROM history_candidates \
+                 WHERE row_num = 1\
+               ) \
+               SELECT \
+                 target.file_id AS file_id, \
+                 target.root_commit_id AS root_commit_id, \
+                 target.depth AS depth, \
+                 target.commit_id AS commit_id, \
+                 file_at_commit.path AS path \
+               FROM history_targets target \
+               LEFT JOIN lix_file_by_version file_at_commit \
+                 ON file_at_commit.id = target.file_id \
+                AND file_at_commit.lixcol_commit_id = target.commit_id \
+               WHERE file_at_commit.path IS NOT NULL \
+               ORDER BY target.root_commit_id, target.depth, target.file_id";
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
     let prepared = preprocessed.require_single_statement("missing history descriptor scan")?;
-    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
+    let rows = backend
+        .execute(&prepared.sql, &prepared.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "missing history descriptor scan failed: {} | sql: {}",
+                error.message, prepared.sql
+            ),
+        })?;
 
     let mut descriptors: BTreeMap<(String, String, i64), FileHistoryDescriptorRow> =
         BTreeMap::new();
@@ -1407,7 +1549,15 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     )
     .await?;
     let prepared = preprocessed.require_single_statement("history-slice plugin state lookup")?;
-    let rows = backend.execute(&prepared.sql, &prepared.params).await?;
+    let rows = backend
+        .execute(&prepared.sql, &prepared.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "history-slice plugin state lookup failed: {} | sql: {}",
+                error.message, prepared.sql
+            ),
+        })?;
 
     let mut changes = Vec::new();
     let mut previous_entity_id: Option<String> = None;

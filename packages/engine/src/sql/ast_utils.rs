@@ -291,9 +291,9 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use crate::sql::{
-        default_alias, object_name_matches, parse_single_query, parse_single_query_with_dialect,
-        rewrite_query_selects, rewrite_table_factors_in_select_decision, visit_query_selects,
-        visit_table_factors_in_select, RewriteDecision,
+        default_alias, object_name_matches, parse_single_query_with_dialect, rewrite_query_selects,
+        rewrite_table_factors_in_select_decision, visit_query_selects, visit_table_factors_in_select,
+        RewriteDecision,
     };
     use crate::SqlDialect;
 
@@ -314,7 +314,8 @@ mod tests {
             if !object_name_matches(name, "foo") {
                 return Ok(RewriteDecision::Unchanged);
             }
-            let derived_query = parse_single_query("SELECT 1 AS id")?;
+            let derived_query =
+                parse_single_query_with_dialect("SELECT 1 AS id", SqlDialect::Sqlite)?;
             let derived_alias = alias.clone().or_else(|| Some(default_alias("foo")));
             *relation = TableFactor::Derived {
                 lateral: false,

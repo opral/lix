@@ -1,6 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::sql::{
+    ensure_history_timeline_materialized_for_root,
     ensure_history_timeline_materialized_for_statement_with_state,
     parse_sql_statements_with_dialect, PlaceholderState, PreparedStatement,
     ReadMaintenanceRequirements, FileReadMaterializationScope,
@@ -8,10 +9,8 @@ use crate::sql::{
 use crate::SqlDialect;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const UPDATE_ROW_FILE_ID_INDEX: usize = 1;
 const UPDATE_ROW_VERSION_ID_INDEX: usize = 2;
 const UPDATE_ROW_SNAPSHOT_CONTENT_INDEX: usize = 5;
-const DELETE_ROW_FILE_ID_INDEX: usize = 1;
 const DELETE_ROW_VERSION_ID_INDEX: usize = 2;
 
 #[derive(Debug, Clone)]
@@ -28,7 +27,14 @@ impl Engine {
         prepared_statements: &[PreparedStatement],
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        if requirements.requires_history_timeline_materialization {
+        let requires_history_maintenance = requirements.requires_history_timeline_materialization
+            || prepared_statements.iter().any(|prepared| {
+                prepared
+                    .sql
+                    .to_ascii_lowercase()
+                    .contains("lix_state_history")
+            });
+        if requires_history_maintenance {
             for prepared in prepared_statements {
                 let statements =
                     parse_sql_statements_with_dialect(&prepared.sql, backend.dialect())?;
@@ -61,6 +67,12 @@ impl Engine {
             .await?;
         }
         if requirements.requires_file_history_materialization {
+            let root_commit_ids = self
+                .resolve_history_roots_for_active_version(backend, active_version_id)
+                .await?;
+            for root_commit_id in root_commit_ids {
+                ensure_history_timeline_materialized_for_root(backend, &root_commit_id, 512).await?;
+            }
             crate::plugin::runtime::materialize_missing_file_history_data_with_plugins(
                 backend,
                 self.wasm_runtime.as_ref(),
@@ -68,6 +80,77 @@ impl Engine {
             .await?;
         }
         Ok(())
+    }
+
+    async fn resolve_commit_id_for_active_version(
+        &self,
+        backend: &dyn LixBackend,
+        active_version_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        let (id_extract, commit_extract): (&str, &str) = match backend.dialect() {
+            crate::SqlDialect::Sqlite => (
+                "json_extract(snapshot_content, '$.\"id\"')",
+                "json_extract(snapshot_content, '$.\"commit_id\"')",
+            ),
+            crate::SqlDialect::Postgres => (
+                "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'id')",
+                "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'commit_id')",
+            ),
+        };
+        let sql = format!(
+            "SELECT \
+               {commit_extract} AS commit_id \
+             FROM lix_internal_state_materialized_v1_lix_version_pointer \
+             WHERE schema_key = 'lix_version_pointer' \
+               AND version_id = 'global' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+               AND {id_extract} = $1 \
+             LIMIT 1",
+            commit_extract = commit_extract,
+            id_extract = id_extract,
+        );
+        let rows = backend
+            .execute(&sql, &[Value::Text(active_version_id.to_string())])
+            .await?;
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(value_as_text_column)
+            )
+    }
+
+    async fn resolve_history_roots_for_active_version(
+        &self,
+        backend: &dyn LixBackend,
+        active_version_id: &str,
+    ) -> Result<Vec<String>, LixError> {
+        let Some(active_commit_id) = self
+            .resolve_commit_id_for_active_version(backend, active_version_id)
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let ancestry_rows = backend
+            .execute(
+                "SELECT ancestor_id \
+                 FROM lix_internal_commit_ancestry \
+                 WHERE commit_id = $1 \
+                 ORDER BY depth ASC",
+                &[Value::Text(active_commit_id.clone())],
+            )
+            .await?;
+        let mut roots = ancestry_rows
+            .rows
+            .iter()
+            .filter_map(|row| row.first().and_then(value_as_text_column))
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            roots.push(active_commit_id);
+        }
+        Ok(roots)
     }
 
     pub(crate) async fn maybe_refresh_working_change_projection_for_read_query(
@@ -214,9 +297,8 @@ impl Engine {
                 .collect::<Vec<_>>();
             let sql = format!(
                 "SELECT entity_id, version_id, snapshot_content \
-                 FROM lix_internal_state_vtable \
+                 FROM lix_internal_state_materialized_v1_lix_file_descriptor \
                  WHERE schema_key = '{schema_key}' \
-                   AND untracked = 0 \
                    AND ({predicates}) \
                  ORDER BY entity_id, version_id, updated_at DESC",
                 schema_key = FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -251,7 +333,12 @@ impl Engine {
                 }
                 let state = match value_as_optional_text_column(snapshot_cell)? {
                     Some(snapshot_content) => FileDescriptorExecutionState::Live {
-                        path: extract_path_from_file_descriptor_snapshot(&snapshot_content)?,
+                        path: extract_path_from_file_descriptor_snapshot_with_backend(
+                            backend,
+                            &version_id,
+                            &snapshot_content,
+                        )
+                        .await?,
                     },
                     None => FileDescriptorExecutionState::Tombstone,
                 };
@@ -294,7 +381,13 @@ impl Engine {
             let Some(snapshot_content) = value_as_optional_text_column(snapshot_cell)? else {
                 continue;
             };
-            let Some(path) = extract_path_from_file_descriptor_snapshot(&snapshot_content)? else {
+            let Some(path) = extract_path_from_file_descriptor_snapshot_with_backend(
+                backend,
+                &version_id,
+                &snapshot_content,
+            )
+            .await?
+            else {
                 continue;
             };
             for ancestor in crate::filesystem::path::file_ancestor_directory_paths(&path) {
@@ -349,11 +442,11 @@ impl Engine {
         let mut writes_by_target = BTreeMap::<(String, String), Option<String>>::new();
         for row in rows {
             let Some(file_id) = row
-                .get(UPDATE_ROW_FILE_ID_INDEX)
+                .first()
                 .and_then(value_as_text_column)
             else {
                 return Err(LixError {
-                    message: "filesystem update side-effect row missing text file_id at index 1"
+                    message: "filesystem update side-effect row missing text entity_id at index 0"
                         .to_string(),
                 });
             };
@@ -373,12 +466,17 @@ impl Engine {
                             .to_string(),
                 });
             };
-            let after_path = value_as_optional_text_column(snapshot_cell)?
-                .map(|snapshot_content| {
-                    extract_path_from_file_descriptor_snapshot(&snapshot_content)
-                })
-                .transpose()?
-                .flatten();
+            let after_path = match value_as_optional_text_column(snapshot_cell)? {
+                Some(snapshot_content) => {
+                    extract_path_from_file_descriptor_snapshot_with_backend(
+                        backend,
+                        &version_id,
+                        &snapshot_content,
+                    )
+                    .await?
+                }
+                None => None,
+            };
             writes_by_target.insert((file_id, version_id), after_path);
         }
 
@@ -399,17 +497,26 @@ impl Engine {
             .await?;
 
         let mut writes = Vec::with_capacity(writes_by_target.len());
+        let mut latest_path_by_file_id = BTreeMap::<String, Option<String>>::new();
         for ((file_id, version_id), after_path) in writes_by_target {
             let before_data_cell = before_data
                 .get(&(file_id.clone(), version_id.clone()))
                 .cloned();
+            let key = (file_id.clone(), version_id.clone());
+            let before_path = if let Some(path) = before_paths.get(&key).cloned() {
+                Some(path)
+            } else if let Some(cached) = latest_path_by_file_id.get(&file_id) {
+                cached.clone()
+            } else {
+                let loaded = load_latest_file_path_from_cache(backend, &file_id).await?;
+                latest_path_by_file_id.insert(file_id.clone(), loaded.clone());
+                loaded
+            };
             writes.push(crate::filesystem::pending_file_writes::PendingFileWrite {
                 file_id: file_id.clone(),
                 version_id: version_id.clone(),
-                before_path: before_paths
-                    .get(&(file_id.clone(), version_id.clone()))
-                    .cloned(),
-                after_path,
+                before_path: before_path.clone(),
+                after_path: after_path.or(before_path),
                 data_is_authoritative: false,
                 before_data: before_data_cell.clone(),
                 after_data: before_data_cell.unwrap_or_default(),
@@ -437,11 +544,11 @@ impl Engine {
         let mut writes_by_target = BTreeMap::<(String, String), Option<String>>::new();
         for row in rows {
             let Some(file_id) = row
-                .get(UPDATE_ROW_FILE_ID_INDEX)
+                .first()
                 .and_then(value_as_text_column)
             else {
                 return Err(LixError {
-                    message: "filesystem update side-effect row missing text file_id at index 1"
+                    message: "filesystem update side-effect row missing text entity_id at index 0"
                         .to_string(),
                 });
             };
@@ -461,12 +568,17 @@ impl Engine {
                             .to_string(),
                 });
             };
-            let after_path = value_as_optional_text_column(snapshot_cell)?
-                .map(|snapshot_content| {
-                    extract_path_from_file_descriptor_snapshot(&snapshot_content)
-                })
-                .transpose()?
-                .flatten();
+            let after_path = match value_as_optional_text_column(snapshot_cell)? {
+                Some(snapshot_content) => {
+                    extract_path_from_file_descriptor_snapshot_with_backend(
+                        backend,
+                        &version_id,
+                        &snapshot_content,
+                    )
+                    .await?
+                }
+                None => None,
+            };
             writes_by_target.insert((file_id, version_id), after_path);
         }
 
@@ -487,6 +599,7 @@ impl Engine {
             .await?;
 
         let mut writes = Vec::new();
+        let mut latest_path_by_file_id = BTreeMap::<String, Option<String>>::new();
         for ((file_id, version_id), after_path) in writes_by_target {
             let after_data = match assignment {
                 crate::sql::FileDataAssignmentPlan::Uniform(bytes) => Some(bytes.clone()),
@@ -498,11 +611,20 @@ impl Engine {
                 continue;
             };
             let key = (file_id.clone(), version_id.clone());
+            let before_path = if let Some(path) = before_paths.get(&key).cloned() {
+                Some(path)
+            } else if let Some(cached) = latest_path_by_file_id.get(&file_id) {
+                cached.clone()
+            } else {
+                let loaded = load_latest_file_path_from_cache(backend, &file_id).await?;
+                latest_path_by_file_id.insert(file_id.clone(), loaded.clone());
+                loaded
+            };
             writes.push(crate::filesystem::pending_file_writes::PendingFileWrite {
                 file_id,
                 version_id,
-                before_path: before_paths.get(&key).cloned(),
-                after_path,
+                before_path: before_path.clone(),
+                after_path: after_path.or(before_path),
                 data_is_authoritative: true,
                 before_data: before_data.get(&key).cloned(),
                 after_data,
@@ -531,11 +653,11 @@ impl Engine {
         let mut targets = BTreeSet::<(String, String)>::new();
         for row in rows {
             let Some(file_id) = row
-                .get(DELETE_ROW_FILE_ID_INDEX)
+                .first()
                 .and_then(value_as_text_column)
             else {
                 return Err(LixError {
-                    message: "filesystem delete side-effect row missing text file_id at index 1"
+                    message: "filesystem delete side-effect row missing text entity_id at index 0"
                         .to_string(),
                 });
             };
@@ -1032,7 +1154,9 @@ fn value_as_optional_text_column(value: &Value) -> Result<Option<String>, LixErr
     }
 }
 
-fn extract_path_from_file_descriptor_snapshot(
+async fn extract_path_from_file_descriptor_snapshot_with_backend(
+    backend: &dyn LixBackend,
+    version_id: &str,
     snapshot_content: &str,
 ) -> Result<Option<String>, LixError> {
     let parsed: serde_json::Value =
@@ -1041,11 +1165,192 @@ fn extract_path_from_file_descriptor_snapshot(
                 "filesystem update side-effect snapshot_content is invalid JSON: {error}"
             ),
         })?;
-    let Some(path) = parsed.get("path").and_then(serde_json::Value::as_str) else {
+    if let Some(path) = parsed.get("path").and_then(serde_json::Value::as_str) {
+        let normalized = crate::filesystem::path::normalize_file_path(path)?;
+        return Ok(Some(normalized));
+    }
+
+    let Some(name) = parsed
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(None);
     };
-    let normalized = crate::filesystem::path::normalize_file_path(path)?;
+    let extension = parsed
+        .get("extension")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty());
+    let file_name = match extension {
+        Some(extension) => format!("{name}.{extension}"),
+        None => name.to_string(),
+    };
+
+    let directory_path = if let Some(directory_path) =
+        parsed.get("directory_path").and_then(serde_json::Value::as_str)
+    {
+        Some(directory_path.to_string())
+    } else if let Some(directory_id) = parsed
+        .get("directory_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        load_directory_path_for_id_with_backend(backend, directory_id, version_id).await?
+    } else {
+        Some("/".to_string())
+    };
+
+    let raw_path = if let Some(directory_path) = directory_path {
+        if directory_path == "/" {
+            format!("/{file_name}")
+        } else if directory_path.ends_with('/') {
+            format!("{directory_path}{file_name}")
+        } else {
+            format!("{directory_path}/{file_name}")
+        }
+    } else {
+        format!("/{file_name}")
+    };
+    let normalized = crate::filesystem::path::normalize_file_path(&raw_path)?;
     Ok(Some(normalized))
+}
+
+async fn load_directory_path_for_id_with_backend(
+    backend: &dyn LixBackend,
+    directory_id: &str,
+    version_id: &str,
+) -> Result<Option<String>, LixError> {
+    let mut segments = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut current_directory_id = Some(directory_id.to_string());
+
+    while let Some(current) = current_directory_id {
+        if !visited.insert(current.clone()) {
+            return Err(LixError {
+                message: format!(
+                    "filesystem update side-effect detected directory cycle for id '{}'",
+                    current
+                ),
+            });
+        }
+
+        let Some((name, parent_id)) =
+            load_directory_name_and_parent_for_version_with_backend(backend, &current, version_id)
+                .await?
+        else {
+            return Ok(None);
+        };
+        segments.push(name);
+        current_directory_id = parent_id;
+    }
+
+    if segments.is_empty() {
+        return Ok(Some("/".to_string()));
+    }
+    segments.reverse();
+    let raw = format!("/{}/", segments.join("/"));
+    let normalized = crate::filesystem::path::normalize_directory_path(&raw)?;
+    Ok(Some(normalized))
+}
+
+async fn load_directory_name_and_parent_for_version_with_backend(
+    backend: &dyn LixBackend,
+    directory_id: &str,
+    version_id: &str,
+) -> Result<Option<(String, Option<String>)>, LixError> {
+    async fn load_snapshot(
+        backend: &dyn LixBackend,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<String>, LixError> {
+        let result = backend.execute(sql, params).await?;
+        Ok(result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(value_as_text_column))
+    }
+
+    let exact_sql =
+        "SELECT snapshot_content \
+         FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
+         WHERE schema_key = 'lix_directory_descriptor' \
+           AND entity_id = $1 \
+           AND version_id = $2 \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC \
+         LIMIT 1";
+    let latest_sql =
+        "SELECT snapshot_content \
+         FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
+         WHERE schema_key = 'lix_directory_descriptor' \
+           AND entity_id = $1 \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY version_id DESC, updated_at DESC \
+         LIMIT 1";
+
+    let raw_snapshot = if let Some(snapshot) = load_snapshot(
+        backend,
+        exact_sql,
+        &[
+            Value::Text(directory_id.to_string()),
+            Value::Text(version_id.to_string()),
+        ],
+    )
+    .await?
+    {
+        snapshot
+    } else if let Some(snapshot) =
+        load_snapshot(backend, latest_sql, &[Value::Text(directory_id.to_string())])
+            .await?
+    {
+        snapshot
+    } else {
+        return Ok(None);
+    };
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw_snapshot).map_err(|error| LixError {
+            message: format!(
+                "filesystem update side-effect directory snapshot is invalid JSON: {error}"
+            ),
+        })?;
+    let Some(name) = parsed
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let parent_id = parsed
+        .get("parent_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Ok(Some((name.to_string(), parent_id)))
+}
+
+async fn load_latest_file_path_from_cache(
+    backend: &dyn LixBackend,
+    file_id: &str,
+) -> Result<Option<String>, LixError> {
+    let result = backend
+        .execute(
+            "SELECT path \
+             FROM lix_internal_file_path_cache \
+             WHERE file_id = $1 \
+             ORDER BY version_id DESC \
+             LIMIT 1",
+            &[Value::Text(file_id.to_string())],
+        )
+        .await?;
+    Ok(result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(value_as_text_column))
 }
 
 fn parse_builtin_binary_blob_ref_snapshot(

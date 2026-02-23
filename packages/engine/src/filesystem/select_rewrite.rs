@@ -28,7 +28,15 @@ pub fn rewrite_query_with_params(
 ) -> Result<Option<Query>, LixError> {
     let mut changed = false;
     let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
+    if let Some(with) = new_query.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            if let Some(rewritten_cte_query) = rewrite_query((*cte.query).clone())? {
+                cte.query = Box::new(rewritten_cte_query);
+                changed = true;
+            }
+        }
+    }
+    new_query.body = Box::new(rewrite_set_expr((*new_query.body).clone(), &mut changed)?);
 
     if changed {
         Ok(Some(new_query))
@@ -46,7 +54,10 @@ fn rewrite_set_expr(expr: SetExpr, changed: &mut bool) -> Result<SetExpr, LixErr
         }
         SetExpr::Query(query) => {
             let mut query = *query;
-            query.body = Box::new(rewrite_set_expr(*query.body, changed)?);
+            if let Some(rewritten_query) = rewrite_query(query.clone())? {
+                query = rewritten_query;
+                *changed = true;
+            }
             SetExpr::Query(Box::new(query))
         }
         SetExpr::SetOperation {
@@ -91,10 +102,15 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
             let Some(source_query) = build_filesystem_projection_query(&view_name)? else {
                 return Ok(());
             };
+            let rewritten_source_query = if let Some(rewritten) = rewrite_query(source_query.clone())? {
+                rewritten
+            } else {
+                source_query
+            };
             let derived_alias = alias.clone().or_else(|| Some(default_alias(&view_name)));
             *relation = TableFactor::Derived {
                 lateral: false,
-                subquery: Box::new(source_query),
+                subquery: Box::new(rewritten_source_query),
                 alias: derived_alias,
             };
             *changed = true;
@@ -190,7 +206,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                COALESCE(fd.data, lix_empty_blob()) AS data, \
+                COALESCE(fd.data, fbv.data, lix_empty_blob()) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -318,14 +334,17 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
             .to_string(),
         FILE_HISTORY_VIEW => "WITH RECURSIVE directory_history_base AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    root_commit_id AS lixcol_root_commit_id, \
-                    depth AS lixcol_depth \
-                 FROM lix_state_history \
-                 WHERE schema_key = 'lix_directory_descriptor' \
-                   AND snapshot_content IS NOT NULL\
+                    lix_json_text(s.content, 'id') AS id, \
+                    lix_json_text(s.content, 'parent_id') AS parent_id, \
+                    lix_json_text(s.content, 'name') AS name, \
+                    bp.root_commit_id AS lixcol_root_commit_id, \
+                    bp.from_depth AS lixcol_depth \
+                 FROM lix_internal_entity_state_timeline_breakpoint bp \
+                 JOIN lix_internal_snapshot s \
+                   ON s.id = bp.snapshot_id \
+                 WHERE bp.schema_key = 'lix_directory_descriptor' \
+                   AND bp.snapshot_id != 'no-content' \
+                   AND s.content IS NOT NULL\
              ), \
              directory_history_path_walk AS (\
                  SELECT \
@@ -382,34 +401,32 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ), \
              file_history_descriptor_rows AS (\
                 SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'extension') AS extension, \
-                    lix_json_text(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
-                    entity_id AS lixcol_entity_id, \
-                    schema_key AS lixcol_schema_key, \
-                    file_id AS lixcol_file_id, \
-                    version_id AS lixcol_version_id, \
-                    plugin_key AS lixcol_plugin_key, \
-                    schema_version AS lixcol_schema_version, \
-                    change_id AS lixcol_change_id, \
-                    metadata AS lixcol_metadata, \
-                    commit_id AS lixcol_commit_id, \
-                    root_commit_id AS lixcol_root_commit_id, \
-                    depth AS lixcol_depth \
-                FROM lix_state_history \
-                WHERE schema_key = 'lix_file_descriptor' \
-                  AND snapshot_content IS NOT NULL\
-             ), \
-             descriptor_depth_zero_roots AS (\
-                SELECT \
-                    id, \
-                    lixcol_root_commit_id \
-                FROM file_history_descriptor_rows \
-                WHERE lixcol_depth = 0 \
-                GROUP BY id, lixcol_root_commit_id\
+                    lix_json_text(s.content, 'id') AS id, \
+                    lix_json_text(s.content, 'directory_id') AS directory_id, \
+                    lix_json_text(s.content, 'name') AS name, \
+                    lix_json_text(s.content, 'extension') AS extension, \
+                    lix_json_text(s.content, 'metadata') AS metadata, \
+                    lix_json_text(s.content, 'hidden') AS hidden, \
+                    bp.entity_id AS lixcol_entity_id, \
+                    bp.schema_key AS lixcol_schema_key, \
+                    bp.file_id AS lixcol_file_id, \
+                    'global' AS lixcol_version_id, \
+                    bp.plugin_key AS lixcol_plugin_key, \
+                    bp.schema_version AS lixcol_schema_version, \
+                    bp.change_id AS lixcol_change_id, \
+                    bp.metadata AS lixcol_metadata, \
+                    ancestry.ancestor_id AS lixcol_commit_id, \
+                    bp.root_commit_id AS lixcol_root_commit_id, \
+                    bp.from_depth AS lixcol_depth \
+                FROM lix_internal_entity_state_timeline_breakpoint bp \
+                JOIN lix_internal_commit_ancestry ancestry \
+                  ON ancestry.commit_id = bp.root_commit_id \
+                 AND ancestry.depth = bp.from_depth \
+                JOIN lix_internal_snapshot s \
+                  ON s.id = bp.snapshot_id \
+                WHERE bp.schema_key = 'lix_file_descriptor' \
+                  AND bp.snapshot_id != 'no-content' \
+                  AND s.content IS NOT NULL\
              ), \
              content_only_roots AS (\
                 SELECT \
@@ -427,18 +444,27 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             PARTITION BY sh.file_id, sh.root_commit_id \
                             ORDER BY ic.created_at DESC, sh.change_id DESC\
                         ) AS row_num \
-                    FROM lix_state_history sh \
+                    FROM (\
+                        SELECT \
+                            bp.file_id AS file_id, \
+                            bp.root_commit_id AS root_commit_id, \
+                            ancestry.ancestor_id AS commit_id, \
+                            bp.change_id AS change_id, \
+                            bp.schema_key AS schema_key, \
+                            bp.snapshot_id AS snapshot_id, \
+                            bp.from_depth AS depth \
+                        FROM lix_internal_entity_state_timeline_breakpoint bp \
+                        JOIN lix_internal_commit_ancestry ancestry \
+                          ON ancestry.commit_id = bp.root_commit_id \
+                         AND ancestry.depth = bp.from_depth\
+                    ) sh \
                     JOIN lix_internal_change ic \
                       ON ic.id = sh.change_id \
-                    LEFT JOIN descriptor_depth_zero_roots d0 \
-                      ON d0.id = sh.file_id \
-                     AND d0.lixcol_root_commit_id = sh.root_commit_id \
                     WHERE sh.depth = 0 \
                       AND sh.file_id IS NOT NULL \
                       AND sh.file_id != 'lix' \
                       AND sh.schema_key != 'lix_file_descriptor' \
-                      AND sh.snapshot_content IS NOT NULL \
-                      AND d0.id IS NULL\
+                      AND sh.snapshot_id != 'no-content'\
                 ) ranked \
                 WHERE ranked.row_num = 1\
              ), \
@@ -472,10 +498,36 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                         AND candidate.lixcol_root_commit_id = c.lixcol_root_commit_id\
                  )\
              ), \
+             content_history_rows_fallback AS (\
+                SELECT \
+                    fbv.id, \
+                    fbv.directory_id, \
+                    fbv.name, \
+                    fbv.extension, \
+                    fbv.metadata, \
+                    fbv.hidden, \
+                    fbv.lixcol_entity_id, \
+                    fbv.lixcol_schema_key, \
+                    fbv.lixcol_file_id, \
+                    fbv.lixcol_version_id, \
+                    fbv.lixcol_plugin_key, \
+                    fbv.lixcol_schema_version, \
+                    c.lixcol_change_id, \
+                    fbv.lixcol_metadata, \
+                    c.lixcol_commit_id, \
+                    c.lixcol_root_commit_id, \
+                    0 AS lixcol_depth \
+                FROM content_only_roots c \
+                JOIN lix_file_by_version fbv \
+                  ON fbv.id = c.id \
+                 AND fbv.lixcol_commit_id = c.lixcol_commit_id\
+             ), \
              file_history_rows AS (\
                 SELECT * FROM file_history_descriptor_rows \
                 UNION ALL \
-                SELECT * FROM content_history_rows\
+                SELECT * FROM content_history_rows \
+                UNION ALL \
+                SELECT * FROM content_history_rows_fallback\
              ), \
              file_history_ranked_rows AS (\
                 SELECT \
@@ -545,6 +597,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                     AND candidate.lixcol_root_commit_id = f.lixcol_root_commit_id \
                     AND candidate.lixcol_depth >= f.lixcol_raw_depth\
               ) \
+             LEFT JOIN lix_file_by_version fbv \
+               ON fbv.id = f.id \
+              AND fbv.lixcol_commit_id = f.lixcol_commit_id \
              LEFT JOIN lix_internal_file_history_data_cache fd \
                ON fd.file_id = f.id \
               AND fd.root_commit_id = f.lixcol_root_commit_id \

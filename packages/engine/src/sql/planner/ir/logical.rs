@@ -205,7 +205,8 @@ impl LogicalStatementPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parse_sql_statements_with_dialect, LixError, SqlDialect};
+    use crate::{LixError, SqlDialect};
+    use crate::sql::parse_sql_statements_with_dialect;
 
     fn statement_from_sql(sql: &str) -> Statement {
         let mut statements =

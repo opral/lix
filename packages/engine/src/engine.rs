@@ -563,9 +563,11 @@ mod tests {
                     rows: vec![vec![Value::Text(snapshot)]],
                 });
             }
-            if sql.contains("FROM lix_internal_state_vtable")
+            if (sql.contains("FROM lix_internal_state_vtable")
                 && sql.contains("schema_key = 'lix_file_descriptor'")
-                && sql.contains("untracked = 0")
+                && sql.contains("untracked = 0"))
+                || (sql.contains("FROM lix_internal_state_materialized_v1_lix_file_descriptor")
+                    && sql.contains("schema_key = 'lix_file_descriptor'"))
             {
                 let rows = self
                     .file_descriptor_execution_rows

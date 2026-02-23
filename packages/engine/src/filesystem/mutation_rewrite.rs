@@ -379,17 +379,6 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
     }
     reject_immutable_id_update(&update, target)?;
 
-    if target.is_file {
-        update.assignments.retain(|assignment| {
-            assignment_target_name(assignment)
-                .map(|name| !name.eq_ignore_ascii_case("data"))
-                .unwrap_or(true)
-        });
-        if update.assignments.is_empty() {
-            return Ok(Some(noop_statement()?));
-        }
-    }
-
     replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
     Ok(Some(Statement::Update(update)))
 }
@@ -411,14 +400,6 @@ pub async fn rewrite_update_with_backend(
 
     if target.is_file {
         let original_assignments = update.assignments.clone();
-        update.assignments.retain(|assignment| {
-            assignment_target_name(assignment)
-                .map(|name| !name.eq_ignore_ascii_case("data"))
-                .unwrap_or(true)
-        });
-        if update.assignments.is_empty() {
-            return Ok(Some(noop_statement()?));
-        }
         rewrite_file_update_assignments_with_backend(
             backend,
             &mut update,

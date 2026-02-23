@@ -4,6 +4,7 @@ use super::super::super::*;
 use super::super::execute_prepared_with_transaction;
 use crate::sql::{
     compile_statement_with_state, load_planner_catalog_snapshot,
+    load_effective_scope_update_rows_for_postprocess,
     parse_sql_statements_with_dialect, prepare_statement_block_with_transaction_flag,
     PlaceholderState, PlannerCatalogSnapshot, StatementBlock,
 };
@@ -257,6 +258,21 @@ impl Engine {
                 let result =
                     execute_prepared_with_transaction(transaction, &output.prepared_statements)
                         .await?;
+                let postprocess_rows = match &postprocess_plan {
+                    PostprocessPlan::VtableUpdate(plan) if result.rows.is_empty() => {
+                        let update_params = single_prepared_statement_params(
+                            &output.prepared_statements,
+                            "update effective scope fallback",
+                        )?;
+                        load_effective_scope_update_rows_for_postprocess(
+                            transaction,
+                            plan,
+                            update_params,
+                        )
+                        .await?
+                    }
+                    _ => result.rows.clone(),
+                };
                 if !skip_side_effect_collection && !read_only_query {
                     match &postprocess_plan {
                         PostprocessPlan::VtableUpdate(plan) => {
@@ -270,14 +286,14 @@ impl Engine {
                                     .collect_filesystem_update_pending_file_writes_from_update_rows(
                                         &backend,
                                         &plan.schema_key,
-                                        &result.rows,
+                                        &postprocess_rows,
                                     )
                                     .await?;
                                 let (tracked_update_changes, untracked_update_changes) = self
                                     .collect_filesystem_update_detected_file_domain_changes_from_update_rows(
                                         &backend,
                                         &plan.schema_key,
-                                        &result.rows,
+                                        &postprocess_rows,
                                         writer_key,
                                     )
                                     .await?;
@@ -320,7 +336,7 @@ impl Engine {
                                     &backend,
                                     &plan.schema_key,
                                     plan.file_data_assignment.as_ref(),
-                                    &result.rows,
+                                    &postprocess_rows,
                                 )
                                 .await?
                             };
@@ -397,7 +413,7 @@ impl Engine {
                         if should_refresh_file_cache {
                             postprocess_file_cache_targets.extend(
                                 collect_postprocess_file_cache_targets(
-                                    &result.rows,
+                                    &postprocess_rows,
                                     &plan.schema_key,
                                 )?,
                             );
@@ -407,7 +423,7 @@ impl Engine {
                         if should_refresh_file_cache {
                             postprocess_file_cache_targets.extend(
                                 collect_postprocess_file_cache_targets(
-                                    &result.rows,
+                                    &postprocess_rows,
                                     &plan.schema_key,
                                 )?,
                             );
@@ -431,7 +447,7 @@ impl Engine {
                         build_update_followup_sql(
                             transaction,
                             &plan,
-                            &result.rows,
+                            &postprocess_rows,
                             &detected_file_domain_changes,
                             writer_key,
                             &mut followup_functions,
@@ -446,7 +462,7 @@ impl Engine {
                         build_delete_followup_sql(
                             transaction,
                             &plan,
-                            &result.rows,
+                            &postprocess_rows,
                             followup_params,
                             &detected_file_domain_changes,
                             writer_key,

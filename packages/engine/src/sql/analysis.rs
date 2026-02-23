@@ -9,7 +9,7 @@ use sqlparser::ast::{
     TableFactor, TableWithJoins,
 };
 #[cfg(test)]
-use sqlparser::ast::{Query, Select, SetExpr, TableFactor, Update, UpdateTableFromKind};
+use sqlparser::ast::{Query, Select, SetExpr, Update, UpdateTableFromKind};
 #[cfg(test)]
 use crate::sql::{expr_references_column_name, ColumnReferenceOptions};
 

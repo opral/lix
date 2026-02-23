@@ -369,6 +369,7 @@ pub fn rewrite_update(
     })?;
 
     let schema_key = extract_single_schema_key(&stripped_selection)?;
+    let effective_scope_selection_sql = Some(stripped_selection.to_string());
     let writer_key_assignment_present = update
         .assignments
         .iter()
@@ -393,6 +394,8 @@ pub fn rewrite_update(
         statement: Statement::Update(new_update),
         plan: VtableUpdatePlan {
             schema_key,
+            effective_scope_fallback: true,
+            effective_scope_selection_sql,
             explicit_writer_key,
             writer_key_assignment_present,
             file_data_assignment,
@@ -530,6 +533,15 @@ pub async fn build_update_followup_sql(
     )
     .await?;
     bind_statement_batch_for_dialect(batch, executor.dialect())
+}
+
+pub async fn load_effective_scope_update_rows_for_postprocess(
+    transaction: &mut dyn LixTransaction,
+    plan: &VtableUpdatePlan,
+    params: &[EngineValue],
+) -> Result<Vec<Vec<EngineValue>>, LixError> {
+    let mut executor = TransactionExecutor { transaction };
+    load_effective_scope_update_rows(&mut executor, plan, params).await
 }
 
 pub async fn build_delete_followup_sql(
@@ -1768,6 +1780,120 @@ async fn load_effective_scope_delete_rows(
     Ok(resolved)
 }
 
+async fn load_effective_scope_update_rows(
+    executor: &mut dyn SqlExecutor,
+    plan: &VtableUpdatePlan,
+    params: &[EngineValue],
+) -> Result<Vec<Vec<EngineValue>>, LixError> {
+    if !plan.effective_scope_fallback {
+        return Ok(Vec::new());
+    }
+    let Some(selection_sql) = plan.effective_scope_selection_sql.as_deref() else {
+        return Ok(Vec::new());
+    };
+
+    let schema_table = quote_ident(&format!("{MATERIALIZED_PREFIX}{}", plan.schema_key));
+    let descriptor_table = quote_ident(&format!(
+        "{MATERIALIZED_PREFIX}{}",
+        version_descriptor_schema_key()
+    ));
+    let sql = format!(
+        "WITH RECURSIVE \
+           version_descriptor AS ( \
+             SELECT \
+               {descriptor_id_expr} AS version_id, \
+               {descriptor_parent_expr} AS inherits_from_version_id \
+             FROM {descriptor_table} \
+             WHERE schema_key = '{descriptor_schema_key}' \
+               AND file_id = '{descriptor_file_id}' \
+               AND version_id = '{descriptor_storage_version_id}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           all_target_versions AS ( \
+             SELECT DISTINCT version_id FROM {schema_table} \
+             UNION \
+             SELECT DISTINCT version_id FROM version_descriptor \
+           ), \
+           version_chain(target_version_id, ancestor_version_id, depth) AS ( \
+             SELECT version_id AS target_version_id, version_id AS ancestor_version_id, 0 AS depth \
+             FROM all_target_versions \
+             UNION ALL \
+             SELECT \
+               vc.target_version_id, \
+               vd.inherits_from_version_id AS ancestor_version_id, \
+               vc.depth + 1 AS depth \
+             FROM version_chain vc \
+             JOIN version_descriptor vd ON vd.version_id = vc.ancestor_version_id \
+             WHERE vd.inherits_from_version_id IS NOT NULL \
+               AND vc.depth < 64 \
+           ), \
+           ranked AS ( \
+             SELECT \
+               s.entity_id AS entity_id, \
+               s.file_id AS file_id, \
+               vc.target_version_id AS version_id, \
+               s.plugin_key AS plugin_key, \
+               s.schema_version AS schema_version, \
+               s.snapshot_content AS snapshot_content, \
+               s.metadata AS metadata, \
+               s.writer_key AS writer_key, \
+               s.updated_at AS updated_at, \
+               '{schema_key}' AS schema_key, \
+               0 AS untracked, \
+               CASE \
+                 WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
+                 WHEN vc.depth = 0 THEN NULL \
+                 ELSE s.version_id \
+               END AS inherited_from_version_id, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY vc.target_version_id, s.entity_id, s.file_id \
+                 ORDER BY vc.depth ASC \
+               ) AS rn \
+             FROM {schema_table} s \
+             JOIN version_chain vc ON vc.ancestor_version_id = s.version_id \
+           ) \
+         SELECT \
+           entity_id, \
+           file_id, \
+           version_id, \
+           plugin_key, \
+           schema_version, \
+           snapshot_content, \
+           metadata, \
+           writer_key, \
+           updated_at \
+         FROM ranked \
+         WHERE rn = 1 \
+           AND snapshot_content IS NOT NULL \
+           AND ({selection_sql}) \
+           AND untracked = 0",
+        descriptor_table = descriptor_table,
+        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
+        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
+        schema_table = schema_table,
+        schema_key = escape_sql_string(&plan.schema_key),
+        descriptor_id_expr = json_text_expr_sql("snapshot_content", "id", executor.dialect()),
+        descriptor_parent_expr = json_text_expr_sql(
+            "snapshot_content",
+            "inherits_from_version_id",
+            executor.dialect(),
+        ),
+    );
+    let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
+    let result = executor.execute(&bound.sql, &bound.params).await?;
+
+    for row in &result.rows {
+        if row.len() < UPDATE_RETURNING_COLUMNS.len() {
+            return Err(LixError {
+                message: "effective scope update row loader expected nine columns".to_string(),
+            });
+        }
+    }
+    Ok(result.rows)
+}
+
 async fn load_cascaded_file_delete_changes(
     executor: &mut dyn SqlExecutor,
     directory_scopes: &[(String, String)],
@@ -1866,6 +1992,7 @@ fn json_text_expr_sql(column: &str, field: &str, dialect: SqlDialect) -> String 
 fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
     assignments
         .into_iter()
+        .filter(|assignment| !assignment_target_is_column(&assignment.target, "data"))
         .filter(|assignment| !assignment_target_is_untracked(&assignment.target))
         .filter(|assignment| !assignment_target_is_column(&assignment.target, "updated_at"))
         .filter(|assignment| !assignment_target_is_column(&assignment.target, "change_id"))
@@ -2303,8 +2430,8 @@ fn build_commit_ancestry_parent_insert_statement(
         body: Box::new(SetExpr::SetOperation {
             op: SetOperator::Union,
             set_quantifier: SetQuantifier::All,
-            left: Box::new(SetExpr::Query(Box::new(candidate_seed))),
-            right: Box::new(SetExpr::Query(Box::new(candidate_recursive))),
+            left: candidate_seed.body,
+            right: candidate_recursive.body,
         }),
         order_by: None,
         limit_clause: None,

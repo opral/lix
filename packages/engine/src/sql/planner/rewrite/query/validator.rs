@@ -105,18 +105,22 @@ fn validate_materialized_state_semantics(query: &Query) -> Result<(), LixError> 
                 });
             }
 
-            let has_snapshot_filter = predicates.iter().any(|predicate| {
-                expr_contains_snapshot_content_not_null_filter(predicate, Some(&relation.qualifier))
-                    || (allow_unqualified
+            if requires_snapshot_content_not_null_filter(&relation.expected_schema_key) {
+                let has_snapshot_filter = predicates.iter().any(|predicate| {
+                    expr_contains_snapshot_content_not_null_filter(
+                        predicate,
+                        Some(&relation.qualifier),
+                    ) || (allow_unqualified
                         && expr_contains_snapshot_content_not_null_filter(predicate, None))
-            });
-            if !has_snapshot_filter {
-                return Err(LixError {
-                    message: format!(
-                        "read rewrite produced materialized relation '{}' without snapshot_content IS NOT NULL filter",
-                        relation.display_name
-                    ),
                 });
+                if !has_snapshot_filter {
+                    return Err(LixError {
+                        message: format!(
+                            "read rewrite produced materialized relation '{}' without snapshot_content IS NOT NULL filter",
+                            relation.display_name
+                        ),
+                    });
+                }
             }
         }
 
@@ -180,6 +184,11 @@ fn materialized_schema_key_for_table_name(base_name: &str) -> Option<String> {
         return None;
     }
     Some(lowercase[MATERIALIZED_STATE_TABLE_PREFIX.len()..].to_string())
+}
+
+fn requires_snapshot_content_not_null_filter(schema_key: &str) -> bool {
+    !schema_key.eq_ignore_ascii_case("lix_change")
+        && !schema_key.eq_ignore_ascii_case("lix_commit")
 }
 
 fn object_name_last_identifier(name: &ObjectName) -> Option<String> {
@@ -487,8 +496,19 @@ fn validate_placeholder_mapping_contract(query: &Query) -> Result<(), LixError> 
                 return ControlFlow::Continue(());
             };
             let trimmed = token.trim();
-            if trimmed == "?" {
-                self.has_bare = true;
+            if let Some(rest) = trimmed.strip_prefix('?') {
+                if rest.is_empty() {
+                    self.has_bare = true;
+                } else {
+                    match rest.parse::<usize>() {
+                        Ok(index) if index > 0 => {
+                            self.has_numbered = true;
+                        }
+                        _ => {
+                            self.invalid_tokens.insert(trimmed.to_string());
+                        }
+                    }
+                }
                 return ControlFlow::Continue(());
             }
             if let Some(rest) = trimmed.strip_prefix('$') {

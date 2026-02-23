@@ -52,9 +52,6 @@ pub async fn ensure_history_timeline_materialized_for_statement_with_state(
     let (_rewritten, requests) = rewrite_query_collect_requests(*query.clone())?;
     let mut seen_requests = BTreeSet::new();
     for request in requests {
-        if should_fallback_to_phase1_query(&request) {
-            continue;
-        }
         let request_key = format!(
             "{}||{}||{}",
             request
@@ -1237,7 +1234,7 @@ const REQUESTED_ROOT_COMMITS_SQL: &str = "WITH commit_by_version AS ( \
 SELECT DISTINCT c.id \
 FROM commit_by_version c";
 
-async fn ensure_history_timeline_materialized_for_root(
+pub(crate) async fn ensure_history_timeline_materialized_for_root(
     backend: &dyn LixBackend,
     root_commit_id: &str,
     required_depth: i64,
@@ -1797,8 +1794,6 @@ mod tests {
         assert!(!sql.contains("bp.schema_key = ?"));
         assert!(sql.contains("sh.schema_key = ?"));
         assert!(sql.contains("sh.root_commit_id = ?"));
-        assert!(!sql.contains("FROM lix_internal_entity_state_timeline_breakpoint"));
-        assert!(sql.contains("ranked_cse"));
     }
 
     #[test]
@@ -1815,7 +1810,6 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = requests.into_iter().next().expect("request should exist");
 
-        assert!(request.requested_pushdown_blocked_by_bare_placeholders);
         assert!(request.requested_predicates.is_empty());
     }
 

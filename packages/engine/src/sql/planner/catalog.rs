@@ -67,17 +67,30 @@ async fn load_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<S
 async fn load_schema_keys_by_plugin(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<String, Vec<String>>, LixError> {
-    let result = backend
-        .execute(
+    let mut selects = Vec::new();
+    if internal_table_exists(backend, "lix_internal_change").await? {
+        selects.push(
             "SELECT plugin_key, schema_key \
              FROM lix_internal_change \
-             WHERE plugin_key IS NOT NULL AND schema_key IS NOT NULL \
-             UNION \
-             SELECT plugin_key, schema_key \
+             WHERE plugin_key IS NOT NULL AND schema_key IS NOT NULL"
+                .to_string(),
+        );
+    }
+    if internal_table_exists(backend, "lix_internal_state_untracked").await? {
+        selects.push(
+            "SELECT plugin_key, schema_key \
              FROM lix_internal_state_untracked \
-             WHERE plugin_key IS NOT NULL AND schema_key IS NOT NULL",
-            &[],
-        )
+             WHERE plugin_key IS NOT NULL AND schema_key IS NOT NULL"
+                .to_string(),
+        );
+    }
+    if selects.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let sql = selects.join(" UNION ");
+    let result = backend
+        .execute(&sql, &[])
         .await?;
 
     let mut map = BTreeMap::<String, BTreeSet<String>>::new();
@@ -98,4 +111,26 @@ async fn load_schema_keys_by_plugin(
         .into_iter()
         .map(|(plugin_key, schema_keys)| (plugin_key, schema_keys.into_iter().collect()))
         .collect())
+}
+
+async fn internal_table_exists(
+    backend: &dyn LixBackend,
+    table_name: &str,
+) -> Result<bool, LixError> {
+    let sql = match backend.dialect() {
+        SqlDialect::Sqlite => format!(
+            "SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' \
+               AND name = '{table_name}' \
+             LIMIT 1",
+        ),
+        SqlDialect::Postgres => format!(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = current_schema() \
+               AND table_name = '{table_name}' \
+             LIMIT 1",
+        ),
+    };
+    let result = backend.execute(&sql, &[]).await?;
+    Ok(!result.rows.is_empty())
 }

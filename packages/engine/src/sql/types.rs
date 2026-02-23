@@ -19,6 +19,8 @@ pub enum FileDataAssignmentPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VtableUpdatePlan {
     pub schema_key: String,
+    pub effective_scope_fallback: bool,
+    pub effective_scope_selection_sql: Option<String>,
     pub explicit_writer_key: Option<Option<String>>,
     pub writer_key_assignment_present: bool,
     pub file_data_assignment: Option<FileDataAssignmentPlan>,

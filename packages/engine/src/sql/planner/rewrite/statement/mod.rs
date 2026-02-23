@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use sqlparser::ast::{Query, Statement};
+use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value as SqlValue};
 
 use crate::functions::LixFunctionProvider;
 use crate::sql::planner::catalog::PlannerCatalogSnapshot;
@@ -33,7 +33,8 @@ where
 {
     let logical_plan = match statement {
         Statement::Query(query) => {
-            let semantics = LogicalStatementSemantics::QueryRead(read_semantics_for_query(&query));
+            let source_semantics = read_semantics_for_query(&query);
+            let semantics = LogicalStatementSemantics::QueryRead(source_semantics.clone());
             let rewritten = rewrite_query_with_backend_and_params_and_catalog(
                 backend,
                 *query,
@@ -41,13 +42,17 @@ where
                 catalog_snapshot,
             )
             .await?;
+            let requirements = merge_read_maintenance_requirements(
+                read_maintenance_requirements_for_semantics(&source_semantics),
+                read_maintenance_requirements_for_query(&rewritten),
+            );
             LogicalStatementPlan::new(
                 LogicalStatementOperation::QueryRead,
                 semantics,
                 vec![LogicalStatementStep::QueryRead],
                 vec![Statement::Query(Box::new(rewritten.clone()))],
             )
-            .with_maintenance_requirements(read_maintenance_requirements_for_query(&rewritten))
+            .with_maintenance_requirements(requirements)
         }
         Statement::Explain {
             describe_alias,
@@ -61,8 +66,9 @@ where
         } => {
             match *statement {
                 Statement::Query(query) => {
+                    let source_semantics = read_semantics_for_query(&query);
                     let semantics =
-                        LogicalStatementSemantics::ExplainRead(read_semantics_for_query(&query));
+                        LogicalStatementSemantics::ExplainRead(source_semantics.clone());
                     let rewritten = rewrite_query_with_backend_and_params_and_catalog(
                         backend,
                         *query,
@@ -70,6 +76,10 @@ where
                         catalog_snapshot,
                     )
                     .await?;
+                    let requirements = merge_read_maintenance_requirements(
+                        read_maintenance_requirements_for_semantics(&source_semantics),
+                        read_maintenance_requirements_for_query(&rewritten),
+                    );
                     let explain_statement = Statement::Explain {
                         describe_alias,
                         analyze,
@@ -86,9 +96,7 @@ where
                         vec![LogicalStatementStep::ExplainRead],
                         vec![explain_statement],
                     )
-                    .with_maintenance_requirements(read_maintenance_requirements_for_query(
-                        &rewritten,
-                    ))
+                    .with_maintenance_requirements(requirements)
                 }
                 other => {
                     let explain_statement = Statement::Explain {
@@ -170,9 +178,50 @@ where
 fn ensure_canonical_write_statement(statement: &Statement) -> Result<(), LixError> {
     match statement {
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => Ok(()),
+        Statement::Query(query) if is_canonical_noop_query(query) => Ok(()),
         _ => Err(LixError {
-            message: "canonical write rewrite emitted non-canonical statement".to_string(),
+            message: format!(
+                "canonical write rewrite emitted non-canonical statement: {statement}"
+            ),
         }),
+    }
+}
+
+fn is_canonical_noop_query(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    if !select.from.is_empty() {
+        return false;
+    }
+    let Some(selection) = select.selection.as_ref() else {
+        return false;
+    };
+    is_constant_false_equality(selection)
+}
+
+fn is_constant_false_equality(expr: &Expr) -> bool {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return false;
+    };
+    if !matches!(op, sqlparser::ast::BinaryOperator::Eq) {
+        return false;
+    }
+    let left_number = number_literal_value(left.as_ref());
+    let right_number = number_literal_value(right.as_ref());
+    matches!(
+        (left_number.as_deref(), right_number.as_deref()),
+        (Some("1"), Some("0")) | (Some("0"), Some("1"))
+    )
+}
+
+fn number_literal_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value_with_span) => match &value_with_span.value {
+            SqlValue::Number(number, _) => Some(number.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -205,10 +254,17 @@ fn read_semantics_for_query(query: &Query) -> LogicalReadSemantics {
 }
 
 fn read_maintenance_requirements_for_query(query: &Query) -> ReadMaintenanceRequirements {
-    let semantics = read_semantics_for_query(query);
+    read_maintenance_requirements_for_semantics(&read_semantics_for_query(query))
+}
+
+fn read_maintenance_requirements_for_semantics(
+    semantics: &LogicalReadSemantics,
+) -> ReadMaintenanceRequirements {
     let mut requirements = ReadMaintenanceRequirements::default();
 
-    if semantics.operators.contains(&LogicalReadOperator::FileByVersion) {
+    if semantics.operators.contains(&LogicalReadOperator::FileByVersion)
+        || semantics.operators.contains(&LogicalReadOperator::FileHistory)
+    {
         requirements.file_materialization_scope = Some(FileReadMaterializationScope::AllVersions);
     } else if semantics.operators.contains(&LogicalReadOperator::File) {
         requirements.file_materialization_scope =
@@ -217,12 +273,45 @@ fn read_maintenance_requirements_for_query(query: &Query) -> ReadMaintenanceRequ
 
     if semantics.operators.contains(&LogicalReadOperator::FileHistory) {
         requirements.requires_file_history_materialization = true;
+        requirements.requires_history_timeline_materialization = true;
     }
     if semantics.operators.contains(&LogicalReadOperator::StateHistory) {
         requirements.requires_history_timeline_materialization = true;
     }
 
     requirements
+}
+
+fn merge_read_maintenance_requirements(
+    left: ReadMaintenanceRequirements,
+    right: ReadMaintenanceRequirements,
+) -> ReadMaintenanceRequirements {
+    let file_materialization_scope = match (
+        left.file_materialization_scope,
+        right.file_materialization_scope,
+    ) {
+        (Some(FileReadMaterializationScope::AllVersions), _)
+        | (_, Some(FileReadMaterializationScope::AllVersions)) => {
+            Some(FileReadMaterializationScope::AllVersions)
+        }
+        (Some(FileReadMaterializationScope::ActiveVersionOnly), _)
+        | (_, Some(FileReadMaterializationScope::ActiveVersionOnly)) => {
+            Some(FileReadMaterializationScope::ActiveVersionOnly)
+        }
+        _ => None,
+    };
+
+    let mut history_roots = left.history_roots;
+    history_roots.extend(right.history_roots);
+
+    ReadMaintenanceRequirements {
+        history_roots,
+        file_materialization_scope,
+        requires_file_history_materialization: left.requires_file_history_materialization
+            || right.requires_file_history_materialization,
+        requires_history_timeline_materialization: left.requires_history_timeline_materialization
+            || right.requires_history_timeline_materialization,
+    }
 }
 
 #[cfg(test)]

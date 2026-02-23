@@ -58,7 +58,10 @@ pub use preprocess::{
     preprocess_sql, preprocess_sql_with_provider,
     preprocess_sql_with_provider_and_detected_file_domain_changes,
 };
-pub(crate) use read_views::lix_state_history_view_read::ensure_history_timeline_materialized_for_statement_with_state;
+pub(crate) use read_views::lix_state_history_view_read::{
+    ensure_history_timeline_materialized_for_root,
+    ensure_history_timeline_materialized_for_statement_with_state,
+};
 #[cfg(test)]
 pub(crate) use rewrite::extract_explicit_transaction_script;
 pub(crate) use rewrite::extract_explicit_transaction_script_from_statements;
@@ -67,7 +70,8 @@ pub(crate) use row_resolution::{
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
 };
 pub use steps::vtable_write::{
-    build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
+    build_delete_followup_sql, build_update_followup_sql,
+    load_effective_scope_update_rows_for_postprocess, DetectedFileDomainChange,
 };
 pub(crate) use steps::working_projection_refresh::refresh_working_projection_for_read_query;
 pub(crate) use types::FileDataAssignmentPlan;

@@ -227,6 +227,8 @@ mod tests {
         let statements = vec![statement_from_sql("UPDATE t SET x = 1")];
         let postprocess = PostprocessPlan::VtableUpdate(VtableUpdatePlan {
             schema_key: "schema".to_string(),
+            effective_scope_fallback: false,
+            effective_scope_selection_sql: None,
             explicit_writer_key: None,
             writer_key_assignment_present: false,
             file_data_assignment: None,
