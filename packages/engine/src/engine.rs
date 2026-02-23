@@ -836,38 +836,24 @@ mod tests {
     }
 
     #[test]
-    fn sequentialize_postprocess_multi_statement_detects_both_pipeline_errors() {
+    fn sequentialize_postprocess_multi_statement_uses_structural_rules_only() {
         let sql =
             "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'";
-        for message in [
-            "postprocess rewrites require a single statement",
-            "only one postprocess rewrite is supported per query",
-        ] {
-            let error = LixError {
-                message: message.to_string(),
-            };
-            assert!(
-                should_sequentialize_postprocess_multi_statement(sql, &[], &error),
-                "expected sequentialization for error message: {message}"
-            );
-        }
+        assert!(should_sequentialize_postprocess_multi_statement(
+            sql, &[]
+        ));
     }
 
     #[test]
     fn sequentialize_postprocess_multi_statement_rejects_params_and_explicit_transaction_wrappers()
     {
-        let error = LixError {
-            message: "only one postprocess rewrite is supported per query".to_string(),
-        };
         assert!(!should_sequentialize_postprocess_multi_statement(
             "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'",
             &[Value::Text("f1".to_string())],
-            &error,
         ));
         assert!(!should_sequentialize_postprocess_multi_statement(
             "BEGIN; UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; COMMIT;",
             &[],
-            &error,
         ));
     }
 
