@@ -1,5 +1,11 @@
 use super::super::*;
 use super::*;
+use crate::sql::{
+    active_version_from_mutations, active_version_from_update_validations,
+    build_delete_followup_sql, build_update_followup_sql, is_query_only_statements,
+    parse_sql_statements, preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
+    should_refresh_file_cache_for_statements, MutationOperation, PostprocessPlan,
+};
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(
