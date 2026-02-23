@@ -1,6 +1,7 @@
 use super::super::*;
 
 impl Engine {
+    #[cfg(test)]
     pub(crate) async fn execute_multi_statement_sequential_with_options(
         &self,
         sql: &str,
@@ -46,12 +47,14 @@ pub(crate) fn should_sequentialize_postprocess_multi_statement(
     should_sequentialize_postprocess_multi_statement_with_statements(&statements, params, error)
 }
 
+#[cfg(test)]
 pub(crate) fn should_sequentialize_postprocess_multi_statement_with_statements(
     statements: &[Statement],
     params: &[Value],
     error: &LixError,
 ) -> bool {
-    if !params.is_empty() || !is_postprocess_multi_statement_error(&error.message) {
+    let _ = error;
+    if !params.is_empty() {
         return false;
     }
     if statements.len() <= 1 {
@@ -66,12 +69,4 @@ pub(crate) fn should_sequentialize_postprocess_multi_statement_with_statements(
                 | Statement::Rollback { .. }
         )
     })
-}
-
-pub(crate) fn is_postprocess_multi_statement_error(message: &str) -> bool {
-    matches!(
-        message,
-        "postprocess rewrites require a single statement"
-            | "only one postprocess rewrite is supported per query"
-    )
 }

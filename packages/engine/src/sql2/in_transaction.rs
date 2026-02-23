@@ -14,6 +14,19 @@ impl Engine {
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql_statements(sql)?;
+        if parsed_statements.len() > 1 {
+            return Box::pin(
+                self.execute_multi_statement_sequential_with_options_in_transaction(
+                    transaction,
+                    sql,
+                    params,
+                    options,
+                    active_version_id,
+                    pending_state_commit_stream_changes,
+                ),
+            )
+            .await;
+        }
         let writer_key = options.writer_key.as_deref();
         let defer_side_effects = deferred_side_effects.is_some();
         let read_only_query = is_query_only_statements(&parsed_statements);
@@ -73,7 +86,7 @@ impl Engine {
                 .prepare_runtime_functions_with_backend(&backend)
                 .await?;
             let output =
-                match preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+                preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
                     &backend,
                     &self.cel_evaluator,
                     parsed_statements.clone(),
@@ -82,30 +95,7 @@ impl Engine {
                     &detected_file_domain_changes_by_statement,
                     writer_key,
                 )
-                .await
-                {
-                    Ok(output) => output,
-                    Err(error)
-                        if should_sequentialize_postprocess_multi_statement_with_statements(
-                            &parsed_statements,
-                            params,
-                            &error,
-                        ) =>
-                    {
-                        return Box::pin(
-                            self.execute_multi_statement_sequential_with_options_in_transaction(
-                                transaction,
-                                sql,
-                                params,
-                                options,
-                                active_version_id,
-                                pending_state_commit_stream_changes,
-                            ),
-                        )
-                        .await;
-                    }
-                    Err(error) => return Err(error),
-                };
+                .await?;
             if !output.mutations.is_empty() {
                 validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
             }
