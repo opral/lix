@@ -1,7 +1,7 @@
-use crate::sql::{bind_sql_with_state, PlaceholderState};
 use crate::{SqlDialect, Value};
 
 use super::super::ast::nodes::Statement;
+use super::super::ast::utils::{bind_sql_with_state, PlaceholderState};
 use super::super::contracts::planner_error::PlannerError;
 
 pub(crate) fn bind_script_placeholders_once(

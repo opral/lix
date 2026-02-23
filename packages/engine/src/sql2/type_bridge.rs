@@ -6,6 +6,11 @@ use super::contracts::planned_statement::{
 use super::contracts::postprocess_actions::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 use super::contracts::prepared_statement::PreparedStatement;
 
+pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> String {
+    let sql_output = to_sql_preprocess_output(output);
+    sql::preprocess_plan_fingerprint(&sql_output)
+}
+
 pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> PlannedStatementSet {
     PlannedStatementSet {
         sql: output.sql,
