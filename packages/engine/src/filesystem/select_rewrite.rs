@@ -5,7 +5,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::engine::sql2::type_bridge::escape_sql_string_with_sql_bridge as escape_sql_string;
+use crate::engine::sql2::legacy_bridge::escape_sql_string_with_sql_bridge as escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
 };

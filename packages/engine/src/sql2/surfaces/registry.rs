@@ -5,7 +5,7 @@ use crate::{LixBackend, LixError, Value};
 use super::super::ast::nodes::Statement;
 use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::contracts::effects::DetectedFileDomainChange;
-use super::super::type_bridge::preprocess_with_sql_surfaces;
+use super::super::legacy_bridge::preprocess_with_sql_surfaces;
 use super::super::vtable;
 use super::{entity, filesystem, lix_state, lix_state_by_version, lix_state_history};
 

@@ -4,7 +4,7 @@ use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::types::{
     InstalledPlugin, PluginContentType, PluginManifest, PluginRuntime, StateContextColumn,
 };
-use crate::engine::sql2::type_bridge::preprocess_sql_with_sql_bridge as preprocess_sql;
+use crate::engine::sql2::legacy_bridge::preprocess_sql_with_sql_bridge as preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

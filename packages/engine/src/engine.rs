@@ -64,11 +64,11 @@ pub(crate) mod sql2;
 
 #[cfg(test)]
 use self::sql2::should_sequentialize_postprocess_multi_statement;
-use self::sql2::ast::utils::parse_sql_statements;
 use self::sql2::contracts::effects::DetectedFileDomainChange;
 use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
+use self::sql2::planning::parse::parse_sql;
 use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-use self::sql2::type_bridge::{
+use self::sql2::legacy_bridge::{
     advance_sql_bridge_placeholder_state, collect_filesystem_update_side_effects_with_sql_bridge,
     new_sql_bridge_placeholder_state, SqlBridgePlaceholderState,
 };
@@ -232,7 +232,7 @@ fn escape_sql_string(value: &str) -> String {
 }
 
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
-    let Ok(statements) = parse_sql_statements(sql) else {
+    let Ok(statements) = parse_sql(sql) else {
         return false;
     };
     should_invalidate_installed_plugins_cache_for_statements(&statements)
@@ -629,7 +629,7 @@ mod tests {
     use crate::engine::sql2::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql2::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql2::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::engine::sql2::type_bridge::{
+    use crate::engine::sql2::legacy_bridge::{
         bind_sql_with_sql_bridge_state, new_sql_bridge_placeholder_state,
     };
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
