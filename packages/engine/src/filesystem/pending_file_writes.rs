@@ -5,8 +5,8 @@ use crate::engine::sql2::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
+use crate::engine::sql2::storage::sql_text::escape_sql_string;
 use crate::engine::sql2::legacy_bridge::{
-    escape_sql_string_with_sql_bridge as escape_sql_string,
     preprocess_sql_with_sql_bridge as preprocess_sql,
 };
 use crate::version::{

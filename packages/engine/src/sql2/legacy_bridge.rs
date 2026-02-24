@@ -23,10 +23,6 @@ pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> Strin
 pub(crate) type SqlBridgeReadRewriteSession = legacy_sql::ReadRewriteSession;
 pub(crate) type SqlBridgeDetectedFileDomainChange = legacy_sql::DetectedFileDomainChange;
 
-pub(crate) fn escape_sql_string_with_sql_bridge(value: &str) -> String {
-    legacy_sql::escape_sql_string(value)
-}
-
 pub(crate) fn preprocess_statements_with_provider_with_sql_bridge<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
