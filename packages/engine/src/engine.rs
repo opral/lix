@@ -59,22 +59,24 @@ mod init_seed;
 mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
+#[path = "sql2/mod.rs"]
+pub(crate) mod sql2;
 #[path = "sql_followup_runtime.rs"]
 pub(crate) mod sql_followup_runtime;
 #[path = "sql_preprocess_runtime.rs"]
 pub(crate) mod sql_preprocess_runtime;
 #[path = "sql_read_rewrite_runtime.rs"]
 pub(crate) mod sql_read_rewrite_runtime;
-#[path = "sql2/mod.rs"]
-pub(crate) mod sql2;
+#[path = "sql_rewrite_runtime.rs"]
+pub(crate) mod sql_rewrite_runtime;
 
-#[cfg(test)]
-use self::sql2::should_sequentialize_postprocess_multi_statement;
 use self::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
 use self::sql2::contracts::effects::DetectedFileDomainChange;
 use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
 use self::sql2::planning::parse::parse_sql;
 use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+#[cfg(test)]
+use self::sql2::should_sequentialize_postprocess_multi_statement;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -546,13 +548,14 @@ async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
     for statement in statements {
         match statement {
             Statement::Update(update) => {
-                let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                    backend,
-                    &update,
-                    params,
-                    &mut placeholder_state,
-                )
-                .await?;
+                let side_effects =
+                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
+                        backend,
+                        &update,
+                        params,
+                        &mut placeholder_state,
+                    )
+                    .await?;
                 let statement_tracked_changes =
                     dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
                 tracked_changes_by_statement.push(statement_tracked_changes);
@@ -628,6 +631,7 @@ mod tests {
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::engine::sql2::ast::utils::parse_sql_statements;
+    use crate::engine::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
     use crate::engine::sql2::contracts::planned_statement::{
         MutationOperation, MutationRow, UpdateValidationPlan,
@@ -637,12 +641,12 @@ mod tests {
         file_read_materialization_scope_for_statements, FileReadMaterializationScope,
     };
     use crate::engine::sql2::planning::script::{
-        coalesce_lix_file_transaction_statements, extract_explicit_transaction_script_from_statements,
+        coalesce_lix_file_transaction_statements,
+        extract_explicit_transaction_script_from_statements,
     };
     use crate::engine::sql2::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql2::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql2::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::engine::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
@@ -855,9 +859,7 @@ mod tests {
     fn sequentialize_postprocess_multi_statement_uses_structural_rules_only() {
         let sql =
             "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'";
-        assert!(should_sequentialize_postprocess_multi_statement(
-            sql, &[]
-        ));
+        assert!(should_sequentialize_postprocess_multi_statement(sql, &[]));
     }
 
     #[test]
@@ -1466,7 +1468,9 @@ mod tests {
 
     fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
         parse_sql_statements(sql)
-            .map(|statements| file_history_read_materialization_required_for_statements(&statements))
+            .map(|statements| {
+                file_history_read_materialization_required_for_statements(&statements)
+            })
             .unwrap_or(false)
     }
 

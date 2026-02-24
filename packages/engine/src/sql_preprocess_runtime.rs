@@ -58,7 +58,7 @@ pub(crate) fn legacy_rewrite_statement_with_provider<P: LixFunctionProvider>(
     statement: Statement,
     provider: &mut P,
 ) -> Result<StatementRewriteOutput, LixError> {
-    super::super::sql::rewrite_statement_with_provider_to_sql2(
+    super::sql_rewrite_runtime::rewrite_statement_with_provider(
         params, writer_key, statement, provider,
     )
 }
@@ -74,7 +74,7 @@ pub(crate) async fn legacy_rewrite_statement_with_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    super::super::sql::rewrite_statement_with_backend_to_sql2(
+    super::sql_rewrite_runtime::rewrite_statement_with_backend(
         backend,
         params,
         writer_key,
