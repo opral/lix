@@ -1,4 +1,5 @@
 use sqlparser::ast::Query;
+use std::collections::BTreeMap;
 
 use crate::{LixBackend, LixError, Value};
 
@@ -17,9 +18,21 @@ const PHASE_ORDER: [RewritePhase; 4] = [
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ReadRewriteSession {
     materialized_schema_keys_cache: Option<Vec<String>>,
+    version_chain_cache: BTreeMap<String, Vec<String>>,
 }
 
 impl ReadRewriteSession {
+    pub(crate) fn cached_version_chain(&self, version_id: &str) -> Option<&[String]> {
+        self.version_chain_cache
+            .get(version_id)
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn cache_version_chain(&mut self, version_id: &str, chain: &[String]) {
+        self.version_chain_cache
+            .insert(version_id.to_string(), chain.to_vec());
+    }
+
     fn seed_context(&self, context: &mut AnalysisContext) {
         if let Some(keys) = &self.materialized_schema_keys_cache {
             context.set_materialized_schema_keys_cache(keys.clone());

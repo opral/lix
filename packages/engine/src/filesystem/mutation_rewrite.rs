@@ -1843,8 +1843,12 @@ fn placeholder_range(start: usize, len: usize) -> String {
 async fn load_version_chain_ids(
     backend: &dyn LixBackend,
     version_id: &str,
-    _read_rewrite_session: &mut ReadRewriteSession,
+    read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<String>, LixError> {
+    if let Some(cached) = read_rewrite_session.cached_version_chain(version_id) {
+        return Ok(cached.to_vec());
+    }
+
     let inherits_expr = json_text_expr_sql(backend.dialect(), "inherits_from_version_id");
     let sql = format!(
         "WITH RECURSIVE version_chain(version_id, depth) AS ( \
@@ -1903,6 +1907,7 @@ async fn load_version_chain_ids(
         chain.push(version_id.to_string());
     }
 
+    read_rewrite_session.cache_version_chain(version_id, &chain);
     Ok(chain)
 }
 
@@ -3448,15 +3453,16 @@ fn noop_statement() -> Result<Statement, LixError> {
 mod tests {
     use super::{
         extract_predicate_string_with_params_and_state, json_text_expr_sql,
+        load_version_chain_ids,
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
-        rewrite_update, select_effective_entity_tombstone_state,
+        rewrite_update, select_effective_entity_tombstone_state, ReadRewriteSession,
     };
     use crate::engine::sql::ast::utils::{
         parse_sql_statements, resolve_expr_cell_with_state, PlaceholderState,
     };
-    use crate::SqlDialect;
-    use crate::Value;
+    use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
+    use std::sync::Mutex;
 
     #[test]
     fn json_text_expr_sql_uses_backend_specific_expression() {
@@ -3732,5 +3738,74 @@ mod tests {
         let tombstone =
             select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
         assert_eq!(tombstone, Some(true));
+    }
+
+    struct VersionChainBackendMock {
+        execute_calls: Mutex<usize>,
+    }
+
+    impl VersionChainBackendMock {
+        fn execute_calls(&self) -> usize {
+            *self
+                .execute_calls
+                .lock()
+                .expect("version chain execute_calls mutex poisoned")
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LixBackend for VersionChainBackendMock {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+            let mut calls = self
+                .execute_calls
+                .lock()
+                .expect("version chain execute_calls mutex poisoned");
+            *calls += 1;
+
+            let requested_version = match params.first() {
+                Some(Value::Text(version_id)) => version_id.clone(),
+                _ => "unknown".to_string(),
+            };
+            let parent_version = format!("{requested_version}-parent");
+
+            Ok(QueryResult {
+                rows: vec![
+                    vec![Value::Text(requested_version)],
+                    vec![Value::Text(parent_version)],
+                ],
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError {
+                message: "transactions are not used in this unit test".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn version_chain_lookup_uses_session_cache_for_repeated_version() {
+        let backend = VersionChainBackendMock {
+            execute_calls: Mutex::new(0),
+        };
+        let mut session = ReadRewriteSession::default();
+
+        let first = load_version_chain_ids(&backend, "v-main", &mut session)
+            .await
+            .expect("first lookup should succeed");
+        let second = load_version_chain_ids(&backend, "v-main", &mut session)
+            .await
+            .expect("cached lookup should succeed");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            backend.execute_calls(),
+            1,
+            "repeated lookup should reuse session cache"
+        );
     }
 }
