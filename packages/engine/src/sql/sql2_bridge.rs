@@ -1,17 +1,14 @@
-use crate::cel::CelEvaluator;
 use crate::engine::sql2::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
 use crate::engine::sql2::contracts::planned_statement::{
     MutationOperation as Sql2MutationOperation, MutationRow as Sql2MutationRow,
-    PlannedStatementSet, SchemaRegistration as Sql2SchemaRegistration,
-    UpdateValidationPlan as Sql2UpdateValidationPlan,
+    SchemaRegistration as Sql2SchemaRegistration, UpdateValidationPlan as Sql2UpdateValidationPlan,
 };
 use crate::engine::sql2::contracts::postprocess_actions::{
     PostprocessPlan as Sql2PostprocessPlan, VtableDeletePlan as Sql2VtableDeletePlan,
     VtableUpdatePlan as Sql2VtableUpdatePlan,
 };
-use crate::engine::sql2::contracts::prepared_statement::PreparedStatement as Sql2PreparedStatement;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::functions::LixFunctionProvider;
+use crate::{LixBackend, LixError, Value};
 
 use crate::engine::sql2::ast::nodes::Statement;
 
@@ -23,57 +20,6 @@ pub(crate) struct Sql2RewriteOutput {
     pub(crate) postprocess: Option<Sql2PostprocessPlan>,
     pub(crate) mutations: Vec<Sql2MutationRow>,
     pub(crate) update_validations: Vec<Sql2UpdateValidationPlan>,
-}
-
-pub(crate) fn preprocess_statements_with_provider_to_sql2_plan<P: LixFunctionProvider>(
-    statements: Vec<Statement>,
-    params: &[Value],
-    provider: &mut P,
-    dialect: SqlDialect,
-) -> Result<PlannedStatementSet, LixError> {
-    let output = super::preprocess_statements_with_provider(statements, params, provider, dialect)?;
-    Ok(from_preprocess_output(output))
-}
-
-pub(crate) async fn preprocess_sql_to_sql2_plan(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql_text: &str,
-    params: &[Value],
-) -> Result<PlannedStatementSet, LixError> {
-    let output = super::preprocess_sql(backend, evaluator, sql_text, params).await?;
-    Ok(from_preprocess_output(output))
-}
-
-pub(crate) async fn preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_to_sql2_plan<
-    P: LixFunctionProvider,
->(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    statements: Vec<Statement>,
-    params: &[Value],
-    functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<Sql2DetectedFileDomainChange>],
-    writer_key: Option<&str>,
-) -> Result<PlannedStatementSet, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    let legacy_detected_changes = to_legacy_detected_file_domain_changes_by_statement(
-        detected_file_domain_changes_by_statement,
-    );
-    let output =
-        super::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
-            backend,
-            evaluator,
-            statements,
-            params,
-            functions,
-            &legacy_detected_changes,
-            writer_key,
-        )
-        .await?;
-    Ok(from_preprocess_output(output))
 }
 
 pub(crate) fn rewrite_statement_with_provider_to_sql2<P: LixFunctionProvider>(
@@ -119,15 +65,6 @@ pub(crate) async fn materialize_vtable_insert_select_sources_for_sql2(
     super::materialize_vtable_insert_select_sources(backend, statements, params).await
 }
 
-fn to_legacy_detected_file_domain_changes_by_statement(
-    changes_by_statement: &[Vec<Sql2DetectedFileDomainChange>],
-) -> Vec<Vec<super::DetectedFileDomainChange>> {
-    changes_by_statement
-        .iter()
-        .map(|changes| to_legacy_detected_file_domain_changes(changes))
-        .collect()
-}
-
 fn to_legacy_detected_file_domain_changes(
     changes: &[Sql2DetectedFileDomainChange],
 ) -> Vec<super::DetectedFileDomainChange> {
@@ -145,33 +82,6 @@ fn to_legacy_detected_file_domain_changes(
             writer_key: change.writer_key.clone(),
         })
         .collect()
-}
-
-fn from_preprocess_output(output: super::PreprocessOutput) -> PlannedStatementSet {
-    PlannedStatementSet {
-        sql: output.sql,
-        prepared_statements: output
-            .prepared_statements
-            .into_iter()
-            .map(from_prepared_statement)
-            .collect(),
-        registrations: output
-            .registrations
-            .into_iter()
-            .map(from_schema_registration)
-            .collect(),
-        postprocess: output.postprocess.map(from_postprocess_plan),
-        mutations: output
-            .mutations
-            .into_iter()
-            .map(from_mutation_row)
-            .collect(),
-        update_validations: output
-            .update_validations
-            .into_iter()
-            .map(from_update_validation_plan)
-        .collect(),
-    }
 }
 
 fn from_rewrite_output(output: super::RewriteOutput) -> Sql2RewriteOutput {
@@ -193,14 +103,7 @@ fn from_rewrite_output(output: super::RewriteOutput) -> Sql2RewriteOutput {
             .update_validations
             .into_iter()
             .map(from_update_validation_plan)
-            .collect(),
-    }
-}
-
-fn from_prepared_statement(statement: super::PreparedStatement) -> Sql2PreparedStatement {
-    Sql2PreparedStatement {
-        sql: statement.sql,
-        params: statement.params,
+        .collect(),
     }
 }
 
