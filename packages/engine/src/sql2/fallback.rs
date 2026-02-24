@@ -18,28 +18,6 @@ impl Engine {
         self.execute_statement_script_with_options(statements, params, options)
             .await
     }
-
-    #[allow(dead_code)]
-    pub(crate) async fn execute_multi_statement_sequential_with_options_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        sql: &str,
-        params: &[Value],
-        options: &ExecuteOptions,
-        active_version_id: &mut String,
-        pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-    ) -> Result<QueryResult, LixError> {
-        let statements = parse_sql_statements(sql)?;
-        self.execute_statement_script_with_options_in_transaction(
-            transaction,
-            statements,
-            params,
-            options,
-            active_version_id,
-            pending_state_commit_stream_changes,
-        )
-        .await
-    }
 }
 
 #[cfg(test)]

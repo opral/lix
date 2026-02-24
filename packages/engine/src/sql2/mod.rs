@@ -2,6 +2,7 @@ pub(crate) mod api;
 pub(crate) mod ast;
 pub(crate) mod contracts;
 pub(crate) mod execution;
+#[cfg(test)]
 pub(crate) mod fallback;
 pub(crate) mod history;
 pub(crate) mod in_transaction;
