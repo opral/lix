@@ -1,9 +1,13 @@
 use crate::cel::CelEvaluator;
 #[cfg(test)]
 use crate::engine::sql2::ast::utils::parse_sql_statements;
-use crate::sql::{
-    bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_expr_cell_with_state,
-    resolve_values_rows, PlaceholderState,
+use crate::engine::sql2::type_bridge::{
+    bind_sql_with_sql_bridge_state as bind_sql_with_state,
+    escape_sql_string_with_sql_bridge as escape_sql_string,
+    preprocess_sql_with_sql_bridge as preprocess_sql,
+    resolve_expr_cell_with_sql_bridge as resolve_expr_cell_with_state,
+    resolve_values_rows_with_sql_bridge as resolve_values_rows,
+    SqlBridgePlaceholderState as PlaceholderState, SqlBridgeResolvedCell as ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -1849,14 +1853,14 @@ fn expr_text_literal_or_placeholder(
     Ok(resolved_cell_text(Some(&resolved)))
 }
 
-fn resolved_cell_text(cell: Option<&crate::sql::ResolvedCell>) -> Option<String> {
+fn resolved_cell_text(cell: Option<&ResolvedCell>) -> Option<String> {
     match cell.and_then(|entry| entry.value.as_ref()) {
         Some(Value::Text(value)) => Some(value.clone()),
         _ => None,
     }
 }
 
-fn resolved_cell_blob_or_text_bytes(cell: Option<&crate::sql::ResolvedCell>) -> Option<Vec<u8>> {
+fn resolved_cell_blob_or_text_bytes(cell: Option<&ResolvedCell>) -> Option<Vec<u8>> {
     cell.and_then(|entry| entry.value.as_ref())
         .and_then(value_as_blob_or_text_bytes)
 }
