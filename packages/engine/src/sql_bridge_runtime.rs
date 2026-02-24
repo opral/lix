@@ -107,18 +107,15 @@ pub(crate) async fn build_update_followup_statements(
     writer_key: Option<&str>,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<Vec<PreparedStatement>, LixError> {
-    let legacy_plan = to_legacy_vtable_update_plan(plan);
-    let legacy_changes = to_legacy_detected_file_domain_changes(detected_file_domain_changes);
-    let statements = legacy_sql::build_update_followup_sql(
+    super::sql_followup_runtime::build_update_followup_statements(
         transaction,
-        &legacy_plan,
+        plan,
         rows,
-        &legacy_changes,
+        detected_file_domain_changes,
         writer_key,
         functions,
     )
-    .await?;
-    Ok(from_legacy_prepared_statements(statements))
+    .await
 }
 
 pub(crate) async fn build_delete_followup_statements(
@@ -130,19 +127,16 @@ pub(crate) async fn build_delete_followup_statements(
     writer_key: Option<&str>,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<Vec<PreparedStatement>, LixError> {
-    let legacy_plan = to_legacy_vtable_delete_plan(plan);
-    let legacy_changes = to_legacy_detected_file_domain_changes(detected_file_domain_changes);
-    let statements = legacy_sql::build_delete_followup_sql(
+    super::sql_followup_runtime::build_delete_followup_statements(
         transaction,
-        &legacy_plan,
+        plan,
         rows,
         params,
-        &legacy_changes,
+        detected_file_domain_changes,
         writer_key,
         functions,
     )
-    .await?;
-    Ok(from_legacy_prepared_statements(statements))
+    .await
 }
 
 fn to_legacy_detected_file_domain_changes_by_statement(
@@ -165,25 +159,6 @@ fn to_legacy_detected_file_domain_changes_by_statement(
                     writer_key: change.writer_key.clone(),
                 })
                 .collect()
-        })
-        .collect()
-}
-
-fn to_legacy_detected_file_domain_changes(
-    changes: &[DetectedFileDomainChange],
-) -> Vec<legacy_sql::DetectedFileDomainChange> {
-    changes
-        .iter()
-        .map(|change| legacy_sql::DetectedFileDomainChange {
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            version_id: change.version_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            writer_key: change.writer_key.clone(),
         })
         .collect()
 }
@@ -220,15 +195,6 @@ fn from_legacy_prepared_statement(statement: legacy_sql::PreparedStatement) -> P
         sql: statement.sql,
         params: statement.params,
     }
-}
-
-fn from_legacy_prepared_statements(
-    statements: Vec<legacy_sql::PreparedStatement>,
-) -> Vec<PreparedStatement> {
-    statements
-        .into_iter()
-        .map(from_legacy_prepared_statement)
-        .collect()
 }
 
 fn from_legacy_schema_registration(
@@ -288,21 +254,5 @@ fn from_legacy_update_validation_plan(
         where_clause: plan.where_clause,
         snapshot_content: plan.snapshot_content,
         snapshot_patch: plan.snapshot_patch,
-    }
-}
-
-fn to_legacy_vtable_update_plan(plan: &VtableUpdatePlan) -> legacy_sql::VtableUpdatePlan {
-    legacy_sql::VtableUpdatePlan {
-        schema_key: plan.schema_key.clone(),
-        explicit_writer_key: plan.explicit_writer_key.clone(),
-        writer_key_assignment_present: plan.writer_key_assignment_present,
-    }
-}
-
-fn to_legacy_vtable_delete_plan(plan: &VtableDeletePlan) -> legacy_sql::VtableDeletePlan {
-    legacy_sql::VtableDeletePlan {
-        schema_key: plan.schema_key.clone(),
-        effective_scope_fallback: plan.effective_scope_fallback,
-        effective_scope_selection_sql: plan.effective_scope_selection_sql.clone(),
     }
 }
