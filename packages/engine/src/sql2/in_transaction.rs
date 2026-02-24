@@ -3,7 +3,7 @@ use super::ast::utils::parse_sql_statements;
 use super::contracts::planned_statement::MutationOperation;
 use super::contracts::postprocess_actions::PostprocessPlan;
 use super::execution::execute_prepared::execute_prepared_with_transaction;
-use super::execution::postprocess::{
+use super::execution::followup::{
     build_delete_followup_statements, build_update_followup_statements,
 };
 use super::semantics::state_resolution::canonical::is_query_only_statements;

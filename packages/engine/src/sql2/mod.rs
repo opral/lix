@@ -12,7 +12,6 @@ pub(crate) mod side_effects;
 pub(crate) mod storage;
 pub(crate) mod surfaces;
 pub(crate) mod transaction;
-pub(crate) mod type_bridge;
 pub(crate) mod vtable;
 
 #[cfg(test)]
