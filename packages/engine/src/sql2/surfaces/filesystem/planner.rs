@@ -1,4 +1,5 @@
 use super::super::super::ast::nodes::Statement;
+use super::super::matcher::statement_matches_any_table;
 
 const TABLE_PATTERNS: &[&str] = &[
     "lix_file",
@@ -11,9 +12,4 @@ const TABLE_PATTERNS: &[&str] = &[
 
 pub(crate) fn matches(statement: &Statement) -> bool {
     statement_matches_any_table(statement, TABLE_PATTERNS)
-}
-
-fn statement_matches_any_table(statement: &Statement, patterns: &[&str]) -> bool {
-    let sql = statement.to_string().to_ascii_lowercase();
-    patterns.iter().any(|pattern| sql.contains(pattern))
 }
