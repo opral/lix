@@ -4,7 +4,7 @@ use crate::materialization::types::{
     MaterializationApplyReport, MaterializationPlan, MaterializationScope, MaterializationWriteOp,
 };
 use crate::schema_registry::register_schema;
-use crate::sql::escape_sql_string;
+use crate::engine::sql2::type_bridge::escape_sql_string_with_sql_bridge as escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn apply_materialization_plan_internal(

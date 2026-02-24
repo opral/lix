@@ -4,7 +4,7 @@ use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFuncti
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::SqlDialect;
-use sqlparser::ast::Update;
+use sqlparser::ast::{Expr, Query, Update};
 
 use super::ast::nodes::Statement;
 use super::contracts::effects::DetectedFileDomainChange;
@@ -20,6 +20,9 @@ pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> Strin
 }
 
 pub(crate) type SqlBridgePlaceholderState = sql::PlaceholderState;
+pub(crate) type SqlBridgeResolvedCell = sql::ResolvedCell;
+pub(crate) type SqlBridgeReadRewriteSession = sql::ReadRewriteSession;
+pub(crate) type SqlBridgeDetectedFileDomainChange = sql::DetectedFileDomainChange;
 
 pub(crate) struct SqlBridgeBoundSql {
     pub(crate) sql: String,
@@ -29,6 +32,28 @@ pub(crate) struct SqlBridgeBoundSql {
 
 pub(crate) fn new_sql_bridge_placeholder_state() -> SqlBridgePlaceholderState {
     sql::PlaceholderState::new()
+}
+
+pub(crate) fn escape_sql_string_with_sql_bridge(value: &str) -> String {
+    sql::escape_sql_string(value)
+}
+
+pub(crate) fn preprocess_statements_with_provider_with_sql_bridge<P: LixFunctionProvider>(
+    statements: Vec<Statement>,
+    params: &[Value],
+    provider: &mut P,
+    dialect: SqlDialect,
+) -> Result<sql::PreprocessOutput, LixError> {
+    sql::preprocess_statements_with_provider(statements, params, provider, dialect)
+}
+
+pub(crate) async fn preprocess_sql_with_sql_bridge(
+    backend: &dyn LixBackend,
+    evaluator: &CelEvaluator,
+    sql_text: &str,
+    params: &[Value],
+) -> Result<sql::PreprocessOutput, LixError> {
+    sql::preprocess_sql(backend, evaluator, sql_text, params).await
 }
 
 pub(crate) fn bind_sql_with_sql_bridge_state(
@@ -61,6 +86,38 @@ pub(crate) fn advance_sql_bridge_placeholder_state(
         })?;
     *placeholder_state = bound.state;
     Ok(())
+}
+
+pub(crate) fn resolve_values_rows_with_sql_bridge(
+    rows: &[Vec<Expr>],
+    params: &[Value],
+) -> Result<Vec<Vec<SqlBridgeResolvedCell>>, LixError> {
+    sql::resolve_values_rows(rows, params)
+}
+
+pub(crate) fn resolve_expr_cell_with_sql_bridge(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut SqlBridgePlaceholderState,
+) -> Result<SqlBridgeResolvedCell, LixError> {
+    sql::resolve_expr_cell_with_state(expr, params, placeholder_state)
+}
+
+pub(crate) fn lower_statement_with_sql_bridge(
+    statement: Statement,
+    dialect: SqlDialect,
+) -> Result<Statement, LixError> {
+    sql::lower_statement(statement, dialect)
+}
+
+pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session_with_sql_bridge(
+    backend: &dyn LixBackend,
+    query: Query,
+    params: &[Value],
+    session: &mut SqlBridgeReadRewriteSession,
+) -> Result<Query, LixError> {
+    sql::rewrite_read_query_with_backend_and_params_in_session(backend, query, params, session)
+        .await
 }
 
 pub(crate) struct FilesystemUpdateSideEffects {
