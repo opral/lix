@@ -17,6 +17,7 @@ use crate::builtin_schema::types::LixVersionPointer;
 use crate::commit::{
     DomainChangeInput, GenerateCommitResult, MaterializedStateRow, VersionInfo, VersionSnapshot,
 };
+use crate::error_classification::is_missing_relation_error;
 use crate::functions::LixFunctionProvider;
 
 use super::super::contracts::prepared_statement::PreparedStatement;
@@ -749,13 +750,4 @@ fn number_expr(value: &str) -> Expr {
 
 fn null_expr() -> Expr {
     Expr::Value(SqlValue::Null.into())
-}
-
-fn is_missing_relation_error(err: &LixError) -> bool {
-    let lower = err.message.to_lowercase();
-    lower.contains("no such table")
-        || lower.contains("relation")
-            && (lower.contains("does not exist")
-                || lower.contains("undefined table")
-                || lower.contains("unknown"))
 }

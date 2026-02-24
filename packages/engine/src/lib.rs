@@ -9,6 +9,7 @@ mod default_values;
 mod deterministic_mode;
 mod engine;
 mod error;
+mod error_classification;
 mod filesystem;
 mod functions;
 mod init;
