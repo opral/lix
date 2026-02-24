@@ -61,8 +61,6 @@ pub(crate) use row_resolution::{
 };
 pub(crate) use sql2_bridge::{
     inline_lix_functions_with_provider_for_sql2, materialize_vtable_insert_select_sources_for_sql2,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_to_sql2_plan,
-    preprocess_sql_to_sql2_plan, preprocess_statements_with_provider_to_sql2_plan,
     rewrite_statement_with_backend_to_sql2, rewrite_statement_with_provider_to_sql2,
     Sql2RewriteOutput,
 };
