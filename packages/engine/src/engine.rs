@@ -65,6 +65,7 @@ use self::sql::contracts::effects::DetectedFileDomainChange;
 use self::sql::contracts::planned_statement::MutationRow;
 use self::sql::planning::parse::parse_sql;
 use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+use self::sql::storage::sql_text::escape_sql_string;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -218,10 +219,6 @@ fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
         });
     }
     Ok(())
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {

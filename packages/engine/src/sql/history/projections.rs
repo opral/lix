@@ -7,6 +7,8 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use super::super::storage::sql_text::escape_sql_string;
+
 pub(crate) async fn refresh_working_projection_for_read_query(
     backend: &dyn LixBackend,
     active_version_id: &str,
@@ -759,8 +761,4 @@ async fn upsert_working_projection_row(
         )
         .await?;
     Ok(())
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
