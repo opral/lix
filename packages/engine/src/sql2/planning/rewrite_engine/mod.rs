@@ -26,11 +26,13 @@ pub(crate) use pipeline::statement_pipeline::StatementPipeline;
 #[allow(unused_imports)]
 pub use pipeline::{
     parse_sql_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
-    preprocess_sql_rewrite_only, preprocess_sql_with_provider,
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
+    preprocess_sql_with_provider,
     preprocess_sql_with_provider_and_detected_file_domain_changes, preprocess_statements,
     preprocess_statements_with_provider, preprocess_statements_with_provider_and_writer_key,
 };
+#[cfg(test)]
+pub(crate) use pipeline::preprocess_sql_rewrite_only;
 pub(crate) use row_resolution::{
     materialize_vtable_insert_select_sources, resolve_expr_cell_with_state, resolve_insert_rows,
     ResolvedCell, RowSourceResolver,
