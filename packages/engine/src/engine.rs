@@ -61,7 +61,6 @@ mod runtime_functions;
 #[path = "sql2/mod.rs"]
 pub(crate) mod sql2;
 
-use self::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
 use self::sql2::contracts::effects::DetectedFileDomainChange;
 use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
 use self::sql2::planning::parse::parse_sql;
@@ -528,72 +527,6 @@ fn detected_file_domain_changes_with_writer_key(
         .collect()
 }
 
-async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
-    backend: &dyn LixBackend,
-    statements: &[Statement],
-    params: &[Value],
-) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let mut placeholder_state = PlaceholderState::new();
-    let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
-    let mut untracked_changes = Vec::new();
-    for statement in statements {
-        match statement {
-            Statement::Update(update) => {
-                let side_effects =
-                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                        backend,
-                        &update,
-                        params,
-                        &mut placeholder_state,
-                    )
-                    .await?;
-                let statement_tracked_changes =
-                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
-                tracked_changes_by_statement.push(statement_tracked_changes);
-                untracked_changes.extend(side_effects.untracked_directory_changes);
-            }
-            other => {
-                tracked_changes_by_statement.push(Vec::new());
-                advance_placeholder_state_for_statement(
-                    &other,
-                    params,
-                    backend.dialect(),
-                    &mut placeholder_state,
-                )?;
-            }
-        }
-    }
-
-    Ok(FilesystemUpdateDomainChangeCollection {
-        untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
-        tracked_changes_by_statement,
-    })
-}
-
-struct FilesystemUpdateDomainChangeCollection {
-    untracked_changes: Vec<DetectedFileDomainChange>,
-    tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
-}
-
-fn advance_placeholder_state_for_statement(
-    statement: &Statement,
-    params: &[Value],
-    dialect: crate::backend::SqlDialect,
-    placeholder_state: &mut PlaceholderState,
-) -> Result<(), LixError> {
-    let statement_sql = statement.to_string();
-    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
-        |error| LixError {
-            message: format!(
-                "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.message
-            ),
-        },
-    )?;
-    *placeholder_state = bound.state;
-    Ok(())
-}
-
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
     let schema_key = schema
         .get("x-lix-key")
@@ -614,8 +547,7 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_placeholder_state_for_statement, boot,
-        detected_file_domain_changes_from_detected_file_changes,
+        boot, detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
         should_invalidate_installed_plugins_cache_for_sql,
         should_sequentialize_postprocess_multi_statement, BootArgs, ExecuteOptions,
@@ -635,6 +567,7 @@ mod tests {
         coalesce_lix_file_transaction_statements,
         extract_explicit_transaction_script_from_statements,
     };
+    use crate::engine::sql2::side_effects::advance_placeholder_state_for_statement;
     use crate::engine::sql2::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql2::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql2::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
