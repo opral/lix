@@ -6,12 +6,8 @@ use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::execution::followup::{
     build_delete_followup_statements, build_update_followup_statements,
 };
-use super::semantics::state_resolution::canonical::is_query_only_statements;
-use super::semantics::state_resolution::effects::{
-    active_version_from_mutations, active_version_from_update_validations,
-};
-use super::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
-use super::surfaces::registry::preprocess_with_surfaces;
+use super::planning::derive_requirements::derive_plan_requirements;
+use super::planning::plan::build_execution_plan;
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(
@@ -28,9 +24,8 @@ impl Engine {
         let parsed_statements = parse_sql_statements(sql)?;
         let writer_key = options.writer_key.as_deref();
         let defer_side_effects = deferred_side_effects.is_some();
-        let read_only_query = is_query_only_statements(&parsed_statements);
-        let should_refresh_file_cache =
-            !read_only_query && should_refresh_file_cache_for_statements(&parsed_statements);
+        let requirements = derive_plan_requirements(&parsed_statements);
+        let read_only_query = requirements.read_only_query;
         let (
             pending_file_writes,
             pending_file_delete_targets,
@@ -40,7 +35,7 @@ impl Engine {
             settings,
             sequence_start,
             functions,
-            output,
+            plan,
         ) = {
             let backend = TransactionBackendAdapter::new(transaction);
             if read_only_query {
@@ -87,7 +82,7 @@ impl Engine {
                 .await?;
             let contract_detected_file_domain_changes_by_statement =
                 detected_file_domain_changes_by_statement.clone();
-            let output = preprocess_with_surfaces(
+            let plan = build_execution_plan(
                 &backend,
                 &self.cel_evaluator,
                 parsed_statements.clone(),
@@ -96,15 +91,16 @@ impl Engine {
                 &contract_detected_file_domain_changes_by_statement,
                 writer_key,
             )
-            .await?;
-            if !output.mutations.is_empty() {
-                validate_inserts(&backend, &self.schema_cache, &output.mutations).await?;
+            .await
+            .map_err(LixError::from)?;
+            if !plan.preprocess.mutations.is_empty() {
+                validate_inserts(&backend, &self.schema_cache, &plan.preprocess.mutations).await?;
             }
-            if !output.update_validations.is_empty() {
+            if !plan.preprocess.update_validations.is_empty() {
                 validate_updates(
                     &backend,
                     &self.schema_cache,
-                    &output.update_validations,
+                    &plan.preprocess.update_validations,
                     params,
                 )
                 .await?;
@@ -119,17 +115,12 @@ impl Engine {
                 settings,
                 sequence_start,
                 functions,
-                output,
+                plan,
             )
         };
-        let state_commit_stream_changes =
-            state_commit_stream_changes_from_mutations(&output.mutations, writer_key);
+        let state_commit_stream_changes = plan.effects.state_commit_stream_changes.clone();
 
-        let next_active_version_id_from_mutations =
-            active_version_from_mutations(&output.mutations)?;
-        let next_active_version_id_from_updates =
-            active_version_from_update_validations(&output.update_validations)?;
-        for registration in &output.registrations {
+        for registration in &plan.preprocess.registrations {
             for statement in
                 register_schema_sql_statements(&registration.schema_key, transaction.dialect())
             {
@@ -139,12 +130,13 @@ impl Engine {
 
         let mut postprocess_file_cache_targets = BTreeSet::new();
         let mut plugin_changes_committed = false;
-        let prepared_statements = output.prepared_statements.clone();
-        let result = match output.postprocess.as_ref() {
+        let prepared_statements = plan.preprocess.prepared_statements.clone();
+        let result = match plan.preprocess.postprocess.as_ref() {
             None => {
                 let result =
                     execute_prepared_with_transaction(transaction, &prepared_statements).await?;
-                let tracked_insert_mutation_present = output.mutations.iter().any(|mutation| {
+                let tracked_insert_mutation_present =
+                    plan.preprocess.mutations.iter().any(|mutation| {
                     mutation.operation == MutationOperation::Insert && !mutation.untracked
                 });
                 if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
@@ -156,22 +148,22 @@ impl Engine {
                 let result =
                     execute_prepared_with_transaction(transaction, &prepared_statements).await?;
                 match postprocess_plan {
-                    PostprocessPlan::VtableUpdate(plan) => {
-                        if should_refresh_file_cache {
+                    PostprocessPlan::VtableUpdate(update_plan) => {
+                        if plan.requirements.should_refresh_file_cache {
                             postprocess_file_cache_targets.extend(
                                 collect_postprocess_file_cache_targets(
                                     &result.rows,
-                                    &plan.schema_key,
+                                    &update_plan.schema_key,
                                 )?,
                             );
                         }
                     }
-                    PostprocessPlan::VtableDelete(plan) => {
-                        if should_refresh_file_cache {
+                    PostprocessPlan::VtableDelete(delete_plan) => {
+                        if plan.requirements.should_refresh_file_cache {
                             postprocess_file_cache_targets.extend(
                                 collect_postprocess_file_cache_targets(
                                     &result.rows,
-                                    &plan.schema_key,
+                                    &delete_plan.schema_key,
                                 )?,
                             );
                         }
@@ -189,16 +181,17 @@ impl Engine {
                     }
                 }
                 let mut followup_functions = functions.clone();
-                let followup_params = output
+                let followup_params = plan
+                    .preprocess
                     .prepared_statements
                     .first()
                     .map(|statement| statement.params.as_slice())
                     .unwrap_or(&[]);
                 let followup_statements = match postprocess_plan {
-                    PostprocessPlan::VtableUpdate(plan) => {
+                    PostprocessPlan::VtableUpdate(update_plan) => {
                         build_update_followup_statements(
                             transaction,
-                            plan,
+                            update_plan,
                             &result.rows,
                             &contract_detected_file_domain_changes,
                             writer_key,
@@ -206,10 +199,10 @@ impl Engine {
                         )
                         .await?
                     }
-                    PostprocessPlan::VtableDelete(plan) => {
+                    PostprocessPlan::VtableDelete(delete_plan) => {
                         build_delete_followup_statements(
                             transaction,
-                            plan,
+                            delete_plan,
                             &result.rows,
                             followup_params,
                             &contract_detected_file_domain_changes,
@@ -225,26 +218,24 @@ impl Engine {
             }
         };
 
-        if let Some(version_id) =
-            next_active_version_id_from_mutations.or(next_active_version_id_from_updates)
-        {
-            *active_version_id = version_id;
+        if let Some(version_id) = &plan.effects.next_active_version_id {
+            *active_version_id = version_id.clone();
         }
 
-        let file_cache_refresh_targets = if should_refresh_file_cache {
-            let mut targets = direct_state_file_cache_refresh_targets(&output.mutations);
+        let file_cache_refresh_targets = if plan.requirements.should_refresh_file_cache {
+            let mut targets = direct_state_file_cache_refresh_targets(&plan.preprocess.mutations);
             targets.extend(postprocess_file_cache_targets);
             targets
         } else {
             BTreeSet::new()
         };
         let descriptor_cache_eviction_targets =
-            file_descriptor_cache_eviction_targets(&output.mutations);
+            file_descriptor_cache_eviction_targets(&plan.preprocess.mutations);
         let mut file_cache_invalidation_targets = file_cache_refresh_targets;
         file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
         file_cache_invalidation_targets.extend(pending_file_delete_targets);
         let should_run_binary_gc =
-            should_run_binary_cas_gc(&output.mutations, &detected_file_domain_changes);
+            should_run_binary_cas_gc(&plan.preprocess.mutations, &detected_file_domain_changes);
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without
