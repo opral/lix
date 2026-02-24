@@ -6,7 +6,6 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::lowering::lower_statement;
-use super::super::ast::nodes::Statement;
 use super::super::ast::utils::parse_sql_statements;
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::{
@@ -20,6 +19,7 @@ use super::materialize::materialize_vtable_insert_select_sources;
 use super::rewrite_engine::StatementPipeline;
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
+use sqlparser::ast::Statement;
 
 struct RewrittenStatementBinding {
     statement: Statement,

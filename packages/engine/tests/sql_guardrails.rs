@@ -79,14 +79,22 @@ fn guardrail_execute_entrypoints_route_through_sql_api() {
         "engine module must wire sql runtime module"
     );
     assert!(
-        sql_api_source.contains("pub(crate) async fn execute_impl")
-            && sql_api_source
-                .contains("self.execute_impl_sql(sql, params, options, allow_internal_tables)"),
-        "engine execute entrypoint must delegate to sql"
+        !sql_api_source.contains("pub(crate) async fn execute_impl("),
+        "legacy execute_impl wrapper should stay removed"
+    );
+    assert!(
+        sql_api_source.contains("pub async fn execute(")
+            && sql_api_source.contains("self.execute_impl_sql(sql, params, options, false).await"),
+        "public execute entrypoint must delegate to execute_impl_sql"
+    );
+    assert!(
+        sql_api_source.contains("pub(crate) async fn execute_internal(")
+            && sql_api_source.contains("self.execute_impl_sql(sql, params, options, true).await"),
+        "internal execute entrypoint must delegate to execute_impl_sql"
     );
     assert!(
         sql_api_source.contains("pub(crate) async fn execute_impl_sql"),
-        "sql api must expose execute_impl_sql entrypoint"
+        "engine execute entrypoint must delegate to sql"
     );
 }
 

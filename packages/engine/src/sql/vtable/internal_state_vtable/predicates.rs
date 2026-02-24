@@ -1,7 +1,7 @@
-use super::super::super::ast::nodes::Statement;
 use super::super::super::ast::walk::{
     object_name_matches, visit_query_selects, visit_table_factors_in_select,
 };
+use sqlparser::ast::Statement;
 use sqlparser::ast::{
     BinaryOperator, Delete, Expr, FromTable, ObjectName, ObjectNamePart, TableFactor, TableObject,
     TableWithJoins, Value, ValueWithSpan,

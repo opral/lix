@@ -3,7 +3,6 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixBackend;
 use crate::Value;
 
-use super::super::ast::nodes::Statement;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::planner_error::PlannerError;
 use super::super::surfaces::registry::{
@@ -12,6 +11,7 @@ use super::super::surfaces::registry::{
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::invariants::validate_execution_plan;
+use sqlparser::ast::Statement;
 
 pub(crate) async fn build_execution_plan<P>(
     backend: &dyn LixBackend,

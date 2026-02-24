@@ -657,8 +657,14 @@ simulation_test!(
         assert_eq!(stored.rows.len(), 1);
         assert_eq!(stored.rows[0][0], Value::Text("2".to_string()));
         assert_eq!(stored.rows[0][1], Value::Text("other".to_string()));
-        assert_eq!(stored.rows[0][2], Value::Text("{\"key\":\"updated\"}".to_string()));
-        assert_eq!(stored.rows[0][3], Value::Text("{\"source\":\"new\"}".to_string()));
+        assert_eq!(
+            stored.rows[0][2],
+            Value::Text("{\"key\":\"updated\"}".to_string())
+        );
+        assert_eq!(
+            stored.rows[0][3],
+            Value::Text("{\"source\":\"new\"}".to_string())
+        );
         assert_eq!(stored.rows[0][4], Value::Text("writer:new".to_string()));
         assert_eq!(stored.rows[0][5], Value::Integer(0));
         let change_id = match &stored.rows[0][6] {
@@ -683,7 +689,10 @@ simulation_test!(
             .unwrap();
         assert_eq!(change.rows.len(), 1);
         assert_eq!(change.rows[0][0], Value::Text("other".to_string()));
-        assert_eq!(change.rows[0][1], Value::Text("{\"source\":\"new\"}".to_string()));
+        assert_eq!(
+            change.rows[0][1],
+            Value::Text("{\"source\":\"new\"}".to_string())
+        );
     }
 );
 

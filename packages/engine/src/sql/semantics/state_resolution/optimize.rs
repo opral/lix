@@ -1,4 +1,4 @@
-use super::super::super::ast::nodes::Statement;
+use sqlparser::ast::Statement;
 
 use super::canonical::{statement_targets_table_name, CanonicalStateResolution};
 

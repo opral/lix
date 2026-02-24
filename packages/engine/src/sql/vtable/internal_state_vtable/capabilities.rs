@@ -1,5 +1,5 @@
-use super::super::super::ast::nodes::Statement;
 use super::predicates::statement_targets_internal_state_vtable;
+use sqlparser::ast::Statement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VtableOperation {

@@ -1,4 +1,4 @@
-use super::super::super::ast::nodes::Statement;
+use sqlparser::ast::Statement;
 use sqlparser::ast::{FromTable, ObjectName, ObjectNamePart, TableObject, TableWithJoins};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -1,9 +1,9 @@
+use crate::error_classification::is_missing_relation_error;
 use crate::version::{
     version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
     GLOBAL_VERSION_ID,
 };
 use crate::working_projection::WORKING_PROJECTION_METADATA;
-use crate::error_classification::is_missing_relation_error;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
