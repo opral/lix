@@ -61,10 +61,10 @@ mod plugin_install;
 mod runtime_functions;
 #[path = "sql_followup_runtime.rs"]
 pub(crate) mod sql_followup_runtime;
+#[path = "sql_preprocess_runtime.rs"]
+pub(crate) mod sql_preprocess_runtime;
 #[path = "sql_read_rewrite_runtime.rs"]
 pub(crate) mod sql_read_rewrite_runtime;
-#[path = "sql_bridge_runtime.rs"]
-pub(crate) mod sql_bridge_runtime;
 #[path = "sql2/mod.rs"]
 pub(crate) mod sql2;
 

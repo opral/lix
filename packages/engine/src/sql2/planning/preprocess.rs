@@ -5,7 +5,7 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 use super::super::ast::nodes::Statement;
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::PlannedStatementSet;
-use super::super::super::sql_bridge_runtime;
+use super::super::super::sql_preprocess_runtime;
 
 pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(
     statements: Vec<Statement>,
@@ -13,7 +13,7 @@ pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider
     provider: &mut P,
     dialect: SqlDialect,
 ) -> Result<PlannedStatementSet, LixError> {
-    sql_bridge_runtime::preprocess_statements_with_provider_to_plan(
+    sql_preprocess_runtime::preprocess_statements_with_provider_to_plan(
         statements,
         params,
         provider,
@@ -27,7 +27,7 @@ pub(crate) async fn preprocess_sql_to_plan(
     sql_text: &str,
     params: &[Value],
 ) -> Result<PlannedStatementSet, LixError> {
-    sql_bridge_runtime::preprocess_sql_to_plan(backend, evaluator, sql_text, params).await
+    sql_preprocess_runtime::preprocess_sql_to_plan(backend, evaluator, sql_text, params).await
 }
 
 pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
@@ -42,7 +42,7 @@ pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    sql_bridge_runtime::preprocess_with_surfaces_to_plan(
+    sql_preprocess_runtime::preprocess_with_surfaces_to_plan(
         backend,
         evaluator,
         statements,

@@ -176,7 +176,7 @@ fn guardrail_legacy_bridge_is_removed_and_references_are_forbidden() {
 }
 
 #[test]
-fn guardrail_legacy_sql_bridge_usage_is_centralized_to_runtime_bridge_module() {
+fn guardrail_legacy_sql_bridge_alias_usage_is_forbidden() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
@@ -185,14 +185,9 @@ fn guardrail_legacy_sql_bridge_usage_is_centralized_to_runtime_bridge_module() {
         let source = fs::read_to_string(&file).expect("source file should be readable");
         let uses_legacy_sql_bridge =
             source.contains("use crate::sql as legacy_sql") || source.contains("legacy_sql::");
-        if !uses_legacy_sql_bridge {
-            continue;
-        }
-
-        let normalized = file.to_string_lossy().replace('\\', "/");
         assert!(
-            normalized.ends_with("src/sql_bridge_runtime.rs"),
-            "legacy_sql bridge usage must stay centralized in src/sql_bridge_runtime.rs: {}",
+            !uses_legacy_sql_bridge,
+            "legacy_sql alias bridge usage is no longer allowed: {}",
             file.display()
         );
     }

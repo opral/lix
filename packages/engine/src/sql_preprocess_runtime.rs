@@ -1,6 +1,5 @@
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql as legacy_sql;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::sql2::ast::nodes::Statement;
@@ -20,7 +19,7 @@ pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider
     dialect: SqlDialect,
 ) -> Result<PlannedStatementSet, LixError> {
     let output =
-        legacy_sql::preprocess_statements_with_provider(statements, params, provider, dialect)?;
+        crate::sql::preprocess_statements_with_provider(statements, params, provider, dialect)?;
     Ok(from_legacy_preprocess_output(output))
 }
 
@@ -30,7 +29,7 @@ pub(crate) async fn preprocess_sql_to_plan(
     sql_text: &str,
     params: &[Value],
 ) -> Result<PlannedStatementSet, LixError> {
-    let output = legacy_sql::preprocess_sql(backend, evaluator, sql_text, params).await?;
+    let output = crate::sql::preprocess_sql(backend, evaluator, sql_text, params).await?;
     Ok(from_legacy_preprocess_output(output))
 }
 
@@ -50,7 +49,7 @@ where
         to_legacy_detected_file_domain_changes_by_statement(
             detected_file_domain_changes_by_statement,
         );
-    let output = legacy_sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+    let output = crate::sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
         backend,
         evaluator,
         statements,
@@ -65,13 +64,13 @@ where
 
 fn to_legacy_detected_file_domain_changes_by_statement(
     changes_by_statement: &[Vec<DetectedFileDomainChange>],
-) -> Vec<Vec<legacy_sql::DetectedFileDomainChange>> {
+) -> Vec<Vec<crate::sql::DetectedFileDomainChange>> {
     changes_by_statement
         .iter()
         .map(|changes| {
             changes
                 .iter()
-                .map(|change| legacy_sql::DetectedFileDomainChange {
+                .map(|change| crate::sql::DetectedFileDomainChange {
                     entity_id: change.entity_id.clone(),
                     schema_key: change.schema_key.clone(),
                     schema_version: change.schema_version.clone(),
@@ -87,7 +86,7 @@ fn to_legacy_detected_file_domain_changes_by_statement(
         .collect()
 }
 
-fn from_legacy_preprocess_output(output: legacy_sql::PreprocessOutput) -> PlannedStatementSet {
+fn from_legacy_preprocess_output(output: crate::sql::PreprocessOutput) -> PlannedStatementSet {
     PlannedStatementSet {
         sql: output.sql,
         prepared_statements: output
@@ -114,7 +113,7 @@ fn from_legacy_preprocess_output(output: legacy_sql::PreprocessOutput) -> Planne
     }
 }
 
-fn from_legacy_prepared_statement(statement: legacy_sql::PreparedStatement) -> PreparedStatement {
+fn from_legacy_prepared_statement(statement: crate::sql::PreparedStatement) -> PreparedStatement {
     PreparedStatement {
         sql: statement.sql,
         params: statement.params,
@@ -122,23 +121,23 @@ fn from_legacy_prepared_statement(statement: legacy_sql::PreparedStatement) -> P
 }
 
 fn from_legacy_schema_registration(
-    registration: legacy_sql::SchemaRegistration,
+    registration: crate::sql::SchemaRegistration,
 ) -> SchemaRegistration {
     SchemaRegistration {
         schema_key: registration.schema_key,
     }
 }
 
-fn from_legacy_postprocess_plan(plan: legacy_sql::PostprocessPlan) -> PostprocessPlan {
+fn from_legacy_postprocess_plan(plan: crate::sql::PostprocessPlan) -> PostprocessPlan {
     match plan {
-        legacy_sql::PostprocessPlan::VtableUpdate(update) => {
+        crate::sql::PostprocessPlan::VtableUpdate(update) => {
             PostprocessPlan::VtableUpdate(VtableUpdatePlan {
                 schema_key: update.schema_key,
                 explicit_writer_key: update.explicit_writer_key,
                 writer_key_assignment_present: update.writer_key_assignment_present,
             })
         }
-        legacy_sql::PostprocessPlan::VtableDelete(delete) => {
+        crate::sql::PostprocessPlan::VtableDelete(delete) => {
             PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: delete.schema_key,
                 effective_scope_fallback: delete.effective_scope_fallback,
@@ -148,7 +147,7 @@ fn from_legacy_postprocess_plan(plan: legacy_sql::PostprocessPlan) -> Postproces
     }
 }
 
-fn from_legacy_mutation_row(row: legacy_sql::MutationRow) -> MutationRow {
+fn from_legacy_mutation_row(row: crate::sql::MutationRow) -> MutationRow {
     MutationRow {
         operation: from_legacy_mutation_operation(row.operation),
         entity_id: row.entity_id,
@@ -162,16 +161,16 @@ fn from_legacy_mutation_row(row: legacy_sql::MutationRow) -> MutationRow {
     }
 }
 
-fn from_legacy_mutation_operation(operation: legacy_sql::MutationOperation) -> MutationOperation {
+fn from_legacy_mutation_operation(operation: crate::sql::MutationOperation) -> MutationOperation {
     match operation {
-        legacy_sql::MutationOperation::Insert => MutationOperation::Insert,
-        legacy_sql::MutationOperation::Update => MutationOperation::Update,
-        legacy_sql::MutationOperation::Delete => MutationOperation::Delete,
+        crate::sql::MutationOperation::Insert => MutationOperation::Insert,
+        crate::sql::MutationOperation::Update => MutationOperation::Update,
+        crate::sql::MutationOperation::Delete => MutationOperation::Delete,
     }
 }
 
 fn from_legacy_update_validation_plan(
-    plan: legacy_sql::UpdateValidationPlan,
+    plan: crate::sql::UpdateValidationPlan,
 ) -> UpdateValidationPlan {
     UpdateValidationPlan {
         table: plan.table,
