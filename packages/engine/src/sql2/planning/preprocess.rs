@@ -5,9 +5,6 @@ use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
-use super::super::super::sql_preprocess_runtime::{
-    legacy_rewrite_statement_with_backend, legacy_rewrite_statement_with_provider,
-};
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::nodes::Statement;
 use super::super::ast::utils::{
@@ -21,6 +18,7 @@ use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
+use super::rewrite_engine::StatementPipeline;
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 
@@ -53,9 +51,9 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
 
     for statement in statements {
         let output =
-            legacy_rewrite_statement_with_provider(params, writer_key, statement, provider)?;
+            StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
         accumulate_rewrite_output(
-            output,
+            from_rewrite_output(output),
             provider,
             dialect,
             &mut rewritten,
@@ -110,10 +108,8 @@ where
 
         // Keep this async rewrite future boxed to avoid infinitely sized
         // futures in recursive rewrite call paths.
-        let output = Box::pin(legacy_rewrite_statement_with_backend(
+        let output = Box::pin(StatementPipeline::new(params, writer_key).rewrite_statement_with_backend(
             backend,
-            params,
-            writer_key,
             statement,
             provider,
             statement_detected_file_domain_changes,
@@ -121,7 +117,7 @@ where
         .await?;
 
         accumulate_rewrite_output(
-            output,
+            from_rewrite_output(output),
             provider,
             backend.dialect(),
             &mut rewritten,
@@ -306,4 +302,15 @@ fn render_statements_with_params(
 
     let normalized_sql = rendered.join("; ");
     Ok((normalized_sql, prepared_statements))
+}
+
+fn from_rewrite_output(output: super::rewrite_engine::RewriteOutput) -> StatementRewriteOutput {
+    StatementRewriteOutput {
+        statements: output.statements,
+        params: output.params,
+        registrations: output.registrations,
+        postprocess: output.postprocess,
+        mutations: output.mutations,
+        update_validations: output.update_validations,
+    }
 }

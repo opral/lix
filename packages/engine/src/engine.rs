@@ -67,8 +67,6 @@ pub(crate) mod sql_followup_runtime;
 pub(crate) mod sql_preprocess_runtime;
 #[path = "sql_read_rewrite_runtime.rs"]
 pub(crate) mod sql_read_rewrite_runtime;
-#[path = "sql_rewrite_runtime.rs"]
-pub(crate) mod sql_rewrite_runtime;
 
 use self::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
 use self::sql2::contracts::effects::DetectedFileDomainChange;
