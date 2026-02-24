@@ -21,8 +21,7 @@ use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::state_commit_stream::{
-    state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,
-    StateCommitStreamChange, StateCommitStreamFilter,
+    StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::validation::{validate_inserts, validate_updates, SchemaCache};
 use crate::version::{
