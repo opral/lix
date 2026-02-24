@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::{fmt::Write as _, string::String};
+use std::string::String;
 
 use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement, Value as SqlAstValue};
 use sqlparser::dialect::GenericDialect;
@@ -184,17 +184,6 @@ where
     })
 }
 
-#[allow(dead_code)]
-pub async fn preprocess_sql(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql: &str,
-    params: &[Value],
-) -> Result<PreprocessOutput, LixError> {
-    let functions = SharedFunctionProvider::new(SystemFunctionProvider);
-    preprocess_sql_with_provider(backend, evaluator, sql, params, functions).await
-}
-
 pub async fn preprocess_sql_with_provider<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
     evaluator: &CelEvaluator,
@@ -278,13 +267,13 @@ where
     .await
 }
 
-#[allow(dead_code)]
-pub fn preprocess_sql_rewrite_only(sql: &str) -> Result<PreprocessOutput, LixError> {
+#[cfg(test)]
+pub(crate) fn preprocess_sql_rewrite_only(sql: &str) -> Result<PreprocessOutput, LixError> {
     preprocess_statements(parse_sql_statements(sql)?, &[], SqlDialect::Sqlite)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
+#[cfg(test)]
+fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
     let mut serialized = String::new();
 
     serialized.push_str("sql:");
