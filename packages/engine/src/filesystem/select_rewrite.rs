@@ -5,7 +5,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::engine::sql2::storage::sql_text::escape_sql_string;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
 };
@@ -830,7 +830,7 @@ fn default_alias(view_name: &str) -> TableAlias {
 #[cfg(test)]
 mod tests {
     use super::{rewrite_query, rewrite_query_with_params};
-    use crate::engine::sql2::ast::utils::parse_sql_statements;
+    use crate::engine::sql::ast::utils::parse_sql_statements;
     use crate::Value;
 
     #[test]

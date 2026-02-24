@@ -3,7 +3,7 @@ use sqlparser::ast::Value as AstValue;
 use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Statement, TableObject};
 
 use crate::cel::CelEvaluator;
-use crate::engine::sql2::ast::utils::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
+use crate::engine::sql::ast::utils::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::{OverlaySchemaProvider, SchemaKey, SchemaProvider};
 use crate::{LixBackend, LixError, Value};
@@ -251,7 +251,7 @@ mod tests {
     use sqlparser::ast::{Expr, SetExpr, Statement};
 
     use crate::cel::CelEvaluator;
-    use crate::engine::sql2::ast::utils::parse_sql_statements;
+    use crate::engine::sql::ast::utils::parse_sql_statements;
     use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 

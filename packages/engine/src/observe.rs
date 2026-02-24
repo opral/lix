@@ -1,5 +1,5 @@
 use crate::engine::{Engine, ExecuteOptions};
-use crate::engine::sql2::ast::utils::{
+use crate::engine::sql::ast::utils::{
     bind_sql_with_state, parse_sql_statements, PlaceholderState,
 };
 use crate::state_commit_stream::{StateCommitStream, StateCommitStreamFilter};

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 
-use crate::engine::sql2::storage::sql_text::escape_sql_string;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 use super::key::SchemaKey;

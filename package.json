@@ -7,7 +7,7 @@
     "postinstall": "command -v cargo >/dev/null 2>&1 && cargo fetch || true",
     "test": "pnpm test:js && pnpm test:rs",
     "test:js": "pnpm exec nx run-many --target=test --parallel",
-    "test:engine:guardrails": "cargo test -p lix_engine --test sql2_guardrails -- --test-threads=1",
+    "test:engine:guardrails": "cargo test -p lix_engine --test sql_guardrails -- --test-threads=1",
     "test:rs": "cargo test --workspace",
     "lint": "pnpm lint:js && pnpm lint:rs",
     "lint:js": "pnpm exec nx run-many --target=lint --parallel",

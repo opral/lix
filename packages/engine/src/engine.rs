@@ -58,13 +58,13 @@ mod init_seed;
 mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
-#[path = "sql2/mod.rs"]
-pub(crate) mod sql2;
+#[path = "sql/mod.rs"]
+pub(crate) mod sql;
 
-use self::sql2::contracts::effects::DetectedFileDomainChange;
-use self::sql2::contracts::planned_statement::MutationRow;
-use self::sql2::planning::parse::parse_sql;
-use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+use self::sql::contracts::effects::DetectedFileDomainChange;
+use self::sql::contracts::planned_statement::MutationRow;
+use self::sql::planning::parse::parse_sql;
+use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -548,25 +548,25 @@ mod tests {
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::engine::Engine;
-    use crate::engine::sql2::ast::utils::parse_sql_statements;
-    use crate::engine::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
-    use crate::engine::sql2::ast::walk::contains_transaction_control_statement;
-    use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
-    use crate::engine::sql2::contracts::planned_statement::{
+    use crate::engine::sql::ast::utils::parse_sql_statements;
+    use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
+    use crate::engine::sql::ast::walk::contains_transaction_control_statement;
+    use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
+    use crate::engine::sql::contracts::planned_statement::{
         MutationOperation, MutationRow, UpdateValidationPlan,
     };
-    use crate::engine::sql2::history::plugin_inputs::{
+    use crate::engine::sql::history::plugin_inputs::{
         file_history_read_materialization_required_for_statements,
         file_read_materialization_scope_for_statements, FileReadMaterializationScope,
     };
-    use crate::engine::sql2::planning::script::{
+    use crate::engine::sql::planning::script::{
         coalesce_lix_file_transaction_statements,
         extract_explicit_transaction_script_from_statements,
     };
-    use crate::engine::sql2::side_effects::advance_placeholder_state_for_statement;
-    use crate::engine::sql2::semantics::state_resolution::canonical::is_query_only_statements;
-    use crate::engine::sql2::semantics::state_resolution::effects::active_version_from_update_validations;
-    use crate::engine::sql2::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::engine::sql::side_effects::advance_placeholder_state_for_statement;
+    use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
+    use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
+    use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
