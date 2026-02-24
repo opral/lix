@@ -14,16 +14,16 @@ use crate::filesystem::path::{
     file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
     normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
 };
+use crate::engine::sql2::ast::utils::{
+    bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
+    ResolvedCell,
+};
 use crate::engine::sql2::legacy_bridge::{
-    bind_sql_with_sql_bridge_state as bind_sql_with_state,
     escape_sql_string_with_sql_bridge as escape_sql_string,
     lower_statement_with_sql_bridge as lower_statement,
-    resolve_expr_cell_with_sql_bridge as resolve_expr_cell_with_state,
-    resolve_values_rows_with_sql_bridge as resolve_values_rows,
     rewrite_read_query_with_backend_and_params_in_session_with_sql_bridge as rewrite_read_query_with_backend_and_params_in_session,
     SqlBridgeDetectedFileDomainChange as DetectedFileDomainChange,
-    SqlBridgePlaceholderState as PlaceholderState,
-    SqlBridgeReadRewriteSession as ReadRewriteSession, SqlBridgeResolvedCell as ResolvedCell,
+    SqlBridgeReadRewriteSession as ReadRewriteSession,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -3466,10 +3466,8 @@ mod tests {
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
         rewrite_update, select_effective_entity_tombstone_state,
     };
-    use crate::engine::sql2::ast::utils::parse_sql_statements;
-    use crate::engine::sql2::legacy_bridge::{
-        resolve_expr_cell_with_sql_bridge as resolve_expr_cell_with_state,
-        SqlBridgePlaceholderState as PlaceholderState,
+    use crate::engine::sql2::ast::utils::{
+        parse_sql_statements, resolve_expr_cell_with_state, PlaceholderState,
     };
     use crate::SqlDialect;
     use crate::Value;
