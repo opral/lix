@@ -7,27 +7,18 @@ use crate::engine::sql2::contracts::postprocess_actions::{
     PostprocessPlan as Sql2PostprocessPlan, VtableDeletePlan as Sql2VtableDeletePlan,
     VtableUpdatePlan as Sql2VtableUpdatePlan,
 };
+use crate::engine::sql2::planning::rewrite_output::StatementRewriteOutput;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
 use crate::engine::sql2::ast::nodes::Statement;
-
-#[derive(Debug, Clone)]
-pub(crate) struct Sql2RewriteOutput {
-    pub(crate) statements: Vec<Statement>,
-    pub(crate) params: Vec<Value>,
-    pub(crate) registrations: Vec<Sql2SchemaRegistration>,
-    pub(crate) postprocess: Option<Sql2PostprocessPlan>,
-    pub(crate) mutations: Vec<Sql2MutationRow>,
-    pub(crate) update_validations: Vec<Sql2UpdateValidationPlan>,
-}
 
 pub(crate) fn rewrite_statement_with_provider_to_sql2<P: LixFunctionProvider>(
     params: &[Value],
     writer_key: Option<&str>,
     statement: Statement,
     provider: &mut P,
-) -> Result<Sql2RewriteOutput, LixError> {
+) -> Result<StatementRewriteOutput, LixError> {
     let output =
         super::StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
     Ok(from_rewrite_output(output))
@@ -40,7 +31,7 @@ pub(crate) async fn rewrite_statement_with_backend_to_sql2<P: LixFunctionProvide
     statement: Statement,
     provider: &mut P,
     detected_file_domain_changes: &[Sql2DetectedFileDomainChange],
-) -> Result<Sql2RewriteOutput, LixError>
+) -> Result<StatementRewriteOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
@@ -71,8 +62,8 @@ fn to_legacy_detected_file_domain_changes(
         .collect()
 }
 
-fn from_rewrite_output(output: super::RewriteOutput) -> Sql2RewriteOutput {
-    Sql2RewriteOutput {
+fn from_rewrite_output(output: super::RewriteOutput) -> StatementRewriteOutput {
+    StatementRewriteOutput {
         statements: output.statements,
         params: output.params,
         registrations: output

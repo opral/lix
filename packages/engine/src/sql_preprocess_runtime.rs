@@ -58,10 +58,9 @@ pub(crate) fn legacy_rewrite_statement_with_provider<P: LixFunctionProvider>(
     statement: Statement,
     provider: &mut P,
 ) -> Result<StatementRewriteOutput, LixError> {
-    let output = super::super::sql::rewrite_statement_with_provider_to_sql2(
+    super::super::sql::rewrite_statement_with_provider_to_sql2(
         params, writer_key, statement, provider,
-    )?;
-    Ok(from_legacy_rewrite_output(output))
+    )
 }
 
 pub(crate) async fn legacy_rewrite_statement_with_backend<P>(
@@ -75,7 +74,7 @@ pub(crate) async fn legacy_rewrite_statement_with_backend<P>(
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    let output = super::super::sql::rewrite_statement_with_backend_to_sql2(
+    super::super::sql::rewrite_statement_with_backend_to_sql2(
         backend,
         params,
         writer_key,
@@ -83,19 +82,5 @@ where
         provider,
         detected_file_domain_changes,
     )
-    .await?;
-    Ok(from_legacy_rewrite_output(output))
-}
-
-fn from_legacy_rewrite_output(
-    output: super::super::sql::Sql2RewriteOutput,
-) -> StatementRewriteOutput {
-    StatementRewriteOutput {
-        statements: output.statements,
-        params: output.params,
-        registrations: output.registrations,
-        postprocess: output.postprocess,
-        mutations: output.mutations,
-        update_validations: output.update_validations,
-    }
+    .await
 }
