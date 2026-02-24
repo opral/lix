@@ -45,5 +45,5 @@ Postprocess ordering:
 ## Guardrails
 
 - `tests/sql2_guardrails.rs` ensures `src/execute` stays removed.
-- `tests/sql2_guardrails.rs` ensures `sql2/legacy_bridge.rs` and `legacy_bridge::` references are not reintroduced.
+- `tests/sql2_guardrails.rs` ensures the removed bridge module and its callsites are not reintroduced.
 - `tests/sql2_guardrails.rs` ensures no string-matched fallback helper is reintroduced.
