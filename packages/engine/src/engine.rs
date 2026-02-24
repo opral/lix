@@ -59,6 +59,8 @@ mod init_seed;
 mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
+#[path = "sql_bridge_runtime.rs"]
+pub(crate) mod sql_bridge_runtime;
 #[path = "sql2/mod.rs"]
 pub(crate) mod sql2;
 

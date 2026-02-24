@@ -137,31 +137,18 @@ fn guardrail_sql2_legacy_contract_adapter_directory_stays_removed() {
 }
 
 #[test]
-fn guardrail_sql2_runtime_legacy_bridge_allowlist_is_explicit() {
+fn guardrail_sql2_runtime_forbids_legacy_bridge_usage() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql2");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
-
-    let allowlisted_suffixes = [
-        "src/sql2/planning/legacy_preprocess.rs",
-        "src/sql2/execution/followup.rs",
-    ];
 
     for file in files {
         let source = fs::read_to_string(&file).expect("source file should be readable");
         let uses_legacy_bridge =
             source.contains("use crate::sql as legacy_sql") || source.contains("legacy_sql::");
-        if !uses_legacy_bridge {
-            continue;
-        }
-
-        let normalized = file.to_string_lossy().replace('\\', "/");
-        let is_allowlisted = allowlisted_suffixes
-            .iter()
-            .any(|suffix| normalized.ends_with(suffix));
         assert!(
-            is_allowlisted,
-            "legacy bridge usage in sql2 must be explicitly allowlisted: {}",
+            !uses_legacy_bridge,
+            "legacy bridge usage in sql2 runtime is no longer allowed: {}",
             file.display()
         );
     }
