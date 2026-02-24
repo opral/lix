@@ -5,8 +5,7 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 use super::sql2::ast::nodes::Statement;
 use super::sql2::contracts::effects::DetectedFileDomainChange;
 use super::sql2::contracts::planned_statement::PlannedStatementSet;
-
-pub(crate) type LegacyRewriteOutput = super::super::sql::Sql2RewriteOutput;
+use super::sql2::planning::rewrite_output::StatementRewriteOutput;
 
 pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(
     statements: Vec<Statement>,
@@ -58,10 +57,11 @@ pub(crate) fn legacy_rewrite_statement_with_provider<P: LixFunctionProvider>(
     writer_key: Option<&str>,
     statement: Statement,
     provider: &mut P,
-) -> Result<LegacyRewriteOutput, LixError> {
-    super::super::sql::rewrite_statement_with_provider_to_sql2(
+) -> Result<StatementRewriteOutput, LixError> {
+    let output = super::super::sql::rewrite_statement_with_provider_to_sql2(
         params, writer_key, statement, provider,
-    )
+    )?;
+    Ok(from_legacy_rewrite_output(output))
 }
 
 pub(crate) async fn legacy_rewrite_statement_with_backend<P>(
@@ -71,11 +71,11 @@ pub(crate) async fn legacy_rewrite_statement_with_backend<P>(
     statement: Statement,
     provider: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
-) -> Result<LegacyRewriteOutput, LixError>
+) -> Result<StatementRewriteOutput, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    super::super::sql::rewrite_statement_with_backend_to_sql2(
+    let output = super::super::sql::rewrite_statement_with_backend_to_sql2(
         backend,
         params,
         writer_key,
@@ -83,5 +83,19 @@ where
         provider,
         detected_file_domain_changes,
     )
-    .await
+    .await?;
+    Ok(from_legacy_rewrite_output(output))
+}
+
+fn from_legacy_rewrite_output(
+    output: super::super::sql::Sql2RewriteOutput,
+) -> StatementRewriteOutput {
+    StatementRewriteOutput {
+        statements: output.statements,
+        params: output.params,
+        registrations: output.registrations,
+        postprocess: output.postprocess,
+        mutations: output.mutations,
+        update_validations: output.update_validations,
+    }
 }
