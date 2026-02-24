@@ -66,7 +66,6 @@ pub(crate) mod sql2;
 use self::sql2::should_sequentialize_postprocess_multi_statement;
 use self::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
 use self::sql2::contracts::effects::DetectedFileDomainChange;
-use self::sql2::contracts::legacy_sql::from_legacy_detected_file_domain_changes;
 use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
 use self::sql2::planning::parse::parse_sql;
 use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
@@ -548,14 +547,10 @@ async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
                     &mut placeholder_state,
                 )
                 .await?;
-                let tracked_changes =
-                    from_legacy_detected_file_domain_changes(side_effects.tracked_directory_changes);
-                let untracked_changes_for_statement =
-                    from_legacy_detected_file_domain_changes(side_effects.untracked_directory_changes);
                 let statement_tracked_changes =
-                    dedupe_detected_file_domain_changes(&tracked_changes);
+                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
                 tracked_changes_by_statement.push(statement_tracked_changes);
-                untracked_changes.extend(untracked_changes_for_statement);
+                untracked_changes.extend(side_effects.untracked_directory_changes);
             }
             other => {
                 tracked_changes_by_statement.push(Vec::new());

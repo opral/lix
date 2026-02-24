@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use sqlparser::ast::Statement;
 
 use crate::functions::LixFunctionProvider;
+use crate::engine::sql2::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
 use crate::sql::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
 use crate::sql::steps::lix_state_history_view_write;
 use crate::sql::types::RewriteOutput;
@@ -356,7 +357,8 @@ where
                 insert_detected_file_domain_changes.extend(
                     filesystem_insert_side_effects
                         .tracked_directory_changes
-                        .clone(),
+                        .iter()
+                        .map(sql2_change_to_legacy_change),
                 );
 
                 let insert = if let Some(rewritten) = filesystem_write::rewrite_insert_with_backend(
@@ -697,4 +699,18 @@ where
     }
 
     Ok(StatementRuleOutcome::Continue(current))
+}
+
+fn sql2_change_to_legacy_change(change: &Sql2DetectedFileDomainChange) -> DetectedFileDomainChange {
+    DetectedFileDomainChange {
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        schema_version: change.schema_version.clone(),
+        file_id: change.file_id.clone(),
+        version_id: change.version_id.clone(),
+        plugin_key: change.plugin_key.clone(),
+        snapshot_content: change.snapshot_content.clone(),
+        metadata: change.metadata.clone(),
+        writer_key: change.writer_key.clone(),
+    }
 }
