@@ -11,6 +11,7 @@ use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
 use super::super::contracts::planned_statement::MutationOperation;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
+use super::super::planning::lower_sql::lower_to_prepared_statements;
 use super::followup::{
     build_delete_followup_statements, build_update_followup_statements,
 };
@@ -30,6 +31,8 @@ pub(crate) async fn execute_plan_sql(
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
 ) -> Result<SqlExecutionOutcome, ExecutorError> {
+    let prepared_statements = lower_to_prepared_statements(plan);
+
     for registration in &plan.preprocess.registrations {
         crate::schema_registry::register_schema(engine.backend.as_ref(), &registration.schema_key)
             .await
@@ -42,7 +45,7 @@ pub(crate) async fn execute_plan_sql(
         None => {
             let result = execute_prepared_with_backend(
                 engine.backend.as_ref(),
-                &plan.preprocess.prepared_statements,
+                &prepared_statements,
             )
             .await
             .map_err(ExecutorError::execute)?;
@@ -63,7 +66,7 @@ pub(crate) async fn execute_plan_sql(
                 .map_err(ExecutorError::execute)?;
             let result = match execute_prepared_with_transaction(
                 transaction.as_mut(),
-                &plan.preprocess.prepared_statements,
+                &prepared_statements,
             )
             .await
             {
@@ -121,9 +124,7 @@ pub(crate) async fn execute_plan_sql(
             }
 
             let mut followup_functions = functions.clone();
-            let followup_params = plan
-                .preprocess
-                .prepared_statements
+            let followup_params = prepared_statements
                 .first()
                 .map(|statement| statement.params.as_slice())
                 .unwrap_or(&[]);

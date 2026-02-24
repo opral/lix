@@ -1,10 +1,4 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PostprocessAction {
-    None,
-    SqlFollowup,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VtableUpdatePlan {
     pub(crate) schema_key: String,
     pub(crate) explicit_writer_key: Option<Option<String>>,

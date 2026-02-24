@@ -1,22 +1,37 @@
-use std::sync::Arc;
+#[cfg(test)]
 use std::string::String;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::fmt::Write as _;
 
-use sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement, Value as SqlAstValue};
+#[cfg(test)]
+use sqlparser::ast::{Expr, Insert, Query, SetExpr, Value as SqlAstValue};
+use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+#[cfg(test)]
 use crate::backend::SqlDialect;
-use crate::cel::CelEvaluator;
-use crate::default_values::apply_vtable_insert_defaults;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+#[cfg(test)]
 use crate::engine::sql2::planning::rewrite_engine::lowering::lower_statement;
-use crate::engine::sql2::planning::rewrite_engine::materialize_vtable_insert_select_sources;
+#[cfg(test)]
 use crate::engine::sql2::planning::rewrite_engine::object_name_matches;
+#[cfg(test)]
 use crate::engine::sql2::planning::rewrite_engine::steps::inline_lix_functions::inline_lix_functions_with_provider;
-use crate::engine::sql2::planning::rewrite_engine::types::{PostprocessPlan, PreparedStatement, PreprocessOutput, SchemaRegistration};
-use crate::engine::sql2::planning::rewrite_engine::DetectedFileDomainChange;
-use crate::engine::sql2::planning::rewrite_engine::{bind_sql_with_state_and_appended_params, PlaceholderState};
-use crate::{LixBackend, LixError, Value};
+#[cfg(test)]
+use crate::engine::sql2::planning::rewrite_engine::types::{
+    PostprocessPlan, PreparedStatement, PreprocessOutput, SchemaRegistration,
+};
+#[cfg(test)]
+use crate::engine::sql2::planning::rewrite_engine::{
+    bind_sql_with_state_and_appended_params, PlaceholderState,
+};
+#[cfg(test)]
+use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+#[cfg(test)]
+use crate::Value;
+use crate::LixError;
 
 pub(crate) mod context;
 pub(crate) mod query_engine;
@@ -26,8 +41,10 @@ pub(crate) mod statement_pipeline;
 pub(crate) mod validator;
 pub(crate) mod walker;
 
+#[cfg(test)]
 use self::statement_pipeline::StatementPipeline;
 
+#[cfg(test)]
 struct RewrittenStatementBinding {
     statement: Statement,
     appended_params: Arc<Vec<Value>>,
@@ -40,6 +57,7 @@ pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     })
 }
 
+#[cfg(test)]
 pub fn preprocess_statements(
     statements: Vec<Statement>,
     params: &[Value],
@@ -49,6 +67,7 @@ pub fn preprocess_statements(
     preprocess_statements_with_provider(statements, params, &mut provider, dialect)
 }
 
+#[cfg(test)]
 pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
@@ -58,6 +77,7 @@ pub fn preprocess_statements_with_provider<P: LixFunctionProvider>(
     preprocess_statements_with_provider_and_writer_key(statements, params, provider, dialect, None)
 }
 
+#[cfg(test)]
 pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
@@ -111,160 +131,6 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         mutations,
         update_validations,
     })
-}
-
-async fn preprocess_statements_with_provider_and_backend<P>(
-    backend: &dyn LixBackend,
-    statements: Vec<Statement>,
-    params: &[Value],
-    provider: &mut P,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
-    writer_key: Option<&str>,
-) -> Result<PreprocessOutput, LixError>
-where
-    P: LixFunctionProvider + Clone + Send + 'static,
-{
-    let statement_pipeline = StatementPipeline::new(params, writer_key);
-    let mut registrations: Vec<SchemaRegistration> = Vec::new();
-    let mut postprocess: Option<PostprocessPlan> = None;
-    let mut rewritten = Vec::with_capacity(statements.len());
-    let mut mutations = Vec::new();
-    let mut update_validations = Vec::new();
-    for (statement_index, statement) in statements.into_iter().enumerate() {
-        let statement_detected_file_domain_changes = detected_file_domain_changes_by_statement
-            .get(statement_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        // Keep this large async rewrite future on the heap to avoid excessive
-        // stack growth in callers that process many rewrite layers.
-        let output = Box::pin(statement_pipeline.rewrite_statement_with_backend(
-            backend,
-            statement,
-            provider,
-            statement_detected_file_domain_changes,
-        ))
-        .await?;
-        registrations.extend(output.registrations);
-        if let Some(plan) = output.postprocess {
-            if postprocess.is_some() {
-                return Err(LixError {
-                    message: "only one postprocess rewrite is supported per query".to_string(),
-                });
-            }
-            postprocess = Some(plan);
-        }
-        mutations.extend(output.mutations);
-        update_validations.extend(output.update_validations);
-        let appended_params = Arc::new(output.params);
-        for rewritten_statement in output.statements {
-            let inlined = inline_lix_functions_with_provider(rewritten_statement, provider);
-            rewritten.push(RewrittenStatementBinding {
-                statement: lower_statement(inlined, backend.dialect())?,
-                appended_params: Arc::clone(&appended_params),
-            });
-        }
-    }
-
-    if postprocess.is_some() && rewritten.len() != 1 {
-        return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
-        });
-    }
-
-    let (normalized_sql, prepared_statements) =
-        render_statements_with_params(&rewritten, params, backend.dialect())?;
-
-    Ok(PreprocessOutput {
-        sql: normalized_sql,
-        prepared_statements,
-        registrations,
-        postprocess,
-        mutations,
-        update_validations,
-    })
-}
-
-pub async fn preprocess_sql_with_provider<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql: &str,
-    params: &[Value],
-    functions: SharedFunctionProvider<P>,
-) -> Result<PreprocessOutput, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    preprocess_sql_with_provider_and_detected_file_domain_changes(
-        backend,
-        evaluator,
-        sql,
-        params,
-        functions,
-        &[],
-        None,
-    )
-    .await
-}
-
-pub async fn preprocess_sql_with_provider_and_detected_file_domain_changes<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql: &str,
-    params: &[Value],
-    functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
-    writer_key: Option<&str>,
-) -> Result<PreprocessOutput, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
-        backend,
-        evaluator,
-        parse_sql_statements(sql)?,
-        params,
-        functions,
-        detected_file_domain_changes_by_statement,
-        writer_key,
-    )
-    .await
-}
-
-pub async fn preprocess_parsed_statements_with_provider_and_detected_file_domain_changes<
-    P: LixFunctionProvider,
->(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    statements: Vec<Statement>,
-    params: &[Value],
-    functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
-    writer_key: Option<&str>,
-) -> Result<PreprocessOutput, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    let params = params.to_vec();
-    let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
-    materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
-    apply_vtable_insert_defaults(
-        backend,
-        evaluator,
-        &mut statements,
-        &params,
-        functions.clone(),
-    )
-    .await?;
-    let mut provider = functions.clone();
-    preprocess_statements_with_provider_and_backend(
-        backend,
-        statements,
-        &params,
-        &mut provider,
-        detected_file_domain_changes_by_statement,
-        writer_key,
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -384,6 +250,7 @@ fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
     blake3::hash(serialized.as_bytes()).to_hex().to_string()
 }
 
+#[cfg(test)]
 fn render_statements_with_params(
     statements: &[RewrittenStatementBinding],
     base_params: &[Value],
@@ -413,48 +280,7 @@ fn render_statements_with_params(
     Ok((normalized_sql, prepared_statements))
 }
 
-fn coalesce_vtable_inserts_in_transactions(
-    statements: Vec<Statement>,
-) -> Result<Vec<Statement>, LixError> {
-    let mut result = Vec::with_capacity(statements.len());
-    let mut in_transaction = false;
-    let mut pending_insert: Option<Insert> = None;
-
-    for statement in statements {
-        match statement {
-            Statement::StartTransaction { .. } => {
-                flush_pending_insert(&mut result, &mut pending_insert);
-                in_transaction = true;
-                result.push(statement);
-            }
-            Statement::Commit { .. } | Statement::Rollback { .. } => {
-                flush_pending_insert(&mut result, &mut pending_insert);
-                in_transaction = false;
-                result.push(statement);
-            }
-            Statement::Insert(insert) if in_transaction => {
-                if let Some(existing) = pending_insert.as_mut() {
-                    if can_merge_vtable_insert(existing, &insert) {
-                        append_insert_rows(existing, &insert)?;
-                    } else {
-                        flush_pending_insert(&mut result, &mut pending_insert);
-                        pending_insert = Some(insert);
-                    }
-                } else {
-                    pending_insert = Some(insert);
-                }
-            }
-            other => {
-                flush_pending_insert(&mut result, &mut pending_insert);
-                result.push(other);
-            }
-        }
-    }
-
-    flush_pending_insert(&mut result, &mut pending_insert);
-    Ok(result)
-}
-
+#[cfg(test)]
 pub(crate) fn coalesce_vtable_inserts_in_statement_list(
     statements: Vec<Statement>,
 ) -> Result<Vec<Statement>, LixError> {
@@ -486,12 +312,14 @@ pub(crate) fn coalesce_vtable_inserts_in_statement_list(
     Ok(result)
 }
 
+#[cfg(test)]
 fn flush_pending_insert(result: &mut Vec<Statement>, pending_insert: &mut Option<Insert>) {
     if let Some(insert) = pending_insert.take() {
         result.push(Statement::Insert(insert));
     }
 }
 
+#[cfg(test)]
 fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
     if !insert_targets_vtable(left) || !insert_targets_vtable(right) {
         return false;
@@ -547,6 +375,7 @@ fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
     plain_values_rows(left).is_some() && plain_values_rows(right).is_some()
 }
 
+#[cfg(test)]
 fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixError> {
     let incoming_rows = plain_values_rows(incoming)
         .ok_or_else(|| LixError {
@@ -561,6 +390,7 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
     Ok(())
 }
 
+#[cfg(test)]
 fn insert_targets_vtable(insert: &Insert) -> bool {
     match &insert.table {
         sqlparser::ast::TableObject::TableName(name) => {
@@ -570,6 +400,7 @@ fn insert_targets_vtable(insert: &Insert) -> bool {
     }
 }
 
+#[cfg(test)]
 fn insert_targets_stored_schema(insert: &Insert) -> bool {
     let schema_key_index = insert
         .columns
@@ -589,6 +420,7 @@ fn insert_targets_stored_schema(insert: &Insert) -> bool {
     })
 }
 
+#[cfg(test)]
 fn expr_is_stored_schema_literal(expr: &Expr) -> bool {
     let Expr::Value(value) = expr else {
         return false;
@@ -600,6 +432,7 @@ fn expr_is_stored_schema_literal(expr: &Expr) -> bool {
     literal.eq_ignore_ascii_case("lix_stored_schema")
 }
 
+#[cfg(test)]
 fn plain_values_rows(insert: &Insert) -> Option<&Vec<Vec<Expr>>> {
     let source = insert.source.as_ref()?;
     if !query_is_plain_values(source) {
@@ -611,6 +444,7 @@ fn plain_values_rows(insert: &Insert) -> Option<&Vec<Vec<Expr>>> {
     Some(&values.rows)
 }
 
+#[cfg(test)]
 fn plain_values_rows_mut(insert: &mut Insert) -> Option<&mut Vec<Vec<Expr>>> {
     let source = insert.source.as_mut()?;
     if !query_is_plain_values(source) {
@@ -622,6 +456,7 @@ fn plain_values_rows_mut(insert: &mut Insert) -> Option<&mut Vec<Vec<Expr>>> {
     Some(&mut values.rows)
 }
 
+#[cfg(test)]
 fn query_is_plain_values(query: &Query) -> bool {
     query.with.is_none()
         && query.order_by.is_none()

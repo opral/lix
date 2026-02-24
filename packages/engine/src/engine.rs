@@ -62,11 +62,9 @@ mod runtime_functions;
 pub(crate) mod sql2;
 
 use self::sql2::contracts::effects::DetectedFileDomainChange;
-use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
+use self::sql2::contracts::planned_statement::MutationRow;
 use self::sql2::planning::parse::parse_sql;
 use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-#[cfg(test)]
-use self::sql2::should_sequentialize_postprocess_multi_statement;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -375,10 +373,7 @@ fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet
         .iter()
         .filter(|mutation| !mutation.untracked)
         .filter(|mutation| mutation.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-        .filter(|mutation| {
-            matches!(mutation.operation, MutationOperation::Delete)
-                || mutation.snapshot_content.is_none()
-        })
+        .filter(|mutation| mutation.snapshot_content.is_none())
         .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
 }
@@ -549,12 +544,13 @@ mod tests {
     use super::{
         boot, detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
-        should_invalidate_installed_plugins_cache_for_sql,
-        should_sequentialize_postprocess_multi_statement, BootArgs, ExecuteOptions,
+        should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::engine::Engine;
     use crate::engine::sql2::ast::utils::parse_sql_statements;
     use crate::engine::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
+    use crate::engine::sql2::ast::walk::contains_transaction_control_statement;
     use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
     use crate::engine::sql2::contracts::planned_statement::{
         MutationOperation, MutationRow, UpdateValidationPlan,
@@ -597,6 +593,38 @@ mod tests {
     struct EmptySnapshotReader;
 
     struct NoopWasmComponentInstance;
+
+    async fn execute_multi_statement_sequential_with_options(
+        engine: &Engine,
+        sql: &str,
+        params: &[Value],
+        options: &ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
+        let statements = parse_sql_statements(sql)?;
+        engine
+            .execute_statement_script_with_options(statements, params, options)
+            .await
+    }
+
+    fn should_sequentialize_postprocess_multi_statement(sql: &str, params: &[Value]) -> bool {
+        let Ok(statements) = parse_sql_statements(sql) else {
+            return false;
+        };
+        should_sequentialize_postprocess_multi_statement_with_statements(&statements, params)
+    }
+
+    fn should_sequentialize_postprocess_multi_statement_with_statements(
+        statements: &[Statement],
+        params: &[Value],
+    ) -> bool {
+        if !params.is_empty() {
+            return false;
+        }
+        if statements.len() <= 1 {
+            return false;
+        }
+        !contains_transaction_control_statement(statements)
+    }
 
     fn active_version_snapshot_json(version_id: &str) -> String {
         serde_json::json!({ "id": "main", "version_id": version_id }).to_string()
@@ -815,12 +843,12 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         ));
 
-        engine
-            .execute_multi_statement_sequential_with_options(
-                "SELECT 1; SELECT 2;",
-                &[],
-                &ExecuteOptions::default(),
-            )
+        execute_multi_statement_sequential_with_options(
+            &engine,
+            "SELECT 1; SELECT 2;",
+            &[],
+            &ExecuteOptions::default(),
+        )
             .await
             .expect("sequential multi-statement execution should succeed");
 
@@ -1266,7 +1294,7 @@ mod tests {
     fn descriptor_delete_targets_cache_eviction_by_entity_id_and_version_id() {
         let targets = file_descriptor_cache_eviction_targets(&[
             MutationRow {
-                operation: MutationOperation::Delete,
+                operation: MutationOperation::Insert,
                 entity_id: "file-a".to_string(),
                 schema_key: "lix_file_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1277,7 +1305,7 @@ mod tests {
                 untracked: false,
             },
             MutationRow {
-                operation: MutationOperation::Delete,
+                operation: MutationOperation::Insert,
                 entity_id: "ignored-dir".to_string(),
                 schema_key: "lix_directory_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1288,7 +1316,7 @@ mod tests {
                 untracked: false,
             },
             MutationRow {
-                operation: MutationOperation::Delete,
+                operation: MutationOperation::Insert,
                 entity_id: "ignored-untracked".to_string(),
                 schema_key: "lix_file_descriptor".to_string(),
                 schema_version: "1".to_string(),

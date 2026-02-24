@@ -16,8 +16,6 @@ pub(crate) struct SchemaRegistration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MutationOperation {
     Insert,
-    Update,
-    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq)]

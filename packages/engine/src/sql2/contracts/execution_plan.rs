@@ -7,5 +7,4 @@ pub(crate) struct ExecutionPlan {
     pub(crate) preprocess: PlannedStatementSet,
     pub(crate) requirements: PlanRequirements,
     pub(crate) effects: PlanEffects,
-    pub(crate) fingerprint: String,
 }

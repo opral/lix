@@ -5,7 +5,6 @@ mod escaping;
 mod lowering;
 mod params;
 mod pipeline;
-mod read_pipeline;
 mod row_resolution;
 mod steps;
 mod types;
@@ -18,24 +17,20 @@ pub(crate) use ast_utils::{
     RewriteDecision,
 };
 pub(crate) use escaping::escape_sql_string;
-pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
-    bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
+    bind_sql, bind_sql_with_state, PlaceholderState,
+};
+#[cfg(test)]
+pub(crate) use params::bind_sql_with_state_and_appended_params;
+pub(crate) use pipeline::query_engine::{
+    rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 pub(crate) use pipeline::statement_pipeline::StatementPipeline;
-#[allow(unused_imports)]
-pub use pipeline::{
-    parse_sql_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes,
-    preprocess_sql_with_provider,
-    preprocess_sql_with_provider_and_detected_file_domain_changes, preprocess_statements,
-    preprocess_statements_with_provider, preprocess_statements_with_provider_and_writer_key,
-};
+pub use pipeline::parse_sql_statements;
 #[cfg(test)]
 pub(crate) use pipeline::preprocess_sql_rewrite_only;
 pub(crate) use row_resolution::{
-    materialize_vtable_insert_select_sources, resolve_expr_cell_with_state, resolve_insert_rows,
-    ResolvedCell, RowSourceResolver,
+    resolve_expr_cell_with_state, resolve_insert_rows, ResolvedCell, RowSourceResolver,
 };
 pub(crate) use steps::vtable_write::DetectedFileDomainChange;
 pub(crate) use types::{

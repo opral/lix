@@ -24,7 +24,7 @@ Postprocess ordering:
 - `ast/`
   SQL AST helpers and parameter binding utilities.
 - `planning/`
-  Parse/bind/plan orchestration and plan fingerprinting.
+  Parse/bind/plan orchestration.
 - `execution/`
   Transaction-scoped execution, SQL materialization, and postprocess orchestration.
 - `surfaces/`
