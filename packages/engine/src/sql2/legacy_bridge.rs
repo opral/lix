@@ -1,4 +1,4 @@
-use crate::sql;
+use crate::sql as legacy_sql;
 use crate::{LixBackend, LixError, LixTransaction, Value};
 use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFunctionProvider};
 use crate::cel::CelEvaluator;
@@ -16,13 +16,13 @@ use super::contracts::prepared_statement::PreparedStatement;
 
 pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> String {
     let sql_output = to_sql_preprocess_output(output);
-    sql::preprocess_plan_fingerprint(&sql_output)
+    legacy_sql::preprocess_plan_fingerprint(&sql_output)
 }
 
-pub(crate) type SqlBridgePlaceholderState = sql::PlaceholderState;
-pub(crate) type SqlBridgeResolvedCell = sql::ResolvedCell;
-pub(crate) type SqlBridgeReadRewriteSession = sql::ReadRewriteSession;
-pub(crate) type SqlBridgeDetectedFileDomainChange = sql::DetectedFileDomainChange;
+pub(crate) type SqlBridgePlaceholderState = legacy_sql::PlaceholderState;
+pub(crate) type SqlBridgeResolvedCell = legacy_sql::ResolvedCell;
+pub(crate) type SqlBridgeReadRewriteSession = legacy_sql::ReadRewriteSession;
+pub(crate) type SqlBridgeDetectedFileDomainChange = legacy_sql::DetectedFileDomainChange;
 
 pub(crate) struct SqlBridgeBoundSql {
     pub(crate) sql: String,
@@ -31,11 +31,11 @@ pub(crate) struct SqlBridgeBoundSql {
 }
 
 pub(crate) fn new_sql_bridge_placeholder_state() -> SqlBridgePlaceholderState {
-    sql::PlaceholderState::new()
+    legacy_sql::PlaceholderState::new()
 }
 
 pub(crate) fn escape_sql_string_with_sql_bridge(value: &str) -> String {
-    sql::escape_sql_string(value)
+    legacy_sql::escape_sql_string(value)
 }
 
 pub(crate) fn preprocess_statements_with_provider_with_sql_bridge<P: LixFunctionProvider>(
@@ -43,8 +43,8 @@ pub(crate) fn preprocess_statements_with_provider_with_sql_bridge<P: LixFunction
     params: &[Value],
     provider: &mut P,
     dialect: SqlDialect,
-) -> Result<sql::PreprocessOutput, LixError> {
-    sql::preprocess_statements_with_provider(statements, params, provider, dialect)
+) -> Result<legacy_sql::PreprocessOutput, LixError> {
+    legacy_sql::preprocess_statements_with_provider(statements, params, provider, dialect)
 }
 
 pub(crate) async fn preprocess_sql_with_sql_bridge(
@@ -52,8 +52,8 @@ pub(crate) async fn preprocess_sql_with_sql_bridge(
     evaluator: &CelEvaluator,
     sql_text: &str,
     params: &[Value],
-) -> Result<sql::PreprocessOutput, LixError> {
-    sql::preprocess_sql(backend, evaluator, sql_text, params).await
+) -> Result<legacy_sql::PreprocessOutput, LixError> {
+    legacy_sql::preprocess_sql(backend, evaluator, sql_text, params).await
 }
 
 pub(crate) fn bind_sql_with_sql_bridge_state(
@@ -62,7 +62,7 @@ pub(crate) fn bind_sql_with_sql_bridge_state(
     dialect: SqlDialect,
     state: SqlBridgePlaceholderState,
 ) -> Result<SqlBridgeBoundSql, LixError> {
-    let bound = sql::bind_sql_with_state(statement_sql, params, dialect, state)?;
+    let bound = legacy_sql::bind_sql_with_state(statement_sql, params, dialect, state)?;
     Ok(SqlBridgeBoundSql {
         sql: bound.sql,
         params: bound.params,
@@ -92,7 +92,7 @@ pub(crate) fn resolve_values_rows_with_sql_bridge(
     rows: &[Vec<Expr>],
     params: &[Value],
 ) -> Result<Vec<Vec<SqlBridgeResolvedCell>>, LixError> {
-    sql::resolve_values_rows(rows, params)
+    legacy_sql::resolve_values_rows(rows, params)
 }
 
 pub(crate) fn resolve_expr_cell_with_sql_bridge(
@@ -100,14 +100,14 @@ pub(crate) fn resolve_expr_cell_with_sql_bridge(
     params: &[Value],
     placeholder_state: &mut SqlBridgePlaceholderState,
 ) -> Result<SqlBridgeResolvedCell, LixError> {
-    sql::resolve_expr_cell_with_state(expr, params, placeholder_state)
+    legacy_sql::resolve_expr_cell_with_state(expr, params, placeholder_state)
 }
 
 pub(crate) fn lower_statement_with_sql_bridge(
     statement: Statement,
     dialect: SqlDialect,
 ) -> Result<Statement, LixError> {
-    sql::lower_statement(statement, dialect)
+    legacy_sql::lower_statement(statement, dialect)
 }
 
 pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session_with_sql_bridge(
@@ -116,7 +116,7 @@ pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session_with_s
     params: &[Value],
     session: &mut SqlBridgeReadRewriteSession,
 ) -> Result<Query, LixError> {
-    sql::rewrite_read_query_with_backend_and_params_in_session(backend, query, params, session)
+    legacy_sql::rewrite_read_query_with_backend_and_params_in_session(backend, query, params, session)
         .await
 }
 
@@ -162,7 +162,7 @@ where
 {
     let sql_detected_file_domain_changes_by_statement =
         to_sql_detected_file_domain_changes_by_statement(detected_file_domain_changes_by_statement);
-    let output = sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
+    let output = legacy_sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
         backend,
         evaluator,
         statements,
@@ -186,7 +186,7 @@ pub(crate) async fn build_update_followup_statements_with_sql_bridge(
     let sql_plan = to_sql_vtable_update_plan(plan);
     let sql_detected_file_domain_changes =
         to_sql_detected_file_domain_changes(detected_file_domain_changes);
-    let statements = sql::build_update_followup_sql(
+    let statements = legacy_sql::build_update_followup_sql(
         transaction,
         &sql_plan,
         rows,
@@ -210,7 +210,7 @@ pub(crate) async fn build_delete_followup_statements_with_sql_bridge(
     let sql_plan = to_sql_vtable_delete_plan(plan);
     let sql_detected_file_domain_changes =
         to_sql_detected_file_domain_changes(detected_file_domain_changes);
-    let statements = sql::build_delete_followup_sql(
+    let statements = legacy_sql::build_delete_followup_sql(
         transaction,
         &sql_plan,
         rows,
@@ -223,7 +223,7 @@ pub(crate) async fn build_delete_followup_statements_with_sql_bridge(
     Ok(from_sql_prepared_statements(statements))
 }
 
-pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> PlannedStatementSet {
+pub(crate) fn from_sql_preprocess_output(output: legacy_sql::PreprocessOutput) -> PlannedStatementSet {
     PlannedStatementSet {
         sql: output.sql,
         prepared_statements: output
@@ -250,8 +250,8 @@ pub(crate) fn from_sql_preprocess_output(output: sql::PreprocessOutput) -> Plann
     }
 }
 
-pub(crate) fn to_sql_preprocess_output(output: &PlannedStatementSet) -> sql::PreprocessOutput {
-    sql::PreprocessOutput {
+pub(crate) fn to_sql_preprocess_output(output: &PlannedStatementSet) -> legacy_sql::PreprocessOutput {
+    legacy_sql::PreprocessOutput {
         sql: output.sql.clone(),
         prepared_statements: output
             .prepared_statements
@@ -282,7 +282,7 @@ pub(crate) fn to_sql_preprocess_output(output: &PlannedStatementSet) -> sql::Pre
 }
 
 pub(crate) fn from_sql_prepared_statements(
-    statements: Vec<sql::PreparedStatement>,
+    statements: Vec<legacy_sql::PreparedStatement>,
 ) -> Vec<PreparedStatement> {
     statements
         .into_iter()
@@ -290,12 +290,12 @@ pub(crate) fn from_sql_prepared_statements(
         .collect()
 }
 
-pub(crate) fn from_sql_mutations(mutations: Vec<sql::MutationRow>) -> Vec<MutationRow> {
+pub(crate) fn from_sql_mutations(mutations: Vec<legacy_sql::MutationRow>) -> Vec<MutationRow> {
     mutations.into_iter().map(from_sql_mutation_row).collect()
 }
 
 pub(crate) fn from_sql_update_validations(
-    plans: Vec<sql::UpdateValidationPlan>,
+    plans: Vec<legacy_sql::UpdateValidationPlan>,
 ) -> Vec<UpdateValidationPlan> {
     plans
         .into_iter()
@@ -303,13 +303,13 @@ pub(crate) fn from_sql_update_validations(
         .collect()
 }
 
-pub(crate) fn to_sql_mutations(mutations: &[MutationRow]) -> Vec<sql::MutationRow> {
+pub(crate) fn to_sql_mutations(mutations: &[MutationRow]) -> Vec<legacy_sql::MutationRow> {
     mutations.iter().cloned().map(to_sql_mutation_row).collect()
 }
 
 pub(crate) fn to_sql_update_validations(
     plans: &[UpdateValidationPlan],
-) -> Vec<sql::UpdateValidationPlan> {
+) -> Vec<legacy_sql::UpdateValidationPlan> {
     plans
         .iter()
         .cloned()
@@ -319,7 +319,7 @@ pub(crate) fn to_sql_update_validations(
 
 pub(crate) fn to_sql_detected_file_domain_changes(
     changes: &[DetectedFileDomainChange],
-) -> Vec<sql::DetectedFileDomainChange> {
+) -> Vec<legacy_sql::DetectedFileDomainChange> {
     changes
         .iter()
         .cloned()
@@ -329,7 +329,7 @@ pub(crate) fn to_sql_detected_file_domain_changes(
 
 pub(crate) fn to_sql_detected_file_domain_changes_by_statement(
     changes_by_statement: &[Vec<DetectedFileDomainChange>],
-) -> Vec<Vec<sql::DetectedFileDomainChange>> {
+) -> Vec<Vec<legacy_sql::DetectedFileDomainChange>> {
     changes_by_statement
         .iter()
         .map(|changes| to_sql_detected_file_domain_changes(changes))
@@ -337,7 +337,7 @@ pub(crate) fn to_sql_detected_file_domain_changes_by_statement(
 }
 
 pub(crate) fn from_sql_detected_file_domain_changes(
-    changes: Vec<sql::DetectedFileDomainChange>,
+    changes: Vec<legacy_sql::DetectedFileDomainChange>,
 ) -> Vec<DetectedFileDomainChange> {
     changes
         .into_iter()
@@ -346,7 +346,7 @@ pub(crate) fn from_sql_detected_file_domain_changes(
 }
 
 pub(crate) fn from_sql_detected_file_domain_changes_by_statement(
-    changes_by_statement: Vec<Vec<sql::DetectedFileDomainChange>>,
+    changes_by_statement: Vec<Vec<legacy_sql::DetectedFileDomainChange>>,
 ) -> Vec<Vec<DetectedFileDomainChange>> {
     changes_by_statement
         .into_iter()
@@ -354,69 +354,69 @@ pub(crate) fn from_sql_detected_file_domain_changes_by_statement(
         .collect()
 }
 
-pub(crate) fn to_sql_postprocess_plan(plan: &PostprocessPlan) -> sql::PostprocessPlan {
+pub(crate) fn to_sql_postprocess_plan(plan: &PostprocessPlan) -> legacy_sql::PostprocessPlan {
     match plan {
         PostprocessPlan::VtableUpdate(update) => {
-            sql::PostprocessPlan::VtableUpdate(to_sql_vtable_update_plan(update))
+            legacy_sql::PostprocessPlan::VtableUpdate(to_sql_vtable_update_plan(update))
         }
         PostprocessPlan::VtableDelete(delete) => {
-            sql::PostprocessPlan::VtableDelete(to_sql_vtable_delete_plan(delete))
+            legacy_sql::PostprocessPlan::VtableDelete(to_sql_vtable_delete_plan(delete))
         }
     }
 }
 
-pub(crate) fn to_sql_vtable_update_plan(plan: &VtableUpdatePlan) -> sql::VtableUpdatePlan {
-    sql::VtableUpdatePlan {
+pub(crate) fn to_sql_vtable_update_plan(plan: &VtableUpdatePlan) -> legacy_sql::VtableUpdatePlan {
+    legacy_sql::VtableUpdatePlan {
         schema_key: plan.schema_key.clone(),
         explicit_writer_key: plan.explicit_writer_key.clone(),
         writer_key_assignment_present: plan.writer_key_assignment_present,
     }
 }
 
-pub(crate) fn to_sql_vtable_delete_plan(plan: &VtableDeletePlan) -> sql::VtableDeletePlan {
-    sql::VtableDeletePlan {
+pub(crate) fn to_sql_vtable_delete_plan(plan: &VtableDeletePlan) -> legacy_sql::VtableDeletePlan {
+    legacy_sql::VtableDeletePlan {
         schema_key: plan.schema_key.clone(),
         effective_scope_fallback: plan.effective_scope_fallback,
         effective_scope_selection_sql: plan.effective_scope_selection_sql.clone(),
     }
 }
 
-fn from_sql_prepared_statement(statement: sql::PreparedStatement) -> PreparedStatement {
+fn from_sql_prepared_statement(statement: legacy_sql::PreparedStatement) -> PreparedStatement {
     PreparedStatement {
         sql: statement.sql,
         params: statement.params,
     }
 }
 
-fn to_sql_prepared_statement(statement: PreparedStatement) -> sql::PreparedStatement {
-    sql::PreparedStatement {
+fn to_sql_prepared_statement(statement: PreparedStatement) -> legacy_sql::PreparedStatement {
+    legacy_sql::PreparedStatement {
         sql: statement.sql,
         params: statement.params,
     }
 }
 
-fn from_sql_schema_registration(registration: sql::SchemaRegistration) -> SchemaRegistration {
+fn from_sql_schema_registration(registration: legacy_sql::SchemaRegistration) -> SchemaRegistration {
     SchemaRegistration {
         schema_key: registration.schema_key,
     }
 }
 
-fn to_sql_schema_registration(registration: SchemaRegistration) -> sql::SchemaRegistration {
-    sql::SchemaRegistration {
+fn to_sql_schema_registration(registration: SchemaRegistration) -> legacy_sql::SchemaRegistration {
+    legacy_sql::SchemaRegistration {
         schema_key: registration.schema_key,
     }
 }
 
-fn from_sql_postprocess_plan(plan: sql::PostprocessPlan) -> PostprocessPlan {
+fn from_sql_postprocess_plan(plan: legacy_sql::PostprocessPlan) -> PostprocessPlan {
     match plan {
-        sql::PostprocessPlan::VtableUpdate(update) => {
+        legacy_sql::PostprocessPlan::VtableUpdate(update) => {
             PostprocessPlan::VtableUpdate(VtableUpdatePlan {
                 schema_key: update.schema_key,
                 explicit_writer_key: update.explicit_writer_key,
                 writer_key_assignment_present: update.writer_key_assignment_present,
             })
         }
-        sql::PostprocessPlan::VtableDelete(delete) => {
+        legacy_sql::PostprocessPlan::VtableDelete(delete) => {
             PostprocessPlan::VtableDelete(VtableDeletePlan {
                 schema_key: delete.schema_key,
                 effective_scope_fallback: delete.effective_scope_fallback,
@@ -426,7 +426,7 @@ fn from_sql_postprocess_plan(plan: sql::PostprocessPlan) -> PostprocessPlan {
     }
 }
 
-fn from_sql_mutation_row(row: sql::MutationRow) -> MutationRow {
+fn from_sql_mutation_row(row: legacy_sql::MutationRow) -> MutationRow {
     MutationRow {
         operation: from_sql_mutation_operation(row.operation),
         entity_id: row.entity_id,
@@ -440,8 +440,8 @@ fn from_sql_mutation_row(row: sql::MutationRow) -> MutationRow {
     }
 }
 
-fn to_sql_mutation_row(row: MutationRow) -> sql::MutationRow {
-    sql::MutationRow {
+fn to_sql_mutation_row(row: MutationRow) -> legacy_sql::MutationRow {
+    legacy_sql::MutationRow {
         operation: to_sql_mutation_operation(row.operation),
         entity_id: row.entity_id,
         schema_key: row.schema_key,
@@ -454,23 +454,23 @@ fn to_sql_mutation_row(row: MutationRow) -> sql::MutationRow {
     }
 }
 
-fn from_sql_mutation_operation(operation: sql::MutationOperation) -> MutationOperation {
+fn from_sql_mutation_operation(operation: legacy_sql::MutationOperation) -> MutationOperation {
     match operation {
-        sql::MutationOperation::Insert => MutationOperation::Insert,
-        sql::MutationOperation::Update => MutationOperation::Update,
-        sql::MutationOperation::Delete => MutationOperation::Delete,
+        legacy_sql::MutationOperation::Insert => MutationOperation::Insert,
+        legacy_sql::MutationOperation::Update => MutationOperation::Update,
+        legacy_sql::MutationOperation::Delete => MutationOperation::Delete,
     }
 }
 
-fn to_sql_mutation_operation(operation: MutationOperation) -> sql::MutationOperation {
+fn to_sql_mutation_operation(operation: MutationOperation) -> legacy_sql::MutationOperation {
     match operation {
-        MutationOperation::Insert => sql::MutationOperation::Insert,
-        MutationOperation::Update => sql::MutationOperation::Update,
-        MutationOperation::Delete => sql::MutationOperation::Delete,
+        MutationOperation::Insert => legacy_sql::MutationOperation::Insert,
+        MutationOperation::Update => legacy_sql::MutationOperation::Update,
+        MutationOperation::Delete => legacy_sql::MutationOperation::Delete,
     }
 }
 
-fn from_sql_update_validation_plan(plan: sql::UpdateValidationPlan) -> UpdateValidationPlan {
+fn from_sql_update_validation_plan(plan: legacy_sql::UpdateValidationPlan) -> UpdateValidationPlan {
     UpdateValidationPlan {
         table: plan.table,
         where_clause: plan.where_clause,
@@ -479,8 +479,8 @@ fn from_sql_update_validation_plan(plan: sql::UpdateValidationPlan) -> UpdateVal
     }
 }
 
-fn to_sql_update_validation_plan(plan: UpdateValidationPlan) -> sql::UpdateValidationPlan {
-    sql::UpdateValidationPlan {
+fn to_sql_update_validation_plan(plan: UpdateValidationPlan) -> legacy_sql::UpdateValidationPlan {
+    legacy_sql::UpdateValidationPlan {
         table: plan.table,
         where_clause: plan.where_clause,
         snapshot_content: plan.snapshot_content,
@@ -490,8 +490,8 @@ fn to_sql_update_validation_plan(plan: UpdateValidationPlan) -> sql::UpdateValid
 
 fn to_sql_detected_file_domain_change(
     change: DetectedFileDomainChange,
-) -> sql::DetectedFileDomainChange {
-    sql::DetectedFileDomainChange {
+) -> legacy_sql::DetectedFileDomainChange {
+    legacy_sql::DetectedFileDomainChange {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
         schema_version: change.schema_version,
@@ -505,7 +505,7 @@ fn to_sql_detected_file_domain_change(
 }
 
 fn from_sql_detected_file_domain_change(
-    change: sql::DetectedFileDomainChange,
+    change: legacy_sql::DetectedFileDomainChange,
 ) -> DetectedFileDomainChange {
     DetectedFileDomainChange {
         entity_id: change.entity_id,
