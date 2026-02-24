@@ -1,4 +1,5 @@
 use std::fs;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 fn collect_rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
@@ -118,6 +119,51 @@ fn guardrail_sql2_planning_and_execution_forbid_direct_sql_runtime_imports() {
             !source.contains("crate::sql::"),
             "sql2 planning/execution must not directly depend on crate::sql::*: {}",
             file.display()
+        );
+    }
+}
+
+#[test]
+fn guardrail_legacy_bridge_callsites_stay_on_allowlist_during_removal() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_sources(&root, &mut files);
+
+    let allowlist: BTreeSet<&str> = BTreeSet::from([
+        "src/deterministic_mode/mod.rs",
+        "src/engine.rs",
+        "src/filesystem/mutation_rewrite.rs",
+        "src/filesystem/pending_file_writes.rs",
+        "src/filesystem/select_rewrite.rs",
+        "src/materialization/apply.rs",
+        "src/plugin/runtime.rs",
+        "src/schema/provider.rs",
+        "src/sql2/execution/postprocess.rs",
+        "src/sql2/planning/trace.rs",
+        "src/sql2/side_effects.rs",
+        "src/sql2/surfaces/registry.rs",
+    ]);
+
+    let mut observed = BTreeSet::new();
+    for file in files {
+        if file.ends_with("sql2/legacy_bridge.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&file).expect("source file should be readable");
+        if !source.contains("legacy_bridge::") {
+            continue;
+        }
+        let relative = file
+            .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .expect("file should be within crate root");
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        observed.insert(relative);
+    }
+
+    for file in &observed {
+        assert!(
+            allowlist.contains(file.as_str()),
+            "new legacy_bridge callsite added outside allowlist: {file}"
         );
     }
 }
