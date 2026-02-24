@@ -107,6 +107,14 @@ pub(crate) fn resolve_values_rows(
     Ok(resolved_rows)
 }
 
+pub(crate) fn resolve_expr_cell_with_state(
+    expr: &Expr,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<ResolvedCell, LixError> {
+    resolve_expr(expr, params, state)
+}
+
 pub(crate) fn resolve_insert_rows(
     insert: &Insert,
     params: &[Value],

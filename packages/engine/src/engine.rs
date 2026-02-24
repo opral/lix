@@ -64,14 +64,12 @@ pub(crate) mod sql2;
 
 #[cfg(test)]
 use self::sql2::should_sequentialize_postprocess_multi_statement;
+use self::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
 use self::sql2::contracts::effects::DetectedFileDomainChange;
 use self::sql2::contracts::planned_statement::{MutationOperation, MutationRow};
 use self::sql2::planning::parse::parse_sql;
 use self::sql2::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
-use self::sql2::legacy_bridge::{
-    advance_sql_bridge_placeholder_state, collect_filesystem_update_side_effects_with_sql_bridge,
-    new_sql_bridge_placeholder_state, SqlBridgePlaceholderState,
-};
+use self::sql2::legacy_bridge::collect_filesystem_update_side_effects_with_sql_bridge;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -537,7 +535,7 @@ async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
     statements: &[Statement],
     params: &[Value],
 ) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let mut placeholder_state = new_sql_bridge_placeholder_state();
+    let mut placeholder_state = PlaceholderState::new();
     let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
     let mut untracked_changes = Vec::new();
     for statement in statements {
@@ -582,9 +580,19 @@ fn advance_placeholder_state_for_statement(
     statement: &Statement,
     params: &[Value],
     dialect: crate::backend::SqlDialect,
-    placeholder_state: &mut SqlBridgePlaceholderState,
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<(), LixError> {
-    advance_sql_bridge_placeholder_state(statement, params, dialect, placeholder_state)
+    let statement_sql = statement.to_string();
+    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
+        |error| LixError {
+            message: format!(
+                "filesystem side-effect placeholder binding failed for '{}': {}",
+                statement_sql, error.message
+            ),
+        },
+    )?;
+    *placeholder_state = bound.state;
+    Ok(())
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -629,9 +637,7 @@ mod tests {
     use crate::engine::sql2::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql2::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql2::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
-    use crate::engine::sql2::legacy_bridge::{
-        bind_sql_with_sql_bridge_state, new_sql_bridge_placeholder_state,
-    };
+    use crate::engine::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
@@ -1076,7 +1082,7 @@ mod tests {
             Value::Text("/docs/a.json".to_string()),
             Value::Text("/archive/b.json".to_string()),
         ];
-        let mut placeholder_state = new_sql_bridge_placeholder_state();
+        let mut placeholder_state = PlaceholderState::new();
         advance_placeholder_state_for_statement(
             &statements.remove(0),
             &params,
@@ -1085,9 +1091,8 @@ mod tests {
         )
         .expect("advance placeholder state for first statement");
 
-        let bound =
-            bind_sql_with_sql_bridge_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
-                .expect("bind placeholder with carried state");
+        let bound = bind_sql_with_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
+            .expect("bind placeholder with carried state");
         assert_eq!(bound.sql, "SELECT ?1");
         assert_eq!(bound.params.len(), 1);
         assert_eq!(bound.params[0], Value::Text("/archive/b.json".to_string()));

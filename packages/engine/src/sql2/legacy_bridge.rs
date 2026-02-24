@@ -4,9 +4,10 @@ use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFuncti
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::SqlDialect;
-use sqlparser::ast::{Expr, Query, Update};
+use sqlparser::ast::{Query, Update};
 
 use super::ast::nodes::Statement;
+use super::ast::utils::PlaceholderState;
 use super::contracts::effects::DetectedFileDomainChange;
 use super::contracts::planned_statement::{
     MutationOperation, MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
@@ -19,20 +20,8 @@ pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> Strin
     legacy_sql::preprocess_plan_fingerprint(&sql_output)
 }
 
-pub(crate) type SqlBridgePlaceholderState = legacy_sql::PlaceholderState;
-pub(crate) type SqlBridgeResolvedCell = legacy_sql::ResolvedCell;
 pub(crate) type SqlBridgeReadRewriteSession = legacy_sql::ReadRewriteSession;
 pub(crate) type SqlBridgeDetectedFileDomainChange = legacy_sql::DetectedFileDomainChange;
-
-pub(crate) struct SqlBridgeBoundSql {
-    pub(crate) sql: String,
-    pub(crate) params: Vec<Value>,
-    pub(crate) state: SqlBridgePlaceholderState,
-}
-
-pub(crate) fn new_sql_bridge_placeholder_state() -> SqlBridgePlaceholderState {
-    legacy_sql::PlaceholderState::new()
-}
 
 pub(crate) fn escape_sql_string_with_sql_bridge(value: &str) -> String {
     legacy_sql::escape_sql_string(value)
@@ -54,53 +43,6 @@ pub(crate) async fn preprocess_sql_with_sql_bridge(
     params: &[Value],
 ) -> Result<legacy_sql::PreprocessOutput, LixError> {
     legacy_sql::preprocess_sql(backend, evaluator, sql_text, params).await
-}
-
-pub(crate) fn bind_sql_with_sql_bridge_state(
-    statement_sql: &str,
-    params: &[Value],
-    dialect: SqlDialect,
-    state: SqlBridgePlaceholderState,
-) -> Result<SqlBridgeBoundSql, LixError> {
-    let bound = legacy_sql::bind_sql_with_state(statement_sql, params, dialect, state)?;
-    Ok(SqlBridgeBoundSql {
-        sql: bound.sql,
-        params: bound.params,
-        state: bound.state,
-    })
-}
-
-pub(crate) fn advance_sql_bridge_placeholder_state(
-    statement: &Statement,
-    params: &[Value],
-    dialect: SqlDialect,
-    placeholder_state: &mut SqlBridgePlaceholderState,
-) -> Result<(), LixError> {
-    let statement_sql = statement.to_string();
-    let bound = bind_sql_with_sql_bridge_state(&statement_sql, params, dialect, *placeholder_state)
-        .map_err(|error| LixError {
-            message: format!(
-                "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.message
-            ),
-        })?;
-    *placeholder_state = bound.state;
-    Ok(())
-}
-
-pub(crate) fn resolve_values_rows_with_sql_bridge(
-    rows: &[Vec<Expr>],
-    params: &[Value],
-) -> Result<Vec<Vec<SqlBridgeResolvedCell>>, LixError> {
-    legacy_sql::resolve_values_rows(rows, params)
-}
-
-pub(crate) fn resolve_expr_cell_with_sql_bridge(
-    expr: &Expr,
-    params: &[Value],
-    placeholder_state: &mut SqlBridgePlaceholderState,
-) -> Result<SqlBridgeResolvedCell, LixError> {
-    legacy_sql::resolve_expr_cell_with_state(expr, params, placeholder_state)
 }
 
 pub(crate) fn lower_statement_with_sql_bridge(
@@ -129,7 +71,7 @@ pub(crate) async fn collect_filesystem_update_side_effects_with_sql_bridge(
     backend: &dyn LixBackend,
     update: &Update,
     params: &[Value],
-    placeholder_state: &mut SqlBridgePlaceholderState,
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<FilesystemUpdateSideEffects, LixError> {
     let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
         backend,
