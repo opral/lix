@@ -28,7 +28,8 @@ pub(crate) fn rewrite_statement_with_provider_to_sql2<P: LixFunctionProvider>(
     statement: Statement,
     provider: &mut P,
 ) -> Result<Sql2RewriteOutput, LixError> {
-    let output = super::StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
+    let output =
+        super::StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
     Ok(from_rewrite_output(output))
 }
 
@@ -43,26 +44,12 @@ pub(crate) async fn rewrite_statement_with_backend_to_sql2<P: LixFunctionProvide
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
-    let legacy_detected_changes = to_legacy_detected_file_domain_changes(detected_file_domain_changes);
+    let legacy_detected_changes =
+        to_legacy_detected_file_domain_changes(detected_file_domain_changes);
     let output = super::StatementPipeline::new(params, writer_key)
         .rewrite_statement_with_backend(backend, statement, provider, &legacy_detected_changes)
         .await?;
     Ok(from_rewrite_output(output))
-}
-
-pub(crate) fn inline_lix_functions_with_provider_for_sql2<P: LixFunctionProvider>(
-    statement: Statement,
-    provider: &mut P,
-) -> Statement {
-    super::inline_lix_functions_with_provider(statement, provider)
-}
-
-pub(crate) async fn materialize_vtable_insert_select_sources_for_sql2(
-    backend: &dyn LixBackend,
-    statements: &mut [Statement],
-    params: &[Value],
-) -> Result<(), LixError> {
-    super::materialize_vtable_insert_select_sources(backend, statements, params).await
 }
 
 fn to_legacy_detected_file_domain_changes(
@@ -103,7 +90,7 @@ fn from_rewrite_output(output: super::RewriteOutput) -> Sql2RewriteOutput {
             .update_validations
             .into_iter()
             .map(from_update_validation_plan)
-        .collect(),
+            .collect(),
     }
 }
 

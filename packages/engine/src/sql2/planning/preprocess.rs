@@ -6,7 +6,6 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::super::sql_preprocess_runtime::{
-    legacy_inline_lix_functions_with_provider, legacy_materialize_vtable_insert_select_sources,
     legacy_rewrite_statement_with_backend, legacy_rewrite_statement_with_provider,
     LegacyRewriteOutput,
 };
@@ -21,6 +20,8 @@ use super::super::contracts::planned_statement::{
 };
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
+use super::inline_functions::inline_lix_functions_with_provider;
+use super::materialize::materialize_vtable_insert_select_sources;
 use super::script::coalesce_vtable_inserts_in_transactions;
 
 struct RewrittenStatementBinding {
@@ -221,7 +222,7 @@ where
     let params = params.to_vec();
     let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
 
-    legacy_materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
+    materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
 
     apply_vtable_insert_defaults(
         backend,
@@ -268,7 +269,7 @@ fn accumulate_rewrite_output<P: LixFunctionProvider>(
 
     let appended_params = Arc::new(output.params);
     for statement in output.statements {
-        let inlined = legacy_inline_lix_functions_with_provider(statement, provider);
+        let inlined = inline_lix_functions_with_provider(statement, provider);
         rewritten.push(RewrittenStatementBinding {
             statement: lower_statement(inlined, dialect)?,
             appended_params: Arc::clone(&appended_params),
