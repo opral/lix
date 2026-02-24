@@ -47,10 +47,7 @@ pub use pipeline::{
     preprocess_sql_with_provider_and_detected_file_domain_changes, preprocess_statements,
     preprocess_statements_with_provider, preprocess_statements_with_provider_and_writer_key,
 };
-pub(crate) use read_pipeline::{
-    rewrite_read_query_with_backend, rewrite_read_query_with_backend_and_params_in_session,
-    ReadRewriteSession,
-};
+pub(crate) use read_pipeline::rewrite_read_query_with_backend;
 #[cfg(test)]
 pub(crate) use rewrite::extract_explicit_transaction_script;
 pub(crate) use rewrite::{
