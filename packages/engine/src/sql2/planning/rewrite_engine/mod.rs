@@ -38,5 +38,4 @@ pub(crate) use row_resolution::{
 pub(crate) use steps::vtable_write::DetectedFileDomainChange;
 pub(crate) use types::{
     MutationOperation, MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration,
-    UpdateValidationPlan,
 };

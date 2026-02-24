@@ -39,11 +39,12 @@ Postprocess ordering:
   History rewrite and projection helpers used by filesystem/state history surfaces.
 - `contracts/`
   Cross-stage data contracts used by planning and execution.
-- `contracts/legacy_sql/`
-  Temporary adapter edge for legacy `crate::sql` types while runtime semantics live in `sql2`.
+- `planning/rewrite_engine/`
+  Statement/query rewrite engine that canonicalizes and lowers logical views for planning.
 
 ## Guardrails
 
 - `tests/sql2_guardrails.rs` ensures `src/execute` stays removed.
-- `tests/sql2_guardrails.rs` ensures the removed bridge module and its callsites are not reintroduced.
+- `tests/sql2_guardrails.rs` ensures `src/sql` stays removed and `crate::sql::*` imports are forbidden.
 - `tests/sql2_guardrails.rs` ensures no string-matched fallback helper is reintroduced.
+- `tests/sql2_guardrails.rs` ensures preprocess placeholder binding flows through `planning/bind_once.rs`.

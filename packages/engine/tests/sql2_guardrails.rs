@@ -194,22 +194,46 @@ fn guardrail_legacy_sql_bridge_alias_usage_is_forbidden() {
 }
 
 #[test]
-fn guardrail_runtime_source_forbids_crate_sql_imports_outside_sql_module() {
+fn guardrail_legacy_sql_directory_stays_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/sql").exists(),
+        "legacy src/sql directory must stay removed"
+    );
+}
+
+#[test]
+fn guardrail_runtime_source_forbids_crate_sql_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
 
     for file in files {
-        let normalized = file.to_string_lossy().replace('\\', "/");
-        if normalized.contains("/src/sql/") {
-            continue;
-        }
-
         let source = fs::read_to_string(&file).expect("source file should be readable");
         assert!(
             !source.contains("crate::sql::"),
-            "runtime source must not import crate::sql::* outside src/sql/**: {}",
+            "runtime source must not import crate::sql::*: {}",
             file.display()
         );
     }
+}
+
+#[test]
+fn guardrail_preprocess_uses_bind_once_path_for_placeholder_binding() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let preprocess_source = fs::read_to_string(root.join("src/sql2/planning/preprocess.rs"))
+        .expect("sql2/planning/preprocess.rs should be readable");
+
+    assert!(
+        preprocess_source.contains("bind_statements_with_appended_params_once"),
+        "preprocess should bind placeholders through bind_once helper"
+    );
+    assert!(
+        !preprocess_source.contains("bind_sql_with_state_and_appended_params("),
+        "preprocess should not bind placeholders directly through ast utils"
+    );
+    assert!(
+        !preprocess_source.contains("PlaceholderState::new()"),
+        "preprocess should not own placeholder state directly"
+    );
 }
