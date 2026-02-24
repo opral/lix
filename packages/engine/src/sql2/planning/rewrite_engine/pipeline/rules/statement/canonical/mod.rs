@@ -358,7 +358,7 @@ where
                     filesystem_insert_side_effects
                         .tracked_directory_changes
                         .iter()
-                        .map(sql2_change_to_legacy_change),
+                        .map(sql2_change_to_detected_file_domain_change),
                 );
 
                 let insert = if let Some(rewritten) = filesystem_write::rewrite_insert_with_backend(
@@ -701,7 +701,9 @@ where
     Ok(StatementRuleOutcome::Continue(current))
 }
 
-fn sql2_change_to_legacy_change(change: &Sql2DetectedFileDomainChange) -> DetectedFileDomainChange {
+fn sql2_change_to_detected_file_domain_change(
+    change: &Sql2DetectedFileDomainChange,
+) -> DetectedFileDomainChange {
     DetectedFileDomainChange {
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
