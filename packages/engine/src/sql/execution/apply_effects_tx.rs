@@ -9,7 +9,6 @@ pub(crate) async fn apply_sql_backed_effects(
     engine: &Engine,
     mutations: &[MutationRow],
     pending_file_writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    pending_file_delete_targets: &BTreeSet<(String, String)>,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     untracked_filesystem_update_domain_changes: &[DetectedFileDomainChange],
     plugin_changes_committed: bool,
@@ -46,7 +45,5 @@ pub(crate) async fn apply_sql_backed_effects(
     engine
         .invalidate_file_path_cache_entries(file_cache_invalidation_targets)
         .await?;
-
-    let _ = pending_file_delete_targets;
     Ok(())
 }
