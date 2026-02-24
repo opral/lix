@@ -160,7 +160,6 @@ impl Engine {
             self,
             &prepared.plan.preprocess.mutations,
             &prepared.pending_file_writes,
-            &prepared.pending_file_delete_targets,
             &prepared.detected_file_domain_changes,
             &prepared.untracked_filesystem_update_domain_changes,
             execution.plugin_changes_committed,
