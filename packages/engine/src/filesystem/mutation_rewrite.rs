@@ -18,6 +18,7 @@ use crate::engine::sql2::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
+use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
 use crate::engine::sql2::history::rewrite::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
@@ -49,7 +50,6 @@ const INTERNAL_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 static REWRITTEN_HELPER_SQL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub type ResolvedDirectoryIdMap = BTreeMap<(String, String), String>;
-type DetectedFileDomainChange = legacy_sql::DetectedFileDomainChange;
 
 #[derive(Debug, Default)]
 pub struct FilesystemInsertSideEffects {
