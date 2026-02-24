@@ -106,22 +106,21 @@ fn guardrail_forbids_string_matched_postprocess_fallback() {
 }
 
 #[test]
-fn guardrail_sql2_planning_and_execution_forbid_direct_sql_runtime_imports() {
+fn guardrail_sql2_runtime_forbids_direct_sql_runtime_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql2");
     let mut files = Vec::new();
-    collect_rust_sources(&root.join("planning"), &mut files);
-    collect_rust_sources(&root.join("execution"), &mut files);
+    collect_rust_sources(&root, &mut files);
 
     for file in files {
         let source = fs::read_to_string(&file).expect("source file should be readable");
         assert!(
             !source.contains("crate::sql::"),
-            "sql2 planning/execution must not directly depend on crate::sql::*: {}",
+            "sql2 runtime must not directly depend on crate::sql::*: {}",
             file.display()
         );
         assert!(
             !source.contains("contracts::legacy_sql"),
-            "sql2 planning/execution must not depend on removed legacy_sql contracts: {}",
+            "sql2 runtime must not depend on removed legacy_sql contracts: {}",
             file.display()
         );
     }
