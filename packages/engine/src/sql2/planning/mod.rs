@@ -11,5 +11,6 @@ pub(crate) mod parse;
 pub(crate) mod plan;
 pub(crate) mod preprocess;
 pub(crate) mod rewrite_output;
+pub(crate) mod rewrite_engine;
 pub(crate) mod script;
 pub(crate) mod trace;
