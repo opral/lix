@@ -9,6 +9,7 @@ mod pipeline;
 mod read_pipeline;
 mod rewrite;
 mod row_resolution;
+mod sql2_bridge;
 mod steps;
 mod types;
 
@@ -39,6 +40,10 @@ pub(crate) use params::{
 };
 pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
 pub(crate) use pipeline::preprocess_plan_fingerprint;
+pub(crate) use sql2_bridge::{
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_to_sql2_plan,
+    preprocess_sql_to_sql2_plan, preprocess_statements_with_provider_to_sql2_plan,
+};
 #[allow(unused_imports)]
 pub use pipeline::{
     parse_sql_statements,
