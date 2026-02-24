@@ -85,21 +85,3 @@ where
     )
     .await
 }
-
-pub(crate) fn legacy_inline_lix_functions_with_provider<P: LixFunctionProvider>(
-    statement: Statement,
-    provider: &mut P,
-) -> Statement {
-    super::super::sql::inline_lix_functions_with_provider_for_sql2(statement, provider)
-}
-
-pub(crate) async fn legacy_materialize_vtable_insert_select_sources(
-    backend: &dyn LixBackend,
-    statements: &mut [Statement],
-    params: &[Value],
-) -> Result<(), LixError> {
-    super::super::sql::materialize_vtable_insert_select_sources_for_sql2(
-        backend, statements, params,
-    )
-    .await
-}
