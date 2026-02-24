@@ -3,3 +3,4 @@ pub(crate) mod apply_effects_tx;
 pub(crate) mod execute_prepared;
 pub(crate) mod followup;
 pub(crate) mod run;
+pub(crate) mod shared_path;

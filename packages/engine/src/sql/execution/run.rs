@@ -8,7 +8,7 @@ use crate::state_commit_stream::{
     state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
     StateCommitStreamOperation,
 };
-use crate::{Engine, LixError, QueryResult};
+use crate::{Engine, LixError, LixTransaction, QueryResult};
 
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::execution_plan::ExecutionPlan;
@@ -198,7 +198,6 @@ pub(crate) async fn execute_plan_sql(
                     }
                 }
             };
-
             if let Err(error) =
                 execute_prepared_with_transaction(transaction.as_mut(), &followup_statements).await
             {
@@ -206,6 +205,151 @@ pub(crate) async fn execute_plan_sql(
                 return Err(ExecutorError::execute(error));
             }
             transaction.commit().await.map_err(ExecutorError::execute)?;
+            plugin_changes_committed = true;
+            result
+        }
+    };
+
+    Ok(SqlExecutionOutcome {
+        result,
+        postprocess_file_cache_targets,
+        plugin_changes_committed,
+        state_commit_stream_changes,
+    })
+}
+
+pub(crate) async fn execute_plan_sql_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    plan: &ExecutionPlan,
+    detected_file_domain_changes: &[DetectedFileDomainChange],
+    should_refresh_file_cache: bool,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+    writer_key: Option<&str>,
+) -> Result<SqlExecutionOutcome, ExecutorError> {
+    let prepared_statements = lower_to_prepared_statements(plan);
+
+    for registration in &plan.preprocess.registrations {
+        for statement in
+            register_schema_sql_statements(&registration.schema_key, transaction.dialect())
+        {
+            transaction
+                .execute(&statement, &[])
+                .await
+                .map_err(ExecutorError::execute)?;
+        }
+    }
+
+    let mut postprocess_file_cache_targets = BTreeSet::new();
+    let mut plugin_changes_committed = false;
+    let mut state_commit_stream_changes = Vec::new();
+
+    let result = match &plan.preprocess.postprocess {
+        None => {
+            let result = execute_prepared_with_transaction(transaction, &prepared_statements)
+                .await
+                .map_err(ExecutorError::execute)?;
+            let tracked_insert_mutation_present =
+                plan.preprocess.mutations.iter().any(|mutation| {
+                    mutation.operation == MutationOperation::Insert && !mutation.untracked
+                });
+            if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
+                plugin_changes_committed = true;
+            }
+            result
+        }
+        Some(postprocess_plan) => {
+            let result = execute_prepared_with_transaction(transaction, &prepared_statements)
+                .await
+                .map_err(ExecutorError::execute)?;
+
+            match postprocess_plan {
+                PostprocessPlan::VtableUpdate(update_plan) if should_refresh_file_cache => {
+                    let targets = super::super::super::collect_postprocess_file_cache_targets(
+                        &result.rows,
+                        &update_plan.schema_key,
+                    )
+                    .map_err(ExecutorError::execute)?;
+                    postprocess_file_cache_targets.extend(targets);
+                }
+                PostprocessPlan::VtableDelete(delete_plan) if should_refresh_file_cache => {
+                    let targets = super::super::super::collect_postprocess_file_cache_targets(
+                        &result.rows,
+                        &delete_plan.schema_key,
+                    )
+                    .map_err(ExecutorError::execute)?;
+                    postprocess_file_cache_targets.extend(targets);
+                }
+                _ => {}
+            }
+
+            match postprocess_plan {
+                PostprocessPlan::VtableUpdate(update_plan) => {
+                    let changes = state_commit_stream_changes_from_postprocess_rows(
+                        &result.rows,
+                        &update_plan.schema_key,
+                        StateCommitStreamOperation::Update,
+                        writer_key,
+                    )
+                    .map_err(ExecutorError::execute)?;
+                    state_commit_stream_changes.extend(changes);
+                }
+                PostprocessPlan::VtableDelete(delete_plan) => {
+                    let changes = state_commit_stream_changes_from_postprocess_rows(
+                        &result.rows,
+                        &delete_plan.schema_key,
+                        StateCommitStreamOperation::Delete,
+                        writer_key,
+                    )
+                    .map_err(ExecutorError::execute)?;
+                    state_commit_stream_changes.extend(changes);
+                }
+            }
+
+            let additional_schema_keys = detected_file_domain_changes
+                .iter()
+                .map(|change| change.schema_key.clone())
+                .collect::<BTreeSet<_>>();
+            for schema_key in additional_schema_keys {
+                for statement in register_schema_sql_statements(&schema_key, transaction.dialect())
+                {
+                    transaction
+                        .execute(&statement, &[])
+                        .await
+                        .map_err(ExecutorError::execute)?;
+                }
+            }
+
+            let mut followup_functions = functions.clone();
+            let followup_params = prepared_statements
+                .first()
+                .map(|statement| statement.params.as_slice())
+                .unwrap_or(&[]);
+            let followup_statements = match postprocess_plan {
+                PostprocessPlan::VtableUpdate(update_plan) => build_update_followup_statements(
+                    transaction,
+                    update_plan,
+                    &result.rows,
+                    detected_file_domain_changes,
+                    writer_key,
+                    &mut followup_functions,
+                )
+                .await
+                .map_err(ExecutorError::execute)?,
+                PostprocessPlan::VtableDelete(delete_plan) => build_delete_followup_statements(
+                    transaction,
+                    delete_plan,
+                    &result.rows,
+                    followup_params,
+                    detected_file_domain_changes,
+                    writer_key,
+                    &mut followup_functions,
+                )
+                .await
+                .map_err(ExecutorError::execute)?,
+            };
+            execute_prepared_with_transaction(transaction, &followup_statements)
+                .await
+                .map_err(ExecutorError::execute)?;
             plugin_changes_committed = true;
             result
         }

@@ -605,7 +605,11 @@ fn materialized_row_values_parameterized(
         text_param_expr(&row.id, next_placeholder, params),
         optional_text_param_expr(row.metadata.as_deref(), next_placeholder, params),
         optional_text_param_expr(row.writer_key.as_deref(), next_placeholder, params),
-        number_expr("0"),
+        number_expr(if row.snapshot_content.is_some() {
+            "0"
+        } else {
+            "1"
+        }),
         text_param_expr(&row.created_at, next_placeholder, params),
         text_param_expr(&row.created_at, next_placeholder, params),
     ]
@@ -677,6 +681,18 @@ fn build_materialized_on_conflict() -> OnInsert {
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
             assignments: vec![
+                sqlparser::ast::Assignment {
+                    target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("schema_version")),
+                    ])),
+                    value: Expr::Identifier(Ident::new("excluded.schema_version")),
+                },
+                sqlparser::ast::Assignment {
+                    target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("plugin_key")),
+                    ])),
+                    value: Expr::Identifier(Ident::new("excluded.plugin_key")),
+                },
                 sqlparser::ast::Assignment {
                     target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
                         ObjectNamePart::Identifier(Ident::new("change_id")),

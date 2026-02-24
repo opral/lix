@@ -23,9 +23,7 @@ pub(crate) struct ReadRewriteSession {
 
 impl ReadRewriteSession {
     pub(crate) fn cached_version_chain(&self, version_id: &str) -> Option<&[String]> {
-        self.version_chain_cache
-            .get(version_id)
-            .map(Vec::as_slice)
+        self.version_chain_cache.get(version_id).map(Vec::as_slice)
     }
 
     pub(crate) fn cache_version_chain(&mut self, version_id: &str, chain: &[String]) {

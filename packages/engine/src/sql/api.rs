@@ -1,10 +1,6 @@
-use std::collections::BTreeSet;
-
 use super::super::*;
-use super::execution::{apply_effects_post_commit, apply_effects_tx, run};
-use super::planning::derive_requirements::derive_plan_requirements;
+use super::execution::{apply_effects_post_commit, apply_effects_tx, run, shared_path};
 use super::planning::parse::parse_sql;
-use super::planning::plan::build_execution_plan;
 use super::planning::script::extract_explicit_transaction_script_from_statements;
 
 impl Engine {
@@ -114,139 +110,74 @@ impl Engine {
                 .await;
         }
 
-        let requirements = derive_plan_requirements(&parsed_statements);
         let active_version_id = self.active_version_id.read().unwrap().clone();
         let writer_key = options.writer_key.as_deref();
-
-        if requirements.read_only_query {
-            self.maybe_refresh_working_change_projection_for_read_query(
-                self.backend.as_ref(),
-                &active_version_id,
-            )
-            .await?;
-        }
-
-        self.maybe_materialize_reads_with_backend_from_statements(
+        let prepared = shared_path::prepare_execution_with_backend(
+            self,
             self.backend.as_ref(),
             &parsed_statements,
+            params,
             &active_version_id,
+            writer_key,
+            shared_path::PreparationPolicy {
+                allow_plugin_cache: true,
+                detect_plugin_file_changes: true,
+                skip_side_effect_collection: false,
+            },
         )
         .await?;
-
-        let CollectedExecutionSideEffects {
-            pending_file_writes,
-            pending_file_delete_targets,
-            detected_file_domain_changes_by_statement,
-            detected_file_domain_changes,
-            untracked_filesystem_update_domain_changes,
-        } = if requirements.read_only_query {
-            CollectedExecutionSideEffects {
-                pending_file_writes: Vec::new(),
-                pending_file_delete_targets: BTreeSet::new(),
-                detected_file_domain_changes_by_statement: Vec::new(),
-                detected_file_domain_changes: Vec::new(),
-                untracked_filesystem_update_domain_changes: Vec::new(),
-            }
-        } else {
-            self.collect_execution_side_effects_with_backend_from_statements(
-                self.backend.as_ref(),
-                &parsed_statements,
-                params,
-                &active_version_id,
-                writer_key,
-                true,
-                true,
-            )
-            .await?
-        };
-
-        let (settings, sequence_start, functions) = self
-            .prepare_runtime_functions_with_backend(self.backend.as_ref())
-            .await?;
-        let contract_detected_file_domain_changes_by_statement =
-            detected_file_domain_changes_by_statement.clone();
-        let contract_detected_file_domain_changes = detected_file_domain_changes.clone();
-        let contract_untracked_filesystem_update_domain_changes =
-            untracked_filesystem_update_domain_changes.clone();
-
-        let plan = build_execution_plan(
-            self.backend.as_ref(),
-            &self.cel_evaluator,
-            parsed_statements.clone(),
-            params,
-            functions.clone(),
-            &contract_detected_file_domain_changes_by_statement,
-            writer_key,
-        )
-        .await
-        .map_err(LixError::from)?;
-        if !plan.preprocess.mutations.is_empty() {
-            validate_inserts(
-                self.backend.as_ref(),
-                &self.schema_cache,
-                &plan.preprocess.mutations,
-            )
-            .await?;
-        }
-        if !plan.preprocess.update_validations.is_empty() {
-            validate_updates(
-                self.backend.as_ref(),
-                &self.schema_cache,
-                &plan.preprocess.update_validations,
-                params,
-            )
-            .await?;
-        }
 
         let execution = run::execute_plan_sql(
             self,
-            &plan,
-            &contract_detected_file_domain_changes,
-            plan.requirements.should_refresh_file_cache,
-            &functions,
+            &prepared.plan,
+            &prepared.detected_file_domain_changes,
+            prepared.plan.requirements.should_refresh_file_cache,
+            &prepared.functions,
             writer_key,
         )
         .await
         .map_err(LixError::from)?;
 
-        run::persist_runtime_sequence(self, settings, sequence_start, &functions).await?;
-
-        if let Some(version_id) = &plan.effects.next_active_version_id {
-            self.set_active_version_id(version_id.clone());
-        }
-
-        let file_cache_refresh_targets = if plan.requirements.should_refresh_file_cache {
-            let mut targets = direct_state_file_cache_refresh_targets(&plan.preprocess.mutations);
-            targets.extend(execution.postprocess_file_cache_targets);
-            targets
-        } else {
-            BTreeSet::new()
-        };
-        let descriptor_cache_eviction_targets =
-            file_descriptor_cache_eviction_targets(&plan.preprocess.mutations);
-        let mut file_cache_invalidation_targets = file_cache_refresh_targets.clone();
-        file_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
-        file_cache_invalidation_targets.extend(pending_file_delete_targets.clone());
-
-        apply_effects_tx::apply_sql_backed_effects(
+        run::persist_runtime_sequence(
             self,
-            &plan.preprocess.mutations,
-            &pending_file_writes,
-            &pending_file_delete_targets,
-            &contract_detected_file_domain_changes,
-            &contract_untracked_filesystem_update_domain_changes,
-            execution.plugin_changes_committed,
-            &file_cache_invalidation_targets,
+            prepared.settings,
+            prepared.sequence_start,
+            &prepared.functions,
         )
         .await?;
 
-        let mut state_commit_stream_changes = plan.effects.state_commit_stream_changes;
+        if let Some(version_id) = &prepared.plan.effects.next_active_version_id {
+            self.set_active_version_id(version_id.clone());
+        }
+
+        let cache_targets = shared_path::derive_cache_targets(
+            &prepared.plan,
+            execution.postprocess_file_cache_targets.clone(),
+            &prepared.pending_file_delete_targets,
+        );
+
+        apply_effects_tx::apply_sql_backed_effects(
+            self,
+            &prepared.plan.preprocess.mutations,
+            &prepared.pending_file_writes,
+            &prepared.pending_file_delete_targets,
+            &prepared.detected_file_domain_changes,
+            &prepared.untracked_filesystem_update_domain_changes,
+            execution.plugin_changes_committed,
+            &cache_targets.file_cache_invalidation_targets,
+        )
+        .await?;
+
+        let mut state_commit_stream_changes = prepared.plan.effects.state_commit_stream_changes;
         state_commit_stream_changes.extend(execution.state_commit_stream_changes);
 
         apply_effects_post_commit::apply_runtime_post_commit_effects(
             self,
-            file_cache_refresh_targets,
-            plan.requirements.should_invalidate_installed_plugins_cache,
+            cache_targets.file_cache_refresh_targets,
+            prepared
+                .plan
+                .requirements
+                .should_invalidate_installed_plugins_cache,
             state_commit_stream_changes,
         )
         .await?;
