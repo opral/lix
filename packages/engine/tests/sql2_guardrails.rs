@@ -192,3 +192,28 @@ fn guardrail_legacy_sql_bridge_alias_usage_is_forbidden() {
         );
     }
 }
+
+#[test]
+fn guardrail_runtime_sql_imports_are_isolated_to_preprocess_runtime_module() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_sources(&root, &mut files);
+
+    for file in files {
+        let normalized = file.to_string_lossy().replace('\\', "/");
+        if normalized.contains("/src/sql/") {
+            continue;
+        }
+
+        let source = fs::read_to_string(&file).expect("source file should be readable");
+        if !source.contains("crate::sql::") {
+            continue;
+        }
+
+        assert!(
+            normalized.ends_with("src/sql_preprocess_runtime.rs"),
+            "runtime crate::sql imports must stay isolated to src/sql_preprocess_runtime.rs: {}",
+            file.display()
+        );
+    }
+}
