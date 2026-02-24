@@ -4,7 +4,7 @@ use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFuncti
 use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::SqlDialect;
-use sqlparser::ast::{Query, Update};
+use sqlparser::ast::Update;
 
 use super::ast::nodes::Statement;
 use super::ast::utils::PlaceholderState;
@@ -19,9 +19,6 @@ pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> Strin
     let sql_output = to_sql_preprocess_output(output);
     legacy_sql::preprocess_plan_fingerprint(&sql_output)
 }
-
-pub(crate) type SqlBridgeReadRewriteSession = legacy_sql::ReadRewriteSession;
-pub(crate) type SqlBridgeDetectedFileDomainChange = legacy_sql::DetectedFileDomainChange;
 
 pub(crate) fn preprocess_statements_with_provider_with_sql_bridge<P: LixFunctionProvider>(
     statements: Vec<Statement>,
@@ -46,16 +43,6 @@ pub(crate) fn lower_statement_with_sql_bridge(
     dialect: SqlDialect,
 ) -> Result<Statement, LixError> {
     legacy_sql::lower_statement(statement, dialect)
-}
-
-pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session_with_sql_bridge(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-    session: &mut SqlBridgeReadRewriteSession,
-) -> Result<Query, LixError> {
-    legacy_sql::rewrite_read_query_with_backend_and_params_in_session(backend, query, params, session)
-        .await
 }
 
 pub(crate) struct FilesystemUpdateSideEffects {

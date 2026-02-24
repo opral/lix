@@ -18,13 +18,12 @@ use crate::engine::sql2::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
-use crate::engine::sql2::storage::sql_text::escape_sql_string;
-use crate::engine::sql2::legacy_bridge::{
-    lower_statement_with_sql_bridge as lower_statement,
-    rewrite_read_query_with_backend_and_params_in_session_with_sql_bridge as rewrite_read_query_with_backend_and_params_in_session,
-    SqlBridgeDetectedFileDomainChange as DetectedFileDomainChange,
-    SqlBridgeReadRewriteSession as ReadRewriteSession,
+use crate::engine::sql2::history::rewrite::{
+    rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
+use crate::engine::sql2::storage::sql_text::escape_sql_string;
+use crate::engine::sql2::legacy_bridge::lower_statement_with_sql_bridge as lower_statement;
+use crate::sql::DetectedFileDomainChange;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
