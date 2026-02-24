@@ -8,7 +8,7 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::engine::sql2::ast::utils::parse_sql_statements;
-use crate::engine::sql2::type_bridge::{
+use crate::engine::sql2::legacy_bridge::{
     escape_sql_string_with_sql_bridge as escape_sql_string,
     preprocess_statements_with_provider_with_sql_bridge as preprocess_statements_with_provider,
 };

@@ -1,7 +1,7 @@
 use crate::cel::CelEvaluator;
 #[cfg(test)]
 use crate::engine::sql2::ast::utils::parse_sql_statements;
-use crate::engine::sql2::type_bridge::{
+use crate::engine::sql2::legacy_bridge::{
     bind_sql_with_sql_bridge_state as bind_sql_with_state,
     escape_sql_string_with_sql_bridge as escape_sql_string,
     preprocess_sql_with_sql_bridge as preprocess_sql,
