@@ -1,12 +1,12 @@
 use crate::cel::CelEvaluator;
 #[cfg(test)]
-use crate::engine::sql2::ast::utils::parse_sql_statements;
-use crate::engine::sql2::ast::utils::{
+use crate::engine::sql::ast::utils::parse_sql_statements;
+use crate::engine::sql::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
-use crate::engine::sql2::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
-use crate::engine::sql2::storage::sql_text::escape_sql_string;
+use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,

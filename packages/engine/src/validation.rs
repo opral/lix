@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::engine::sql2::ast::utils::bind_sql;
-use crate::engine::sql2::contracts::planned_statement::{
+use crate::engine::sql::ast::utils::bind_sql;
+use crate::engine::sql::contracts::planned_statement::{
     MutationOperation, MutationRow, UpdateValidationPlan,
 };
 use crate::schema::{

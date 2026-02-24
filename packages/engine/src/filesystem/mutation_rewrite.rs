@@ -14,16 +14,16 @@ use crate::filesystem::path::{
     file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
     normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
 };
-use crate::engine::sql2::ast::utils::{
+use crate::engine::sql::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
-use crate::engine::sql2::ast::lowering::lower_statement;
-use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
-use crate::engine::sql2::planning::rewrite_engine::{
+use crate::engine::sql::ast::lowering::lower_statement;
+use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
+use crate::engine::sql::planning::rewrite_engine::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
-use crate::engine::sql2::storage::sql_text::escape_sql_string;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
@@ -3459,7 +3459,7 @@ mod tests {
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
         rewrite_update, select_effective_entity_tombstone_state,
     };
-    use crate::engine::sql2::ast::utils::{
+    use crate::engine::sql::ast::utils::{
         parse_sql_statements, resolve_expr_cell_with_state, PlaceholderState,
     };
     use crate::SqlDialect;
