@@ -20,7 +20,6 @@ mod plugin;
 mod schema;
 mod schema_registry;
 mod snapshot;
-mod sql;
 mod state_commit_stream;
 mod types;
 mod validation;
