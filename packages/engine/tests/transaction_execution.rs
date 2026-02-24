@@ -401,6 +401,38 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_script_path_binds_placeholder_variants_once_across_statements,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let result = engine
+            .execute(
+                "BEGIN; \
+                 SELECT ?; \
+                 SELECT ?3; \
+                 SELECT $2, ?; \
+                 COMMIT;",
+                &[
+                    Value::Integer(11),
+                    Value::Integer(22),
+                    Value::Integer(33),
+                    Value::Integer(44),
+                ],
+            )
+            .await
+            .expect("mixed placeholder transaction script should execute");
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0], vec![Value::Integer(22), Value::Integer(44)]);
+    }
+);
+
+simulation_test!(
     transaction_path_rolls_back_when_callback_panics,
     simulations = [sqlite, postgres],
     |sim| async move {

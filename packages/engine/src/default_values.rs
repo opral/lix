@@ -3,9 +3,9 @@ use sqlparser::ast::Value as AstValue;
 use sqlparser::ast::{Expr, Insert, ObjectName, ObjectNamePart, Statement, TableObject};
 
 use crate::cel::CelEvaluator;
+use crate::engine::sql::ast::utils::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::{OverlaySchemaProvider, SchemaKey, SchemaProvider};
-use crate::sql::{insert_values_rows_mut, resolve_insert_rows, ResolvedCell};
 use crate::{LixBackend, LixError, Value};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
@@ -251,8 +251,8 @@ mod tests {
     use sqlparser::ast::{Expr, SetExpr, Statement};
 
     use crate::cel::CelEvaluator;
+    use crate::engine::sql::ast::utils::parse_sql_statements;
     use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-    use crate::sql::parse_sql_statements;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
     use super::{apply_defaults_to_snapshot, apply_vtable_insert_defaults};

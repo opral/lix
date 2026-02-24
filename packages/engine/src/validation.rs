@@ -5,11 +5,14 @@ use std::sync::{Arc, RwLock};
 use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::engine::sql::ast::utils::bind_sql;
+use crate::engine::sql::contracts::planned_statement::{
+    MutationOperation, MutationRow, UpdateValidationPlan,
+};
 use crate::schema::{
     schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
     SchemaProvider, SqlStoredSchemaProvider,
 };
-use crate::sql::{bind_sql, MutationOperation, MutationRow, UpdateValidationPlan};
 use crate::{LixBackend, LixError, Value};
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";

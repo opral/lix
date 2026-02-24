@@ -1,5 +1,9 @@
 use serde_json::Value as JsonValue;
 
+use crate::engine::sql::ast::utils::parse_sql_statements;
+use crate::engine::sql::planning::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::error_classification::is_missing_relation_error;
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::json_truthiness::{loosely_false, loosely_true};
@@ -7,7 +11,6 @@ use crate::key_value::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::sql::{escape_sql_string, parse_sql_statements, preprocess_statements_with_provider};
 use crate::LixBackend;
 use crate::{LixError, Value};
 
@@ -174,7 +177,10 @@ pub async fn persist_sequence_highest(
     let statements = parse_sql_statements(&sql)?;
     let rewritten =
         preprocess_statements_with_provider(statements, &[], &mut provider, backend.dialect())?;
-    if let Err(err) = backend.execute(&rewritten.sql, &rewritten.params).await {
+    if let Err(err) = backend
+        .execute(&rewritten.sql, rewritten.single_statement_params()?)
+        .await
+    {
         if is_missing_relation_error(&err) {
             return Ok(());
         }
@@ -203,7 +209,9 @@ async fn load_key_value_payload(
     let mut provider = SystemFunctionProvider;
     let rewritten =
         preprocess_statements_with_provider(statements, &[], &mut provider, backend.dialect())?;
-    let result = backend.execute(&rewritten.sql, &rewritten.params).await?;
+    let result = backend
+        .execute(&rewritten.sql, rewritten.single_statement_params()?)
+        .await?;
     parse_first_payload(result.rows.first())
 }
 
@@ -222,15 +230,6 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             message: format!("expected text value for {name}"),
         }),
     }
-}
-
-fn is_missing_relation_error(err: &LixError) -> bool {
-    let lower = err.message.to_lowercase();
-    lower.contains("no such table")
-        || lower.contains("relation")
-            && (lower.contains("does not exist")
-                || lower.contains("undefined table")
-                || lower.contains("unknown"))
 }
 
 fn parse_first_payload(row: Option<&Vec<Value>>) -> Result<Option<JsonValue>, LixError> {

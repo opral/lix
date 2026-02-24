@@ -19,26 +19,10 @@ use crate::materialization::{
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
-use crate::schema_registry::{register_schema, register_schema_sql_statements};
-use crate::sql::{
-    active_version_from_mutations, active_version_from_update_validations, bind_sql_with_state,
-    build_delete_followup_sql, build_update_followup_sql, coalesce_lix_file_transaction_statements,
-    coalesce_vtable_inserts_in_statement_list, escape_sql_string,
-    extract_explicit_transaction_script_from_statements,
-    file_history_read_materialization_required_for_statements,
-    file_read_materialization_scope_for_statements, is_query_only_statements, parse_sql_statements,
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes, preprocess_sql,
-    should_invalidate_installed_plugins_cache_for_sql,
-    should_invalidate_installed_plugins_cache_for_statements,
-    should_refresh_file_cache_for_statements, DetectedFileDomainChange,
-    FileReadMaterializationScope, MutationOperation, MutationRow, PlaceholderState,
-    PostprocessPlan,
-};
 use crate::state_commit_stream::{
-    state_commit_stream_changes_from_mutations, StateCommitStream, StateCommitStreamBus,
-    StateCommitStreamChange, StateCommitStreamFilter,
+    StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::validation::{validate_inserts, validate_updates, SchemaCache};
+use crate::validation::SchemaCache;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
@@ -63,8 +47,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
-#[path = "execute/mod.rs"]
-mod execute;
 #[path = "init/active_version.rs"]
 mod init_active_version;
 #[path = "init/bootstrap.rs"]
@@ -75,9 +57,14 @@ mod init_seed;
 mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
+#[path = "sql/mod.rs"]
+pub(crate) mod sql;
 
-#[cfg(test)]
-use self::execute::should_sequentialize_postprocess_multi_statement;
+use self::sql::contracts::effects::DetectedFileDomainChange;
+use self::sql::contracts::planned_statement::MutationRow;
+use self::sql::planning::parse::parse_sql;
+use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+use self::sql::storage::sql_text::escape_sql_string;
 
 pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 
@@ -233,6 +220,13 @@ fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
     Ok(())
 }
 
+fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
+    let Ok(statements) = parse_sql(sql) else {
+        return false;
+    };
+    should_invalidate_installed_plugins_cache_for_statements(&statements)
+}
+
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
 // Internal access to the raw transaction pointer is serialized with a mutex.
 unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
@@ -375,10 +369,7 @@ fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet
         .iter()
         .filter(|mutation| !mutation.untracked)
         .filter(|mutation| mutation.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-        .filter(|mutation| {
-            matches!(mutation.operation, MutationOperation::Delete)
-                || mutation.snapshot_content.is_none()
-        })
+        .filter(|mutation| mutation.snapshot_content.is_none())
         .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
 }
@@ -527,72 +518,6 @@ fn detected_file_domain_changes_with_writer_key(
         .collect()
 }
 
-async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
-    backend: &dyn LixBackend,
-    statements: &[Statement],
-    params: &[Value],
-) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let mut placeholder_state = PlaceholderState::new();
-    let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
-    let mut untracked_changes = Vec::new();
-    for statement in statements {
-        match statement {
-            Statement::Update(update) => {
-                let side_effects =
-                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                        backend,
-                        &update,
-                        params,
-                        &mut placeholder_state,
-                    )
-                    .await?;
-                let statement_tracked_changes =
-                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
-                tracked_changes_by_statement.push(statement_tracked_changes);
-                untracked_changes.extend(side_effects.untracked_directory_changes);
-            }
-            other => {
-                tracked_changes_by_statement.push(Vec::new());
-                advance_placeholder_state_for_statement(
-                    &other,
-                    params,
-                    backend.dialect(),
-                    &mut placeholder_state,
-                )?;
-            }
-        }
-    }
-
-    Ok(FilesystemUpdateDomainChangeCollection {
-        untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
-        tracked_changes_by_statement,
-    })
-}
-
-struct FilesystemUpdateDomainChangeCollection {
-    untracked_changes: Vec<DetectedFileDomainChange>,
-    tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
-}
-
-fn advance_placeholder_state_for_statement(
-    statement: &Statement,
-    params: &[Value],
-    dialect: crate::backend::SqlDialect,
-    placeholder_state: &mut PlaceholderState,
-) -> Result<(), LixError> {
-    let statement_sql = statement.to_string();
-    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
-        |error| LixError {
-            message: format!(
-                "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.message
-            ),
-        },
-    )?;
-    *placeholder_state = bound.state;
-    Ok(())
-}
-
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
     let schema_key = schema
         .get("x-lix-key")
@@ -613,22 +538,32 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_placeholder_state_for_statement, boot,
-        detected_file_domain_changes_from_detected_file_changes,
+        boot, detected_file_domain_changes_from_detected_file_changes,
         detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
-        should_sequentialize_postprocess_multi_statement, BootArgs, ExecuteOptions,
+        should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
-    use crate::sql::{
-        active_version_from_update_validations, bind_sql_with_state,
-        coalesce_lix_file_transaction_statements, extract_explicit_transaction_script,
-        file_history_read_materialization_required_for_sql,
-        file_read_materialization_scope_for_sql, is_query_only_sql, parse_sql_statements,
-        should_invalidate_installed_plugins_cache_for_sql, should_refresh_file_cache_for_sql,
-        FileReadMaterializationScope, MutationOperation, MutationRow, PlaceholderState,
+    use crate::engine::sql::ast::utils::parse_sql_statements;
+    use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
+    use crate::engine::sql::ast::walk::contains_transaction_control_statement;
+    use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
+    use crate::engine::sql::contracts::planned_statement::{
+        MutationOperation, MutationRow, UpdateValidationPlan,
     };
-    use crate::sql::{DetectedFileDomainChange, UpdateValidationPlan};
+    use crate::engine::sql::history::plugin_inputs::{
+        file_history_read_materialization_required_for_statements,
+        file_read_materialization_scope_for_statements, FileReadMaterializationScope,
+    };
+    use crate::engine::sql::planning::script::{
+        coalesce_lix_file_transaction_statements,
+        extract_explicit_transaction_script_from_statements,
+    };
+    use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
+    use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
+    use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::engine::sql::side_effects::advance_placeholder_state_for_statement;
+    use crate::engine::Engine;
+    use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
         LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
@@ -654,6 +589,38 @@ mod tests {
     struct EmptySnapshotReader;
 
     struct NoopWasmComponentInstance;
+
+    async fn execute_multi_statement_sequential_with_options(
+        engine: &Engine,
+        sql: &str,
+        params: &[Value],
+        options: &ExecuteOptions,
+    ) -> Result<QueryResult, LixError> {
+        let statements = parse_sql_statements(sql)?;
+        engine
+            .execute_statement_script_with_options(statements, params, options)
+            .await
+    }
+
+    fn should_sequentialize_postprocess_multi_statement(sql: &str, params: &[Value]) -> bool {
+        let Ok(statements) = parse_sql_statements(sql) else {
+            return false;
+        };
+        should_sequentialize_postprocess_multi_statement_with_statements(&statements, params)
+    }
+
+    fn should_sequentialize_postprocess_multi_statement_with_statements(
+        statements: &[Statement],
+        params: &[Value],
+    ) -> bool {
+        if !params.is_empty() {
+            return false;
+        }
+        if statements.len() <= 1 {
+            return false;
+        }
+        !contains_transaction_control_statement(statements)
+    }
 
     fn active_version_snapshot_json(version_id: &str) -> String {
         serde_json::json!({ "id": "main", "version_id": version_id }).to_string()
@@ -837,38 +804,22 @@ mod tests {
     }
 
     #[test]
-    fn sequentialize_postprocess_multi_statement_detects_both_pipeline_errors() {
+    fn sequentialize_postprocess_multi_statement_uses_structural_rules_only() {
         let sql =
             "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'";
-        for message in [
-            "postprocess rewrites require a single statement",
-            "only one postprocess rewrite is supported per query",
-        ] {
-            let error = LixError {
-                message: message.to_string(),
-            };
-            assert!(
-                should_sequentialize_postprocess_multi_statement(sql, &[], &error),
-                "expected sequentialization for error message: {message}"
-            );
-        }
+        assert!(should_sequentialize_postprocess_multi_statement(sql, &[]));
     }
 
     #[test]
     fn sequentialize_postprocess_multi_statement_rejects_params_and_explicit_transaction_wrappers()
     {
-        let error = LixError {
-            message: "only one postprocess rewrite is supported per query".to_string(),
-        };
         assert!(!should_sequentialize_postprocess_multi_statement(
             "UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; UPDATE lix_file SET path = '/b', data = x'02' WHERE id = 'f2'",
             &[Value::Text("f1".to_string())],
-            &error,
         ));
         assert!(!should_sequentialize_postprocess_multi_statement(
             "BEGIN; UPDATE lix_file SET path = '/a', data = x'01' WHERE id = 'f1'; COMMIT;",
             &[],
-            &error,
         ));
     }
 
@@ -888,14 +839,14 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         ));
 
-        engine
-            .execute_multi_statement_sequential_with_options(
-                "SELECT 1; SELECT 2;",
-                &[],
-                &ExecuteOptions::default(),
-            )
-            .await
-            .expect("sequential multi-statement execution should succeed");
+        execute_multi_statement_sequential_with_options(
+            &engine,
+            "SELECT 1; SELECT 2;",
+            &[],
+            &ExecuteOptions::default(),
+        )
+        .await
+        .expect("sequential multi-statement execution should succeed");
 
         assert!(commit_called.load(Ordering::SeqCst));
         assert!(!rollback_called.load(Ordering::SeqCst));
@@ -1097,6 +1048,7 @@ mod tests {
 
         let bound = bind_sql_with_state("SELECT ?", &params, SqlDialect::Sqlite, placeholder_state)
             .expect("bind placeholder with carried state");
+        assert_eq!(bound.sql, "SELECT ?1");
         assert_eq!(bound.params.len(), 1);
         assert_eq!(bound.params[0], Value::Text("/archive/b.json".to_string()));
     }
@@ -1338,7 +1290,7 @@ mod tests {
     fn descriptor_delete_targets_cache_eviction_by_entity_id_and_version_id() {
         let targets = file_descriptor_cache_eviction_targets(&[
             MutationRow {
-                operation: MutationOperation::Delete,
+                operation: MutationOperation::Insert,
                 entity_id: "file-a".to_string(),
                 schema_key: "lix_file_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1349,7 +1301,7 @@ mod tests {
                 untracked: false,
             },
             MutationRow {
-                operation: MutationOperation::Delete,
+                operation: MutationOperation::Insert,
                 entity_id: "ignored-dir".to_string(),
                 schema_key: "lix_directory_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1360,7 +1312,7 @@ mod tests {
                 untracked: false,
             },
             MutationRow {
-                operation: MutationOperation::Delete,
+                operation: MutationOperation::Insert,
                 entity_id: "ignored-untracked".to_string(),
                 schema_key: "lix_file_descriptor".to_string(),
                 schema_version: "1".to_string(),
@@ -1442,6 +1394,40 @@ mod tests {
             rewritten.is_none(),
             "coalescer must not drop non-replay columns from lix_file inserts"
         );
+    }
+
+    fn is_query_only_sql(sql: &str) -> bool {
+        parse_sql_statements(sql)
+            .map(|statements| is_query_only_statements(&statements))
+            .unwrap_or(false)
+    }
+
+    fn should_refresh_file_cache_for_sql(sql: &str) -> bool {
+        parse_sql_statements(sql)
+            .map(|statements| should_refresh_file_cache_for_statements(&statements))
+            .unwrap_or(false)
+    }
+
+    fn file_read_materialization_scope_for_sql(sql: &str) -> Option<FileReadMaterializationScope> {
+        parse_sql_statements(sql)
+            .ok()
+            .and_then(|statements| file_read_materialization_scope_for_statements(&statements))
+    }
+
+    fn file_history_read_materialization_required_for_sql(sql: &str) -> bool {
+        parse_sql_statements(sql)
+            .map(|statements| {
+                file_history_read_materialization_required_for_statements(&statements)
+            })
+            .unwrap_or(false)
+    }
+
+    fn extract_explicit_transaction_script(
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Option<Vec<Statement>>, LixError> {
+        let statements = parse_sql_statements(sql)?;
+        extract_explicit_transaction_script_from_statements(&statements, params)
     }
 
     fn parse_update_where_clause(sql: &str) -> Expr {

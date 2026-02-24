@@ -1,10 +1,12 @@
 use crate::cel::CelEvaluator;
 #[cfg(test)]
-use crate::sql::parse_sql_statements;
-use crate::sql::{
-    bind_sql_with_state, escape_sql_string, preprocess_sql, resolve_expr_cell_with_state,
-    resolve_values_rows, PlaceholderState,
+use crate::engine::sql::ast::utils::parse_sql_statements;
+use crate::engine::sql::ast::utils::{
+    bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
+    ResolvedCell,
 };
+use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
@@ -1849,14 +1851,14 @@ fn expr_text_literal_or_placeholder(
     Ok(resolved_cell_text(Some(&resolved)))
 }
 
-fn resolved_cell_text(cell: Option<&crate::sql::ResolvedCell>) -> Option<String> {
+fn resolved_cell_text(cell: Option<&ResolvedCell>) -> Option<String> {
     match cell.and_then(|entry| entry.value.as_ref()) {
         Some(Value::Text(value)) => Some(value.clone()),
         _ => None,
     }
 }
 
-fn resolved_cell_blob_or_text_bytes(cell: Option<&crate::sql::ResolvedCell>) -> Option<Vec<u8>> {
+fn resolved_cell_blob_or_text_bytes(cell: Option<&ResolvedCell>) -> Option<Vec<u8>> {
     cell.and_then(|entry| entry.value.as_ref())
         .and_then(value_as_blob_or_text_bytes)
 }
@@ -1978,7 +1980,7 @@ mod tests {
     }
 
     fn parse_delete(sql: &str) -> sqlparser::ast::Delete {
-        let statements = crate::sql::parse_sql_statements(sql).expect("parse SQL");
+        let statements = parse_sql_statements(sql).expect("parse SQL");
         let statement = statements.into_iter().next().expect("statement");
         let Statement::Delete(delete) = statement else {
             panic!("expected delete statement");
@@ -2118,7 +2120,9 @@ async fn execute_prefetch_query(
     // Keep the rewrite future on the heap to avoid stack blow-ups in deep
     // query rewrite paths on tokio test threads with smaller default stacks.
     let output = Box::pin(preprocess_sql(backend, &CelEvaluator::new(), sql, params)).await?;
-    let result = backend.execute(&output.sql, &output.params).await?;
+    let result = backend
+        .execute(&output.sql, output.single_statement_params()?)
+        .await?;
     if trace {
         eprintln!(
             "[trace][file-prefetch] module=pending_file_writes label={label} source_sql_chars={} rewritten_sql_chars={} rows={}",
