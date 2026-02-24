@@ -68,7 +68,7 @@ pub(crate) fn rewrite_query_selects(
     rewrite_select: &mut dyn FnMut(&mut Select) -> Result<RewriteDecision, LixError>,
 ) -> Result<Option<Query>, LixError> {
     let mut changed = false;
-    let mut new_query = query.clone();
+    let mut new_query = query;
     let mut visitor = SelectRewriteVisitor {
         rewrite_select,
         changed: &mut changed,

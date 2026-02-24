@@ -167,7 +167,7 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
 }
 
 fn parse_hex_literal(text: &str) -> Result<Vec<u8>, LixError> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(LixError {
             message: format!(
                 "hex literal must contain an even number of digits, got {}",
