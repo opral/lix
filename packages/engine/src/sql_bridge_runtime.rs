@@ -1,12 +1,11 @@
 use crate::cel::CelEvaluator;
-use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql as legacy_sql;
 use crate::sql::{
     rewrite_read_query_with_backend_and_params_in_session as legacy_rewrite_read_query_with_backend_and_params_in_session,
     ReadRewriteSession as LegacyReadRewriteSession,
 };
-use crate::{LixBackend, LixError, LixTransaction, SqlDialect, Value};
+use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::Query;
 
 use super::sql2::ast::nodes::Statement;
@@ -97,46 +96,6 @@ where
     )
     .await?;
     Ok(from_legacy_preprocess_output(output))
-}
-
-pub(crate) async fn build_update_followup_statements(
-    transaction: &mut dyn LixTransaction,
-    plan: &VtableUpdatePlan,
-    rows: &[Vec<Value>],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    super::sql_followup_runtime::build_update_followup_statements(
-        transaction,
-        plan,
-        rows,
-        detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await
-}
-
-pub(crate) async fn build_delete_followup_statements(
-    transaction: &mut dyn LixTransaction,
-    plan: &VtableDeletePlan,
-    rows: &[Vec<Value>],
-    params: &[Value],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    super::sql_followup_runtime::build_delete_followup_statements(
-        transaction,
-        plan,
-        rows,
-        params,
-        detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await
 }
 
 fn to_legacy_detected_file_domain_changes_by_statement(
