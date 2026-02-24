@@ -1,4 +1,5 @@
 use super::super::*;
+use super::ast::utils::{bind_sql_with_state, PlaceholderState};
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
@@ -9,6 +10,71 @@ use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
 };
 use crate::SqlDialect;
+
+pub(crate) struct FilesystemUpdateDomainChangeCollection {
+    pub(crate) untracked_changes: Vec<DetectedFileDomainChange>,
+    pub(crate) tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
+}
+
+pub(crate) async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
+    backend: &dyn LixBackend,
+    statements: &[Statement],
+    params: &[Value],
+) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
+    let mut placeholder_state = PlaceholderState::new();
+    let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
+    let mut untracked_changes = Vec::new();
+    for statement in statements {
+        match statement {
+            Statement::Update(update) => {
+                let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
+                    backend,
+                    &update,
+                    params,
+                    &mut placeholder_state,
+                )
+                .await?;
+                let statement_tracked_changes =
+                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
+                tracked_changes_by_statement.push(statement_tracked_changes);
+                untracked_changes.extend(side_effects.untracked_directory_changes);
+            }
+            other => {
+                tracked_changes_by_statement.push(Vec::new());
+                advance_placeholder_state_for_statement(
+                    &other,
+                    params,
+                    backend.dialect(),
+                    &mut placeholder_state,
+                )?;
+            }
+        }
+    }
+
+    Ok(FilesystemUpdateDomainChangeCollection {
+        untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
+        tracked_changes_by_statement,
+    })
+}
+
+pub(crate) fn advance_placeholder_state_for_statement(
+    statement: &Statement,
+    params: &[Value],
+    dialect: crate::backend::SqlDialect,
+    placeholder_state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    let statement_sql = statement.to_string();
+    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
+        |error| LixError {
+            message: format!(
+                "filesystem side-effect placeholder binding failed for '{}': {}",
+                statement_sql, error.message
+            ),
+        },
+    )?;
+    *placeholder_state = bound.state;
+    Ok(())
+}
 
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
