@@ -8,10 +8,8 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::engine::sql2::ast::utils::parse_sql_statements;
+use crate::engine::sql2::planning::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
 use crate::engine::sql2::storage::sql_text::escape_sql_string;
-use crate::engine::sql2::legacy_bridge::{
-    preprocess_statements_with_provider_with_sql_bridge as preprocess_statements_with_provider,
-};
 use crate::LixBackend;
 use crate::{LixError, Value};
 

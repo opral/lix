@@ -4,7 +4,7 @@ use super::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use super::storage::tables;
-use super::legacy_bridge::{from_sql_prepared_statements, preprocess_sql_with_sql_bridge};
+use super::planning::preprocess::preprocess_sql_to_plan;
 use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
 };
@@ -406,10 +406,9 @@ impl Engine {
         let (sql, params) = build_detected_file_domain_changes_insert(&deduped_changes, untracked);
         let output = {
             let backend = TransactionBackendAdapter::new(transaction);
-            preprocess_sql_with_sql_bridge(&backend, &self.cel_evaluator, &sql, &params).await?
+            preprocess_sql_to_plan(&backend, &self.cel_evaluator, &sql, &params).await?
         };
-        let prepared_statements = from_sql_prepared_statements(output.prepared_statements);
-        execute_prepared_with_transaction(transaction, &prepared_statements).await?;
+        execute_prepared_with_transaction(transaction, &output.prepared_statements).await?;
 
         Ok(())
     }

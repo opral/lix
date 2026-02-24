@@ -1,8 +1,6 @@
 use crate::sql as legacy_sql;
 use crate::{LixBackend, LixError, LixTransaction, Value};
 use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFunctionProvider};
-use crate::cel::CelEvaluator;
-use crate::functions::LixFunctionProvider;
 use crate::SqlDialect;
 use sqlparser::ast::Update;
 
@@ -18,24 +16,6 @@ use super::contracts::prepared_statement::PreparedStatement;
 pub(crate) fn preprocess_plan_fingerprint(output: &PlannedStatementSet) -> String {
     let sql_output = to_sql_preprocess_output(output);
     legacy_sql::preprocess_plan_fingerprint(&sql_output)
-}
-
-pub(crate) fn preprocess_statements_with_provider_with_sql_bridge<P: LixFunctionProvider>(
-    statements: Vec<Statement>,
-    params: &[Value],
-    provider: &mut P,
-    dialect: SqlDialect,
-) -> Result<legacy_sql::PreprocessOutput, LixError> {
-    legacy_sql::preprocess_statements_with_provider(statements, params, provider, dialect)
-}
-
-pub(crate) async fn preprocess_sql_with_sql_bridge(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql_text: &str,
-    params: &[Value],
-) -> Result<legacy_sql::PreprocessOutput, LixError> {
-    legacy_sql::preprocess_sql(backend, evaluator, sql_text, params).await
 }
 
 pub(crate) fn lower_statement_with_sql_bridge(
@@ -71,33 +51,6 @@ pub(crate) async fn collect_filesystem_update_side_effects_with_sql_bridge(
             side_effects.untracked_directory_changes,
         ),
     })
-}
-
-pub(crate) async fn preprocess_with_sql_surfaces<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    statements: Vec<Statement>,
-    params: &[Value],
-    functions: SharedFunctionProvider<P>,
-    detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
-    writer_key: Option<&str>,
-) -> Result<PlannedStatementSet, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    let sql_detected_file_domain_changes_by_statement =
-        to_sql_detected_file_domain_changes_by_statement(detected_file_domain_changes_by_statement);
-    let output = legacy_sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
-        backend,
-        evaluator,
-        statements,
-        params,
-        functions,
-        &sql_detected_file_domain_changes_by_statement,
-        writer_key,
-    )
-    .await?;
-    Ok(from_sql_preprocess_output(output))
 }
 
 pub(crate) async fn build_update_followup_statements_with_sql_bridge(
