@@ -6,7 +6,9 @@ use sqlparser::ast::Query;
 use sqlparser::ast::{ObjectNamePart, TableFactor};
 
 #[cfg(debug_assertions)]
-use crate::engine::sql::planning::rewrite_engine::{visit_query_selects, visit_table_factors_in_select};
+use crate::engine::sql::planning::rewrite_engine::{
+    visit_query_selects, visit_table_factors_in_select,
+};
 use crate::LixError;
 
 #[cfg(debug_assertions)]

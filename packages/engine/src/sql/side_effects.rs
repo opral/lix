@@ -1,11 +1,11 @@
 use super::super::*;
 use super::ast::utils::{bind_sql_with_state, PlaceholderState};
 use super::execution::execute_prepared::execute_prepared_with_transaction;
+use super::planning::preprocess::preprocess_sql_to_plan;
 use super::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use super::storage::tables;
-use super::planning::preprocess::preprocess_sql_to_plan;
 use super::{
     history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
 };
@@ -27,13 +27,14 @@ pub(crate) async fn collect_filesystem_update_detected_file_domain_changes_from_
     for statement in statements {
         match statement {
             Statement::Update(update) => {
-                let side_effects = crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                    backend,
-                    &update,
-                    params,
-                    &mut placeholder_state,
-                )
-                .await?;
+                let side_effects =
+                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
+                        backend,
+                        &update,
+                        params,
+                        &mut placeholder_state,
+                    )
+                    .await?;
                 let statement_tracked_changes =
                     dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
                 tracked_changes_by_statement.push(statement_tracked_changes);

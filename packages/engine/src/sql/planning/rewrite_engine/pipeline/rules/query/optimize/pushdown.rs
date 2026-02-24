@@ -1,6 +1,8 @@
 use sqlparser::ast::Query;
 
-use crate::engine::sql::planning::rewrite_engine::steps::{lix_state_by_version_view_read, lix_state_view_read};
+use crate::engine::sql::planning::rewrite_engine::steps::{
+    lix_state_by_version_view_read, lix_state_view_read,
+};
 use crate::LixError;
 
 pub(crate) fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {

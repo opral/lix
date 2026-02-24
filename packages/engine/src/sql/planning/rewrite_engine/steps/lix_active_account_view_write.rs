@@ -9,7 +9,9 @@ use crate::account::{
     active_account_storage_version_id,
 };
 use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
-use crate::engine::sql::planning::rewrite_engine::steps::{lix_active_account_view_read, vtable_read};
+use crate::engine::sql::planning::rewrite_engine::steps::{
+    lix_active_account_view_read, vtable_read,
+};
 use crate::engine::sql::planning::rewrite_engine::{
     bind_sql_with_state, escape_sql_string, object_name_matches, resolve_insert_rows,
     PlaceholderState,

@@ -4,7 +4,9 @@ use sqlparser::ast::Query;
 
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::PostprocessPlan;
-use crate::engine::sql::planning::rewrite_engine::{object_name_matches, visit_query_selects, visit_table_factors_in_select};
+use crate::engine::sql::planning::rewrite_engine::{
+    object_name_matches, visit_query_selects, visit_table_factors_in_select,
+};
 use crate::LixError;
 
 use super::context::AnalysisContext;
@@ -149,7 +151,9 @@ mod tests {
 
     use crate::engine::sql::planning::rewrite_engine::pipeline::context::AnalysisContext;
     use crate::engine::sql::planning::rewrite_engine::pipeline::registry::RewritePhase;
-    use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput, VtableDeletePlan, VtableUpdatePlan};
+    use crate::engine::sql::planning::rewrite_engine::types::{
+        PostprocessPlan, RewriteOutput, VtableDeletePlan, VtableUpdatePlan,
+    };
 
     use super::{validate_phase_invariants, validate_statement_output};
 
@@ -222,12 +226,14 @@ mod tests {
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
-            update_validations: vec![crate::engine::sql::planning::rewrite_engine::types::UpdateValidationPlan {
-                table: "t".to_string(),
-                where_clause: None,
-                snapshot_content: None,
-                snapshot_patch: None,
-            }],
+            update_validations: vec![
+                crate::engine::sql::planning::rewrite_engine::types::UpdateValidationPlan {
+                    table: "t".to_string(),
+                    where_clause: None,
+                    snapshot_content: None,
+                    snapshot_patch: None,
+                },
+            ],
         };
 
         let err = validate_statement_output(&output)
@@ -245,12 +251,14 @@ mod tests {
             registrations: Vec::new(),
             postprocess: None,
             mutations: Vec::new(),
-            update_validations: vec![crate::engine::sql::planning::rewrite_engine::types::UpdateValidationPlan {
-                table: "t".to_string(),
-                where_clause: None,
-                snapshot_content: None,
-                snapshot_patch: None,
-            }],
+            update_validations: vec![
+                crate::engine::sql::planning::rewrite_engine::types::UpdateValidationPlan {
+                    table: "t".to_string(),
+                    where_clause: None,
+                    snapshot_content: None,
+                    snapshot_patch: None,
+                },
+            ],
         };
 
         let err = validate_statement_output(&output)

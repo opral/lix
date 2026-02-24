@@ -48,11 +48,8 @@ pub(crate) struct StatementBatch {
 
 #[async_trait::async_trait(?Send)]
 pub(crate) trait CommitQueryExecutor {
-    async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[EngineValue],
-    ) -> Result<QueryResult, LixError>;
+    async fn execute(&mut self, sql: &str, params: &[EngineValue])
+        -> Result<QueryResult, LixError>;
 }
 
 pub(crate) fn bind_statement_batch_for_dialect(
@@ -183,7 +180,8 @@ pub(crate) async fn load_version_info_for_versions(
                 if !version_ids.contains(&entity_id) {
                     continue;
                 }
-                let Some(parsed) = parse_version_info_from_tip_snapshot(&row[1], &entity_id)? else {
+                let Some(parsed) = parse_version_info_from_tip_snapshot(&row[1], &entity_id)?
+                else {
                     continue;
                 };
                 versions.insert(entity_id, parsed);
@@ -210,9 +208,10 @@ fn parse_version_info_from_tip_snapshot(
         }
     };
 
-    let snapshot: LixVersionPointer = serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-        message: format!("version tip snapshot_content invalid JSON: {error}"),
-    })?;
+    let snapshot: LixVersionPointer =
+        serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+            message: format!("version tip snapshot_content invalid JSON: {error}"),
+        })?;
     let version_id = if snapshot.id.is_empty() {
         fallback_version_id.to_string()
     } else {
@@ -222,11 +221,12 @@ fn parse_version_info_from_tip_snapshot(
         .working_commit_id
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| fallback_version_id.to_string());
-    let parent_commit_ids = if snapshot.commit_id.is_empty() || snapshot.commit_id == working_commit_id {
-        Vec::new()
-    } else {
-        vec![snapshot.commit_id]
-    };
+    let parent_commit_ids =
+        if snapshot.commit_id.is_empty() || snapshot.commit_id == working_commit_id {
+            Vec::new()
+        } else {
+            vec![snapshot.commit_id]
+        };
 
     Ok(Some(VersionInfo {
         parent_commit_ids,
@@ -274,7 +274,11 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
 
         change_rows.push(vec![
             text_param_expr(&change.id, &mut next_placeholder, &mut statement_params),
-            text_param_expr(&change.entity_id, &mut next_placeholder, &mut statement_params),
+            text_param_expr(
+                &change.entity_id,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
             text_param_expr(
                 &change.schema_key,
                 &mut next_placeholder,
@@ -285,7 +289,11 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
                 &mut next_placeholder,
                 &mut statement_params,
             ),
-            text_param_expr(&change.file_id, &mut next_placeholder, &mut statement_params),
+            text_param_expr(
+                &change.file_id,
+                &mut next_placeholder,
+                &mut statement_params,
+            ),
             text_param_expr(
                 &change.plugin_key,
                 &mut next_placeholder,
@@ -489,7 +497,9 @@ fn append_commit_ancestry_statements(
                 commit_placeholder = commit_placeholder,
                 parent_placeholder = parent_placeholder,
             );
-            statements.push(parse_single_statement_from_sql(&insert_parent_ancestry_sql)?);
+            statements.push(parse_single_statement_from_sql(
+                &insert_parent_ancestry_sql,
+            )?);
         }
     }
     Ok(())
@@ -523,7 +533,9 @@ fn collect_commit_parent_map_for_ancestry(
     Ok(out)
 }
 
-fn parse_commit_edge_snapshot_for_ancestry(raw: &str) -> Result<Option<(String, String)>, LixError> {
+fn parse_commit_edge_snapshot_for_ancestry(
+    raw: &str,
+) -> Result<Option<(String, String)>, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
         message: format!("commit_edge snapshot invalid JSON: {error}"),
     })?;

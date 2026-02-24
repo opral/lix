@@ -240,11 +240,14 @@ impl Engine {
         )
         .await?;
 
+        let mut state_commit_stream_changes = plan.effects.state_commit_stream_changes;
+        state_commit_stream_changes.extend(execution.state_commit_stream_changes);
+
         apply_effects_post_commit::apply_runtime_post_commit_effects(
             self,
             file_cache_refresh_targets,
             plan.requirements.should_invalidate_installed_plugins_cache,
-            plan.effects.state_commit_stream_changes,
+            state_commit_stream_changes,
         )
         .await?;
 

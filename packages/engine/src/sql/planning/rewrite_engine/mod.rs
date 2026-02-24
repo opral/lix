@@ -17,18 +17,16 @@ pub(crate) use ast_utils::{
     RewriteDecision,
 };
 pub(crate) use escaping::escape_sql_string;
-pub(crate) use params::{
-    bind_sql, bind_sql_with_state, PlaceholderState,
-};
 #[cfg(test)]
 pub(crate) use params::bind_sql_with_state_and_appended_params;
+pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};
+pub use pipeline::parse_sql_statements;
+#[cfg(test)]
+pub(crate) use pipeline::preprocess_sql_rewrite_only;
 pub(crate) use pipeline::query_engine::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 pub(crate) use pipeline::statement_pipeline::StatementPipeline;
-pub use pipeline::parse_sql_statements;
-#[cfg(test)]
-pub(crate) use pipeline::preprocess_sql_rewrite_only;
 pub(crate) use row_resolution::{
     resolve_expr_cell_with_state, resolve_insert_rows, ResolvedCell, RowSourceResolver,
 };

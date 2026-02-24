@@ -8,6 +8,9 @@ use super::execution::followup::{
 };
 use super::planning::derive_requirements::derive_plan_requirements;
 use super::planning::plan::build_execution_plan;
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation,
+};
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(
@@ -118,7 +121,7 @@ impl Engine {
                 plan,
             )
         };
-        let state_commit_stream_changes = plan.effects.state_commit_stream_changes.clone();
+        let mut state_commit_stream_changes = plan.effects.state_commit_stream_changes.clone();
 
         for registration in &plan.preprocess.registrations {
             for statement in
@@ -137,8 +140,8 @@ impl Engine {
                     execute_prepared_with_transaction(transaction, &prepared_statements).await?;
                 let tracked_insert_mutation_present =
                     plan.preprocess.mutations.iter().any(|mutation| {
-                    mutation.operation == MutationOperation::Insert && !mutation.untracked
-                });
+                        mutation.operation == MutationOperation::Insert && !mutation.untracked
+                    });
                 if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
                     plugin_changes_committed = true;
                 }
@@ -189,6 +192,14 @@ impl Engine {
                     .unwrap_or(&[]);
                 let followup_statements = match postprocess_plan {
                     PostprocessPlan::VtableUpdate(update_plan) => {
+                        state_commit_stream_changes.extend(
+                            state_commit_stream_changes_from_postprocess_rows(
+                                &result.rows,
+                                &update_plan.schema_key,
+                                StateCommitStreamOperation::Update,
+                                writer_key,
+                            )?,
+                        );
                         build_update_followup_statements(
                             transaction,
                             update_plan,
@@ -200,6 +211,14 @@ impl Engine {
                         .await?
                     }
                     PostprocessPlan::VtableDelete(delete_plan) => {
+                        state_commit_stream_changes.extend(
+                            state_commit_stream_changes_from_postprocess_rows(
+                                &result.rows,
+                                &delete_plan.schema_key,
+                                StateCommitStreamOperation::Delete,
+                                writer_key,
+                            )?,
+                        );
                         build_delete_followup_statements(
                             transaction,
                             delete_plan,

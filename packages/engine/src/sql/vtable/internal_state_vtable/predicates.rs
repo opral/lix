@@ -179,7 +179,8 @@ mod tests {
     use sqlparser::parser::Parser;
 
     use super::{
-        schema_key_is_valid, statement_has_schema_key_predicate, statement_targets_internal_state_vtable,
+        schema_key_is_valid, statement_has_schema_key_predicate,
+        statement_targets_internal_state_vtable,
     };
 
     #[test]

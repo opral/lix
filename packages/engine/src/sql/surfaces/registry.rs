@@ -3,8 +3,8 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::{LixBackend, LixError, Value};
 
 use super::super::ast::nodes::Statement;
-use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::contracts::effects::DetectedFileDomainChange;
+use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::planning::preprocess::preprocess_with_surfaces_to_plan;
 use super::super::vtable;
 use super::{entity, filesystem, lix_state, lix_state_by_version, lix_state_history};

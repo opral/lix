@@ -334,7 +334,10 @@ mod tests {
     fn bind_with_appended_params_resolves_placeholders_across_base_and_appended() {
         let bound = bind_sql_with_state_and_appended_params(
             "SELECT ?, ?, ?3",
-            &[Value::Text("base-a".to_string()), Value::Text("base-b".to_string())],
+            &[
+                Value::Text("base-a".to_string()),
+                Value::Text("base-b".to_string()),
+            ],
             &[Value::Text("extra-c".to_string())],
             SqlDialect::Sqlite,
             crate::engine::sql::planning::rewrite_engine::PlaceholderState::new(),

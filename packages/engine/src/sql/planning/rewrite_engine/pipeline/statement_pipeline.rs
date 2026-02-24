@@ -1,8 +1,8 @@
 use sqlparser::ast::Statement;
 
-use crate::functions::LixFunctionProvider;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
+use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
 use super::registry::statement_rules;

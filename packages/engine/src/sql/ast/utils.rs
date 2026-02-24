@@ -39,7 +39,11 @@ pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError
     })
 }
 
-pub(crate) fn bind_sql(sql: &str, params: &[Value], dialect: SqlDialect) -> Result<BoundSql, LixError> {
+pub(crate) fn bind_sql(
+    sql: &str,
+    params: &[Value],
+    dialect: SqlDialect,
+) -> Result<BoundSql, LixError> {
     bind_sql_with_state(sql, params, dialect, PlaceholderState::new())
 }
 

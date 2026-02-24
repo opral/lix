@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::materialization::types::{
     MaterializationApplyReport, MaterializationPlan, MaterializationScope, MaterializationWriteOp,
 };
 use crate::schema_registry::register_schema;
-use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn apply_materialization_plan_internal(

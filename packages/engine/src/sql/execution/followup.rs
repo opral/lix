@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::commit::{
-    generate_commit, DomainChangeInput, GenerateCommitArgs,
-};
+use crate::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::version::{
@@ -21,7 +19,8 @@ use super::super::contracts::postprocess_actions::{VtableDeletePlan, VtableUpdat
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::super::history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
+    load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
+    StatementBatch,
 };
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
@@ -43,11 +42,8 @@ const UPDATE_RETURNING_COLUMNS: &[&str] = &[
 trait SqlExecutor {
     fn dialect(&self) -> SqlDialect;
 
-    async fn execute(
-        &mut self,
-        sql: &str,
-        params: &[EngineValue],
-    ) -> Result<QueryResult, LixError>;
+    async fn execute(&mut self, sql: &str, params: &[EngineValue])
+        -> Result<QueryResult, LixError>;
 }
 
 struct TransactionExecutor<'a> {
@@ -161,7 +157,10 @@ async fn build_update_followup_statement_batch(
         let schema_version = value_to_string(&row[4], "schema_version")?;
         let snapshot_content = value_to_optional_text(&row[5], "snapshot_content")?;
         let metadata = value_to_optional_text(&row[6], "metadata")?;
-        let row_writer_key = match (&plan.explicit_writer_key, plan.writer_key_assignment_present) {
+        let row_writer_key = match (
+            &plan.explicit_writer_key,
+            plan.writer_key_assignment_present,
+        ) {
             (Some(explicit), _) => explicit.clone(),
             (None, true) => value_to_optional_text(&row[7], "writer_key")?,
             (None, false) => writer_key.map(ToString::to_string),
@@ -206,7 +205,8 @@ async fn build_update_followup_statement_batch(
 
     let mut commit_executor = CommitExecutorAdapter { executor };
     let versions = load_version_info_for_versions(&mut commit_executor, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
+    let active_accounts =
+        load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
@@ -216,7 +216,12 @@ async fn build_update_followup_statement_batch(
         },
         || functions.uuid_v7(),
     )?;
-    build_statement_batch_from_generate_commit_result(commit_result, functions, 0, executor.dialect())
+    build_statement_batch_from_generate_commit_result(
+        commit_result,
+        functions,
+        0,
+        executor.dialect(),
+    )
 }
 
 async fn build_delete_followup_statement_batch(
@@ -348,7 +353,8 @@ async fn build_delete_followup_statement_batch(
 
     let mut commit_executor = CommitExecutorAdapter { executor };
     let versions = load_version_info_for_versions(&mut commit_executor, &affected_versions).await?;
-    let active_accounts = load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
+    let active_accounts =
+        load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp,
@@ -358,7 +364,12 @@ async fn build_delete_followup_statement_batch(
         },
         || functions.uuid_v7(),
     )?;
-    build_statement_batch_from_generate_commit_result(commit_result, functions, 0, executor.dialect())
+    build_statement_batch_from_generate_commit_result(
+        commit_result,
+        functions,
+        0,
+        executor.dialect(),
+    )
 }
 
 struct EffectiveScopeDeleteRow {

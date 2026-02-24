@@ -1,13 +1,13 @@
 #[cfg(test)]
+use std::fmt::Write as _;
+#[cfg(test)]
 use std::string::String;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
-use std::fmt::Write as _;
 
+use sqlparser::ast::Statement;
 #[cfg(test)]
 use sqlparser::ast::{Expr, Insert, Query, SetExpr, Value as SqlAstValue};
-use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -29,9 +29,9 @@ use crate::engine::sql::planning::rewrite_engine::{
 };
 #[cfg(test)]
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+use crate::LixError;
 #[cfg(test)]
 use crate::Value;
-use crate::LixError;
 
 pub(crate) mod context;
 pub(crate) mod query_engine;
@@ -556,9 +556,8 @@ mod tests {
     #[test]
     fn preprocess_output_uses_prepared_statement_params() {
         let statements = parse_sql_statements("SELECT ?").expect("parse should succeed");
-        let rewritten =
-            preprocess_statements(statements, &[Value::Integer(7)], SqlDialect::Sqlite)
-                .expect("rewrite should succeed");
+        let rewritten = preprocess_statements(statements, &[Value::Integer(7)], SqlDialect::Sqlite)
+            .expect("rewrite should succeed");
 
         assert_eq!(
             rewritten.prepared_statements[0].params,

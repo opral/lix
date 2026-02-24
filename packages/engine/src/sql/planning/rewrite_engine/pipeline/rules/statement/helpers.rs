@@ -1,9 +1,9 @@
 use sqlparser::ast::Insert;
 
-use crate::functions::LixFunctionProvider;
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
+use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) fn merge_rewrite_output(
