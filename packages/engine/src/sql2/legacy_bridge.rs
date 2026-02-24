@@ -1,6 +1,5 @@
 use crate::sql as legacy_sql;
-use crate::{LixBackend, LixError, LixTransaction, Value};
-use crate::{deterministic_mode::RuntimeFunctionProvider, functions::SharedFunctionProvider};
+use crate::{LixBackend, LixError, Value};
 use crate::SqlDialect;
 use sqlparser::ast::Update;
 
@@ -51,54 +50,6 @@ pub(crate) async fn collect_filesystem_update_side_effects_with_sql_bridge(
             side_effects.untracked_directory_changes,
         ),
     })
-}
-
-pub(crate) async fn build_update_followup_statements_with_sql_bridge(
-    transaction: &mut dyn LixTransaction,
-    plan: &VtableUpdatePlan,
-    rows: &[Vec<Value>],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    let sql_plan = to_sql_vtable_update_plan(plan);
-    let sql_detected_file_domain_changes =
-        to_sql_detected_file_domain_changes(detected_file_domain_changes);
-    let statements = legacy_sql::build_update_followup_sql(
-        transaction,
-        &sql_plan,
-        rows,
-        &sql_detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await?;
-    Ok(from_sql_prepared_statements(statements))
-}
-
-pub(crate) async fn build_delete_followup_statements_with_sql_bridge(
-    transaction: &mut dyn LixTransaction,
-    plan: &VtableDeletePlan,
-    rows: &[Vec<Value>],
-    params: &[Value],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    let sql_plan = to_sql_vtable_delete_plan(plan);
-    let sql_detected_file_domain_changes =
-        to_sql_detected_file_domain_changes(detected_file_domain_changes);
-    let statements = legacy_sql::build_delete_followup_sql(
-        transaction,
-        &sql_plan,
-        rows,
-        params,
-        &sql_detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await?;
-    Ok(from_sql_prepared_statements(statements))
 }
 
 pub(crate) fn from_sql_preprocess_output(output: legacy_sql::PreprocessOutput) -> PlannedStatementSet {
@@ -157,15 +108,6 @@ pub(crate) fn to_sql_preprocess_output(output: &PlannedStatementSet) -> legacy_s
             .map(to_sql_update_validation_plan)
             .collect(),
     }
-}
-
-pub(crate) fn from_sql_prepared_statements(
-    statements: Vec<legacy_sql::PreparedStatement>,
-) -> Vec<PreparedStatement> {
-    statements
-        .into_iter()
-        .map(from_sql_prepared_statement)
-        .collect()
 }
 
 pub(crate) fn from_sql_mutations(mutations: Vec<legacy_sql::MutationRow>) -> Vec<MutationRow> {
