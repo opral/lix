@@ -15,6 +15,16 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use crate::engine::sql2::ast::nodes::Statement;
 
+#[derive(Debug, Clone)]
+pub(crate) struct Sql2RewriteOutput {
+    pub(crate) statements: Vec<Statement>,
+    pub(crate) params: Vec<Value>,
+    pub(crate) registrations: Vec<Sql2SchemaRegistration>,
+    pub(crate) postprocess: Option<Sql2PostprocessPlan>,
+    pub(crate) mutations: Vec<Sql2MutationRow>,
+    pub(crate) update_validations: Vec<Sql2UpdateValidationPlan>,
+}
+
 pub(crate) fn preprocess_statements_with_provider_to_sql2_plan<P: LixFunctionProvider>(
     statements: Vec<Statement>,
     params: &[Value],
@@ -66,26 +76,73 @@ where
     Ok(from_preprocess_output(output))
 }
 
+pub(crate) fn rewrite_statement_with_provider_to_sql2<P: LixFunctionProvider>(
+    params: &[Value],
+    writer_key: Option<&str>,
+    statement: Statement,
+    provider: &mut P,
+) -> Result<Sql2RewriteOutput, LixError> {
+    let output = super::StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
+    Ok(from_rewrite_output(output))
+}
+
+pub(crate) async fn rewrite_statement_with_backend_to_sql2<P: LixFunctionProvider>(
+    backend: &dyn LixBackend,
+    params: &[Value],
+    writer_key: Option<&str>,
+    statement: Statement,
+    provider: &mut P,
+    detected_file_domain_changes: &[Sql2DetectedFileDomainChange],
+) -> Result<Sql2RewriteOutput, LixError>
+where
+    P: LixFunctionProvider + Clone + Send + 'static,
+{
+    let legacy_detected_changes = to_legacy_detected_file_domain_changes(detected_file_domain_changes);
+    let output = super::StatementPipeline::new(params, writer_key)
+        .rewrite_statement_with_backend(backend, statement, provider, &legacy_detected_changes)
+        .await?;
+    Ok(from_rewrite_output(output))
+}
+
+pub(crate) fn inline_lix_functions_with_provider_for_sql2<P: LixFunctionProvider>(
+    statement: Statement,
+    provider: &mut P,
+) -> Statement {
+    super::inline_lix_functions_with_provider(statement, provider)
+}
+
+pub(crate) async fn materialize_vtable_insert_select_sources_for_sql2(
+    backend: &dyn LixBackend,
+    statements: &mut [Statement],
+    params: &[Value],
+) -> Result<(), LixError> {
+    super::materialize_vtable_insert_select_sources(backend, statements, params).await
+}
+
 fn to_legacy_detected_file_domain_changes_by_statement(
     changes_by_statement: &[Vec<Sql2DetectedFileDomainChange>],
 ) -> Vec<Vec<super::DetectedFileDomainChange>> {
     changes_by_statement
         .iter()
-        .map(|changes| {
-            changes
-                .iter()
-                .map(|change| super::DetectedFileDomainChange {
-                    entity_id: change.entity_id.clone(),
-                    schema_key: change.schema_key.clone(),
-                    schema_version: change.schema_version.clone(),
-                    file_id: change.file_id.clone(),
-                    version_id: change.version_id.clone(),
-                    plugin_key: change.plugin_key.clone(),
-                    snapshot_content: change.snapshot_content.clone(),
-                    metadata: change.metadata.clone(),
-                    writer_key: change.writer_key.clone(),
-                })
-                .collect()
+        .map(|changes| to_legacy_detected_file_domain_changes(changes))
+        .collect()
+}
+
+fn to_legacy_detected_file_domain_changes(
+    changes: &[Sql2DetectedFileDomainChange],
+) -> Vec<super::DetectedFileDomainChange> {
+    changes
+        .iter()
+        .map(|change| super::DetectedFileDomainChange {
+            entity_id: change.entity_id.clone(),
+            schema_key: change.schema_key.clone(),
+            schema_version: change.schema_version.clone(),
+            file_id: change.file_id.clone(),
+            version_id: change.version_id.clone(),
+            plugin_key: change.plugin_key.clone(),
+            snapshot_content: change.snapshot_content.clone(),
+            metadata: change.metadata.clone(),
+            writer_key: change.writer_key.clone(),
         })
         .collect()
 }
@@ -98,6 +155,29 @@ fn from_preprocess_output(output: super::PreprocessOutput) -> PlannedStatementSe
             .into_iter()
             .map(from_prepared_statement)
             .collect(),
+        registrations: output
+            .registrations
+            .into_iter()
+            .map(from_schema_registration)
+            .collect(),
+        postprocess: output.postprocess.map(from_postprocess_plan),
+        mutations: output
+            .mutations
+            .into_iter()
+            .map(from_mutation_row)
+            .collect(),
+        update_validations: output
+            .update_validations
+            .into_iter()
+            .map(from_update_validation_plan)
+        .collect(),
+    }
+}
+
+fn from_rewrite_output(output: super::RewriteOutput) -> Sql2RewriteOutput {
+    Sql2RewriteOutput {
+        statements: output.statements,
+        params: output.params,
         registrations: output
             .registrations
             .into_iter()
