@@ -204,6 +204,48 @@ pub(crate) fn coalesce_vtable_inserts_in_statement_list(
     Ok(result)
 }
 
+pub(crate) fn coalesce_vtable_inserts_in_transactions(
+    statements: Vec<Statement>,
+) -> Result<Vec<Statement>, LixError> {
+    let mut result = Vec::with_capacity(statements.len());
+    let mut in_transaction = false;
+    let mut pending_insert: Option<Insert> = None;
+
+    for statement in statements {
+        match statement {
+            Statement::StartTransaction { .. } => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                in_transaction = true;
+                result.push(statement);
+            }
+            Statement::Commit { .. } | Statement::Rollback { .. } => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                in_transaction = false;
+                result.push(statement);
+            }
+            Statement::Insert(insert) if in_transaction => {
+                if let Some(existing) = pending_insert.as_mut() {
+                    if can_merge_vtable_insert(existing, &insert) {
+                        append_insert_rows(existing, &insert)?;
+                    } else {
+                        flush_pending_insert(&mut result, &mut pending_insert);
+                        pending_insert = Some(insert);
+                    }
+                } else {
+                    pending_insert = Some(insert);
+                }
+            }
+            other => {
+                flush_pending_insert(&mut result, &mut pending_insert);
+                result.push(other);
+            }
+        }
+    }
+
+    flush_pending_insert(&mut result, &mut pending_insert);
+    Ok(result)
+}
+
 fn flush_pending_insert(result: &mut Vec<Statement>, pending_insert: &mut Option<Insert>) {
     if let Some(insert) = pending_insert.take() {
         result.push(Statement::Insert(insert));

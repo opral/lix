@@ -40,10 +40,7 @@ pub(crate) use params::{
 };
 pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
 pub(crate) use pipeline::preprocess_plan_fingerprint;
-pub(crate) use sql2_bridge::{
-    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_to_sql2_plan,
-    preprocess_sql_to_sql2_plan, preprocess_statements_with_provider_to_sql2_plan,
-};
+pub(crate) use pipeline::statement_pipeline::StatementPipeline;
 #[allow(unused_imports)]
 pub use pipeline::{
     parse_sql_statements,
@@ -62,6 +59,11 @@ pub(crate) use row_resolution::{
     insert_values_rows_mut, materialize_vtable_insert_select_sources, resolve_expr_cell_with_state,
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
 };
+pub(crate) use sql2_bridge::{
+    preprocess_parsed_statements_with_provider_and_detected_file_domain_changes_to_sql2_plan,
+    preprocess_sql_to_sql2_plan, preprocess_statements_with_provider_to_sql2_plan,
+};
+pub(crate) use steps::inline_lix_functions::inline_lix_functions_with_provider;
 pub use steps::vtable_write::{
     build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
 };
@@ -69,6 +71,7 @@ pub(crate) use steps::working_projection_refresh::refresh_working_projection_for
 pub use types::PostprocessPlan;
 pub(crate) use types::PreparedStatement;
 pub(crate) use types::PreprocessOutput;
+pub(crate) use types::RewriteOutput;
 pub use types::SchemaRegistration;
 pub use types::{MutationOperation, MutationRow, UpdateValidationPlan};
 pub(crate) use types::{VtableDeletePlan, VtableUpdatePlan};
