@@ -7,7 +7,6 @@ mod params;
 mod pipeline;
 mod read_pipeline;
 mod row_resolution;
-mod sql2_bridge;
 mod steps;
 mod types;
 
@@ -35,9 +34,6 @@ pub use pipeline::{
 pub(crate) use row_resolution::{
     insert_values_rows_mut, materialize_vtable_insert_select_sources, resolve_expr_cell_with_state,
     resolve_insert_rows, resolve_values_rows, ResolvedCell, RowSourceResolver,
-};
-pub(crate) use sql2_bridge::{
-    rewrite_statement_with_backend_to_sql2, rewrite_statement_with_provider_to_sql2,
 };
 pub use steps::vtable_write::DetectedFileDomainChange;
 pub use types::PostprocessPlan;

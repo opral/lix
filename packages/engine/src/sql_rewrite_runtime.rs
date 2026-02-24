@@ -1,30 +1,31 @@
-use crate::engine::sql2::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
-use crate::engine::sql2::contracts::planned_statement::{
-    MutationOperation as Sql2MutationOperation, MutationRow as Sql2MutationRow,
-    SchemaRegistration as Sql2SchemaRegistration, UpdateValidationPlan as Sql2UpdateValidationPlan,
-};
-use crate::engine::sql2::contracts::postprocess_actions::{
-    PostprocessPlan as Sql2PostprocessPlan, VtableDeletePlan as Sql2VtableDeletePlan,
-    VtableUpdatePlan as Sql2VtableUpdatePlan,
-};
-use crate::engine::sql2::planning::rewrite_output::StatementRewriteOutput;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
-use crate::engine::sql2::ast::nodes::Statement;
+use super::super::sql;
+use super::sql2::ast::nodes::Statement;
+use super::sql2::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
+use super::sql2::contracts::planned_statement::{
+    MutationOperation as Sql2MutationOperation, MutationRow as Sql2MutationRow,
+    SchemaRegistration as Sql2SchemaRegistration, UpdateValidationPlan as Sql2UpdateValidationPlan,
+};
+use super::sql2::contracts::postprocess_actions::{
+    PostprocessPlan as Sql2PostprocessPlan, VtableDeletePlan as Sql2VtableDeletePlan,
+    VtableUpdatePlan as Sql2VtableUpdatePlan,
+};
+use super::sql2::planning::rewrite_output::StatementRewriteOutput;
 
-pub(crate) fn rewrite_statement_with_provider_to_sql2<P: LixFunctionProvider>(
+pub(crate) fn rewrite_statement_with_provider<P: LixFunctionProvider>(
     params: &[Value],
     writer_key: Option<&str>,
     statement: Statement,
     provider: &mut P,
 ) -> Result<StatementRewriteOutput, LixError> {
     let output =
-        super::StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
+        sql::StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
     Ok(from_rewrite_output(output))
 }
 
-pub(crate) async fn rewrite_statement_with_backend_to_sql2<P: LixFunctionProvider>(
+pub(crate) async fn rewrite_statement_with_backend<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
     params: &[Value],
     writer_key: Option<&str>,
@@ -37,7 +38,7 @@ where
 {
     let legacy_detected_changes =
         to_legacy_detected_file_domain_changes(detected_file_domain_changes);
-    let output = super::StatementPipeline::new(params, writer_key)
+    let output = sql::StatementPipeline::new(params, writer_key)
         .rewrite_statement_with_backend(backend, statement, provider, &legacy_detected_changes)
         .await?;
     Ok(from_rewrite_output(output))
@@ -45,10 +46,10 @@ where
 
 fn to_legacy_detected_file_domain_changes(
     changes: &[Sql2DetectedFileDomainChange],
-) -> Vec<super::DetectedFileDomainChange> {
+) -> Vec<sql::DetectedFileDomainChange> {
     changes
         .iter()
-        .map(|change| super::DetectedFileDomainChange {
+        .map(|change| sql::DetectedFileDomainChange {
             entity_id: change.entity_id.clone(),
             schema_key: change.schema_key.clone(),
             schema_version: change.schema_version.clone(),
@@ -62,7 +63,7 @@ fn to_legacy_detected_file_domain_changes(
         .collect()
 }
 
-fn from_rewrite_output(output: super::RewriteOutput) -> StatementRewriteOutput {
+fn from_rewrite_output(output: sql::RewriteOutput) -> StatementRewriteOutput {
     StatementRewriteOutput {
         statements: output.statements,
         params: output.params,
@@ -85,22 +86,22 @@ fn from_rewrite_output(output: super::RewriteOutput) -> StatementRewriteOutput {
     }
 }
 
-fn from_schema_registration(registration: super::SchemaRegistration) -> Sql2SchemaRegistration {
+fn from_schema_registration(registration: sql::SchemaRegistration) -> Sql2SchemaRegistration {
     Sql2SchemaRegistration {
         schema_key: registration.schema_key,
     }
 }
 
-fn from_postprocess_plan(plan: super::PostprocessPlan) -> Sql2PostprocessPlan {
+fn from_postprocess_plan(plan: sql::PostprocessPlan) -> Sql2PostprocessPlan {
     match plan {
-        super::PostprocessPlan::VtableUpdate(update) => {
+        sql::PostprocessPlan::VtableUpdate(update) => {
             Sql2PostprocessPlan::VtableUpdate(Sql2VtableUpdatePlan {
                 schema_key: update.schema_key,
                 explicit_writer_key: update.explicit_writer_key,
                 writer_key_assignment_present: update.writer_key_assignment_present,
             })
         }
-        super::PostprocessPlan::VtableDelete(delete) => {
+        sql::PostprocessPlan::VtableDelete(delete) => {
             Sql2PostprocessPlan::VtableDelete(Sql2VtableDeletePlan {
                 schema_key: delete.schema_key,
                 effective_scope_fallback: delete.effective_scope_fallback,
@@ -110,7 +111,7 @@ fn from_postprocess_plan(plan: super::PostprocessPlan) -> Sql2PostprocessPlan {
     }
 }
 
-fn from_mutation_row(row: super::MutationRow) -> Sql2MutationRow {
+fn from_mutation_row(row: sql::MutationRow) -> Sql2MutationRow {
     Sql2MutationRow {
         operation: from_mutation_operation(row.operation),
         entity_id: row.entity_id,
@@ -124,15 +125,15 @@ fn from_mutation_row(row: super::MutationRow) -> Sql2MutationRow {
     }
 }
 
-fn from_mutation_operation(operation: super::MutationOperation) -> Sql2MutationOperation {
+fn from_mutation_operation(operation: sql::MutationOperation) -> Sql2MutationOperation {
     match operation {
-        super::MutationOperation::Insert => Sql2MutationOperation::Insert,
-        super::MutationOperation::Update => Sql2MutationOperation::Update,
-        super::MutationOperation::Delete => Sql2MutationOperation::Delete,
+        sql::MutationOperation::Insert => Sql2MutationOperation::Insert,
+        sql::MutationOperation::Update => Sql2MutationOperation::Update,
+        sql::MutationOperation::Delete => Sql2MutationOperation::Delete,
     }
 }
 
-fn from_update_validation_plan(plan: super::UpdateValidationPlan) -> Sql2UpdateValidationPlan {
+fn from_update_validation_plan(plan: sql::UpdateValidationPlan) -> Sql2UpdateValidationPlan {
     Sql2UpdateValidationPlan {
         table: plan.table,
         where_clause: plan.where_clause,
