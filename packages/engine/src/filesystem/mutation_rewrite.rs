@@ -18,8 +18,8 @@ use crate::engine::sql2::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
+use crate::engine::sql2::storage::sql_text::escape_sql_string;
 use crate::engine::sql2::legacy_bridge::{
-    escape_sql_string_with_sql_bridge as escape_sql_string,
     lower_statement_with_sql_bridge as lower_statement,
     rewrite_read_query_with_backend_and_params_in_session_with_sql_bridge as rewrite_read_query_with_backend_and_params_in_session,
     SqlBridgeDetectedFileDomainChange as DetectedFileDomainChange,
