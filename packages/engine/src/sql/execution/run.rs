@@ -4,6 +4,10 @@ use crate::deterministic_mode::DeterministicSettings;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::schema_registry::register_schema_sql_statements;
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
+    StateCommitStreamOperation,
+};
 use crate::{Engine, LixError, QueryResult};
 
 use super::super::contracts::effects::DetectedFileDomainChange;
@@ -12,15 +16,14 @@ use super::super::contracts::executor_error::ExecutorError;
 use super::super::contracts::planned_statement::MutationOperation;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
-use super::followup::{
-    build_delete_followup_statements, build_update_followup_statements,
-};
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
+use super::followup::{build_delete_followup_statements, build_update_followup_statements};
 
 pub(crate) struct SqlExecutionOutcome {
     pub(crate) result: QueryResult,
     pub(crate) postprocess_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) plugin_changes_committed: bool,
+    pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
 }
 
 pub(crate) async fn execute_plan_sql(
@@ -41,14 +44,13 @@ pub(crate) async fn execute_plan_sql(
 
     let mut postprocess_file_cache_targets = BTreeSet::new();
     let mut plugin_changes_committed = false;
+    let mut state_commit_stream_changes = Vec::new();
     let result = match &plan.preprocess.postprocess {
         None => {
-            let result = execute_prepared_with_backend(
-                engine.backend.as_ref(),
-                &prepared_statements,
-            )
-            .await
-            .map_err(ExecutorError::execute)?;
+            let result =
+                execute_prepared_with_backend(engine.backend.as_ref(), &prepared_statements)
+                    .await
+                    .map_err(ExecutorError::execute)?;
             let tracked_insert_mutation_present =
                 plan.preprocess.mutations.iter().any(|mutation| {
                     mutation.operation == MutationOperation::Insert && !mutation.untracked
@@ -64,18 +66,16 @@ pub(crate) async fn execute_plan_sql(
                 .begin_transaction()
                 .await
                 .map_err(ExecutorError::execute)?;
-            let result = match execute_prepared_with_transaction(
-                transaction.as_mut(),
-                &prepared_statements,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(ExecutorError::execute(error));
-                }
-            };
+            let result =
+                match execute_prepared_with_transaction(transaction.as_mut(), &prepared_statements)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(ExecutorError::execute(error));
+                    }
+                };
 
             match postprocess_plan {
                 PostprocessPlan::VtableUpdate(update_plan) if should_refresh_file_cache => {
@@ -107,6 +107,37 @@ pub(crate) async fn execute_plan_sql(
                     }
                 }
                 _ => {}
+            }
+
+            match postprocess_plan {
+                PostprocessPlan::VtableUpdate(update_plan) => {
+                    match state_commit_stream_changes_from_postprocess_rows(
+                        &result.rows,
+                        &update_plan.schema_key,
+                        StateCommitStreamOperation::Update,
+                        writer_key,
+                    ) {
+                        Ok(changes) => state_commit_stream_changes.extend(changes),
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(ExecutorError::execute(error));
+                        }
+                    }
+                }
+                PostprocessPlan::VtableDelete(delete_plan) => {
+                    match state_commit_stream_changes_from_postprocess_rows(
+                        &result.rows,
+                        &delete_plan.schema_key,
+                        StateCommitStreamOperation::Delete,
+                        writer_key,
+                    ) {
+                        Ok(changes) => state_commit_stream_changes.extend(changes),
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(ExecutorError::execute(error));
+                        }
+                    }
+                }
             }
 
             let additional_schema_keys = detected_file_domain_changes
@@ -184,6 +215,7 @@ pub(crate) async fn execute_plan_sql(
         result,
         postprocess_file_cache_targets,
         plugin_changes_committed,
+        state_commit_stream_changes,
     })
 }
 

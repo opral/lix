@@ -1,6 +1,8 @@
 use sqlparser::ast::{Expr, Insert, SetExpr, Value as SqlValue};
 
-use crate::engine::sql::planning::rewrite_engine::params::{resolve_placeholder_index, PlaceholderState};
+use crate::engine::sql::planning::rewrite_engine::params::{
+    resolve_placeholder_index, PlaceholderState,
+};
 use crate::{LixError, Value};
 
 #[derive(Debug, Clone, PartialEq)]

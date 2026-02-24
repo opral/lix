@@ -1,5 +1,5 @@
-use super::predicates::statement_targets_internal_state_vtable;
 use super::super::super::ast::nodes::Statement;
+use super::predicates::statement_targets_internal_state_vtable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VtableOperation {
@@ -34,7 +34,9 @@ pub(crate) fn detect_operation(statement: &Statement) -> VtableOperation {
         Statement::Explain {
             statement: inner, ..
         } => detect_operation(inner),
-        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => VtableOperation::Write,
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            VtableOperation::Write
+        }
         _ => VtableOperation::Unknown,
     }
 }

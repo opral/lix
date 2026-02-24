@@ -7,7 +7,9 @@ use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::StatePushdown;
-use crate::engine::sql::planning::rewrite_engine::{escape_sql_string, object_name_matches, parse_single_query, quote_ident};
+use crate::engine::sql::planning::rewrite_engine::{
+    escape_sql_string, object_name_matches, parse_single_query, quote_ident,
+};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     version_descriptor_file_id, version_descriptor_schema_key,

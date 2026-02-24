@@ -107,12 +107,14 @@ where
 
         // Keep this async rewrite future boxed to avoid infinitely sized
         // futures in recursive rewrite call paths.
-        let output = Box::pin(StatementPipeline::new(params, writer_key).rewrite_statement_with_backend(
-            backend,
-            statement,
-            provider,
-            statement_detected_file_domain_changes,
-        ))
+        let output = Box::pin(
+            StatementPipeline::new(params, writer_key).rewrite_statement_with_backend(
+                backend,
+                statement,
+                provider,
+                statement_detected_file_domain_changes,
+            ),
+        )
         .await?;
 
         accumulate_rewrite_output(

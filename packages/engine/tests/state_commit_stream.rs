@@ -1,6 +1,6 @@
 mod support;
 
-use lix_engine::{ExecuteOptions, LixError, StateCommitStreamFilter};
+use lix_engine::{ExecuteOptions, LixError, StateCommitStreamFilter, StateCommitStreamOperation};
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
@@ -9,6 +9,21 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
          ) VALUES (\
          '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
          )"
+    )
+}
+
+fn update_key_value_sql(key: &str, value_json: &str) -> String {
+    format!(
+        "UPDATE lix_internal_state_vtable \
+         SET snapshot_content = '{{\"key\":\"{key}\",\"value\":{value_json}}}' \
+         WHERE schema_key = 'lix_key_value' AND entity_id = '{key}' AND version_id = 'global'"
+    )
+}
+
+fn delete_key_value_sql(key: &str) -> String {
+    format!(
+        "DELETE FROM lix_internal_state_vtable \
+         WHERE schema_key = 'lix_key_value' AND entity_id = '{key}' AND version_id = 'global'"
     )
 }
 
@@ -240,6 +255,98 @@ simulation_test!(
         assert!(
             events.try_next().is_none(),
             "rollback must drop queued state commit batches"
+        );
+    }
+);
+
+simulation_test!(
+    state_commit_stream_emits_update_operation_for_update_mutation,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let entity_id = "state-commit-events-update-op";
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        engine
+            .execute(&insert_key_value_sql(entity_id, "\"v0\""), &[])
+            .await
+            .unwrap();
+        let _insert_batch = events
+            .try_next()
+            .expect("expected initial insert event batch");
+
+        engine
+            .execute(&update_key_value_sql(entity_id, "\"v1\""), &[])
+            .await
+            .unwrap();
+
+        let update_batch = events
+            .try_next()
+            .expect("expected update event batch after UPDATE");
+
+        assert!(
+            update_batch
+                .changes
+                .iter()
+                .any(|change| change.entity_id == entity_id
+                    && change.operation == StateCommitStreamOperation::Update),
+            "expected UPDATE operation for entity {}; got changes: {:?}",
+            entity_id,
+            update_batch.changes
+        );
+    }
+);
+
+simulation_test!(
+    state_commit_stream_emits_delete_operation_for_delete_mutation,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let entity_id = "state-commit-events-delete-op";
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        engine
+            .execute(&insert_key_value_sql(entity_id, "\"v0\""), &[])
+            .await
+            .unwrap();
+        let _insert_batch = events
+            .try_next()
+            .expect("expected initial insert event batch");
+
+        engine
+            .execute(&delete_key_value_sql(entity_id), &[])
+            .await
+            .unwrap();
+
+        let delete_batch = events
+            .try_next()
+            .expect("expected delete event batch after DELETE");
+
+        assert!(
+            delete_batch
+                .changes
+                .iter()
+                .any(|change| change.entity_id == entity_id
+                    && change.operation == StateCommitStreamOperation::Delete),
+            "expected DELETE operation for entity {}; got changes: {:?}",
+            entity_id,
+            delete_batch.changes
         );
     }
 );

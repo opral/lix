@@ -3,10 +3,10 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Value};
 use sqlparser::ast::{VisitMut, VisitorMut};
 
+use crate::engine::sql::planning::rewrite_engine::object_name_matches;
 use crate::functions::LixFunctionProvider;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
-use crate::engine::sql::planning::rewrite_engine::object_name_matches;
 
 #[cfg(test)]
 pub fn inline_lix_functions(statement: Statement) -> Statement {

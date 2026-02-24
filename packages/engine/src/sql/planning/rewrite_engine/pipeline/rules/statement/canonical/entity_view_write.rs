@@ -1,8 +1,8 @@
 use sqlparser::ast::{Delete, Insert, Update};
 
 use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::engine::sql::planning::rewrite_engine::entity_views::write as entity_view_write;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) fn rewrite_insert(insert: Insert, params: &[Value]) -> Result<Option<Insert>, LixError> {

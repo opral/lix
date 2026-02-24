@@ -547,7 +547,6 @@ mod tests {
         should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::engine::Engine;
     use crate::engine::sql::ast::utils::parse_sql_statements;
     use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
@@ -563,10 +562,11 @@ mod tests {
         coalesce_lix_file_transaction_statements,
         extract_explicit_transaction_script_from_statements,
     };
-    use crate::engine::sql::side_effects::advance_placeholder_state_for_statement;
     use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;
     use crate::engine::sql::semantics::state_resolution::effects::active_version_from_update_validations;
     use crate::engine::sql::semantics::state_resolution::optimize::should_refresh_file_cache_for_statements;
+    use crate::engine::sql::side_effects::advance_placeholder_state_for_statement;
+    use crate::engine::Engine;
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
@@ -849,8 +849,8 @@ mod tests {
             &[],
             &ExecuteOptions::default(),
         )
-            .await
-            .expect("sequential multi-statement execution should succeed");
+        .await
+        .expect("sequential multi-statement execution should succeed");
 
         assert!(commit_called.load(Ordering::SeqCst));
         assert!(!rollback_called.load(Ordering::SeqCst));

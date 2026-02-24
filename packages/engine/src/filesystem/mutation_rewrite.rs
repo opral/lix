@@ -9,21 +9,21 @@ use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
-use crate::filesystem::path::{
-    compose_directory_path, directory_ancestor_paths, directory_name_from_path,
-    file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
-    normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
-};
+use crate::engine::sql::ast::lowering::lower_statement;
 use crate::engine::sql::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
-use crate::engine::sql::ast::lowering::lower_statement;
 use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
 use crate::engine::sql::planning::rewrite_engine::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::filesystem::path::{
+    compose_directory_path, directory_ancestor_paths, directory_name_from_path,
+    file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
+    normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
+};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
@@ -2578,9 +2578,7 @@ async fn read_directory_path_by_id(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
-    let result = backend
-        .execute(&rewritten_sql, &query_params)
-        .await?;
+    let result = backend.execute(&rewritten_sql, &query_params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -2617,9 +2615,7 @@ async fn read_directory_descriptor_by_id(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
-    let result = backend
-        .execute(&rewritten_sql, &query_params)
-        .await?;
+    let result = backend.execute(&rewritten_sql, &query_params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -2716,8 +2712,7 @@ async fn directory_rows_matching_delete(
         )
     };
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session)
-            .await?;
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
     let result = backend
         .execute(&rewritten_sql, params)
         .await
@@ -2828,8 +2823,7 @@ async fn file_ids_matching_update(
         where_clause = where_clause
     );
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session)
-            .await?;
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
     let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
     let result = backend
         .execute(&bound.sql, &bound.params)
@@ -3263,9 +3257,7 @@ async fn load_directory_descendants(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
-    let result = backend
-        .execute(&rewritten_sql, &query_params)
-        .await?;
+    let result = backend.execute(&rewritten_sql, &query_params).await?;
     let mut ids = Vec::new();
     for row in result.rows {
         if let Some(EngineValue::Text(id)) = row.first() {

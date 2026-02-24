@@ -32,16 +32,18 @@ mod tests {
 
     #[test]
     fn matches_relation_in_query() {
-        let statements = Parser::parse_sql(&GenericDialect {}, "SELECT * FROM lix_state")
-            .expect("parse SQL");
+        let statements =
+            Parser::parse_sql(&GenericDialect {}, "SELECT * FROM lix_state").expect("parse SQL");
         assert!(statement_matches_any_table(&statements[0], &["lix_state"]));
     }
 
     #[test]
     fn matches_relation_in_mutation_target() {
-        let statements =
-            Parser::parse_sql(&GenericDialect {}, "UPDATE lix_state SET key = 'x' WHERE key = 'y'")
-                .expect("parse SQL");
+        let statements = Parser::parse_sql(
+            &GenericDialect {},
+            "UPDATE lix_state SET key = 'x' WHERE key = 'y'",
+        )
+        .expect("parse SQL");
         assert!(statement_matches_any_table(&statements[0], &["lix_state"]));
     }
 

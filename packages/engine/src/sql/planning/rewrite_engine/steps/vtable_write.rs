@@ -8,16 +8,13 @@ use sqlparser::ast::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::commit::{
-    generate_commit, DomainChangeInput, GenerateCommitArgs,
-};
-use crate::functions::LixFunctionProvider;
+use crate::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
+#[cfg(test)]
+use crate::engine::sql::history::commit_runtime::bind_statement_batch_for_dialect as bind_shared_statement_batch_for_dialect;
 use crate::engine::sql::history::commit_runtime::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
 };
-#[cfg(test)]
-use crate::engine::sql::history::commit_runtime::bind_statement_batch_for_dialect as bind_shared_statement_batch_for_dialect;
 use crate::engine::sql::planning::rewrite_engine::types::{
     MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
@@ -26,10 +23,11 @@ use crate::engine::sql::planning::rewrite_engine::{
     object_name_matches, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
     RowSourceResolver,
 };
-use crate::Value as EngineValue;
-use crate::{LixBackend, LixError, QueryResult};
+use crate::functions::LixFunctionProvider;
 #[cfg(test)]
 use crate::SqlDialect;
+use crate::Value as EngineValue;
+use crate::{LixBackend, LixError, QueryResult};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
@@ -101,7 +99,8 @@ pub struct VtableDeleteRewrite {
     pub plan: VtableDeletePlan,
 }
 
-pub type DetectedFileDomainChange = crate::engine::sql::contracts::effects::DetectedFileDomainChange;
+pub type DetectedFileDomainChange =
+    crate::engine::sql::contracts::effects::DetectedFileDomainChange;
 
 #[cfg(test)]
 pub fn rewrite_insert(
@@ -1128,10 +1127,7 @@ fn build_untracked_insert(
 fn bind_statement_batch_for_dialect(
     batch: StatementBatch,
     dialect: SqlDialect,
-) -> Result<
-    Vec<crate::engine::sql::contracts::prepared_statement::PreparedStatement>,
-    LixError,
-> {
+) -> Result<Vec<crate::engine::sql::contracts::prepared_statement::PreparedStatement>, LixError> {
     bind_shared_statement_batch_for_dialect(batch, dialect)
 }
 
@@ -1217,7 +1213,11 @@ fn advance_placeholder_state_for_expr(
             };
 
             if let Err(error) =
-                crate::engine::sql::planning::rewrite_engine::params::resolve_placeholder_index(token, self.params_len, self.state)
+                crate::engine::sql::planning::rewrite_engine::params::resolve_placeholder_index(
+                    token,
+                    self.params_len,
+                    self.state,
+                )
             {
                 self.error = Some(error);
                 return std::ops::ControlFlow::Break(());

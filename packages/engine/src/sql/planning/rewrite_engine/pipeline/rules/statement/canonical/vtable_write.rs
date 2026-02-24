@@ -1,9 +1,13 @@
 use sqlparser::ast::{Delete, Insert, Statement, Update};
 
-use crate::functions::LixFunctionProvider;
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
-use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput, UpdateValidationPlan};
-use crate::engine::sql::planning::rewrite_engine::{expr_references_column_name, ColumnReferenceOptions, DetectedFileDomainChange};
+use crate::engine::sql::planning::rewrite_engine::types::{
+    PostprocessPlan, RewriteOutput, UpdateValidationPlan,
+};
+use crate::engine::sql::planning::rewrite_engine::{
+    expr_references_column_name, ColumnReferenceOptions, DetectedFileDomainChange,
+};
+use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) fn rewrite_insert_with_writer_key<P: LixFunctionProvider>(

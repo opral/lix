@@ -19,8 +19,8 @@ fn collect_rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
 
 fn read_runtime_engine_section() -> String {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let engine_source = fs::read_to_string(root.join("src/engine.rs"))
-        .expect("engine.rs should be readable");
+    let engine_source =
+        fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
     let boundary = engine_source
         .find("mod tests {")
         .expect("engine.rs should contain test module");
@@ -39,8 +39,8 @@ fn guardrail_legacy_execute_directory_is_removed() {
 #[test]
 fn guardrail_engine_module_is_not_wired_to_legacy_execute_mod() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let engine_source = fs::read_to_string(root.join("src/engine.rs"))
-        .expect("engine.rs should be readable");
+    let engine_source =
+        fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
 
     assert!(
         !engine_source.contains("[path = \"execute/mod.rs\"]"),
@@ -69,10 +69,10 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 #[test]
 fn guardrail_execute_entrypoints_route_through_sql_api() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let engine_source = fs::read_to_string(root.join("src/engine.rs"))
-        .expect("engine.rs should be readable");
-    let sql_api_source = fs::read_to_string(root.join("src/sql/api.rs"))
-        .expect("sql/api.rs should be readable");
+    let engine_source =
+        fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
+    let sql_api_source =
+        fs::read_to_string(root.join("src/sql/api.rs")).expect("sql/api.rs should be readable");
 
     assert!(
         engine_source.contains("[path = \"sql/mod.rs\"]"),
@@ -80,7 +80,8 @@ fn guardrail_execute_entrypoints_route_through_sql_api() {
     );
     assert!(
         sql_api_source.contains("pub(crate) async fn execute_impl")
-            && sql_api_source.contains("self.execute_impl_sql(sql, params, options, allow_internal_tables)"),
+            && sql_api_source
+                .contains("self.execute_impl_sql(sql, params, options, allow_internal_tables)"),
         "engine execute entrypoint must delegate to sql"
     );
     assert!(

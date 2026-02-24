@@ -4,9 +4,9 @@ use sqlparser::ast::{ObjectNamePart, Visit, Visitor};
 
 use crate::LixError;
 
-use super::nodes::{ObjectName, Query, Select, SetExpr, TableFactor};
 #[cfg(test)]
 use super::nodes::Statement;
+use super::nodes::{ObjectName, Query, Select, SetExpr, TableFactor};
 #[cfg(test)]
 use super::utils::is_transaction_control_statement;
 
