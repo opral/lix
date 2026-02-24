@@ -23,8 +23,6 @@ pub(crate) use lowering::lower_statement;
 pub(crate) use params::{
     bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
 };
-pub(crate) use pipeline::coalesce_vtable_inserts_in_statement_list;
-pub(crate) use pipeline::preprocess_plan_fingerprint;
 pub(crate) use pipeline::statement_pipeline::StatementPipeline;
 #[allow(unused_imports)]
 pub use pipeline::{
@@ -41,14 +39,8 @@ pub(crate) use row_resolution::{
 pub(crate) use sql2_bridge::{
     rewrite_statement_with_backend_to_sql2, rewrite_statement_with_provider_to_sql2,
 };
-pub use steps::vtable_write::{
-    build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
-};
-pub(crate) use steps::working_projection_refresh::refresh_working_projection_for_read_query;
+pub use steps::vtable_write::DetectedFileDomainChange;
 pub use types::PostprocessPlan;
-pub(crate) use types::PreparedStatement;
-pub(crate) use types::PreprocessOutput;
 pub(crate) use types::RewriteOutput;
 pub use types::SchemaRegistration;
 pub use types::{MutationOperation, MutationRow, UpdateValidationPlan};
-pub(crate) use types::{VtableDeletePlan, VtableUpdatePlan};
