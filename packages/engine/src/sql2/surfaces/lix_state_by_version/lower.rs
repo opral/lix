@@ -8,12 +8,11 @@ pub(crate) enum LoweringKind {
 }
 
 pub(crate) fn lowering_kind(statement: &Statement) -> LoweringKind {
-    let sql = statement.to_string().trim_start().to_ascii_lowercase();
-    if sql.starts_with("select") || sql.starts_with("with") || sql.starts_with("explain") {
-        LoweringKind::Read
-    } else if sql.starts_with("insert") || sql.starts_with("update") || sql.starts_with("delete") {
-        LoweringKind::Write
-    } else {
-        LoweringKind::Unknown
+    match statement {
+        Statement::Query(_) | Statement::Explain { .. } | Statement::ExplainTable { .. } => {
+            LoweringKind::Read
+        }
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => LoweringKind::Write,
+        _ => LoweringKind::Unknown,
     }
 }
