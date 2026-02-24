@@ -5,7 +5,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::sql::params::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::{lower_statement, object_name_matches, rewrite_read_query_with_backend};
+use crate::sql::read_pipeline::rewrite_read_query_with_backend;
+use crate::sql::{lower_statement, object_name_matches};
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq)]
