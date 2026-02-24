@@ -4,11 +4,11 @@ use crate::sql as legacy_sql;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::nodes::Statement;
+use super::super::contracts::legacy_sql::{
+    from_legacy_preprocess_output, to_legacy_detected_file_domain_changes_by_statement,
+};
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::PlannedStatementSet;
-use super::super::legacy_bridge::{
-    from_sql_preprocess_output, to_sql_detected_file_domain_changes_by_statement,
-};
 
 pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(
     statements: Vec<Statement>,
@@ -17,7 +17,7 @@ pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider
     dialect: SqlDialect,
 ) -> Result<PlannedStatementSet, LixError> {
     let output = legacy_sql::preprocess_statements_with_provider(statements, params, provider, dialect)?;
-    Ok(from_sql_preprocess_output(output))
+    Ok(from_legacy_preprocess_output(output))
 }
 
 pub(crate) async fn preprocess_sql_to_plan(
@@ -27,7 +27,7 @@ pub(crate) async fn preprocess_sql_to_plan(
     params: &[Value],
 ) -> Result<PlannedStatementSet, LixError> {
     let output = legacy_sql::preprocess_sql(backend, evaluator, sql_text, params).await?;
-    Ok(from_sql_preprocess_output(output))
+    Ok(from_legacy_preprocess_output(output))
 }
 
 pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
@@ -42,8 +42,9 @@ pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let sql_detected_file_domain_changes_by_statement =
-        to_sql_detected_file_domain_changes_by_statement(detected_file_domain_changes_by_statement);
+    let sql_detected_file_domain_changes_by_statement = to_legacy_detected_file_domain_changes_by_statement(
+        detected_file_domain_changes_by_statement,
+    );
     let output = legacy_sql::preprocess_parsed_statements_with_provider_and_detected_file_domain_changes(
         backend,
         evaluator,
@@ -54,5 +55,5 @@ where
         writer_key,
     )
     .await?;
-    Ok(from_sql_preprocess_output(output))
+    Ok(from_legacy_preprocess_output(output))
 }

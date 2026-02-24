@@ -5,7 +5,6 @@ pub(crate) mod execution;
 pub(crate) mod fallback;
 pub(crate) mod history;
 pub(crate) mod in_transaction;
-pub(crate) mod legacy_bridge;
 pub(crate) mod planning;
 pub(crate) mod scripts;
 pub(crate) mod semantics;
