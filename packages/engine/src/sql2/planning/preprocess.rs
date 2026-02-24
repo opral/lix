@@ -7,15 +7,14 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::nodes::Statement;
-use super::super::ast::utils::{
-    bind_sql_with_state_and_appended_params, parse_sql_statements, PlaceholderState,
-};
+use super::super::ast::utils::parse_sql_statements;
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
 };
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
+use super::bind_once::{bind_statements_with_appended_params_once, StatementWithAppendedParams};
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
 use super::rewrite_engine::StatementPipeline;
@@ -280,24 +279,27 @@ fn render_statements_with_params(
     base_params: &[Value],
     dialect: SqlDialect,
 ) -> Result<(String, Vec<PreparedStatement>), LixError> {
-    let mut rendered = Vec::with_capacity(statements.len());
-    let mut prepared_statements = Vec::with_capacity(statements.len());
-    let mut placeholder_state = PlaceholderState::new();
+    let statement_sql = statements
+        .iter()
+        .map(|statement| statement.statement.to_string())
+        .collect::<Vec<_>>();
+    let statement_inputs = statements
+        .iter()
+        .zip(statement_sql.iter())
+        .map(|(statement, sql)| StatementWithAppendedParams {
+            sql: sql.as_str(),
+            appended_params: statement.appended_params.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let bound_statements =
+        bind_statements_with_appended_params_once(&statement_inputs, base_params, dialect)
+            .map_err(LixError::from)?;
 
-    for statement in statements {
-        let bound = bind_sql_with_state_and_appended_params(
-            &statement.statement.to_string(),
-            base_params,
-            statement.appended_params.as_slice(),
-            dialect,
-            placeholder_state,
-        )?;
-        placeholder_state = bound.state;
-        rendered.push(bound.sql.clone());
-        prepared_statements.push(PreparedStatement {
-            sql: bound.sql,
-            params: bound.params,
-        });
+    let mut rendered = Vec::with_capacity(bound_statements.len());
+    let mut prepared_statements = Vec::with_capacity(bound_statements.len());
+    for (sql, params) in bound_statements {
+        rendered.push(sql.clone());
+        prepared_statements.push(PreparedStatement { sql, params });
     }
 
     let normalized_sql = rendered.join("; ");
