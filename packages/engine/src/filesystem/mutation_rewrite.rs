@@ -3452,8 +3452,7 @@ fn noop_statement() -> Result<Statement, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_predicate_string_with_params_and_state, json_text_expr_sql,
-        load_version_chain_ids,
+        extract_predicate_string_with_params_and_state, json_text_expr_sql, load_version_chain_ids,
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
         rewrite_update, select_effective_entity_tombstone_state, ReadRewriteSession,
     };

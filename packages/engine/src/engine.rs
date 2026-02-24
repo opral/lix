@@ -19,11 +19,10 @@ use crate::materialization::{
 };
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::types::{InstalledPlugin, PluginManifest};
-use crate::schema_registry::register_schema_sql_statements;
 use crate::state_commit_stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::validation::{validate_inserts, validate_updates, SchemaCache};
+use crate::validation::SchemaCache;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,

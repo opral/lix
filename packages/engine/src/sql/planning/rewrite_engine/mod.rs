@@ -8,6 +8,7 @@ mod row_resolution;
 mod steps;
 mod types;
 
+pub(crate) use crate::engine::sql::storage::sql_text::escape_sql_string;
 pub(crate) use ast_ref::{expr_references_column_name, ColumnReferenceOptions};
 pub(crate) use ast_utils::{
     default_alias, object_name_matches, parse_single_query, quote_ident, rewrite_query_selects,
@@ -15,7 +16,6 @@ pub(crate) use ast_utils::{
     rewrite_table_factors_in_select_decision, visit_query_selects, visit_table_factors_in_select,
     RewriteDecision,
 };
-pub(crate) use crate::engine::sql::storage::sql_text::escape_sql_string;
 #[cfg(test)]
 pub(crate) use params::bind_sql_with_state_and_appended_params;
 pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};
