@@ -62,7 +62,7 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
-        self.execute_impl(sql, params, options, false).await
+        self.execute_impl_sql(sql, params, options, false).await
     }
 
     pub(crate) async fn execute_internal(
@@ -71,18 +71,7 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<QueryResult, LixError> {
-        self.execute_impl(sql, params, options, true).await
-    }
-
-    pub(crate) async fn execute_impl(
-        &self,
-        sql: &str,
-        params: &[Value],
-        options: ExecuteOptions,
-        allow_internal_tables: bool,
-    ) -> Result<QueryResult, LixError> {
-        self.execute_impl_sql(sql, params, options, allow_internal_tables)
-            .await
+        self.execute_impl_sql(sql, params, options, true).await
     }
 
     pub(crate) async fn execute_impl_sql(
