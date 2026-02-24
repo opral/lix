@@ -552,6 +552,150 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    tracked_insert_updates_all_mutable_materialized_columns_on_conflict,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+                 'lix_stored_schema',\
+                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+                 'lix_stored_schema',\
+                 '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"2\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+                 ) VALUES (\
+                 'entity-all-cols', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"initial\"}', '1', '{\"source\":\"old\"}', 'writer:old'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_state_vtable \
+                 WHERE entity_id = 'entity-all-cols' \
+                   AND schema_key = 'test_schema' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let tombstone = engine
+            .execute(
+                "SELECT is_tombstone, snapshot_content, updated_at \
+                 FROM lix_internal_state_materialized_v1_test_schema \
+                 WHERE entity_id = 'entity-all-cols' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tombstone.rows.len(), 1);
+        assert_eq!(tombstone.rows[0][0], Value::Integer(1));
+        assert_eq!(tombstone.rows[0][1], Value::Null);
+        let tombstone_updated_at = match &tombstone.rows[0][2] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected tombstone updated_at text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+                 ) VALUES (\
+                 'entity-all-cols', 'test_schema', 'file-1', 'version-1', 'other', '{\"key\":\"updated\"}', '2', '{\"source\":\"new\"}', 'writer:new'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let stored = engine
+            .execute(
+                "SELECT schema_version, plugin_key, snapshot_content, metadata, writer_key, is_tombstone, change_id, updated_at \
+                 FROM lix_internal_state_materialized_v1_test_schema \
+                 WHERE entity_id = 'entity-all-cols' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stored.rows.len(), 1);
+        assert_eq!(stored.rows[0][0], Value::Text("2".to_string()));
+        assert_eq!(stored.rows[0][1], Value::Text("other".to_string()));
+        assert_eq!(
+            stored.rows[0][2],
+            Value::Text("{\"key\":\"updated\"}".to_string())
+        );
+        assert_eq!(
+            stored.rows[0][3],
+            Value::Text("{\"source\":\"new\"}".to_string())
+        );
+        assert_eq!(stored.rows[0][4], Value::Text("writer:new".to_string()));
+        assert_eq!(stored.rows[0][5], Value::Integer(0));
+        let change_id = match &stored.rows[0][6] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected change_id text, got {other:?}"),
+        };
+        let updated_at = match &stored.rows[0][7] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected updated_at text, got {other:?}"),
+        };
+        assert_ne!(updated_at, tombstone_updated_at);
+
+        let change = engine
+            .execute(
+                &format!(
+                    "SELECT plugin_key, metadata FROM lix_internal_change WHERE id = '{}'",
+                    change_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(change.rows.len(), 1);
+        assert_eq!(change.rows[0][0], Value::Text("other".to_string()));
+        assert_eq!(
+            change.rows[0][1],
+            Value::Text("{\"source\":\"new\"}".to_string())
+        );
+    }
+);
+
 simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)

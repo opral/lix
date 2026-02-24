@@ -1,10 +1,10 @@
 use crate::cel::CelEvaluator;
+use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::types::{
     InstalledPlugin, PluginContentType, PluginManifest, PluginRuntime, StateContextColumn,
 };
-use crate::sql::preprocess_sql;
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1005,7 +1005,7 @@ async fn load_plugin_state_changes_for_file(
     )
     .await?;
     let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
+        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;
 
     let mut changes = Vec::with_capacity(rows.rows.len());
@@ -1154,7 +1154,7 @@ async fn load_active_state_context_rows(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
+        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;
 
     let mut result = Vec::with_capacity(rows.rows.len());
@@ -1258,7 +1258,7 @@ async fn load_missing_file_descriptors(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
+        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;
 
     let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
@@ -1314,7 +1314,7 @@ async fn load_file_paths_for_descriptors(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &params).await?;
     let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
+        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;
 
     let mut out = BTreeMap::new();
@@ -1349,7 +1349,7 @@ async fn load_missing_file_history_descriptors(
 
     let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
     let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
+        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;
 
     let mut descriptors: BTreeMap<(String, String, i64), FileHistoryDescriptorRow> =
@@ -1412,7 +1412,7 @@ async fn load_plugin_state_changes_for_file_at_history_slice(
     )
     .await?;
     let rows = backend
-        .execute(&preprocessed.sql, &preprocessed.params)
+        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;
 
     let mut changes = Vec::new();

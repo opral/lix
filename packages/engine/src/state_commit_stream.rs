@@ -1,4 +1,5 @@
-use crate::sql::{MutationOperation, MutationRow};
+use crate::engine::sql::contracts::planned_statement::{MutationOperation, MutationRow};
+use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use serde::{Deserialize, Serialize};
@@ -483,10 +484,150 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
         .collect()
 }
 
+pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
+    rows: &[Vec<Value>],
+    schema_key: &str,
+    operation: StateCommitStreamOperation,
+    writer_key: Option<&str>,
+) -> Result<Vec<StateCommitStreamChange>, LixError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let writer_key = writer_key.map(str::to_string);
+    let mut changes = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let entity_id = row_text(row, 0, "entity_id")?;
+        let file_id = row_text(row, 1, "file_id")?;
+        let version_id = row_text(row, 2, "version_id")?;
+        let plugin_key = row_text(row, 3, "plugin_key")?;
+        let schema_version = row_text(row, 4, "schema_version")?;
+        let snapshot_content = row_snapshot_content(row, 5)?;
+
+        changes.push(StateCommitStreamChange {
+            operation,
+            entity_id,
+            schema_key: schema_key.to_string(),
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            snapshot_content,
+            untracked: false,
+            writer_key: writer_key.clone(),
+        });
+    }
+
+    Ok(changes)
+}
+
+fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
+    let value = row.get(index).ok_or_else(|| LixError {
+        message: format!(
+            "postprocess state commit stream rows expected {column} column at index {index}"
+        ),
+    })?;
+    match value {
+        Value::Text(text) => Ok(text.clone()),
+        other => Err(LixError {
+            message: format!(
+                "postprocess state commit stream expected text {column}, got {other:?}"
+            ),
+        }),
+    }
+}
+
+fn row_snapshot_content(row: &[Value], index: usize) -> Result<Option<JsonValue>, LixError> {
+    let value = row.get(index).ok_or_else(|| LixError {
+        message: format!(
+            "postprocess state commit stream rows expected snapshot_content column at index {index}"
+        ),
+    })?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => {
+            let parsed = serde_json::from_str(text).map_err(|error| LixError {
+                message: format!(
+                    "postprocess state commit stream expected JSON snapshot_content text: {error}"
+                ),
+            })?;
+            Ok(Some(parsed))
+        }
+        other => Err(LixError {
+            message: format!(
+                "postprocess state commit stream expected null/text snapshot_content, got {other:?}"
+            ),
+        }),
+    }
+}
+
 fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
     match operation {
         MutationOperation::Insert => StateCommitStreamOperation::Insert,
-        MutationOperation::Update => StateCommitStreamOperation::Update,
-        MutationOperation::Delete => StateCommitStreamOperation::Delete,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation};
+    use crate::Value;
+
+    #[test]
+    fn postprocess_rows_map_to_update_changes() {
+        let rows = vec![vec![
+            Value::Text("entity-1".to_string()),
+            Value::Text("file-1".to_string()),
+            Value::Text("version-1".to_string()),
+            Value::Text("plugin-1".to_string()),
+            Value::Text("1".to_string()),
+            Value::Text("{\"name\":\"Ada\"}".to_string()),
+            Value::Text("{}".to_string()),
+            Value::Null,
+            Value::Text("2026-02-24T00:00:00Z".to_string()),
+        ]];
+
+        let changes = state_commit_stream_changes_from_postprocess_rows(
+            &rows,
+            "lix_entity",
+            StateCommitStreamOperation::Update,
+            Some("writer-a"),
+        )
+        .expect("postprocess rows should map");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].operation, StateCommitStreamOperation::Update);
+        assert_eq!(changes[0].entity_id, "entity-1");
+        assert_eq!(changes[0].schema_key, "lix_entity");
+        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-a"));
+    }
+
+    #[test]
+    fn postprocess_rows_map_null_snapshot_for_delete_changes() {
+        let rows = vec![vec![
+            Value::Text("entity-2".to_string()),
+            Value::Text("file-2".to_string()),
+            Value::Text("version-2".to_string()),
+            Value::Text("plugin-2".to_string()),
+            Value::Text("1".to_string()),
+            Value::Null,
+            Value::Text("{}".to_string()),
+            Value::Null,
+            Value::Text("2026-02-24T00:00:00Z".to_string()),
+        ]];
+
+        let changes = state_commit_stream_changes_from_postprocess_rows(
+            &rows,
+            "lix_entity",
+            StateCommitStreamOperation::Delete,
+            None,
+        )
+        .expect("postprocess rows should map");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].operation, StateCommitStreamOperation::Delete);
+        assert_eq!(changes[0].entity_id, "entity-2");
+        assert_eq!(changes[0].snapshot_content, None);
+        assert_eq!(changes[0].writer_key, None);
     }
 }

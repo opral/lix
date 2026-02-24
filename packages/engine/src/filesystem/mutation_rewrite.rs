@@ -9,16 +9,20 @@ use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
+use crate::engine::sql::ast::lowering::lower_statement;
+use crate::engine::sql::ast::utils::{
+    bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
+    ResolvedCell,
+};
+use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
+use crate::engine::sql::planning::rewrite_engine::{
+    rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
+};
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
     normalize_path_segment, parent_directory_path, parse_file_path, path_depth,
-};
-use crate::sql::escape_sql_string;
-use crate::sql::{
-    bind_sql_with_state, lower_statement, resolve_expr_cell_with_state, resolve_values_rows,
-    rewrite_read_query_with_backend_and_params_in_session, DetectedFileDomainChange,
-    PlaceholderState, ReadRewriteSession, ResolvedCell,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -1903,7 +1907,7 @@ async fn load_version_chain_ids(
         chain.push(version_id.to_string());
     }
 
-    read_rewrite_session.cache_version_chain(version_id.to_string(), chain.clone());
+    read_rewrite_session.cache_version_chain(version_id, &chain);
     Ok(chain)
 }
 
@@ -2001,6 +2005,7 @@ fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> Strin
 async fn rewrite_single_read_query_for_backend(
     backend: &dyn LixBackend,
     sql: &str,
+    params: &[EngineValue],
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<String, LixError> {
     let cache_key = {
@@ -2036,7 +2041,7 @@ async fn rewrite_single_read_query_for_backend(
     let rewritten = rewrite_read_query_with_backend_and_params_in_session(
         backend,
         *query,
-        &[],
+        params,
         read_rewrite_session,
     )
     .await?;
@@ -2571,17 +2576,14 @@ async fn read_directory_path_by_id(
          FROM lix_directory_by_version \
          WHERE lixcol_version_id = $1 AND id = $2 \
          LIMIT 1";
+    let query_params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(directory_id.to_string()),
+    ];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
-    let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(directory_id.to_string()),
-            ],
-        )
-        .await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
+    let result = backend.execute(&rewritten_sql, &query_params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -2611,17 +2613,14 @@ async fn read_directory_descriptor_by_id(
            AND version_id = $1 \
            AND lix_json_text(snapshot_content, 'id') = $2 \
          LIMIT 1";
+    let query_params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(directory_id.to_string()),
+    ];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
-    let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(directory_id.to_string()),
-            ],
-        )
-        .await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
+    let result = backend.execute(&rewritten_sql, &query_params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -2718,7 +2717,7 @@ async fn directory_rows_matching_delete(
         )
     };
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
     let result = backend
         .execute(&rewritten_sql, params)
         .await
@@ -2829,7 +2828,7 @@ async fn file_ids_matching_update(
         where_clause = where_clause
     );
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
     let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
     let result = backend
         .execute(&bound.sql, &bound.params)
@@ -2923,13 +2922,12 @@ async fn try_file_ids_matching_update_fast(
                AND snapshot_content IS NOT NULL \
                AND version_id = $1 \
                AND entity_id = $2";
+    let query_params = vec![EngineValue::Text(version_id), EngineValue::Text(file_id)];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
     let result = backend
-        .execute(
-            &rewritten_sql,
-            &[EngineValue::Text(version_id), EngineValue::Text(file_id)],
-        )
+        .execute(&rewritten_sql, &query_params)
         .await
         .map_err(|error| LixError {
             message: format!(
@@ -3257,17 +3255,14 @@ async fn load_directory_descendants(
            WHERE child.version_id = $1\
          ) \
          SELECT id FROM descendants";
+    let query_params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(root_id.to_string()),
+    ];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
-    let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(root_id.to_string()),
-            ],
-        )
-        .await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
+    let result = backend.execute(&rewritten_sql, &query_params).await?;
     let mut ids = Vec::new();
     for row in result.rows {
         if let Some(EngineValue::Text(id)) = row.first() {
@@ -3457,16 +3452,16 @@ fn noop_statement() -> Result<Statement, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_predicate_string_with_params_and_state, json_text_expr_sql,
+        extract_predicate_string_with_params_and_state, json_text_expr_sql, load_version_chain_ids,
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
-        rewrite_update, select_effective_entity_tombstone_state,
+        rewrite_update, select_effective_entity_tombstone_state, ReadRewriteSession,
     };
-    use crate::sql::parse_sql_statements;
-    use crate::sql::resolve_expr_cell_with_state;
-    use crate::sql::PlaceholderState;
-    use crate::SqlDialect;
-    use crate::Value;
+    use crate::engine::sql::ast::utils::{
+        parse_sql_statements, resolve_expr_cell_with_state, PlaceholderState,
+    };
+    use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
+    use std::sync::Mutex;
 
     #[test]
     fn json_text_expr_sql_uses_backend_specific_expression() {
@@ -3742,5 +3737,74 @@ mod tests {
         let tombstone =
             select_effective_entity_tombstone_state(&rows, &chain).expect("select state");
         assert_eq!(tombstone, Some(true));
+    }
+
+    struct VersionChainBackendMock {
+        execute_calls: Mutex<usize>,
+    }
+
+    impl VersionChainBackendMock {
+        fn execute_calls(&self) -> usize {
+            *self
+                .execute_calls
+                .lock()
+                .expect("version chain execute_calls mutex poisoned")
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl LixBackend for VersionChainBackendMock {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+            let mut calls = self
+                .execute_calls
+                .lock()
+                .expect("version chain execute_calls mutex poisoned");
+            *calls += 1;
+
+            let requested_version = match params.first() {
+                Some(Value::Text(version_id)) => version_id.clone(),
+                _ => "unknown".to_string(),
+            };
+            let parent_version = format!("{requested_version}-parent");
+
+            Ok(QueryResult {
+                rows: vec![
+                    vec![Value::Text(requested_version)],
+                    vec![Value::Text(parent_version)],
+                ],
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError {
+                message: "transactions are not used in this unit test".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn version_chain_lookup_uses_session_cache_for_repeated_version() {
+        let backend = VersionChainBackendMock {
+            execute_calls: Mutex::new(0),
+        };
+        let mut session = ReadRewriteSession::default();
+
+        let first = load_version_chain_ids(&backend, "v-main", &mut session)
+            .await
+            .expect("first lookup should succeed");
+        let second = load_version_chain_ids(&backend, "v-main", &mut session)
+            .await
+            .expect("cached lookup should succeed");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            backend.execute_calls(),
+            1,
+            "repeated lookup should reuse session cache"
+        );
     }
 }

@@ -1,5 +1,5 @@
+use crate::engine::sql::ast::utils::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::engine::{Engine, ExecuteOptions};
-use crate::sql::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
 use crate::state_commit_stream::{StateCommitStream, StateCommitStreamFilter};
 use crate::{LixError, QueryResult, SqlDialect, Value};
 use serde::{Deserialize, Serialize};
