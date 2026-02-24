@@ -7,7 +7,6 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::super::super::sql_preprocess_runtime::{
     legacy_rewrite_statement_with_backend, legacy_rewrite_statement_with_provider,
-    LegacyRewriteOutput,
 };
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::nodes::Statement;
@@ -22,6 +21,7 @@ use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
+use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 
 struct RewrittenStatementBinding {
@@ -246,7 +246,7 @@ where
 }
 
 fn accumulate_rewrite_output<P: LixFunctionProvider>(
-    output: LegacyRewriteOutput,
+    output: StatementRewriteOutput,
     provider: &mut P,
     dialect: SqlDialect,
     rewritten: &mut Vec<RewrittenStatementBinding>,
