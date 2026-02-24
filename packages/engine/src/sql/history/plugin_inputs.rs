@@ -1,4 +1,4 @@
-use super::super::ast::nodes::Statement;
+use sqlparser::ast::Statement;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, Query,
     Select, SetExpr, TableFactor, TableWithJoins, Update, UpdateTableFromKind,

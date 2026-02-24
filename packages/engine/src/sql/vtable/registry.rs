@@ -1,6 +1,5 @@
 use crate::LixError;
 
-use super::super::ast::nodes::Statement;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::internal_state_vtable::capabilities::{
     internal_state_vtable_capabilities, VtableCapabilities,
@@ -8,6 +7,7 @@ use super::internal_state_vtable::capabilities::{
 use super::internal_state_vtable::predicates::{
     schema_key_is_valid, statement_targets_internal_state_vtable,
 };
+use sqlparser::ast::Statement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisteredVtable {

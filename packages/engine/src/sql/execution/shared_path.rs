@@ -9,11 +9,11 @@ use crate::functions::SharedFunctionProvider;
 use crate::validation::{validate_inserts, validate_updates};
 use crate::{LixBackend, LixError, Value};
 
-use super::super::ast::nodes::Statement;
 use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::planning::derive_requirements::derive_plan_requirements;
 use super::super::planning::plan::build_execution_plan;
+use sqlparser::ast::Statement;
 
 pub(crate) struct PreparationPolicy {
     pub(crate) allow_plugin_cache: bool,

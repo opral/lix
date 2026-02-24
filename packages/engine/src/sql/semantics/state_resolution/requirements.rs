@@ -1,5 +1,5 @@
-use super::super::super::ast::nodes::Statement;
 use super::super::super::contracts::requirements::PlanRequirements;
+use sqlparser::ast::Statement;
 
 use super::canonical::canonicalize_state_resolution;
 use super::optimize::optimize_state_resolution;

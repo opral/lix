@@ -1,6 +1,6 @@
-use crate::engine::sql::ast::nodes::Statement;
 use crate::engine::sql::contracts::planned_statement::PlannedStatementSet;
 use crate::Value;
+use sqlparser::ast::Statement;
 
 pub(crate) type SchemaRegistration =
     crate::engine::sql::contracts::planned_statement::SchemaRegistration;

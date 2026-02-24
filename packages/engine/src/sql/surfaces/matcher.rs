@@ -2,8 +2,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::visit_relations;
 
-use super::super::ast::nodes::Statement;
 use super::super::ast::walk::object_name_matches;
+use sqlparser::ast::Statement;
 
 pub(crate) fn statement_matches_any_table(statement: &Statement, table_names: &[&str]) -> bool {
     if table_names.is_empty() {

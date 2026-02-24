@@ -5,10 +5,10 @@ use sqlparser::ast::{ObjectNamePart, Visit, Visitor};
 use crate::LixError;
 
 #[cfg(test)]
-use super::nodes::Statement;
-use super::nodes::{ObjectName, Query, Select, SetExpr, TableFactor};
-#[cfg(test)]
 use super::utils::is_transaction_control_statement;
+#[cfg(test)]
+use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectName, Query, Select, SetExpr, TableFactor};
 
 pub(crate) fn object_name_matches(name: &ObjectName, target: &str) -> bool {
     name.0

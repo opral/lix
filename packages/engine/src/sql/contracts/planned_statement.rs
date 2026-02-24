@@ -4,9 +4,9 @@ use serde_json::Value as JsonValue;
 
 use crate::{LixError, Value};
 
-use super::super::ast::nodes::Expr;
 use super::postprocess_actions::PostprocessPlan;
 use super::prepared_statement::PreparedStatement;
+use sqlparser::ast::Expr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaRegistration {

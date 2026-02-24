@@ -1,4 +1,4 @@
-use super::super::super::ast::nodes::Statement;
+use sqlparser::ast::Statement;
 
 use super::capabilities::{detect_operation, internal_state_vtable_capabilities, VtableOperation};
 use super::predicates::{

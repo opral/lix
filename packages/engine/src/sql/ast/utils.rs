@@ -7,7 +7,7 @@ use sqlparser::parser::Parser;
 
 use crate::{LixError, SqlDialect, Value};
 
-use super::nodes::Statement;
+use sqlparser::ast::Statement;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PlaceholderState {
