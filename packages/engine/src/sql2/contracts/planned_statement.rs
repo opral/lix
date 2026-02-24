@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
+use crate::{LixError, Value};
+
 use super::super::ast::nodes::Expr;
 use super::postprocess_actions::PostprocessPlan;
 use super::prepared_statement::PreparedStatement;
@@ -47,4 +49,16 @@ pub(crate) struct PlannedStatementSet {
     pub(crate) postprocess: Option<PostprocessPlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
+}
+
+impl PlannedStatementSet {
+    pub(crate) fn single_statement_params(&self) -> Result<&[Value], LixError> {
+        match self.prepared_statements.as_slice() {
+            [statement] => Ok(statement.params.as_slice()),
+            [] => Ok(&[]),
+            _ => Err(LixError {
+                message: "preprocess output expected a single prepared statement".to_string(),
+            }),
+        }
+    }
 }
