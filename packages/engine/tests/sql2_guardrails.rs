@@ -123,7 +123,7 @@ fn guardrail_sql2_planning_and_execution_forbid_direct_sql_runtime_imports() {
 }
 
 #[test]
-fn guardrail_legacy_bridge_callsites_stay_on_allowlist_during_removal() {
+fn guardrail_legacy_bridge_is_removed_and_references_are_forbidden() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
         !crate_root.join("src/sql2/legacy_bridge.rs").exists(),

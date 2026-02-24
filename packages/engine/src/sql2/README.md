@@ -19,7 +19,31 @@ Postprocess ordering:
 3. commit boundary
 4. `apply_effects_post_commit` for non-SQL runtime effects
 
-Guardrails:
+## Ownership Map
+
+- `ast/`
+  SQL AST helpers and parameter binding utilities.
+- `planning/`
+  Parse/bind/plan orchestration and plan fingerprinting.
+- `execution/`
+  Transaction-scoped execution, SQL materialization, and postprocess orchestration.
+- `surfaces/`
+  View/surface classification and lowering entrypoints for logical Lix surfaces.
+- `semantics/`
+  Stateful semantic derivation (`requirements`, `effects`, and state resolution decisions).
+- `vtable/`
+  Internal state-vtable capability detection and read/write lowering.
+- `storage/`
+  SQL text helpers and table/query-specific storage utilities.
+- `history/`
+  History rewrite and projection helpers used by filesystem/state history surfaces.
+- `contracts/`
+  Cross-stage data contracts used by planning and execution.
+- `contracts/legacy_sql/`
+  Temporary adapter edge for legacy `crate::sql` types while runtime semantics live in `sql2`.
+
+## Guardrails
 
 - `tests/sql2_guardrails.rs` ensures `src/execute` stays removed.
+- `tests/sql2_guardrails.rs` ensures `sql2/legacy_bridge.rs` and `legacy_bridge::` references are not reintroduced.
 - `tests/sql2_guardrails.rs` ensures no string-matched fallback helper is reintroduced.
