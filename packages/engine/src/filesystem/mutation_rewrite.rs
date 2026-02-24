@@ -18,12 +18,12 @@ use crate::engine::sql2::ast::utils::{
     bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
     ResolvedCell,
 };
+use crate::engine::sql2::ast::lowering::lower_statement;
 use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
 use crate::engine::sql2::history::rewrite::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 use crate::engine::sql2::storage::sql_text::escape_sql_string;
-use crate::sql as legacy_sql;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
@@ -2044,8 +2044,7 @@ async fn rewrite_single_read_query_for_backend(
         read_rewrite_session,
     )
     .await?;
-    let lowered =
-        legacy_sql::lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
+    let lowered = lower_statement(Statement::Query(Box::new(rewritten)), backend.dialect())?;
     let lowered_sql = lowered.to_string();
     let mut cache = helper_sql_cache()
         .lock()

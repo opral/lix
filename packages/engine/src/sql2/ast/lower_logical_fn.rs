@@ -1,0 +1,120 @@
+use sqlparser::ast::{
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart,
+    Value as AstValue, ValueWithSpan,
+};
+
+use crate::LixError;
+
+#[derive(Debug, Clone)]
+pub(crate) struct LixJsonTextCall {
+    pub(crate) json_expr: Expr,
+    pub(crate) path: Vec<String>,
+}
+
+pub(crate) fn parse_lix_json_text(
+    function: &Function,
+) -> Result<Option<LixJsonTextCall>, LixError> {
+    if !function_name_matches(&function.name, "lix_json_text") {
+        return Ok(None);
+    }
+
+    let args = match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: "lix_json_text() does not support DISTINCT/ALL/clauses".to_string(),
+                });
+            }
+            &list.args
+        }
+        _ => {
+            return Err(LixError {
+                message: "lix_json_text() requires a regular argument list".to_string(),
+            })
+        }
+    };
+
+    if args.len() < 2 {
+        return Err(LixError {
+            message: "lix_json_text() requires at least 2 arguments".to_string(),
+        });
+    }
+
+    let json_expr = function_arg_expr(&args[0])?;
+    let mut path = Vec::with_capacity(args.len() - 1);
+    for arg in &args[1..] {
+        let expr = function_arg_expr(arg)?;
+        let key = string_literal(&expr).ok_or_else(|| LixError {
+            message: "lix_json_text() path arguments must be single-quoted strings".to_string(),
+        })?;
+        if key.is_empty() {
+            return Err(LixError {
+                message: "lix_json_text() path segments must not be empty".to_string(),
+            });
+        }
+        path.push(key.to_string());
+    }
+
+    Ok(Some(LixJsonTextCall { json_expr, path }))
+}
+
+pub(crate) fn parse_lix_empty_blob(function: &Function) -> Result<Option<()>, LixError> {
+    if !function_name_matches(&function.name, "lix_empty_blob") {
+        return Ok(None);
+    }
+    match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: "lix_empty_blob() does not support DISTINCT/ALL/clauses".to_string(),
+                });
+            }
+            if !list.args.is_empty() {
+                return Err(LixError {
+                    message: "lix_empty_blob() does not accept arguments".to_string(),
+                });
+            }
+            Ok(Some(()))
+        }
+        FunctionArguments::None => Ok(Some(())),
+        _ => Err(LixError {
+            message: "lix_empty_blob() requires a regular argument list".to_string(),
+        }),
+    }
+}
+
+pub(crate) fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
+fn function_arg_expr(arg: &FunctionArg) -> Result<Expr, LixError> {
+    let inner = match arg {
+        FunctionArg::Unnamed(arg) => arg,
+        _ => {
+            return Err(LixError {
+                message: "lix_json_text() does not support named arguments".to_string(),
+            })
+        }
+    };
+
+    match inner {
+        FunctionArgExpr::Expr(expr) => Ok(expr.clone()),
+        _ => Err(LixError {
+            message: "lix_json_text() arguments must be SQL expressions".to_string(),
+        }),
+    }
+}
+
+fn string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::SingleQuotedString(value),
+            ..
+        }) => Some(value.as_str()),
+        _ => None,
+    }
+}
