@@ -3,6 +3,7 @@ use serde_json::Value as JsonValue;
 use crate::engine::sql::ast::utils::parse_sql_statements;
 use crate::engine::sql::planning::preprocess::preprocess_statements_with_provider_to_plan as preprocess_statements_with_provider;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::error_classification::is_missing_relation_error;
 use crate::functions::SystemFunctionProvider;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::json_truthiness::{loosely_false, loosely_true};
@@ -229,15 +230,6 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             message: format!("expected text value for {name}"),
         }),
     }
-}
-
-fn is_missing_relation_error(err: &LixError) -> bool {
-    let lower = err.message.to_lowercase();
-    lower.contains("no such table")
-        || lower.contains("relation")
-            && (lower.contains("does not exist")
-                || lower.contains("undefined table")
-                || lower.contains("unknown"))
 }
 
 fn parse_first_payload(row: Option<&Vec<Value>>) -> Result<Option<JsonValue>, LixError> {

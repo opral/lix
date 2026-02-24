@@ -3,6 +3,7 @@ use crate::version::{
     GLOBAL_VERSION_ID,
 };
 use crate::working_projection::WORKING_PROJECTION_METADATA;
+use crate::error_classification::is_missing_relation_error;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -721,7 +722,7 @@ fn build_working_projection_change_id(
 
 fn is_missing_internal_relation_error(error: &LixError) -> bool {
     let message = error.message.to_ascii_lowercase();
-    (message.contains("no such table") || message.contains("does not exist"))
+    is_missing_relation_error(error)
         && (message.contains("lix_internal_state_materialized_v1_")
             || message.contains("lix_internal_state_untracked")
             || message.contains("lix_internal_state_vtable"))
