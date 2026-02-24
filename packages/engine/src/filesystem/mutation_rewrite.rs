@@ -2005,6 +2005,7 @@ fn json_text_expr_sql(dialect: crate::backend::SqlDialect, field: &str) -> Strin
 async fn rewrite_single_read_query_for_backend(
     backend: &dyn LixBackend,
     sql: &str,
+    params: &[EngineValue],
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<String, LixError> {
     let cache_key = {
@@ -2040,7 +2041,7 @@ async fn rewrite_single_read_query_for_backend(
     let rewritten = rewrite_read_query_with_backend_and_params_in_session(
         backend,
         *query,
-        &[],
+        params,
         read_rewrite_session,
     )
     .await?;
@@ -2575,16 +2576,15 @@ async fn read_directory_path_by_id(
          FROM lix_directory_by_version \
          WHERE lixcol_version_id = $1 AND id = $2 \
          LIMIT 1";
+    let query_params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(directory_id.to_string()),
+    ];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
     let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(directory_id.to_string()),
-            ],
-        )
+        .execute(&rewritten_sql, &query_params)
         .await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
@@ -2615,16 +2615,15 @@ async fn read_directory_descriptor_by_id(
            AND version_id = $1 \
            AND lix_json_text(snapshot_content, 'id') = $2 \
          LIMIT 1";
+    let query_params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(directory_id.to_string()),
+    ];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
     let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(directory_id.to_string()),
-            ],
-        )
+        .execute(&rewritten_sql, &query_params)
         .await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
@@ -2722,7 +2721,8 @@ async fn directory_rows_matching_delete(
         )
     };
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session)
+            .await?;
     let result = backend
         .execute(&rewritten_sql, params)
         .await
@@ -2833,7 +2833,8 @@ async fn file_ids_matching_update(
         where_clause = where_clause
     );
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, &sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session)
+            .await?;
     let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
     let result = backend
         .execute(&bound.sql, &bound.params)
@@ -2927,13 +2928,12 @@ async fn try_file_ids_matching_update_fast(
                AND snapshot_content IS NOT NULL \
                AND version_id = $1 \
                AND entity_id = $2";
+    let query_params = vec![EngineValue::Text(version_id), EngineValue::Text(file_id)];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
     let result = backend
-        .execute(
-            &rewritten_sql,
-            &[EngineValue::Text(version_id), EngineValue::Text(file_id)],
-        )
+        .execute(&rewritten_sql, &query_params)
         .await
         .map_err(|error| LixError {
             message: format!(
@@ -3261,16 +3261,15 @@ async fn load_directory_descendants(
            WHERE child.version_id = $1\
          ) \
          SELECT id FROM descendants";
+    let query_params = vec![
+        EngineValue::Text(version_id.to_string()),
+        EngineValue::Text(root_id.to_string()),
+    ];
     let rewritten_sql =
-        rewrite_single_read_query_for_backend(backend, sql, read_rewrite_session).await?;
+        rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
+            .await?;
     let result = backend
-        .execute(
-            &rewritten_sql,
-            &[
-                EngineValue::Text(version_id.to_string()),
-                EngineValue::Text(root_id.to_string()),
-            ],
-        )
+        .execute(&rewritten_sql, &query_params)
         .await?;
     let mut ids = Vec::new();
     for row in result.rows {
