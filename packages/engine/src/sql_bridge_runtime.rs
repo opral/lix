@@ -1,12 +1,7 @@
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql as legacy_sql;
-use crate::sql::{
-    rewrite_read_query_with_backend_and_params_in_session as legacy_rewrite_read_query_with_backend_and_params_in_session,
-    ReadRewriteSession as LegacyReadRewriteSession,
-};
 use crate::{LixBackend, LixError, SqlDialect, Value};
-use sqlparser::ast::Query;
 
 use super::sql2::ast::nodes::Statement;
 use super::sql2::contracts::effects::DetectedFileDomainChange;
@@ -17,36 +12,6 @@ use super::sql2::contracts::postprocess_actions::{
     PostprocessPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use super::sql2::contracts::prepared_statement::PreparedStatement;
-
-#[derive(Debug, Default, Clone)]
-pub(crate) struct ReadRewriteSession {
-    inner: LegacyReadRewriteSession,
-}
-
-impl ReadRewriteSession {
-    pub(crate) fn cached_version_chain(&self, version_id: &str) -> Option<&[String]> {
-        self.inner.cached_version_chain(version_id)
-    }
-
-    pub(crate) fn cache_version_chain(&mut self, version_id: String, chain: Vec<String>) {
-        self.inner.cache_version_chain(version_id, chain);
-    }
-}
-
-pub(crate) async fn rewrite_read_query_with_backend_and_params_in_session(
-    backend: &dyn LixBackend,
-    query: Query,
-    params: &[Value],
-    session: &mut ReadRewriteSession,
-) -> Result<Query, LixError> {
-    legacy_rewrite_read_query_with_backend_and_params_in_session(
-        backend,
-        query,
-        params,
-        &mut session.inner,
-    )
-    .await
-}
 
 pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(
     statements: Vec<Statement>,
