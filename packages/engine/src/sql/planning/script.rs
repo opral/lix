@@ -10,6 +10,7 @@ use super::super::ast::walk::object_name_matches;
 use super::super::semantics::state_resolution::canonical::{
     table_object_targets_table_name, table_with_joins_targets_table_name,
 };
+use super::super::storage::sql_text::escape_sql_string;
 
 pub(crate) fn extract_explicit_transaction_script_from_statements(
     statements: &[Statement],
@@ -571,8 +572,4 @@ fn object_name_last_ident_value(name: &ObjectName) -> Option<&str> {
         .last()
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.as_str())
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

@@ -22,6 +22,7 @@ use super::super::history::commit_runtime::{
     load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
     StatementBatch,
 };
+use super::super::storage::sql_text::escape_sql_string;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -607,10 +608,6 @@ fn value_to_string(value: &EngineValue, name: &str) -> Result<String, LixError> 
             message: format!("vtable update expected text for {name}"),
         }),
     }
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn quote_ident(value: &str) -> String {
