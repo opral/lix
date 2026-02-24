@@ -484,9 +484,6 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
 }
 
 fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
-    match operation {
-        MutationOperation::Insert => StateCommitStreamOperation::Insert,
-        MutationOperation::Update => StateCommitStreamOperation::Update,
-        MutationOperation::Delete => StateCommitStreamOperation::Delete,
-    }
+    let _ = operation;
+    StateCommitStreamOperation::Insert
 }

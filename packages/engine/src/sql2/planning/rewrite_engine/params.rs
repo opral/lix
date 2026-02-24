@@ -24,6 +24,7 @@ impl PlaceholderState {
 pub(crate) struct BoundSql {
     pub(crate) sql: String,
     pub(crate) params: Vec<Value>,
+    #[cfg(test)]
     pub(crate) state: PlaceholderState,
 }
 
@@ -78,6 +79,7 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
     Ok(BoundSql {
         sql,
         params: bound_params,
+        #[cfg(test)]
         state,
     })
 }

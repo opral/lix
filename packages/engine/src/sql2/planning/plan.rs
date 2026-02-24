@@ -12,7 +12,6 @@ use super::super::surfaces::registry::{
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::invariants::validate_execution_plan;
-use super::trace::plan_fingerprint;
 
 pub(crate) async fn build_execution_plan<P>(
     backend: &dyn LixBackend,
@@ -40,13 +39,11 @@ where
 
     let requirements = derive_plan_requirements(&parsed_statements);
     let effects = derive_plan_effects(&preprocess, writer_key)?;
-    let fingerprint = plan_fingerprint(&preprocess);
 
     let plan = ExecutionPlan {
         preprocess,
         requirements,
         effects,
-        fingerprint,
     };
     validate_execution_plan(&plan)?;
     Ok(plan)

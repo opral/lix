@@ -20,7 +20,7 @@ use crate::engine::sql2::ast::utils::{
 };
 use crate::engine::sql2::ast::lowering::lower_statement;
 use crate::engine::sql2::contracts::effects::DetectedFileDomainChange;
-use crate::engine::sql2::history::rewrite::{
+use crate::engine::sql2::planning::rewrite_engine::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 use crate::engine::sql2::storage::sql_text::escape_sql_string;
@@ -1843,12 +1843,8 @@ fn placeholder_range(start: usize, len: usize) -> String {
 async fn load_version_chain_ids(
     backend: &dyn LixBackend,
     version_id: &str,
-    read_rewrite_session: &mut ReadRewriteSession,
+    _read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<String>, LixError> {
-    if let Some(cached) = read_rewrite_session.cached_version_chain(version_id) {
-        return Ok(cached.to_vec());
-    }
-
     let inherits_expr = json_text_expr_sql(backend.dialect(), "inherits_from_version_id");
     let sql = format!(
         "WITH RECURSIVE version_chain(version_id, depth) AS ( \
@@ -1907,7 +1903,6 @@ async fn load_version_chain_ids(
         chain.push(version_id.to_string());
     }
 
-    read_rewrite_session.cache_version_chain(version_id.to_string(), chain.clone());
     Ok(chain)
 }
 

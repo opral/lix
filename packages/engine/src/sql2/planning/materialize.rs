@@ -7,7 +7,7 @@ use crate::{LixBackend, LixError, Value};
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::utils::parse_sql_statements;
 use super::super::ast::walk::object_name_matches;
-use super::super::history::rewrite::{
+use super::rewrite_engine::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 

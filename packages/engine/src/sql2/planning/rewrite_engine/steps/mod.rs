@@ -1,4 +1,5 @@
 pub mod filesystem_step;
+#[cfg(test)]
 pub mod inline_lix_functions;
 pub mod lix_active_account_view_read;
 pub mod lix_active_account_view_write;
@@ -16,4 +17,3 @@ pub(crate) mod state_pushdown;
 pub mod stored_schema;
 pub mod vtable_read;
 pub mod vtable_write;
-pub mod working_projection_refresh;

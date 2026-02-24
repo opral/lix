@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub(crate) mod bind_once;
 pub(crate) mod derive_effects;
 pub(crate) mod derive_requirements;
@@ -13,4 +11,3 @@ pub(crate) mod preprocess;
 pub(crate) mod rewrite_output;
 pub(crate) mod rewrite_engine;
 pub(crate) mod script;
-pub(crate) mod trace;
