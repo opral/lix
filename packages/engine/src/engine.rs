@@ -61,8 +61,6 @@ mod plugin_install;
 mod runtime_functions;
 #[path = "sql2/mod.rs"]
 pub(crate) mod sql2;
-#[path = "sql_followup_runtime.rs"]
-pub(crate) mod sql_followup_runtime;
 
 use self::sql2::ast::utils::{bind_sql_with_state, PlaceholderState};
 use self::sql2::contracts::effects::DetectedFileDomainChange;
