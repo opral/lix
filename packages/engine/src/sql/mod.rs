@@ -61,7 +61,6 @@ pub(crate) use row_resolution::{
 };
 pub(crate) use sql2_bridge::{
     rewrite_statement_with_backend_to_sql2, rewrite_statement_with_provider_to_sql2,
-    Sql2RewriteOutput,
 };
 pub use steps::vtable_write::{
     build_delete_followup_sql, build_update_followup_sql, DetectedFileDomainChange,
