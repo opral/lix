@@ -20,12 +20,9 @@ No `sql2` runtime path should call legacy `sql/*`.
 
 ## Remaining Bridge Seams
 
-1. `sql2/planning/preprocess.rs` calls legacy `preprocess_*`.
-2. `sql2/execution/postprocess.rs` calls legacy followup SQL builders.
-3. `sql2/history/rewrite/mod.rs` aliases legacy `ReadRewriteSession` + rewrite API.
-4. `filesystem/mutation_rewrite.rs` emits legacy `DetectedFileDomainChange` and calls legacy lowering.
-5. `engine.rs` converts filesystem legacy change rows via `contracts/legacy_sql`.
-6. `sql2/contracts/legacy_sql/*` adapter modules still exist.
+1. `sql_preprocess_runtime.rs` is the only non-`sql/*` runtime module still importing `crate::sql::*`.
+2. `packages/engine/src/sql/*` still owns preprocess internals (`pipeline`, `types`, `row_resolution`, `steps`, `rewrite`) that block physical deletion.
+3. Legacy `sql/*` tests still hold behavioral coverage that must be migrated or replaced before deletion.
 
 ## Phase NL1: Remove Legacy Detected-Change Types
 
@@ -132,9 +129,101 @@ Exit:
 
 1. Guardrails enforce no return to legacy bridge patterns.
 
+## Phase NL8: Preprocess Contract Internalization (`sql2` owns output types)
+
+1. Replace `sql_preprocess_runtime` conversions from `crate::sql::PreprocessOutput` to `sql2` contracts with native `sql2` output construction.
+2. Move/introduce preprocess contract builders under `sql2/planning` + `sql2/contracts` so runtime no longer depends on `sql/types.rs`.
+3. Keep `sql/*` wrappers only as temporary call-through where needed.
+
+Verify:
+
+1. `cargo test -p lix_engine --test execute --test commit --test transaction_execution -- --test-threads=1`
+
+Exit:
+
+1. `sql_preprocess_runtime` no longer depends on `crate::sql::{PreprocessOutput,PostprocessPlan,MutationRow,...}` data types.
+
+## Phase NL9: Port Preprocess Pipeline Core to `sql2/planning`
+
+1. Move preprocess pipeline orchestration (`materialize insert-select sources`, `defaults`, `statement rewrite`, `render`) from `sql/pipeline.rs` to `sql2/planning`.
+2. Keep `sql/pipeline.rs` as a wrapper to `sql2` during this phase.
+3. Ensure placeholder bind-once semantics and postprocess single-statement invariants remain unchanged.
+
+Verify:
+
+1. `cargo test -p lix_engine --test transaction_execution --test schema_provider --test deterministic_mode -- --test-threads=1`
+
+Exit:
+
+1. `sql_preprocess_runtime` calls `sql2/planning` directly, not `crate::sql::preprocess_*`.
+
+## Phase NL10: Port Shared SQL Utilities Needed by Preprocess
+
+1. Move remaining preprocess dependencies from `sql/*` into `sql2` ownership:
+   - binding/placeholder helpers,
+   - row/source resolution helpers,
+   - rewrite helpers used during preprocess.
+2. Keep compatibility wrappers in `sql/*` only if still referenced by in-tree `sql/*` tests.
+
+Verify:
+
+1. `cargo test -p lix_engine --test filesystem_view --test file_history_view --test transaction_execution -- --test-threads=1`
+
+Exit:
+
+1. `rg -n "\\bcrate::sql::" packages/engine/src --glob '!packages/engine/src/sql/**'` returns no matches.
+
+## Phase NL11: Migrate/Retire Legacy `sql/*` Unit Coverage
+
+1. Identify behaviorally important `sql/*` unit tests and move them under `sql2/*` test modules.
+2. Drop obsolete tests that only validate removed legacy implementation details.
+3. Ensure remaining coverage is integration-first and `sql2`-owned.
+
+Verify:
+
+1. `cargo test -p lix_engine --lib`
+2. `cargo test -p lix_engine --tests -- --test-threads=1`
+
+Exit:
+
+1. No required correctness coverage depends on compiling `packages/engine/src/sql/*`.
+
+## Phase NL12: Convert `sql/*` to Wrapper-Only (Deletion Readiness Gate)
+
+1. Reduce `sql/mod.rs` and submodules to minimal wrappers forwarding to `sql2` (or no-op stubs if unused).
+2. Remove dead exports and dead imports from `sql/mod.rs`.
+3. Add a strict guardrail asserting no runtime modules import `crate::sql::*`.
+
+Verify:
+
+1. `cargo test -p lix_engine --test sql2_guardrails`
+2. `cargo test -p lix_engine --test execute --test transaction_execution -- --test-threads=1`
+
+Exit:
+
+1. Runtime behavior does not require any `sql/*` implementation code paths.
+
+## Phase NL13: Delete `packages/engine/src/sql/*`
+
+1. Remove `mod sql;` from `packages/engine/src/lib.rs`.
+2. Delete `packages/engine/src/sql/**`.
+3. Remove leftover imports/re-exports and dead code references.
+4. Add file-existence guardrail to prevent reintroduction.
+
+Verify:
+
+1. `cargo test -p lix_engine --tests -- --test-threads=1`
+2. `rg -n "\\bcrate::sql::|\\bsql::" packages/engine/src` (allow only SQL parser crate paths like `sqlparser::`).
+
+Exit:
+
+1. `packages/engine/src/sql` is physically removed.
+2. Full `lix_engine` integration suite stays green.
+
 ## Definition of Done
 
 1. No `sql2` runtime module imports `crate::sql::*`.
 2. No filesystem/engine runtime path depends on legacy adapter conversions.
 3. `sql2/contracts/legacy_sql/*` is deleted.
-4. Full `lix_engine` integration suite passes.
+4. `packages/engine/src/sql/*` is deleted.
+5. Full `lix_engine` integration suite passes.
