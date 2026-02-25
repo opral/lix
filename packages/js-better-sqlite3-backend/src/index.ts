@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
-import type { LixBackend, LixTransaction } from "js-sdk";
-import { Value } from "js-sdk";
-import type { QueryResult } from "js-sdk";
+import type { LixBackend, LixTransaction } from "@lix-js/sdk";
+import { Value } from "@lix-js/sdk";
+import type { QueryResult } from "@lix-js/sdk";
 type BetterSqlite3Options = {
   filename?: string;
   options?: ConstructorParameters<typeof Database>[1];

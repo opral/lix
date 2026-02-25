@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
-import { openLix as openNewLix } from "js-sdk";
+import { openLix as openNewLix } from "@lix-js/sdk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, "..", "results");
@@ -292,7 +292,7 @@ function printSummary(report) {
   const lines = [
     "",
     "+--------------------------------------------------------------------+",
-    "| LIX JSON Insert Breakdown (new js-sdk)                             |",
+    "| LIX JSON Insert Breakdown (new @lix-js/sdk)                        |",
     "+--------------------------------------------------------------------+",
     "Lower is faster.",
     `Payload size: ${report.config.jsonLeafCount} JSON leaves`,

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { openLix, createWasmSqliteBackend } from "js-sdk";
+import { openLix, createWasmSqliteBackend } from "@lix-js/sdk";
 import {
   ensureGitRepo,
   listLinearCommits,

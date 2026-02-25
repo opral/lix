@@ -3,7 +3,7 @@ import { serve } from "@hono/node-server";
 import {
 	createServerProtocolHandler,
 	createLspInMemoryEnvironment,
-} from "@lix-js/sdk";
+} from "@lix-js/sdk-old";
 
 const app = new Hono();
 

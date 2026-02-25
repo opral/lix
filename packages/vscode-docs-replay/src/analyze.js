@@ -2,7 +2,7 @@ import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import { openLix } from "js-sdk";
+import { openLix } from "@lix-js/sdk";
 import { createBetterSqlite3Backend } from "@lix-js/better-sqlite3-backend";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));

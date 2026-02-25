@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { createBetterSqlite3Backend } from "./index.js";
-import type { LixQueryResultLike } from "js-sdk";
+import type { LixQueryResultLike } from "@lix-js/sdk";
 
 function rowsOf(result: LixQueryResultLike): unknown[][] {
   return Array.isArray(result) ? result : result.rows;

@@ -23,7 +23,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "js-sdk": "workspace:*",
+    "@lix-js/sdk": "workspace:*",
     "better-sqlite3": "^12.4.1"
   },
   "devDependencies": {

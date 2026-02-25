@@ -2,8 +2,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
-import { openLix as openOldLix } from "@lix-js/sdk";
-import { openLix as openNewLix } from "js-sdk";
+import { openLix as openOldLix } from "@lix-js/sdk-old";
+import { openLix as openNewLix } from "@lix-js/sdk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, "..", "results");
@@ -134,7 +134,7 @@ async function setupOldAdapter() {
   const versionId = String(versionRows[0].version_id);
 
   return {
-    name: "@lix-js/sdk",
+    name: "@lix-js/sdk-old",
     schemaVersion: "1.0",
     tableName: "state_by_version",
     versionId,
@@ -178,7 +178,7 @@ async function setupNewAdapter() {
   const versionId = scalarToString(versionResult.rows?.[0]?.[0], "lix_active_version.version_id");
 
   return {
-    name: "js-sdk",
+    name: "@lix-js/sdk",
     schemaVersion: "1",
     tableName: "lix_state_by_version",
     versionId,
@@ -339,7 +339,7 @@ function formatMs(value) {
 
 function printSummary(report) {
   const width = 70;
-  const title = "LIX State Insert Bench (new js-sdk vs old @lix-js/sdk)";
+  const title = "LIX State Insert Bench (new @lix-js/sdk vs old @lix-js/sdk-old)";
   const border = `+${"-".repeat(width - 2)}+`;
   console.log("");
   console.log(color(border, "dim"));
@@ -354,11 +354,11 @@ function printSummary(report) {
     const speedupText = `${item.speedupNewOverOld.toFixed(2)}x`;
     console.log("");
     console.log(color(item.operation.label, "bold"));
-    console.log(`  old @lix-js/sdk: ${color(formatMs(old.meanMs), "red")}`);
-    console.log(`  new js-sdk:      ${color(formatMs(nu.meanMs), "green")}`);
+    console.log(`  old @lix-js/sdk-old: ${color(formatMs(old.meanMs), "red")}`);
+    console.log(`  new @lix-js/sdk:     ${color(formatMs(nu.meanMs), "green")}`);
 
     console.log(color("Summary", "bold"));
-    console.log(`  new js-sdk ran ${color(speedupText, "green")} faster than old @lix-js/sdk`);
+    console.log(`  new @lix-js/sdk ran ${color(speedupText, "green")} faster than old @lix-js/sdk-old`);
   }
 }
 
