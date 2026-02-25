@@ -1,0 +1,32 @@
+{
+  "name": "@lix-js/kysely",
+  "type": "module",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Compile-only Kysely query builder and Lix schema types for JS SDK v0.6 consumers",
+  "license": "Apache-2.0",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:types": "tsc -p tsconfig.type-tests.json --noEmit"
+  },
+  "dependencies": {
+    "json-schema-to-ts": "^3.1.1",
+    "kysely": "^0.28.7"
+  },
+  "peerDependencies": {
+    "@lix-js/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@lix-js/sdk": "workspace:*",
+    "typescript": "^5.5.4"
+  }
+}
