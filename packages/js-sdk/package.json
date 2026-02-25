@@ -14,8 +14,9 @@
   "description": "WASM-backed JS SDK wrapper for Lix",
   "scripts": {
     "build": "node ./scripts/build.js",
-    "build:dist": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",
+    "build:dist": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json",
+    "typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
     "test": "node ./scripts/build.js && vitest run",
     "test:watch": "node ./scripts/build.js && vitest"
   },

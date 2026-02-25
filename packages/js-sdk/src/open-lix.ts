@@ -105,7 +105,10 @@ export type OpenLixKeyValue = {
 };
 
 export type Lix = {
-  execute(sql: string, params?: ReadonlyArray<unknown>): Promise<QueryResult>;
+  execute(
+    sql: string,
+    params?: ReadonlyArray<unknown>,
+  ): Promise<QueryResult>;
   executeTransaction(statements: ReadonlyArray<TransactionStatement>): Promise<QueryResult>;
   stateCommitStream(filter?: StateCommitStreamFilter): StateCommitStream;
   observe(query: ObserveQuery): ObserveEvents;

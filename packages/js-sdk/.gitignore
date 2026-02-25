@@ -12,3 +12,6 @@
 # wasm modules and generated declarations
 *.wasm
 *.wasm.d.ts
+
+# generated from engine builtin schemas
+/src/generated/
