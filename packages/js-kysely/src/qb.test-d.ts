@@ -25,13 +25,17 @@ type KeyValueByVersionInsert = Insertable<
 
 type _InsertHasKey = Expect<Equal<KeyValueByVersionInsert["key"], string>>;
 
-qb.selectFrom("file").select(["id", "path", "hidden"]).compile();
-qb.selectFrom("directory").select(["id", "path"]).compile();
-qb.selectFrom("key_value_by_version")
+const db = qb({
+	execute: async () => ({ rows: [] }),
+});
+
+db.selectFrom("file").select(["id", "path", "hidden"]).compile();
+db.selectFrom("directory").select(["id", "path"]).compile();
+db.selectFrom("key_value_by_version")
 	.select(["key", "value", "lixcol_version_id"])
 	.compile();
 
-qb.insertInto("key_value_by_version")
+db.insertInto("key_value_by_version")
 	.values({
 		key: "flashtype_active_file_id",
 		value: "file-1",
@@ -40,20 +44,23 @@ qb.insertInto("key_value_by_version")
 	})
 	.compile();
 
-qb.updateTable("key_value_by_version")
+db.updateTable("key_value_by_version")
 	.set({ value: "file-2" })
 	.where("key", "=", "flashtype_active_file_id")
 	.compile();
 
-qb.deleteFrom("key_value_by_version")
+db.deleteFrom("key_value_by_version")
 	.where("key", "=", "flashtype_active_file_id")
 	.compile();
 
+const withDb = qb({ db });
+withDb.selectFrom("file").select("id");
+
 // @ts-expect-error unknown table
-qb.selectFrom("not_a_table").selectAll().compile();
+db.selectFrom("not_a_table").selectAll().compile();
 
 // @ts-expect-error unknown column
-qb.selectFrom("file").select(["not_a_column"]).compile();
+db.selectFrom("file").select(["not_a_column"]).compile();
 
 const badInsert: Insertable<LixDatabaseSchema["key_value_by_version"]> = {
 	key: "x",

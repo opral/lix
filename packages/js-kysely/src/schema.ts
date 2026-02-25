@@ -42,15 +42,16 @@ type ExtractFromGenerated<T> = T extends LixGenerated<infer U> ? U : T;
 type IsNever<T> = [T] extends [never] ? true : false;
 type IsAny<T> = 0 extends 1 & T ? true : false;
 
-type TransformEmptyObject<T> = IsAny<T> extends true
-	? any
-	: IsNever<T> extends true
-		? never
-		: T extends object
-			? keyof T extends never
-				? Record<string, any>
-				: T
-			: T;
+type TransformEmptyObject<T> =
+	IsAny<T> extends true
+		? any
+		: IsNever<T> extends true
+			? never
+			: T extends object
+				? keyof T extends never
+					? Record<string, any>
+					: T
+				: T;
 
 type IsEmptyObjectSchema<P> = P extends { type: "object" }
 	? P extends { properties: any }
@@ -66,20 +67,19 @@ type PropertyHasDefault<P> = P extends { "x-lix-default": any }
 		? true
 		: false;
 
-type ApplyLixGenerated<TSchema extends LixSchemaDefinition> =
-	TSchema extends {
-		properties: infer Props;
-	}
-		? {
-				[K in keyof FromSchema<TSchema>]: K extends keyof Props
-					? PropertyHasDefault<Props[K]> extends true
-						? LixGenerated<TransformEmptyObject<FromSchema<TSchema>[K]>>
-						: IsEmptyObjectSchema<Props[K]> extends true
-							? Record<string, any> | GetNullablePart<Props[K]>
-							: TransformEmptyObject<FromSchema<TSchema>[K]>
-					: TransformEmptyObject<FromSchema<TSchema>[K]>;
-			}
-		: never;
+type ApplyLixGenerated<TSchema extends LixSchemaDefinition> = TSchema extends {
+	properties: infer Props;
+}
+	? {
+			[K in keyof FromSchema<TSchema>]: K extends keyof Props
+				? PropertyHasDefault<Props[K]> extends true
+					? LixGenerated<TransformEmptyObject<FromSchema<TSchema>[K]>>
+					: IsEmptyObjectSchema<Props[K]> extends true
+						? Record<string, any> | GetNullablePart<Props[K]>
+						: TransformEmptyObject<FromSchema<TSchema>[K]>
+				: TransformEmptyObject<FromSchema<TSchema>[K]>;
+		}
+	: never;
 
 export type FromLixSchemaDefinition<T extends LixSchemaDefinition> =
 	ApplyLixGenerated<T>;

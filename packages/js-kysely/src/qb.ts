@@ -1,27 +1,11 @@
-import {
-	DummyDriver,
-	Kysely,
-	SqliteAdapter,
-	SqliteIntrospector,
-	SqliteQueryCompiler,
-} from "kysely";
-import type { LixDatabaseSchema } from "./schema.js";
+import { createLixKysely } from "./create-lix-kysely.js";
 
-const compileOnlySqliteDialect = {
-	createAdapter: () => new SqliteAdapter(),
-	createDriver: () => new DummyDriver(),
-	createIntrospector: (db: Kysely<any>) => new SqliteIntrospector(db),
-	createQueryCompiler: () => new SqliteQueryCompiler(),
-};
+type QbInput = Parameters<typeof createLixKysely>[0];
 
 /**
- * Compile-only Kysely query builder for Lix.
+ * Kysely entrypoint for Lix.
  *
  * Usage:
- * const compiled = qb.selectFrom("file").selectAll().compile()
- * await lix.execute(compiled.sql, compiled.parameters)
+ * await qb(lix).selectFrom("file").selectAll().execute()
  */
-export const qb = new Kysely<LixDatabaseSchema>({
-	dialect: compileOnlySqliteDialect,
-});
-
+export const qb = (lix: QbInput) => createLixKysely(lix);
