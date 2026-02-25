@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
-import { openLix } from "js-sdk";
+import { openLix } from "@lix-js/sdk";
 import {
   ensureGitRepo,
   listLinearCommits,

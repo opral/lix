@@ -3,9 +3,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
-import { openLix as openOldLix } from "@lix-js/sdk";
+import { openLix as openOldLix } from "@lix-js/sdk-old";
 import { plugin as legacyJsonPlugin } from "@lix-js/plugin-json";
-import { openLix as openNewLix } from "js-sdk";
+import { openLix as openNewLix } from "@lix-js/sdk";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, "..", "results");
@@ -52,7 +52,7 @@ async function main() {
     }
     if (newResult.pluginRows.meanPerFile <= 0) {
       warnings.push(
-        "New js-sdk adapter produced 0 plugin rows/file. Plugin execution did not produce state rows.",
+        "New @lix-js/sdk adapter produced 0 plugin rows/file. Plugin execution did not produce state rows.",
       );
     }
 
@@ -107,7 +107,7 @@ async function setupOldAdapter() {
   });
 
   return {
-    name: "old @lix-js/sdk",
+    name: "old @lix-js/sdk-old",
     async insertOne(sequence) {
       const fileId = `legacy-json-${sequence}`;
       const path = `/bench/legacy-${sequence}.json`;
@@ -149,7 +149,7 @@ async function setupNewAdapter() {
   });
 
   return {
-    name: "new js-sdk",
+    name: "new @lix-js/sdk",
     async insertOne(sequence) {
       const fileId = `new-json-${sequence}`;
       const path = `/bench/new-${sequence}.json`;
@@ -383,11 +383,11 @@ function printSummary(report) {
 
   console.log("");
   console.log(color(report.operation.label, "bold"));
-  console.log(`  old @lix-js/sdk: ${color(formatMs(report.oldSdk.timing.meanMs), "red")}`);
-  console.log(`  new js-sdk:      ${color(formatMs(report.newJsSdk.timing.meanMs), "green")}`);
+  console.log(`  old @lix-js/sdk-old: ${color(formatMs(report.oldSdk.timing.meanMs), "red")}`);
+  console.log(`  new @lix-js/sdk:     ${color(formatMs(report.newJsSdk.timing.meanMs), "green")}`);
   console.log(color("Summary", "bold"));
   console.log(
-    `  new js-sdk ran ${color(`${report.speedupNewOverOld.toFixed(2)}x`, "green")} faster than old @lix-js/sdk`,
+    `  new @lix-js/sdk ran ${color(`${report.speedupNewOverOld.toFixed(2)}x`, "green")} faster than old @lix-js/sdk-old`,
   );
   console.log(
     `  plugin rows/file (old): ${report.oldSdk.pluginRows.meanPerFile.toFixed(1)}`,

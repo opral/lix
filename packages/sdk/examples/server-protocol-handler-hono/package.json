@@ -14,7 +14,7 @@
 	},
 	"dependencies": {
 		"@hono/node-server": "^1.13.7",
-		"@lix-js/sdk": "workspace:*",
+		"@lix-js/sdk-old": "workspace:*",
 		"hono": "^4.6.11"
 	},
 	"devDependencies": {
