@@ -1,5 +1,5 @@
 import type { Insertable, Selectable } from "kysely";
-import { qb } from "./index.js";
+import { ebEntity, qb } from "./index.js";
 import type { LixDatabaseSchema } from "./schema.js";
 
 type Equal<A, B> =
@@ -33,6 +33,11 @@ db.selectFrom("file").select(["id", "path", "hidden"]).compile();
 db.selectFrom("directory").select(["id", "path"]).compile();
 db.selectFrom("key_value_by_version")
 	.select(["key", "value", "lixcol_version_id"])
+	.compile();
+
+db.selectFrom("commit")
+	.where(ebEntity("commit").hasLabel({ name: "checkpoint" }))
+	.select("id")
 	.compile();
 
 db.insertInto("key_value_by_version")
