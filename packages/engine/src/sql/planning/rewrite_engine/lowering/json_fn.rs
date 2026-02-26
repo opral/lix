@@ -1,6 +1,7 @@
 use sqlparser::ast::{
-    CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, Value as AstValue,
+    helpers::attached_token::AttachedToken, CastKind, DataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+    Value as AstValue,
 };
 
 use crate::backend::SqlDialect;
@@ -41,17 +42,36 @@ pub(crate) fn lower_lix_empty_blob(dialect: SqlDialect) -> Expr {
 }
 
 fn lower_sqlite_json_text(call: &LixJsonExtractCall) -> Expr {
-    let mut json_path = "$".to_string();
-    for segment in &call.path {
-        json_path.push('.');
-        json_path.push('"');
-        json_path.push_str(&segment.replace('\\', "\\\\").replace('"', "\\\""));
-        json_path.push('"');
+    let json_path = sqlite_json_path_literal(&call.path);
+    let json_path_expr = string_literal_expr(json_path);
+    let json_type_expr = function_expr(
+        "json_type",
+        vec![call.json_expr.clone(), json_path_expr.clone()],
+    );
+    let json_extract_expr =
+        function_expr("json_extract", vec![call.json_expr.clone(), json_path_expr]);
+    let sqlite_text_expr = Expr::BinaryOp {
+        left: Box::new(json_extract_expr),
+        op: sqlparser::ast::BinaryOperator::StringConcat,
+        right: Box::new(string_literal_expr("".to_string())),
+    };
+
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: Some(Box::new(json_type_expr)),
+        conditions: vec![
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("true".to_string()),
+                result: string_literal_expr("true".to_string()),
+            },
+            sqlparser::ast::CaseWhen {
+                condition: string_literal_expr("false".to_string()),
+                result: string_literal_expr("false".to_string()),
+            },
+        ],
+        else_result: Some(Box::new(sqlite_text_expr)),
     }
-    function_expr(
-        "json_extract",
-        vec![call.json_expr.clone(), string_literal_expr(json_path)],
-    )
 }
 
 fn lower_postgres_json_text(call: &LixJsonExtractCall) -> Expr {
@@ -69,6 +89,17 @@ fn lower_postgres_json_text(call: &LixJsonExtractCall) -> Expr {
     );
 
     function_expr("jsonb_extract_path_text", args)
+}
+
+fn sqlite_json_path_literal(path: &[String]) -> String {
+    let mut json_path = "$".to_string();
+    for segment in path {
+        json_path.push('.');
+        json_path.push('"');
+        json_path.push_str(&segment.replace('\\', "\\\\").replace('"', "\\\""));
+        json_path.push('"');
+    }
+    json_path
 }
 
 fn function_expr(name: &str, args: Vec<Expr>) -> Expr {

@@ -104,7 +104,7 @@ mod tests {
         let projection = select_expr(&lowered);
         assert_eq!(
             projection,
-            "json_extract(snapshot_content, '$.\"id\".\"commit_id\"')"
+            "CASE json_type(snapshot_content, '$.\"id\".\"commit_id\"') WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' ELSE json_extract(snapshot_content, '$.\"id\".\"commit_id\"') || '' END"
         );
     }
 
