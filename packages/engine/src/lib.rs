@@ -61,4 +61,5 @@ pub use state_commit_stream::{
     StateCommitStreamOperation,
 };
 pub use types::{QueryResult, Value};
+pub use version::{CreateVersionOptions, CreateVersionResult};
 pub use wasm_runtime::{NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime};

@@ -4,11 +4,11 @@ mod wasm {
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, observe_owned, BootArgs, BootKeyValue, CreateCheckpointResult, ExecuteOptions,
-        LixBackend, LixError, LixTransaction, ObserveEvent as EngineObserveEvent,
-        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect,
-        StateCommitStream as EngineStateCommitStream, StateCommitStreamBatch,
+        boot, observe_owned, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
+        CreateVersionResult, ExecuteOptions, LixBackend, LixError, LixTransaction,
+        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
+        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
+        SqlDialect, StateCommitStream as EngineStateCommitStream, StateCommitStreamBatch,
         StateCommitStreamChange, StateCommitStreamFilter, StateCommitStreamOperation,
         Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
     };
@@ -81,6 +81,19 @@ export type LixBootKeyValue = {
   versionId?: string;
   version_id?: string;
   lixcol_version_id?: string;
+};
+
+export type CreateVersionOptions = {
+  id?: string;
+  name?: string;
+  inheritsFromVersionId?: string;
+  hidden?: boolean;
+};
+
+export type CreateVersionResult = {
+  id: string;
+  name: string;
+  inheritsFromVersionId: string;
 };
 
 export type StateCommitStreamFilter = {
@@ -217,6 +230,25 @@ export type LixObserveEvents = {
         pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
             let result = self.engine.create_checkpoint().await.map_err(js_error)?;
             Ok(create_checkpoint_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = createVersion)]
+        pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_create_version_options(args).map_err(js_error)?;
+            let result = self
+                .engine
+                .create_version(options)
+                .await
+                .map_err(js_error)?;
+            Ok(create_version_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = switchVersion)]
+        pub async fn switch_version(&self, version_id: String) -> Result<(), JsValue> {
+            self.engine
+                .switch_version(version_id)
+                .await
+                .map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = exportSnapshot)]
@@ -471,6 +503,40 @@ export type LixObserveEvents = {
         Ok(parsed)
     }
 
+    fn parse_create_version_options(input: JsValue) -> Result<CreateVersionOptions, LixError> {
+        if input.is_null() || input.is_undefined() {
+            return Ok(CreateVersionOptions::default());
+        }
+        if !input.is_object() {
+            return Err(LixError {
+                message: "createVersion options must be an object".to_string(),
+            });
+        }
+
+        let id = read_optional_string_property_with_context(&input, "id", "createVersion")?;
+        let name = read_optional_string_property_with_context(&input, "name", "createVersion")?;
+        let inherits_from_version_id = read_optional_string_property_with_context(
+            &input,
+            "inheritsFromVersionId",
+            "createVersion",
+        )?
+        .or(read_optional_string_property_with_context(
+            &input,
+            "inherits_from_version_id",
+            "createVersion",
+        )?);
+
+        let hidden = read_optional_bool_property_with_context(&input, "hidden", "createVersion")?
+            .unwrap_or(false);
+
+        Ok(CreateVersionOptions {
+            id,
+            name,
+            inherits_from_version_id,
+            hidden,
+        })
+    }
+
     fn parse_state_commit_stream_filter(
         input: JsValue,
     ) -> Result<StateCommitStreamFilter, LixError> {
@@ -639,6 +705,23 @@ export type LixObserveEvents = {
             .map(Some)
     }
 
+    fn read_optional_bool_property_with_context(
+        object: &JsValue,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<bool>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        value
+            .as_bool()
+            .ok_or_else(|| LixError {
+                message: format!("{context}.{key} must be a boolean"),
+            })
+            .map(Some)
+    }
+
     fn state_commit_stream_batch_to_js(batch: StateCommitStreamBatch) -> Object {
         let object = Object::new();
         let _ = Reflect::set(
@@ -665,6 +748,26 @@ export type LixObserveEvents = {
             &object,
             &JsValue::from_str("changeSetId"),
             &JsValue::from_str(&result.change_set_id),
+        );
+        object
+    }
+
+    fn create_version_result_to_js(result: CreateVersionResult) -> Object {
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("id"),
+            &JsValue::from_str(&result.id),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("name"),
+            &JsValue::from_str(&result.name),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("inheritsFromVersionId"),
+            &JsValue::from_str(&result.inherits_from_version_id),
         );
         object
     }
@@ -784,6 +887,24 @@ export type LixObserveEvents = {
             message: format!("openLix keyValues entry '{key}' must be a string"),
         })?;
         if text.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(text))
+    }
+
+    fn read_optional_string_property_with_context(
+        object: &JsValue,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<String>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        let text = value.as_string().ok_or_else(|| LixError {
+            message: format!("{context}.{key} must be a string"),
+        })?;
+        if text.trim().is_empty() {
             return Ok(None);
         }
         Ok(Some(text))

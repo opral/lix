@@ -1,7 +1,7 @@
-use super::super::*;
-use super::execution::{apply_effects_post_commit, apply_effects_tx, run, shared_path};
-use super::planning::parse::parse_sql;
-use super::planning::script::extract_explicit_transaction_script_from_statements;
+use super::sql::execution::{apply_effects_post_commit, apply_effects_tx, run, shared_path};
+use super::sql::planning::parse::parse_sql;
+use super::sql::planning::script::extract_explicit_transaction_script_from_statements;
+use super::*;
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -175,6 +175,17 @@ impl Engine {
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
         crate::checkpoint::create_checkpoint(self).await
+    }
+
+    pub async fn create_version(
+        &self,
+        options: crate::CreateVersionOptions,
+    ) -> Result<crate::CreateVersionResult, LixError> {
+        crate::version::create_version(self, options).await
+    }
+
+    pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
+        crate::version::switch_version(self, version_id).await
     }
 
     /// Exports a portable snapshot as SQLite3 file bytes written via chunk stream.
