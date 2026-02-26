@@ -51,10 +51,12 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
     try {
       const boundParams: SqlValue[] = params.map(toSqlParam);
       const rows: SqlValue[][] = [];
+      const columns: string[] = [];
       db.exec({
         sql,
         bind: boundParams,
         rowMode: "array",
+        columnNames: columns,
         resultRows: rows,
       });
       const normalizedRows = rows.map((row) =>
@@ -62,6 +64,7 @@ export async function createWasmSqliteBackend(): Promise<LixBackend> {
       );
       return {
         rows: normalizedRows,
+        columns,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

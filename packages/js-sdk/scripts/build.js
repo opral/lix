@@ -48,7 +48,17 @@ async function buildEngineWasm() {
   await cp(engineOutDir, engineDistOutDir, { recursive: true, force: true });
 }
 
+async function syncBuiltinSchemas() {
+  await run("node", ["./scripts/sync-builtin-schemas.js"], { cwd: jsSdkDir });
+}
+
+async function buildTypescriptDist() {
+  await run("tsc", ["-p", "tsconfig.json"], { cwd: jsSdkDir });
+}
+
 async function main() {
+  await syncBuiltinSchemas();
+  await buildTypescriptDist();
   await buildEngineWasm();
 }
 
