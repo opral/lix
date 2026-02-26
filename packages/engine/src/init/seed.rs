@@ -46,6 +46,7 @@ impl Engine {
                 .version_id
                 .as_deref()
                 .unwrap_or(KEY_VALUE_GLOBAL_VERSION);
+            let untracked = key_value.untracked.unwrap_or(true);
             let snapshot_content = serde_json::json!({
                 "key": key_value.key,
                 "value": key_value.value,
@@ -55,7 +56,7 @@ impl Engine {
             self.execute_internal(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
                     Value::Text(key_value.key.clone()),
                     Value::Text(key_value_schema_key().to_string()),
@@ -64,6 +65,7 @@ impl Engine {
                     Value::Text(key_value_plugin_key().to_string()),
                     Value::Text(snapshot_content),
                     Value::Text(key_value_schema_version().to_string()),
+                    Value::Integer(if untracked { 1 } else { 0 }),
                 ],
                 ExecuteOptions::default(),
             )

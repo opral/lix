@@ -23,6 +23,7 @@ pub struct BootKeyValueConfig {
     pub key: String,
     pub value: JsonValue,
     pub version_id: Option<String>,
+    pub untracked: Option<bool>,
 }
 
 pub struct Lix {
@@ -41,6 +42,7 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
             key: item.key,
             value: item.value,
             version_id: item.version_id,
+            untracked: item.untracked,
         })
         .collect();
     let engine = boot(BootArgs {
