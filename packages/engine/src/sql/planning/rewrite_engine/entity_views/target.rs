@@ -32,12 +32,19 @@ pub(crate) struct EntityViewOverridePredicate {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct PrimaryKeyField {
+    pub pointer: String,
+    pub path: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct EntityViewTarget {
     pub view_name: String,
     pub schema_key: String,
     pub variant: EntityViewVariant,
     pub schema: JsonValue,
     pub properties: Vec<String>,
+    pub primary_key_fields: Vec<PrimaryKeyField>,
     pub primary_key_properties: Vec<String>,
     pub schema_version: String,
     pub file_id_override: Option<String>,
@@ -141,7 +148,9 @@ fn build_target_from_schema(
         .unwrap_or_default();
     properties.sort();
 
-    let primary_key_properties = extract_primary_key_properties(schema, &properties)?;
+    let primary_key_fields = extract_primary_key_fields(schema)?;
+    let primary_key_properties =
+        extract_top_level_primary_key_properties(&primary_key_fields, &properties);
     let schema_version = schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
@@ -163,6 +172,7 @@ fn build_target_from_schema(
         variant,
         schema: schema.clone(),
         properties,
+        primary_key_fields,
         primary_key_properties,
         schema_version,
         file_id_override,
@@ -225,10 +235,7 @@ fn variant_enabled(schema: &JsonValue, variant: EntityViewVariant) -> bool {
     })
 }
 
-fn extract_primary_key_properties(
-    schema: &JsonValue,
-    properties: &[String],
-) -> Result<Vec<String>, LixError> {
+fn extract_primary_key_fields(schema: &JsonValue) -> Result<Vec<PrimaryKeyField>, LixError> {
     let Some(pk) = schema
         .get("x-lix-primary-key")
         .and_then(JsonValue::as_array)
@@ -240,33 +247,53 @@ fn extract_primary_key_properties(
         let Some(pointer) = pointer.as_str() else {
             continue;
         };
-        let Some(property) = top_level_pointer_property(pointer)? else {
+        let path = parse_json_pointer_path(pointer)?;
+        if path.is_empty() {
             continue;
-        };
-        if properties.iter().any(|prop| prop == &property) {
-            out.push(property);
         }
+        out.push(PrimaryKeyField {
+            pointer: pointer.to_string(),
+            path,
+        });
     }
     Ok(out)
 }
 
-fn top_level_pointer_property(pointer: &str) -> Result<Option<String>, LixError> {
+fn extract_top_level_primary_key_properties(
+    fields: &[PrimaryKeyField],
+    properties: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for field in fields {
+        if field.path.len() != 1 {
+            continue;
+        }
+        let property = &field.path[0];
+        if properties.iter().any(|prop| prop == property) && !out.iter().any(|p| p == property) {
+            out.push(property.clone());
+        }
+    }
+    out
+}
+
+fn parse_json_pointer_path(pointer: &str) -> Result<Vec<String>, LixError> {
     if pointer.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if !pointer.starts_with('/') {
         return Err(LixError {
             message: format!("invalid x-lix-primary-key pointer '{pointer}'"),
         });
     }
-    if pointer[1..].contains('/') {
-        return Ok(None);
+    let mut path = Vec::new();
+    for segment in pointer[1..].split('/') {
+        let decoded = decode_json_pointer_segment(segment)?;
+        if decoded.is_empty() {
+            continue;
+        }
+        path.push(decoded);
     }
-    let segment = decode_json_pointer_segment(&pointer[1..])?;
-    if segment.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(segment))
+    Ok(path)
 }
 
 fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
@@ -438,6 +465,18 @@ mod tests {
             .expect("resolve should succeed")
             .expect("target should resolve");
         assert_eq!(target.schema_key, "lix_key_value");
+    }
+
+    #[test]
+    fn resolves_nested_primary_key_fields_for_lix_stored_schema() {
+        let target = resolve_target_from_view_name("lix_stored_schema_by_version")
+            .expect("resolve should succeed")
+            .expect("target should resolve");
+        assert_eq!(target.schema_key, "lix_stored_schema");
+        assert_eq!(target.primary_key_fields.len(), 2);
+        assert_eq!(target.primary_key_fields[0].pointer, "/value/x-lix-key");
+        assert_eq!(target.primary_key_fields[1].pointer, "/value/x-lix-version");
+        assert!(target.primary_key_properties.is_empty());
     }
 
     #[test]
