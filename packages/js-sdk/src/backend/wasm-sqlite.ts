@@ -12,6 +12,8 @@ type SqliteWasmDatabase = Database & {
   sqlite3: Sqlite3Static;
 };
 
+const sqliteWasmAssetUrl = new URL("./sqlite3.wasm", import.meta.url).toString();
+
 // https://github.com/opral/lix-sdk/issues/231
 // @ts-expect-error - globalThis
 globalThis.sqlite3ApiConfig = {
@@ -27,7 +29,10 @@ let sqlite3: Sqlite3Static | undefined;
 
 async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
   if (!sqlite3) {
-    sqlite3 = await sqlite3InitModule();
+    sqlite3 = await sqlite3InitModule({
+      locateFile: (path, prefix) =>
+        path === "sqlite3.wasm" ? sqliteWasmAssetUrl : `${prefix}${path}`,
+    });
   }
 
   const db = new sqlite3.oo1.DB(":memory:", "c");
