@@ -284,33 +284,33 @@ where
             functions.clone(),
         )?;
         let entity_id_expr = match entity_id_index {
-            Some(index) => row[index].clone(),
+            Some(index) => resolved_or_original_expr(row, resolved_row, index),
             None => derive_entity_id_expr(&snapshot_object, target)?,
         };
         let file_id_expr = match file_id_index {
-            Some(index) => row[index].clone(),
+            Some(index) => resolved_or_original_expr(row, resolved_row, index),
             None => match target.file_id_override.as_ref() {
                 Some(value) => string_literal_expr(value),
                 None => string_literal_expr("lix"),
             },
         };
         let plugin_key_expr = match plugin_key_index {
-            Some(index) => row[index].clone(),
+            Some(index) => resolved_or_original_expr(row, resolved_row, index),
             None => match target.plugin_key_override.as_ref() {
                 Some(value) => string_literal_expr(value),
                 None => string_literal_expr("lix"),
             },
         };
         let schema_version_expr = match schema_version_index {
-            Some(index) => row[index].clone(),
+            Some(index) => resolved_or_original_expr(row, resolved_row, index),
             None => string_literal_expr(&target.schema_version),
         };
         let metadata_expr = match metadata_index {
-            Some(index) => row[index].clone(),
+            Some(index) => resolved_or_original_expr(row, resolved_row, index),
             None => null_expr(),
         };
         let untracked_expr = match untracked_index {
-            Some(index) => row[index].clone(),
+            Some(index) => resolved_or_original_expr(row, resolved_row, index),
             None => integer_expr(0),
         };
         let snapshot_content_expr =
@@ -330,7 +330,7 @@ where
             ],
             EntityViewVariant::ByVersion => {
                 let version_expr = match version_id_index {
-                    Some(index) => row[index].clone(),
+                    Some(index) => resolved_or_original_expr(row, resolved_row, index),
                     None => match target.version_id_override.as_ref() {
                         Some(value) => string_literal_expr(value),
                         None => {
@@ -395,6 +395,26 @@ where
     };
     values.rows = rewritten_rows;
     Ok(insert)
+}
+
+fn resolved_or_original_expr(row: &[Expr], resolved_row: &[ResolvedCell], index: usize) -> Expr {
+    match resolved_row.get(index).and_then(|cell| cell.value.as_ref()) {
+        Some(EngineValue::Null) => Expr::Value(AstValue::Null.into()),
+        Some(EngineValue::Text(value)) => {
+            Expr::Value(AstValue::SingleQuotedString(value.clone()).into())
+        }
+        Some(EngineValue::Integer(value)) => {
+            Expr::Value(AstValue::Number(value.to_string(), false).into())
+        }
+        Some(EngineValue::Real(value)) => {
+            Expr::Value(AstValue::Number(value.to_string(), false).into())
+        }
+        Some(EngineValue::Blob(value)) => Expr::Value(
+            AstValue::SingleQuotedByteStringLiteral(String::from_utf8_lossy(value).to_string())
+                .into(),
+        ),
+        None => row[index].clone(),
+    }
 }
 
 fn rewrite_update_with_target(
@@ -1457,46 +1477,134 @@ fn coerce_json_value_for_property(
     value: JsonValue,
     property: &str,
     target: &EntityViewTarget,
-    _context: &str,
+    context: &str,
 ) -> Result<JsonValue, LixError> {
-    if !property_expects_boolean(target, property) {
-        return Ok(value);
-    }
-
-    Ok(match value {
-        JsonValue::Bool(_) => value,
-        JsonValue::Number(number) => match number.as_i64() {
-            Some(0) => JsonValue::Bool(false),
-            Some(1) => JsonValue::Bool(true),
-            _ => JsonValue::Number(number),
-        },
-        JsonValue::String(text) => {
-            let normalized = text.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "true" | "1" => JsonValue::Bool(true),
-                "false" | "0" => JsonValue::Bool(false),
-                _ => JsonValue::String(text),
+    let value = if property_expects_boolean(target, property) {
+        match value {
+            JsonValue::Bool(_) => value,
+            JsonValue::Number(number) => match number.as_i64() {
+                Some(0) => JsonValue::Bool(false),
+                Some(1) => JsonValue::Bool(true),
+                _ => JsonValue::Number(number),
+            },
+            JsonValue::String(text) => {
+                let normalized = text.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "true" | "1" => JsonValue::Bool(true),
+                    "false" | "0" => JsonValue::Bool(false),
+                    _ => JsonValue::String(text),
+                }
             }
+            other => other,
         }
-        other => other,
-    })
+    } else {
+        value
+    };
+
+    enforce_property_type_constraints(&value, property, target, context)?;
+    Ok(value)
 }
 
 fn property_expects_boolean(target: &EntityViewTarget, property: &str) -> bool {
+    property_schema(target, property)
+        .map(|schema| schema_allows_type(schema, "boolean"))
+        .unwrap_or(false)
+}
+
+fn enforce_property_type_constraints(
+    value: &JsonValue,
+    property: &str,
+    target: &EntityViewTarget,
+    context: &str,
+) -> Result<(), LixError> {
+    let Some(schema) = property_schema(target, property) else {
+        return Ok(());
+    };
+    let expected = expected_json_schema_types(schema);
+    if expected.is_empty() {
+        return Ok(());
+    }
+    if schema_accepts_json_value(schema, value) {
+        return Ok(());
+    }
+    let hint = if matches!(value, JsonValue::String(_))
+        && expected.iter().any(|ty| *ty == "object" || *ty == "array")
+    {
+        " Wrap JSON object/array input with lix_json(...)."
+    } else {
+        ""
+    };
+    Err(LixError {
+        message: format!(
+            "{context} expects one of [{}], got {}.{}",
+            expected.join(", "),
+            json_value_type(value),
+            hint
+        )
+        .trim_end_matches('.')
+        .to_string(),
+    })
+}
+
+fn expected_json_schema_types(schema: &JsonValue) -> Vec<&'static str> {
+    let mut types = Vec::new();
+    for candidate in [
+        "null", "boolean", "integer", "number", "string", "object", "array",
+    ] {
+        if schema_allows_type(schema, candidate) {
+            types.push(candidate);
+        }
+    }
+    types
+}
+
+fn schema_accepts_json_value(schema: &JsonValue, value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Null => schema_allows_type(schema, "null"),
+        JsonValue::Bool(_) => schema_allows_type(schema, "boolean"),
+        JsonValue::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                schema_allows_type(schema, "integer") || schema_allows_type(schema, "number")
+            } else {
+                schema_allows_type(schema, "number")
+            }
+        }
+        JsonValue::String(_) => schema_allows_type(schema, "string"),
+        JsonValue::Array(_) => schema_allows_type(schema, "array"),
+        JsonValue::Object(_) => schema_allows_type(schema, "object"),
+    }
+}
+
+fn json_value_type(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+fn property_schema<'a>(target: &'a EntityViewTarget, property: &str) -> Option<&'a JsonValue> {
     target
         .schema
         .get("properties")
         .and_then(JsonValue::as_object)
         .and_then(|properties| properties.get(property))
-        .map(schema_allows_boolean)
-        .unwrap_or(false)
 }
 
-fn schema_allows_boolean(schema: &JsonValue) -> bool {
+fn schema_allows_type(schema: &JsonValue, expected: &str) -> bool {
     if schema
         .get("type")
         .and_then(JsonValue::as_str)
-        .map(|value| value.eq_ignore_ascii_case("boolean"))
+        .map(|value| value.eq_ignore_ascii_case(expected))
         .unwrap_or(false)
     {
         return true;
@@ -1509,7 +1617,7 @@ fn schema_allows_boolean(schema: &JsonValue) -> bool {
             values.iter().any(|value| {
                 value
                     .as_str()
-                    .map(|value| value.eq_ignore_ascii_case("boolean"))
+                    .map(|value| value.eq_ignore_ascii_case(expected))
                     .unwrap_or(false)
             })
         })
@@ -1522,7 +1630,11 @@ fn schema_allows_boolean(schema: &JsonValue) -> bool {
         if schema
             .get(key)
             .and_then(JsonValue::as_array)
-            .map(|variants| variants.iter().any(schema_allows_boolean))
+            .map(|variants| {
+                variants
+                    .iter()
+                    .any(|variant| schema_allows_type(variant, expected))
+            })
             .unwrap_or(false)
         {
             return true;
@@ -1619,12 +1731,150 @@ fn json_value_from_resolved_or_literal(
     expr: Option<&Expr>,
     context: &str,
 ) -> Result<JsonValue, LixError> {
+    if let Some(expr) = expr {
+        if let Some(arg_expr) = lix_json_argument_expr(expr)? {
+            return json_value_from_lix_json_argument(cell, arg_expr, context);
+        }
+    }
     if let Some(cell) = cell {
         if let Some(value) = &cell.value {
             return json_value_from_engine_value(value, context);
         }
     }
     json_value_from_literal_expr(expr, context)
+}
+
+fn json_value_from_lix_json_argument(
+    cell: Option<&ResolvedCell>,
+    arg_expr: &Expr,
+    context: &str,
+) -> Result<JsonValue, LixError> {
+    if let Some(cell) = cell {
+        if cell.placeholder_index.is_none() {
+            if let Ok(raw) = json_text_input_from_literal_expr(arg_expr, context) {
+                return parse_json_value(&raw, context);
+            }
+        }
+        if let Some(value) = &cell.value {
+            let raw = json_text_input_from_engine_value(value, context)?;
+            return parse_json_value(&raw, context);
+        }
+    }
+    let raw = json_text_input_from_literal_expr(arg_expr, context)?;
+    parse_json_value(&raw, context)
+}
+
+fn parse_json_value(raw: &str, context: &str) -> Result<JsonValue, LixError> {
+    serde_json::from_str(raw).map_err(|error| LixError {
+        message: format!("{context} lix_json() argument must be valid JSON ({error})"),
+    })
+}
+
+fn json_text_input_from_engine_value(
+    value: &EngineValue,
+    context: &str,
+) -> Result<String, LixError> {
+    match value {
+        EngineValue::Null => Ok("null".to_string()),
+        EngineValue::Integer(value) => Ok(value.to_string()),
+        EngineValue::Real(value) => {
+            if value.is_finite() {
+                Ok(value.to_string())
+            } else {
+                Err(LixError {
+                    message: format!("{context} contains non-finite numeric value"),
+                })
+            }
+        }
+        EngineValue::Text(value) => Ok(value.clone()),
+        EngineValue::Blob(_) => Err(LixError {
+            message: format!("{context} does not support blob values"),
+        }),
+    }
+}
+
+fn json_text_input_from_literal_expr(expr: &Expr, context: &str) -> Result<String, LixError> {
+    let Expr::Value(ValueWithSpan { value, .. }) = expr else {
+        return Err(LixError {
+            message: format!("{context} requires literal or placeholder values"),
+        });
+    };
+    match value {
+        AstValue::Null => Ok("null".to_string()),
+        AstValue::Boolean(value) => Ok(value.to_string()),
+        AstValue::Number(value, _) => Ok(value.clone()),
+        AstValue::SingleQuotedString(value)
+        | AstValue::DoubleQuotedString(value)
+        | AstValue::TripleSingleQuotedString(value)
+        | AstValue::TripleDoubleQuotedString(value)
+        | AstValue::EscapedStringLiteral(value)
+        | AstValue::UnicodeStringLiteral(value)
+        | AstValue::NationalStringLiteral(value)
+        | AstValue::HexStringLiteral(value)
+        | AstValue::SingleQuotedRawStringLiteral(value)
+        | AstValue::DoubleQuotedRawStringLiteral(value)
+        | AstValue::TripleSingleQuotedRawStringLiteral(value)
+        | AstValue::TripleDoubleQuotedRawStringLiteral(value)
+        | AstValue::SingleQuotedByteStringLiteral(value)
+        | AstValue::DoubleQuotedByteStringLiteral(value)
+        | AstValue::TripleSingleQuotedByteStringLiteral(value)
+        | AstValue::TripleDoubleQuotedByteStringLiteral(value) => Ok(value.clone()),
+        AstValue::DollarQuotedString(value) => Ok(value.value.clone()),
+        AstValue::Placeholder(token) => Err(LixError {
+            message: format!("{context} unresolved placeholder '{token}'"),
+        }),
+    }
+}
+
+fn lix_json_argument_expr<'a>(expr: &'a Expr) -> Result<Option<&'a Expr>, LixError> {
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+    if !function_name_matches(&function.name, "lix_json") {
+        return Ok(None);
+    }
+    let args = match &function.args {
+        sqlparser::ast::FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
+                });
+            }
+            &list.args
+        }
+        _ => {
+            return Err(LixError {
+                message: "lix_json() requires a regular argument list".to_string(),
+            });
+        }
+    };
+    if args.len() != 1 {
+        return Err(LixError {
+            message: "lix_json() requires exactly 1 argument".to_string(),
+        });
+    }
+    let arg = match &args[0] {
+        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => expr,
+        sqlparser::ast::FunctionArg::Unnamed(_) => {
+            return Err(LixError {
+                message: "lix_json() arguments must be SQL expressions".to_string(),
+            });
+        }
+        _ => {
+            return Err(LixError {
+                message: "lix_json() does not support named arguments".to_string(),
+            });
+        }
+    };
+    Ok(Some(arg))
+}
+
+fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
 }
 
 fn json_value_from_engine_value(value: &EngineValue, context: &str) -> Result<JsonValue, LixError> {
@@ -1704,7 +1954,7 @@ fn derive_entity_id_expr(
     snapshot: &JsonMap<String, JsonValue>,
     target: &EntityViewTarget,
 ) -> Result<Expr, LixError> {
-    if target.primary_key_properties.is_empty() {
+    if target.primary_key_fields.is_empty() {
         return Err(LixError {
             message: format!(
                 "{} insert requires entity_id (schema has no x-lix-primary-key)",
@@ -1712,19 +1962,26 @@ fn derive_entity_id_expr(
             ),
         });
     }
-    let mut parts = Vec::with_capacity(target.primary_key_properties.len());
-    for property in &target.primary_key_properties {
-        let Some(value) = snapshot.get(property) else {
+    let mut parts = Vec::with_capacity(target.primary_key_fields.len());
+    for field in &target.primary_key_fields {
+        let Some(value) = json_pointer_get_from_snapshot(snapshot, &field.path) else {
             return Err(LixError {
                 message: format!(
                     "{} insert requires entity_id or all primary-key properties ({})",
                     target.view_name,
-                    target.primary_key_properties.join(", ")
+                    target
+                        .primary_key_fields
+                        .iter()
+                        .map(|field| field.pointer.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             });
         };
         parts.push(entity_id_component_from_json_value(
-            value, property, target,
+            value,
+            &field.pointer,
+            target,
         )?);
     }
     let entity_id = if parts.len() == 1 {
@@ -1737,14 +1994,14 @@ fn derive_entity_id_expr(
 
 fn entity_id_component_from_json_value(
     value: &JsonValue,
-    property: &str,
+    key_ref: &str,
     target: &EntityViewTarget,
 ) -> Result<String, LixError> {
     match value {
         JsonValue::Null => Err(LixError {
             message: format!(
                 "{} insert cannot derive entity_id from null primary-key property '{}'",
-                target.view_name, property
+                target.view_name, key_ref
             ),
         }),
         JsonValue::String(text) => Ok(text.clone()),
@@ -1752,6 +2009,21 @@ fn entity_id_component_from_json_value(
         JsonValue::Number(number) => Ok(number.to_string()),
         JsonValue::Array(_) | JsonValue::Object(_) => Ok(value.to_string()),
     }
+}
+
+fn json_pointer_get_from_snapshot<'a>(
+    snapshot: &'a JsonMap<String, JsonValue>,
+    path: &[String],
+) -> Option<&'a JsonValue> {
+    let mut current: Option<&JsonValue> = None;
+    for (index, segment) in path.iter().enumerate() {
+        current = if index == 0 {
+            snapshot.get(segment)
+        } else {
+            current?.as_object()?.get(segment)
+        };
+    }
+    current
 }
 
 fn build_property_index(
@@ -1953,11 +2225,14 @@ fn parse_expression_from_sql(sql: &str) -> Result<Expr, LixError> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Map as JsonMap};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use super::{rewrite_delete, rewrite_insert, rewrite_update};
+    use super::{derive_entity_id_expr, rewrite_delete, rewrite_insert, rewrite_update};
+    use crate::engine::sql::planning::rewrite_engine::entity_views::target::resolve_target_from_view_name;
+    use crate::Value as EngineValue;
 
     #[test]
     fn rewrites_lix_key_value_by_version_insert_target() {
@@ -2052,5 +2327,78 @@ mod tests {
         assert!(rendered.contains("change-1"));
         assert!(rendered.contains("account-1"));
         assert!(rendered.contains("||"));
+    }
+
+    #[test]
+    fn derive_entity_id_supports_nested_primary_key_pointers_for_insert() {
+        let target = resolve_target_from_view_name("lix_stored_schema_by_version")
+            .expect("resolve should succeed")
+            .expect("target should resolve");
+        let mut snapshot = JsonMap::new();
+        snapshot.insert(
+            "value".to_string(),
+            json!({
+                "x-lix-key": "mock_schema",
+                "x-lix-version": "1"
+            }),
+        );
+
+        let entity_id = derive_entity_id_expr(&snapshot, &target).expect("entity id should derive");
+        assert_eq!(entity_id.to_string(), "'mock_schema~1'");
+    }
+
+    #[test]
+    fn rewrite_insert_derives_nested_primary_key_when_value_uses_lix_json() {
+        let sql = "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES (lix_json('{\"x-lix-key\":\"mock_schema\",\"x-lix-version\":\"1\"}'), 'global')";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Insert(insert) = statement else {
+            panic!("expected insert statement");
+        };
+        let rewritten = rewrite_insert(insert, &[])
+            .expect("insert rewrite should succeed")
+            .expect("insert should rewrite");
+        let rendered = rewritten.to_string();
+        assert!(rendered.contains("entity_id"));
+        assert!(rendered.contains("mock_schema~1"));
+    }
+
+    #[test]
+    fn rewrite_insert_keeps_bound_version_id_when_placeholders_are_reordered() {
+        let sql =
+            "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES (lix_json(?), ?)";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Insert(insert) = statement else {
+            panic!("expected insert statement");
+        };
+        let rewritten = rewrite_insert(
+            insert,
+            &[
+                EngineValue::Text(
+                    "{\"x-lix-key\":\"mock_schema\",\"x-lix-version\":\"1\"}".to_string(),
+                ),
+                EngineValue::Text("global".to_string()),
+            ],
+        )
+        .expect("insert rewrite should succeed")
+        .expect("insert should rewrite");
+        let rendered = rewritten.to_string();
+        assert!(rendered.contains("version_id"));
+        assert!(rendered.contains("'global'"));
+    }
+
+    #[test]
+    fn rewrite_insert_rejects_json_text_without_lix_json() {
+        let sql = "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES ('{\"x-lix-key\":\"mock_schema\",\"x-lix-version\":\"1\"}', 'global')";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Insert(insert) = statement else {
+            panic!("expected insert statement");
+        };
+        let err = rewrite_insert(insert, &[]).expect_err("insert should require lix_json()");
+        assert!(err
+            .message
+            .contains("Wrap JSON object/array input with lix_json(...)"));
     }
 }

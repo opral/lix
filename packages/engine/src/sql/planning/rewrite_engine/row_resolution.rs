@@ -1,4 +1,7 @@
-use sqlparser::ast::{Expr, Insert, SetExpr, Value as SqlValue};
+use sqlparser::ast::{
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectNamePart,
+    SetExpr, Value as SqlValue,
+};
 
 use crate::engine::sql::planning::rewrite_engine::params::{
     resolve_placeholder_index, PlaceholderState,
@@ -109,6 +112,11 @@ fn resolve_expr(
     state: &mut PlaceholderState,
 ) -> Result<ResolvedCell, LixError> {
     let Expr::Value(value) = expr else {
+        if let Expr::Function(function) = expr {
+            if let Some(resolved) = resolve_lix_json_function(function, params, state)? {
+                return Ok(resolved);
+            }
+        }
         return Ok(ResolvedCell {
             value: None,
             placeholder_index: None,
@@ -126,6 +134,63 @@ fn resolve_expr(
         other => Ok(ResolvedCell {
             value: Some(sql_literal_to_engine_value(other)?),
             placeholder_index: None,
+        }),
+    }
+}
+
+fn resolve_lix_json_function(
+    function: &Function,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<Option<ResolvedCell>, LixError> {
+    if !function_name_matches(&function.name, "lix_json") {
+        return Ok(None);
+    }
+    let args = match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
+                });
+            }
+            &list.args
+        }
+        _ => {
+            return Err(LixError {
+                message: "lix_json() requires a regular argument list".to_string(),
+            });
+        }
+    };
+    if args.len() != 1 {
+        return Err(LixError {
+            message: "lix_json() requires exactly 1 argument".to_string(),
+        });
+    }
+    let arg_expr = function_arg_expr(&args[0], "lix_json()")?;
+    Ok(Some(resolve_expr(arg_expr, params, state)?))
+}
+
+fn function_name_matches(name: &sqlparser::ast::ObjectName, expected: &str) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
+}
+
+fn function_arg_expr<'a>(arg: &'a FunctionArg, fn_name: &str) -> Result<&'a Expr, LixError> {
+    let inner = match arg {
+        FunctionArg::Unnamed(arg) => arg,
+        _ => {
+            return Err(LixError {
+                message: format!("{fn_name} does not support named arguments"),
+            });
+        }
+    };
+    match inner {
+        FunctionArgExpr::Expr(expr) => Ok(expr),
+        _ => Err(LixError {
+            message: format!("{fn_name} arguments must be SQL expressions"),
         }),
     }
 }
@@ -302,5 +367,24 @@ mod tests {
         let rows = parse_values_rows("INSERT INTO t(a) VALUES (X'414243')");
         let resolved = resolve_values_rows(&rows, &[]).expect("resolve");
         assert_eq!(resolved[0][0].value, Some(Value::Blob(vec![65, 66, 67])));
+    }
+
+    #[test]
+    fn resolves_placeholders_nested_in_lix_json_function() {
+        let rows =
+            parse_values_rows("INSERT INTO t(a, b, c) VALUES (lix_json(?), ?, lix_json(?2))");
+        let params = vec![
+            Value::Text("{\"x\":1}".to_string()),
+            Value::Text("plain".to_string()),
+        ];
+        let resolved = resolve_values_rows(&rows, &params).expect("resolve");
+        assert_eq!(resolved[0][0].placeholder_index, Some(0));
+        assert_eq!(resolved[0][1].placeholder_index, Some(1));
+        assert_eq!(resolved[0][2].placeholder_index, Some(1));
+        assert_eq!(
+            resolved[0][0].value,
+            Some(Value::Text("{\"x\":1}".to_string()))
+        );
+        assert_eq!(resolved[0][1].value, Some(Value::Text("plain".to_string())));
     }
 }

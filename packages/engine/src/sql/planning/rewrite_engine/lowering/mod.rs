@@ -9,9 +9,8 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::backend::SqlDialect;
 use crate::LixError;
 
-use self::json_fn::lower_lix_empty_blob;
-use self::json_fn::lower_lix_json_text;
-use self::logical_fn::{parse_lix_empty_blob, parse_lix_json_text};
+use self::json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_text};
+use self::logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_text};
 
 pub(crate) fn lower_statement(
     statement: Statement,
@@ -43,6 +42,14 @@ impl VisitorMut for LogicalFunctionLowerer {
         };
 
         let Some(call) = parsed else {
+            let parsed_json = match parse_lix_json(function) {
+                Ok(parsed) => parsed,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if let Some(call) = parsed_json {
+                *expr = lower_lix_json(&call, self.dialect);
+                return ControlFlow::Continue(());
+            }
             let parsed_empty_blob = match parse_lix_empty_blob(function) {
                 Ok(parsed) => parsed,
                 Err(error) => return ControlFlow::Break(error),
@@ -133,5 +140,19 @@ mod tests {
         let lowered = lower_query("SELECT lix_empty_blob() FROM foo", SqlDialect::Postgres);
         let projection = select_expr(&lowered);
         assert_eq!(projection, "decode('', 'hex')");
+    }
+
+    #[test]
+    fn lowers_lix_json_to_sqlite_json_function() {
+        let lowered = lower_query("SELECT lix_json(payload) FROM foo", SqlDialect::Sqlite);
+        let projection = select_expr(&lowered);
+        assert_eq!(projection, "json(payload)");
+    }
+
+    #[test]
+    fn lowers_lix_json_to_postgres_jsonb_cast() {
+        let lowered = lower_query("SELECT lix_json(payload) FROM foo", SqlDialect::Postgres);
+        let projection = select_expr(&lowered);
+        assert_eq!(projection, "CAST(payload AS JSONB)");
     }
 }

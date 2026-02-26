@@ -4,12 +4,26 @@ use sqlparser::ast::{
 };
 
 use crate::backend::SqlDialect;
-use crate::engine::sql::planning::rewrite_engine::lowering::logical_fn::LixJsonTextCall;
+use crate::engine::sql::planning::rewrite_engine::lowering::logical_fn::{
+    LixJsonCall, LixJsonTextCall,
+};
 
 pub(crate) fn lower_lix_json_text(call: &LixJsonTextCall, dialect: SqlDialect) -> Expr {
     match dialect {
         SqlDialect::Sqlite => lower_sqlite_json_text(call),
         SqlDialect::Postgres => lower_postgres_json_text(call),
+    }
+}
+
+pub(crate) fn lower_lix_json(call: &LixJsonCall, dialect: SqlDialect) -> Expr {
+    match dialect {
+        SqlDialect::Sqlite => function_expr("json", vec![call.json_expr.clone()]),
+        SqlDialect::Postgres => Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(call.json_expr.clone()),
+            data_type: DataType::JSONB,
+            format: None,
+        },
     }
 }
 

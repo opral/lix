@@ -447,7 +447,7 @@ simulation_test!(
             .expect_err("expected schema validation failure");
         assert!(
             err.message
-                .contains("snapshot_content does not match schema 'lix_patch_validation'"),
+                .contains("expects one of [string], got integer"),
             "unexpected error: {}",
             err.message
         );
