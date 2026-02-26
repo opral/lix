@@ -149,7 +149,7 @@ type StateByVersionView = {
 	schema_key: string;
 	file_id: string;
 	plugin_key: string;
-	snapshot_content: Record<string, any> | null;
+	snapshot_content: Record<string, any>;
 	schema_version: string;
 	version_id: string;
 	created_at: Generated<string>;
