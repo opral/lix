@@ -175,7 +175,7 @@ export async function openLix(
     ensureOpen("execute");
     return (wasmLix as any).execute(
       sql,
-      params.map((param) => Value.from(param)),
+      params.map((param) => Value.from(normalizeSqlParam(param))),
       normalizeExecuteOptions(options, "execute"),
     );
   };
@@ -203,7 +203,7 @@ export async function openLix(
       }
       return {
         sql,
-        params: params.map((param) => Value.from(param)),
+        params: params.map((param) => Value.from(normalizeSqlParam(param))),
       };
     });
 
@@ -250,7 +250,9 @@ export async function openLix(
     }
     const rawEvents = (wasmLix as any).observe({
       sql: query.sql,
-      params: (query.params ?? []).map((param) => Value.from(param)),
+      params: (query.params ?? []).map((param) =>
+        Value.from(normalizeSqlParam(param)),
+      ),
     });
     if (!rawEvents || typeof rawEvents.next !== "function") {
       throw new Error("observe is not available in this wasm build");
@@ -503,4 +505,80 @@ function normalizeExecuteOptions(
   return {
     writerKey,
   };
+}
+
+function normalizeSqlParam(param: unknown): unknown {
+  if (param === null || param === undefined) {
+    return param;
+  }
+  if (param instanceof Value) {
+    return param;
+  }
+  if (isKindValueObject(param)) {
+    return {
+      kind: param.kind,
+      value: normalizeKindValue(param.kind, param.value),
+    };
+  }
+  if (isKindFunctionObject(param)) {
+    return param;
+  }
+  if (param instanceof Uint8Array) {
+    return param;
+  }
+  if (ArrayBuffer.isView(param)) {
+    return new Uint8Array(param.buffer, param.byteOffset, param.byteLength);
+  }
+  if (param instanceof ArrayBuffer) {
+    return new Uint8Array(param);
+  }
+  if (Array.isArray(param) || typeof param === "object") {
+    return JSON.stringify(param);
+  }
+  return param;
+}
+
+function isKindFunctionObject(
+  value: unknown,
+): value is { kind: () => string; value?: unknown } {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const kind = (value as { kind?: unknown }).kind;
+  return typeof kind === "function";
+}
+
+function isKindValueObject(
+  value: unknown,
+): value is { kind: "Null" | "Integer" | "Real" | "Text" | "Blob"; value: unknown } {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const kind = (value as { kind?: unknown }).kind;
+  return (
+    kind === "Null" ||
+    kind === "Integer" ||
+    kind === "Real" ||
+    kind === "Text" ||
+    kind === "Blob"
+  );
+}
+
+function normalizeKindValue(
+  kind: "Null" | "Integer" | "Real" | "Text" | "Blob",
+  value: unknown,
+): unknown {
+  if (kind !== "Blob") {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  return value;
 }
