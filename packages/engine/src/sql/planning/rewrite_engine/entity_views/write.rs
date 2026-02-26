@@ -4,9 +4,10 @@ use std::pin::Pin;
 
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Ident, Insert,
-    ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, Value as AstValue, ValueWithSpan, Values,
+    Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Ident,
+    Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, Update, Value as AstValue, ValueWithSpan,
+    Values,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -172,11 +173,7 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     let write_variant = mutation_variant(target);
-    if insert.on.is_some() {
-        return Err(LixError {
-            message: format!("{} insert does not support ON CONFLICT", target.view_name),
-        });
-    }
+    validate_and_strip_insert_on_conflict(&mut insert, &target.view_name)?;
     let is_default_values_insert = insert.columns.is_empty() && insert.source.is_none();
     if insert.columns.is_empty() && !is_default_values_insert {
         return Err(LixError {
@@ -395,6 +392,64 @@ where
     };
     values.rows = rewritten_rows;
     Ok(insert)
+}
+
+fn validate_and_strip_insert_on_conflict(
+    insert: &mut Insert,
+    view_name: &str,
+) -> Result<(), LixError> {
+    let Some(on_insert) = insert.on.take() else {
+        return Ok(());
+    };
+
+    let OnInsert::OnConflict(on_conflict) = on_insert else {
+        return Err(LixError {
+            message: format!(
+                "{} insert only supports ON CONFLICT ... DO UPDATE",
+                view_name
+            ),
+        });
+    };
+
+    match on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => {}
+        Some(_) => {
+            return Err(LixError {
+                message: format!(
+                    "{} insert ON CONFLICT only supports explicit column targets",
+                    view_name
+                ),
+            })
+        }
+        None => {
+            return Err(LixError {
+                message: format!(
+                    "{} insert ON CONFLICT requires explicit conflict columns",
+                    view_name
+                ),
+            })
+        }
+    }
+
+    match on_conflict.action {
+        OnConflictAction::DoUpdate(update) => {
+            if update.selection.is_some() {
+                return Err(LixError {
+                    message: format!(
+                        "{} insert ON CONFLICT DO UPDATE does not support WHERE",
+                        view_name
+                    ),
+                });
+            }
+            Ok(())
+        }
+        OnConflictAction::DoNothing => Err(LixError {
+            message: format!(
+                "{} insert ON CONFLICT DO NOTHING is not supported",
+                view_name
+            ),
+        }),
+    }
 }
 
 fn resolved_or_original_expr(row: &[Expr], resolved_row: &[ResolvedCell], index: usize) -> Expr {

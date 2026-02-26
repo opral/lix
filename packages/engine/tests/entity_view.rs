@@ -262,6 +262,74 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_entity_view_insert_on_conflict_do_update_is_supported,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('key-upsert', 'value-a')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('key-upsert', 'value-b') \
+                 ON CONFLICT (key) DO UPDATE SET value = 'value-b'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let updated = engine
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'key-upsert'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(updated.rows.clone());
+        assert_eq!(updated.rows.len(), 1);
+        assert_text(&updated.rows[0][0], "value-b");
+    }
+);
+
+simulation_test!(
+    lix_entity_view_insert_on_conflict_do_nothing_is_rejected,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('key-upsert', 'value-a') \
+                 ON CONFLICT (key) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("DO NOTHING should be rejected");
+
+        assert!(
+            err.message
+                .contains("ON CONFLICT DO NOTHING is not supported"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
     lix_entity_view_insert_default_values_populates_schema_defaults,
     |sim| async move {
         let engine = sim
@@ -372,7 +440,7 @@ simulation_test!(
 
         engine
             .execute(
-                 "INSERT INTO lix_version (\
+                "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
                  'version-child', 'version-child', 'global', false, 'commit-child', 'working-child'\
@@ -465,7 +533,7 @@ simulation_test!(
 
         engine
             .execute(
-                 "INSERT INTO lix_version (\
+                "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
                  'active-test', 'active-test', NULL, false, 'commit-active', 'working-active'\
@@ -601,7 +669,7 @@ simulation_test!(
 
         engine
             .execute(
-                 "INSERT INTO lix_version (\
+                "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
                  'version-child', 'version-child', 'global', false, 'commit-child', 'working-child'\

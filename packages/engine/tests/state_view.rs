@@ -500,6 +500,127 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_insert_on_conflict_do_update_is_supported,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"B\"}'\
+                 ) \
+                 ON CONFLICT (entity_id, schema_key, file_id) DO UPDATE \
+                 SET snapshot_content = '{\"value\":\"B\"}'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upsert' \
+                   AND file_id = 'file-upsert'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(visible.rows.clone());
+        assert_eq!(visible.rows.len(), 1);
+        assert_text(&visible.rows[0][0], "{\"value\":\"B\"}");
+
+        let materialized = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upsert' \
+                   AND file_id = 'file-upsert' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(materialized.rows.clone());
+        assert_eq!(materialized.rows.len(), 1);
+        assert_text(&materialized.rows[0][0], "{\"value\":\"B\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_insert_on_conflict_do_nothing_is_rejected,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
+                 ) \
+                 ON CONFLICT (entity_id, schema_key, file_id) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect_err("DO NOTHING should be rejected");
+
+        assert!(
+            err.message
+                .contains("ON CONFLICT DO NOTHING is not supported"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
     lix_state_insert_rejects_explicit_version_id_column,
     |sim| async move {
         let engine = sim
