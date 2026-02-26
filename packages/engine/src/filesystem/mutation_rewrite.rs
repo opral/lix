@@ -3776,6 +3776,7 @@ mod tests {
                     vec![Value::Text(requested_version)],
                     vec![Value::Text(parent_version)],
                 ],
+                columns: vec!["version_id".to_string()],
             })
         }
 

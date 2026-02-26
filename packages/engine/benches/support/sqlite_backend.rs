@@ -1,5 +1,5 @@
 use lix_engine::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
-use sqlx::{Executor, Row, SqlitePool, ValueRef};
+use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
 use std::path::Path;
 use tokio::sync::OnceCell;
 
@@ -73,7 +73,7 @@ impl LixBackend for BenchSqliteBackend {
             pool.execute(sql).await.map_err(|error| LixError {
                 message: error.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new() });
+            return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
         }
 
         let mut query = sqlx::query(sql);
@@ -84,6 +84,15 @@ impl LixBackend for BenchSqliteBackend {
         let rows = query.fetch_all(pool).await.map_err(|error| LixError {
             message: error.to_string(),
         })?;
+        let columns = rows
+            .first()
+            .map(|row| {
+                row.columns()
+                    .iter()
+                    .map(|column| column.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let mut out_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -93,7 +102,10 @@ impl LixBackend for BenchSqliteBackend {
             }
             out_rows.push(out);
         }
-        Ok(QueryResult { rows: out_rows })
+        Ok(QueryResult {
+            rows: out_rows,
+            columns,
+        })
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -122,7 +134,7 @@ impl LixTransaction for BenchSqliteTransaction {
             self.conn.execute(sql).await.map_err(|error| LixError {
                 message: error.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new() });
+            return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
         }
 
         let mut query = sqlx::query(sql);
@@ -136,6 +148,15 @@ impl LixTransaction for BenchSqliteTransaction {
             .map_err(|error| LixError {
                 message: error.to_string(),
             })?;
+        let columns = rows
+            .first()
+            .map(|row| {
+                row.columns()
+                    .iter()
+                    .map(|column| column.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let mut out_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -145,7 +166,10 @@ impl LixTransaction for BenchSqliteTransaction {
             }
             out_rows.push(out);
         }
-        Ok(QueryResult { rows: out_rows })
+        Ok(QueryResult {
+            rows: out_rows,
+            columns,
+        })
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {

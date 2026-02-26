@@ -645,9 +645,10 @@ mod tests {
                     .clone();
                 return Ok(QueryResult {
                     rows: vec![vec![Value::Text(snapshot)]],
+                    columns: vec!["snapshot_content".to_string()],
                 });
             }
-            Ok(QueryResult { rows: Vec::new() })
+            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -682,7 +683,7 @@ mod tests {
             _sql: &str,
             _params: &[Value],
         ) -> Result<QueryResult, LixError> {
-            Ok(QueryResult { rows: Vec::new() })
+            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
         }
 
         async fn commit(self: Box<Self>) -> Result<(), LixError> {

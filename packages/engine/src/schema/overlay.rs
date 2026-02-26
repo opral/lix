@@ -151,10 +151,11 @@ mod tests {
                     if let Some(snapshot_content) = self.schema_rows.get(&entity_id) {
                         return Ok(QueryResult {
                             rows: vec![vec![Value::Text(snapshot_content.clone())]],
+                            columns: vec!["snapshot_content".to_string()],
                         });
                     }
                 }
-                return Ok(QueryResult { rows: Vec::new() });
+                return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
             }
 
             if sql.contains("SELECT schema_version, snapshot_content") {
@@ -165,10 +166,14 @@ mod tests {
                                 Value::Text(schema_version.clone()),
                                 Value::Text(snapshot_content.clone()),
                             ]],
+                            columns: vec![
+                                "schema_version".to_string(),
+                                "snapshot_content".to_string(),
+                            ],
                         });
                     }
                 }
-                return Ok(QueryResult { rows: Vec::new() });
+                return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
             }
 
             Err(LixError {
