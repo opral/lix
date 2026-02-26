@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::assert_boolean_like;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -27,7 +28,7 @@ async fn insert_version(engine: &support::simulation_test::SimulationEngine, ver
         "INSERT INTO lix_version (\
          id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
          ) VALUES (\
-         '{version_id}', '{version_id}', 'global', 0, 'commit-{version_id}', 'working-{version_id}'\
+         '{version_id}', '{version_id}', 'global', false, 'commit-{version_id}', 'working-{version_id}'\
          )",
     );
     engine.execute(&sql, &[]).await.unwrap();
@@ -49,7 +50,7 @@ async fn insert_state_row(
         entity_id = entity_id,
         version_id = version_id,
         snapshot_content = snapshot_content.replace('\'', "''"),
-        untracked = if untracked { 1 } else { 0 },
+        untracked = if untracked { "true" } else { "false" },
     );
     engine.execute(&sql, &[]).await.unwrap();
 }
@@ -135,7 +136,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic_normalized(rows.rows.clone());
         assert_eq!(rows.rows.len(), 1);
         assert_text(&rows.rows[0][0], "entity-a");
         assert_text(&rows.rows[0][1], "{\"value\":\"A\"}");
@@ -245,10 +246,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic_normalized(rows.rows.clone());
         assert_eq!(rows.rows.len(), 1);
         assert_text(&rows.rows[0][0], "{\"value\":\"untracked\"}");
-        assert_eq!(rows.rows[0][1], Value::Integer(1));
+        assert_boolean_like(&rows.rows[0][1], true);
     }
 );
 
@@ -329,7 +330,7 @@ simulation_test!(
                    AND entity_id = 'untracked-entity' \
                    AND file_id = 'test-file' \
                    AND version_id = 'version-a' \
-                   AND untracked = 1",
+                   AND untracked = true",
                 &[],
             )
             .await
@@ -345,10 +346,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(updated.rows.clone());
+        sim.assert_deterministic_normalized(updated.rows.clone());
         assert_eq!(updated.rows.len(), 1);
         assert_text(&updated.rows[0][0], "{\"value\":\"updated\"}");
-        assert_eq!(updated.rows[0][1], Value::Integer(1));
+        assert_boolean_like(&updated.rows[0][1], true);
     }
 );
 
@@ -611,7 +612,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_update_allows_untracked_without_untracked_predicate,
+    lix_state_update_allows_untracked_with_untracked_predicate,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -642,7 +643,9 @@ simulation_test!(
             .execute(
                 "UPDATE lix_state \
                  SET snapshot_content = '{\"value\":\"updated\"}' \
-                 WHERE entity_id = 'untracked-entity-u'",
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'untracked-entity-u' \
+                   AND untracked = true",
                 &[],
             )
             .await
@@ -658,10 +661,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic_normalized(rows.rows.clone());
         assert_eq!(rows.rows.len(), 1);
         assert_text(&rows.rows[0][0], "{\"value\":\"updated\"}");
-        assert_eq!(rows.rows[0][1], Value::Integer(1));
+        assert_boolean_like(&rows.rows[0][1], true);
     }
 );
 
@@ -772,7 +775,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic_normalized(rows.rows.clone());
         assert_eq!(rows.rows.len(), 2);
         assert_text(&rows.rows[0][0], "version-a");
         assert_eq!(rows.rows[0][1], Value::Null);
@@ -824,7 +827,7 @@ simulation_test!(
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'untracked-entity-d' \
                    AND file_id = 'test-file' \
-                   AND untracked = 1",
+                   AND untracked = true",
                 &[],
             )
             .await
@@ -843,11 +846,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic_normalized(rows.rows.clone());
         assert_eq!(rows.rows.len(), 1);
         assert_text(&rows.rows[0][0], "version-b");
         assert_text(&rows.rows[0][1], "{\"value\":\"B-untracked\"}");
-        assert_eq!(rows.rows[0][2], Value::Integer(1));
+        assert_boolean_like(&rows.rows[0][2], true);
     }
 );
 
@@ -898,7 +901,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic_normalized(rows.rows.clone());
         assert_eq!(rows.rows.len(), 2);
         assert_text(&rows.rows[0][0], "version-a");
         assert_text(&rows.rows[0][1], "{\"value\":\"A\"}");

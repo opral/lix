@@ -57,7 +57,7 @@ fn build_lix_active_version_view_query() -> Result<Query, LixError> {
          WHERE schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \
            AND version_id = '{storage_version_id}' \
-           AND untracked = 1 \
+           AND untracked = true \
            AND snapshot_content IS NOT NULL",
         schema_key = escape_sql_string(active_version_schema_key()),
         file_id = escape_sql_string(active_version_file_id()),
@@ -100,6 +100,6 @@ mod tests {
 
         assert!(!sql.contains("FROM lix_active_version"));
         assert!(sql.contains("lix_internal_state_vtable"));
-        assert!(sql.contains("untracked = 1"));
+        assert!(sql.contains("untracked = true"));
     }
 }

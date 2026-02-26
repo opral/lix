@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::assert_boolean_like;
 
 simulation_test!(
     vtable_read_prioritizes_untracked_over_tracked,
@@ -43,7 +44,7 @@ simulation_test!(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
              )",
                 &[],
             )
@@ -59,13 +60,13 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(read.rows.clone());
+        sim.assert_deterministic_normalized(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
             Value::Text("{\"key\":\"untracked\"}".to_string())
         );
-        assert_eq!(read.rows[0][1], Value::Integer(1));
+        assert_boolean_like(&read.rows[0][1], true);
     }
 );
 
@@ -113,13 +114,13 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(read.rows.clone());
+        sim.assert_deterministic_normalized(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
-        assert_eq!(read.rows[0][1], Value::Integer(0));
+        assert_boolean_like(&read.rows[0][1], false);
     }
 );
 
@@ -191,7 +192,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(read.rows.clone());
+        sim.assert_deterministic_normalized(read.rows.clone());
         assert_eq!(read.rows.len(), 3);
         assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
         assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
@@ -272,7 +273,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(read.rows.clone());
+        sim.assert_deterministic_normalized(read.rows.clone());
         assert_eq!(read.rows.len(), 3);
         assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
         assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
@@ -714,7 +715,7 @@ simulation_test!(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
              )",
                 &[],
             )
@@ -724,7 +725,7 @@ simulation_test!(
         // Delete untracked row.
         engine
         .execute(
-            "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = 1",
+            "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = true",
             &[],
         )
         .await
@@ -739,12 +740,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(read.rows.clone());
+        sim.assert_deterministic_normalized(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
-        assert_eq!(read.rows[0][1], Value::Integer(0));
+        assert_boolean_like(&read.rows[0][1], false);
     }
 );

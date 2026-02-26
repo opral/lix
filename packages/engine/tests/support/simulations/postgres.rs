@@ -305,6 +305,7 @@ fn bind_param_postgres<'q>(
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match param {
         Value::Null => query.bind(Option::<i64>::None),
+        Value::Boolean(v) => query.bind(*v),
         Value::Integer(v) => query.bind(*v),
         Value::Real(v) => query.bind(*v),
         Value::Text(v) => query.bind(v.as_str()),
@@ -339,7 +340,7 @@ fn map_postgres_value(row: &sqlx::postgres::PgRow, index: usize) -> Result<Value
         return Ok(Value::Real(value as f64));
     }
     if let Ok(value) = row.try_get::<bool, _>(index) {
-        return Ok(Value::Integer(if value { 1 } else { 0 }));
+        return Ok(Value::Boolean(value));
     }
     if let Ok(value) = row.try_get::<String, _>(index) {
         return Ok(Value::Text(value));

@@ -163,7 +163,7 @@ pub async fn persist_sequence_highest(
     let sql = format!(
         "INSERT INTO lix_internal_state_vtable \
          (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked) \
-         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', 1)",
+         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', true)",
         entity_id = escape_sql_string(SEQUENCE_KEY),
         schema_key = escape_sql_string(key_value_schema_key()),
         file_id = escape_sql_string(key_value_file_id()),

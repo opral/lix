@@ -3,6 +3,15 @@ mod support;
 use lix_engine::Value;
 use support::simulation_test::SimulationArgs;
 
+fn assert_true_like(value: &Value) {
+    match value {
+        Value::Boolean(value) => assert!(*value),
+        Value::Integer(value) => assert_eq!(*value, 1),
+        Value::Text(value) => assert!(matches!(value.as_str(), "true" | "TRUE" | "1")),
+        other => panic!("expected boolean-like true value, got {other:?}"),
+    }
+}
+
 fn parse_snapshot(value: &Value) -> serde_json::Value {
     let text = match value {
         Value::Text(value) => value,
@@ -19,7 +28,7 @@ async fn read_active_version_value(engine: &support::simulation_test::Simulation
              WHERE schema_key = 'lix_active_version' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
-               AND untracked = 1 \
+               AND untracked = true \
              ORDER BY updated_at DESC \
              LIMIT 1",
             &[],
@@ -69,7 +78,7 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
              WHERE schema_key = 'lix_active_version' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
-               AND untracked = 1 \
+               AND untracked = true \
              ORDER BY updated_at DESC \
              LIMIT 1",
             &[],
@@ -88,7 +97,7 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
         .as_str()
         .expect("active version snapshot should include string version_id");
     assert!(!active_version_id.is_empty());
-    assert_eq!(row.rows[0][2], Value::Integer(1));
+    assert_true_like(&row.rows[0][2]);
 
     sim.assert_deterministic(entity_id.to_string());
     sim.assert_deterministic(active_version_id.to_string());
@@ -127,7 +136,7 @@ simulation_test!(init_seeds_default_active_version, |sim| async move {
              WHERE schema_key = 'lix_active_version' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
-               AND untracked = 1 \
+               AND untracked = true \
              ORDER BY updated_at DESC \
              LIMIT 1",
             &[],
@@ -146,7 +155,7 @@ simulation_test!(init_seeds_default_active_version, |sim| async move {
         .as_str()
         .expect("active version snapshot should include string version_id");
     assert!(!active_version_id.is_empty());
-    assert_eq!(row.rows[0][2], Value::Integer(1));
+    assert_true_like(&row.rows[0][2]);
 
     let version = engine
         .execute(
@@ -256,7 +265,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_internal_state_vtable \
                  SET snapshot_content = $1 \
-                 WHERE untracked = 1 \
+                 WHERE untracked = true \
                    AND schema_key = 'lix_active_version' \
                    AND file_id = 'lix' \
                    AND version_id = 'global'",
@@ -290,7 +299,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_internal_state_vtable \
                  SET snapshot_content = $1 \
-                 WHERE untracked = 1 \
+                 WHERE untracked = true \
                    AND schema_key = 'lix_active_version' \
                    AND file_id = 'lix' \
                    AND version_id = 'global'",

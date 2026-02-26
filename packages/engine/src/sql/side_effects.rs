@@ -925,7 +925,7 @@ fn build_detected_file_domain_changes_insert(
             None => Value::Null,
         });
         if untracked {
-            params.push(Value::Integer(1));
+            params.push(Value::Boolean(true));
         }
     }
 

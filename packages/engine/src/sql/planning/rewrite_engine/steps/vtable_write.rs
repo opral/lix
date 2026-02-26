@@ -617,14 +617,9 @@ fn split_insert_rows(
 
         let untracked = match untracked_value {
             None => false,
-            Some(cell) if is_untracked_true_value(cell) => true,
-            Some(cell) if is_untracked_false_value(cell) => false,
-            Some(_) => {
-                return Err(LixError {
-                    message: "vtable insert requires literal or parameter untracked values"
-                        .to_string(),
-                })
-            }
+            Some(cell) => parse_untracked_bool_like_value(cell).ok_or_else(|| LixError {
+                message: "vtable insert requires literal or parameter untracked values".to_string(),
+            })?,
         };
 
         if untracked {
@@ -1296,6 +1291,7 @@ fn table_with_joins_for(table: &str) -> TableWithJoins {
 fn value_to_expr(value: &EngineValue) -> Result<Expr, LixError> {
     match value {
         EngineValue::Null => Ok(null_expr()),
+        EngineValue::Boolean(value) => Ok(Expr::Value(Value::Boolean(*value).into())),
         EngineValue::Text(text) => Ok(string_expr(text)),
         EngineValue::Integer(value) => {
             Ok(Expr::Value(Value::Number(value.to_string(), false).into()))
@@ -1761,10 +1757,6 @@ fn expr_is_untracked_column(expr: &Expr) -> bool {
 fn is_untracked_true_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Value(ValueWithSpan {
-            value: Value::Number(value, _),
-            ..
-        }) => value == "1",
-        Expr::Value(ValueWithSpan {
             value: Value::Boolean(value),
             ..
         }) => *value,
@@ -1775,10 +1767,6 @@ fn is_untracked_true_literal(expr: &Expr) -> bool {
 fn is_untracked_false_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Value(ValueWithSpan {
-            value: Value::Number(value, _),
-            ..
-        }) => value == "0",
-        Expr::Value(ValueWithSpan {
             value: Value::Boolean(value),
             ..
         }) => !*value,
@@ -1786,17 +1774,10 @@ fn is_untracked_false_literal(expr: &Expr) -> bool {
     }
 }
 
-fn is_untracked_true_value(cell: &ResolvedCell) -> bool {
+fn parse_untracked_bool_like_value(cell: &ResolvedCell) -> Option<bool> {
     match cell.value.as_ref() {
-        Some(EngineValue::Integer(value)) => *value == 1,
-        _ => false,
-    }
-}
-
-fn is_untracked_false_value(cell: &ResolvedCell) -> bool {
-    match cell.value.as_ref() {
-        Some(EngineValue::Integer(value)) => *value == 0,
-        _ => false,
+        Some(EngineValue::Boolean(value)) => Some(*value),
+        _ => None,
     }
 }
 
@@ -2618,7 +2599,7 @@ mod tests {
     fn rewrite_untracked_insert_routes_to_untracked_table() {
         let sql = r#"INSERT INTO lix_internal_state_vtable
             (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked)
-            VALUES ('entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{"key":"value"}', '1', 1)"#;
+            VALUES ('entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{"key":"value"}', '1', true)"#;
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
         let statement = statements.remove(0);
 
@@ -2635,6 +2616,64 @@ mod tests {
         assert_eq!(rewrite.statements.len(), 1);
         let stmt = &rewrite.statements[0];
         assert_eq!(table_name(stmt), "lix_internal_state_untracked");
+    }
+
+    #[test]
+    fn rewrite_untracked_insert_accepts_true_boolean_parameter() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable
+            (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked)
+            VALUES ('entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{"key":"value"}', '1', ?)"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let insert = match statement {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+
+        let mut provider = SystemFunctionProvider;
+        let rewrite = rewrite_insert(
+            insert,
+            &[EngineValue::Boolean(true)],
+            &mut provider,
+        )
+        .expect("rewrite ok")
+        .expect("rewrite applied");
+
+        assert_eq!(rewrite.statements.len(), 1);
+        let stmt = &rewrite.statements[0];
+        assert_eq!(table_name(stmt), "lix_internal_state_untracked");
+    }
+
+    #[test]
+    fn rewrite_untracked_insert_rejects_numeric_parameter() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable
+            (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked)
+            VALUES ('entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{"key":"value"}', '1', ?)"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let insert = match statement {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+
+        let mut provider = SystemFunctionProvider;
+        let error = match rewrite_insert(
+            insert,
+            &[EngineValue::Integer(1)],
+            &mut provider,
+        ) {
+            Ok(_) => panic!("expected rewrite error"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message
+                .contains("vtable insert requires literal or parameter untracked values"),
+            "unexpected error message: {}",
+            error.message
+        );
     }
 
     #[test]

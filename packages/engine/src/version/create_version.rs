@@ -53,7 +53,7 @@ async fn create_version_in_transaction(
         "inherits_from_version_id",
     )?
     .unwrap_or(active_version_id);
-    let hidden = if options.hidden { 1 } else { 0 };
+    let hidden = options.hidden;
     let working_commit_id = generate_uuid(tx).await?;
     let working_change_set_id = generate_uuid(tx).await?;
 
@@ -98,7 +98,7 @@ async fn create_version_in_transaction(
             Value::Text(id.clone()),
             Value::Text(name.clone()),
             Value::Text(inherits_from_version_id.clone()),
-            Value::Integer(hidden),
+            Value::Boolean(hidden),
             Value::Text(active_commit_id),
             Value::Text(working_commit_id),
         ],

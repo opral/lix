@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::assert_boolean_like;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -31,22 +32,6 @@ fn assert_integer(value: &Value, expected: i64) {
     match value {
         Value::Integer(actual) => assert_eq!(*actual, expected),
         other => panic!("expected integer value {expected}, got {other:?}"),
-    }
-}
-
-fn assert_boolean_like(value: &Value, expected: bool) {
-    match value {
-        Value::Integer(actual) => assert_eq!(*actual != 0, expected),
-        Value::Text(actual) => {
-            let normalized = actual.trim().to_ascii_lowercase();
-            let parsed = match normalized.as_str() {
-                "1" | "true" => true,
-                "0" | "false" => false,
-                _ => panic!("expected boolean-like text, got '{actual}'"),
-            };
-            assert_eq!(parsed, expected);
-        }
-        other => panic!("expected boolean-like value, got {other:?}"),
     }
 }
 
@@ -93,7 +78,7 @@ async fn insert_version(
         "INSERT INTO lix_version (\
          id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
          ) VALUES (\
-         '{version_id}', '{version_id}', '{parent_version_id}', 0, 'commit-{version_id}', 'working-{version_id}'\
+         '{version_id}', '{version_id}', '{parent_version_id}', false, 'commit-{version_id}', 'working-{version_id}'\
          )",
     );
     engine.execute(&sql, &[]).await.unwrap();
@@ -1955,7 +1940,7 @@ simulation_test!(
                     "INSERT INTO lix_internal_state_vtable (\
                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
-                        'file-path-untracked', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', '{snapshot_content}', '1', 1\
+                        'file-path-untracked', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', '{snapshot_content}', '1', true\
                      )",
                     version_id = version_id_sql,
                     snapshot_content = snapshot_content
@@ -1969,7 +1954,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_file \
                  SET path = '/docs/guides/a.md' \
-                 WHERE id = 'file-path-untracked' AND lixcol_untracked = 1",
+                 WHERE id = 'file-path-untracked' AND lixcol_untracked = true",
                 &[],
             )
             .await
@@ -1979,7 +1964,7 @@ simulation_test!(
             .execute(
                 "SELECT path \
                  FROM lix_file \
-                 WHERE id = 'file-path-untracked' AND lixcol_untracked = 1",
+                 WHERE id = 'file-path-untracked' AND lixcol_untracked = true",
                 &[],
             )
             .await
@@ -2057,7 +2042,7 @@ simulation_test!(
                     "INSERT INTO lix_internal_state_vtable (\
                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
-                        'file-tombstone-fast-path', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', NULL, '1', 1\
+                        'file-tombstone-fast-path', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', NULL, '1', true\
                      )"
                 ),
                 &[],

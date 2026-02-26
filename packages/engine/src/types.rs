@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
+    Boolean(bool),
     Integer(i64),
     Real(f64),
     Text(String),

@@ -112,11 +112,11 @@ fn build_effective_state_by_version_view_query(
         String::new()
     };
     let commit_expr = if include_commit_mapping {
-        "COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) \
+        "COALESCE(cc.commit_id, CASE WHEN s.untracked = true THEN 'untracked' ELSE NULL END) \
              AS commit_id"
             .to_string()
     } else {
-        "CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END AS commit_id".to_string()
+        "CASE WHEN s.untracked = true THEN 'untracked' ELSE NULL END AS commit_id".to_string()
     };
     let sql = format!(
         "SELECT \
@@ -433,11 +433,11 @@ fn build_effective_state_active_view_query(
         String::new()
     };
     let commit_expr = if include_commit_mapping {
-        "COALESCE(cc.commit_id, CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END) \
+        "COALESCE(cc.commit_id, CASE WHEN s.untracked = true THEN 'untracked' ELSE NULL END) \
              AS commit_id"
             .to_string()
     } else {
-        "CASE WHEN s.untracked = 1 THEN 'untracked' ELSE NULL END AS commit_id".to_string()
+        "CASE WHEN s.untracked = true THEN 'untracked' ELSE NULL END AS commit_id".to_string()
     };
     let sql = format!(
         "SELECT \
@@ -832,7 +832,7 @@ fn build_untracked_union_query(
     let mut union_parts = Vec::new();
     union_parts.push(format!(
         "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, NULL AS writer_key, 1 AS untracked, 1 AS priority \
+                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, NULL AS writer_key, true AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
         untracked = UNTRACKED_TABLE
@@ -847,7 +847,7 @@ fn build_untracked_union_query(
             .unwrap_or_default();
         union_parts.push(format!(
             "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, inherited_from_version_id, change_id, writer_key, 0 AS untracked, 2 AS priority \
+                    created_at, updated_at, inherited_from_version_id, change_id, writer_key, false AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
             materialized_where = materialized_where

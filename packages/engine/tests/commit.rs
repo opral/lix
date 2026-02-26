@@ -303,7 +303,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES (\
-                 'entity-untracked', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"local\"}', '1', 1\
+                 'entity-untracked', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"local\"}', '1', true\
                  )",
                 &[],
             )
@@ -336,7 +336,11 @@ simulation_test!(
             row.rows[0][0],
             Value::Text("{\"key\":\"local\"}".to_string())
         );
-        assert_eq!(row.rows[0][1], Value::Integer(1));
+        match &row.rows[0][1] {
+            Value::Boolean(value) => assert!(*value),
+            Value::Integer(value) => assert_eq!(*value, 1),
+            other => panic!("expected true-like untracked marker, got {other:?}"),
+        }
     }
 );
 

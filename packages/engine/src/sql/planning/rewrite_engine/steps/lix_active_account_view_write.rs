@@ -204,7 +204,7 @@ fn build_vtable_insert(rows: Vec<InsertRow>) -> Result<Insert, LixError> {
         .iter()
         .map(|row| {
             format!(
-                "('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', 1)",
+                "('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', '{schema_version}', true)",
                 entity_id = escape_sql_string(&row.entity_id),
                 schema_key = escape_sql_string(active_account_schema_key()),
                 file_id = escape_sql_string(active_account_file_id()),
@@ -240,7 +240,7 @@ fn build_vtable_delete(entity_ids: Vec<String>) -> Result<Statement, LixError> {
          WHERE schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}' \
-           AND untracked = 1 \
+           AND untracked = true \
            AND entity_id IN ({in_values})",
         vtable = VTABLE_NAME,
         schema_key = escape_sql_string(active_account_schema_key()),
