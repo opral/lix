@@ -47,6 +47,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 
+#[path = "api.rs"]
+mod api;
 #[path = "init/active_version.rs"]
 mod init_active_version;
 #[path = "init/bootstrap.rs"]

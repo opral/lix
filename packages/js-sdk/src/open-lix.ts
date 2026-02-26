@@ -265,40 +265,32 @@ export async function openLix(
     args2: CreateVersionOptions = {},
   ): Promise<CreateVersionResult> => {
     ensureOpen("createVersion");
-    const activeVersionResult = await execute(
-      "SELECT av.version_id, v.commit_id \
-       FROM lix_active_version av \
-       JOIN lix_version v ON v.id = av.version_id \
-       ORDER BY av.id LIMIT 1",
-    );
-    const activeVersionRow = firstRow(activeVersionResult, "active version");
-    const activeVersionId = valueAsText(
-      activeVersionRow[0],
-      "active_version.version_id",
-    );
-    const commitId = valueAsText(activeVersionRow[1], "lix_version.commit_id");
-
-    const id =
-      args2.id ??
-      valueAsText(
-        firstRow(await execute("SELECT lix_uuid_v7()"), "generated version id")[0],
-        "lix_uuid_v7()",
-      );
-    const name = args2.name ?? id;
-    const inheritsFromVersionId = args2.inheritsFromVersionId ?? activeVersionId;
-    const hidden = args2.hidden === true ? 1 : 0;
-    const workingCommitId = valueAsText(
-      firstRow(await execute("SELECT lix_uuid_v7()"), "generated working commit id")[0],
-      "lix_uuid_v7()",
-    );
-
-    await execute(
-      "INSERT INTO lix_version (\
-       id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
-       ) VALUES (?, ?, ?, ?, ?, ?)",
-      [id, name, inheritsFromVersionId, hidden, commitId, workingCommitId],
-    );
-
+    if (typeof (wasmLix as any).createVersion !== "function") {
+      throw new Error("createVersion is not available in this wasm build");
+    }
+    const raw = await (wasmLix as any).createVersion(args2);
+    if (!raw || typeof raw !== "object") {
+      throw new Error("createVersion() must return an object");
+    }
+    const id = (raw as { id?: unknown }).id;
+    const name = (raw as { name?: unknown }).name;
+    const inheritsFromVersionId =
+      (
+        raw as {
+          inheritsFromVersionId?: unknown;
+          inherits_from_version_id?: unknown;
+        }
+      ).inheritsFromVersionId ??
+      (raw as { inherits_from_version_id?: unknown }).inherits_from_version_id;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error("createVersion() result is missing string id");
+    }
+    if (typeof name !== "string" || name.length === 0) {
+      throw new Error("createVersion() result is missing string name");
+    }
+    if (typeof inheritsFromVersionId !== "string" || inheritsFromVersionId.length === 0) {
+      throw new Error("createVersion() result is missing string inheritsFromVersionId");
+    }
     return { id, name, inheritsFromVersionId };
   };
 
@@ -307,7 +299,10 @@ export async function openLix(
     if (!versionId || typeof versionId !== "string") {
       throw new Error("switchVersion requires a non-empty versionId string");
     }
-    await execute("UPDATE lix_active_version SET version_id = ?", [versionId]);
+    if (typeof (wasmLix as any).switchVersion !== "function") {
+      throw new Error("switchVersion is not available in this wasm build");
+    }
+    await (wasmLix as any).switchVersion(versionId);
   };
 
   const installPlugin = async (args2: InstallPluginOptions): Promise<void> => {
@@ -464,25 +459,4 @@ function isNodeRuntime(): boolean {
     typeof globalProcess.versions === "object" &&
     typeof globalProcess.versions?.node === "string"
   );
-}
-
-function firstRow(result: QueryResult, context: string): unknown[] {
-  const rows = (result as any)?.rows;
-  if (!Array.isArray(rows) || rows.length === 0 || !Array.isArray(rows[0])) {
-    throw new Error(`Expected at least one row while reading ${context}`);
-  }
-  return rows[0] as unknown[];
-}
-
-function valueAsText(value: unknown, fieldName: string): string {
-  const parsed = Value.from(value);
-  const text = parsed.asText();
-  if (text !== undefined) {
-    return text;
-  }
-  const integer = parsed.asInteger();
-  if (integer !== undefined) {
-    return integer.toString();
-  }
-  throw new Error(`Expected text-like value for ${fieldName}`);
 }
