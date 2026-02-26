@@ -5,6 +5,7 @@ pub struct CreateVersionOptions {
     pub id: Option<String>,
     pub name: Option<String>,
     pub inherits_from_version_id: Option<String>,
+    #[serde(default)]
     pub hidden: bool,
 }
 
@@ -246,4 +247,17 @@ fn normalize_parent_commit_ids(
     parent_commit_ids.sort();
     parent_commit_ids.dedup();
     parent_commit_ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CreateVersionOptions;
+
+    #[test]
+    fn create_version_options_deserialize_defaults_hidden() {
+        let options: CreateVersionOptions =
+            serde_json::from_str(r#"{"id":"test-version"}"#).expect("deserialization should work");
+        assert_eq!(options.id.as_deref(), Some("test-version"));
+        assert!(!options.hidden);
+    }
 }
