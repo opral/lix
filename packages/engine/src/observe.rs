@@ -257,43 +257,35 @@ fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommi
 
     for relation in &derived.relations {
         match relation.as_str() {
-            "state"
-            | "state_by_version"
-            | "state_history"
-            | "lix_state"
+            "lix_state"
             | "lix_state_by_version"
             | "lix_state_history"
+            | "lix_working_changes"
             | "lix_internal_state_vtable"
             | "lix_internal_state_untracked" => {
                 uses_dynamic_state_relations = true;
             }
-            "file"
-            | "file_by_version"
-            | "file_history"
-            | "lix_file"
+            "lix_file"
             | "lix_file_by_version"
             | "lix_file_history" => {
                 schema_keys.insert("lix_file_descriptor".to_string());
             }
-            "directory"
-            | "directory_by_version"
-            | "directory_history"
-            | "lix_directory"
+            "lix_directory"
             | "lix_directory_by_version"
             | "lix_directory_history" => {
                 schema_keys.insert("lix_directory_descriptor".to_string());
             }
-            "version" | "version_by_version" | "lix_version" | "lix_version_by_version" => {
+            "lix_version" | "lix_version_by_version" => {
                 schema_keys.insert("lix_version_descriptor".to_string());
                 schema_keys.insert("lix_version_tip".to_string());
             }
-            "active_version" | "lix_active_version" => {
+            "lix_active_version" => {
                 schema_keys.insert("lix_active_version".to_string());
             }
-            "active_account" | "lix_active_account" => {
+            "lix_active_account" => {
                 schema_keys.insert("lix_active_account".to_string());
             }
-            "change" => {
+            "lix_change" => {
                 schema_keys.insert("lix_change".to_string());
             }
             _ => {

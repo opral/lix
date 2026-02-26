@@ -11,6 +11,7 @@ pub mod lix_state_history_view_read;
 pub mod lix_state_history_view_write;
 pub mod lix_state_view_read;
 pub mod lix_state_view_write;
+pub mod lix_working_changes_view_read;
 pub mod lix_version_view_read;
 pub mod lix_version_view_write;
 pub(crate) mod state_pushdown;
