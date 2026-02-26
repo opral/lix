@@ -7,6 +7,12 @@ use crate::builtin_schema::{
 };
 use crate::LixError;
 
+mod create_version;
+mod switch_version;
+
+pub use create_version::{create_version, CreateVersionOptions, CreateVersionResult};
+pub use switch_version::switch_version;
+
 pub(crate) const GLOBAL_VERSION_ID: &str = "global";
 pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
 
