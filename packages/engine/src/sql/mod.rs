@@ -1,4 +1,3 @@
-pub(crate) mod api;
 pub(crate) mod ast;
 pub(crate) mod contracts;
 pub(crate) mod execution;

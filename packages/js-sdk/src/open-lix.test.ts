@@ -35,6 +35,37 @@ test("createVersion + switchVersion use the JS API surface", async () => {
   await lix.close();
 });
 
+test("createVersion forwards inheritsFromVersionId and hidden options", async () => {
+  const lix = await openLix();
+
+  const created = await lix.createVersion({
+    id: "branch-options",
+    name: "Branch Options",
+    inheritsFromVersionId: "global",
+    hidden: true,
+  });
+  expect(created).toEqual({
+    id: "branch-options",
+    name: "Branch Options",
+    inheritsFromVersionId: "global",
+  });
+
+  const row = await lix.execute(
+    "SELECT id, name, inherits_from_version_id, hidden \
+     FROM lix_version \
+     WHERE id = ? \
+     LIMIT 1",
+    ["branch-options"],
+  );
+  expect(row.rows.length).toBe(1);
+  expect(row.rows[0][0]).toEqual({ kind: "Text", value: "branch-options" });
+  expect(row.rows[0][1]).toEqual({ kind: "Text", value: "Branch Options" });
+  expect(row.rows[0][2]).toEqual({ kind: "Text", value: "global" });
+  expect(row.rows[0][3]).toEqual({ kind: "Integer", value: 1 });
+
+  await lix.close();
+});
+
 test("createCheckpoint returns checkpoint metadata and rotates working pointer", async () => {
   const lix = await openLix();
   await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
