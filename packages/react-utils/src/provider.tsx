@@ -1,5 +1,5 @@
 import { createContext, type ReactNode } from "react";
-import type { Lix } from "../../sdk/dist/index.js";
+import type { Lix } from "@lix-js/sdk";
 
 export const LixContext = createContext<Lix | null>(null);
 

@@ -20,9 +20,9 @@ test("useLix returns the Lix instance when used inside LixProvider", async () =>
 	const { result } = renderHook(() => useLix(), { wrapper });
 
 	expect(result.current).toBe(lix);
-	expect(result.current.db).toBeDefined();
+	expect(result.current.execute).toBeDefined();
 	expect(result.current.observe).toBeDefined();
-	expect(result.current.hooks).toBeDefined();
+	expect(result.current.close).toBeDefined();
 
 	await lix.close();
 });

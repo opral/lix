@@ -1,19 +1,26 @@
-import { useMemo, useContext, useEffect, useState, use } from "react";
+import { useContext, useEffect, useState, use } from "react";
 import type { Lix } from "@lix-js/sdk";
 import { LixContext } from "../provider.js";
-import type { SelectQueryBuilder } from "@lix-js/sdk/dependency/kysely";
 
 // Map to cache promises by query key
 const queryPromiseCache = new Map<string, Promise<any>>();
+const lixInstanceIds = new WeakMap<object, number>();
+let nextLixInstanceId = 1;
 
 interface UseQueryOptions {
 	subscribe?: boolean;
 }
 
-// New API: the query factory receives an object to allow future extensibility.
-type QueryFactory<TRow> = (args: {
-	lix: Lix;
-}) => SelectQueryBuilder<any, any, TRow>;
+// Query factory receives a lix instance and returns a compilable+executable query.
+interface QueryLike<TRow> {
+	compile(): {
+		sql: string;
+		parameters: ReadonlyArray<unknown>;
+	};
+	execute(): Promise<TRow[]>;
+}
+
+type QueryFactory<TRow> = (lix: Lix) => QueryLike<TRow>;
 
 /**
  * Subscribe to a live query using React 19 Suspense.
@@ -21,15 +28,15 @@ type QueryFactory<TRow> = (args: {
  * The hook suspends on first render and re-suspends whenever its SQL changes,
  * so wrap consuming components with React Suspense and an ErrorBoundary.
  *
- * @param query - Factory function that creates a Kysely SelectQueryBuilder. Preferred shape: `({ lix }) => ...`.
+ * @param query - Factory function that creates a compiled+executable query object. Preferred shape: `(lix) => qb(lix).selectFrom(...)`.
  * @param options - Optional configuration
  * @param options.subscribe - Whether to subscribe to live updates (default: true)
  *
  * @example
  * // Basic list
  * function KeyValueList() {
- *   const keyValues = useQuery(({ lix }) =>
- *     lix.db.selectFrom('key_value')
+ *   const keyValues = useQuery((lix) =>
+ *     qb(lix).selectFrom('lix_key_value')
  *       .where('key', 'like', 'example_%')
  *       .selectAll()
  *   );
@@ -60,7 +67,7 @@ type QueryFactory<TRow> = (args: {
  * @example
  * // One-time query without live updates
  * const config = useQuery(
- *   ({ lix }) => lix.db.selectFrom('config').selectAll(),
+ *   (lix) => qb(lix).selectFrom('config').selectAll(),
  *   { subscribe: false }
  * );
  */
@@ -72,19 +79,15 @@ export function useQuery<TRow>(
 	if (!lix) throw new Error("useQuery must be used inside <LixProvider>.");
 
 	const { subscribe = true } = options;
-
-	// Compile the query to build a cache key and avoid re-creating builders.
-	const { cacheKey, execute } = useMemo(() => {
-		const builder = query({ lix });
-		const compiled = builder.compile();
-		const key =
-			`${subscribe ? "sub" : "once"}:` +
-			`${compiled.sql}:${JSON.stringify(compiled.parameters)}`;
-		return {
-			cacheKey: key,
-			execute: () => builder.execute() as Promise<TRow[]>,
-		};
-	}, [query, lix, subscribe]);
+	const builder = query(lix);
+	const compiled = builder.compile();
+	const observeQuery = {
+		sql: compiled.sql,
+		params: [...compiled.parameters],
+	};
+	const cacheKey =
+		`${getLixInstanceId(lix)}:${subscribe ? "sub" : "once"}:` +
+		`${compiled.sql}:${JSON.stringify(compiled.parameters)}`;
 
 	// Get or create promise. Cache key includes parameters so different queries
 	// resolve independently while reuse avoids duplicating in-flight requests.
@@ -92,7 +95,7 @@ export function useQuery<TRow>(
 	const promise: Promise<TRow[]> =
 		cached ??
 		(() => {
-			const p = execute();
+			const p = builder.execute() as Promise<TRow[]>;
 			queryPromiseCache.set(cacheKey, p);
 			return p;
 		})();
@@ -102,23 +105,48 @@ export function useQuery<TRow>(
 
 	// Local state for updates
 	const [rows, setRows] = useState(initialRows);
+	useEffect(() => {
+		setRows(initialRows);
+	}, [cacheKey]);
 
 	// Subscribe for ongoing updates (only if subscribe is true)
 	useEffect(() => {
 		if (!subscribe) return;
-		const builder = query({ lix });
-		const sub = lix.observe(builder).subscribe({
-			next: (value) => setRows(value as TRow[]),
-			error: (err) => {
+
+		let cancelled = false;
+		const events = lix.observe(observeQuery);
+
+		const observeLoop = async () => {
+			try {
+				while (!cancelled) {
+					const event = await events.next();
+					if (cancelled || event === undefined) {
+						break;
+					}
+					const nextRows = (await query(lix).execute()) as TRow[];
+					if (cancelled) {
+						return;
+					}
+					setRows(nextRows);
+				}
+			} catch (err) {
+				if (cancelled) {
+					return;
+				}
 				// Clear promise to allow retry
 				queryPromiseCache.delete(cacheKey);
 				// Surface error to ErrorBoundary
 				setRows(() => {
 					throw err instanceof Error ? err : new Error(String(err));
 				});
-			},
-		});
-		return () => sub.unsubscribe();
+			}
+		};
+
+		void observeLoop();
+		return () => {
+			cancelled = true;
+			events.close();
+		};
 	}, [cacheKey, subscribe, lix]);
 
 	if (!subscribe) {
@@ -126,6 +154,17 @@ export function useQuery<TRow>(
 	}
 
 	return rows;
+}
+
+function getLixInstanceId(lix: Lix): number {
+	const asObject = lix as object;
+	const cached = lixInstanceIds.get(asObject);
+	if (cached !== undefined) {
+		return cached;
+	}
+	const next = nextLixInstanceId++;
+	lixInstanceIds.set(asObject, next);
+	return next;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -139,8 +178,8 @@ export function useQuery<TRow>(
  * @example
  * ```tsx
  * function ExampleComponent({ itemId }: { itemId: string }) {
- *   const item = useQueryTakeFirst(({ lix }) =>
- *     lix.db.selectFrom('key_value')
+ *   const item = useQueryTakeFirst((lix) =>
+ *     qb(lix).selectFrom('lix_key_value')
  *       .where('key', '=', `example_${itemId}`)
  *       .selectAll()
  *   );
@@ -180,8 +219,8 @@ export const useQueryTakeFirst = <TResult>(
  * @example
  * ```tsx
  * function ExampleDetail({ itemId }: { itemId: string }) {
- *   const item = useQueryTakeFirstOrThrow(({ lix }) =>
- *     lix.db.selectFrom('key_value')
+ *   const item = useQueryTakeFirstOrThrow((lix) =>
+ *     qb(lix).selectFrom('lix_key_value')
  *       .where('key', '=', `example_${itemId}`)
  *       .selectAll()
  *   );

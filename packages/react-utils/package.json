@@ -25,6 +25,7 @@
 		"react": ">=19.0.0"
 	},
 	"devDependencies": {
+		"@lix-js/kysely": "workspace:*",
 		"@lix-js/sdk": "workspace:*",
 		"@testing-library/react": "^16.3.0",
 		"@types/react": "^19.1.8",

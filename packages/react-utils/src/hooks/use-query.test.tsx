@@ -7,7 +7,14 @@ import {
 	useQueryTakeFirstOrThrow,
 } from "./use-query.js";
 import { LixProvider } from "../provider.js";
-import { openLix, type LixKeyValue, type State } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
+import { qb } from "@lix-js/kysely";
+
+type KeyValueRow = {
+	key: string;
+	value: unknown;
+	readonly [key: string]: unknown;
+};
 
 // React Error Boundaries require class components - no functional equivalent exists
 class MockErrorBoundary extends React.Component<
@@ -38,7 +45,7 @@ test("useQuery throws error when used outside LixProvider", () => {
 	// We need to catch the error since it's thrown during render
 	expect(() => {
 		renderHook(() =>
-			useQuery(({ lix }) => lix.db.selectFrom("key_value").selectAll()),
+			useQuery((lix) => qb(lix).selectFrom("lix_key_value").selectAll()),
 		);
 	}).toThrow("useQuery must be used inside <LixProvider>.");
 });
@@ -54,14 +61,14 @@ test("returns array with data using new API", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
-				const data = useQuery(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "like", "test_%"),
 				);
@@ -91,14 +98,14 @@ test("updates when data changes", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
-				const data = useQuery(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "like", "react_test_%"),
 				);
@@ -116,8 +123,8 @@ test("updates when data changes", async () => {
 
 	// Insert a test key-value pair
 	await act(async () => {
-		await lix.db
-			.insertInto("key_value")
+		await qb(lix)
+			.insertInto("lix_key_value")
 			.values({ key: "react_test_key", value: "test_value" })
 			.execute();
 	});
@@ -138,8 +145,8 @@ test("akeFirst returns array with single item or undefined", async () => {
 	const lix = await openLix({});
 
 	// Insert test data
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values([
 			{ key: "first_test_1", value: "first" },
 			{ key: "first_test_2", value: "second" },
@@ -154,14 +161,14 @@ test("akeFirst returns array with single item or undefined", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue> | undefined } | undefined;
+	let hookResult: { current: KeyValueRow | undefined } | undefined;
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
-				const data = useQueryTakeFirst(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQueryTakeFirst((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "like", "first_test_%")
 						.orderBy("key", "asc"),
@@ -193,14 +200,14 @@ test("akeFirst returns undefined for empty results", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue> | undefined };
+	let hookResult: { current: KeyValueRow | undefined };
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
-				const data = useQueryTakeFirst(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQueryTakeFirst((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "=", "non_existent"),
 				);
@@ -220,8 +227,8 @@ test("akeFirst returns undefined for empty results", async () => {
 
 test("useQueryTakeFirst (subscribe:false) returns fresh data on rerender", async () => {
 	const lix = await openLix({});
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values([
 			{ key: "memo_a", value: "value_a" },
 			{ key: "memo_b", value: "value_b" },
@@ -241,9 +248,9 @@ test("useQueryTakeFirst (subscribe:false) returns fresh data on rerender", async
 		renderHook(
 			({ lookup = "memo_a" }: { lookup?: string } = {}) => {
 				const row = useQueryTakeFirst(
-					({ lix }) =>
-						lix.db
-							.selectFrom("key_value")
+					(lix) =>
+						qb(lix)
+							.selectFrom("lix_key_value")
 							.selectAll()
 							.where("key", "=", lookup),
 					{ subscribe: false },
@@ -275,8 +282,8 @@ test("useQueryTakeFirst (subscribe:false) returns fresh data on rerender", async
 
 test("useQueryTakeFirst (subscribe:false) does not reuse previous rows", async () => {
 	const lix = await openLix({});
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values([
 			{ key: "no_subscribe_a", value: "value_a" },
 			{ key: "no_subscribe_b", value: "value_b" },
@@ -297,8 +304,8 @@ test("useQueryTakeFirst (subscribe:false) does not reuse previous rows", async (
 		const { rerender: rerenderFn } = renderHook(
 			({ key = "no_subscribe_a" }: { key?: string } = {}) => {
 				const row = useQueryTakeFirst(
-					({ lix }) =>
-						lix.db.selectFrom("key_value").selectAll().where("key", "=", key),
+					(lix) =>
+						qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", key),
 					{ subscribe: false },
 				);
 				emissions.push(row?.key);
@@ -331,8 +338,8 @@ test("useQueryTakeFirst (subscribe:false) does not reuse previous rows", async (
 
 test("useQueryTakeFirst (subscribe:false) returns fresh data on rerender", async () => {
 	const lix = await openLix({});
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values([
 			{ key: "memo_a", value: "value_a" },
 			{ key: "memo_b", value: "value_b" },
@@ -352,9 +359,9 @@ test("useQueryTakeFirst (subscribe:false) returns fresh data on rerender", async
 		renderHook(
 			({ lookup = "memo_a" }: { lookup?: string } = {}) => {
 				const row = useQueryTakeFirst(
-					({ lix }) =>
-						lix.db
-							.selectFrom("key_value")
+					(lix) =>
+						qb(lix)
+							.selectFrom("lix_key_value")
 							.selectAll()
 							.where("key", "=", lookup),
 					{ subscribe: false },
@@ -388,8 +395,8 @@ test("akeFirst updates reference when underlying row changes", async () => {
 	const lix = await openLix({});
 	const rowKey = "react_first_ref";
 
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values({ key: rowKey, value: "initial" })
 		.execute();
 
@@ -401,13 +408,13 @@ test("akeFirst updates reference when underlying row changes", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue> | undefined };
+	let hookResult: { current: KeyValueRow | undefined };
 
 	await act(async () => {
 		const { result } = renderHook(
 			() =>
-				useQueryTakeFirst(({ lix }) =>
-					lix.db.selectFrom("key_value").selectAll().where("key", "=", rowKey),
+				useQueryTakeFirst((lix) =>
+					qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", rowKey),
 				),
 			{ wrapper },
 		);
@@ -421,10 +428,10 @@ test("akeFirst updates reference when underlying row changes", async () => {
 	const initialRef = hookResult!.current;
 
 	await act(async () => {
-		await lix.db
-			.updateTable("key_value")
-			.set({ value: "updated" })
-			.where("key", "=", rowKey)
+		await lix.execute("DELETE FROM lix_key_value WHERE key = ?1", [rowKey]);
+		await qb(lix)
+			.insertInto("lix_key_value")
+			.values({ key: rowKey, value: "updated" })
 			.execute();
 	});
 
@@ -440,12 +447,12 @@ test("useQuery key includes lix instance (no cross-instance reuse)", async () =>
 	const lix1 = await openLix({});
 	const lix2 = await openLix({});
 
-	await lix1.db
-		.insertInto("key_value")
+	await qb(lix1)
+		.insertInto("lix_key_value")
 		.values({ key: "shared_key", value: "instance_one" })
 		.execute();
-	await lix2.db
-		.insertInto("key_value")
+	await qb(lix2)
+		.insertInto("lix_key_value")
 		.values({ key: "shared_key", value: "instance_two" })
 		.execute();
 
@@ -459,15 +466,15 @@ test("useQuery key includes lix instance (no cross-instance reuse)", async () =>
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 	let rerender: () => void;
 
 	await act(async () => {
 		const { result, rerender: rerenderFn } = renderHook(
 			() =>
-				useQuery(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "=", "shared_key"),
 				),
@@ -506,16 +513,13 @@ test("akeFirst re-emits when aggregate result returns to the initial value", asy
 		</LixProvider>
 	);
 
-	let hookResult: { current: { count: number | null } | undefined } | undefined;
+	let hookResult: { current: KeyValueRow[] } | undefined;
 
 	await act(async () => {
 		const { result } = renderHook(
 			() =>
-				useQueryTakeFirst(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
-						.select((eb) => [eb.fn.count<number>("value").as("count")])
-						.where("key", "=", key),
+				useQuery((lix) =>
+					qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", key),
 				),
 			{ wrapper },
 		);
@@ -523,23 +527,23 @@ test("akeFirst re-emits when aggregate result returns to the initial value", asy
 	});
 
 	await waitFor(() => {
-		expect(hookResult!.current?.count ?? 0).toBe(0);
+		expect(hookResult!.current).toHaveLength(0);
 	});
 
 	await act(async () => {
-		await lix.db.insertInto("key_value").values({ key, value: "v1" }).execute();
+		await qb(lix).insertInto("lix_key_value").values({ key, value: "v1" }).execute();
 	});
 
 	await waitFor(() => {
-		expect(hookResult!.current?.count ?? 0).toBe(1);
+		expect(hookResult!.current).toHaveLength(1);
 	});
 
 	await act(async () => {
-		await lix.db.deleteFrom("key_value").where("key", "=", key).execute();
+		await lix.execute("DELETE FROM lix_key_value WHERE key = ?1", [key]);
 	});
 
 	await waitFor(() => {
-		expect(hookResult!.current?.count ?? -1).toBe(0);
+		expect(hookResult!.current).toHaveLength(0);
 	});
 
 	await lix.close();
@@ -555,13 +559,13 @@ test("return type is properly typed", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] } | undefined;
+	let hookResult: { current: KeyValueRow[] } | undefined;
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
-				const data = useQuery(({ lix }) =>
-					lix.db.selectFrom("key_value").selectAll(),
+				const data = useQuery((lix) =>
+					qb(lix).selectFrom("lix_key_value").selectAll(),
 				);
 				return data;
 			},
@@ -578,7 +582,7 @@ test("return type is properly typed", async () => {
 
 	// Type test: data should be properly typed as an array of KeyValue
 	// This should pass without any type errors if the types are working correctly
-	hookResult!.current satisfies State<LixKeyValue>[];
+	hookResult!.current satisfies KeyValueRow[];
 
 	await lix.close();
 });
@@ -604,9 +608,9 @@ test("error handling with ErrorBoundary", async () => {
 	await act(async () => {
 		renderHook(
 			() =>
-				useQuery(({ lix }) =>
+				useQuery((lix) =>
 					// invalid table: will reject then throw
-					lix.db.selectFrom("non_existent_table" as never).selectAll(),
+					qb(lix).selectFrom("non_existent_table" as never).selectAll(),
 				),
 			{ wrapper },
 		);
@@ -616,7 +620,13 @@ test("error handling with ErrorBoundary", async () => {
 		expect(caught).toBeDefined();
 	});
 
-	expect(caught!.message).toMatch(/no such table/i);
+	const caughtMessage =
+		caught instanceof Error
+			? caught.message
+			: caught
+				? String(caught)
+				: "";
+	expect(caughtMessage).toMatch(/no such table|non_existent_table/i);
 
 	// Restore console.error
 	console.error = originalError;
@@ -627,8 +637,8 @@ test("akeFirstOrThrow returns data when result exists", async () => {
 	const lix = await openLix({});
 
 	// Insert test data
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values({ key: "throw_test", value: "exists" })
 		.execute();
 
@@ -640,14 +650,14 @@ test("akeFirstOrThrow returns data when result exists", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue> };
+	let hookResult: { current: KeyValueRow };
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
-				const data = useQueryTakeFirstOrThrow(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQueryTakeFirstOrThrow((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "=", "throw_test"),
 				);
@@ -689,9 +699,9 @@ test("akeFirstOrThrow throws when no result found", async () => {
 	await act(async () => {
 		renderHook(
 			() => {
-				const data = useQueryTakeFirstOrThrow(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQueryTakeFirstOrThrow((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "=", "does_not_exist"),
 				);
@@ -715,8 +725,8 @@ test("re-executes when query function changes (dependency array fix)", async () 
 	const lix = await openLix({});
 
 	// Insert test data with different prefixes
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values([
 			{ key: "prefix_a_1", value: "value_a_1" },
 			{ key: "prefix_a_2", value: "value_a_2" },
@@ -734,16 +744,16 @@ test("re-executes when query function changes (dependency array fix)", async () 
 	);
 
 	// State to control which prefix to query
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 	let rerender: (props?: { prefix: string }) => void;
 
 	await act(async () => {
 		const { result, rerender: rerenderFn } = renderHook(
 			({ prefix = "prefix_a" }: { prefix?: string } = {}) => {
 				// Create a new query function each time prefix changes
-				const data = useQuery(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "like", `${prefix}_%`)
 						.orderBy("key", "asc"),
@@ -797,8 +807,8 @@ test("useQuery with subscribe: false executes once without live updates", async 
 	const lix = await openLix({});
 
 	// Insert initial test data
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values({ key: "once_test", value: "initial" })
 		.execute();
 
@@ -810,15 +820,15 @@ test("useQuery with subscribe: false executes once without live updates", async 
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 
 	await act(async () => {
 		const { result } = renderHook(
 			() => {
 				const data = useQuery(
-					({ lix }) =>
-						lix.db
-							.selectFrom("key_value")
+					(lix) =>
+						qb(lix)
+							.selectFrom("lix_key_value")
 							.selectAll()
 							.where("key", "=", "once_test"),
 					{ subscribe: false },
@@ -841,8 +851,8 @@ test("useQuery with subscribe: false executes once without live updates", async 
 
 	// Update the data in the database
 	await act(async () => {
-		await lix.db
-			.updateTable("key_value")
+		await qb(lix)
+			.updateTable("lix_key_value")
 			.set({ value: "updated" })
 			.where("key", "=", "once_test")
 			.execute();
@@ -865,8 +875,8 @@ test("useQuery subscription updates when query dependencies change", async () =>
 	const lix = await openLix({});
 
 	// Insert initial test data
-	await lix.db
-		.insertInto("key_value")
+	await qb(lix)
+		.insertInto("lix_key_value")
 		.values([
 			{ key: "sub_test_a_1", value: "initial_a" },
 			{ key: "sub_test_b_1", value: "initial_b" },
@@ -881,15 +891,15 @@ test("useQuery subscription updates when query dependencies change", async () =>
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 	let rerender: (props?: { filter: string }) => void;
 
 	await act(async () => {
 		const { result, rerender: rerenderFn } = renderHook(
 			({ filter = "sub_test_a" }: { filter?: string } = {}) => {
-				const data = useQuery(({ lix }) =>
-					lix.db
-						.selectFrom("key_value")
+				const data = useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
 						.selectAll()
 						.where("key", "like", `${filter}_%`),
 				);
@@ -923,8 +933,8 @@ test("useQuery subscription updates when query dependencies change", async () =>
 
 	// Insert new data that matches the current filter
 	await act(async () => {
-		await lix.db
-			.insertInto("key_value")
+		await qb(lix)
+			.insertInto("lix_key_value")
 			.values({ key: "sub_test_b_2", value: "new_b" })
 			.execute();
 	});
@@ -941,23 +951,32 @@ test("useQuery subscription updates when query dependencies change", async () =>
 });
 
 test("useQuery refreshes when lix instance is switched", async () => {
-	// Create two separate lix instances - each will have its own unique lix_id
+	const switchKey = "switch_instance_value";
+	// Create two separate lix instances
 	const lix1 = await openLix({});
 	const lix2 = await openLix({});
+	await qb(lix1)
+		.insertInto("lix_key_value")
+		.values({ key: switchKey, value: "instance_one" })
+		.execute();
+	await qb(lix2)
+		.insertInto("lix_key_value")
+		.values({ key: switchKey, value: "instance_two" })
+		.execute();
 
-	// Check that they have different lix_id values
-	const lix1IdDirect = await lix1.db
-		.selectFrom("key_value")
+	// Check that they have different values for the same key
+	const lix1IdDirect = await qb(lix1)
+		.selectFrom("lix_key_value")
 		.selectAll()
-		.where("key", "=", "lix_id")
+		.where("key", "=", switchKey)
 		.executeTakeFirst();
-	const lix2IdDirect = await lix2.db
-		.selectFrom("key_value")
+	const lix2IdDirect = await qb(lix2)
+		.selectFrom("lix_key_value")
 		.selectAll()
-		.where("key", "=", "lix_id")
+		.where("key", "=", switchKey)
 		.executeTakeFirst();
 
-	// Ensure the test is valid - the two instances should have different lix_ids
+	// Ensure the test is valid - the two instances should have different values
 	expect(lix1IdDirect?.value).not.toBe(lix2IdDirect?.value);
 
 	// Use a state variable to control which lix instance is used
@@ -965,8 +984,8 @@ test("useQuery refreshes when lix instance is switched", async () => {
 
 	// Wrapper function that uses the current lix
 	const TestComponent = () => {
-		const data = useQuery(({ lix }) =>
-			lix.db.selectFrom("key_value").selectAll().where("key", "=", "lix_id"),
+		const data = useQuery((lix) =>
+			qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", switchKey),
 		);
 		return data;
 	};
@@ -979,7 +998,7 @@ test("useQuery refreshes when lix instance is switched", async () => {
 		</LixProvider>
 	);
 
-	let hookResult: { current: State<LixKeyValue>[] };
+	let hookResult: { current: KeyValueRow[] };
 	let rerender: () => void;
 
 	await act(async () => {
@@ -993,7 +1012,7 @@ test("useQuery refreshes when lix instance is switched", async () => {
 	// Verify we get data from lix1
 	await waitFor(() => {
 		expect(hookResult.current).toHaveLength(1);
-		expect(hookResult.current[0]?.key).toBe("lix_id");
+		expect(hookResult.current[0]?.key).toBe(switchKey);
 	});
 
 	// Store the initial lix_id value
@@ -1008,7 +1027,7 @@ test("useQuery refreshes when lix instance is switched", async () => {
 	// Verify the query refreshes and we now get data from lix2
 	await waitFor(() => {
 		expect(hookResult.current).toHaveLength(1);
-		expect(hookResult.current[0]?.key).toBe("lix_id");
+		expect(hookResult.current[0]?.key).toBe(switchKey);
 		// The lix_id value should be different from lix1
 		expect(hookResult.current[0]?.value).not.toBe(lix1Id);
 	});

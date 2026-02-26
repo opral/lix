@@ -11,7 +11,7 @@ import { LixContext } from "../provider.js";
  *   const lix = useLix();
  *
  *   const handleClick = async () => {
- *     await lix.db
+ *     await qb(lix)
  *       .insertInto('account')
  *       .values({
  *         name: 'John Doe',
