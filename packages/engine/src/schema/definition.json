@@ -127,13 +127,13 @@
         },
         "x-lix-entity-views": {
           "type": "array",
-          "description": "Restricts which SQL entity views (state/state_by_version/state_history) are generated. When omitted, all views are created.",
+          "description": "Restricts which SQL entity views (lix_state/lix_state_by_version/lix_state_history) are generated. When omitted, all views are created.",
           "items": {
             "type": "string",
             "enum": [
-              "state",
-              "state_by_version",
-              "state_history"
+              "lix_state",
+              "lix_state_by_version",
+              "lix_state_history"
             ]
           },
           "uniqueItems": true

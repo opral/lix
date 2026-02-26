@@ -213,9 +213,9 @@ fn variant_enabled(schema: &JsonValue, variant: EntityViewVariant) -> bool {
         return true;
     };
     let key = match variant {
-        EntityViewVariant::Base => "state",
-        EntityViewVariant::ByVersion => "state_by_version",
-        EntityViewVariant::History => "state_history",
+        EntityViewVariant::Base => "lix_state",
+        EntityViewVariant::ByVersion => "lix_state_by_version",
+        EntityViewVariant::History => "lix_state_history",
     };
     selected.iter().any(|entry| {
         entry

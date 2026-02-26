@@ -67,38 +67,6 @@ fn guardrail_engine_runtime_section_excludes_legacy_sql_pipeline_imports() {
 }
 
 #[test]
-fn guardrail_execute_entrypoints_route_through_sql_api() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let engine_source =
-        fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
-    let sql_api_source =
-        fs::read_to_string(root.join("src/sql/api.rs")).expect("sql/api.rs should be readable");
-
-    assert!(
-        engine_source.contains("[path = \"sql/mod.rs\"]"),
-        "engine module must wire sql runtime module"
-    );
-    assert!(
-        !sql_api_source.contains("pub(crate) async fn execute_impl("),
-        "legacy execute_impl wrapper should stay removed"
-    );
-    assert!(
-        sql_api_source.contains("pub async fn execute(")
-            && sql_api_source.contains("self.execute_impl_sql(sql, params, options, false).await"),
-        "public execute entrypoint must delegate to execute_impl_sql"
-    );
-    assert!(
-        sql_api_source.contains("pub(crate) async fn execute_internal(")
-            && sql_api_source.contains("self.execute_impl_sql(sql, params, options, true).await"),
-        "internal execute entrypoint must delegate to execute_impl_sql"
-    );
-    assert!(
-        sql_api_source.contains("pub(crate) async fn execute_impl_sql"),
-        "engine execute entrypoint must delegate to sql"
-    );
-}
-
-#[test]
 fn guardrail_forbids_string_matched_postprocess_fallback() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

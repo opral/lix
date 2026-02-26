@@ -401,7 +401,7 @@ fn x_lix_entity_views_accepts_known_view_names() {
         "type": "object",
         "x-lix-key": "mock",
         "x-lix-version": "1",
-        "x-lix-entity-views": ["state", "state_by_version"],
+        "x-lix-entity-views": ["lix_state", "lix_state_by_version"],
         "properties": {
             "name": { "type": "string" }
         },
@@ -418,7 +418,7 @@ fn x_lix_entity_views_rejects_unknown_view_names() {
         "type": "object",
         "x-lix-key": "mock",
         "x-lix-version": "1",
-        "x-lix-entity-views": ["state", "unknown"],
+        "x-lix-entity-views": ["lix_state", "unknown"],
         "properties": {
             "name": { "type": "string" }
         },
