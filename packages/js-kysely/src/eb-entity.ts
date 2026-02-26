@@ -14,11 +14,9 @@ type LixEntity = {
 };
 
 const CANONICAL_TABLES = [
-	"state",
-	"state_by_version",
-	"entity_label",
-	"entity_conversation",
-	"entity_conversation_by_version",
+	"lix_state",
+	"lix_state_by_version",
+	"lix_entity_label",
 ] as const;
 
 export function ebEntity<
@@ -72,19 +70,19 @@ export function ebEntity<
 				const columnRef = entityType
 					? `${entityType}.${entityIdCol}`
 					: entityIdCol;
-				return eb(eb.ref(columnRef as any), "in", (subquery: any) =>
-					subquery
-						.selectFrom("entity_label")
-						.innerJoin("label", "label.id", "entity_label.label_id")
-						.select("entity_label.entity_id")
-						.$if("name" in label, (qb: any) =>
-							qb.where("label.name", "=", label.name!),
-						)
-						.$if("id" in label, (qb: any) =>
-							qb.where("label.id", "=", label.id!),
-						),
-				);
-			};
+					return eb(eb.ref(columnRef as any), "in", (subquery: any) =>
+						subquery
+							.selectFrom("lix_entity_label")
+							.innerJoin("lix_label", "lix_label.id", "lix_entity_label.label_id")
+							.select("lix_entity_label.entity_id")
+							.$if("name" in label, (qb: any) =>
+								qb.where("lix_label.name", "=", label.name!),
+							)
+							.$if("id" in label, (qb: any) =>
+								qb.where("lix_label.id", "=", label.id!),
+							),
+					);
+				};
 		},
 		equals(entity: LixEntity | LixEntityCanonical) {
 			return (

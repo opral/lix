@@ -9,7 +9,7 @@ type Equal<A, B> =
 
 type Expect<T extends true> = T;
 
-type FileRow = Selectable<LixDatabaseSchema["file"]>;
+type FileRow = Selectable<LixDatabaseSchema["lix_file"]>;
 type _FilePathIsString = Expect<Equal<FileRow["path"], string>>;
 const fileHiddenBoolean: FileRow["hidden"] = true;
 const fileHiddenUndefined: FileRow["hidden"] = undefined;
@@ -20,7 +20,7 @@ void fileHiddenUndefined;
 void fileHiddenString;
 
 type KeyValueByVersionInsert = Insertable<
-	LixDatabaseSchema["key_value_by_version"]
+	LixDatabaseSchema["lix_key_value_by_version"]
 >;
 
 type _InsertHasKey = Expect<Equal<KeyValueByVersionInsert["key"], string>>;
@@ -35,20 +35,20 @@ const dbWithWriter = qb(
 	},
 	{ writerKey: "writer-a" },
 );
-dbWithWriter.selectFrom("file").select("id").compile();
+dbWithWriter.selectFrom("lix_file").select("id").compile();
 
-db.selectFrom("file").select(["id", "path", "hidden"]).compile();
-db.selectFrom("directory").select(["id", "path"]).compile();
-db.selectFrom("key_value_by_version")
+db.selectFrom("lix_file").select(["id", "path", "hidden"]).compile();
+db.selectFrom("lix_directory").select(["id", "path"]).compile();
+db.selectFrom("lix_key_value_by_version")
 	.select(["key", "value", "lixcol_version_id"])
 	.compile();
 
-db.selectFrom("commit")
-	.where(ebEntity("commit").hasLabel({ name: "checkpoint" }))
+db.selectFrom("lix_commit")
+	.where(ebEntity("lix_commit").hasLabel({ name: "checkpoint" }))
 	.select("id")
 	.compile();
 
-db.insertInto("key_value_by_version")
+db.insertInto("lix_key_value_by_version")
 	.values({
 		key: "flashtype_active_file_id",
 		value: "file-1",
@@ -57,25 +57,25 @@ db.insertInto("key_value_by_version")
 	})
 	.compile();
 
-db.updateTable("key_value_by_version")
+db.updateTable("lix_key_value_by_version")
 	.set({ value: "file-2" })
 	.where("key", "=", "flashtype_active_file_id")
 	.compile();
 
-db.deleteFrom("key_value_by_version")
+db.deleteFrom("lix_key_value_by_version")
 	.where("key", "=", "flashtype_active_file_id")
 	.compile();
 
 const withDb = qb({ db });
-withDb.selectFrom("file").select("id");
+withDb.selectFrom("lix_file").select("id");
 
 // @ts-expect-error unknown table
 db.selectFrom("not_a_table").selectAll().compile();
 
 // @ts-expect-error unknown column
-db.selectFrom("file").select(["not_a_column"]).compile();
+db.selectFrom("lix_file").select(["not_a_column"]).compile();
 
-const badInsert: Insertable<LixDatabaseSchema["key_value_by_version"]> = {
+const badInsert: Insertable<LixDatabaseSchema["lix_key_value_by_version"]> = {
 	key: "x",
 	value: "y",
 	// @ts-expect-error wrong column type

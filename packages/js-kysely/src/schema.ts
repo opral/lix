@@ -244,39 +244,33 @@ type DirectoryDescriptorHistoryView = ToKysely<
 >;
 
 export type LixDatabaseSchema = {
-	active_account: EntityViews<
+	lix_active_account: EntityViews<
 		typeof LixActiveAccountSchema,
-		"active_account"
-	>["active_account"];
-	active_version: ToKysely<LixActiveVersion>;
+		"lix_active_account"
+	>["lix_active_account"];
+	lix_active_version: ToKysely<LixActiveVersion>;
 
-	state: StateView;
-	state_by_version: StateByVersionView;
-	state_with_tombstones: StateWithTombstonesView;
-	state_history: StateHistoryView;
+	lix_state: StateView;
+	lix_state_by_version: StateByVersionView;
+	lix_state_history: StateHistoryView;
 	lix_working_changes: WorkingChangesView;
 
-	change: ChangeView;
-	directory: DirectoryDescriptorView;
-	directory_by_version: DirectoryDescriptorByVersionView;
-	directory_history: DirectoryDescriptorHistoryView;
+	lix_change: ChangeView;
+	lix_directory: DirectoryDescriptorView;
+	lix_directory_by_version: DirectoryDescriptorByVersionView;
+	lix_directory_history: DirectoryDescriptorHistoryView;
 } & EntityViews<
 	typeof LixKeyValueSchema,
-	"key_value",
+	"lix_key_value",
 	{ value: LixKeyValue["value"] }
 > &
-	EntityViews<
-		typeof LixKeyValueSchema,
-		"lix_key_value",
-		{ value: LixKeyValue["value"] }
-> &
-	EntityViews<typeof LixAccountSchema, "account"> &
-	EntityViews<typeof LixChangeSetSchema, "change_set"> &
-	EntityViews<typeof LixChangeSetElementSchema, "change_set_element"> &
-	EntityViews<typeof LixChangeAuthorSchema, "change_author"> &
+	EntityViews<typeof LixAccountSchema, "lix_account"> &
+	EntityViews<typeof LixChangeSetSchema, "lix_change_set"> &
+	EntityViews<typeof LixChangeSetElementSchema, "lix_change_set_element"> &
+	EntityViews<typeof LixChangeAuthorSchema, "lix_change_author"> &
 	EntityViews<
 		typeof LixFileDescriptorSchema,
-		"file",
+		"lix_file",
 		{
 			data: Uint8Array;
 			path: LixGenerated<string>;
@@ -285,13 +279,13 @@ export type LixDatabaseSchema = {
 			extension: LixGenerated<string | null>;
 		}
 	> &
-	EntityViews<typeof LixLabelSchema, "label"> &
-	EntityViews<typeof LixEntityLabelSchema, "entity_label"> &
-	EntityViews<typeof LixStoredSchemaSchema, "stored_schema", { value: any }> &
+	EntityViews<typeof LixLabelSchema, "lix_label"> &
+	EntityViews<typeof LixEntityLabelSchema, "lix_entity_label"> &
+	EntityViews<typeof LixStoredSchemaSchema, "lix_stored_schema", { value: any }> &
 	EntityViews<
 		typeof LixVersionDescriptorSchema,
-		"version",
+		"lix_version",
 		{ commit_id: LixGenerated<string>; working_commit_id: LixGenerated<string> }
 	> &
-	EntityViews<typeof LixCommitSchema, "commit"> &
-	EntityViews<typeof LixCommitEdgeSchema, "commit_edge">;
+	EntityViews<typeof LixCommitSchema, "lix_commit"> &
+	EntityViews<typeof LixCommitEdgeSchema, "lix_commit_edge">;

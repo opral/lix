@@ -8,7 +8,7 @@ type QbOptions = CreateLixKyselyOptions;
  * Kysely entrypoint for Lix.
  *
  * Usage:
- * await qb(lix).selectFrom("file").selectAll().execute()
+ * await qb(lix).selectFrom("lix_file").selectAll().execute()
  */
 export const qb = (lix: QbInput, options?: QbOptions) =>
 	createLixKysely(lix, options);
