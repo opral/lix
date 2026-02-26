@@ -191,6 +191,9 @@ pub fn rewrite_insert(
         "1970-01-01T00:00:00Z",
     )?;
 
+    // `lix_stored_schema` materialized storage does not expose `untracked`.
+    drop_column_if_present(&mut columns, &mut rows, "untracked");
+
     source.body = Box::new(sqlparser::ast::SetExpr::Values(sqlparser::ast::Values {
         explicit_row: values_layout.explicit_row,
         value_keyword: values_layout.value_keyword,
@@ -256,6 +259,18 @@ fn append_column_with_literal(
         row.push(expr.clone());
     }
     columns.len() - 1
+}
+
+fn drop_column_if_present(columns: &mut Vec<Ident>, rows: &mut Vec<Vec<Expr>>, name: &str) {
+    let Some(index) = find_column_index(columns, name) else {
+        return;
+    };
+    columns.remove(index);
+    for row in rows.iter_mut() {
+        if index < row.len() {
+            row.remove(index);
+        }
+    }
 }
 
 fn resolve_row_literals(
@@ -492,5 +507,25 @@ mod tests {
         let insert = parse_insert(sql);
         let rewritten = rewrite_insert(insert, &[]).expect("rewrite ok");
         assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn rewrite_stored_schema_drops_untracked_column_for_materialized_table() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content, untracked) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}', 0)"#;
+        let insert = parse_insert(sql);
+        let rewritten = rewrite_insert(insert, &[])
+            .expect("rewrite ok")
+            .expect("rewritten");
+        let insert = match rewritten.statement {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+        assert!(
+            insert
+                .columns
+                .iter()
+                .all(|column| !column.value.eq_ignore_ascii_case("untracked")),
+            "rewritten stored schema insert must not include untracked column"
+        );
     }
 }
