@@ -142,6 +142,10 @@ export type LixTransactionStatement = {
   params?: LixValueLike[];
 };
 
+export type ExecuteOptions = {
+  writerKey?: string | null;
+};
+
 export type ObserveEvent = {
   sequence: number;
   rows: LixQueryResultLike;
@@ -182,32 +186,40 @@ export type LixObserveEvents = {
     #[wasm_bindgen]
     impl Lix {
         #[wasm_bindgen(js_name = execute)]
-        pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
+        pub async fn execute(
+            &self,
+            sql: String,
+            params: JsValue,
+            options: Option<JsValue>,
+        ) -> Result<JsValue, JsValue> {
             let params = Array::from(&params);
             let mut values = Vec::new();
             for value in params.iter() {
                 values.push(value_from_js(value).map_err(js_error)?);
             }
+            let execute_options = parse_execute_options(options, "execute").map_err(js_error)?;
             let result = self
                 .engine
-                .execute(&sql, &values, ExecuteOptions::default())
+                .execute(&sql, &values, execute_options)
                 .await
                 .map_err(js_error)?;
             Ok(query_result_to_js(result))
         }
 
         #[wasm_bindgen(js_name = executeTransaction)]
-        pub async fn execute_transaction(&self, statements: JsValue) -> Result<JsValue, JsValue> {
+        pub async fn execute_transaction(
+            &self,
+            statements: JsValue,
+            options: Option<JsValue>,
+        ) -> Result<JsValue, JsValue> {
             let statements = parse_transaction_statements(statements).map_err(js_error)?;
             let (transaction_sql, transaction_params) =
                 build_transaction_script_and_params(statements).map_err(js_error)?;
+            let execute_options =
+                parse_execute_options(options, "executeTransaction").map_err(js_error)?;
             let result = self
                 .engine
-                .execute(
-                    &transaction_sql,
-                    &transaction_params,
-                    ExecuteOptions::default(),
-                )
+                .execute(&transaction_sql, &transaction_params, execute_options)
                 .await
                 .map_err(js_error)?;
             Ok(query_result_to_js(result))
@@ -612,6 +624,34 @@ export type LixObserveEvents = {
             });
         };
         Ok(EngineObserveQuery { sql, params })
+    }
+
+    fn parse_execute_options(
+        input: Option<JsValue>,
+        context: &str,
+    ) -> Result<ExecuteOptions, LixError> {
+        let Some(input) = input else {
+            return Ok(ExecuteOptions::default());
+        };
+        if input.is_null() || input.is_undefined() {
+            return Ok(ExecuteOptions::default());
+        }
+        if !input.is_object() {
+            return Err(LixError {
+                message: format!("{context} options must be an object"),
+            });
+        }
+        if Reflect::has(&input, &JsValue::from_str("writer_key")).map_err(js_to_lix_error)? {
+            return Err(LixError {
+                message: format!(
+                    "{context} options must use 'writerKey' instead of 'writer_key'"
+                ),
+            });
+        }
+
+        let writer_key =
+            read_optional_string_property_with_context(&input, "writerKey", context)?;
+        Ok(ExecuteOptions { writer_key })
     }
 
     struct TransactionStatement {

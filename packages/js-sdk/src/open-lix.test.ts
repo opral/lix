@@ -114,6 +114,65 @@ test("executeTransaction applies multiple statements in one call", async () => {
   await lix.close();
 });
 
+test("execute options.writerKey is reflected in state commit stream changes", async () => {
+  const lix = await openLix();
+  const events = lix.stateCommitStream({
+    schemaKeys: ["lix_key_value"],
+    writerKeys: ["writer-js-sdk-execute"],
+  });
+
+  await lix.execute(
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["writer-key-execute", "ok"],
+    { writerKey: "writer-js-sdk-execute" },
+  );
+
+  const batch = await waitForBatch(events);
+  expect(batch).toBeDefined();
+  expect(batch!.changes.length).toBeGreaterThan(0);
+  expect(
+    batch!.changes.some(
+      (change: { writerKey: string | null; entityId: string }) =>
+        change.writerKey === "writer-js-sdk-execute" &&
+        change.entityId === "writer-key-execute",
+    ),
+  ).toBe(true);
+
+  events.close();
+  await lix.close();
+});
+
+test("executeTransaction options.writerKey is reflected in state commit stream changes", async () => {
+  const lix = await openLix();
+  const events = lix.stateCommitStream({
+    schemaKeys: ["lix_key_value"],
+    writerKeys: ["writer-js-sdk-tx"],
+  });
+
+  await lix.executeTransaction(
+    [
+      {
+        sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
+        params: ["writer-key-tx", "ok"],
+      },
+    ],
+    { writerKey: "writer-js-sdk-tx" },
+  );
+
+  const batch = await waitForBatch(events);
+  expect(batch).toBeDefined();
+  expect(
+    batch!.changes.some(
+      (change: { writerKey: string | null; entityId: string }) =>
+        change.writerKey === "writer-js-sdk-tx" &&
+        change.entityId === "writer-key-tx",
+    ),
+  ).toBe(true);
+
+  events.close();
+  await lix.close();
+});
+
 test("installPlugin stores plugin metadata", async () => {
   const lix = await openLix();
 

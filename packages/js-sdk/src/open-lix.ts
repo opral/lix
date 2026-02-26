@@ -85,6 +85,10 @@ export type TransactionStatement = {
   params?: ReadonlyArray<unknown>;
 };
 
+export type ExecuteOptions = {
+  writerKey?: string | null;
+};
+
 export type ObserveEvent = {
   sequence: number;
   rows: QueryResult;
@@ -107,8 +111,12 @@ export type Lix = {
   execute(
     sql: string,
     params?: ReadonlyArray<unknown>,
+    options?: ExecuteOptions,
   ): Promise<QueryResult>;
-  executeTransaction(statements: ReadonlyArray<TransactionStatement>): Promise<QueryResult>;
+  executeTransaction(
+    statements: ReadonlyArray<TransactionStatement>,
+    options?: ExecuteOptions,
+  ): Promise<QueryResult>;
   stateCommitStream(filter?: StateCommitStreamFilter): StateCommitStream;
   observe(query: ObserveQuery): ObserveEvents;
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
@@ -162,13 +170,19 @@ export async function openLix(
   const execute = async (
     sql: string,
     params: ReadonlyArray<unknown> = [],
+    options?: ExecuteOptions,
   ): Promise<QueryResult> => {
     ensureOpen("execute");
-    return wasmLix.execute(sql, params.map((param) => Value.from(param)));
+    return (wasmLix as any).execute(
+      sql,
+      params.map((param) => Value.from(param)),
+      normalizeExecuteOptions(options, "execute"),
+    );
   };
 
   const executeTransaction = async (
     statements: ReadonlyArray<TransactionStatement>,
+    options?: ExecuteOptions,
   ): Promise<QueryResult> => {
     ensureOpen("executeTransaction");
     if (!Array.isArray(statements)) {
@@ -193,7 +207,10 @@ export async function openLix(
       };
     });
 
-    return (wasmLix as any).executeTransaction(encoded);
+    return (wasmLix as any).executeTransaction(
+      encoded,
+      normalizeExecuteOptions(options, "executeTransaction"),
+    );
   };
 
   const stateCommitStream = (
@@ -458,4 +475,26 @@ function isNodeRuntime(): boolean {
     typeof globalProcess.versions === "object" &&
     typeof globalProcess.versions?.node === "string"
   );
+}
+
+function normalizeExecuteOptions(
+  options: ExecuteOptions | undefined,
+  methodName: "execute" | "executeTransaction",
+): ExecuteOptions | undefined {
+  if (options === undefined) {
+    return undefined;
+  }
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error(`${methodName} options must be an object`);
+  }
+  const writerKey = (options as { writerKey?: unknown }).writerKey;
+  if (writerKey !== undefined && writerKey !== null && typeof writerKey !== "string") {
+    throw new Error(`${methodName} options.writerKey must be a string or null`);
+  }
+  if (writerKey === undefined) {
+    return undefined;
+  }
+  return {
+    writerKey,
+  };
 }
