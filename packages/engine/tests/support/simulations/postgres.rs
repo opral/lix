@@ -170,7 +170,10 @@ impl LixBackend for PostgresBackend {
             pool.execute(sql).await.map_err(|err| LixError {
                 message: err.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+            return Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
         }
 
         let mut query = sqlx::query(sql);
@@ -233,7 +236,10 @@ impl LixTransaction for PostgresBackendTransaction {
             self.conn.execute(sql).await.map_err(|err| LixError {
                 message: err.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+            return Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
         }
 
         let mut query = sqlx::query(sql);

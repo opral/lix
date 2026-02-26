@@ -256,7 +256,10 @@ mod tests {
                         });
                     }
                 }
-                return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                });
             }
 
             if sql.contains("SELECT schema_version, snapshot_content") {
@@ -274,7 +277,10 @@ mod tests {
                         });
                     }
                 }
-                return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                });
             }
 
             Err(LixError {

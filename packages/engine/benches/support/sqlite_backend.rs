@@ -73,7 +73,10 @@ impl LixBackend for BenchSqliteBackend {
             pool.execute(sql).await.map_err(|error| LixError {
                 message: error.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+            return Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
         }
 
         let mut query = sqlx::query(sql);
@@ -134,7 +137,10 @@ impl LixTransaction for BenchSqliteTransaction {
             self.conn.execute(sql).await.map_err(|error| LixError {
                 message: error.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+            return Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
         }
 
         let mut query = sqlx::query(sql);

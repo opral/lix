@@ -643,14 +643,11 @@ export type LixObserveEvents = {
         }
         if Reflect::has(&input, &JsValue::from_str("writer_key")).map_err(js_to_lix_error)? {
             return Err(LixError {
-                message: format!(
-                    "{context} options must use 'writerKey' instead of 'writer_key'"
-                ),
+                message: format!("{context} options must use 'writerKey' instead of 'writer_key'"),
             });
         }
 
-        let writer_key =
-            read_optional_string_property_with_context(&input, "writerKey", context)?;
+        let writer_key = read_optional_string_property_with_context(&input, "writerKey", context)?;
         Ok(ExecuteOptions { writer_key })
     }
 

@@ -121,7 +121,10 @@ impl Engine {
         };
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 
-        let mut last_result = QueryResult { rows: Vec::new(), columns: Vec::new() };
+        let mut last_result = QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        };
         for (sql, statement_params) in sql_statements {
             let result = if skip_statement_side_effect_collection {
                 self.execute_with_options_in_transaction(
