@@ -2605,13 +2605,13 @@ async fn read_directory_descriptor_by_id(
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Option<DirectoryDescriptorSnapshot>, LixError> {
     let sql = "SELECT \
-         lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-         lix_json_text(snapshot_content, 'name') AS name \
+         lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+         lix_json_extract(snapshot_content, 'name') AS name \
          FROM lix_state_by_version \
          WHERE schema_key = 'lix_directory_descriptor' \
            AND snapshot_content IS NOT NULL \
            AND version_id = $1 \
-           AND lix_json_text(snapshot_content, 'id') = $2 \
+           AND lix_json_extract(snapshot_content, 'id') = $2 \
          LIMIT 1";
     let query_params = vec![
         EngineValue::Text(version_id.to_string()),
@@ -3238,8 +3238,8 @@ async fn load_directory_descendants(
 ) -> Result<Vec<String>, LixError> {
     let sql = "WITH RECURSIVE directory_rows AS (\
          SELECT \
-           lix_json_text(snapshot_content, 'id') AS id, \
-           lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
+           lix_json_extract(snapshot_content, 'id') AS id, \
+           lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
            version_id \
          FROM lix_state_by_version \
          WHERE schema_key = 'lix_directory_descriptor' \

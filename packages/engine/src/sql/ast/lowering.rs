@@ -11,8 +11,8 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::backend::SqlDialect;
 use crate::LixError;
 
-use self::lower_json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_text};
-use self::lower_logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_text};
+use self::lower_json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract};
+use self::lower_logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract};
 
 pub(crate) fn lower_statement(
     statement: Statement,
@@ -38,7 +38,7 @@ impl VisitorMut for LogicalFunctionLowerer {
             return ControlFlow::Continue(());
         };
 
-        let parsed = match parse_lix_json_text(function) {
+        let parsed = match parse_lix_json_extract(function) {
             Ok(parsed) => parsed,
             Err(error) => return ControlFlow::Break(error),
         };
@@ -62,7 +62,7 @@ impl VisitorMut for LogicalFunctionLowerer {
             return ControlFlow::Continue(());
         };
 
-        let lowered = lower_lix_json_text(&call, self.dialect);
+        let lowered = lower_lix_json_extract(&call, self.dialect);
         *expr = lowered;
         ControlFlow::Continue(())
     }

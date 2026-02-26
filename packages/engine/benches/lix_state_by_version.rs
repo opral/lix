@@ -86,7 +86,7 @@ fn bench_lix_state_by_version_count_active_scope_subquery(c: &mut Criterion) {
                      FROM lix_state_by_version \
                      WHERE schema_key = ? \
                        AND version_id IN (\
-                           SELECT lix_json_text(snapshot_content, 'version_id') \
+                           SELECT lix_json_extract(snapshot_content, 'version_id') \
                            FROM lix_internal_state_untracked \
                            WHERE schema_key = 'lix_version_pointer' \
                              AND file_id = 'lix' \

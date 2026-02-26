@@ -120,9 +120,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
         FILE_VIEW => format!(
             "WITH RECURSIVE directory_descriptor_rows AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
                     version_id AS lixcol_version_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
@@ -148,12 +148,12 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ), \
              file_descriptor_rows AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'extension') AS extension, \
-                    lix_json_text(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'extension') AS extension, \
+                    lix_json_extract(snapshot_content, 'metadata') AS metadata, \
+                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
                     file_id AS lixcol_file_id, \
@@ -221,9 +221,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
         ),
         FILE_BY_VERSION_VIEW => "WITH RECURSIVE directory_descriptor_rows AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
                     version_id AS lixcol_version_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
@@ -248,12 +248,12 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ), \
              file_descriptor_rows AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'extension') AS extension, \
-                    lix_json_text(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'extension') AS extension, \
+                    lix_json_extract(snapshot_content, 'metadata') AS metadata, \
+                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
                     file_id AS lixcol_file_id, \
@@ -318,9 +318,9 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
             .to_string(),
         FILE_HISTORY_VIEW => "WITH RECURSIVE directory_history_base AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
                     root_commit_id AS lixcol_root_commit_id, \
                     depth AS lixcol_depth \
                  FROM lix_state_history \
@@ -382,12 +382,12 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
              ), \
              file_history_descriptor_rows AS (\
                 SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'extension') AS extension, \
-                    lix_json_text(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'extension') AS extension, \
+                    lix_json_extract(snapshot_content, 'metadata') AS metadata, \
+                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
                     file_id AS lixcol_file_id, \
@@ -553,10 +553,10 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
         DIRECTORY_VIEW => format!(
             "WITH RECURSIVE directory_descriptor_rows AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
                     schema_version AS lixcol_schema_version, \
@@ -615,10 +615,10 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
         ),
         DIRECTORY_BY_VERSION_VIEW => "WITH RECURSIVE directory_descriptor_rows AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
                     schema_version AS lixcol_schema_version, \
@@ -676,10 +676,10 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
             .to_string(),
         DIRECTORY_HISTORY_VIEW => "WITH RECURSIVE directory_history_base AS (\
                  SELECT \
-                    lix_json_text(snapshot_content, 'id') AS id, \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'name') AS name, \
-                    lix_json_text(snapshot_content, 'hidden') AS hidden, \
+                    lix_json_extract(snapshot_content, 'id') AS id, \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'name') AS name, \
+                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
                     entity_id AS lixcol_entity_id, \
                     schema_key AS lixcol_schema_key, \
                     file_id AS lixcol_file_id, \
@@ -780,7 +780,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
 fn active_version_scope_predicate(version_column: &str) -> String {
     format!(
         "{version_column} IN (\
-         SELECT lix_json_text(snapshot_content, 'version_id') \
+         SELECT lix_json_extract(snapshot_content, 'version_id') \
          FROM lix_internal_state_untracked \
          WHERE schema_key = '{schema_key}' \
            AND file_id = '{file_id}' \

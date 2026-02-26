@@ -6,7 +6,7 @@ use sqlparser::ast::{
 use crate::LixError;
 
 #[derive(Debug, Clone)]
-pub(crate) struct LixJsonTextCall {
+pub(crate) struct LixJsonExtractCall {
     pub(crate) json_expr: Expr,
     pub(crate) path: Vec<String>,
 }
@@ -16,10 +16,10 @@ pub(crate) struct LixJsonCall {
     pub(crate) json_expr: Expr,
 }
 
-pub(crate) fn parse_lix_json_text(
+pub(crate) fn parse_lix_json_extract(
     function: &Function,
-) -> Result<Option<LixJsonTextCall>, LixError> {
-    if !function_name_matches(&function.name, "lix_json_text") {
+) -> Result<Option<LixJsonExtractCall>, LixError> {
+    if !function_name_matches(&function.name, "lix_json_extract") {
         return Ok(None);
     }
 
@@ -27,40 +27,40 @@ pub(crate) fn parse_lix_json_text(
         FunctionArguments::List(list) => {
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(LixError {
-                    message: "lix_json_text() does not support DISTINCT/ALL/clauses".to_string(),
+                    message: "lix_json_extract() does not support DISTINCT/ALL/clauses".to_string(),
                 });
             }
             &list.args
         }
         _ => {
             return Err(LixError {
-                message: "lix_json_text() requires a regular argument list".to_string(),
+                message: "lix_json_extract() requires a regular argument list".to_string(),
             })
         }
     };
 
     if args.len() < 2 {
         return Err(LixError {
-            message: "lix_json_text() requires at least 2 arguments".to_string(),
+            message: "lix_json_extract() requires at least 2 arguments".to_string(),
         });
     }
 
-    let json_expr = function_arg_expr(&args[0], "lix_json_text()")?;
+    let json_expr = function_arg_expr(&args[0], "lix_json_extract()")?;
     let mut path = Vec::with_capacity(args.len() - 1);
     for arg in &args[1..] {
-        let expr = function_arg_expr(arg, "lix_json_text()")?;
+        let expr = function_arg_expr(arg, "lix_json_extract()")?;
         let key = string_literal(&expr).ok_or_else(|| LixError {
-            message: "lix_json_text() path arguments must be single-quoted strings".to_string(),
+            message: "lix_json_extract() path arguments must be single-quoted strings".to_string(),
         })?;
         if key.is_empty() {
             return Err(LixError {
-                message: "lix_json_text() path segments must not be empty".to_string(),
+                message: "lix_json_extract() path segments must not be empty".to_string(),
             });
         }
         path.push(key.to_string());
     }
 
-    Ok(Some(LixJsonTextCall { json_expr, path }))
+    Ok(Some(LixJsonExtractCall { json_expr, path }))
 }
 
 pub(crate) fn parse_lix_json(function: &Function) -> Result<Option<LixJsonCall>, LixError> {

@@ -400,8 +400,8 @@ async fn load_effective_scope_delete_rows(
         "WITH RECURSIVE \
            version_descriptor AS ( \
              SELECT \
-               lix_json_text(snapshot_content, 'id') AS version_id, \
-               lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+               lix_json_extract(snapshot_content, 'id') AS version_id, \
+               lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
              FROM {descriptor_table} \
              WHERE schema_key = '{descriptor_schema_key}' \
                AND file_id = '{descriptor_file_id}' \
@@ -533,7 +533,7 @@ async fn load_cascaded_file_delete_changes(
              FROM {materialized_table} m \
              WHERE m.version_id = '{version_id}' \
                AND m.is_tombstone = 0 \
-               AND lix_json_text(m.snapshot_content, 'directory_id') IN ({in_list})",
+               AND lix_json_extract(m.snapshot_content, 'directory_id') IN ({in_list})",
             materialized_table = materialized_table,
             version_id = escape_sql_string(&version_id),
             in_list = in_list,

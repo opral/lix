@@ -265,7 +265,7 @@ mod tests {
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.schema_key = 'lix_file_descriptor' \
                AND sv.version_id IN ( \
-                 SELECT lix_json_text(snapshot_content, 'version_id') \
+                 SELECT lix_json_extract(snapshot_content, 'version_id') \
                  FROM lix_internal_state_untracked \
                  WHERE schema_key = 'lix_version_pointer' \
                    AND file_id = 'lix' \

@@ -72,8 +72,8 @@ fn build_effective_state_by_version_view_query(
             ", \
              commit_by_version AS ( \
                SELECT \
-                 COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
-                 lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+                 COALESCE(lix_json_extract(snapshot_content, 'id'), entity_id) AS commit_id, \
+                 lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
                FROM {vtable_name} \
                WHERE schema_key = 'lix_commit' \
                  AND version_id = '{global_version}' \
@@ -81,8 +81,8 @@ fn build_effective_state_by_version_view_query(
              ), \
              change_set_element_by_version AS ( \
                SELECT \
-                 lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-                 lix_json_text(snapshot_content, 'change_id') AS change_id \
+                 lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+                 lix_json_extract(snapshot_content, 'change_id') AS change_id \
                FROM {vtable_name} \
                WHERE schema_key = 'lix_change_set_element' \
                  AND version_id = '{global_version}' \
@@ -139,8 +139,8 @@ fn build_effective_state_by_version_view_query(
            WITH RECURSIVE \
              version_descriptor AS ( \
                SELECT \
-                 lix_json_text(snapshot_content, 'id') AS version_id, \
-                 lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+                 lix_json_extract(snapshot_content, 'id') AS version_id, \
+                 lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
                FROM {descriptor_table} \
                WHERE schema_key = '{descriptor_schema_key}' \
                  AND file_id = '{descriptor_file_id}' \
@@ -243,8 +243,8 @@ fn build_effective_state_by_version_count_query(
            WITH RECURSIVE \
              version_descriptor AS ( \
                SELECT \
-                 lix_json_text(snapshot_content, 'id') AS version_id, \
-                 lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+                 lix_json_extract(snapshot_content, 'id') AS version_id, \
+                 lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
                FROM {descriptor_table} \
                WHERE schema_key = '{descriptor_schema_key}' \
                  AND file_id = '{descriptor_file_id}' \
@@ -393,8 +393,8 @@ fn build_effective_state_active_view_query(
             ", \
            commit_by_version AS ( \
              SELECT \
-               COALESCE(lix_json_text(snapshot_content, 'id'), entity_id) AS commit_id, \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+               COALESCE(lix_json_extract(snapshot_content, 'id'), entity_id) AS commit_id, \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
              FROM {vtable_name} \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
@@ -402,8 +402,8 @@ fn build_effective_state_active_view_query(
            ), \
            change_set_element_by_version AS ( \
              SELECT \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_text(snapshot_content, 'change_id') AS change_id \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_extract(snapshot_content, 'change_id') AS change_id \
              FROM {vtable_name} \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
@@ -458,7 +458,7 @@ fn build_effective_state_active_view_query(
              ranked.metadata AS metadata \
          FROM ( \
            WITH RECURSIVE active_version AS ( \
-             SELECT lix_json_text(snapshot_content, 'version_id') AS version_id \
+             SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
              FROM lix_internal_state_untracked \
              WHERE schema_key = '{active_schema_key}' \
                AND file_id = '{active_file_id}' \
@@ -472,17 +472,17 @@ fn build_effective_state_active_view_query(
              FROM active_version \
              UNION ALL \
              SELECT \
-               lix_json_text(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
+               lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
                vc.depth + 1 AS depth \
              FROM version_chain vc \
              JOIN {descriptor_table} vd \
-               ON lix_json_text(vd.snapshot_content, 'id') = vc.version_id \
+               ON lix_json_extract(vd.snapshot_content, 'id') = vc.version_id \
              WHERE vd.schema_key = '{descriptor_schema_key}' \
                AND vd.file_id = '{descriptor_file_id}' \
                AND vd.version_id = '{descriptor_storage_version_id}' \
                AND vd.is_tombstone = 0 \
                AND vd.snapshot_content IS NOT NULL \
-               AND lix_json_text(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
+               AND lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
                AND vc.depth < 64 \
            ) \
            {commit_ctes} \
@@ -556,7 +556,7 @@ fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<
              ranked.entity_id AS entity_id \
          FROM ( \
            WITH RECURSIVE active_version AS ( \
-             SELECT lix_json_text(snapshot_content, 'version_id') AS version_id \
+             SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
              FROM lix_internal_state_untracked \
              WHERE schema_key = '{active_schema_key}' \
                AND file_id = '{active_file_id}' \
@@ -570,17 +570,17 @@ fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<
              FROM active_version \
              UNION ALL \
              SELECT \
-               lix_json_text(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
+               lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
                vc.depth + 1 AS depth \
              FROM version_chain vc \
              JOIN {descriptor_table} vd \
-               ON lix_json_text(vd.snapshot_content, 'id') = vc.version_id \
+               ON lix_json_extract(vd.snapshot_content, 'id') = vc.version_id \
              WHERE vd.schema_key = '{descriptor_schema_key}' \
                AND vd.file_id = '{descriptor_file_id}' \
                AND vd.version_id = '{descriptor_storage_version_id}' \
                AND vd.is_tombstone = 0 \
                AND vd.snapshot_content IS NOT NULL \
-               AND lix_json_text(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
+               AND lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
                AND vc.depth < 64 \
            ) \
            SELECT \

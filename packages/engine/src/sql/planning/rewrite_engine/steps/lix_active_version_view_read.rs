@@ -44,7 +44,7 @@ fn build_lix_active_version_view_query() -> Result<Query, LixError> {
     let sql = format!(
         "SELECT \
              entity_id AS id, \
-             lix_json_text(snapshot_content, 'version_id') AS version_id, \
+             lix_json_extract(snapshot_content, 'version_id') AS version_id, \
              schema_key, \
              file_id, \
              version_id AS lixcol_version_id, \

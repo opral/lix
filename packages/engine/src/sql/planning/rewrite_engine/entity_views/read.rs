@@ -88,7 +88,7 @@ fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError>
     let mut select_parts = Vec::new();
     for property in &target.properties {
         select_parts.push(format!(
-            "lix_json_text(snapshot_content, '{property}') AS {alias}",
+            "lix_json_extract(snapshot_content, '{property}') AS {alias}",
             property = escape_sql_string(property),
             alias = quote_ident(property),
         ));
