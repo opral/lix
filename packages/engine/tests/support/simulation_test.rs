@@ -222,6 +222,7 @@ impl SimulationArgs {
                 key: "lix_deterministic_mode".to_string(),
                 value: serde_json::json!({ "enabled": true }),
                 version_id: None,
+                untracked: None,
             }],
             active_account: None,
             wasm_runtime: default_simulation_wasm_runtime(),
@@ -274,6 +275,7 @@ fn enable_timestamp_shuffle_mode(key_values: &mut Vec<BootKeyValue>) {
             "timestamp_shuffle": true
         }),
         version_id: None,
+        untracked: None,
     });
 }
 

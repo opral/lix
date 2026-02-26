@@ -80,9 +80,8 @@ export type LixWasmRuntime = {
 export type LixBootKeyValue = {
   key: string;
   value: unknown;
-  versionId?: string;
-  version_id?: string;
   lixcol_version_id?: string;
+  lixcol_untracked?: boolean;
 };
 
 export type CreateVersionOptions = {
@@ -491,14 +490,37 @@ export type LixObserveEvents = {
                 Reflect::get(&entry, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
             let value = js_to_json_value(value, &format!("openLix keyValues[{key}].value"))?;
 
-            let version_id = read_optional_string_property(&entry, "versionId")?
-                .or(read_optional_string_property(&entry, "version_id")?)
-                .or(read_optional_string_property(&entry, "lixcol_version_id")?);
+            if Reflect::has(&entry, &JsValue::from_str("versionId")).map_err(js_to_lix_error)? {
+                return Err(LixError {
+                    message:
+                        "openLix keyValues entries must use 'lixcol_version_id' instead of 'versionId'"
+                            .to_string(),
+                });
+            }
+            if Reflect::has(&entry, &JsValue::from_str("version_id")).map_err(js_to_lix_error)? {
+                return Err(LixError {
+                    message:
+                        "openLix keyValues entries must use 'lixcol_version_id' instead of 'version_id'"
+                            .to_string(),
+                });
+            }
+
+            let version_id = read_optional_string_property_with_context(
+                &entry,
+                "lixcol_version_id",
+                "openLix keyValues entry",
+            )?;
+            let untracked = read_optional_bool_property_with_context(
+                &entry,
+                "lixcol_untracked",
+                "openLix keyValues entry",
+            )?;
 
             parsed.push(BootKeyValue {
                 key,
                 value,
                 version_id,
+                untracked,
             });
         }
 
@@ -875,23 +897,6 @@ export type LixObserveEvents = {
             });
         }
         Ok(text)
-    }
-
-    fn read_optional_string_property(
-        object: &JsValue,
-        key: &str,
-    ) -> Result<Option<String>, LixError> {
-        let value = Reflect::get(object, &JsValue::from_str(key)).map_err(js_to_lix_error)?;
-        if value.is_null() || value.is_undefined() {
-            return Ok(None);
-        }
-        let text = value.as_string().ok_or_else(|| LixError {
-            message: format!("openLix keyValues entry '{key}' must be a string"),
-        })?;
-        if text.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(text))
     }
 
     fn read_optional_string_property_with_context(

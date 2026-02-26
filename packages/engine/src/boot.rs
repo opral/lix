@@ -13,6 +13,7 @@ pub struct BootKeyValue {
     pub key: String,
     pub value: JsonValue,
     pub version_id: Option<String>,
+    pub untracked: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

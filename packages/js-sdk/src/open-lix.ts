@@ -99,9 +99,8 @@ export type ObserveEvents = {
 export type OpenLixKeyValue = {
   key: string;
   value: unknown;
-  versionId?: string;
-  version_id?: string;
   lixcol_version_id?: string;
+  lixcol_untracked?: boolean;
 };
 
 export type Lix = {
