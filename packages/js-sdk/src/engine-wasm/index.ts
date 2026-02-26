@@ -77,6 +77,10 @@ export class Value {
     return this.kind === "Integer" ? (this.value as number) : undefined;
   }
 
+  asBoolean(): boolean | undefined {
+    return this.kind === "Boolean" ? (this.value as boolean) : undefined;
+  }
+
   asReal(): number | undefined {
     return this.kind === "Real" ? (this.value as number) : undefined;
   }
@@ -181,6 +185,3 @@ export async function resolveEngineWasmModuleOrPath(): Promise<InitInput> {
 
   return engineWasmUrl;
 }
-  asBoolean(): boolean | undefined {
-    return this.kind === "Boolean" ? (this.value as boolean) : undefined;
-  }

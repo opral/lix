@@ -112,7 +112,7 @@ pub fn rewrite_insert(
 }
 
 pub fn rewrite_insert_with_writer_key(
-    insert: sqlparser::ast::Insert,
+    mut insert: sqlparser::ast::Insert,
     params: &[EngineValue],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
@@ -121,11 +121,7 @@ pub fn rewrite_insert_with_writer_key(
         return Ok(None);
     }
 
-    if insert.on.is_some() {
-        return Err(LixError {
-            message: "vtable insert does not support ON CONFLICT".to_string(),
-        });
-    }
+    validate_and_strip_insert_on_conflict(&mut insert)?;
 
     if insert.columns.is_empty() {
         return Err(LixError {
@@ -169,7 +165,7 @@ pub fn rewrite_insert_with_writer_key(
 
 pub async fn rewrite_insert_with_backend(
     backend: &dyn LixBackend,
-    insert: sqlparser::ast::Insert,
+    mut insert: sqlparser::ast::Insert,
     params: &[EngineValue],
     generated_param_offset: usize,
     detected_file_domain_changes: &[DetectedFileDomainChange],
@@ -180,11 +176,7 @@ pub async fn rewrite_insert_with_backend(
         return Ok(None);
     }
 
-    if insert.on.is_some() {
-        return Err(LixError {
-            message: "vtable insert does not support ON CONFLICT".to_string(),
-        });
-    }
+    validate_and_strip_insert_on_conflict(&mut insert)?;
 
     if insert.columns.is_empty() {
         return Err(LixError {
@@ -229,6 +221,50 @@ pub async fn rewrite_insert_with_backend(
         registrations,
         mutations,
     }))
+}
+
+fn validate_and_strip_insert_on_conflict(
+    insert: &mut sqlparser::ast::Insert,
+) -> Result<(), LixError> {
+    let Some(on_insert) = insert.on.take() else {
+        return Ok(());
+    };
+
+    let OnInsert::OnConflict(on_conflict) = on_insert else {
+        return Err(LixError {
+            message: "vtable insert only supports ON CONFLICT ... DO UPDATE".to_string(),
+        });
+    };
+
+    match on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => {}
+        Some(_) => {
+            return Err(LixError {
+                message: "vtable insert ON CONFLICT only supports explicit column targets"
+                    .to_string(),
+            })
+        }
+        None => {
+            return Err(LixError {
+                message: "vtable insert ON CONFLICT requires explicit conflict columns".to_string(),
+            })
+        }
+    }
+
+    match on_conflict.action {
+        OnConflictAction::DoUpdate(update) => {
+            if update.selection.is_some() {
+                return Err(LixError {
+                    message: "vtable insert ON CONFLICT DO UPDATE does not support WHERE"
+                        .to_string(),
+                });
+            }
+            Ok(())
+        }
+        OnConflictAction::DoNothing => Err(LixError {
+            message: "vtable insert ON CONFLICT DO NOTHING is not supported".to_string(),
+        }),
+    }
 }
 
 pub fn rewrite_update(
@@ -2632,13 +2668,9 @@ mod tests {
         };
 
         let mut provider = SystemFunctionProvider;
-        let rewrite = rewrite_insert(
-            insert,
-            &[EngineValue::Boolean(true)],
-            &mut provider,
-        )
-        .expect("rewrite ok")
-        .expect("rewrite applied");
+        let rewrite = rewrite_insert(insert, &[EngineValue::Boolean(true)], &mut provider)
+            .expect("rewrite ok")
+            .expect("rewrite applied");
 
         assert_eq!(rewrite.statements.len(), 1);
         let stmt = &rewrite.statements[0];
@@ -2659,11 +2691,7 @@ mod tests {
         };
 
         let mut provider = SystemFunctionProvider;
-        let error = match rewrite_insert(
-            insert,
-            &[EngineValue::Integer(1)],
-            &mut provider,
-        ) {
+        let error = match rewrite_insert(insert, &[EngineValue::Integer(1)], &mut provider) {
             Ok(_) => panic!("expected rewrite error"),
             Err(error) => error,
         };
@@ -2671,6 +2699,62 @@ mod tests {
             error
                 .message
                 .contains("vtable insert requires literal or parameter untracked values"),
+            "unexpected error message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rewrite_insert_allows_on_conflict_do_update() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable
+            (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked)
+            VALUES ('entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{"key":"value"}', '1', true)
+            ON CONFLICT (entity_id, schema_key, file_id, version_id)
+            DO UPDATE SET snapshot_content = '{"key":"next"}'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let insert = match statement {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+
+        let mut provider = SystemFunctionProvider;
+        let rewrite = rewrite_insert(insert, &[], &mut provider)
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        assert_eq!(rewrite.statements.len(), 1);
+        assert_eq!(
+            table_name(&rewrite.statements[0]),
+            "lix_internal_state_untracked"
+        );
+    }
+
+    #[test]
+    fn rewrite_insert_rejects_on_conflict_do_nothing() {
+        let sql = r#"INSERT INTO lix_internal_state_vtable
+            (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked)
+            VALUES ('entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{"key":"value"}', '1', true)
+            ON CONFLICT (entity_id, schema_key, file_id, version_id)
+            DO NOTHING"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let insert = match statement {
+            Statement::Insert(insert) => insert,
+            _ => panic!("expected insert"),
+        };
+
+        let mut provider = SystemFunctionProvider;
+        let error = match rewrite_insert(insert, &[], &mut provider) {
+            Ok(_) => panic!("expected rewrite error"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message
+                .contains("ON CONFLICT DO NOTHING is not supported"),
             "unexpected error message: {}",
             error.message
         );

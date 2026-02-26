@@ -148,3 +148,92 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_entity_by_version_insert_on_conflict_do_update_is_supported,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+        let version_id = active_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value_by_version (\
+                 key, value, lixcol_version_id, lixcol_untracked\
+                 ) VALUES (\
+                 'key-upsert-bv', 'value-a', $1, true\
+                 )",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value_by_version (\
+                 key, value, lixcol_version_id, lixcol_untracked\
+                 ) VALUES (\
+                 'key-upsert-bv', 'value-b', $1, true\
+                 ) \
+                 ON CONFLICT (key, lixcol_version_id) DO UPDATE \
+                 SET value = 'value-b', lixcol_untracked = true",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .unwrap();
+
+        let updated = engine
+            .execute(
+                "SELECT value, lixcol_untracked \
+                 FROM lix_key_value_by_version \
+                 WHERE key = 'key-upsert-bv' AND lixcol_version_id = $1",
+                &[Value::Text(version_id)],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic_normalized(updated.rows.clone());
+        assert_eq!(updated.rows.len(), 1);
+        assert_text(&updated.rows[0][0], "value-b");
+        assert!(
+            matches!(updated.rows[0][1], Value::Boolean(true) | Value::Integer(1)),
+            "expected true-like untracked marker, got {:?}",
+            updated.rows[0][1]
+        );
+    }
+);
+
+simulation_test!(
+    lix_entity_by_version_insert_on_conflict_do_nothing_is_rejected,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+        let version_id = active_version_id(&engine).await;
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_key_value_by_version (\
+                 key, value, lixcol_version_id\
+                 ) VALUES (\
+                 'key-upsert-bv', 'value-a', $1\
+                 ) \
+                 ON CONFLICT (key, lixcol_version_id) DO NOTHING",
+                &[Value::Text(version_id)],
+            )
+            .await
+            .expect_err("DO NOTHING should be rejected");
+
+        assert!(
+            err.message
+                .contains("ON CONFLICT DO NOTHING is not supported"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);

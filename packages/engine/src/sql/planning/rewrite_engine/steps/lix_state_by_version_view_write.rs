@@ -1,6 +1,7 @@
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Ident, Insert, ObjectName,
-    ObjectNamePart, TableFactor, TableObject, TableWithJoins, Update,
+    AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Ident, Insert,
+    ObjectName, ObjectNamePart, OnConflictAction, OnInsert, TableFactor, TableObject,
+    TableWithJoins, Update,
 };
 
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
@@ -13,11 +14,7 @@ pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
     if !table_object_is_lix_state_by_version(&insert.table) {
         return Ok(None);
     }
-    if insert.on.is_some() {
-        return Err(LixError {
-            message: "lix_state_by_version insert does not support ON CONFLICT".to_string(),
-        });
-    }
+    validate_and_strip_insert_on_conflict(&mut insert)?;
     if insert.columns.is_empty() {
         return Err(LixError {
             message: "lix_state_by_version insert requires explicit columns".to_string(),
@@ -48,6 +45,54 @@ pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
         Ident::new(VTABLE_NAME),
     )]));
     Ok(Some(insert))
+}
+
+fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixError> {
+    let Some(on_insert) = insert.on.take() else {
+        return Ok(());
+    };
+
+    let OnInsert::OnConflict(on_conflict) = on_insert else {
+        return Err(LixError {
+            message: "lix_state_by_version insert only supports ON CONFLICT ... DO UPDATE"
+                .to_string(),
+        });
+    };
+
+    match on_conflict.conflict_target {
+        Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => {}
+        Some(_) => {
+            return Err(LixError {
+                message:
+                    "lix_state_by_version insert ON CONFLICT only supports explicit column targets"
+                        .to_string(),
+            })
+        }
+        None => {
+            return Err(LixError {
+                message:
+                    "lix_state_by_version insert ON CONFLICT requires explicit conflict columns"
+                        .to_string(),
+            })
+        }
+    }
+
+    match on_conflict.action {
+        OnConflictAction::DoUpdate(update) => {
+            if update.selection.is_some() {
+                return Err(LixError {
+                    message:
+                        "lix_state_by_version insert ON CONFLICT DO UPDATE does not support WHERE"
+                            .to_string(),
+                });
+            }
+            Ok(())
+        }
+        OnConflictAction::DoNothing => Err(LixError {
+            message: "lix_state_by_version insert ON CONFLICT DO NOTHING is not supported"
+                .to_string(),
+        }),
+    }
 }
 
 pub fn rewrite_update(mut update: Update) -> Result<Option<Update>, LixError> {
