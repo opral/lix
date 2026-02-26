@@ -749,7 +749,7 @@ async fn collect_delete_targets(
                     'pending.collect_delete_targets.id_projection' AS __lix_trace \
              FROM (\
                  SELECT \
-                     lix_json_text(snapshot_content, 'id') AS id, \
+                     lix_json_extract(snapshot_content, 'id') AS id, \
                      version_id AS lixcol_version_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_file_descriptor' \
@@ -762,7 +762,7 @@ async fn collect_delete_targets(
                     'pending.collect_delete_targets.id_projection' AS __lix_trace \
              FROM (\
                  SELECT \
-                     lix_json_text(snapshot_content, 'id') AS id, \
+                     lix_json_extract(snapshot_content, 'id') AS id, \
                      version_id AS lixcol_version_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_file_descriptor' \
@@ -1915,7 +1915,10 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_file_data_cache") {
-                return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                });
             }
             if sql.contains("pending.collect_update_writes") {
                 self.fallback_query_seen.store(true, Ordering::SeqCst);
@@ -1934,7 +1937,10 @@ mod tests {
                     ],
                 });
             }
-            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -1953,7 +1959,10 @@ mod tests {
             _sql: &str,
             _params: &[Value],
         ) -> Result<QueryResult, LixError> {
-            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
         }
 
         async fn commit(self: Box<Self>) -> Result<(), LixError> {
@@ -1988,7 +1997,10 @@ mod tests {
                     ],
                 });
             }
-            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {

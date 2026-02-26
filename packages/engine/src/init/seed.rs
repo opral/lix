@@ -198,15 +198,15 @@ impl Engine {
                    ), \
                    edges AS ( \
                      SELECT \
-                       lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                       lix_json_text(snapshot_content, 'child_id') AS child_id \
+                       lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                       lix_json_extract(snapshot_content, 'child_id') AS child_id \
                      FROM lix_internal_state_materialized_v1_lix_commit_edge \
                      WHERE schema_key = 'lix_commit_edge' \
                        AND version_id = 'global' \
                        AND is_tombstone = 0 \
                        AND snapshot_content IS NOT NULL \
-                       AND lix_json_text(snapshot_content, 'parent_id') IS NOT NULL \
-                       AND lix_json_text(snapshot_content, 'child_id') IS NOT NULL \
+                       AND lix_json_extract(snapshot_content, 'parent_id') IS NOT NULL \
+                       AND lix_json_extract(snapshot_content, 'child_id') IS NOT NULL \
                    ), \
                    walk(commit_id, ancestor_id, depth) AS ( \
                      SELECT c.commit_id, c.commit_id AS ancestor_id, 0 AS depth \

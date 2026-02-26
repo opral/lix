@@ -625,7 +625,7 @@ fn build_lix_state_history_view_query(
            commit_by_version AS ( \
              SELECT \
                entity_id AS id, \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                version_id AS lixcol_version_id \
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
@@ -857,7 +857,7 @@ fn build_lix_state_history_view_query_phase1(
            commit_by_version AS ( \
              SELECT \
                entity_id AS id, \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                version_id AS lixcol_version_id \
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
@@ -867,11 +867,11 @@ fn build_lix_state_history_view_query_phase1(
            ), \
            change_set_element_by_version AS ( \
              SELECT \
-               lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_text(snapshot_content, 'change_id') AS change_id, \
-               lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-               lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-               lix_json_text(snapshot_content, 'file_id') AS file_id, \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_extract(snapshot_content, 'change_id') AS change_id, \
+               lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+               lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+               lix_json_extract(snapshot_content, 'file_id') AS file_id, \
                version_id AS lixcol_version_id \
              FROM lix_internal_state_materialized_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \

@@ -62,10 +62,10 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    change_id, \
                    created_at, \
                    updated_at, \
-                   lix_json_text(snapshot_content, 'id') AS id, \
-                   lix_json_text(snapshot_content, 'name') AS name, \
-                   lix_json_text(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id, \
-                   lix_json_text(snapshot_content, 'hidden') AS hidden \
+                   lix_json_extract(snapshot_content, 'id') AS id, \
+                   lix_json_extract(snapshot_content, 'name') AS name, \
+                   lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id, \
+                   lix_json_extract(snapshot_content, 'hidden') AS hidden \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_descriptor' \
                    AND version_id = 'global' \
@@ -77,9 +77,9 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    change_id, \
                    created_at, \
                    updated_at, \
-                   lix_json_text(snapshot_content, 'id') AS id, \
-                   lix_json_text(snapshot_content, 'commit_id') AS commit_id, \
-                   lix_json_text(snapshot_content, 'working_commit_id') AS working_commit_id \
+                   lix_json_extract(snapshot_content, 'id') AS id, \
+                   lix_json_extract(snapshot_content, 'commit_id') AS commit_id, \
+                   lix_json_extract(snapshot_content, 'working_commit_id') AS working_commit_id \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_pointer' \
                    AND version_id = 'global' \

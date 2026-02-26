@@ -40,7 +40,7 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
 fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
     let sql = "WITH \
             active_version AS ( \
-                SELECT lix_json_text(snapshot_content, 'version_id') AS version_id \
+                SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_active_version' \
                   AND file_id = 'lix' \
@@ -61,14 +61,14 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                 LIMIT 1 \
             ), \
             wc AS ( \
-                SELECT lix_json_text(snapshot_content, 'working_commit_id') AS id \
+                SELECT lix_json_extract(snapshot_content, 'working_commit_id') AS id \
                 FROM version_pointer \
                 LIMIT 1 \
             ), \
             commit_rows AS ( \
                 SELECT \
                     entity_id AS id, \
-                    lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_commit' \
                   AND file_id = 'lix' \
@@ -79,7 +79,7 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
  \
                 SELECT \
                     entity_id AS id, \
-                    lix_json_text(snapshot_content, 'change_set_id') AS change_set_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
                 FROM lix_internal_state_materialized_v1_lix_commit \
                 WHERE schema_key = 'lix_commit' \
                   AND file_id = 'lix' \
@@ -90,10 +90,10 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             working_change_rows AS ( \
                 SELECT \
                     entity_id AS change_id, \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'file_id') AS file_id, \
-                    lix_json_text(snapshot_content, 'snapshot_content') AS row_snapshot \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'file_id') AS file_id, \
+                    lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_change' \
                   AND file_id = 'lix' \
@@ -102,11 +102,11 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             working_change_set_element_rows AS ( \
                 SELECT \
-                    lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-                    lix_json_text(snapshot_content, 'change_id') AS change_id, \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+                    lix_json_extract(snapshot_content, 'change_id') AS change_id, \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_change_set_element' \
                   AND file_id = 'lix' \
@@ -115,8 +115,8 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             commit_edge_rows AS ( \
                 SELECT \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'child_id') AS child_id \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'child_id') AS child_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_commit_edge' \
                   AND file_id = 'lix' \
@@ -126,8 +126,8 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                 UNION \
  \
                 SELECT \
-                    lix_json_text(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_text(snapshot_content, 'child_id') AS child_id \
+                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+                    lix_json_extract(snapshot_content, 'child_id') AS child_id \
                 FROM lix_internal_state_materialized_v1_lix_commit_edge \
                 WHERE schema_key = 'lix_commit_edge' \
                   AND file_id = 'lix' \
@@ -138,7 +138,7 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             label_rows AS ( \
                 SELECT \
                     entity_id AS id, \
-                    lix_json_text(snapshot_content, 'name') AS name \
+                    lix_json_extract(snapshot_content, 'name') AS name \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_label' \
                   AND file_id = 'lix' \
@@ -149,7 +149,7 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
  \
                 SELECT \
                     entity_id AS id, \
-                    lix_json_text(snapshot_content, 'name') AS name \
+                    lix_json_extract(snapshot_content, 'name') AS name \
                 FROM lix_internal_state_materialized_v1_lix_label \
                 WHERE schema_key = 'lix_label' \
                   AND file_id = 'lix' \
@@ -159,9 +159,9 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             entity_label_rows AS ( \
                 SELECT \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'label_id') AS label_id \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'label_id') AS label_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_entity_label' \
                   AND file_id = 'lix' \
@@ -171,9 +171,9 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                 UNION \
  \
                 SELECT \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'label_id') AS label_id \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'label_id') AS label_id \
                 FROM lix_internal_state_materialized_v1_lix_entity_label \
                 WHERE schema_key = 'lix_entity_label' \
                   AND file_id = 'lix' \
@@ -184,9 +184,9 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             checkpoint_change_rows AS ( \
                 SELECT \
                     entity_id AS change_id, \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_change' \
                   AND file_id = 'lix' \
@@ -198,9 +198,9 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
  \
                 SELECT \
                     entity_id AS change_id, \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
                 FROM lix_internal_state_materialized_v1_lix_change \
                 WHERE schema_key = 'lix_change' \
                   AND file_id = 'lix' \
@@ -210,11 +210,11 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             checkpoint_change_set_element_rows AS ( \
                 SELECT \
-                    lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-                    lix_json_text(snapshot_content, 'change_id') AS change_id, \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+                    lix_json_extract(snapshot_content, 'change_id') AS change_id, \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_change_set_element' \
                   AND file_id = 'lix' \
@@ -225,11 +225,11 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                 UNION \
  \
                 SELECT \
-                    lix_json_text(snapshot_content, 'change_set_id') AS change_set_id, \
-                    lix_json_text(snapshot_content, 'change_id') AS change_id, \
-                    lix_json_text(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_text(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_text(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+                    lix_json_extract(snapshot_content, 'change_id') AS change_id, \
+                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
                 FROM lix_internal_state_materialized_v1_lix_change_set_element \
                 WHERE schema_key = 'lix_change_set_element' \
                   AND file_id = 'lix' \

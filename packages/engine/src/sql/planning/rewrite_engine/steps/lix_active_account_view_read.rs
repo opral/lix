@@ -43,7 +43,7 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
 fn build_lix_active_account_view_query() -> Result<Query, LixError> {
     let sql = format!(
         "SELECT \
-             lix_json_text(snapshot_content, 'account_id') AS account_id, \
+             lix_json_extract(snapshot_content, 'account_id') AS account_id, \
              schema_key, \
              file_id, \
              version_id AS lixcol_version_id, \

@@ -5,9 +5,9 @@ use sqlparser::ast::{
 
 use crate::backend::SqlDialect;
 
-use super::lower_logical_fn::{LixJsonCall, LixJsonTextCall};
+use super::lower_logical_fn::{LixJsonCall, LixJsonExtractCall};
 
-pub(crate) fn lower_lix_json_text(call: &LixJsonTextCall, dialect: SqlDialect) -> Expr {
+pub(crate) fn lower_lix_json_extract(call: &LixJsonExtractCall, dialect: SqlDialect) -> Expr {
     match dialect {
         SqlDialect::Sqlite => lower_sqlite_json_text(call),
         SqlDialect::Postgres => lower_postgres_json_text(call),
@@ -39,7 +39,7 @@ pub(crate) fn lower_lix_empty_blob(dialect: SqlDialect) -> Expr {
     }
 }
 
-fn lower_sqlite_json_text(call: &LixJsonTextCall) -> Expr {
+fn lower_sqlite_json_text(call: &LixJsonExtractCall) -> Expr {
     let mut json_path = "$".to_string();
     for segment in &call.path {
         json_path.push('.');
@@ -53,7 +53,7 @@ fn lower_sqlite_json_text(call: &LixJsonTextCall) -> Expr {
     )
 }
 
-fn lower_postgres_json_text(call: &LixJsonTextCall) -> Expr {
+fn lower_postgres_json_text(call: &LixJsonExtractCall) -> Expr {
     let mut args = Vec::with_capacity(call.path.len() + 1);
     args.push(Expr::Cast {
         kind: CastKind::Cast,

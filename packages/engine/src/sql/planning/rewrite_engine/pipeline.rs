@@ -480,13 +480,13 @@ mod tests {
     use sqlparser::ast::Statement;
 
     #[test]
-    fn rewrite_only_path_lowers_lix_json_text_functions() {
+    fn rewrite_only_path_lowers_lix_json_extract_functions() {
         let rewritten = preprocess_sql_rewrite_only("SELECT version_id FROM lix_active_version")
             .expect("rewrite should succeed");
 
         assert!(
-            !rewritten.sql.contains("lix_json_text("),
-            "rewrite-only path must lower logical lix_json_text() calls"
+            !rewritten.sql.contains("lix_json_extract("),
+            "rewrite-only path must lower logical lix_json_extract() calls"
         );
         assert!(
             rewritten.sql.contains("json_extract("),
@@ -502,8 +502,8 @@ mod tests {
             .expect("rewrite should succeed");
 
         assert!(
-            !rewritten.sql.contains("lix_json_text("),
-            "preprocess path must lower logical lix_json_text() calls"
+            !rewritten.sql.contains("lix_json_extract("),
+            "preprocess path must lower logical lix_json_extract() calls"
         );
         assert!(
             rewritten.sql.contains("jsonb_extract_path_text("),

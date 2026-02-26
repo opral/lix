@@ -9,8 +9,8 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::backend::SqlDialect;
 use crate::LixError;
 
-use self::json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_text};
-use self::logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_text};
+use self::json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract};
+use self::logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract};
 
 pub(crate) fn lower_statement(
     statement: Statement,
@@ -36,7 +36,7 @@ impl VisitorMut for LogicalFunctionLowerer {
             return ControlFlow::Continue(());
         };
 
-        let parsed = match parse_lix_json_text(function) {
+        let parsed = match parse_lix_json_extract(function) {
             Ok(parsed) => parsed,
             Err(error) => return ControlFlow::Break(error),
         };
@@ -60,7 +60,7 @@ impl VisitorMut for LogicalFunctionLowerer {
             return ControlFlow::Continue(());
         };
 
-        let lowered = lower_lix_json_text(&call, self.dialect);
+        let lowered = lower_lix_json_extract(&call, self.dialect);
         *expr = lowered;
         ControlFlow::Continue(())
     }
@@ -96,9 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn lowers_lix_json_text_to_sqlite_json_extract() {
+    fn lowers_lix_json_extract_to_sqlite_json_extract() {
         let lowered = lower_query(
-            "SELECT lix_json_text(snapshot_content, 'id', 'commit_id') FROM foo",
+            "SELECT lix_json_extract(snapshot_content, 'id', 'commit_id') FROM foo",
             SqlDialect::Sqlite,
         );
         let projection = select_expr(&lowered);
@@ -109,9 +109,9 @@ mod tests {
     }
 
     #[test]
-    fn lowers_lix_json_text_to_postgres_jsonb_extract_path_text() {
+    fn lowers_lix_json_extract_to_postgres_jsonb_extract_path_text() {
         let lowered = lower_query(
-            "SELECT lix_json_text(snapshot_content, 'id', 'commit_id') FROM foo",
+            "SELECT lix_json_extract(snapshot_content, 'id', 'commit_id') FROM foo",
             SqlDialect::Postgres,
         );
         let projection = select_expr(&lowered);
