@@ -449,11 +449,17 @@ async function loadDefaultWasmRuntime(): Promise<LixWasmRuntime> {
     return createUnsupportedWasmRuntime();
   }
 
-  const module = await import("./wasm-runtime/node.js");
+  const nodeRuntimeModulePath = "./wasm-runtime/node.js";
+  const module = (await import(
+    /* @vite-ignore */
+    nodeRuntimeModulePath
+  )) as {
+    createNodeWasmRuntime?: () => LixWasmRuntime | Promise<LixWasmRuntime>;
+  };
   if (typeof module.createNodeWasmRuntime !== "function") {
     throw new Error("js-sdk node runtime module is missing createNodeWasmRuntime()");
   }
-  return module.createNodeWasmRuntime();
+  return await module.createNodeWasmRuntime();
 }
 
 function createUnsupportedWasmRuntime(): LixWasmRuntime {
