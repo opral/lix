@@ -21,10 +21,15 @@ type LixQueryResult = {
 	columns?: unknown;
 };
 
+export type LixExecuteOptions = {
+	writerKey?: string | null;
+};
+
 type LixExecuteLike = {
 	execute(
 		sql: string,
 		params?: ReadonlyArray<unknown>,
+		options?: LixExecuteOptions,
 	): Promise<LixQueryResult>;
 };
 
@@ -33,18 +38,24 @@ type LixDbLike = {
 };
 
 type LixLike = LixExecuteLike | LixDbLike;
+export type CreateLixKyselyOptions = {
+	writerKey?: string | null;
+};
 
 class LixConnection implements DatabaseConnection {
 	readonly #lix: LixExecuteLike;
+	readonly #options?: LixExecuteOptions;
 
-	constructor(lix: LixExecuteLike) {
+	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
 		this.#lix = lix;
+		this.#options = options;
 	}
 
 	async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
 		const raw = await this.#lix.execute(
 			compiledQuery.sql,
 			compiledQuery.parameters,
+			this.#options,
 		);
 		const decodedRows = decodeRows(raw.rows);
 		const columnNames =
@@ -84,7 +95,7 @@ class LixConnection implements DatabaseConnection {
 	}
 
 	async readIntegerResult(sql: string): Promise<bigint | undefined> {
-		const raw = await this.#lix.execute(sql);
+		const raw = await this.#lix.execute(sql, undefined, this.#options);
 		const rows = decodeRows(raw.rows);
 		if (!rows[0] || rows[0].length === 0) {
 			return undefined;
@@ -141,10 +152,12 @@ class LixConnection implements DatabaseConnection {
 class LixDriver implements Driver {
 	readonly #lix: LixExecuteLike;
 	readonly #connection: LixConnection;
+	readonly #options?: LixExecuteOptions;
 
-	constructor(lix: LixExecuteLike) {
+	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
 		this.#lix = lix;
-		this.#connection = new LixConnection(lix);
+		this.#options = options;
+		this.#connection = new LixConnection(lix, options);
 	}
 
 	async init(): Promise<void> {}
@@ -154,15 +167,15 @@ class LixDriver implements Driver {
 	}
 
 	async beginTransaction(): Promise<void> {
-		await this.#lix.execute("BEGIN");
+		await this.#lix.execute("BEGIN", undefined, this.#options);
 	}
 
 	async commitTransaction(): Promise<void> {
-		await this.#lix.execute("COMMIT");
+		await this.#lix.execute("COMMIT", undefined, this.#options);
 	}
 
 	async rollbackTransaction(): Promise<void> {
-		await this.#lix.execute("ROLLBACK");
+		await this.#lix.execute("ROLLBACK", undefined, this.#options);
 	}
 
 	async savepoint(
@@ -170,7 +183,11 @@ class LixDriver implements Driver {
 		savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#lix.execute(`SAVEPOINT ${quoteIdentifier(savepointName)}`);
+		await this.#lix.execute(
+			`SAVEPOINT ${quoteIdentifier(savepointName)}`,
+			undefined,
+			this.#options,
+		);
 	}
 
 	async rollbackToSavepoint(
@@ -180,6 +197,8 @@ class LixDriver implements Driver {
 	): Promise<void> {
 		await this.#lix.execute(
 			`ROLLBACK TO SAVEPOINT ${quoteIdentifier(savepointName)}`,
+			undefined,
+			this.#options,
 		);
 	}
 
@@ -190,6 +209,8 @@ class LixDriver implements Driver {
 	): Promise<void> {
 		await this.#lix.execute(
 			`RELEASE SAVEPOINT ${quoteIdentifier(savepointName)}`,
+			undefined,
+			this.#options,
 		);
 	}
 
@@ -198,10 +219,20 @@ class LixDriver implements Driver {
 	async destroy(): Promise<void> {}
 }
 
-const cache = new WeakMap<object, Kysely<LixDatabaseSchema>>();
+const cache = new WeakMap<object, Map<string, Kysely<LixDatabaseSchema>>>();
 
-export function createLixKysely(lix: LixLike): Kysely<LixDatabaseSchema> {
+export function createLixKysely(
+	lix: LixLike,
+	options: CreateLixKyselyOptions = {},
+): Kysely<LixDatabaseSchema> {
+	const writerKey = normalizeWriterKey(options.writerKey);
+	const cacheKey = writerKeyCacheKey(writerKey);
 	if (isLixDbLike(lix)) {
+		if (writerKey !== undefined) {
+			throw new TypeError(
+				"createLixKysely writerKey option requires lix.execute(sql, params, options)",
+			);
+		}
 		return lix.db as Kysely<LixDatabaseSchema>;
 	}
 	if (!isLixExecuteLike(lix)) {
@@ -210,20 +241,25 @@ export function createLixKysely(lix: LixLike): Kysely<LixDatabaseSchema> {
 		);
 	}
 
-	const cached = cache.get(lix as object);
+	const entry = cache.get(lix as object);
+	const cached = entry?.get(cacheKey);
 	if (cached) {
 		return cached;
 	}
 
 	const dialect = {
 		createAdapter: () => new SqliteAdapter(),
-		createDriver: () => new LixDriver(lix),
+		createDriver: () => new LixDriver(lix, { writerKey }),
 		createIntrospector: (db: Kysely<any>) => new SqliteIntrospector(db),
 		createQueryCompiler: () => new SqliteQueryCompiler(),
 	};
 
 	const db = new Kysely<LixDatabaseSchema>({ dialect });
-	cache.set(lix as object, db);
+	if (entry) {
+		entry.set(cacheKey, db);
+	} else {
+		cache.set(lix as object, new Map([[cacheKey, db]]));
+	}
 	return db;
 }
 
@@ -232,6 +268,29 @@ function isLixExecuteLike(value: unknown): value is LixExecuteLike {
 		return false;
 	}
 	return typeof (value as { execute?: unknown }).execute === "function";
+}
+
+function normalizeWriterKey(value: unknown): string | null | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	if (value === null) {
+		return null;
+	}
+	if (typeof value === "string") {
+		return value;
+	}
+	throw new TypeError("createLixKysely writerKey must be a string or null");
+}
+
+function writerKeyCacheKey(writerKey: string | null | undefined): string {
+	if (writerKey === undefined) {
+		return "__default__";
+	}
+	if (writerKey === null) {
+		return "__null__";
+	}
+	return `writer:${writerKey}`;
 }
 
 function isLixDbLike(value: unknown): value is LixDbLike {

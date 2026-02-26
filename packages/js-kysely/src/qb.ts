@@ -1,6 +1,8 @@
 import { createLixKysely } from "./create-lix-kysely.js";
+import type { CreateLixKyselyOptions } from "./create-lix-kysely.js";
 
 type QbInput = Parameters<typeof createLixKysely>[0];
+type QbOptions = CreateLixKyselyOptions;
 
 /**
  * Kysely entrypoint for Lix.
@@ -8,4 +10,5 @@ type QbInput = Parameters<typeof createLixKysely>[0];
  * Usage:
  * await qb(lix).selectFrom("file").selectAll().execute()
  */
-export const qb = (lix: QbInput) => createLixKysely(lix);
+export const qb = (lix: QbInput, options?: QbOptions) =>
+	createLixKysely(lix, options);

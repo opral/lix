@@ -29,6 +29,14 @@ const db = qb({
 	execute: async () => ({ rows: [] }),
 });
 
+const dbWithWriter = qb(
+	{
+		execute: async () => ({ rows: [] }),
+	},
+	{ writerKey: "writer-a" },
+);
+dbWithWriter.selectFrom("file").select("id").compile();
+
 db.selectFrom("file").select(["id", "path", "hidden"]).compile();
 db.selectFrom("directory").select(["id", "path"]).compile();
 db.selectFrom("key_value_by_version")
