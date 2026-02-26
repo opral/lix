@@ -11,6 +11,11 @@ pub(crate) struct LixJsonTextCall {
     pub(crate) path: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LixJsonCall {
+    pub(crate) json_expr: Expr,
+}
+
 pub(crate) fn parse_lix_json_text(
     function: &Function,
 ) -> Result<Option<LixJsonTextCall>, LixError> {
@@ -40,10 +45,10 @@ pub(crate) fn parse_lix_json_text(
         });
     }
 
-    let json_expr = function_arg_expr(&args[0])?;
+    let json_expr = function_arg_expr(&args[0], "lix_json_text()")?;
     let mut path = Vec::with_capacity(args.len() - 1);
     for arg in &args[1..] {
-        let expr = function_arg_expr(arg)?;
+        let expr = function_arg_expr(arg, "lix_json_text()")?;
         let key = string_literal(&expr).ok_or_else(|| LixError {
             message: "lix_json_text() path arguments must be single-quoted strings".to_string(),
         })?;
@@ -56,6 +61,34 @@ pub(crate) fn parse_lix_json_text(
     }
 
     Ok(Some(LixJsonTextCall { json_expr, path }))
+}
+
+pub(crate) fn parse_lix_json(function: &Function) -> Result<Option<LixJsonCall>, LixError> {
+    if !function_name_matches(&function.name, "lix_json") {
+        return Ok(None);
+    }
+    let args = match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
+                });
+            }
+            &list.args
+        }
+        _ => {
+            return Err(LixError {
+                message: "lix_json() requires a regular argument list".to_string(),
+            });
+        }
+    };
+    if args.len() != 1 {
+        return Err(LixError {
+            message: "lix_json() requires exactly 1 argument".to_string(),
+        });
+    }
+    let json_expr = function_arg_expr(&args[0], "lix_json()")?;
+    Ok(Some(LixJsonCall { json_expr }))
 }
 
 pub(crate) fn parse_lix_empty_blob(function: &Function) -> Result<Option<()>, LixError> {
@@ -91,12 +124,12 @@ pub(crate) fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn function_arg_expr(arg: &FunctionArg) -> Result<Expr, LixError> {
+fn function_arg_expr(arg: &FunctionArg, function_name: &str) -> Result<Expr, LixError> {
     let inner = match arg {
         FunctionArg::Unnamed(arg) => arg,
         _ => {
             return Err(LixError {
-                message: "lix_json_text() does not support named arguments".to_string(),
+                message: format!("{function_name} does not support named arguments"),
             })
         }
     };
@@ -104,7 +137,7 @@ fn function_arg_expr(arg: &FunctionArg) -> Result<Expr, LixError> {
     match inner {
         FunctionArgExpr::Expr(expr) => Ok(expr.clone()),
         _ => Err(LixError {
-            message: "lix_json_text() arguments must be SQL expressions".to_string(),
+            message: format!("{function_name} arguments must be SQL expressions"),
         }),
     }
 }
