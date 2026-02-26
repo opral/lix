@@ -56,7 +56,7 @@ impl LixBackend for SqliteBackend {
         let mut result_rows = Vec::new();
         while let Some(row) = rows.next().map_err(|err| LixError {
             message: err.to_string(),
-            })? {
+        })? {
             result_rows.push(map_row(row)?);
         }
         Ok(QueryResult {

@@ -5,6 +5,6 @@ pub(crate) mod lix_active_version;
 pub(crate) mod lix_state;
 pub(crate) mod lix_state_by_version;
 pub(crate) mod lix_state_history;
-pub(crate) mod lix_working_changes;
 pub(crate) mod lix_version;
+pub(crate) mod lix_working_changes;
 pub(crate) mod logical_views;

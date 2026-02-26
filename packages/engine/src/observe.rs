@@ -265,14 +265,10 @@ fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommi
             | "lix_internal_state_untracked" => {
                 uses_dynamic_state_relations = true;
             }
-            "lix_file"
-            | "lix_file_by_version"
-            | "lix_file_history" => {
+            "lix_file" | "lix_file_by_version" | "lix_file_history" => {
                 schema_keys.insert("lix_file_descriptor".to_string());
             }
-            "lix_directory"
-            | "lix_directory_by_version"
-            | "lix_directory_history" => {
+            "lix_directory" | "lix_directory_by_version" | "lix_directory_history" => {
                 schema_keys.insert("lix_directory_descriptor".to_string());
             }
             "lix_version" | "lix_version_by_version" => {
