@@ -15,7 +15,6 @@
   "scripts": {
     "build": "node ./scripts/build.js",
     "sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",
-    "build:dist": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json",
     "typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
     "test": "node ./scripts/build.js && vitest run",
     "test:watch": "node ./scripts/build.js && vitest"

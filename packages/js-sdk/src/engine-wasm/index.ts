@@ -88,7 +88,10 @@ export class Value {
   }
 }
 
-export type QueryResult = any;
+export type QueryResult = {
+	rows: any[][];
+	columns: string[];
+};
 
 const engineWasmUrl = new URL("./wasm/lix_engine_wasm_bindgen_bg.wasm", import.meta.url);
 
@@ -102,6 +105,38 @@ function isNodeRuntime(): boolean {
   );
 }
 
+async function tryReadNodeFileFromViteHttpUrl(url: URL): Promise<Uint8Array | undefined> {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return undefined;
+  }
+
+  // Vitest/Vite in Node often rewrites module URLs to http://localhost with /@fs/.
+  const decodedPathname = decodeURIComponent(url.pathname);
+  let filePath: string | undefined;
+  if (decodedPathname.startsWith("/@fs/")) {
+    filePath = decodedPathname.slice("/@fs".length);
+  } else if (
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "::1"
+  ) {
+    // Some setups expose absolute filesystem paths directly on localhost.
+    filePath = decodedPathname;
+  }
+
+  if (!filePath) {
+    return undefined;
+  }
+
+  const fsModuleName = "node:fs/promises";
+  const { readFile } = await import(fsModuleName);
+  try {
+    return new Uint8Array(await readFile(filePath));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Returns a wasm-bindgen-compatible init input that works in both browser and Node.
  *
@@ -113,11 +148,30 @@ export async function resolveEngineWasmModuleOrPath(): Promise<InitInput> {
     return engineWasmUrl;
   }
 
-  const fsModuleName = "node:fs/promises";
-  const urlModuleName = "node:url";
-  const [{ readFile }, { fileURLToPath }] = await Promise.all([
-    import(fsModuleName),
-    import(urlModuleName),
-  ]);
-  return readFile(fileURLToPath(engineWasmUrl));
+  if (engineWasmUrl.protocol === "file:") {
+    const fsModuleName = "node:fs/promises";
+    const urlModuleName = "node:url";
+    const [{ readFile }, { fileURLToPath }] = await Promise.all([
+      import(fsModuleName),
+      import(urlModuleName),
+    ]);
+    return readFile(fileURLToPath(engineWasmUrl));
+  }
+
+  if (engineWasmUrl.protocol === "http:" || engineWasmUrl.protocol === "https:") {
+    const localBytes = await tryReadNodeFileFromViteHttpUrl(engineWasmUrl);
+    if (localBytes) {
+      return localBytes;
+    }
+
+    const response = await fetch(engineWasmUrl);
+    if (!response.ok) {
+      throw new Error(
+        `failed to fetch wasm module from '${engineWasmUrl.toString()}': ${response.status} ${response.statusText}`,
+      );
+    }
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  return engineWasmUrl;
 }

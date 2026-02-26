@@ -31,7 +31,9 @@ export type LixValueLike =
   | Uint8Array
   | ArrayBuffer;
 
-export type LixQueryResultLike = { rows: LixValueLike[][] } | LixValueLike[][];
+export type LixQueryResultLike =
+  | { rows: LixValueLike[][]; columns?: string[] }
+  | LixValueLike[][];
 
 export type LixTransaction = {
   dialect?: LixSqlDialect | (() => LixSqlDialect);
@@ -1293,7 +1295,7 @@ export type LixObserveEvents = {
                 rows
             }
         } else {
-            value
+            value.clone()
         };
 
         let rows_array = Array::from(&rows_value);
@@ -1306,7 +1308,31 @@ export type LixObserveEvents = {
             }
             rows.push(values);
         }
-        Ok(EngineQueryResult { rows })
+
+        let mut columns = Vec::new();
+        if let Ok(raw_columns) = Reflect::get(&value, &JsValue::from_str("columns")) {
+            let columns_value = if let Ok(func) = raw_columns.clone().dyn_into::<Function>() {
+                func.call0(&value).map_err(js_to_lix_error)?
+            } else {
+                raw_columns
+            };
+
+            if !columns_value.is_null() && !columns_value.is_undefined() {
+                if !Array::is_array(&columns_value) {
+                    return Err(LixError {
+                        message: "query result 'columns' must be an array of strings".to_string(),
+                    });
+                }
+
+                for column in Array::from(&columns_value).iter() {
+                    columns.push(column.as_string().ok_or_else(|| LixError {
+                        message: "query result 'columns' must be an array of strings".to_string(),
+                    })?);
+                }
+            }
+        }
+
+        Ok(EngineQueryResult { rows, columns })
     }
 
     fn get_kind(value: &JsValue) -> Option<String> {
@@ -1390,8 +1416,13 @@ export type LixObserveEvents = {
             }
             rows.push(&js_row);
         }
+        let columns = Array::new();
+        for column in result.columns {
+            columns.push(&JsValue::from_str(&column));
+        }
         let obj = Object::new();
         let _ = Reflect::set(&obj, &JsValue::from_str("rows"), &rows);
+        let _ = Reflect::set(&obj, &JsValue::from_str("columns"), &columns);
         obj.into()
     }
 
