@@ -228,3 +228,35 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    key_value_lix_json_extract_supports_array_index_segments,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(&insert_key_value_sql("array_extract", "[10,20,30]"), &[])
+            .await
+            .unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT lix_json_extract(snapshot_content, 'value', '1') \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = 'array_extract' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(result.rows.clone());
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("20".to_string()));
+    }
+);
