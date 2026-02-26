@@ -54,6 +54,40 @@ async fn create_version_in_transaction(
     .unwrap_or(active_version_id);
     let hidden = if options.hidden { 1 } else { 0 };
     let working_commit_id = generate_uuid(tx).await?;
+    let working_change_set_id = generate_uuid(tx).await?;
+
+    tx.execute(
+        "INSERT INTO lix_change_set (id) VALUES ($1)",
+        &[Value::Text(working_change_set_id.clone())],
+    )
+    .await?;
+
+    tx.execute(
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1')",
+        &[
+            Value::Text(working_commit_id.clone()),
+            Value::Text(
+                serde_json::json!({
+                    "id": working_commit_id.clone(),
+                    "change_set_id": working_change_set_id,
+                    "parent_commit_ids": [active_commit_id.clone()],
+                    "change_ids": [],
+                })
+                .to_string(),
+            ),
+        ],
+    )
+    .await?;
+
+    ensure_commit_edge(tx, &active_commit_id, &working_commit_id).await?;
+    ensure_commit_ancestry(
+        tx,
+        &working_commit_id,
+        std::slice::from_ref(&active_commit_id),
+    )
+    .await?;
 
     tx.execute(
         "INSERT INTO lix_version (\
@@ -120,4 +154,96 @@ fn normalize_optional_non_empty_text(
         Some(value) => Ok(Some(value)),
         None => Ok(None),
     }
+}
+
+async fn ensure_commit_edge(
+    tx: &mut EngineTransaction<'_>,
+    parent_id: &str,
+    child_id: &str,
+) -> Result<(), LixError> {
+    if parent_id == child_id {
+        return Err(LixError {
+            message: format!("refusing self-edge for commit '{parent_id}'"),
+        });
+    }
+
+    let exists = tx
+        .execute(
+            "SELECT 1 FROM lix_commit_edge WHERE parent_id = $1 AND child_id = $2 LIMIT 1",
+            &[
+                Value::Text(parent_id.to_string()),
+                Value::Text(child_id.to_string()),
+            ],
+        )
+        .await?;
+    if !exists.rows.is_empty() {
+        return Ok(());
+    }
+
+    tx.execute(
+        "INSERT INTO lix_state_by_version (\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+         ) VALUES ($1, 'lix_commit_edge', 'lix', 'global', 'lix', $2, '1')",
+        &[
+            Value::Text(format!("{parent_id}~{child_id}")),
+            Value::Text(
+                serde_json::json!({
+                    "parent_id": parent_id,
+                    "child_id": child_id,
+                })
+                .to_string(),
+            ),
+        ],
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn ensure_commit_ancestry(
+    tx: &mut EngineTransaction<'_>,
+    commit_id: &str,
+    parent_ids: &[String],
+) -> Result<(), LixError> {
+    tx.execute_internal(
+        "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+         VALUES ($1, $1, 0) \
+         ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
+        &[Value::Text(commit_id.to_string())],
+    )
+    .await?;
+
+    for parent_id in normalize_parent_commit_ids(parent_ids.to_vec(), commit_id) {
+        tx.execute_internal(
+            "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+             SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
+             FROM ( \
+               SELECT $2 AS ancestor_id, 1 AS depth \
+               UNION ALL \
+               SELECT ancestor_id, depth + 1 AS depth \
+               FROM lix_internal_commit_ancestry \
+               WHERE commit_id = $2 \
+             ) AS candidate \
+             GROUP BY candidate.ancestor_id \
+             ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
+             SET depth = CASE \
+               WHEN excluded.depth < lix_internal_commit_ancestry.depth THEN excluded.depth \
+               ELSE lix_internal_commit_ancestry.depth \
+             END",
+            &[Value::Text(commit_id.to_string()), Value::Text(parent_id)],
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn normalize_parent_commit_ids(
+    mut parent_commit_ids: Vec<String>,
+    self_commit_id: &str,
+) -> Vec<String> {
+    parent_commit_ids.retain(|id| !id.is_empty() && id != self_commit_id);
+    parent_commit_ids.sort();
+    parent_commit_ids.dedup();
+    parent_commit_ids
 }

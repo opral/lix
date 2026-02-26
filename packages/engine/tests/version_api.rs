@@ -18,6 +18,16 @@ fn value_as_bool(value: &Value) -> bool {
     }
 }
 
+fn value_as_i64(value: &Value) -> i64 {
+    match value {
+        Value::Integer(value) => *value,
+        Value::Text(value) => value
+            .parse::<i64>()
+            .unwrap_or_else(|error| panic!("expected i64-compatible text, got '{value}': {error}")),
+        other => panic!("expected integer-compatible value, got {other:?}"),
+    }
+}
+
 simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -64,7 +74,31 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     assert_eq!(value_as_text(&row[2]), created.inherits_from_version_id);
     assert!(!value_as_bool(&row[3]));
     assert_eq!(value_as_text(&row[4]), active_commit_id);
-    assert!(!value_as_text(&row[5]).is_empty());
+    let working_commit_id = value_as_text(&row[5]);
+    assert!(!working_commit_id.is_empty());
+
+    let working_commit_rows = engine
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_commit \
+             WHERE id = $1",
+            &[Value::Text(working_commit_id.clone())],
+        )
+        .await
+        .expect("working commit existence query should succeed");
+    assert_eq!(value_as_i64(&working_commit_rows.rows[0][0]), 1);
+
+    let working_change_set_rows = engine
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_change_set cs \
+             JOIN lix_commit c ON c.change_set_id = cs.id \
+             WHERE c.id = $1",
+            &[Value::Text(working_commit_id)],
+        )
+        .await
+        .expect("working change set existence query should succeed");
+    assert_eq!(value_as_i64(&working_change_set_rows.rows[0][0]), 1);
 
     let active_after = engine
         .execute(
@@ -147,4 +181,27 @@ simulation_test!(switch_version_rejects_invalid_inputs, |sim| async move {
         .await
         .expect_err("unknown version id should fail");
     assert!(missing.message.contains("does not exist"));
+});
+
+simulation_test!(create_version_switch_then_checkpoint, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.expect("init should succeed");
+
+    let created = engine
+        .create_version(CreateVersionOptions::default())
+        .await
+        .expect("create_version should succeed");
+
+    engine
+        .switch_version(created.id)
+        .await
+        .expect("switch_version should succeed");
+
+    engine
+        .create_checkpoint()
+        .await
+        .expect("create_checkpoint should succeed after switching to created version");
 });
