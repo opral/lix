@@ -54,7 +54,9 @@ impl AnalysisContext {
     }
 
     pub(crate) fn references_state_views(&self) -> bool {
-        self.references_relation("lix_state") || self.references_relation("lix_state_by_version")
+        self.references_relation("lix_state")
+            || self.references_relation("lix_state_by_version")
+            || self.references_relation("lix_working_changes")
     }
 
     pub(crate) fn references_entity_views(&self) -> bool {
@@ -76,6 +78,7 @@ impl AnalysisContext {
             || self.references_relation("lix_state")
             || self.references_relation("lix_state_by_version")
             || self.references_relation("lix_state_history")
+            || self.references_relation("lix_working_changes")
     }
 
     pub(crate) fn materialized_schema_keys_cache(&self) -> Option<&[String]> {
@@ -100,5 +103,6 @@ fn is_builtin_logical_relation(name: &str) -> bool {
         || name == "lix_state"
         || name == "lix_state_by_version"
         || name == "lix_state_history"
+        || name == "lix_working_changes"
         || FILESYSTEM_VIEW_NAMES.contains(&name)
 }

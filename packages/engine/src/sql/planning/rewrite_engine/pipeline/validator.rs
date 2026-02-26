@@ -18,6 +18,7 @@ const LOGICAL_READ_VIEW_NAMES: &[&str] = &[
     "lix_state",
     "lix_state_by_version",
     "lix_state_history",
+    "lix_working_changes",
     "lix_version",
     "lix_file",
     "lix_file_by_version",

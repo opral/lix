@@ -196,6 +196,17 @@ type StateHistoryView = {
 	depth: number;
 };
 
+type WorkingChangesView = {
+	entity_id: string;
+	schema_key: string;
+	file_id: string;
+	before_change_id: string | null;
+	after_change_id: string | null;
+	before_commit_id: string | null;
+	after_commit_id: string | null;
+	status: "added" | "modified" | "removed" | "unchanged";
+};
+
 type LixActiveVersion = FromLixSchemaDefinition<typeof LixActiveVersionSchema>;
 type LixKeyValue = FromLixSchemaDefinition<typeof LixKeyValueSchema> & {
 	value: any;
@@ -243,6 +254,7 @@ export type LixDatabaseSchema = {
 	state_by_version: StateByVersionView;
 	state_with_tombstones: StateWithTombstonesView;
 	state_history: StateHistoryView;
+	lix_working_changes: WorkingChangesView;
 
 	change: ChangeView;
 	directory: DirectoryDescriptorView;

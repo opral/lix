@@ -6,7 +6,9 @@ use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::planning::preprocess::preprocess_with_surfaces_to_plan;
 use super::super::vtable;
-use super::{entity, filesystem, lix_state, lix_state_by_version, lix_state_history};
+use super::{
+    entity, filesystem, lix_state, lix_state_by_version, lix_state_history, lix_working_changes,
+};
 use sqlparser::ast::Statement;
 
 pub(crate) type DetectedFileDomainChangesByStatement = [Vec<DetectedFileDomainChange>];
@@ -17,6 +19,7 @@ pub(crate) enum SurfaceKind {
     LixState,
     LixStateByVersion,
     LixStateHistory,
+    LixWorkingChanges,
     Filesystem,
     Entity,
     Generic,
@@ -28,6 +31,7 @@ pub(crate) struct SurfaceCoverage {
     pub(crate) lix_state: usize,
     pub(crate) lix_state_by_version: usize,
     pub(crate) lix_state_history: usize,
+    pub(crate) lix_working_changes: usize,
     pub(crate) filesystem: usize,
     pub(crate) entity: usize,
     pub(crate) generic: usize,
@@ -42,6 +46,9 @@ pub(crate) fn classify_statement(statement: &Statement) -> SurfaceKind {
     }
     if lix_state_history::planner::matches(statement) {
         return SurfaceKind::LixStateHistory;
+    }
+    if lix_working_changes::planner::matches(statement) {
+        return SurfaceKind::LixWorkingChanges;
     }
     if lix_state::planner::matches(statement) {
         return SurfaceKind::LixState;
@@ -79,6 +86,10 @@ pub(crate) fn collect_surface_coverage(statements: &[Statement]) -> SurfaceCover
             SurfaceKind::LixStateHistory => {
                 let _ = lix_state_history::lower::lowering_kind(statement);
                 coverage.lix_state_history += 1;
+            }
+            SurfaceKind::LixWorkingChanges => {
+                let _ = lix_working_changes::lower::lowering_kind(statement);
+                coverage.lix_working_changes += 1;
             }
             SurfaceKind::Filesystem => {
                 let _ = filesystem::lower::lowering_kind(statement);
