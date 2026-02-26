@@ -94,12 +94,22 @@ fn lower_postgres_json_text(call: &LixJsonExtractCall) -> Expr {
 fn sqlite_json_path_literal(path: &[String]) -> String {
     let mut json_path = "$".to_string();
     for segment in path {
-        json_path.push('.');
-        json_path.push('"');
-        json_path.push_str(&segment.replace('\\', "\\\\").replace('"', "\\\""));
-        json_path.push('"');
+        if sqlite_path_segment_is_array_index(segment) {
+            json_path.push('[');
+            json_path.push_str(segment);
+            json_path.push(']');
+        } else {
+            json_path.push('.');
+            json_path.push('"');
+            json_path.push_str(&segment.replace('\\', "\\\\").replace('"', "\\\""));
+            json_path.push('"');
+        }
     }
     json_path
+}
+
+fn sqlite_path_segment_is_array_index(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn function_expr(name: &str, args: Vec<Expr>) -> Expr {

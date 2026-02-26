@@ -109,6 +109,19 @@ mod tests {
     }
 
     #[test]
+    fn lowers_lix_json_extract_numeric_segment_to_sqlite_array_index() {
+        let lowered = lower_query(
+            "SELECT lix_json_extract(snapshot_content, 'items', '0', 'commit_id') FROM foo",
+            SqlDialect::Sqlite,
+        );
+        let projection = select_expr(&lowered);
+        assert_eq!(
+            projection,
+            "CASE json_type(snapshot_content, '$.\"items\"[0].\"commit_id\"') WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' ELSE json_extract(snapshot_content, '$.\"items\"[0].\"commit_id\"') || '' END"
+        );
+    }
+
+    #[test]
     fn lowers_lix_json_extract_to_postgres_jsonb_extract_path_text() {
         let lowered = lower_query(
             "SELECT lix_json_extract(snapshot_content, 'id', 'commit_id') FROM foo",
