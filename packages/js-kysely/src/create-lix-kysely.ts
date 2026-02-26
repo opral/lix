@@ -18,6 +18,7 @@ type LixValue = {
 
 type LixQueryResult = {
 	rows?: unknown;
+	columns?: unknown;
 };
 
 type LixExecuteLike = {
@@ -35,7 +36,6 @@ type LixLike = LixExecuteLike | LixDbLike;
 
 class LixConnection implements DatabaseConnection {
 	readonly #lix: LixExecuteLike;
-	readonly #tableColumnsCache = new Map<string, string[]>();
 
 	constructor(lix: LixExecuteLike) {
 		this.#lix = lix;
@@ -47,7 +47,9 @@ class LixConnection implements DatabaseConnection {
 			compiledQuery.parameters,
 		);
 		const decodedRows = decodeRows(raw.rows);
-		const columnNames = await this.resolveColumnNames(compiledQuery.query);
+		const columnNames =
+			decodeColumnNames(raw.columns) ??
+			(await this.resolveColumnNames(compiledQuery.query));
 		const rows =
 			columnNames &&
 			decodedRows.every((row) => row.length === columnNames.length)
@@ -113,11 +115,6 @@ class LixConnection implements DatabaseConnection {
 			if (selections.length > 0) {
 				return selections.map(selectionNameFromNode);
 			}
-
-			const tableNames = selectTableNames(query);
-			if (tableNames.length === 1) {
-				return await this.getTableColumns(tableNames[0]);
-			}
 			return undefined;
 		}
 
@@ -138,26 +135,6 @@ class LixConnection implements DatabaseConnection {
 		}
 
 		return undefined;
-	}
-
-	async getTableColumns(tableName: string): Promise<string[] | undefined> {
-		const cached = this.#tableColumnsCache.get(tableName);
-		if (cached) {
-			return cached;
-		}
-
-		const escapedTable = tableName.replaceAll('"', '""');
-		const raw = await this.#lix.execute(`PRAGMA table_info("${escapedTable}")`);
-		const rows = decodeRows(raw.rows);
-		const names = rows
-			.map((row) => row[1])
-			.filter((value): value is string => typeof value === "string");
-		if (names.length === 0) {
-			return undefined;
-		}
-
-		this.#tableColumnsCache.set(tableName, names);
-		return names;
 	}
 }
 
@@ -292,13 +269,29 @@ function decodeValue(value: unknown): unknown {
 	return value;
 }
 
+function decodeColumnNames(rawColumns: unknown): string[] | undefined {
+	if (!Array.isArray(rawColumns)) {
+		return undefined;
+	}
+
+	const names = rawColumns.filter(
+		(value): value is string => typeof value === "string",
+	);
+
+	return names.length > 0 ? names : undefined;
+}
+
 function rowToObject(
 	row: unknown[],
 	columns: string[],
 ): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
 	for (let i = 0; i < columns.length; i++) {
-		out[columns[i]] = row[i];
+		const column = columns[i];
+		if (!column) {
+			continue;
+		}
+		out[column] = row[i];
 	}
 	return out;
 }
