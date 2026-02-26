@@ -1907,10 +1907,15 @@ mod tests {
                         Value::Text("v1".to_string()),
                         Value::Text("/src/a.md".to_string()),
                     ]],
+                    columns: vec![
+                        "file_id".to_string(),
+                        "version_id".to_string(),
+                        "path".to_string(),
+                    ],
                 });
             }
             if sql.contains("FROM lix_internal_file_data_cache") {
-                return Ok(QueryResult { rows: Vec::new() });
+                return Ok(QueryResult { rows: Vec::new(), columns: Vec::new() });
             }
             if sql.contains("pending.collect_update_writes") {
                 self.fallback_query_seen.store(true, Ordering::SeqCst);
@@ -1921,9 +1926,15 @@ mod tests {
                         Value::Blob(b"seed-data".to_vec()),
                         Value::Text("v1".to_string()),
                     ]],
+                    columns: vec![
+                        "file_id".to_string(),
+                        "path".to_string(),
+                        "data".to_string(),
+                        "version_id".to_string(),
+                    ],
                 });
             }
-            Ok(QueryResult { rows: Vec::new() })
+            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -1942,7 +1953,7 @@ mod tests {
             _sql: &str,
             _params: &[Value],
         ) -> Result<QueryResult, LixError> {
-            Ok(QueryResult { rows: Vec::new() })
+            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
         }
 
         async fn commit(self: Box<Self>) -> Result<(), LixError> {
@@ -1969,9 +1980,15 @@ mod tests {
                         Value::Blob(b"seed".to_vec()),
                         Value::Text("v1".to_string()),
                     ]],
+                    columns: vec![
+                        "file_id".to_string(),
+                        "path".to_string(),
+                        "data".to_string(),
+                        "version_id".to_string(),
+                    ],
                 });
             }
-            Ok(QueryResult { rows: Vec::new() })
+            Ok(QueryResult { rows: Vec::new(), columns: Vec::new() })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {

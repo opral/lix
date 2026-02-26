@@ -10,4 +10,6 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
+    #[serde(default)]
+    pub columns: Vec<String>,
 }

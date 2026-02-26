@@ -33,12 +33,20 @@ impl LixBackend for SqliteBackend {
             conn.execute_batch(sql).map_err(|err| LixError {
                 message: err.to_string(),
             })?;
-            return Ok(QueryResult { rows: Vec::new() });
+            return Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            });
         }
 
         let mut stmt = conn.prepare(sql).map_err(|err| LixError {
             message: err.to_string(),
         })?;
+        let columns = stmt
+            .column_names()
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
         let bound_params = params.iter().cloned().map(to_sql_value);
         let mut rows = stmt
             .query(params_from_iter(bound_params))
@@ -48,10 +56,13 @@ impl LixBackend for SqliteBackend {
         let mut result_rows = Vec::new();
         while let Some(row) = rows.next().map_err(|err| LixError {
             message: err.to_string(),
-        })? {
+            })? {
             result_rows.push(map_row(row)?);
         }
-        Ok(QueryResult { rows: result_rows })
+        Ok(QueryResult {
+            rows: result_rows,
+            columns,
+        })
     }
 
     async fn begin_transaction(
