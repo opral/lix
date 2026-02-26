@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { openLix } from "./open-lix.js";
+import { openLix, Value } from "./open-lix.js";
 
 test("openLix executes SQL against default in-memory sqlite backend", async () => {
   const lix = await openLix();
@@ -61,7 +61,7 @@ test("createVersion forwards inheritsFromVersionId and hidden options", async ()
   expect(row.rows[0][0]).toEqual({ kind: "Text", value: "branch-options" });
   expect(row.rows[0][1]).toEqual({ kind: "Text", value: "Branch Options" });
   expect(row.rows[0][2]).toEqual({ kind: "Text", value: "global" });
-  expect(row.rows[0][3]).toEqual({ kind: "Integer", value: 1 });
+  expect(row.rows[0][3]).toEqual({ kind: "Text", value: "true" });
 
   await lix.close();
 });
@@ -110,6 +110,74 @@ test("executeTransaction applies multiple statements in one call", async () => {
     ["tx-batch-a", "tx-batch-b"],
   );
   expect(values.rows.length).toBe(2);
+
+  await lix.close();
+});
+
+test("execute serializes object params for structured JSON columns", async () => {
+  const lix = await openLix();
+
+  await lix.execute(
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    [
+      "open-lix-json-param-value",
+      {
+        enabled: true,
+      },
+    ],
+  );
+
+  const inserted = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["open-lix-json-param-value"],
+  );
+  expect(inserted.rows.length).toBe(1);
+  expect(inserted.rows[0][0]).toEqual({
+    kind: "Text",
+    value: JSON.stringify({ enabled: true }),
+  });
+
+  await lix.close();
+});
+
+test("execute preserves typed kind/value params without JSON stringification", async () => {
+  const lix = await openLix();
+
+  await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+    "open-lix-typed-param-value",
+    { kind: "Text", value: "typed-text-value" },
+  ]);
+
+  const inserted = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["open-lix-typed-param-value"],
+  );
+  expect(inserted.rows.length).toBe(1);
+  expect(inserted.rows[0][0]).toEqual({
+    kind: "Text",
+    value: "typed-text-value",
+  });
+
+  await lix.close();
+});
+
+test("execute preserves Value instances as typed params", async () => {
+  const lix = await openLix();
+
+  await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+    "open-lix-value-instance",
+    Value.text("typed-from-instance"),
+  ]);
+
+  const inserted = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["open-lix-value-instance"],
+  );
+  expect(inserted.rows.length).toBe(1);
+  expect(inserted.rows[0][0]).toEqual({
+    kind: "Text",
+    value: "typed-from-instance",
+  });
 
   await lix.close();
 });
