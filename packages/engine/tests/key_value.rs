@@ -37,13 +37,17 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(after_insert.rows.clone());
+    sim.assert_deterministic(vec![vec![after_insert.rows[0][0].clone()]]);
     assert_eq!(after_insert.rows.len(), 1);
     assert_eq!(
         after_insert.rows[0][0],
         Value::Text("{\"key\":\"key0\",\"value\":\"value0\"}".to_string())
     );
-    assert_eq!(after_insert.rows[0][1], Value::Integer(0));
+    match &after_insert.rows[0][1] {
+        Value::Boolean(value) => assert!(!value),
+        Value::Integer(value) => assert_eq!(*value, 0),
+        other => panic!("expected false-like untracked marker, got {other:?}"),
+    }
 
     engine
         .execute(

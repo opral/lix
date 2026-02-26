@@ -484,12 +484,12 @@ mod tests {
         let schema = json!({
             "x-lix-key": "lix_custom_entity",
             "x-lix-version": "1",
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "'file-custom'",
-                "lixcol_plugin_key": "'plugin-custom'",
-                "lixcol_version_id": "'version-custom'",
-                "lixcol_untracked": "1"
-            },
+                "x-lix-override-lixcols": {
+                    "lixcol_file_id": "'file-custom'",
+                    "lixcol_plugin_key": "'plugin-custom'",
+                    "lixcol_version_id": "'version-custom'",
+                    "lixcol_untracked": "true"
+                },
             "type": "object",
             "properties": {
                 "id": { "type": "string" }
@@ -517,7 +517,7 @@ mod tests {
         assert!(target
             .override_predicates
             .iter()
-            .any(|predicate| predicate.column == "untracked" && predicate.value == json!(1)));
+            .any(|predicate| predicate.column == "untracked" && predicate.value == json!(true)));
     }
 
     #[test]

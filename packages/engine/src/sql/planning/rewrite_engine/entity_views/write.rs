@@ -311,7 +311,7 @@ where
         };
         let untracked_expr = match untracked_index {
             Some(index) => resolved_or_original_expr(row, resolved_row, index),
-            None => integer_expr(0),
+            None => boolean_expr(false),
         };
         let snapshot_content_expr =
             string_literal_expr(&JsonValue::Object(snapshot_object.clone()).to_string());
@@ -400,6 +400,7 @@ where
 fn resolved_or_original_expr(row: &[Expr], resolved_row: &[ResolvedCell], index: usize) -> Expr {
     match resolved_row.get(index).and_then(|cell| cell.value.as_ref()) {
         Some(EngineValue::Null) => Expr::Value(AstValue::Null.into()),
+        Some(EngineValue::Boolean(value)) => Expr::Value(AstValue::Boolean(*value).into()),
         Some(EngineValue::Text(value)) => {
             Expr::Value(AstValue::SingleQuotedString(value.clone()).into())
         }
@@ -1776,6 +1777,7 @@ fn json_text_input_from_engine_value(
 ) -> Result<String, LixError> {
     match value {
         EngineValue::Null => Ok("null".to_string()),
+        EngineValue::Boolean(value) => Ok(value.to_string()),
         EngineValue::Integer(value) => Ok(value.to_string()),
         EngineValue::Real(value) => {
             if value.is_finite() {
@@ -1880,6 +1882,7 @@ fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
 fn json_value_from_engine_value(value: &EngineValue, context: &str) -> Result<JsonValue, LixError> {
     match value {
         EngineValue::Null => Ok(JsonValue::Null),
+        EngineValue::Boolean(value) => Ok(JsonValue::Bool(*value)),
         EngineValue::Integer(value) => Ok(JsonValue::Number((*value).into())),
         EngineValue::Real(value) => JsonNumber::from_f64(*value)
             .map(JsonValue::Number)
@@ -2180,8 +2183,8 @@ fn string_literal_expr(value: &str) -> Expr {
     Expr::Value(AstValue::SingleQuotedString(value.to_string()).into())
 }
 
-fn integer_expr(value: i64) -> Expr {
-    Expr::Value(AstValue::Number(value.to_string(), false).into())
+fn boolean_expr(value: bool) -> Expr {
+    Expr::Value(AstValue::Boolean(value).into())
 }
 
 fn null_expr() -> Expr {

@@ -65,7 +65,7 @@ impl Engine {
                     Value::Text(key_value_plugin_key().to_string()),
                     Value::Text(snapshot_content),
                     Value::Text(key_value_schema_version().to_string()),
-                    Value::Integer(if untracked { 1 } else { 0 }),
+                    Value::Boolean(untracked),
                 ],
                 ExecuteOptions::default(),
             )
@@ -113,7 +113,7 @@ impl Engine {
         self.execute_internal(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, 'lix_label', 'lix', 'global', 'lix', $2, '1', 1)",
+             ) VALUES ($1, 'lix_label', 'lix', 'global', 'lix', $2, '1', true)",
             &[Value::Text(label_id), Value::Text(snapshot_content)],
             ExecuteOptions::default(),
         )
@@ -273,7 +273,7 @@ impl Engine {
 
         self.execute_internal(
             "DELETE FROM lix_internal_state_vtable \
-             WHERE untracked = 1 \
+             WHERE untracked = true \
                AND schema_key = $1 \
                AND file_id = $2 \
                AND version_id = $3",
@@ -289,7 +289,7 @@ impl Engine {
         self.execute_internal(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, true)",
             &[
                 Value::Text(account.id.clone()),
                 Value::Text(active_account_schema_key().to_string()),
@@ -499,7 +499,7 @@ impl Engine {
         self.execute_internal(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', 1)",
+             ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', true)",
             &[
                 Value::Text(GLOBAL_VERSION_ID.to_string()),
                 Value::Text(snapshot_content),
@@ -536,7 +536,7 @@ impl Engine {
         self.execute_internal(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', 1)",
+             ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', true)",
             &[
                 Value::Text(GLOBAL_VERSION_ID.to_string()),
                 Value::Text(snapshot_content),

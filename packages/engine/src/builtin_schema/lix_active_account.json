@@ -7,7 +7,7 @@
   "x-lix-override-lixcols": {
     "lixcol_file_id": "\"lix\"",
     "lixcol_plugin_key": "\"lix\"",
-    "lixcol_untracked": "1",
+    "lixcol_untracked": "true",
     "lixcol_version_id": "\"global\""
   },
   "x-lix-foreign-keys": [

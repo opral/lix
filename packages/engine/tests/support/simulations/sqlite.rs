@@ -218,6 +218,7 @@ fn bind_param_sqlite<'q>(
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
     match param {
         Value::Null => query.bind(Option::<i64>::None),
+        Value::Boolean(v) => query.bind(*v),
         Value::Integer(v) => query.bind(*v),
         Value::Real(v) => query.bind(*v),
         Value::Text(v) => query.bind(v.as_str()),

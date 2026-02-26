@@ -2,7 +2,7 @@ export { default } from "./wasm/lix_engine_wasm_bindgen.js";
 export * from "./wasm/lix_engine_wasm_bindgen.js";
 import type { InitInput } from "./wasm/lix_engine_wasm_bindgen.js";
 
-export type ValueKind = "Null" | "Integer" | "Real" | "Text" | "Blob";
+export type ValueKind = "Null" | "Boolean" | "Integer" | "Real" | "Text" | "Blob";
 
 export class Value {
   kind: ValueKind;
@@ -19,6 +19,10 @@ export class Value {
 
   static integer(value: number): Value {
     return new Value("Integer", value);
+  }
+
+  static boolean(value: boolean): Value {
+    return new Value("Boolean", value);
   }
 
   static real(value: number): Value {
@@ -46,6 +50,7 @@ export class Value {
         const resolved = kindFn.call(raw);
         if (typeof resolved === "string") {
           if (resolved === "Integer") return Value.integer((raw as any).asInteger?.() ?? 0);
+          if (resolved === "Boolean") return Value.boolean((raw as any).asBoolean?.() ?? false);
           if (resolved === "Real") return Value.real((raw as any).asReal?.() ?? 0);
           if (resolved === "Text") return Value.text((raw as any).asText?.() ?? "");
           if (resolved === "Blob") return Value.blob((raw as any).asBlob?.() ?? new Uint8Array());
@@ -57,6 +62,7 @@ export class Value {
     if (typeof raw === "number") {
       return Number.isInteger(raw) ? Value.integer(raw) : Value.real(raw);
     }
+    if (typeof raw === "boolean") return Value.boolean(raw);
     if (typeof raw === "string") return Value.text(raw);
     if (raw instanceof Uint8Array) return Value.blob(raw);
     if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
@@ -175,3 +181,6 @@ export async function resolveEngineWasmModuleOrPath(): Promise<InitInput> {
 
   return engineWasmUrl;
 }
+  asBoolean(): boolean | undefined {
+    return this.kind === "Boolean" ? (this.value as boolean) : undefined;
+  }

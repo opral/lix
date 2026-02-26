@@ -12,6 +12,7 @@ fn value_as_text(value: &Value) -> String {
 
 fn value_as_bool(value: &Value) -> bool {
     match value {
+        Value::Boolean(value) => *value,
         Value::Integer(value) => *value != 0,
         Value::Text(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
         other => panic!("expected boolean-compatible value, got {other:?}"),

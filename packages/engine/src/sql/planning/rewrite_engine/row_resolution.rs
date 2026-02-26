@@ -225,7 +225,7 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
         | SqlValue::TripleDoubleQuotedByteStringLiteral(text) => Ok(Value::Text(text.clone())),
         SqlValue::HexStringLiteral(text) => Ok(Value::Blob(parse_hex_literal(text)?)),
         SqlValue::DollarQuotedString(text) => Ok(Value::Text(text.value.clone())),
-        SqlValue::Boolean(value) => Ok(Value::Integer(if *value { 1 } else { 0 })),
+        SqlValue::Boolean(value) => Ok(Value::Boolean(*value)),
         SqlValue::Null => Ok(Value::Null),
         SqlValue::Placeholder(token) => Err(LixError {
             message: format!("unexpected placeholder '{token}' while resolving row"),

@@ -237,6 +237,10 @@ impl SimulationArgs {
     {
         self.expect.assert_deterministic(actual);
     }
+
+    pub fn assert_deterministic_normalized(&self, actual: Vec<Vec<Value>>) {
+        self.expect.assert_deterministic_normalized(actual);
+    }
 }
 
 fn default_simulation_boot_args() -> SimulationBootArgs {
@@ -357,6 +361,10 @@ impl LocalExpectDeterministic {
 				expected
 			);
         }
+    }
+
+    fn assert_deterministic_normalized(&self, actual: Vec<Vec<Value>>) {
+        self.assert_deterministic(normalize_bool_like_rows(&actual));
     }
 }
 
@@ -492,6 +500,10 @@ impl SharedDeterministicRun {
                 expected
             );
         }
+    }
+
+    fn assert_deterministic_normalized(&self, actual: Vec<Vec<Value>>) {
+        self.assert_deterministic(normalize_bool_like_rows(&actual));
     }
 
     fn finish(&self, success: bool) -> Result<(), String> {
@@ -638,6 +650,10 @@ impl SharedExpectDeterministic {
     {
         self.run.assert_deterministic(actual);
     }
+
+    fn assert_deterministic_normalized(&self, actual: Vec<Vec<Value>>) {
+        self.run.assert_deterministic_normalized(actual);
+    }
 }
 
 impl ExpectDeterministic {
@@ -667,6 +683,52 @@ impl ExpectDeterministic {
             Self::Local(local) => local.assert_deterministic(actual),
             Self::Shared(shared) => shared.assert_deterministic(actual),
         }
+    }
+
+    fn assert_deterministic_normalized(&self, actual: Vec<Vec<Value>>) {
+        match self {
+            Self::Local(local) => local.assert_deterministic_normalized(actual),
+            Self::Shared(shared) => shared.assert_deterministic_normalized(actual),
+        }
+    }
+}
+
+pub fn assert_boolean_like(value: &Value, expected: bool) {
+    match value {
+        Value::Boolean(actual) => assert_eq!(*actual, expected),
+        Value::Integer(actual) => assert_eq!(*actual != 0, expected),
+        Value::Text(actual) => {
+            let normalized = actual.trim().to_ascii_lowercase();
+            let parsed = match normalized.as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => panic!("expected boolean-like text, got '{actual}'"),
+            };
+            assert_eq!(parsed, expected);
+        }
+        other => panic!("expected boolean-like value, got {other:?}"),
+    }
+}
+
+fn normalize_bool_like_rows(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    rows.iter()
+        .map(|row| row.iter().map(normalize_bool_like_value).collect())
+        .collect()
+}
+
+fn normalize_bool_like_value(value: &Value) -> Value {
+    match value {
+        Value::Integer(0) => Value::Boolean(false),
+        Value::Integer(1) => Value::Boolean(true),
+        Value::Text(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "0" | "false" => Value::Boolean(false),
+                "1" | "true" => Value::Boolean(true),
+                _ => value.clone(),
+            }
+        }
+        _ => value.clone(),
     }
 }
 

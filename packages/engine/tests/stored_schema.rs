@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::assert_boolean_like;
 
 simulation_test!(
     stored_schema_registers_materialized_table,
@@ -34,7 +35,7 @@ simulation_test!(
         .await
         .unwrap();
 
-        sim.assert_deterministic(stored.rows.clone());
+        sim.assert_deterministic_normalized(stored.rows.clone());
         assert_eq!(stored.rows.len(), 1);
         let row = &stored.rows[0];
         assert_eq!(row[0], Value::Text("test_schema~1".to_string()));
@@ -43,7 +44,7 @@ simulation_test!(
         assert_eq!(row[3], Value::Text("global".to_string()));
         assert_eq!(row[4], Value::Text("lix".to_string()));
         assert_eq!(row[5], Value::Text("schema".to_string()));
-        assert_eq!(row[7], Value::Integer(0));
+        assert_boolean_like(&row[7], false);
         assert_eq!(
             row[6],
             Value::Text(

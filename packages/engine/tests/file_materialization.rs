@@ -2164,7 +2164,7 @@ simulation_test!(
                     "INSERT INTO lix_version (\
                      id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', 0, 'commit-{version_b}', 'working-{version_b}'\
+                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}', 'working-{version_b}'\
                      )",
                     version_b = version_b,
                     main_version = main_version_id
@@ -2305,7 +2305,7 @@ simulation_test!(
                     "INSERT INTO lix_version (\
                      id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', 0, 'commit-{version_b}', 'working-{version_b}'\
+                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}', 'working-{version_b}'\
                      )",
                     version_b = version_b,
                     main_version = main_version_id
@@ -2537,7 +2537,7 @@ simulation_test!(
                     "INSERT INTO lix_version (\
                      id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', 0, 'commit-{version_b}', 'working-{version_b}'\
+                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}', 'working-{version_b}'\
                      )",
                     version_b = version_b,
                     main_version = main_version_id
@@ -2687,7 +2687,7 @@ simulation_test!(
                     "INSERT INTO lix_version (\
                      id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', 0, 'commit-{version_b}', 'working-{version_b}'\
+                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}', 'working-{version_b}'\
                      )",
                     version_b = version_b,
                     main_version = main_version_id

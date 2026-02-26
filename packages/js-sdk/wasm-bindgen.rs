@@ -23,9 +23,10 @@ mod wasm {
 export type LixSqlDialect = "sqlite" | "postgres";
 
 export type LixValueLike =
-  | { kind: "Null" | "Integer" | "Real" | "Text" | "Blob"; value: unknown }
+  | { kind: "Null" | "Boolean" | "Integer" | "Real" | "Text" | "Blob"; value: unknown }
   | null
   | undefined
+  | boolean
   | number
   | string
   | Uint8Array
@@ -1407,6 +1408,9 @@ export type LixObserveEvents = {
         if value.is_null() || value.is_undefined() {
             return Ok(EngineValue::Null);
         }
+        if let Some(boolean) = value.as_bool() {
+            return Ok(EngineValue::Boolean(boolean));
+        }
         if let Some(number) = value.as_f64() {
             if number.fract() == 0.0 {
                 return Ok(EngineValue::Integer(number as i64));
@@ -1424,6 +1428,10 @@ export type LixObserveEvents = {
         if let Some(kind) = get_kind(&value) {
             return match kind.as_str() {
                 "Null" => Ok(EngineValue::Null),
+                "Boolean" => {
+                    let v = get_value_field_or_method(&value, "value", "asBoolean")?;
+                    Ok(EngineValue::Boolean(v.as_bool().unwrap_or(false)))
+                }
                 "Integer" => {
                     let v = get_value_field_or_method(&value, "value", "asInteger")?;
                     Ok(EngineValue::Integer(v.as_f64().unwrap_or(0.0) as i64))
@@ -1474,6 +1482,14 @@ export type LixObserveEvents = {
             EngineValue::Null => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("Null"));
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::NULL);
+            }
+            EngineValue::Boolean(value) => {
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("kind"),
+                    &JsValue::from_str("Boolean"),
+                );
+                let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from_bool(value));
             }
             EngineValue::Integer(value) => {
                 let _ = Reflect::set(

@@ -989,7 +989,7 @@ async fn active_version_id_from_internal_state_update(
 
     let active_version_predicate = if table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE) {
         format!(
-            "schema_key = '{}' AND file_id = '{}' AND version_id = '{}' AND untracked = 1",
+            "schema_key = '{}' AND file_id = '{}' AND version_id = '{}'",
             escape_sql_string(active_version_schema_key()),
             escape_sql_string(active_version_file_id()),
             escape_sql_string(active_version_storage_version_id()),
@@ -1006,7 +1006,11 @@ async fn active_version_id_from_internal_state_update(
     };
 
     let mut query_sql = format!("SELECT 1 FROM {table_name} WHERE {active_version_predicate}");
-    if let Some(selection) = update.selection.as_ref() {
+    if table_name.eq_ignore_ascii_case(INTERNAL_STATE_VTABLE) {
+        // INTERNAL_STATE_VTABLE selection predicates can use logical aliases (e.g. `untracked`)
+        // that are not valid physical column names on storage tables.
+        // The fixed active-version predicate above is sufficient for this prefetch query.
+    } else if let Some(selection) = update.selection.as_ref() {
         query_sql.push_str(" AND (");
         query_sql.push_str(&selection.to_string());
         query_sql.push(')');

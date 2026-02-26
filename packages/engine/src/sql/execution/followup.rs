@@ -437,7 +437,7 @@ async fn load_effective_scope_delete_rows(
                s.metadata AS metadata, \
                s.snapshot_content AS snapshot_content, \
                '{schema_key}' AS schema_key, \
-               0 AS untracked, \
+               false AS untracked, \
                CASE \
                  WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
                  WHEN vc.depth = 0 THEN NULL \
@@ -455,7 +455,7 @@ async fn load_effective_scope_delete_rows(
          WHERE rn = 1 \
            AND snapshot_content IS NOT NULL \
            AND ({selection_sql}) \
-           AND untracked = 0",
+           AND untracked = false",
         descriptor_table = descriptor_table,
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),

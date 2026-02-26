@@ -593,7 +593,7 @@ async fn query_lix_version_rows(
         let id = value_required_string(&row[0], "id")?;
         let name = value_required_string(&row[1], "name")?;
         let inherits_from_version_id = value_optional_string(&row[2], "inherits_from_version_id")?;
-        let hidden = value_bool(&row[3], "hidden")?;
+        let hidden = value_bool_from_existing_row(&row[3], "hidden")?;
         let _commit_id = value_required_string(&row[4], "commit_id")?;
         let _working_commit_id = value_required_string(&row[5], "working_commit_id")?;
 
@@ -808,23 +808,52 @@ fn value_optional_string(value: &EngineValue, field: &str) -> Result<Option<Stri
 
 fn value_bool(value: &EngineValue, field: &str) -> Result<bool, LixError> {
     match value {
-        EngineValue::Integer(number) => Ok(*number != 0),
-        EngineValue::Real(number) => Ok(*number != 0.0),
+        EngineValue::Boolean(value) => Ok(*value),
+        EngineValue::Null => Ok(false),
+        _ => Err(LixError {
+            message: format!("lix_version field '{field}' must be a boolean"),
+        }),
+    }
+}
+
+fn value_bool_from_existing_row(value: &EngineValue, field: &str) -> Result<bool, LixError> {
+    match value {
+        EngineValue::Boolean(value) => Ok(*value),
+        EngineValue::Integer(value) => match *value {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(LixError {
+                message: format!(
+                    "lix_version field '{field}' must be boolean-compatible for existing rows"
+                ),
+            }),
+        },
+        EngineValue::Real(value) => match *value {
+            1.0 => Ok(true),
+            0.0 => Ok(false),
+            _ => Err(LixError {
+                message: format!(
+                    "lix_version field '{field}' must be boolean-compatible for existing rows"
+                ),
+            }),
+        },
         EngineValue::Text(text) => {
             let normalized = text.trim().to_ascii_lowercase();
             match normalized.as_str() {
-                "1" | "true" => Ok(true),
-                "0" | "false" => Ok(false),
+                "true" | "1" => Ok(true),
+                "false" | "0" | "" => Ok(false),
                 _ => Err(LixError {
                     message: format!(
-                        "lix_version field '{field}' must be boolean-compatible, got '{text}'"
+                        "lix_version field '{field}' must be boolean-compatible for existing rows"
                     ),
                 }),
             }
         }
         EngineValue::Null => Ok(false),
-        _ => Err(LixError {
-            message: format!("lix_version field '{field}' must be boolean-compatible"),
+        EngineValue::Blob(_) => Err(LixError {
+            message: format!(
+                "lix_version field '{field}' must be boolean-compatible for existing rows"
+            ),
         }),
     }
 }

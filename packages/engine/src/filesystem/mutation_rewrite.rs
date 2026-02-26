@@ -306,7 +306,7 @@ pub async fn insert_side_effect_statements_with_backend(
             let statement_sql = if target.uses_active_version_scope() {
                 format!(
                     "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_untracked) \
-                     VALUES ('{id}', {parent_id}, '{name}', 0, 1)",
+                     VALUES ('{id}', {parent_id}, '{name}', false, true)",
                     table = DIRECTORY_DESCRIPTOR_VIEW,
                     id = escape_sql_string(&id),
                     parent_id = parent_id
@@ -318,7 +318,7 @@ pub async fn insert_side_effect_statements_with_backend(
             } else {
                 format!(
                     "INSERT INTO {table} (id, parent_id, name, hidden, lixcol_version_id, lixcol_untracked) \
-                     VALUES ('{id}', {parent_id}, '{name}', 0, '{version_id}', 1)",
+                     VALUES ('{id}', {parent_id}, '{name}', false, '{version_id}', true)",
                     table = DIRECTORY_DESCRIPTOR_BY_VERSION_VIEW,
                     id = escape_sql_string(&id),
                     parent_id = parent_id
@@ -1620,7 +1620,7 @@ async fn find_directory_child_id(
     let lookup_sql = format!(
         "SELECT entity_id, version_id, untracked \
          FROM ( \
-           SELECT entity_id, version_id, 1 AS untracked \
+           SELECT entity_id, version_id, true AS untracked \
            FROM lix_internal_state_untracked \
            WHERE schema_key = '{schema_key}' \
              AND version_id IN ({version_predicate}) \
@@ -1628,7 +1628,7 @@ async fn find_directory_child_id(
              AND {name_expr} = ${name_index} \
              AND {parent_predicate} \
            UNION ALL \
-           SELECT entity_id, version_id, 0 AS untracked \
+           SELECT entity_id, version_id, false AS untracked \
            FROM lix_internal_state_materialized_v1_lix_directory_descriptor \
            WHERE schema_key = '{schema_key}' \
              AND version_id IN ({version_predicate}) \
@@ -1724,7 +1724,7 @@ async fn find_file_id_by_components(
     let lookup_sql = format!(
         "SELECT entity_id, version_id, untracked \
          FROM ( \
-           SELECT entity_id, version_id, 1 AS untracked \
+           SELECT entity_id, version_id, true AS untracked \
            FROM lix_internal_state_untracked \
            WHERE schema_key = '{schema_key}' \
              AND version_id IN ({version_predicate}) \
@@ -1733,7 +1733,7 @@ async fn find_file_id_by_components(
              AND {directory_predicate} \
              AND {extension_predicate} \
            UNION ALL \
-           SELECT entity_id, version_id, 0 AS untracked \
+           SELECT entity_id, version_id, false AS untracked \
            FROM lix_internal_state_materialized_v1_lix_file_descriptor \
            WHERE schema_key = '{schema_key}' \
              AND version_id IN ({version_predicate}) \
@@ -1806,14 +1806,14 @@ async fn effective_entity_is_tombstoned_in_chain(
     let sql = format!(
         "SELECT version_id, untracked, tombstone \
          FROM ( \
-           SELECT version_id, 1 AS untracked, \
+           SELECT version_id, true AS untracked, \
                   CASE WHEN snapshot_content IS NULL THEN 1 ELSE 0 END AS tombstone \
            FROM lix_internal_state_untracked \
            WHERE schema_key = '{schema_key}' \
              AND version_id IN ({version_predicate}) \
              AND entity_id = ${entity_index} \
            UNION ALL \
-           SELECT version_id, 0 AS untracked, \
+           SELECT version_id, false AS untracked, \
                   CASE WHEN is_tombstone = 1 OR snapshot_content IS NULL THEN 1 ELSE 0 END AS tombstone \
            FROM {materialized_table} \
            WHERE schema_key = '{schema_key}' \
@@ -2070,6 +2070,7 @@ fn resolve_text_expr(
         if let Some(value) = &cell.value {
             return match value {
                 EngineValue::Null => Ok(None),
+                EngineValue::Boolean(value) => Ok(Some(value.to_string())),
                 EngineValue::Text(value) => Ok(Some(value.clone())),
                 EngineValue::Integer(value) => Ok(Some(value.to_string())),
                 EngineValue::Real(value) => Ok(Some(value.to_string())),
@@ -2106,11 +2107,7 @@ fn resolve_text_expr(
         | AstValue::TripleDoubleQuotedByteStringLiteral(value) => Ok(Some(value.clone())),
         AstValue::DollarQuotedString(value) => Ok(Some(value.value.clone())),
         AstValue::Number(value, _) => Ok(Some(value.clone())),
-        AstValue::Boolean(value) => Ok(Some(if *value {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        })),
+        AstValue::Boolean(value) => Ok(Some(value.to_string())),
         AstValue::Placeholder(_) => Ok(None),
     }
 }
@@ -2124,16 +2121,27 @@ fn resolve_untracked_expr(
         if let Some(value) = &cell.value {
             return match value {
                 EngineValue::Null => Ok(None),
-                EngineValue::Integer(value) => Ok(Some(*value != 0)),
-                EngineValue::Real(value) => Ok(Some(*value != 0.0)),
+                EngineValue::Boolean(value) => Ok(Some(*value)),
+                EngineValue::Integer(number) => Err(LixError {
+                    message: format!(
+                        "{context} expects boolean values (TRUE/FALSE), numeric values are not supported ('{}')",
+                        number
+                    ),
+                }),
+                EngineValue::Real(number) => Err(LixError {
+                    message: format!(
+                        "{context} expects boolean values (TRUE/FALSE), numeric values are not supported ('{}')",
+                        number
+                    ),
+                }),
                 EngineValue::Text(value) => {
                     let normalized = value.trim().to_ascii_lowercase();
                     match normalized.as_str() {
-                        "1" | "true" => Ok(Some(true)),
-                        "0" | "false" | "" => Ok(Some(false)),
+                        "true" => Ok(Some(true)),
+                        "false" | "" => Ok(Some(false)),
                         _ => Err(LixError {
                             message: format!(
-                                "{context} expects a boolean-like value, got '{}'",
+                                "{context} expects boolean text 'true'/'false', got '{}'",
                                 value
                             ),
                         }),
@@ -2155,13 +2163,6 @@ fn resolve_untracked_expr(
     match value {
         AstValue::Null => Ok(None),
         AstValue::Boolean(value) => Ok(Some(*value)),
-        AstValue::Number(value, _) => match value.trim() {
-            "1" => Ok(Some(true)),
-            "0" => Ok(Some(false)),
-            _ => Err(LixError {
-                message: format!("{context} expects 0/1, got '{}'", value),
-            }),
-        },
         AstValue::SingleQuotedString(value)
         | AstValue::DoubleQuotedString(value)
         | AstValue::TripleSingleQuotedString(value)
@@ -2180,23 +2181,32 @@ fn resolve_untracked_expr(
         | AstValue::TripleDoubleQuotedByteStringLiteral(value) => {
             let normalized = value.trim().to_ascii_lowercase();
             match normalized.as_str() {
-                "1" | "true" => Ok(Some(true)),
-                "0" | "false" | "" => Ok(Some(false)),
+                "true" => Ok(Some(true)),
+                "false" | "" => Ok(Some(false)),
                 _ => Err(LixError {
-                    message: format!("{context} expects boolean-like text, got '{}'", value),
+                    message: format!("{context} expects boolean text 'true'/'false', got '{}'", value),
                 }),
             }
         }
         AstValue::DollarQuotedString(value) => {
             let normalized = value.value.trim().to_ascii_lowercase();
             match normalized.as_str() {
-                "1" | "true" => Ok(Some(true)),
-                "0" | "false" | "" => Ok(Some(false)),
+                "true" => Ok(Some(true)),
+                "false" | "" => Ok(Some(false)),
                 _ => Err(LixError {
-                    message: format!("{context} expects boolean-like text, got '{}'", value.value),
+                    message: format!(
+                        "{context} expects boolean text 'true'/'false', got '{}'",
+                        value.value
+                    ),
                 }),
             }
         }
+        AstValue::Number(value, _) => Err(LixError {
+            message: format!(
+                "{context} expects boolean values (TRUE/FALSE), numeric values are not supported ('{}')",
+                value
+            ),
+        }),
         AstValue::Placeholder(_) => Ok(None),
     }
 }
@@ -2435,11 +2445,7 @@ fn expr_string_literal(expr: &Expr) -> Option<String> {
         | AstValue::TripleDoubleQuotedByteStringLiteral(value) => Some(value.clone()),
         AstValue::DollarQuotedString(value) => Some(value.value.clone()),
         AstValue::Number(value, _) => Some(value.clone()),
-        AstValue::Boolean(value) => Some(if *value {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        }),
+        AstValue::Boolean(value) => Some(value.to_string()),
         AstValue::Null | AstValue::Placeholder(_) => None,
     }
 }
@@ -2457,6 +2463,7 @@ fn expr_string_literal_or_placeholder(
         return Ok(None);
     };
     match value {
+        EngineValue::Boolean(value) => Ok(Some(value.to_string())),
         EngineValue::Text(value) => Ok(Some(value)),
         EngineValue::Integer(value) => Ok(Some(value.to_string())),
         EngineValue::Real(value) => Ok(Some(value.to_string())),
@@ -2964,7 +2971,7 @@ async fn try_exact_file_descriptor_lookup_current_version(
     version_id: &str,
     file_id: &str,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
-    let untracked_sql = "SELECT entity_id, 1 AS untracked, snapshot_content, \
+    let untracked_sql = "SELECT entity_id, true AS untracked, snapshot_content, \
                               'mutation.file_ids_matching_update.fast_id.untracked' AS __lix_trace \
                        FROM lix_internal_state_untracked \
                        WHERE schema_key = 'lix_file_descriptor' \
@@ -2990,7 +2997,7 @@ async fn try_exact_file_descriptor_lookup_current_version(
         return Ok(Some(parsed));
     }
 
-    let materialized_sql = "SELECT entity_id, 0 AS untracked, snapshot_content, \
+    let materialized_sql = "SELECT entity_id, false AS untracked, snapshot_content, \
                                  'mutation.file_ids_matching_update.fast_id.materialized' AS __lix_trace \
                           FROM lix_internal_state_materialized_v1_lix_file_descriptor \
                           WHERE schema_key = 'lix_file_descriptor' \
@@ -3184,6 +3191,7 @@ fn file_prefetch_trace_enabled() -> bool {
 
 fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
     match value {
+        EngineValue::Boolean(value) => Ok(*value),
         EngineValue::Integer(v) => Ok(*v != 0),
         EngineValue::Text(v) => {
             let normalized = v.trim().to_ascii_lowercase();

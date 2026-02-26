@@ -27,7 +27,7 @@ async fn insert_version(engine: &support::simulation_test::SimulationEngine, ver
         "INSERT INTO lix_version (\
          id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
          ) VALUES (\
-         '{version_id}', '{version_id}', 'global', 0, 'commit-{version_id}', 'working-{version_id}'\
+         '{version_id}', '{version_id}', 'global', false, 'commit-{version_id}', 'working-{version_id}'\
          )",
     );
     engine.execute(&sql, &[]).await.unwrap();

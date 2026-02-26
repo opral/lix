@@ -22,6 +22,7 @@ fn assert_non_empty_text(value: &Value) {
 
 fn assert_bool(value: &Value, expected: bool) {
     match value {
+        Value::Boolean(actual) => assert_eq!(*actual, expected),
         Value::Integer(actual) => assert_eq!(*actual != 0, expected),
         Value::Text(actual) => {
             let normalized = actual.trim().to_ascii_lowercase();
@@ -119,7 +120,7 @@ simulation_test!(
         assert_text(&row[7], "global");
         assert_text(&row[8], "lix");
         assert_text(&row[9], "1");
-        assert_eq!(row[10], Value::Integer(0));
+        assert_bool(&row[10], false);
     }
 );
 
@@ -166,7 +167,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
              id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
              ) VALUES (\
-             'version-a', 'Version A', NULL, 0, 'commit-a', 'working-a'\
+             'version-a', 'Version A', NULL, false, 'commit-a', 'working-a'\
              )",
                 &[],
             )
@@ -225,7 +226,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
-                 'version-missing-tip', 'Version Missing Tip', NULL, 0, 'commit-missing-tip'\
+                 'version-missing-tip', 'Version Missing Tip', NULL, false, 'commit-missing-tip'\
                  )",
                 &[],
             )
@@ -256,7 +257,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
              id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
              ) VALUES (\
-             'version-b', 'Version B', NULL, 0, 'commit-b', 'working-b'\
+             'version-b', 'Version B', NULL, false, 'commit-b', 'working-b'\
              )",
                 &[],
             )
@@ -266,7 +267,7 @@ simulation_test!(
         engine
         .execute(
             "UPDATE lix_version \
-             SET name = 'Version B2', hidden = 1, commit_id = 'commit-b2', working_commit_id = 'working-b2' \
+             SET name = 'Version B2', hidden = true, commit_id = 'commit-b2', working_commit_id = 'working-b2' \
              WHERE id = 'version-b'",
             &[],
         )
@@ -308,7 +309,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
              id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
              ) VALUES (\
-             'version-tip-contract', 'Version Tip Contract', NULL, 0, 'commit-tip-0', 'working-tip-0'\
+             'version-tip-contract', 'Version Tip Contract', NULL, false, 'commit-tip-0', 'working-tip-0'\
              )",
                 &[],
             )
@@ -347,7 +348,7 @@ simulation_test!(lix_version_update_supports_placeholders, |sim| async move {
             "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'version-ph', 'Version PH', NULL, 0, 'commit-ph', 'working-ph'\
+                 'version-ph', 'Version PH', NULL, false, 'commit-ph', 'working-ph'\
                  )",
             &[],
         )
@@ -399,7 +400,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
             "INSERT INTO lix_version (\
              id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
              ) VALUES (\
-             'version-c', 'Version C', NULL, 0, 'commit-c', 'working-c'\
+             'version-c', 'Version C', NULL, false, 'commit-c', 'working-c'\
              )",
             &[],
         )
@@ -448,7 +449,7 @@ simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {
             "INSERT INTO lix_version (\
              id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
              ) VALUES (\
-             'version-pd', 'Version PD', NULL, 0, 'commit-pd', 'working-pd'\
+             'version-pd', 'Version PD', NULL, false, 'commit-pd', 'working-pd'\
              )",
             &[],
         )
@@ -485,7 +486,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'version-direct', 'version-direct', NULL, 0, 'commit-direct', 'working-direct'\
+                 'version-direct', 'version-direct', NULL, false, 'commit-direct', 'working-direct'\
                  )",
                 &[],
             )
@@ -563,7 +564,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'version-state', 'version-state', NULL, 0, 'commit-state', 'working-state'\
+                 'version-state', 'version-state', NULL, false, 'commit-state', 'working-state'\
                  )",
                 &[],
             )
@@ -625,7 +626,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'v-unique-1', 'v-unique-1', NULL, 0, 'commit-unique-1', 'working-unique-1'\
+                 'v-unique-1', 'v-unique-1', NULL, false, 'commit-unique-1', 'working-unique-1'\
                  )",
                 &[],
             )
@@ -637,7 +638,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'v-unique-2', 'v-unique-2', NULL, 0, 'commit-unique-2', 'working-unique-1'\
+                 'v-unique-2', 'v-unique-2', NULL, false, 'commit-unique-2', 'working-unique-1'\
                  )",
                 &[],
             )
@@ -666,7 +667,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'v-unique-3', 'v-unique-3', NULL, 0, 'commit-unique-3', 'working-unique-3'\
+                 'v-unique-3', 'v-unique-3', NULL, false, 'commit-unique-3', 'working-unique-3'\
                  )",
                 &[],
             )
@@ -703,7 +704,7 @@ simulation_test!(
                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'v-lenient', 'v-lenient', NULL, 0, 'does_not_exist', 'working-lenient'\
+                 'v-lenient', 'v-lenient', NULL, false, 'does_not_exist', 'working-lenient'\
                  )",
                 &[],
             )

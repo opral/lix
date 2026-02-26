@@ -122,6 +122,7 @@ fn insert_targets_vtable(insert: &Insert) -> bool {
 fn engine_value_to_expr(value: &Value) -> Result<Expr, LixError> {
     match value {
         Value::Null => Ok(Expr::Value(SqlValue::Null.into())),
+        Value::Boolean(value) => Ok(Expr::Value(SqlValue::Boolean(*value).into())),
         Value::Text(value) => Ok(Expr::Value(
             SqlValue::SingleQuotedString(value.clone()).into(),
         )),

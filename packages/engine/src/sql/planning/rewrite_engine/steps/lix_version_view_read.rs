@@ -52,7 +52,7 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                  COALESCE(t.change_id, d.change_id) AS change_id, \
                  COALESCE(d.created_at, t.created_at) AS created_at, \
                  COALESCE(t.updated_at, d.updated_at) AS updated_at, \
-                 0 AS untracked \
+                 false AS untracked \
                FROM ( \
                  SELECT \
                    entity_id, \

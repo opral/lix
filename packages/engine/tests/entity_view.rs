@@ -103,7 +103,7 @@ async fn install_select_override_schema(engine: &support::simulation_test::Simul
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\",\"lixcol_untracked\":\"1\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
+             '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )",
             &[],
         )
@@ -372,10 +372,10 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_version (\
+                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'version-child', 'version-child', 'global', 0, 'commit-child', 'working-child'\
+                 'version-child', 'version-child', 'global', false, 'commit-child', 'working-child'\
                  )",
                 &[],
             )
@@ -465,10 +465,10 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_version (\
+                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'active-test', 'active-test', NULL, 0, 'commit-active', 'working-active'\
+                 'active-test', 'active-test', NULL, false, 'commit-active', 'working-active'\
                  )",
                 &[],
             )
@@ -601,10 +601,10 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_version (\
+                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'version-child', 'version-child', 'global', 0, 'commit-child', 'working-child'\
+                 'version-child', 'version-child', 'global', false, 'commit-child', 'working-child'\
                  )",
                 &[],
             )
@@ -655,12 +655,12 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, untracked\
                  ) VALUES \
-                 ('match-global', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"match-global\"}', NULL, '1', 1), \
-                 ('mismatch-file', 'lix_select_override_schema', 'other', 'global', 'inlang_sdk', '{\"id\":\"mismatch-file\"}', NULL, '1', 1), \
-                 ('mismatch-plugin', 'lix_select_override_schema', 'inlang', 'global', 'other_plugin', '{\"id\":\"mismatch-plugin\"}', NULL, '1', 1), \
-                 ('mismatch-untracked', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-untracked\"}', NULL, '1', 0), \
-                 ('mismatch-metadata', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-metadata\"}', '{\"k\":1}', '1', 1), \
-                 ('match-main', 'lix_select_override_schema', 'inlang', 'main', 'inlang_sdk', '{\"id\":\"match-main\"}', NULL, '1', 1)",
+                 ('match-global', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"match-global\"}', NULL, '1', true), \
+                 ('mismatch-file', 'lix_select_override_schema', 'other', 'global', 'inlang_sdk', '{\"id\":\"mismatch-file\"}', NULL, '1', true), \
+                 ('mismatch-plugin', 'lix_select_override_schema', 'inlang', 'global', 'other_plugin', '{\"id\":\"mismatch-plugin\"}', NULL, '1', true), \
+                 ('mismatch-untracked', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-untracked\"}', NULL, '1', false), \
+                 ('mismatch-metadata', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-metadata\"}', '{\"k\":1}', '1', true), \
+                 ('match-main', 'lix_select_override_schema', 'inlang', 'main', 'inlang_sdk', '{\"id\":\"match-main\"}', NULL, '1', true)",
                 &[],
             )
             .await
@@ -733,10 +733,10 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_version (\
+                 "INSERT INTO lix_version (\
                  id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
                  ) VALUES (\
-                 'active-inherited', 'active-inherited', 'global', 0, 'commit-inherited', 'working-inherited'\
+                 'active-inherited', 'active-inherited', 'global', false, 'commit-inherited', 'working-inherited'\
                  )",
                 &[],
             )
@@ -755,8 +755,8 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES \
-                 ('inherited-match', 'lix_inherited_override_schema', 'lix', 'global', 'lix', '{\"id\":\"inherited-match\"}', '1', 0), \
-                 ('inherited-mismatch', 'lix_inherited_override_schema', 'lix', 'active-inherited', 'lix', '{\"id\":\"inherited-mismatch\"}', '1', 0)",
+                 ('inherited-match', 'lix_inherited_override_schema', 'lix', 'global', 'lix', '{\"id\":\"inherited-match\"}', '1', false), \
+                 ('inherited-mismatch', 'lix_inherited_override_schema', 'lix', 'active-inherited', 'lix', '{\"id\":\"inherited-mismatch\"}', '1', false)",
                 &[],
             )
             .await

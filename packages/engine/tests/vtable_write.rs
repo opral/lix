@@ -1,7 +1,7 @@
 mod support;
 
 use lix_engine::Value;
-use support::simulation_test::SimulationEngine;
+use support::simulation_test::{assert_boolean_like, SimulationEngine};
 
 async fn register_test_schema(engine: &SimulationEngine) {
     engine
@@ -42,7 +42,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
              )",
                 &[],
             )
@@ -67,7 +67,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"key\":\"updated\"}' \
-             WHERE entity_id = 'entity-1' AND untracked = 1",
+             WHERE entity_id = 'entity-1' AND untracked = true",
                 &[],
             )
             .await
@@ -107,17 +107,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(read.rows.clone());
+        sim.assert_deterministic_normalized(read.rows.clone());
         assert_eq!(read.rows.len(), 1);
         assert_eq!(
             read.rows[0][0],
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
-        assert_eq!(read.rows[0][1], Value::Integer(1));
+        assert_boolean_like(&read.rows[0][1], true);
 
         engine
             .execute(
-                "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = 1",
+                "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = true",
                 &[],
             )
             .await
@@ -159,7 +159,7 @@ simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
                 "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
              )",
                 &[],
             )
@@ -195,7 +195,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, untracked\
                  ) VALUES (\
-                 'entity-meta-untracked', 'test_schema', 'file-1', 'main', 'lix', '{\"key\":\"untracked-meta\"}', '1', '{\"source\":\"local\"}', 1\
+                 'entity-meta-untracked', 'test_schema', 'file-1', 'main', 'lix', '{\"key\":\"untracked-meta\"}', '1', '{\"source\":\"local\"}', true\
                  )",
                 &[],
             )
@@ -241,7 +241,7 @@ simulation_test!(
                  SET metadata = '{\"source\":\"updated\",\"retries\":1}' \
                  WHERE entity_id = 'entity-meta-untracked' \
                    AND schema_key = 'test_schema' \
-                   AND untracked = 1",
+                   AND untracked = true",
                 &[],
             )
             .await
@@ -1228,9 +1228,9 @@ simulation_test!(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1', 0\
+             'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1', false\
              ), (\
-             'entity-2', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', 1\
+             'entity-2', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
              )",
             &[],
         )

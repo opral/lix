@@ -290,6 +290,7 @@ fn resolve_row_literals(
 fn engine_value_to_expr(value: &EngineValue) -> Expr {
     match value {
         EngineValue::Null => Expr::Value(ValueWithSpan::from(Value::Null)),
+        EngineValue::Boolean(value) => Expr::Value(ValueWithSpan::from(Value::Boolean(*value))),
         EngineValue::Text(value) => Expr::Value(ValueWithSpan::from(Value::SingleQuotedString(
             value.clone(),
         ))),
@@ -511,7 +512,7 @@ mod tests {
 
     #[test]
     fn rewrite_stored_schema_drops_untracked_column_for_materialized_table() {
-        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content, untracked) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}', 0)"#;
+        let sql = r#"INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content, untracked) VALUES ('lix_stored_schema', '{"value":{"x-lix-key":"mock_schema","x-lix-version":"1"}}', false)"#;
         let insert = parse_insert(sql);
         let rewritten = rewrite_insert(insert, &[])
             .expect("rewrite ok")

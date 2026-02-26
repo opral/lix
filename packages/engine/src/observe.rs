@@ -519,6 +519,7 @@ fn extract_placeholder_literal(token: &str, params: &[Value]) -> Option<String> 
 fn value_to_filter_literal(value: &Value) -> Option<String> {
     match value {
         Value::Text(text) => Some(text.clone()),
+        Value::Boolean(value) => Some(value.to_string()),
         Value::Integer(number) => Some(number.to_string()),
         Value::Real(number) => Some(number.to_string()),
         Value::Null | Value::Blob(_) => None,
