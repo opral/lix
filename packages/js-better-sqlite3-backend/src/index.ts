@@ -24,7 +24,7 @@ export async function createBetterSqlite3Backend(
     try {
       if (params.length === 0 && looksLikeMultiStatementSql(sql)) {
         db.exec(sql);
-        return { rows: [] };
+        return { rows: [], columns: [] };
       }
 
       const statement = db.prepare(sql);
@@ -44,7 +44,7 @@ export async function createBetterSqlite3Backend(
         const rows = rawRows.map((row: readonly unknown[]) =>
           Array.isArray(row) ? row.map((value) => fromSqlValue(value)) : [],
         );
-        return { rows };
+        return { rows, columns: [] };
       }
 
       if (boundParams.length === 0) {
@@ -54,7 +54,7 @@ export async function createBetterSqlite3Backend(
       } else {
         statement.run(boundParams);
       }
-      return { rows: [] };
+      return { rows: [], columns: [] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const sqlPreview = sql.replace(/\s+/g, " ").slice(0, 500);
