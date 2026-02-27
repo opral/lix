@@ -10,6 +10,7 @@ use crate::LixError;
 
 const GLOBAL_VERSION: &str = "global";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
+const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -64,6 +65,7 @@ where
     }
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
+    let change_set_schema = builtin_schema_meta(CHANGE_SET_SCHEMA_KEY)?;
     let version_pointer_schema = builtin_schema_meta(VERSION_POINTER_SCHEMA_KEY)?;
     let change_set_element_schema = builtin_schema_meta(CHANGE_SET_ELEMENT_SCHEMA_KEY)?;
     let commit_edge_schema = builtin_schema_meta(COMMIT_EDGE_SCHEMA_KEY)?;
@@ -103,6 +105,7 @@ where
     let unique_active_accounts = dedupe_ordered(&args.active_accounts);
     let mut meta_changes: Vec<ChangeRow> = Vec::new();
     let mut tip_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
+    let mut change_set_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut commit_change_id_by_version: BTreeMap<String, String> = BTreeMap::new();
     let mut commit_row_index_by_version: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -129,6 +132,25 @@ where
                     "id": version_id,
                     "commit_id": meta.commit_id,
                     "working_commit_id": version_info.snapshot.working_commit_id,
+                })
+                .to_string(),
+            ),
+            metadata: None,
+            created_at: args.timestamp.clone(),
+        });
+
+        let change_set_change_id = generate_uuid();
+        change_set_change_id_by_version.insert(version_id.clone(), change_set_change_id.clone());
+        meta_changes.push(ChangeRow {
+            id: change_set_change_id,
+            entity_id: meta.change_set_id.clone(),
+            schema_key: CHANGE_SET_SCHEMA_KEY.to_string(),
+            schema_version: change_set_schema.schema_version.clone(),
+            file_id: change_set_schema.file_id.clone(),
+            plugin_key: change_set_schema.plugin_key.clone(),
+            snapshot_content: Some(
+                json!({
+                    "id": meta.change_set_id,
                 })
                 .to_string(),
             ),
@@ -359,6 +381,30 @@ where
 
     // Materialize commit rows and version_pointer rows so commit views can resolve immediately.
     for (version_id, meta) in &meta_by_version {
+        let change_set_change_id = change_set_change_id_by_version
+            .get(version_id)
+            .cloned()
+            .unwrap_or_else(|| generate_uuid());
+        materialized_state.push(MaterializedStateRow {
+            id: change_set_change_id,
+            entity_id: meta.change_set_id.clone(),
+            schema_key: CHANGE_SET_SCHEMA_KEY.to_string(),
+            schema_version: change_set_schema.schema_version.clone(),
+            file_id: change_set_schema.file_id.clone(),
+            plugin_key: change_set_schema.plugin_key.clone(),
+            snapshot_content: Some(
+                json!({
+                    "id": meta.change_set_id,
+                })
+                .to_string(),
+            ),
+            metadata: None,
+            created_at: args.timestamp.clone(),
+            lixcol_version_id: GLOBAL_VERSION.to_string(),
+            lixcol_commit_id: meta.commit_id.clone(),
+            writer_key: None,
+        });
+
         let commit_snapshot = commit_snapshot_by_version
             .get(version_id)
             .cloned()
@@ -605,12 +651,20 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        assert_eq!(result.changes.len(), 3);
+        assert_eq!(result.changes.len(), 4);
         assert_eq!(
             result
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit")
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .changes
+                .iter()
+                .filter(|row| row.schema_key == "lix_change_set")
                 .count(),
             1
         );
@@ -662,10 +716,11 @@ mod tests {
         assert_eq!(materialized_counts.get("lix_key_value"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_author"), Some(&1));
         assert_eq!(materialized_counts.get("lix_change_set_element"), Some(&1));
+        assert_eq!(materialized_counts.get("lix_change_set"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit"), Some(&1));
         assert_eq!(materialized_counts.get("lix_version_pointer"), Some(&1));
         assert_eq!(materialized_counts.get("lix_commit_edge"), Some(&1));
-        assert_eq!(result.materialized_state.len(), 6);
+        assert_eq!(result.materialized_state.len(), 7);
 
         let domain_materialized = result
             .materialized_state
@@ -739,7 +794,15 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(result.materialized_state.len(), 6);
+        assert_eq!(
+            result
+                .materialized_state
+                .iter()
+                .filter(|row| row.schema_key == "lix_change_set")
+                .count(),
+            1
+        );
+        assert_eq!(result.materialized_state.len(), 7);
 
         let commit_row = result
             .changes
@@ -808,12 +871,20 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        assert_eq!(result.changes.len(), 6);
+        assert_eq!(result.changes.len(), 8);
         assert_eq!(
             result
                 .changes
                 .iter()
                 .filter(|row| row.schema_key == "lix_commit")
+                .count(),
+            2
+        );
+        assert_eq!(
+            result
+                .changes
+                .iter()
+                .filter(|row| row.schema_key == "lix_change_set")
                 .count(),
             2
         );
@@ -834,7 +905,15 @@ mod tests {
                 .count(),
             4
         );
-        assert_eq!(result.materialized_state.len(), 14);
+        assert_eq!(
+            result
+                .materialized_state
+                .iter()
+                .filter(|row| row.schema_key == "lix_change_set")
+                .count(),
+            2
+        );
+        assert_eq!(result.materialized_state.len(), 16);
 
         let commit_rows: Vec<_> = result
             .changes

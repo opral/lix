@@ -45,12 +45,26 @@ async fn create_checkpoint_in_transaction(
         });
     }
     let working_change_ids = working_commit.change_ids.clone();
-    let has_working_elements = !working_change_ids.is_empty();
+    let has_working_elements = tx
+        .execute(
+            "SELECT 1 \
+             FROM lix_change_set_element cse \
+             JOIN lix_change c ON c.id = cse.change_id \
+             WHERE cse.change_set_id = $1 \
+               AND c.schema_key NOT IN ('lix_version_pointer', 'lix_version_descriptor') \
+             LIMIT 1",
+            &[Value::Text(working_change_set_id.clone())],
+        )
+        .await?
+        .rows
+        .first()
+        .is_some();
     let effective_previous_tip_id = if has_working_elements {
         resolve_effective_previous_tip_id(
             tx,
             &previous_tip_id,
             &working_commit_id,
+            &working_commit.parent_commit_ids,
             &working_change_ids,
         )
         .await?
@@ -371,6 +385,7 @@ async fn resolve_effective_previous_tip_id(
     tx: &mut EngineTransaction<'_>,
     previous_tip_id: &str,
     working_commit_id: &str,
+    working_parent_commit_ids: &[String],
     working_change_ids: &[String],
 ) -> Result<String, LixError> {
     if previous_tip_id != working_commit_id {
@@ -379,30 +394,29 @@ async fn resolve_effective_previous_tip_id(
     if working_change_ids.is_empty() {
         return Ok(previous_tip_id.to_string());
     }
-    let mut sql = String::from(
-        "SELECT lixcol_commit_id \
-         FROM lix_change \
-         WHERE id IN (",
-    );
-    let mut params = Vec::with_capacity(working_change_ids.len() + 1);
-    for (index, change_id) in working_change_ids.iter().enumerate() {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        sql.push_str(&format!("${}", index + 1));
-        params.push(Value::Text(change_id.clone()));
+    if let Some(parent_id) = working_parent_commit_ids
+        .iter()
+        .find(|id| !id.is_empty() && id.as_str() != working_commit_id)
+    {
+        return Ok(parent_id.clone());
     }
-    sql.push_str(") AND lixcol_commit_id <> $");
-    sql.push_str(&(working_change_ids.len() + 1).to_string());
-    sql.push_str(" ORDER BY created_at DESC LIMIT 1");
-    params.push(Value::Text(working_commit_id.to_string()));
-    let result = tx.execute(&sql, &params).await?;
-    let row = first_row(&result, "effective previous tip row").map_err(|_| LixError {
-        message: format!(
-            "working commit '{working_commit_id}' has changes but previous tip could not be resolved"
-        ),
-    })?;
-    text_at(row, 0, "lixcol_commit_id")
+
+    let result = tx
+        .execute(
+            "SELECT parent_id \
+             FROM lix_commit_edge \
+             WHERE child_id = $1 \
+               AND parent_id <> $1 \
+             ORDER BY lixcol_created_at DESC \
+             LIMIT 1",
+            &[Value::Text(working_commit_id.to_string())],
+        )
+        .await?;
+    if let Some(row) = result.rows.first() {
+        return text_at(row, 0, "parent_id");
+    }
+
+    Ok(previous_tip_id.to_string())
 }
 
 async fn ensure_change_set_elements_for_checkpoint(
@@ -416,9 +430,10 @@ async fn ensure_change_set_elements_for_checkpoint(
 
     let working_elements = tx
         .execute(
-            "SELECT change_id, entity_id, schema_key, file_id \
-             FROM lix_change_set_element \
-             WHERE change_set_id = $1",
+            "SELECT cse.change_id, cse.entity_id, cse.schema_key, cse.file_id \
+             FROM lix_change_set_element cse \
+             JOIN lix_change c ON c.id = cse.change_id \
+             WHERE cse.change_set_id = $1",
             &[Value::Text(change_set_id.to_string())],
         )
         .await?;

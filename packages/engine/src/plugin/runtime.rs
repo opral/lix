@@ -2131,7 +2131,9 @@ mod tests {
                 "key":"k",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "match":{"path_glob":"*.md"}
+                "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"]
             }"#
             .to_string(),
             wasm: vec![1],
@@ -2155,6 +2157,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true
@@ -2191,6 +2195,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,

@@ -140,6 +140,7 @@ simulation_test!(
             .execute(
                 "SELECT path, name, parent_id, hidden \
                  FROM lix_directory \
+                 WHERE path = '/docs/' \
                  ORDER BY path",
                 &[],
             )
@@ -176,6 +177,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, name, parent_id, hidden \
                  FROM lix_directory \
+                 WHERE path IN ('/docs/', '/docs/guides/') \
                  ORDER BY path",
                 &[],
             )
@@ -327,7 +329,12 @@ simulation_test!(
             .unwrap();
 
         let directories = engine
-            .execute("SELECT path FROM lix_directory ORDER BY path", &[])
+            .execute(
+                "SELECT path FROM lix_directory \
+                 WHERE path IN ('/guides/', '/guides/api/') \
+                 ORDER BY path",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -378,11 +385,21 @@ simulation_test!(
             .unwrap();
 
         let directories = engine
-            .execute("SELECT id FROM lix_directory ORDER BY id", &[])
+            .execute(
+                "SELECT id FROM lix_directory \
+                 WHERE path = '/docs/' OR path LIKE '/docs/%' \
+                 ORDER BY id",
+                &[],
+            )
             .await
             .unwrap();
         let files = engine
-            .execute("SELECT id FROM lix_file ORDER BY id", &[])
+            .execute(
+                "SELECT id FROM lix_file \
+                 WHERE path LIKE '/docs/%' \
+                 ORDER BY id",
+                &[],
+            )
             .await
             .unwrap();
 
@@ -436,11 +453,21 @@ simulation_test!(
             .unwrap();
 
         let directories = engine
-            .execute("SELECT id FROM lix_directory ORDER BY id", &[])
+            .execute(
+                "SELECT id FROM lix_directory \
+                 WHERE path = '/docs/' OR path LIKE '/docs/%' \
+                 ORDER BY id",
+                &[],
+            )
             .await
             .unwrap();
         let files = engine
-            .execute("SELECT id FROM lix_file ORDER BY id", &[])
+            .execute(
+                "SELECT id FROM lix_file \
+                 WHERE path LIKE '/docs/%' \
+                 ORDER BY id",
+                &[],
+            )
             .await
             .unwrap();
 

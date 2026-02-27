@@ -2,27 +2,61 @@ use super::*;
 
 impl Engine {
     pub(crate) async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {
-        let result = self
+        let pointer_result = self
             .backend
             .execute(
-                "SELECT entity_id \
-                 FROM lix_internal_change \
-                 WHERE schema_key = 'lix_commit' \
-                 ORDER BY created_at DESC, id DESC \
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                 WHERE schema_key = 'lix_version_pointer' \
+                   AND entity_id = 'global' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
                 &[],
             )
             .await?;
-        let Some(row) = result.rows.first() else {
-            return Ok(None);
-        };
-        let Some(value) = row.first() else {
-            return Ok(None);
-        };
-        match value {
-            Value::Text(value) if !value.is_empty() => Ok(Some(value.clone())),
-            _ => Ok(None),
+        if let Some(row) = pointer_result.rows.first() {
+            if let Some(Value::Text(snapshot_content)) = row.first() {
+                let snapshot: crate::builtin_schema::types::LixVersionPointer =
+                    serde_json::from_str(snapshot_content).map_err(|error| LixError {
+                        message: format!(
+                            "version pointer snapshot_content invalid JSON while loading latest commit id: {error}"
+                        ),
+                    })?;
+                if !snapshot.commit_id.is_empty() {
+                    return Ok(Some(snapshot.commit_id));
+                }
+            }
         }
+
+        let has_commits = self
+            .backend
+            .execute(
+                "SELECT 1 \
+                 FROM lix_internal_state_materialized_v1_lix_commit \
+                 WHERE schema_key = 'lix_commit' \
+                   AND version_id = 'global' \
+                   AND is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[],
+            )
+            .await?
+            .rows
+            .first()
+            .is_some();
+        if has_commits {
+            return Err(LixError {
+                message:
+                    "init invariant violation: commits exist but global version pointer is missing"
+                        .to_string(),
+            });
+        }
+
+        Ok(None)
     }
 
     pub(crate) async fn generate_runtime_uuid(&self) -> Result<String, LixError> {

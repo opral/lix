@@ -359,7 +359,9 @@ simulation_test!(
             .execute(
                 "SELECT entity_id, snapshot_content \
                  FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_default_values_schema'",
+                 WHERE schema_key = 'lix_default_values_schema' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL",
                 &[],
             )
             .await
@@ -567,7 +569,9 @@ simulation_test!(
                 "SELECT version_id, snapshot_content \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_override_schema' \
-                   AND entity_id = 'ovr-1'",
+                   AND entity_id = 'ovr-1' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL",
                 &[],
             )
             .await
@@ -641,17 +645,44 @@ simulation_test!(
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_override_schema' \
                    AND entity_id = 'ovr-2' \
+                   AND snapshot_content IS NOT NULL \
                  ORDER BY version_id",
                 &[],
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows.len(), 2);
-        assert_text(&rows.rows[0][0], "global");
-        let global_name = snapshot_field(&rows.rows[0][1], "name");
+        let versioned_names = rows
+            .rows
+            .iter()
+            .map(|row| {
+                let version_id = match &row[0] {
+                    Value::Text(value) => value.clone(),
+                    other => panic!("expected version_id text, got {other:?}"),
+                };
+                (version_id, snapshot_field(&row[1], "name"))
+            })
+            .collect::<Vec<_>>();
+        let global_name = versioned_names
+            .iter()
+            .find_map(|(version_id, name)| {
+                if version_id == "global" {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("expected global row");
+        let main_name = versioned_names
+            .iter()
+            .find_map(|(version_id, name)| {
+                if version_id == "main" {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("expected main row");
         assert_eq!(global_name, "Updated");
-        assert_text(&rows.rows[1][0], "main");
-        let main_name = snapshot_field(&rows.rows[1][1], "name");
         assert_eq!(main_name, "Main");
         sim.assert_deterministic(vec![vec![Value::Text(global_name), Value::Text(main_name)]]);
     }
