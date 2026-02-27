@@ -1489,7 +1489,11 @@ export type LixObserveEvents = {
                     &JsValue::from_str("kind"),
                     &JsValue::from_str("Boolean"),
                 );
-                let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from_bool(value));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("value"),
+                    &JsValue::from_bool(value),
+                );
             }
             EngineValue::Integer(value) => {
                 let _ = Reflect::set(
