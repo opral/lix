@@ -2097,8 +2097,11 @@ dependencies = [
  "async-trait",
  "lix_engine",
  "rusqlite",
+ "serde",
  "serde_json",
  "tokio",
+ "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]
