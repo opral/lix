@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    Expr, Ident, Insert, ObjectName, ObjectNamePart, Statement, TableObject, Value, ValueWithSpan,
+    ConflictTarget, Expr, Ident, Insert, ObjectName, ObjectNamePart, OnConflict, OnConflictAction,
+    OnInsert, Statement, TableObject, Value, ValueWithSpan,
 };
 
 use crate::engine::sql::planning::rewrite_engine::{
@@ -206,6 +207,7 @@ pub fn rewrite_insert(
         table: TableObject::TableName(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
             "lix_internal_state_materialized_v1_lix_stored_schema",
         ))])),
+        on: Some(build_on_conflict_do_nothing()),
         ..insert
     };
 
@@ -226,6 +228,17 @@ pub fn rewrite_insert(
             untracked: false,
         },
     }))
+}
+
+fn build_on_conflict_do_nothing() -> OnInsert {
+    OnInsert::OnConflict(OnConflict {
+        conflict_target: Some(ConflictTarget::Columns(vec![
+            Ident::new("entity_id"),
+            Ident::new("file_id"),
+            Ident::new("version_id"),
+        ])),
+        action: OnConflictAction::DoNothing,
+    })
 }
 
 fn table_object_is_vtable(table: &TableObject) -> bool {
@@ -492,6 +505,10 @@ mod tests {
             .table
             .to_string()
             .contains("lix_internal_state_materialized_v1_lix_stored_schema"));
+        assert!(insert
+            .on
+            .as_ref()
+            .is_some_and(|on| on.to_string().contains("DO NOTHING")));
     }
 
     #[test]

@@ -443,12 +443,18 @@ fn validate_and_strip_insert_on_conflict(
             }
             Ok(())
         }
-        OnConflictAction::DoNothing => Err(LixError {
-            message: format!(
-                "{} insert ON CONFLICT DO NOTHING is not supported",
-                view_name
-            ),
-        }),
+        OnConflictAction::DoNothing => {
+            if view_name.eq_ignore_ascii_case("lix_stored_schema_by_version") {
+                Ok(())
+            } else {
+                Err(LixError {
+                    message: format!(
+                        "{} insert ON CONFLICT DO NOTHING is not supported",
+                        view_name
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -2458,5 +2464,21 @@ mod tests {
         assert!(err
             .message
             .contains("Wrap JSON object/array input with lix_json(...)"));
+    }
+
+    #[test]
+    fn rewrite_insert_allows_stored_schema_on_conflict_do_nothing() {
+        let sql = "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) \
+                   VALUES (lix_json('{\"x-lix-key\":\"mock_schema\",\"x-lix-version\":\"1\"}'), 'global') \
+                   ON CONFLICT (entity_id, file_id, version_id) DO NOTHING";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Insert(insert) = statement else {
+            panic!("expected insert statement");
+        };
+        let rewritten = rewrite_insert(insert, &[])
+            .expect("insert rewrite should succeed")
+            .expect("insert should rewrite");
+        assert!(rewritten.to_string().contains("lix_state_by_version"));
     }
 }
