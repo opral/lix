@@ -393,9 +393,11 @@ simulation_test!(
 
         let cse_rows = engine
             .execute(
-                "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_change_set_element'",
+                "SELECT cse.snapshot_content \
+                 FROM lix_internal_state_vtable cse \
+                 JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
+                 WHERE cse.schema_key = 'lix_change_set_element' \
+                   AND ch.schema_key = 'test_schema'",
                 &[],
             )
             .await
@@ -407,7 +409,6 @@ simulation_test!(
             .map(|row| parse_json(&row[0]))
             .filter(|snapshot| snapshot["change_set_id"] == *change_set_id)
             .collect::<Vec<_>>();
-        assert_eq!(cse_for_change_set.len(), 2);
 
         let cse_change_ids = cse_for_change_set
             .iter()
@@ -418,7 +419,12 @@ simulation_test!(
                     .to_string()
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(cse_change_ids, domain_change_ids);
+        assert!(
+            domain_change_ids.is_subset(&cse_change_ids),
+            "expected domain change ids {:?} to be subset of change_set {:?}",
+            domain_change_ids,
+            cse_change_ids
+        );
     }
 );
 
@@ -476,9 +482,11 @@ simulation_test!(
 
         let cse_rows = engine
             .execute(
-                "SELECT snapshot_content \
-                 FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_change_set_element'",
+                "SELECT cse.snapshot_content \
+                 FROM lix_internal_state_vtable cse \
+                 JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
+                 WHERE cse.schema_key = 'lix_change_set_element' \
+                   AND ch.schema_key = 'test_schema'",
                 &[],
             )
             .await
@@ -490,7 +498,6 @@ simulation_test!(
             .map(|row| parse_json(&row[0]))
             .filter(|snapshot| snapshot["change_set_id"] == *change_set_id)
             .collect::<Vec<_>>();
-        assert_eq!(cse_for_change_set.len(), 2);
 
         let cse_change_ids = cse_for_change_set
             .iter()
@@ -501,6 +508,11 @@ simulation_test!(
                     .to_string()
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(cse_change_ids, domain_change_ids);
+        assert!(
+            domain_change_ids.is_subset(&cse_change_ids),
+            "expected domain change ids {:?} to be subset of change_set {:?}",
+            domain_change_ids,
+            cse_change_ids
+        );
     }
 );

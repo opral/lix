@@ -1,5 +1,8 @@
 use super::*;
 
+const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
+const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
+
 impl Engine {
     pub(crate) async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
         for schema_key in builtin_schema_keys() {
@@ -29,9 +32,13 @@ impl Engine {
             })
             .to_string();
             self.execute_internal(
-                "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) \
-                 VALUES ('lix_stored_schema', $1)",
-                &[Value::Text(snapshot_content)],
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, created_at, updated_at, untracked\
+                 ) VALUES ($1, 'lix_stored_schema', 'lix', 'global', 'lix', $2, '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', true)",
+                &[
+                    Value::Text(entity_id),
+                    Value::Text(snapshot_content),
+                ],
                 ExecuteOptions::default(),
             )
             .await?;
@@ -67,6 +74,38 @@ impl Engine {
                     Value::Text(key_value_schema_version().to_string()),
                     Value::Boolean(untracked),
                 ],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn seed_global_system_directories(&self) -> Result<(), LixError> {
+        let directories = [SYSTEM_ROOT_DIRECTORY_PATH, SYSTEM_APP_DATA_DIRECTORY_PATH];
+
+        for path in directories {
+            let existing = self
+                .execute_internal(
+                    "SELECT 1 \
+                     FROM lix_directory_by_version \
+                     WHERE path = $1 \
+                       AND lixcol_version_id = 'global' \
+                     LIMIT 1",
+                    &[Value::Text(path.to_string())],
+                    ExecuteOptions::default(),
+                )
+                .await?;
+            if !existing.rows.is_empty() {
+                continue;
+            }
+
+            self.execute_internal(
+                "INSERT INTO lix_directory_by_version (\
+                 path, hidden, lixcol_version_id, lixcol_untracked\
+                 ) VALUES ($1, true, 'global', true)",
+                &[Value::Text(path.to_string())],
                 ExecuteOptions::default(),
             )
             .await?;
@@ -149,6 +188,8 @@ impl Engine {
             self.seed_bootstrap_change_set().await?;
             self.seed_bootstrap_commit().await?;
         }
+        self.assert_commit_change_set_integrity(&bootstrap_commit_id)
+            .await?;
         self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
         self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
@@ -317,7 +358,8 @@ impl Engine {
             version_descriptor_schema_key()
         );
         let check_sql = format!(
-            "SELECT 1 FROM {table} \
+            "SELECT 1 \
+             FROM {table} \
              WHERE schema_key = '{schema_key}' \
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
@@ -338,15 +380,16 @@ impl Engine {
 
         let snapshot_content =
             version_descriptor_snapshot_content(entity_id, name, inherits_from_version_id, false);
+        let inherited_from = inherits_from_version_id
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, \
-             change_id, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, inherited_from_version_id, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', \
-             'bootstrap', 0, '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\
-             ) \
-             ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', {inherited_from}, '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             )",
             table = table,
             entity_id = escape_sql_string(entity_id),
             schema_key = escape_sql_string(version_descriptor_schema_key()),
@@ -355,6 +398,8 @@ impl Engine {
             version_id = escape_sql_string(version_descriptor_storage_version_id()),
             plugin_key = escape_sql_string(version_descriptor_plugin_key()),
             snapshot_content = escape_sql_string(&snapshot_content),
+            inherited_from = inherited_from,
+            change_id = escape_sql_string(&change_id),
         );
         self.backend.execute(&insert_sql, &[]).await?;
 
@@ -427,7 +472,8 @@ impl Engine {
             version_pointer_schema_key()
         );
         let check_sql = format!(
-            "SELECT 1 FROM {table} \
+            "SELECT 1 \
+             FROM {table} \
              WHERE schema_key = '{schema_key}' \
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
@@ -447,15 +493,13 @@ impl Engine {
         }
 
         let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id, commit_id);
+        let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, \
-             change_id, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, inherited_from_version_id, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', \
-             'bootstrap', 0, '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z'\
-             ) \
-             ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', '{snapshot_content}', NULL, '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             )",
             table = table,
             entity_id = escape_sql_string(entity_id),
             schema_key = escape_sql_string(version_pointer_schema_key()),
@@ -464,6 +508,7 @@ impl Engine {
             version_id = escape_sql_string(version_pointer_storage_version_id()),
             plugin_key = escape_sql_string(version_pointer_plugin_key()),
             snapshot_content = escape_sql_string(&snapshot_content),
+            change_id = escape_sql_string(&change_id),
         );
         self.backend.execute(&insert_sql, &[]).await?;
 
@@ -544,6 +589,63 @@ impl Engine {
             ExecuteOptions::default(),
         )
         .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn assert_commit_change_set_integrity(
+        &self,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let commit_row = self
+            .execute(
+                "SELECT change_set_id \
+                 FROM lix_commit \
+                 WHERE id = $1 \
+                 LIMIT 1",
+                &[Value::Text(commit_id.to_string())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        let Some(row) = commit_row.rows.first() else {
+            return Err(LixError {
+                message: format!(
+                    "init invariant violation: commit '{commit_id}' is missing from lix_commit"
+                ),
+            });
+        };
+        let Some(Value::Text(change_set_id)) = row.first() else {
+            return Err(LixError {
+                message: format!(
+                    "init invariant violation: commit '{commit_id}' has non-text change_set_id"
+                ),
+            });
+        };
+        if change_set_id.is_empty() {
+            return Err(LixError {
+                message: format!(
+                    "init invariant violation: commit '{commit_id}' has empty change_set_id"
+                ),
+            });
+        }
+
+        let existing = self
+            .execute(
+                "SELECT 1 \
+                 FROM lix_change_set \
+                 WHERE id = $1 \
+                 LIMIT 1",
+                &[Value::Text(change_set_id.clone())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        if existing.rows.is_empty() {
+            return Err(LixError {
+                message: format!(
+                    "init invariant violation: commit '{commit_id}' references missing change_set '{change_set_id}'"
+                ),
+            });
+        }
+
         Ok(())
     }
 

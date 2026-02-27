@@ -228,51 +228,52 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
-        let commit_result = engine
+        let version_result = engine
             .execute(
-                "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
-             WHERE entity_id = 'global' \
-               AND schema_key = 'lix_commit' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL \
+                "SELECT commit_id \
+             FROM lix_version \
+             WHERE id = 'global' \
              LIMIT 1",
                 &[],
             )
             .await
             .unwrap();
-        sim.assert_deterministic(commit_result.rows.clone());
-        assert_eq!(commit_result.rows.len(), 1);
-
-        let commit_snapshot_content = match &commit_result.rows[0][0] {
-            lix_engine::Value::Text(value) => value,
-            other => panic!("expected text snapshot_content for bootstrap commit, got {other:?}"),
+        sim.assert_deterministic(version_result.rows.clone());
+        assert_eq!(version_result.rows.len(), 1);
+        let commit_id = match &version_result.rows[0][0] {
+            lix_engine::Value::Text(value) => value.clone(),
+            other => panic!("expected text commit_id for global version, got {other:?}"),
         };
-        let commit_snapshot: serde_json::Value = serde_json::from_str(commit_snapshot_content)
-            .expect("bootstrap commit snapshot must be JSON");
-        let change_set_id = commit_snapshot
-            .get("change_set_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("bootstrap commit must include change_set_id");
-        assert_eq!(change_set_id, "global");
 
         let change_set_result = engine
             .execute(
-                "SELECT snapshot_content \
-             FROM lix_internal_state_vtable \
-             WHERE entity_id = $1 \
-               AND schema_key = 'lix_change_set' \
-               AND file_id = 'lix' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL \
+                "SELECT change_set_id \
+             FROM lix_commit \
+             WHERE id = $1 \
              LIMIT 1",
-                &[lix_engine::Value::Text(change_set_id.to_string())],
+                &[lix_engine::Value::Text(commit_id)],
             )
             .await
             .unwrap();
         sim.assert_deterministic(change_set_result.rows.clone());
         assert_eq!(change_set_result.rows.len(), 1);
+        let change_set_id = match &change_set_result.rows[0][0] {
+            lix_engine::Value::Text(value) => value.clone(),
+            other => panic!("expected text change_set_id for commit, got {other:?}"),
+        };
+
+        let change_set_exists = engine
+            .execute(
+                "SELECT 1 \
+             FROM lix_change_set \
+             WHERE id = $1 \
+             LIMIT 1",
+                &[lix_engine::Value::Text(change_set_id.clone())],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(change_set_exists.rows.clone());
+        assert_eq!(change_set_exists.rows.len(), 1);
     }
 );
 
@@ -316,6 +317,58 @@ simulation_test!(
         assert!(
             has_checkpoint,
             "expected checkpoint label in global version"
+        );
+    }
+);
+
+simulation_test!(
+    init_seeds_global_system_directories,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        let result = engine
+            .execute(
+                "SELECT path, hidden \
+                 FROM lix_directory_by_version \
+                 WHERE lixcol_version_id = 'global' \
+                   AND path IN ('/.lix/', '/.lix/app_data/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(result.rows.clone());
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], lix_engine::Value::Text("/.lix/".to_string()));
+        let root_hidden = match &result.rows[0][1] {
+            lix_engine::Value::Boolean(value) => *value,
+            lix_engine::Value::Text(value) => value == "true",
+            _ => false,
+        };
+        assert!(
+            root_hidden,
+            "expected hidden=true for /.lix/, got {:?}",
+            result.rows[0][1]
+        );
+        assert_eq!(
+            result.rows[1][0],
+            lix_engine::Value::Text("/.lix/app_data/".to_string())
+        );
+        let app_data_hidden = match &result.rows[1][1] {
+            lix_engine::Value::Boolean(value) => *value,
+            lix_engine::Value::Text(value) => value == "true",
+            _ => false,
+        };
+        assert!(
+            app_data_hidden,
+            "expected hidden=true for /.lix/app_data/, got {:?}",
+            result.rows[1][1]
         );
     }
 );
