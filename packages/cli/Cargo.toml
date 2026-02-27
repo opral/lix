@@ -1,0 +1,15 @@
+[package]
+name = "lix_cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lix"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+lix_rs_sdk = { path = "../rs-sdk" }
+serde_json = "1.0"
+pollster = "0.4"
+comfy-table = "7.1"

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 use rusqlite::{params_from_iter, Connection, Row};
+use std::path::Path;
 use std::sync::Mutex;
 
 pub struct SqliteBackend {
@@ -10,6 +11,15 @@ pub struct SqliteBackend {
 impl SqliteBackend {
     pub fn in_memory() -> Result<Self, LixError> {
         let conn = Connection::open_in_memory().map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LixError> {
+        let conn = Connection::open(path).map_err(|err| LixError {
             message: err.to_string(),
         })?;
         Ok(Self {
@@ -96,6 +106,7 @@ fn map_row(row: &Row<'_>) -> Result<Vec<Value>, LixError> {
 fn to_sql_value(value: Value) -> rusqlite::types::Value {
     match value {
         Value::Null => rusqlite::types::Value::Null,
+        Value::Boolean(value) => rusqlite::types::Value::Integer(if value { 1 } else { 0 }),
         Value::Integer(value) => rusqlite::types::Value::Integer(value),
         Value::Real(value) => rusqlite::types::Value::Real(value),
         Value::Text(value) => rusqlite::types::Value::Text(value),
