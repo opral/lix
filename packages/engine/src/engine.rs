@@ -17,8 +17,7 @@ use crate::materialization::{
     MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
     MaterializationReport, MaterializationRequest, MaterializationScope,
 };
-use crate::plugin::manifest::parse_plugin_manifest_json;
-use crate::plugin::types::{InstalledPlugin, PluginManifest};
+use crate::plugin::types::InstalledPlugin;
 use crate::state_commit_stream::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };

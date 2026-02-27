@@ -394,3 +394,6 @@ packages/lix-docs/docs/.vitepress/dist
 artifact/*
 packages/engine/artifact/*
 target
+
+# Built plugin archive artifacts
+packages/*/*.lixplugin

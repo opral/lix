@@ -31,8 +31,7 @@ export type CreateVersionResult = {
 };
 
 export type InstallPluginOptions = {
-  manifestJson: string | Record<string, unknown>;
-  wasmBytes: Uint8Array | ArrayBuffer;
+  archiveBytes: Uint8Array | ArrayBuffer;
 };
 
 export type CreateCheckpointResult = {
@@ -137,7 +136,7 @@ export type Lix = {
   createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
   createCheckpoint(): Promise<CreateCheckpointResult>;
   switchVersion(versionId: string): Promise<void>;
-  installPlugin(args: InstallPluginOptions): Promise<void>;
+  installPlugin(args: InstallPluginOptions | Uint8Array | ArrayBuffer): Promise<void>;
   /** Exports the current database as SQLite file bytes (portable `.lix` artifact). */
   exportSnapshot(): Promise<Uint8Array>;
   close(): Promise<void>;
@@ -477,23 +476,26 @@ export async function openLix(
     await runQueued(() => (wasmLix as any).switchVersion(versionId));
   };
 
-  const installPlugin = async (args2: InstallPluginOptions): Promise<void> => {
+  const installPlugin = async (
+    args2: InstallPluginOptions | Uint8Array | ArrayBuffer,
+  ): Promise<void> => {
     ensureOpen("installPlugin");
     if (typeof (wasmLix as any).installPlugin !== "function") {
       throw new Error("installPlugin is not available in this wasm build");
     }
-    const manifestJson =
-      typeof args2.manifestJson === "string"
-        ? args2.manifestJson
-        : JSON.stringify(args2.manifestJson);
-    const wasmBytes =
-      args2.wasmBytes instanceof Uint8Array
-        ? args2.wasmBytes
-        : new Uint8Array(args2.wasmBytes);
+    const archiveBytes =
+      args2 instanceof Uint8Array
+        ? args2
+        : args2 instanceof ArrayBuffer
+          ? new Uint8Array(args2)
+          : args2.archiveBytes instanceof Uint8Array
+            ? args2.archiveBytes
+            : new Uint8Array(args2.archiveBytes);
+    if (archiveBytes.byteLength === 0) {
+      throw new Error("installPlugin requires non-empty archiveBytes");
+    }
 
-    await runQueued(() =>
-      (wasmLix as any).installPlugin(manifestJson, wasmBytes),
-    );
+    await runQueued(() => (wasmLix as any).installPlugin(archiveBytes));
   };
 
   const createCheckpoint = async (): Promise<CreateCheckpointResult> => {

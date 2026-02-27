@@ -17,5 +17,9 @@
       ]
     }
   },
-  "entry": "plugin.wasm"
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/markdown_document.json",
+    "schema/markdown_block.json"
+  ]
 }

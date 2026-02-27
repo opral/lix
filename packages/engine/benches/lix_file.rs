@@ -8,8 +8,7 @@ use tokio::runtime::Runtime;
 mod support;
 use support::sqlite_backend::BenchSqliteBackend;
 use support::test_json_plugin::{
-    dummy_wasm_header, BenchJsonPluginRuntime, TEST_JSON_POINTER_SCHEMA_DEFINITION,
-    TEST_PLUGIN_MANIFEST_JSON,
+    build_test_plugin_archive, BenchJsonPluginRuntime, TEST_JSON_POINTER_SCHEMA_DEFINITION,
 };
 
 const JSON_LEAF_COUNT: usize = 8;
@@ -300,9 +299,8 @@ async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> 
             )
             .await?;
 
-        engine
-            .install_plugin(TEST_PLUGIN_MANIFEST_JSON, &dummy_wasm_header())
-            .await?;
+        let plugin_archive = build_test_plugin_archive()?;
+        engine.install_plugin(&plugin_archive).await?;
 
         let warmup_file_id = "bench-plugin-warmup";
         let warmup_path = format!("/bench/{warmup_file_id}.json");
