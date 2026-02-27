@@ -114,6 +114,121 @@ test("executeTransaction applies multiple statements in one call", async () => {
   await lix.close();
 });
 
+test("beginTransaction commits and rollbacks explicitly", async () => {
+  const lix = await openLix();
+
+  const tx = await lix.beginTransaction({ writerKey: "js-sdk-begin-tx" });
+  await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+    "tx-explicit-commit",
+    "yes",
+  ]);
+  await tx.commit();
+
+  const committed = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["tx-explicit-commit"],
+  );
+  expect(committed.rows.length).toBe(1);
+
+  const tx2 = await lix.beginTransaction();
+  await tx2.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+    "tx-explicit-rollback",
+    "no",
+  ]);
+  await tx2.rollback();
+
+  const rolledBack = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["tx-explicit-rollback"],
+  );
+  expect(rolledBack.rows.length).toBe(0);
+
+  await lix.close();
+});
+
+test("beginTransaction calls are serialized per lix instance", async () => {
+  const lix = await openLix();
+  const tx1 = await lix.beginTransaction();
+
+  const tx2Promise = lix.beginTransaction();
+  const firstRace = await Promise.race([
+    tx2Promise.then(() => "resolved"),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 30)),
+  ]);
+  expect(firstRace).toBe("timeout");
+
+  await tx1.commit();
+  const tx2 = await tx2Promise;
+  await tx2.commit();
+
+  await lix.close();
+});
+
+test("non-transaction execute waits while a transaction is open", async () => {
+  const lix = await openLix();
+  const tx = await lix.beginTransaction();
+  await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+    "tx-open-visible-only-after-commit",
+    "pending",
+  ]);
+
+  const executePromise = lix.execute(
+    "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
+    ["outside-execute-waits", "ok"],
+  );
+  const race = await Promise.race([
+    executePromise.then(() => "resolved"),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 30)),
+  ]);
+  expect(race).toBe("timeout");
+
+  await tx.commit();
+  await executePromise;
+
+  const rows = await lix.execute(
+    "SELECT key FROM lix_key_value WHERE key IN (?1, ?2) ORDER BY key",
+    ["outside-execute-waits", "tx-open-visible-only-after-commit"],
+  );
+  expect(rows.rows.length).toBe(2);
+
+  await lix.close();
+});
+
+test("transaction helper commits on success and rolls back on error", async () => {
+  const lix = await openLix();
+
+  await lix.transaction(async (tx) => {
+    await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+      "tx-helper-commit",
+      "ok",
+    ]);
+  });
+
+  await expect(
+    lix.transaction(async (tx) => {
+      await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
+        "tx-helper-rollback",
+        "no",
+      ]);
+      throw new Error("boom");
+    }),
+  ).rejects.toThrow("boom");
+
+  const committed = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["tx-helper-commit"],
+  );
+  expect(committed.rows.length).toBe(1);
+
+  const rolledBack = await lix.execute(
+    "SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+    ["tx-helper-rollback"],
+  );
+  expect(rolledBack.rows.length).toBe(0);
+
+  await lix.close();
+});
+
 test("execute serializes object params for structured JSON columns", async () => {
   const lix = await openLix();
 
