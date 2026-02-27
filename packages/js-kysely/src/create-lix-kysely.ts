@@ -33,30 +33,42 @@ type LixExecuteLike = {
 	): Promise<LixQueryResult>;
 };
 
+type LixSqlTransactionLike = {
+	execute(sql: string, params?: ReadonlyArray<unknown>): Promise<LixQueryResult>;
+	commit(): Promise<void>;
+	rollback(): Promise<void>;
+};
+
+type LixBeginTransactionLike = {
+	beginTransaction(options?: LixExecuteOptions): Promise<LixSqlTransactionLike>;
+};
+
 type LixDbLike = {
 	db: unknown;
 };
 
-type LixLike = LixExecuteLike | LixDbLike;
+type LixLike = LixExecuteLike | LixDbLike | (LixExecuteLike & LixBeginTransactionLike);
 export type CreateLixKyselyOptions = {
 	writerKey?: string | null;
 };
 
 class LixConnection implements DatabaseConnection {
-	readonly #lix: LixExecuteLike;
-	readonly #options?: LixExecuteOptions;
+	readonly #executeSql: (
+		sql: string,
+		params?: ReadonlyArray<unknown>,
+	) => Promise<LixQueryResult>;
 
-	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
-		this.#lix = lix;
-		this.#options = options;
+	constructor(
+		executeSql: (
+			sql: string,
+			params?: ReadonlyArray<unknown>,
+		) => Promise<LixQueryResult>,
+	) {
+		this.#executeSql = executeSql;
 	}
 
 	async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
-		const raw = await this.#lix.execute(
-			compiledQuery.sql,
-			compiledQuery.parameters,
-			this.#options,
-		);
+		const raw = await this.#executeSql(compiledQuery.sql, compiledQuery.parameters);
 		const decodedRows = decodeRows(raw.rows);
 		const columnNames =
 			decodeColumnNames(raw.columns) ??
@@ -95,7 +107,7 @@ class LixConnection implements DatabaseConnection {
 	}
 
 	async readIntegerResult(sql: string): Promise<bigint | undefined> {
-		const raw = await this.#lix.execute(sql, undefined, this.#options);
+		const raw = await this.#executeSql(sql, undefined);
 		const rows = decodeRows(raw.rows);
 		if (!rows[0] || rows[0].length === 0) {
 			return undefined;
@@ -151,13 +163,20 @@ class LixConnection implements DatabaseConnection {
 
 class LixDriver implements Driver {
 	readonly #lix: LixExecuteLike;
+	readonly #lixWithTransactions?: LixExecuteLike & LixBeginTransactionLike;
 	readonly #connection: LixConnection;
 	readonly #options?: LixExecuteOptions;
+	#activeTransaction?: LixSqlTransactionLike;
 
 	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
 		this.#lix = lix;
 		this.#options = options;
-		this.#connection = new LixConnection(lix, options);
+		this.#lixWithTransactions = isLixBeginTransactionLike(lix)
+			? lix
+			: undefined;
+		this.#connection = new LixConnection((sql, params) =>
+			this.#executeSql(sql, params),
+		);
 	}
 
 	async init(): Promise<void> {}
@@ -167,14 +186,36 @@ class LixDriver implements Driver {
 	}
 
 	async beginTransaction(): Promise<void> {
+		if (this.#lixWithTransactions) {
+			this.#activeTransaction = await this.#lixWithTransactions.beginTransaction(
+				this.#options,
+			);
+			return;
+		}
 		await this.#lix.execute("BEGIN", undefined, this.#options);
 	}
 
 	async commitTransaction(): Promise<void> {
+		if (this.#activeTransaction) {
+			try {
+				await this.#activeTransaction.commit();
+			} finally {
+				this.#activeTransaction = undefined;
+			}
+			return;
+		}
 		await this.#lix.execute("COMMIT", undefined, this.#options);
 	}
 
 	async rollbackTransaction(): Promise<void> {
+		if (this.#activeTransaction) {
+			try {
+				await this.#activeTransaction.rollback();
+			} finally {
+				this.#activeTransaction = undefined;
+			}
+			return;
+		}
 		await this.#lix.execute("ROLLBACK", undefined, this.#options);
 	}
 
@@ -183,11 +224,7 @@ class LixDriver implements Driver {
 		savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#lix.execute(
-			`SAVEPOINT ${quoteIdentifier(savepointName)}`,
-			undefined,
-			this.#options,
-		);
+		await this.#executeSql(`SAVEPOINT ${quoteIdentifier(savepointName)}`, undefined);
 	}
 
 	async rollbackToSavepoint(
@@ -195,10 +232,9 @@ class LixDriver implements Driver {
 		savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#lix.execute(
+		await this.#executeSql(
 			`ROLLBACK TO SAVEPOINT ${quoteIdentifier(savepointName)}`,
 			undefined,
-			this.#options,
 		);
 	}
 
@@ -207,16 +243,22 @@ class LixDriver implements Driver {
 		savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#lix.execute(
-			`RELEASE SAVEPOINT ${quoteIdentifier(savepointName)}`,
-			undefined,
-			this.#options,
-		);
+		await this.#executeSql(`RELEASE SAVEPOINT ${quoteIdentifier(savepointName)}`, undefined);
 	}
 
 	async releaseConnection(): Promise<void> {}
 
 	async destroy(): Promise<void> {}
+
+	async #executeSql(
+		sql: string,
+		params?: ReadonlyArray<unknown>,
+	): Promise<LixQueryResult> {
+		if (this.#activeTransaction) {
+			return this.#activeTransaction.execute(sql, params ?? []);
+		}
+		return this.#lix.execute(sql, params, this.#options);
+	}
 }
 
 const cache = new WeakMap<object, Map<string, Kysely<LixDatabaseSchema>>>();
@@ -268,6 +310,17 @@ function isLixExecuteLike(value: unknown): value is LixExecuteLike {
 		return false;
 	}
 	return typeof (value as { execute?: unknown }).execute === "function";
+}
+
+function isLixBeginTransactionLike(
+	value: unknown,
+): value is LixExecuteLike & LixBeginTransactionLike {
+	if (!isLixExecuteLike(value)) {
+		return false;
+	}
+	return (
+		typeof (value as { beginTransaction?: unknown }).beginTransaction === "function"
+	);
 }
 
 function normalizeWriterKey(value: unknown): string | null | undefined {

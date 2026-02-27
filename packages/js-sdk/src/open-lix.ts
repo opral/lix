@@ -89,6 +89,15 @@ export type ExecuteOptions = {
   writerKey?: string | null;
 };
 
+export type SqlTransaction = {
+  execute(
+    sql: string,
+    params?: ReadonlyArray<unknown>,
+  ): Promise<QueryResult>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+};
+
 export type ObserveEvent = {
   sequence: number;
   rows: QueryResult;
@@ -113,6 +122,12 @@ export type Lix = {
     params?: ReadonlyArray<unknown>,
     options?: ExecuteOptions,
   ): Promise<QueryResult>;
+  beginTransaction(options?: ExecuteOptions): Promise<SqlTransaction>;
+  transaction<T>(
+    options: ExecuteOptions,
+    f: (tx: SqlTransaction) => Promise<T>,
+  ): Promise<T>;
+  transaction<T>(f: (tx: SqlTransaction) => Promise<T>): Promise<T>;
   executeTransaction(
     statements: ReadonlyArray<TransactionStatement>,
     options?: ExecuteOptions,
@@ -154,16 +169,54 @@ export async function openLix(
     args.keyValues ? [...args.keyValues] : undefined,
   );
   let closed = false;
+  let closing = false;
   const openStateCommitStreamHandles = new Set<{
     close?: () => void;
   }>();
   const openObserveHandles = new Set<{
     close?: () => void;
   }>();
+  const openSqlTransactions = new Set<{
+    forceRollback: () => Promise<void>;
+  }>();
+  let transactionQueue: Promise<void> = Promise.resolve();
 
   const ensureOpen = (methodName: string): void => {
-    if (closed) {
+    if (closed || closing) {
       throw new Error(`lix is closed; ${methodName}() is unavailable`);
+    }
+  };
+
+  const runExecute = (
+    sql: string,
+    params: ReadonlyArray<unknown> = [],
+    options?: ExecuteOptions,
+  ): Promise<QueryResult> =>
+    (wasmLix as any).execute(
+      sql,
+      params.map((param) => Value.from(normalizeSqlParam(param))),
+      normalizeExecuteOptions(options, "execute"),
+    );
+
+  const acquireTransactionSlot = async (): Promise<(() => void)> => {
+    const previous = transactionQueue;
+    let releaseCurrent: (() => void) | undefined;
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    transactionQueue = previous.then(() => current);
+    await previous;
+    return () => {
+      releaseCurrent?.();
+    };
+  };
+
+  const runQueued = async <T>(operation: () => Promise<T>): Promise<T> => {
+    const release = await acquireTransactionSlot();
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   };
 
@@ -173,12 +226,111 @@ export async function openLix(
     options?: ExecuteOptions,
   ): Promise<QueryResult> => {
     ensureOpen("execute");
-    return (wasmLix as any).execute(
-      sql,
-      params.map((param) => Value.from(normalizeSqlParam(param))),
-      normalizeExecuteOptions(options, "execute"),
-    );
+    return runQueued(() => runExecute(sql, params, options));
   };
+
+  const beginTransaction = async (
+    options?: ExecuteOptions,
+  ): Promise<SqlTransaction> => {
+    ensureOpen("beginTransaction");
+    const releaseSlot = await acquireTransactionSlot();
+    const transactionOptions = normalizeExecuteOptions(options, "beginTransaction");
+    let transactionClosed = false;
+
+    try {
+      await runExecute("BEGIN", [], transactionOptions);
+    } catch (error) {
+      releaseSlot();
+      throw error;
+    }
+
+    const tx = {
+      execute: async (
+        sql: string,
+        params: ReadonlyArray<unknown> = [],
+      ): Promise<QueryResult> => {
+        if (transactionClosed) {
+          throw new Error("transaction is closed; execute() is unavailable");
+        }
+        if (closing || closed) {
+          throw new Error("lix is closed; transaction.execute() is unavailable");
+        }
+        return runExecute(sql, params, transactionOptions);
+      },
+      commit: async (): Promise<void> => {
+        if (transactionClosed) {
+          return;
+        }
+        try {
+          await runExecute("COMMIT", [], transactionOptions);
+        } finally {
+          transactionClosed = true;
+          openSqlTransactions.delete(txHandle);
+          releaseSlot();
+        }
+      },
+      rollback: async (): Promise<void> => {
+        if (transactionClosed) {
+          return;
+        }
+        try {
+          await runExecute("ROLLBACK", [], transactionOptions);
+        } finally {
+          transactionClosed = true;
+          openSqlTransactions.delete(txHandle);
+          releaseSlot();
+        }
+      },
+    } satisfies SqlTransaction;
+
+    const txHandle = {
+      forceRollback: async (): Promise<void> => {
+        if (transactionClosed) {
+          return;
+        }
+        try {
+          await runExecute("ROLLBACK", [], transactionOptions);
+        } finally {
+          transactionClosed = true;
+          releaseSlot();
+        }
+      },
+    };
+    openSqlTransactions.add(txHandle);
+    return tx;
+  };
+
+  async function transaction<T>(
+    options: ExecuteOptions,
+    f: (tx: SqlTransaction) => Promise<T>,
+  ): Promise<T>;
+  async function transaction<T>(f: (tx: SqlTransaction) => Promise<T>): Promise<T>;
+  async function transaction<T>(
+    first: ExecuteOptions | ((tx: SqlTransaction) => Promise<T>),
+    second?: (tx: SqlTransaction) => Promise<T>,
+  ): Promise<T> {
+    ensureOpen("transaction");
+    const options = typeof first === "function" ? undefined : first;
+    const callback = (typeof first === "function" ? first : second) as
+      | ((tx: SqlTransaction) => Promise<T>)
+      | undefined;
+    if (typeof callback !== "function") {
+      throw new Error("transaction requires an async callback");
+    }
+    const tx = await beginTransaction(options);
+    try {
+      const value = await callback(tx);
+      await tx.commit();
+      return value;
+    } catch (error) {
+      try {
+        await tx.rollback();
+      } catch {
+        // ignore rollback errors; original error is more relevant to caller
+      }
+      throw error;
+    }
+  }
 
   const executeTransaction = async (
     statements: ReadonlyArray<TransactionStatement>,
@@ -207,9 +359,11 @@ export async function openLix(
       };
     });
 
-    return (wasmLix as any).executeTransaction(
-      encoded,
-      normalizeExecuteOptions(options, "executeTransaction"),
+    return runQueued(() =>
+      (wasmLix as any).executeTransaction(
+        encoded,
+        normalizeExecuteOptions(options, "executeTransaction"),
+      ),
     );
   };
 
@@ -286,7 +440,7 @@ export async function openLix(
     if (typeof (wasmLix as any).createVersion !== "function") {
       throw new Error("createVersion is not available in this wasm build");
     }
-    const raw = await (wasmLix as any).createVersion(args2);
+    const raw = await runQueued(() => (wasmLix as any).createVersion(args2));
     if (!raw || typeof raw !== "object") {
       throw new Error("createVersion() must return an object");
     }
@@ -320,7 +474,7 @@ export async function openLix(
     if (typeof (wasmLix as any).switchVersion !== "function") {
       throw new Error("switchVersion is not available in this wasm build");
     }
-    await (wasmLix as any).switchVersion(versionId);
+    await runQueued(() => (wasmLix as any).switchVersion(versionId));
   };
 
   const installPlugin = async (args2: InstallPluginOptions): Promise<void> => {
@@ -337,7 +491,9 @@ export async function openLix(
         ? args2.wasmBytes
         : new Uint8Array(args2.wasmBytes);
 
-    await (wasmLix as any).installPlugin(manifestJson, wasmBytes);
+    await runQueued(() =>
+      (wasmLix as any).installPlugin(manifestJson, wasmBytes),
+    );
   };
 
   const createCheckpoint = async (): Promise<CreateCheckpointResult> => {
@@ -345,7 +501,7 @@ export async function openLix(
     if (typeof (wasmLix as any).createCheckpoint !== "function") {
       throw new Error("createCheckpoint is not available in this wasm build");
     }
-    const raw = await (wasmLix as any).createCheckpoint();
+    const raw = await runQueued(() => (wasmLix as any).createCheckpoint());
     if (!raw || typeof raw !== "object") {
       throw new Error("createCheckpoint() must return an object");
     }
@@ -378,10 +534,10 @@ export async function openLix(
   };
 
   const close = async (): Promise<void> => {
-    if (closed) {
+    if (closed || closing) {
       return;
     }
-    closed = true;
+    closing = true;
     for (const handle of openStateCommitStreamHandles) {
       try {
         handle.close?.();
@@ -399,34 +555,50 @@ export async function openLix(
     }
     openObserveHandles.clear();
 
+    for (const tx of [...openSqlTransactions]) {
+      try {
+        await tx.forceRollback();
+      } catch {
+        // ignore rollback failures while shutting down
+      }
+    }
+    openSqlTransactions.clear();
+
     let firstError: unknown;
     try {
-      if (typeof (wasmLix as any).free === "function") {
-        (wasmLix as any).free();
-      }
-    } catch (error) {
-      firstError = error;
-    }
-
-    try {
-      if (typeof backend.close === "function") {
-        await backend.close();
-      }
-    } catch (error) {
-      if (!firstError) {
+      try {
+        if (typeof (wasmLix as any).free === "function") {
+          (wasmLix as any).free();
+        }
+      } catch (error) {
         firstError = error;
       }
-    }
 
-    if (firstError) {
-      throw firstError instanceof Error
-        ? firstError
-        : new Error(String(firstError));
+      try {
+        if (typeof backend.close === "function") {
+          await backend.close();
+        }
+      } catch (error) {
+        if (!firstError) {
+          firstError = error;
+        }
+      }
+
+      if (firstError) {
+        throw firstError instanceof Error
+          ? firstError
+          : new Error(String(firstError));
+      }
+    } finally {
+      closed = true;
+      closing = false;
     }
   };
 
   return {
     execute,
+    beginTransaction,
+    transaction,
     executeTransaction,
     stateCommitStream,
     observe,
@@ -487,7 +659,7 @@ function isNodeRuntime(): boolean {
 
 function normalizeExecuteOptions(
   options: ExecuteOptions | undefined,
-  methodName: "execute" | "executeTransaction",
+  methodName: "execute" | "executeTransaction" | "beginTransaction",
 ): ExecuteOptions | undefined {
   if (options === undefined) {
     return undefined;
