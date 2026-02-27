@@ -370,5 +370,47 @@ simulation_test!(
             "expected hidden=true for /.lix/app_data/, got {:?}",
             result.rows[1][1]
         );
+
+        let active_result = engine
+            .execute(
+                "SELECT path, hidden \
+                 FROM lix_directory \
+                 WHERE path IN ('/.lix/', '/.lix/app_data/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(active_result.rows.clone());
+        assert_eq!(active_result.rows.len(), 2);
+        assert_eq!(
+            active_result.rows[0][0],
+            lix_engine::Value::Text("/.lix/".to_string())
+        );
+        let active_root_hidden = match &active_result.rows[0][1] {
+            lix_engine::Value::Boolean(value) => *value,
+            lix_engine::Value::Text(value) => value == "true",
+            _ => false,
+        };
+        assert!(
+            active_root_hidden,
+            "expected hidden=true for /.lix/ in lix_directory, got {:?}",
+            active_result.rows[0][1]
+        );
+        assert_eq!(
+            active_result.rows[1][0],
+            lix_engine::Value::Text("/.lix/app_data/".to_string())
+        );
+        let active_app_data_hidden = match &active_result.rows[1][1] {
+            lix_engine::Value::Boolean(value) => *value,
+            lix_engine::Value::Text(value) => value == "true",
+            _ => false,
+        };
+        assert!(
+            active_app_data_hidden,
+            "expected hidden=true for /.lix/app_data/ in lix_directory, got {:?}",
+            active_result.rows[1][1]
+        );
     }
 );

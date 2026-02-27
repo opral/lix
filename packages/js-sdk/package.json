@@ -27,5 +27,27 @@
   "devDependencies": {
     "typescript": "^5.5.4",
     "vitest": "^4.0.18"
+  },
+  "nx": {
+    "targets": {
+      "build": {
+        "inputs": [
+          "default",
+          "^default",
+          "publicEnv",
+          "nodeVersion",
+          "platform",
+          "{workspaceRoot}/Cargo.toml",
+          "{workspaceRoot}/Cargo.lock",
+          "{workspaceRoot}/packages/engine/**/*",
+          "{workspaceRoot}/packages/js-sdk/Cargo.toml",
+          "{workspaceRoot}/packages/js-sdk/wasm-bindgen.rs"
+        ],
+        "outputs": [
+          "{projectRoot}/dist",
+          "{projectRoot}/src/engine-wasm/wasm"
+        ]
+      }
+    }
   }
 }
