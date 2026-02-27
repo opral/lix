@@ -197,8 +197,11 @@ async fn boot_engine_with_json_plugin(
     engine.init().await.expect("engine init should succeed");
     register_plugin_schema(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
+    let plugin_archive =
+        support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .expect("build test plugin archive should succeed");
     engine
-        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
     engine

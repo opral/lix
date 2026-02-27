@@ -227,17 +227,10 @@ export type LixObserveEvents = {
         }
 
         #[wasm_bindgen(js_name = installPlugin)]
-        pub async fn install_plugin(
-            &self,
-            manifest_json: String,
-            wasm_bytes: Uint8Array,
-        ) -> Result<(), JsValue> {
-            let mut bytes = vec![0u8; wasm_bytes.length() as usize];
-            wasm_bytes.copy_to(&mut bytes);
-            self.engine
-                .install_plugin(&manifest_json, &bytes)
-                .await
-                .map_err(js_error)
+        pub async fn install_plugin(&self, archive_bytes: Uint8Array) -> Result<(), JsValue> {
+            let mut bytes = vec![0u8; archive_bytes.length() as usize];
+            archive_bytes.copy_to(&mut bytes);
+            self.engine.install_plugin(&bytes).await.map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = createCheckpoint)]

@@ -415,8 +415,11 @@ async fn boot_engine_with_json_plugin(
     register_plugin_schema(&engine).await;
     let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
+    let plugin_archive =
+        support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .expect("build test plugin archive should succeed");
     engine
-        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
     (engine, main_version_id)
@@ -440,8 +443,11 @@ async fn boot_engine_with_path_echo_plugin(
     register_plugin_schema(&engine).await;
     let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
+    let plugin_archive =
+        support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .expect("build test plugin archive should succeed");
     engine
-        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
     (engine, main_version_id)
@@ -465,8 +471,11 @@ async fn boot_engine_with_before_aware_plugin(
     register_plugin_schema(&engine).await;
     let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
+    let plugin_archive =
+        support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .expect("build test plugin archive should succeed");
     engine
-        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
     (engine, main_version_id)
@@ -799,8 +808,11 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     register_plugin_schema(&engine).await;
     let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
+    let plugin_archive =
+        support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .expect("build test plugin archive should succeed");
     engine
-        .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+        .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
     (engine, main_version_id)
@@ -892,8 +904,11 @@ simulation_test!(
         let main_version_id = main_version_id(&engine).await;
         let plugin_wasm = plugin_json_v2_wasm_bytes();
 
+        let plugin_archive =
+            support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+                .expect("build test plugin archive should succeed");
         engine
-            .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .install_plugin(&plugin_archive)
             .await
             .expect("install_plugin should succeed");
 
@@ -991,8 +1006,11 @@ simulation_test!(
         let main_version_id = main_version_id(&engine).await;
         let plugin_wasm = plugin_json_v2_wasm_bytes();
 
+        let plugin_archive =
+            support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+                .expect("build test plugin archive should succeed");
         engine
-            .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .install_plugin(&plugin_archive)
             .await
             .expect("install_plugin should succeed");
 
@@ -1075,8 +1093,11 @@ simulation_test!(
         let main_version_id = main_version_id(&engine).await;
         let plugin_wasm = plugin_json_v2_wasm_bytes();
 
+        let plugin_archive =
+            support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+                .expect("build test plugin archive should succeed");
         engine
-            .install_plugin(TEST_PLUGIN_MANIFEST, &plugin_wasm)
+            .install_plugin(&plugin_archive)
             .await
             .expect("install_plugin should succeed");
 
@@ -1692,8 +1713,13 @@ simulation_test!(
         let (engine, main_version_id) =
             boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
         let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        let plugin_archive = support::simulation_test::build_test_plugin_archive(
+            TEST_TXT_PLUGIN_MANIFEST,
+            &plugin_wasm,
+        )
+        .expect("build test plugin archive should succeed");
         engine
-            .install_plugin(TEST_TXT_PLUGIN_MANIFEST, &plugin_wasm)
+            .install_plugin(&plugin_archive)
             .await
             .expect("install txt plugin should succeed");
 
@@ -1784,8 +1810,13 @@ simulation_test!(
         let (engine, main_version_id) =
             boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
         let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        let plugin_archive = support::simulation_test::build_test_plugin_archive(
+            TEST_TXT_PLUGIN_MANIFEST,
+            &plugin_wasm,
+        )
+        .expect("build test plugin archive should succeed");
         engine
-            .install_plugin(TEST_TXT_PLUGIN_MANIFEST, &plugin_wasm)
+            .install_plugin(&plugin_archive)
             .await
             .expect("install txt plugin should succeed");
 

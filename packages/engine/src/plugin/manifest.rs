@@ -108,14 +108,16 @@ mod tests {
                 "key":"plugin_json",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "match":{"path_glob":"*.json"}
+                "match":{"path_glob":"*.json"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"]
             }"#,
         )
         .expect("manifest should parse");
 
         assert_eq!(validated.manifest.key, "plugin_json");
         assert_eq!(validated.manifest.runtime.as_str(), "wasm-component-v1");
-        assert_eq!(validated.manifest.entry_or_default(), "plugin.wasm");
+        assert_eq!(validated.manifest.entry, "plugin.wasm");
     }
 
     #[test]
@@ -124,7 +126,9 @@ mod tests {
             r#"{
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "match":{"path_glob":"*.json"}
+                "match":{"path_glob":"*.json"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"]
             }"#,
         )
         .expect_err("manifest should be invalid");
@@ -140,7 +144,9 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "match":{"path_glob":"*.{md,mdx"}
+                "match":{"path_glob":"*.{md,mdx"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"]
             }"#,
         )
         .expect_err("invalid glob should fail");
@@ -155,7 +161,9 @@ mod tests {
                 "key":"plugin_text",
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
-                "match":{"path_glob":"**/*", "content_type":"text"}
+                "match":{"path_glob":"**/*", "content_type":"text"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"]
             }"#,
         )
         .expect("manifest should parse");
@@ -174,6 +182,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.{md,mdx}"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
@@ -210,6 +220,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true
@@ -238,6 +250,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "columns": ["entity_id", "schema_key"]
@@ -259,6 +273,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": false,
@@ -281,6 +297,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,
@@ -303,6 +321,8 @@ mod tests {
                 "runtime":"wasm-component-v1",
                 "api_version":"0.1.0",
                 "match":{"path_glob":"*.md"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/default.json"],
                 "detect_changes": {
                     "state_context": {
                         "include_active_state": true,

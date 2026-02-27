@@ -456,11 +456,13 @@ simulation_test!(
             .expect("boot_simulated_engine should succeed");
         engine.init().await.expect("init should succeed");
         register_json_pointer_schema(&engine).await;
+        let plugin_archive = support::simulation_test::build_test_plugin_archive(
+            TEST_PLUGIN_MANIFEST,
+            &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+        )
+        .expect("build test plugin archive should succeed");
         engine
-            .install_plugin(
-                TEST_PLUGIN_MANIFEST,
-                &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
-            )
+            .install_plugin(&plugin_archive)
             .await
             .expect("install_plugin should succeed");
 

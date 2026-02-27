@@ -17,6 +17,7 @@ unicode-normalization = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 blake3 = "1"
 fastcdc = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 criterion = "0.8.2"

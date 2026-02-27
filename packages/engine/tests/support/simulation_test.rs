@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{Cursor, Write};
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,8 @@ use lix_engine::{
     WasmRuntime,
 };
 use tokio::sync::Mutex as TokioMutex;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
 
 use super::simulations::default_simulations as default_simulations_impl;
 
@@ -124,12 +127,8 @@ impl SimulationEngine {
         }
     }
 
-    pub async fn install_plugin(
-        &self,
-        manifest_json: &str,
-        wasm_bytes: &[u8],
-    ) -> Result<(), LixError> {
-        self.engine.install_plugin(manifest_json, wasm_bytes).await
+    pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
+        self.engine.install_plugin(archive_bytes).await
     }
 
     pub async fn materialization_plan(
@@ -179,6 +178,109 @@ impl SimulationEngine {
             .store(false, Ordering::SeqCst);
         Ok(())
     }
+}
+
+const DEFAULT_TEST_SCHEMA_PATH: &str = "schema/default.json";
+const DEFAULT_TEST_SCHEMA_JSON: &str = r#"{
+  "x-lix-key":"json_pointer",
+  "x-lix-version":"1",
+  "type":"object",
+  "properties":{"path":{"type":"string"},"value":{}},
+  "required":["path","value"],
+  "additionalProperties":false
+}"#;
+
+pub fn build_test_plugin_archive(
+    manifest_json: &str,
+    wasm_bytes: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let mut manifest_value: serde_json::Value =
+        serde_json::from_str(manifest_json).map_err(|error| LixError {
+            message: format!("test plugin manifest must be valid JSON: {error}"),
+        })?;
+    {
+        let manifest_object = manifest_value.as_object_mut().ok_or_else(|| LixError {
+            message: "test plugin manifest must be a JSON object".to_string(),
+        })?;
+
+        if !manifest_object.contains_key("entry") {
+            manifest_object.insert(
+                "entry".to_string(),
+                serde_json::Value::String("plugin.wasm".to_string()),
+            );
+        }
+        if !manifest_object.contains_key("schemas") {
+            manifest_object.insert(
+                "schemas".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(
+                    DEFAULT_TEST_SCHEMA_PATH.to_string(),
+                )]),
+            );
+        }
+    }
+
+    let normalized_manifest = serde_json::to_vec(&manifest_value).map_err(|error| LixError {
+        message: format!("failed to normalize test plugin manifest JSON: {error}"),
+    })?;
+    let schemas = manifest_value
+        .get("schemas")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| LixError {
+            message: "test plugin manifest schemas must be an array".to_string(),
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| LixError {
+                message: "test plugin manifest schemas must contain string paths".to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file("manifest.json", options)
+        .map_err(|error| LixError {
+            message: format!("failed to start manifest.json in test plugin archive: {error}"),
+        })?;
+    writer
+        .write_all(&normalized_manifest)
+        .map_err(|error| LixError {
+            message: format!("failed to write manifest.json in test plugin archive: {error}"),
+        })?;
+
+    writer
+        .start_file("plugin.wasm", options)
+        .map_err(|error| LixError {
+            message: format!("failed to start plugin.wasm in test plugin archive: {error}"),
+        })?;
+    writer.write_all(wasm_bytes).map_err(|error| LixError {
+        message: format!("failed to write plugin.wasm in test plugin archive: {error}"),
+    })?;
+
+    for schema_path in &schemas {
+        writer
+            .start_file(schema_path, options)
+            .map_err(|error| LixError {
+                message: format!(
+                    "failed to start schema '{schema_path}' in test plugin archive: {error}"
+                ),
+            })?;
+        writer
+            .write_all(DEFAULT_TEST_SCHEMA_JSON.as_bytes())
+            .map_err(|error| LixError {
+                message: format!(
+                    "failed to write schema '{schema_path}' in test plugin archive: {error}"
+                ),
+            })?;
+    }
+
+    writer
+        .finish()
+        .map(|cursor| cursor.into_inner())
+        .map_err(|error| LixError {
+            message: format!("failed to finish test plugin archive: {error}"),
+        })
 }
 
 impl Deref for SimulationEngine {

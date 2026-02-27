@@ -30,14 +30,8 @@ pub struct PluginManifest {
     pub file_match: PluginMatch,
     #[serde(default)]
     pub detect_changes: Option<DetectChangesConfig>,
-    #[serde(default)]
-    pub entry: Option<String>,
-}
-
-impl PluginManifest {
-    pub fn entry_or_default(&self) -> &str {
-        self.entry.as_deref().unwrap_or("plugin.wasm")
-    }
+    pub entry: String,
+    pub schemas: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
