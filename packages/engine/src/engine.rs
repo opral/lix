@@ -796,18 +796,18 @@ mod tests {
     }
 
     #[test]
-    fn plugin_cache_invalidation_detects_internal_plugin_mutations_only() {
+    fn plugin_cache_invalidation_detects_filesystem_mutations() {
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "INSERT INTO lix_internal_plugin (key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at) VALUES ('k', 'wasm-component-v1', '0.1.0', '*.json', 'plugin.wasm', '{}', X'00', '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z')"
+            "INSERT INTO lix_file (id, path, data) VALUES ('f', '/.lix/plugins/k.lixplugin', X'00')"
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "UPDATE lix_internal_plugin SET match_path_glob = '*.md' WHERE key = 'k'"
+            "UPDATE lix_file_by_version SET data = X'01' WHERE id = 'f' AND lixcol_version_id = 'global'"
         ));
         assert!(should_invalidate_installed_plugins_cache_for_sql(
-            "DELETE FROM lix_internal_plugin WHERE key = 'k'"
+            "DELETE FROM lix_file_by_version WHERE id = 'f' AND lixcol_version_id = 'global'"
         ));
         assert!(!should_invalidate_installed_plugins_cache_for_sql(
-            "SELECT * FROM lix_internal_plugin WHERE key = 'k'"
+            "SELECT * FROM lix_file WHERE id = 'f'"
         ));
     }
 

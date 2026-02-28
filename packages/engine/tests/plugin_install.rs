@@ -7,6 +7,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_SCHEMA_PATH: &str = "schema/plugin_json_schema.json";
+const PLUGIN_STORAGE_ROOT: &str = "/.lix/plugins";
 const DEFAULT_SCHEMA_JSON: &str = r#"{
   "x-lix-key":"plugin_json_schema",
   "x-lix-version":"1",
@@ -83,6 +84,10 @@ fn value_as_i64(value: &Value) -> i64 {
     }
 }
 
+fn plugin_archive_path(key: &str) -> String {
+    format!("{PLUGIN_STORAGE_ROOT}/{key}.lixplugin")
+}
+
 simulation_test!(
     install_plugin_persists_manifest_and_wasm,
     |sim| async move {
@@ -113,23 +118,24 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "SELECT key, runtime, api_version, match_path_glob, entry, manifest_json, wasm \
-             FROM lix_internal_plugin \
-             WHERE key = 'plugin_json'",
+                "SELECT id, path, data \
+                 FROM lix_file_by_version \
+                 WHERE path = '/.lix/plugins/plugin_json.lixplugin' \
+                   AND lixcol_version_id = 'global'",
                 &[],
             )
             .await
-            .expect("plugin lookup should succeed");
+            .expect("plugin archive lookup should succeed");
 
         sim.assert_deterministic(result.rows.clone());
         assert_eq!(result.rows.len(), 1);
         let row = &result.rows[0];
-        assert_eq!(row[0], Value::Text("plugin_json".to_string()));
-        assert_eq!(row[1], Value::Text("wasm-component-v1".to_string()));
-        assert_eq!(row[2], Value::Text("0.1.0".to_string()));
-        assert_eq!(row[3], Value::Text("*.json".to_string()));
-        assert_eq!(row[4], Value::Text("plugin.wasm".to_string()));
-        assert_eq!(row[6], Value::Blob(wasm));
+        assert_eq!(
+            row[0],
+            Value::Text("lix_plugin_archive::plugin_json".to_string())
+        );
+        assert_eq!(row[1], Value::Text(plugin_archive_path("plugin_json")));
+        assert_eq!(row[2], Value::Blob(archive));
     }
 );
 
@@ -341,7 +347,10 @@ simulation_test!(
 
         let plugin_count = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_internal_plugin WHERE key = 'plugin_json'",
+                "SELECT COUNT(*) \
+                 FROM lix_file_by_version \
+                 WHERE lixcol_version_id = 'global' \
+                   AND path = '/.lix/plugins/plugin_json.lixplugin'",
                 &[],
             )
             .await
@@ -407,20 +416,22 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "SELECT key, api_version, match_path_glob, entry, wasm \
-                 FROM lix_internal_plugin \
-                 WHERE key = 'plugin_json'",
+                "SELECT id, path, data \
+                 FROM lix_file_by_version \
+                 WHERE lixcol_version_id = 'global' \
+                   AND path = '/.lix/plugins/plugin_json.lixplugin'",
                 &[],
             )
             .await
-            .expect("plugin lookup should succeed");
+            .expect("plugin archive lookup should succeed");
 
         assert_eq!(result.rows.len(), 1);
         let row = &result.rows[0];
-        assert_eq!(row[0], Value::Text("plugin_json".to_string()));
-        assert_eq!(row[1], Value::Text("0.1.1".to_string()));
-        assert_eq!(row[2], Value::Text("*.json5".to_string()));
-        assert_eq!(row[3], Value::Text("plugin.wasm".to_string()));
-        assert_eq!(row[4], Value::Blob(second_wasm));
+        assert_eq!(
+            row[0],
+            Value::Text("lix_plugin_archive::plugin_json".to_string())
+        );
+        assert_eq!(row[1], Value::Text(plugin_archive_path("plugin_json")));
+        assert_eq!(row[2], Value::Blob(second_archive));
     }
 );

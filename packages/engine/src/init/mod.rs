@@ -188,19 +188,6 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_file_lixcol_cache_lookup \
      ON lix_internal_file_lixcol_cache (file_id, version_id)",
-    "CREATE TABLE IF NOT EXISTS lix_internal_plugin (\
-     key TEXT PRIMARY KEY,\
-     runtime TEXT NOT NULL,\
-     api_version TEXT NOT NULL,\
-     match_path_glob TEXT NOT NULL,\
-     entry TEXT NOT NULL,\
-     manifest_json TEXT NOT NULL,\
-     wasm BYTEA NOT NULL,\
-     created_at TEXT NOT NULL,\
-     updated_at TEXT NOT NULL\
-     )",
-    "CREATE INDEX IF NOT EXISTS idx_lix_internal_plugin_runtime \
-     ON lix_internal_plugin (runtime)",
 ];
 
 pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {

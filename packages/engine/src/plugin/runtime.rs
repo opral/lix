@@ -1,14 +1,19 @@
 use crate::cel::CelEvaluator;
 use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
+use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
+use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{
-    InstalledPlugin, PluginContentType, PluginManifest, PluginRuntime, StateContextColumn,
+    InstalledPlugin, PluginContentType, PluginManifest, StateContextColumn,
 };
 use crate::{LixBackend, LixError, Value, WasmLimits, WasmRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read};
+use std::path::{Component, Path};
 use std::sync::Arc;
+use zip::read::ZipArchive;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const BUILTIN_BINARY_FALLBACK_PLUGIN_KEY: &str = "lix_builtin_binary_fallback";
@@ -1500,46 +1505,251 @@ pub(crate) async fn load_installed_plugins(
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let rows = backend
         .execute(
-            "SELECT key, runtime, api_version, match_path_glob, entry, manifest_json, wasm \
-             FROM lix_internal_plugin \
-             WHERE runtime = 'wasm-component-v1' \
-             ORDER BY key",
+            "SELECT binary_ref.file_id, path_cache.path, binary_ref.blob_hash \
+             FROM lix_internal_binary_file_version_ref AS binary_ref \
+             INNER JOIN lix_internal_file_path_cache AS path_cache \
+                 ON path_cache.file_id = binary_ref.file_id \
+                AND path_cache.version_id = binary_ref.version_id \
+             WHERE binary_ref.version_id = 'global' \
+               AND path_cache.path LIKE '/.lix/plugins/%.lixplugin' \
+               AND path_cache.path NOT LIKE '/.lix/plugins/%/%' \
+             ORDER BY path_cache.path",
             &[],
         )
         .await?;
 
     let mut plugins = Vec::with_capacity(rows.rows.len());
     for row in rows.rows {
-        plugins.push(parse_installed_plugin_row(&row)?);
+        plugins.push(load_installed_plugin_from_blob_ref_row(backend, &row).await?);
     }
     Ok(plugins)
 }
 
-fn parse_installed_plugin_row(row: &[Value]) -> Result<InstalledPlugin, LixError> {
-    let key = text_required(row, 0, "key")?;
-    let runtime_raw = text_required(row, 1, "runtime")?;
-    let runtime = PluginRuntime::from_str(&runtime_raw).ok_or_else(|| LixError {
-        message: format!("plugin materialization: unsupported runtime '{runtime_raw}'"),
+async fn load_installed_plugin_from_blob_ref_row(
+    backend: &dyn LixBackend,
+    row: &[Value],
+) -> Result<InstalledPlugin, LixError> {
+    let file_id = text_required(row, 0, "file_id")?;
+    let archive_path = text_required(row, 1, "path")?;
+    let blob_hash = text_required(row, 2, "blob_hash")?;
+    let Some(plugin_key) = plugin_key_from_archive_path(&archive_path) else {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: unsupported plugin archive path '{}'",
+                archive_path
+            ),
+        });
+    };
+    let archive_bytes = load_binary_blob_data_by_hash(backend, &blob_hash)
+        .await?
+        .ok_or_else(|| LixError {
+            message: format!(
+                "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
+                blob_hash, archive_path, file_id
+            ),
+        })?;
+    if archive_bytes.is_empty() {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: archive '{}' is empty",
+                archive_path
+            ),
+        });
+    }
+    parse_installed_plugin_from_archive_bytes(&plugin_key, &archive_path, &archive_bytes)
+}
+
+fn parse_installed_plugin_from_archive_bytes(
+    plugin_key: &str,
+    archive_path: &str,
+    archive_bytes: &[u8],
+) -> Result<InstalledPlugin, LixError> {
+    let files = read_plugin_archive_files(archive_path, archive_bytes)?;
+    let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
+        message: format!(
+            "plugin materialization: archive '{}' is missing manifest.json",
+            archive_path
+        ),
     })?;
-    let api_version = text_required(row, 2, "api_version")?;
-    let path_glob = text_required(row, 3, "match_path_glob")?;
-    let entry = text_required(row, 4, "entry")?;
-    let manifest_json = text_required(row, 5, "manifest_json")?;
-    let wasm = blob_required(row, 6, "wasm")?;
-    let content_type = serde_json::from_str::<PluginManifest>(&manifest_json)
-        .ok()
-        .and_then(|manifest| manifest.file_match.content_type);
+    let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
+        message: format!(
+            "plugin materialization: archive '{}' manifest.json must be UTF-8: {error}",
+            archive_path
+        ),
+    })?;
+    let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
+    if validated_manifest.manifest.key != plugin_key {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: archive '{}' key mismatch: path key '{}' vs manifest key '{}'",
+                archive_path, plugin_key, validated_manifest.manifest.key
+            ),
+        });
+    }
+
+    let entry_path = normalize_plugin_archive_path(&validated_manifest.manifest.entry)?;
+    let wasm = files.get(&entry_path).ok_or_else(|| LixError {
+        message: format!(
+            "plugin materialization: archive '{}' is missing entry file '{}'",
+            archive_path, validated_manifest.manifest.entry
+        ),
+    })?;
+    ensure_valid_plugin_wasm(wasm)?;
+
+    let manifest = validated_manifest.manifest;
+    let content_type = manifest.file_match.content_type;
 
     Ok(InstalledPlugin {
-        key,
-        runtime,
-        api_version,
-        path_glob,
+        key: manifest.key,
+        runtime: manifest.runtime,
+        api_version: manifest.api_version,
+        path_glob: manifest.file_match.path_glob,
         content_type,
-        entry,
-        manifest_json,
-        wasm,
+        entry: manifest.entry,
+        manifest_json: validated_manifest.normalized_json,
+        wasm: wasm.clone(),
     })
+}
+
+fn read_plugin_archive_files(
+    archive_path: &str,
+    archive_bytes: &[u8],
+) -> Result<BTreeMap<String, Vec<u8>>, LixError> {
+    if archive_bytes.is_empty() {
+        return Err(LixError {
+            message: format!(
+                "plugin materialization: archive '{}' is empty",
+                archive_path
+            ),
+        });
+    }
+
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
+        message: format!(
+            "plugin materialization: archive '{}' is not a valid zip file: {error}",
+            archive_path
+        ),
+    })?;
+    let mut files = BTreeMap::<String, Vec<u8>>::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| LixError {
+            message: format!(
+                "plugin materialization: failed to read archive '{}' entry index {}: {error}",
+                archive_path, index
+            ),
+        })?;
+        let raw_name = entry.name().to_string();
+        if entry.is_dir() {
+            continue;
+        }
+        if is_plugin_archive_symlink(entry.unix_mode()) {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: archive '{}' entry '{}' must not be a symlink",
+                    archive_path, raw_name
+                ),
+            });
+        }
+        let normalized_name = normalize_plugin_archive_path(&raw_name)?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|error| LixError {
+            message: format!(
+                "plugin materialization: failed to read archive '{}' entry '{}': {error}",
+                archive_path, raw_name
+            ),
+        })?;
+        if files.insert(normalized_name.clone(), bytes).is_some() {
+            return Err(LixError {
+                message: format!(
+                    "plugin materialization: archive '{}' contains duplicate entry '{}'",
+                    archive_path, normalized_name
+                ),
+            });
+        }
+    }
+
+    Ok(files)
+}
+
+fn is_plugin_archive_symlink(mode: Option<u32>) -> bool {
+    const MODE_FILE_TYPE_MASK: u32 = 0o170000;
+    const MODE_SYMLINK: u32 = 0o120000;
+    mode.is_some_and(|value| (value & MODE_FILE_TYPE_MASK) == MODE_SYMLINK)
+}
+
+fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
+    if path.is_empty() {
+        return Err(LixError {
+            message: "plugin archive path must not be empty".to_string(),
+        });
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(LixError {
+            message: format!("plugin archive path '{}' must be relative", path),
+        });
+    }
+    if path.contains('\\') {
+        return Err(LixError {
+            message: format!(
+                "plugin archive path '{}' must use forward slash separators",
+                path
+            ),
+        });
+    }
+
+    let mut segments = Vec::<String>::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(value) => {
+                let segment = value.to_str().ok_or_else(|| LixError {
+                    message: format!(
+                        "plugin archive path '{}' contains non-UTF-8 components",
+                        path
+                    ),
+                })?;
+                if segment.is_empty() {
+                    return Err(LixError {
+                        message: format!("plugin archive path '{}' is invalid", path),
+                    });
+                }
+                segments.push(segment.to_string());
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(LixError {
+                    message: format!(
+                        "plugin archive path '{}' must not contain traversal or absolute components",
+                        path
+                    ),
+                });
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err(LixError {
+            message: format!("plugin archive path '{}' is invalid", path),
+        });
+    }
+    Ok(segments.join("/"))
+}
+
+fn ensure_valid_plugin_wasm(wasm_bytes: &[u8]) -> Result<(), LixError> {
+    if wasm_bytes.is_empty() {
+        return Err(LixError {
+            message: "plugin materialization: wasm bytes must not be empty".to_string(),
+        });
+    }
+    if wasm_bytes.len() < 8 || !wasm_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]) {
+        return Err(LixError {
+            message: "plugin materialization: wasm bytes must start with a valid wasm header"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 async fn load_binary_blob_data_by_hash(

@@ -2,6 +2,7 @@ use super::*;
 
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
 const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
+const SYSTEM_PLUGIN_DIRECTORY_PATH: &str = "/.lix/plugins/";
 
 impl Engine {
     pub(crate) async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
@@ -83,7 +84,11 @@ impl Engine {
     }
 
     pub(crate) async fn seed_global_system_directories(&self) -> Result<(), LixError> {
-        let directories = [SYSTEM_ROOT_DIRECTORY_PATH, SYSTEM_APP_DATA_DIRECTORY_PATH];
+        let directories = [
+            SYSTEM_ROOT_DIRECTORY_PATH,
+            SYSTEM_APP_DATA_DIRECTORY_PATH,
+            SYSTEM_PLUGIN_DIRECTORY_PATH,
+        ];
 
         for path in directories {
             let existing = self

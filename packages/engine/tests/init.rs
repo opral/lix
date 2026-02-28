@@ -321,96 +321,124 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    init_seeds_global_system_directories,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
+simulation_test!(init_seeds_global_system_directories, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+    engine.init().await.unwrap();
 
-        let result = engine
-            .execute(
-                "SELECT path, hidden \
+    let result = engine
+        .execute(
+            "SELECT path, hidden \
                  FROM lix_directory_by_version \
                  WHERE lixcol_version_id = 'global' \
-                   AND path IN ('/.lix/', '/.lix/app_data/') \
+                   AND path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
                  ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
+            &[],
+        )
+        .await
+        .unwrap();
 
-        sim.assert_deterministic(result.rows.clone());
-        assert_eq!(result.rows.len(), 2);
-        assert_eq!(result.rows[0][0], lix_engine::Value::Text("/.lix/".to_string()));
-        let root_hidden = match &result.rows[0][1] {
-            lix_engine::Value::Boolean(value) => *value,
-            lix_engine::Value::Text(value) => value == "true",
-            _ => false,
-        };
-        assert!(
-            root_hidden,
-            "expected hidden=true for /.lix/, got {:?}",
-            result.rows[0][1]
-        );
-        assert_eq!(
-            result.rows[1][0],
-            lix_engine::Value::Text("/.lix/app_data/".to_string())
-        );
-        let app_data_hidden = match &result.rows[1][1] {
-            lix_engine::Value::Boolean(value) => *value,
-            lix_engine::Value::Text(value) => value == "true",
-            _ => false,
-        };
-        assert!(
-            app_data_hidden,
-            "expected hidden=true for /.lix/app_data/, got {:?}",
-            result.rows[1][1]
-        );
+    sim.assert_deterministic(result.rows.clone());
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(
+        result.rows[0][0],
+        lix_engine::Value::Text("/.lix/".to_string())
+    );
+    let root_hidden = match &result.rows[0][1] {
+        lix_engine::Value::Boolean(value) => *value,
+        lix_engine::Value::Text(value) => value == "true",
+        _ => false,
+    };
+    assert!(
+        root_hidden,
+        "expected hidden=true for /.lix/, got {:?}",
+        result.rows[0][1]
+    );
+    assert_eq!(
+        result.rows[1][0],
+        lix_engine::Value::Text("/.lix/app_data/".to_string())
+    );
+    let app_data_hidden = match &result.rows[1][1] {
+        lix_engine::Value::Boolean(value) => *value,
+        lix_engine::Value::Text(value) => value == "true",
+        _ => false,
+    };
+    assert!(
+        app_data_hidden,
+        "expected hidden=true for /.lix/app_data/, got {:?}",
+        result.rows[1][1]
+    );
+    assert_eq!(
+        result.rows[2][0],
+        lix_engine::Value::Text("/.lix/plugins/".to_string())
+    );
+    let plugins_hidden = match &result.rows[2][1] {
+        lix_engine::Value::Boolean(value) => *value,
+        lix_engine::Value::Text(value) => value == "true",
+        _ => false,
+    };
+    assert!(
+        plugins_hidden,
+        "expected hidden=true for /.lix/plugins/, got {:?}",
+        result.rows[2][1]
+    );
 
-        let active_result = engine
-            .execute(
-                "SELECT path, hidden \
+    let active_result = engine
+        .execute(
+            "SELECT path, hidden \
                  FROM lix_directory \
-                 WHERE path IN ('/.lix/', '/.lix/app_data/') \
+                 WHERE path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
                  ORDER BY path",
-                &[],
-            )
-            .await
-            .unwrap();
+            &[],
+        )
+        .await
+        .unwrap();
 
-        sim.assert_deterministic(active_result.rows.clone());
-        assert_eq!(active_result.rows.len(), 2);
-        assert_eq!(
-            active_result.rows[0][0],
-            lix_engine::Value::Text("/.lix/".to_string())
-        );
-        let active_root_hidden = match &active_result.rows[0][1] {
-            lix_engine::Value::Boolean(value) => *value,
-            lix_engine::Value::Text(value) => value == "true",
-            _ => false,
-        };
-        assert!(
-            active_root_hidden,
-            "expected hidden=true for /.lix/ in lix_directory, got {:?}",
-            active_result.rows[0][1]
-        );
-        assert_eq!(
-            active_result.rows[1][0],
-            lix_engine::Value::Text("/.lix/app_data/".to_string())
-        );
-        let active_app_data_hidden = match &active_result.rows[1][1] {
-            lix_engine::Value::Boolean(value) => *value,
-            lix_engine::Value::Text(value) => value == "true",
-            _ => false,
-        };
-        assert!(
-            active_app_data_hidden,
-            "expected hidden=true for /.lix/app_data/ in lix_directory, got {:?}",
-            active_result.rows[1][1]
-        );
-    }
-);
+    sim.assert_deterministic(active_result.rows.clone());
+    assert_eq!(active_result.rows.len(), 3);
+    assert_eq!(
+        active_result.rows[0][0],
+        lix_engine::Value::Text("/.lix/".to_string())
+    );
+    let active_root_hidden = match &active_result.rows[0][1] {
+        lix_engine::Value::Boolean(value) => *value,
+        lix_engine::Value::Text(value) => value == "true",
+        _ => false,
+    };
+    assert!(
+        active_root_hidden,
+        "expected hidden=true for /.lix/ in lix_directory, got {:?}",
+        active_result.rows[0][1]
+    );
+    assert_eq!(
+        active_result.rows[1][0],
+        lix_engine::Value::Text("/.lix/app_data/".to_string())
+    );
+    let active_app_data_hidden = match &active_result.rows[1][1] {
+        lix_engine::Value::Boolean(value) => *value,
+        lix_engine::Value::Text(value) => value == "true",
+        _ => false,
+    };
+    assert!(
+        active_app_data_hidden,
+        "expected hidden=true for /.lix/app_data/ in lix_directory, got {:?}",
+        active_result.rows[1][1]
+    );
+    assert_eq!(
+        active_result.rows[2][0],
+        lix_engine::Value::Text("/.lix/plugins/".to_string())
+    );
+    let active_plugins_hidden = match &active_result.rows[2][1] {
+        lix_engine::Value::Boolean(value) => *value,
+        lix_engine::Value::Text(value) => value == "true",
+        _ => false,
+    };
+    assert!(
+        active_plugins_hidden,
+        "expected hidden=true for /.lix/plugins/ in lix_directory, got {:?}",
+        active_result.rows[2][1]
+    );
+});

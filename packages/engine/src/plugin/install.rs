@@ -6,6 +6,7 @@ use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
 
 use crate::plugin::manifest::parse_plugin_manifest_json;
+use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use crate::plugin::types::PluginManifest;
 use crate::schema::{validate_lix_schema_definition, SchemaKey};
 
@@ -18,7 +19,6 @@ const INSTALL_STORED_SCHEMA_SQL: &str =
 
 struct ParsedPluginArchive {
     manifest: PluginManifest,
-    normalized_manifest_json: String,
     wasm_bytes: Vec<u8>,
     schemas: Vec<ParsedSchema>,
 }
@@ -42,6 +42,7 @@ impl Engine {
             self,
             transaction.as_mut(),
             &parsed,
+            archive_bytes,
             &options,
             &mut active_version_id,
             &mut pending_state_commit_stream_changes,
@@ -69,6 +70,7 @@ async fn install_plugin_in_transaction(
     engine: &Engine,
     transaction: &mut dyn LixTransaction,
     parsed: &ParsedPluginArchive,
+    archive_bytes: &[u8],
     options: &ExecuteOptions,
     active_version_id: &mut String,
     pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
@@ -88,15 +90,45 @@ async fn install_plugin_in_transaction(
             .await?;
     }
 
-    let now = crate::functions::timestamp::timestamp();
-    upsert_plugin_record_in_transaction(
-        transaction,
-        &parsed.manifest,
-        &parsed.normalized_manifest_json,
-        &parsed.wasm_bytes,
-        &now,
-    )
-    .await
+    let plugin_key = parsed.manifest.key.as_str();
+    let archive_id = plugin_storage_archive_file_id(plugin_key);
+    let archive_path = plugin_storage_archive_path(plugin_key)?;
+
+    engine
+        .execute_with_options_in_transaction(
+            transaction,
+            "DELETE FROM lix_file_by_version \
+             WHERE lixcol_version_id = 'global' \
+               AND id = $1",
+            &[Value::Text(archive_id.clone())],
+            options,
+            active_version_id,
+            None,
+            false,
+            pending_state_commit_stream_changes,
+        )
+        .await?;
+
+    engine
+        .execute_with_options_in_transaction(
+            transaction,
+            "INSERT INTO lix_file_by_version (\
+             id, path, data, lixcol_version_id\
+             ) VALUES ($1, $2, $3, 'global')",
+            &[
+                Value::Text(archive_id),
+                Value::Text(archive_path),
+                Value::Blob(archive_bytes.to_vec()),
+            ],
+            options,
+            active_version_id,
+            None,
+            false,
+            pending_state_commit_stream_changes,
+        )
+        .await?;
+
+    Ok(())
 }
 
 fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, LixError> {
@@ -159,7 +191,6 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
 
     Ok(ParsedPluginArchive {
         manifest: validated_manifest.manifest,
-        normalized_manifest_json: validated_manifest.normalized_json,
         wasm_bytes,
         schemas,
     })
@@ -285,42 +316,6 @@ fn normalize_archive_path(path: &str) -> Result<String, LixError> {
     }
 
     Ok(segments.join("/"))
-}
-
-async fn upsert_plugin_record_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    manifest: &PluginManifest,
-    manifest_json: &str,
-    wasm_bytes: &[u8],
-    timestamp: &str,
-) -> Result<(), LixError> {
-    transaction
-        .execute(
-            "INSERT INTO lix_internal_plugin (\
-             key, runtime, api_version, match_path_glob, entry, manifest_json, wasm, created_at, updated_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) \
-             ON CONFLICT (key) DO UPDATE SET \
-             runtime = EXCLUDED.runtime, \
-             api_version = EXCLUDED.api_version, \
-             match_path_glob = EXCLUDED.match_path_glob, \
-             entry = EXCLUDED.entry, \
-             manifest_json = EXCLUDED.manifest_json, \
-             wasm = EXCLUDED.wasm, \
-             updated_at = EXCLUDED.updated_at",
-            &[
-                Value::Text(manifest.key.clone()),
-                Value::Text(manifest.runtime.as_str().to_string()),
-                Value::Text(manifest.api_version.clone()),
-                Value::Text(manifest.file_match.path_glob.clone()),
-                Value::Text(manifest.entry.clone()),
-                Value::Text(manifest_json.to_string()),
-                Value::Blob(wasm_bytes.to_vec()),
-                Value::Text(timestamp.to_string()),
-            ],
-        )
-        .await?;
-
-    Ok(())
 }
 
 fn ensure_valid_wasm_binary(wasm_bytes: &[u8]) -> Result<(), LixError> {
