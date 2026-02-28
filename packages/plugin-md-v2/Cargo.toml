@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 markdown = { version = "1", features = ["serde"] }
+markdown_wc_core = { path = "../../../../../markdown-wc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strsim = "0.11"

@@ -2932,24 +2932,12 @@ simulation_test!(
             .execute("SELECT id FROM file", &[])
             .await
             .expect_err("non-prefixed file should not be supported");
-        assert!(
-            file_err.description.contains("file")
-                && (file_err.description.contains("no such table")
-                    || file_err.description.contains("does not exist")),
-            "unexpected error: {}",
-            file_err.description
-        );
+        assert_eq!(file_err.code, "LIX_ERROR_TABLE_NOT_FOUND");
 
         let directory_err = engine
             .execute("SELECT id FROM \"directory\"", &[])
             .await
             .expect_err("non-prefixed directory should not be supported");
-        assert!(
-            directory_err.description.contains("directory")
-                && (directory_err.description.contains("no such table")
-                    || directory_err.description.contains("does not exist")),
-            "unexpected error: {}",
-            directory_err.description
-        );
+        assert_eq!(directory_err.code, "LIX_ERROR_TABLE_NOT_FOUND");
     }
 );
