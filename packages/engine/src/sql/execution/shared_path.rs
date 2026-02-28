@@ -46,7 +46,18 @@ pub(crate) async fn prepare_execution_with_backend(
     writer_key: Option<&str>,
     policy: PreparationPolicy,
 ) -> Result<PreparedExecutionContext, LixError> {
-    let requirements = derive_plan_requirements(parsed_statements);
+    let (settings, sequence_start, functions) = engine
+        .prepare_runtime_functions_with_backend(backend)
+        .await?;
+
+    let mut statements = parsed_statements.to_vec();
+    crate::filesystem::pending_file_writes::ensure_file_insert_ids_for_data_writes(
+        &mut statements,
+        &functions,
+    )
+    ?;
+
+    let requirements = derive_plan_requirements(&statements);
     if requirements.read_only_query {
         engine
             .maybe_refresh_working_change_projection_for_read_query(backend, active_version_id)
@@ -56,7 +67,7 @@ pub(crate) async fn prepare_execution_with_backend(
     engine
         .maybe_materialize_reads_with_backend_from_statements(
             backend,
-            parsed_statements,
+            &statements,
             active_version_id,
         )
         .await?;
@@ -79,7 +90,7 @@ pub(crate) async fn prepare_execution_with_backend(
         engine
             .collect_execution_side_effects_with_backend_from_statements(
                 backend,
-                parsed_statements,
+                &statements,
                 params,
                 active_version_id,
                 writer_key,
@@ -89,13 +100,10 @@ pub(crate) async fn prepare_execution_with_backend(
             .await?
     };
 
-    let (settings, sequence_start, functions) = engine
-        .prepare_runtime_functions_with_backend(backend)
-        .await?;
     let plan = build_execution_plan(
         backend,
         &engine.cel_evaluator,
-        parsed_statements.to_vec(),
+        statements,
         params,
         functions.clone(),
         &detected_file_domain_changes_by_statement,

@@ -77,6 +77,61 @@ pub(crate) fn advance_placeholder_state_for_statement(
     Ok(())
 }
 
+async fn resolve_pending_write_file_id_with_backend(
+    backend: &dyn LixBackend,
+    write: &crate::filesystem::pending_file_writes::PendingFileWrite,
+) -> Result<String, LixError> {
+    let Some(path) =
+        crate::filesystem::pending_file_writes::unresolved_auto_file_path_from_id(&write.file_id)
+    else {
+        return Ok(write.file_id.clone());
+    };
+    let resolved = crate::filesystem::mutation_rewrite::resolve_file_id_by_path_in_version(
+        backend,
+        &write.version_id,
+        path,
+    )
+    .await?;
+    let Some(file_id) = resolved else {
+        return Err(LixError {
+            message: format!(
+                "pending file write: unable to resolve auto-generated file id for path '{}' in version '{}'",
+                path, write.version_id
+            ),
+        });
+    };
+    Ok(file_id)
+}
+
+async fn resolve_pending_write_file_id_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    write: &crate::filesystem::pending_file_writes::PendingFileWrite,
+) -> Result<String, LixError> {
+    let Some(path) =
+        crate::filesystem::pending_file_writes::unresolved_auto_file_path_from_id(&write.file_id)
+    else {
+        return Ok(write.file_id.clone());
+    };
+    let resolved = {
+        let backend = TransactionBackendAdapter::new(transaction);
+        crate::filesystem::mutation_rewrite::resolve_file_id_by_path_in_version(
+            &backend,
+            &write.version_id,
+            path,
+        )
+        .await?
+    };
+    let Some(file_id) = resolved else {
+        return Err(LixError {
+            message: format!(
+                "pending file write: unable to resolve auto-generated file id for path '{}' in version '{}'",
+                path, write.version_id
+            ),
+        });
+    };
+    Ok(file_id)
+}
+
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
         &self,
@@ -489,15 +544,17 @@ impl Engine {
             if !write.data_is_authoritative {
                 continue;
             }
-            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+            let resolved_file_id =
+                resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
+            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
-        for index in latest_by_key.into_values() {
+        for ((file_id, version_id), index) in latest_by_key {
             let write = &writes[index];
             persist_binary_blob_with_fastcdc_backend(
                 self.backend.as_ref(),
-                &write.file_id,
-                &write.version_id,
+                &file_id,
+                &version_id,
                 &write.after_data,
             )
             .await?;
@@ -516,15 +573,17 @@ impl Engine {
             if !write.data_is_authoritative {
                 continue;
             }
-            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+            let resolved_file_id =
+                resolve_pending_write_file_id_in_transaction(transaction, write).await?;
+            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
-        for index in latest_by_key.into_values() {
+        for ((file_id, version_id), index) in latest_by_key {
             let write = &writes[index];
             persist_binary_blob_with_fastcdc_in_transaction(
                 transaction,
-                &write.file_id,
-                &write.version_id,
+                &file_id,
+                &version_id,
                 &write.after_data,
             )
             .await?;
@@ -540,10 +599,12 @@ impl Engine {
         let upsert_sql = filesystem_queries::upsert_file_path_cache_sql();
         let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
-            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+            let resolved_file_id =
+                resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
+            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
-        for index in latest_by_key.into_values() {
+        for ((file_id, version_id), index) in latest_by_key {
             let write = &writes[index];
             let Some(path) = write.after_path.as_deref() else {
                 continue;
@@ -555,8 +616,8 @@ impl Engine {
                 .execute(
                     &upsert_sql,
                     &[
-                        Value::Text(write.file_id.clone()),
-                        Value::Text(write.version_id.clone()),
+                        Value::Text(file_id),
+                        Value::Text(version_id),
                         Value::Text(name),
                         match extension {
                             Some(value) => Value::Text(value),
@@ -578,10 +639,12 @@ impl Engine {
         let upsert_sql = filesystem_queries::upsert_file_path_cache_sql();
         let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
-            latest_by_key.insert((write.file_id.clone(), write.version_id.clone()), index);
+            let resolved_file_id =
+                resolve_pending_write_file_id_in_transaction(transaction, write).await?;
+            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
-        for index in latest_by_key.into_values() {
+        for ((file_id, version_id), index) in latest_by_key {
             let write = &writes[index];
             let Some(path) = write.after_path.as_deref() else {
                 continue;
@@ -593,8 +656,8 @@ impl Engine {
                 .execute(
                     &upsert_sql,
                     &[
-                        Value::Text(write.file_id.clone()),
-                        Value::Text(write.version_id.clone()),
+                        Value::Text(file_id),
+                        Value::Text(version_id),
                         Value::Text(name),
                         match extension {
                             Some(value) => Value::Text(value),
