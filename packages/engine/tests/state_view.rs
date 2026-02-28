@@ -837,6 +837,53 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_update_rejects_unknown_assignment_column,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-unknown-col",
+            "version-a",
+            "{\"value\":\"before\"}",
+            false,
+        )
+        .await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .execute(
+                "UPDATE lix_state \
+                 SET bogus = 'x' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-unknown-col'",
+                &[],
+            )
+            .await
+            .expect_err("lix_state update with unknown assignment should fail");
+        assert!(
+            error.message.contains("strict rewrite violation")
+                && error.message.contains("unknown column")
+                && error.message.contains("bogus"),
+            "unexpected error message: {}",
+            error.message
+        );
+    }
+);
+
+simulation_test!(
     lix_state_delete_routes_to_active_version,
     |sim| async move {
         let engine = sim

@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 lix_engine = { path = "../engine" }
 async-trait = "0.1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 wasmtime = { version = "30", features = ["component-model"] }

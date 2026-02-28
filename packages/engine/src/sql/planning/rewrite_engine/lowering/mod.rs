@@ -9,8 +9,14 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::backend::SqlDialect;
 use crate::LixError;
 
-use self::json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract};
-use self::logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract};
+use self::json_fn::{
+    lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract, lower_lix_text_decode,
+    lower_lix_text_encode,
+};
+use self::logical_fn::{
+    parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract, parse_lix_text_decode,
+    parse_lix_text_encode,
+};
 
 pub(crate) fn lower_statement(
     statement: Statement,
@@ -56,6 +62,23 @@ impl VisitorMut for LogicalFunctionLowerer {
             };
             if parsed_empty_blob.is_some() {
                 *expr = lower_lix_empty_blob(self.dialect);
+                return ControlFlow::Continue(());
+            }
+            let parsed_text_encode = match parse_lix_text_encode(function) {
+                Ok(parsed) => parsed,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if let Some(call) = parsed_text_encode {
+                *expr = lower_lix_text_encode(&call, self.dialect);
+                return ControlFlow::Continue(());
+            }
+            let parsed_text_decode = match parse_lix_text_decode(function) {
+                Ok(parsed) => parsed,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if let Some(call) = parsed_text_decode {
+                *expr = lower_lix_text_decode(&call, self.dialect);
+                return ControlFlow::Continue(());
             }
             return ControlFlow::Continue(());
         };
@@ -167,5 +190,45 @@ mod tests {
         let lowered = lower_query("SELECT lix_json(payload) FROM foo", SqlDialect::Postgres);
         let projection = select_expr(&lowered);
         assert_eq!(projection, "CAST(payload AS JSONB)");
+    }
+
+    #[test]
+    fn lowers_lix_text_encode_default_to_sqlite_blob_cast() {
+        let lowered = lower_query(
+            "SELECT lix_text_encode(payload) FROM foo",
+            SqlDialect::Sqlite,
+        );
+        let projection = select_expr(&lowered);
+        assert_eq!(projection, "CAST(payload AS BLOB)");
+    }
+
+    #[test]
+    fn lowers_lix_text_decode_default_to_sqlite_text_cast() {
+        let lowered = lower_query(
+            "SELECT lix_text_decode(payload) FROM foo",
+            SqlDialect::Sqlite,
+        );
+        let projection = select_expr(&lowered);
+        assert_eq!(projection, "CAST(payload AS TEXT)");
+    }
+
+    #[test]
+    fn lowers_lix_text_encode_default_to_postgres_convert_to() {
+        let lowered = lower_query(
+            "SELECT lix_text_encode(payload) FROM foo",
+            SqlDialect::Postgres,
+        );
+        let projection = select_expr(&lowered);
+        assert_eq!(projection, "convert_to(CAST(payload AS TEXT), 'UTF8')");
+    }
+
+    #[test]
+    fn lowers_lix_text_decode_default_to_postgres_convert_from() {
+        let lowered = lower_query(
+            "SELECT lix_text_decode(payload) FROM foo",
+            SqlDialect::Postgres,
+        );
+        let projection = select_expr(&lowered);
+        assert_eq!(projection, "convert_from(CAST(payload AS BYTEA), 'UTF8')");
     }
 }

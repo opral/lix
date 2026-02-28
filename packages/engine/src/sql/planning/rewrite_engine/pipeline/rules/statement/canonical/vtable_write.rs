@@ -1,9 +1,7 @@
 use sqlparser::ast::{Delete, Insert, Statement, Update};
 
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
-use crate::engine::sql::planning::rewrite_engine::types::{
-    PostprocessPlan, RewriteOutput, UpdateValidationPlan,
-};
+use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput};
 use crate::engine::sql::planning::rewrite_engine::{
     expr_references_column_name, ColumnReferenceOptions, DetectedFileDomainChange,
 };
@@ -59,14 +57,26 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
             mutations: Vec::new(),
             update_validations: rewrite.validation.into_iter().collect(),
         }),
-        None => Ok(RewriteOutput {
-            statements: vec![Statement::Update(update)],
-            params: Vec::new(),
-            registrations: Vec::new(),
-            postprocess: None,
-            mutations: Vec::new(),
-            update_validations: Vec::<UpdateValidationPlan>::new(),
-        }),
+        None => {
+            let target = update_target_name(&update);
+            if is_allowed_internal_write_target(&target) {
+                Ok(RewriteOutput {
+                    statements: vec![Statement::Update(update)],
+                    params: Vec::new(),
+                    registrations: Vec::new(),
+                    postprocess: None,
+                    mutations: Vec::new(),
+                    update_validations: Vec::new(),
+                })
+            } else {
+                Err(LixError {
+                    message: format!(
+                        "strict rewrite violation: statement routing: unsupported UPDATE target '{}'",
+                        target
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -97,14 +107,26 @@ pub(crate) fn rewrite_delete(
             mutations: Vec::new(),
             update_validations: Vec::new(),
         }),
-        None => Ok(RewriteOutput {
-            statements: vec![Statement::Delete(delete)],
-            params: Vec::new(),
-            registrations: Vec::new(),
-            postprocess: None,
-            mutations: Vec::new(),
-            update_validations: Vec::new(),
-        }),
+        None => {
+            let target = delete_target_name(&delete);
+            if is_allowed_internal_write_target(&target) {
+                Ok(RewriteOutput {
+                    statements: vec![Statement::Delete(delete)],
+                    params: Vec::new(),
+                    registrations: Vec::new(),
+                    postprocess: None,
+                    mutations: Vec::new(),
+                    update_validations: Vec::new(),
+                })
+            } else {
+                Err(LixError {
+                    message: format!(
+                        "strict rewrite violation: statement routing: unsupported DELETE target '{}'",
+                        target
+                    ),
+                })
+            }
+        }
     }
 }
 
@@ -122,6 +144,32 @@ pub(crate) fn selection_mentions_inherited_from_version_id(
             )
         })
         .unwrap_or(false)
+}
+
+fn update_target_name(update: &Update) -> String {
+    match &update.table.relation {
+        sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+        _ => "<non-table-target>".to_string(),
+    }
+}
+
+fn delete_target_name(delete: &Delete) -> String {
+    let tables = match &delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    tables
+        .first()
+        .map(|table| match &table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+            _ => "<non-table-target>".to_string(),
+        })
+        .unwrap_or_else(|| "<missing-target>".to_string())
+}
+
+fn is_allowed_internal_write_target(target: &str) -> bool {
+    let normalized = target.trim_matches('"').to_ascii_lowercase();
+    normalized.starts_with("lix_internal_")
 }
 
 #[cfg(test)]

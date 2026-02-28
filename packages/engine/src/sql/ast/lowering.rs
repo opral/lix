@@ -11,8 +11,14 @@ use sqlparser::ast::{VisitMut, VisitorMut};
 use crate::backend::SqlDialect;
 use crate::LixError;
 
-use self::lower_json_fn::{lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract};
-use self::lower_logical_fn::{parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract};
+use self::lower_json_fn::{
+    lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract, lower_lix_text_decode,
+    lower_lix_text_encode,
+};
+use self::lower_logical_fn::{
+    parse_lix_empty_blob, parse_lix_json, parse_lix_json_extract, parse_lix_text_decode,
+    parse_lix_text_encode,
+};
 
 pub(crate) fn lower_statement(
     statement: Statement,
@@ -58,6 +64,23 @@ impl VisitorMut for LogicalFunctionLowerer {
             };
             if parsed_empty_blob.is_some() {
                 *expr = lower_lix_empty_blob(self.dialect);
+                return ControlFlow::Continue(());
+            }
+            let parsed_text_encode = match parse_lix_text_encode(function) {
+                Ok(parsed) => parsed,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if let Some(call) = parsed_text_encode {
+                *expr = lower_lix_text_encode(&call, self.dialect);
+                return ControlFlow::Continue(());
+            }
+            let parsed_text_decode = match parse_lix_text_decode(function) {
+                Ok(parsed) => parsed,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if let Some(call) = parsed_text_decode {
+                *expr = lower_lix_text_decode(&call, self.dialect);
+                return ControlFlow::Continue(());
             }
             return ControlFlow::Continue(());
         };

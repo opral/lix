@@ -1,11 +1,23 @@
 use async_trait::async_trait;
-use lix_engine::{LixBackend, LixError, QueryResult, SqlDialect, Value};
-use rusqlite::{params_from_iter, Connection, Row};
-use std::path::Path;
-use std::sync::Mutex;
+use lix_engine::{
+    LixBackend, LixError, LixTransaction, QueryResult, SnapshotChunkReader, SnapshotChunkWriter,
+    SqlDialect, Value,
+};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    params_from_iter, Connection, Row,
+};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct SqliteBackend {
     conn: Mutex<Connection>,
+}
+
+struct SqliteTransaction<'a> {
+    conn: MutexGuard<'a, Connection>,
+    finalized: bool,
 }
 
 impl SqliteBackend {
@@ -38,50 +50,188 @@ impl LixBackend for SqliteBackend {
         let conn = self.conn.lock().map_err(|_| LixError {
             message: "sqlite mutex poisoned".to_string(),
         })?;
+        execute_sql(&conn, sql, params)
+    }
 
-        if params.is_empty() && sql.contains(';') {
-            conn.execute_batch(sql).map_err(|err| LixError {
-                message: err.to_string(),
-            })?;
-            return Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            });
-        }
-
-        let mut stmt = conn.prepare(sql).map_err(|err| LixError {
-            message: err.to_string(),
+    async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+        let conn = self.conn.lock().map_err(|_| LixError {
+            message: "sqlite mutex poisoned".to_string(),
         })?;
-        let columns = stmt
-            .column_names()
-            .into_iter()
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>();
-        let bound_params = params.iter().cloned().map(to_sql_value);
-        let mut rows = stmt
-            .query(params_from_iter(bound_params))
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
             .map_err(|err| LixError {
                 message: err.to_string(),
             })?;
-        let mut result_rows = Vec::new();
-        while let Some(row) = rows.next().map_err(|err| LixError {
-            message: err.to_string(),
-        })? {
-            result_rows.push(map_row(row)?);
-        }
-        Ok(QueryResult {
-            rows: result_rows,
-            columns,
-        })
+
+        Ok(Box::new(SqliteTransaction {
+            conn,
+            finalized: false,
+        }))
     }
 
-    async fn begin_transaction(
-        &self,
-    ) -> Result<Box<dyn lix_engine::LixTransaction + '_>, LixError> {
-        Err(LixError {
-            message: "transactions are not implemented for rs-sdk sqlite backend".to_string(),
-        })
+    async fn export_snapshot(&self, writer: &mut dyn SnapshotChunkWriter) -> Result<(), LixError> {
+        let conn = self.conn.lock().map_err(|_| LixError {
+            message: "sqlite mutex poisoned".to_string(),
+        })?;
+        let snapshot_path = temp_snapshot_path("export");
+
+        let export_result = (|| -> Result<(), LixError> {
+            let mut snapshot_conn = Connection::open(&snapshot_path).map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            let backup = Backup::new(&conn, &mut snapshot_conn).map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            run_backup_to_completion(&backup)?;
+            Ok(())
+        })();
+
+        let bytes = std::fs::read(&snapshot_path).map_err(|err| LixError {
+            message: err.to_string(),
+        });
+        let _ = std::fs::remove_file(&snapshot_path);
+        export_result?;
+        let bytes = bytes?;
+
+        for chunk in bytes.chunks(64 * 1024) {
+            writer.write_chunk(chunk).await?;
+        }
+        writer.finish().await?;
+        Ok(())
     }
+
+    async fn restore_from_snapshot(
+        &self,
+        reader: &mut dyn SnapshotChunkReader,
+    ) -> Result<(), LixError> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = reader.read_chunk().await? {
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(LixError {
+                message: "snapshot stream is empty".to_string(),
+            });
+        }
+
+        let snapshot_path = temp_snapshot_path("restore");
+        std::fs::write(&snapshot_path, &bytes).map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+
+        let restore_result = (|| -> Result<(), LixError> {
+            let source_conn = Connection::open(&snapshot_path).map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            let mut conn = self.conn.lock().map_err(|_| LixError {
+                message: "sqlite mutex poisoned".to_string(),
+            })?;
+            let backup = Backup::new(&source_conn, &mut conn).map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+            run_backup_to_completion(&backup)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&snapshot_path);
+        restore_result
+    }
+}
+
+#[async_trait(?Send)]
+impl LixTransaction for SqliteTransaction<'_> {
+    fn dialect(&self) -> SqlDialect {
+        SqlDialect::Sqlite
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        execute_sql(&self.conn, sql, params)
+    }
+
+    async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
+        self.conn.execute_batch("COMMIT").map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+        self.finalized = true;
+        Ok(())
+    }
+
+    async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
+        self.conn
+            .execute_batch("ROLLBACK")
+            .map_err(|err| LixError {
+                message: err.to_string(),
+            })?;
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for SqliteTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.finalized && !std::thread::panicking() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+    if params.is_empty() && sql.contains(';') {
+        conn.execute_batch(sql).map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+        return Ok(QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        });
+    }
+
+    let mut stmt = conn.prepare(sql).map_err(|err| LixError {
+        message: err.to_string(),
+    })?;
+    let columns = stmt
+        .column_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let bound_params = params.iter().cloned().map(to_sql_value);
+    let mut rows = stmt
+        .query(params_from_iter(bound_params))
+        .map_err(|err| LixError {
+            message: err.to_string(),
+        })?;
+    let mut result_rows = Vec::new();
+    while let Some(row) = rows.next().map_err(|err| LixError {
+        message: err.to_string(),
+    })? {
+        result_rows.push(map_row(row)?);
+    }
+    Ok(QueryResult {
+        rows: result_rows,
+        columns,
+    })
+}
+
+fn run_backup_to_completion(backup: &Backup<'_, '_>) -> Result<(), LixError> {
+    loop {
+        match backup.step(-1).map_err(|err| LixError {
+            message: err.to_string(),
+        })? {
+            StepResult::Done => return Ok(()),
+            StepResult::More => continue,
+            StepResult::Busy | StepResult::Locked => std::thread::sleep(Duration::from_millis(5)),
+            _ => continue,
+        }
+    }
+}
+
+fn temp_snapshot_path(operation: &str) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "lix-rs-sdk-snapshot-{operation}-{}-{ts}.sqlite",
+        std::process::id()
+    ))
 }
 
 fn map_row(row: &Row<'_>) -> Result<Vec<Value>, LixError> {

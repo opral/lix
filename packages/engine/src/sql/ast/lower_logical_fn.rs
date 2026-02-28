@@ -16,6 +16,12 @@ pub(crate) struct LixJsonCall {
     pub(crate) json_expr: Expr,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LixTextCodecCall {
+    pub(crate) value_expr: Expr,
+    pub(crate) encoding: String,
+}
+
 pub(crate) fn parse_lix_json_extract(
     function: &Function,
 ) -> Result<Option<LixJsonExtractCall>, LixError> {
@@ -119,6 +125,62 @@ pub(crate) fn parse_lix_empty_blob(function: &Function) -> Result<Option<()>, Li
     }
 }
 
+pub(crate) fn parse_lix_text_encode(
+    function: &Function,
+) -> Result<Option<LixTextCodecCall>, LixError> {
+    parse_lix_text_codec(function, "lix_text_encode")
+}
+
+pub(crate) fn parse_lix_text_decode(
+    function: &Function,
+) -> Result<Option<LixTextCodecCall>, LixError> {
+    parse_lix_text_codec(function, "lix_text_decode")
+}
+
+fn parse_lix_text_codec(
+    function: &Function,
+    fn_name: &str,
+) -> Result<Option<LixTextCodecCall>, LixError> {
+    if !function_name_matches(&function.name, fn_name) {
+        return Ok(None);
+    }
+    let args = match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: format!("{fn_name}() does not support DISTINCT/ALL/clauses"),
+                });
+            }
+            &list.args
+        }
+        _ => {
+            return Err(LixError {
+                message: format!("{fn_name}() requires a regular argument list"),
+            });
+        }
+    };
+    if !(1..=2).contains(&args.len()) {
+        return Err(LixError {
+            message: format!("{fn_name}() requires 1 or 2 arguments"),
+        });
+    }
+    let value_expr = function_arg_expr(&args[0], &format!("{fn_name}()"))?;
+    let encoding = if args.len() == 2 {
+        let expr = function_arg_expr(&args[1], &format!("{fn_name}()"))?;
+        let raw = string_literal(&expr).ok_or_else(|| LixError {
+            message: format!("{fn_name}() encoding must be a single-quoted string literal"),
+        })?;
+        normalize_utf8_encoding(raw, fn_name)?
+    } else {
+        "UTF8".to_string()
+    };
+
+    Ok(Some(LixTextCodecCall {
+        value_expr,
+        encoding,
+    }))
+}
+
 pub(crate) fn function_name_matches(name: &ObjectName, expected: &str) -> bool {
     name.0
         .last()
@@ -152,5 +214,16 @@ fn string_literal(expr: &Expr) -> Option<&str> {
             ..
         }) => Some(value.as_str()),
         _ => None,
+    }
+}
+
+fn normalize_utf8_encoding(raw: &str, fn_name: &str) -> Result<String, LixError> {
+    let normalized = raw.trim().to_ascii_uppercase().replace('-', "");
+    if normalized == "UTF8" {
+        Ok("UTF8".to_string())
+    } else {
+        Err(LixError {
+            message: format!("{fn_name}() only supports UTF8 encoding, got '{raw}'"),
+        })
     }
 }

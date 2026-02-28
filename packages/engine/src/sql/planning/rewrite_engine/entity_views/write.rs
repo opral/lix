@@ -243,6 +243,7 @@ where
             ),
         });
     }
+    validate_insert_columns_known(target, &column_index)?;
 
     let entity_id_index =
         find_first_column_index(&column_index, &["entity_id", "lixcol_entity_id"]);
@@ -508,8 +509,12 @@ fn rewrite_update_with_target(
             });
         };
         let Some(terminal) = column_name.0.last().and_then(ObjectNamePart::as_ident) else {
-            rewritten_assignments.push(assignment);
-            continue;
+            return Err(LixError {
+                message: format!(
+                    "strict rewrite violation: entity view update unknown assignment target in {}",
+                    target.view_name
+                ),
+            });
         };
         let column = terminal.value.to_ascii_lowercase();
 
@@ -532,8 +537,12 @@ fn rewrite_update_with_target(
         }
 
         let Some(mapped) = rewrite_metadata_column_name(&column) else {
-            rewritten_assignments.push(assignment);
-            continue;
+            return Err(unknown_entity_view_column_error(
+                &target.view_name,
+                "update assignment",
+                terminal.value.as_str(),
+                Some(&property_names),
+            ));
         };
         if mapped == "schema_key" {
             return Err(LixError {
@@ -568,7 +577,15 @@ fn rewrite_update_with_target(
     let rewritten_selection = update
         .selection
         .take()
-        .map(|expr| rewrite_expression(expr, &property_names, dialect))
+        .map(|expr| {
+            rewrite_expression(
+                expr,
+                &property_names,
+                dialect,
+                &target.view_name,
+                "update WHERE",
+            )
+        })
         .transpose()?;
     update.selection = Some(append_entity_scope_predicate(
         rewritten_selection,
@@ -594,7 +611,15 @@ fn rewrite_delete_with_target(
     let rewritten_selection = delete
         .selection
         .take()
-        .map(|expr| rewrite_expression(expr, &property_names, dialect))
+        .map(|expr| {
+            rewrite_expression(
+                expr,
+                &property_names,
+                dialect,
+                &target.view_name,
+                "delete WHERE",
+            )
+        })
         .transpose()?;
     delete.selection = Some(append_entity_scope_predicate(
         rewritten_selection,
@@ -611,11 +636,18 @@ fn rewrite_expression(
     expr: Expr,
     property_names: &HashSet<String>,
     dialect: SqlDialect,
+    view_name: &str,
+    context: &str,
 ) -> Result<Expr, LixError> {
     Ok(match expr {
-        Expr::Identifier(ident) => {
-            rewrite_column_reference_expr(ident.value, None, property_names, dialect)?
-        }
+        Expr::Identifier(ident) => rewrite_column_reference_expr(
+            ident.value,
+            None,
+            property_names,
+            dialect,
+            view_name,
+            context,
+        )?,
         Expr::CompoundIdentifier(idents) => {
             let Some(terminal) = idents.last() else {
                 return Ok(Expr::CompoundIdentifier(idents));
@@ -633,31 +665,59 @@ fn rewrite_expression(
                 qualifier.as_deref(),
                 property_names,
                 dialect,
+                view_name,
+                context,
             )?
         }
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(rewrite_expression(*left, property_names, dialect)?),
+            left: Box::new(rewrite_expression(
+                *left,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             op,
-            right: Box::new(rewrite_expression(*right, property_names, dialect)?),
+            right: Box::new(rewrite_expression(
+                *right,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
         },
         Expr::UnaryOp { op, expr } => Expr::UnaryOp {
             op,
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
         },
         Expr::Nested(inner) => Expr::Nested(Box::new(rewrite_expression(
             *inner,
             property_names,
             dialect,
+            view_name,
+            context,
         )?)),
         Expr::InList {
             expr,
             list,
             negated,
         } => Expr::InList {
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             list: list
                 .into_iter()
-                .map(|item| rewrite_expression(item, property_names, dialect))
+                .map(|item| rewrite_expression(item, property_names, dialect, view_name, context))
                 .collect::<Result<Vec<_>, _>>()?,
             negated,
         },
@@ -666,7 +726,13 @@ fn rewrite_expression(
             subquery,
             negated,
         } => Expr::InSubquery {
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             subquery,
             negated,
         },
@@ -675,8 +741,20 @@ fn rewrite_expression(
             array_expr,
             negated,
         } => Expr::InUnnest {
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
-            array_expr: Box::new(rewrite_expression(*array_expr, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
+            array_expr: Box::new(rewrite_expression(
+                *array_expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             negated,
         },
         Expr::Between {
@@ -685,10 +763,28 @@ fn rewrite_expression(
             low,
             high,
         } => Expr::Between {
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             negated,
-            low: Box::new(rewrite_expression(*low, property_names, dialect)?),
-            high: Box::new(rewrite_expression(*high, property_names, dialect)?),
+            low: Box::new(rewrite_expression(
+                *low,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
+            high: Box::new(rewrite_expression(
+                *high,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
         },
         Expr::Like {
             negated,
@@ -699,8 +795,20 @@ fn rewrite_expression(
         } => Expr::Like {
             negated,
             any,
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
-            pattern: Box::new(rewrite_expression(*pattern, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
+            pattern: Box::new(rewrite_expression(
+                *pattern,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             escape_char,
         },
         Expr::ILike {
@@ -712,19 +820,35 @@ fn rewrite_expression(
         } => Expr::ILike {
             negated,
             any,
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
-            pattern: Box::new(rewrite_expression(*pattern, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
+            pattern: Box::new(rewrite_expression(
+                *pattern,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             escape_char,
         },
         Expr::IsNull(inner) => Expr::IsNull(Box::new(rewrite_expression(
             *inner,
             property_names,
             dialect,
+            view_name,
+            context,
         )?)),
         Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(rewrite_expression(
             *inner,
             property_names,
             dialect,
+            view_name,
+            context,
         )?)),
         Expr::Cast {
             kind,
@@ -733,7 +857,13 @@ fn rewrite_expression(
             format,
         } => Expr::Cast {
             kind,
-            expr: Box::new(rewrite_expression(*expr, property_names, dialect)?),
+            expr: Box::new(rewrite_expression(
+                *expr,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             data_type,
             format,
         },
@@ -745,7 +875,13 @@ fn rewrite_expression(
                         sqlparser::ast::FunctionArgExpr::Expr(expr),
                     ) = arg
                     {
-                        *expr = rewrite_expression(expr.clone(), property_names, dialect)?;
+                        *expr = rewrite_expression(
+                            expr.clone(),
+                            property_names,
+                            dialect,
+                            view_name,
+                            context,
+                        )?;
                     }
                 }
             }
@@ -757,9 +893,21 @@ fn rewrite_expression(
             right,
             is_some,
         } => Expr::AnyOp {
-            left: Box::new(rewrite_expression(*left, property_names, dialect)?),
+            left: Box::new(rewrite_expression(
+                *left,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             compare_op,
-            right: Box::new(rewrite_expression(*right, property_names, dialect)?),
+            right: Box::new(rewrite_expression(
+                *right,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             is_some,
         },
         Expr::AllOp {
@@ -767,9 +915,21 @@ fn rewrite_expression(
             compare_op,
             right,
         } => Expr::AllOp {
-            left: Box::new(rewrite_expression(*left, property_names, dialect)?),
+            left: Box::new(rewrite_expression(
+                *left,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
             compare_op,
-            right: Box::new(rewrite_expression(*right, property_names, dialect)?),
+            right: Box::new(rewrite_expression(
+                *right,
+                property_names,
+                dialect,
+                view_name,
+                context,
+            )?),
         },
         other => other,
     })
@@ -1152,6 +1312,8 @@ fn rewrite_column_reference_expr(
     qualifier: Option<&str>,
     property_names: &HashSet<String>,
     dialect: SqlDialect,
+    view_name: &str,
+    context: &str,
 ) -> Result<Expr, LixError> {
     let lower = column_name.to_ascii_lowercase();
     if property_names.contains(&lower) {
@@ -1178,13 +1340,14 @@ fn rewrite_column_reference_expr(
         }
         return Ok(Expr::Identifier(Ident::new(mapped)));
     }
-    if let Some(qualifier) = qualifier {
-        return Ok(Expr::CompoundIdentifier(vec![
-            Ident::new(qualifier),
-            Ident::new(column_name),
-        ]));
-    }
-    Ok(Expr::Identifier(Ident::new(column_name)))
+    Err(unknown_entity_view_column_error(
+        view_name,
+        context,
+        qualifier
+            .map(|prefix| format!("{prefix}.{column_name}"))
+            .unwrap_or(column_name),
+        Some(property_names),
+    ))
 }
 
 fn snapshot_column_reference_sql(qualifier: Option<&str>) -> String {
@@ -2105,6 +2268,115 @@ fn build_property_index(
         }
     }
     out
+}
+
+fn validate_insert_columns_known(
+    target: &EntityViewTarget,
+    columns: &HashMap<String, usize>,
+) -> Result<(), LixError> {
+    let property_set = target
+        .properties
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    for column in columns.keys() {
+        if property_set.contains(column) {
+            continue;
+        }
+        if is_known_insert_metadata_column(column) {
+            continue;
+        }
+        return Err(unknown_entity_view_column_error(
+            &target.view_name,
+            "insert column",
+            column.as_str(),
+            Some(&property_set),
+        ));
+    }
+    Ok(())
+}
+
+fn is_known_insert_metadata_column(column: &str) -> bool {
+    matches!(
+        column,
+        "entity_id"
+            | "lixcol_entity_id"
+            | "file_id"
+            | "lixcol_file_id"
+            | "plugin_key"
+            | "lixcol_plugin_key"
+            | "version_id"
+            | "lixcol_version_id"
+            | "metadata"
+            | "lixcol_metadata"
+            | "untracked"
+            | "lixcol_untracked"
+            | "schema_version"
+            | "lixcol_schema_version"
+            | "schema_key"
+            | "lixcol_schema_key"
+            | "snapshot_content"
+            | "lixcol_snapshot_content"
+    )
+}
+
+fn unknown_entity_view_column_error(
+    view_name: &str,
+    context: &str,
+    column: impl AsRef<str>,
+    property_names: Option<&HashSet<String>>,
+) -> LixError {
+    let mut allowed = vec![
+        "entity_id",
+        "lixcol_entity_id",
+        "schema_key",
+        "lixcol_schema_key",
+        "file_id",
+        "lixcol_file_id",
+        "version_id",
+        "lixcol_version_id",
+        "plugin_key",
+        "lixcol_plugin_key",
+        "snapshot_content",
+        "lixcol_snapshot_content",
+        "schema_version",
+        "lixcol_schema_version",
+        "metadata",
+        "lixcol_metadata",
+        "untracked",
+        "lixcol_untracked",
+        "created_at",
+        "lixcol_created_at",
+        "updated_at",
+        "lixcol_updated_at",
+        "change_id",
+        "lixcol_change_id",
+        "commit_id",
+        "lixcol_commit_id",
+        "root_commit_id",
+        "lixcol_root_commit_id",
+        "depth",
+        "lixcol_depth",
+        "inherited_from_version_id",
+        "lixcol_inherited_from_version_id",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    if let Some(property_names) = property_names {
+        allowed.extend(property_names.iter().cloned());
+    }
+    allowed.sort();
+    allowed.dedup();
+
+    LixError {
+        message: format!(
+            "strict rewrite violation: entity view '{view_name}' {context} references unknown column '{}'; allowed columns: {}",
+            column.as_ref(),
+            allowed.join(", ")
+        ),
+    }
 }
 
 fn find_first_column_index(columns: &HashMap<String, usize>, candidates: &[&str]) -> Option<usize> {
