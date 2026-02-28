@@ -11,6 +11,9 @@ use sqlparser::ast::{Visit, Visitor};
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Duration;
+
+const SQLITE_EXTERNAL_OBSERVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveQuery {
@@ -48,6 +51,8 @@ struct ObserveState {
     query: ObserveQuery,
     state_commits: StateCommitStream,
     last_result: Option<QueryResult>,
+    sqlite_external_polling: bool,
+    sqlite_last_data_version: Option<i64>,
     emitted_initial: bool,
     next_sequence: u64,
     closed: bool,
@@ -98,10 +103,50 @@ impl ObserveState {
             self.emitted_initial = true;
             let rows = execute_observe_query(engine, &self.query).await?;
             self.last_result = Some(rows.clone());
+            if self.sqlite_external_polling {
+                self.sqlite_last_data_version = Some(sqlite_data_version(engine).await?);
+            }
             return Ok(Some(self.make_event(rows, None)));
         }
 
         loop {
+            if self.sqlite_external_polling {
+                if let Some(batch) = self.state_commits.try_next() {
+                    let rows = execute_observe_query(engine, &self.query).await?;
+
+                    if self
+                        .last_result
+                        .as_ref()
+                        .is_some_and(|previous| *previous == rows)
+                    {
+                        continue;
+                    }
+
+                    self.last_result = Some(rows.clone());
+                    return Ok(Some(self.make_event(rows, Some(batch.sequence))));
+                }
+
+                observe_poll_sleep(SQLITE_EXTERNAL_OBSERVE_POLL_INTERVAL).await;
+                if self.closed {
+                    return Ok(None);
+                }
+                if !self.sqlite_data_version_advanced(engine).await? {
+                    continue;
+                }
+
+                let rows = execute_observe_query(engine, &self.query).await?;
+                if self
+                    .last_result
+                    .as_ref()
+                    .is_some_and(|previous| *previous == rows)
+                {
+                    continue;
+                }
+
+                self.last_result = Some(rows.clone());
+                return Ok(Some(self.make_event(rows, None)));
+            }
+
             let Some(batch) = self.state_commits.next().await else {
                 self.closed = true;
                 return Ok(None);
@@ -119,6 +164,17 @@ impl ObserveState {
 
             self.last_result = Some(rows.clone());
             return Ok(Some(self.make_event(rows, Some(batch.sequence))));
+        }
+    }
+
+    async fn sqlite_data_version_advanced(&mut self, engine: &Engine) -> Result<bool, LixError> {
+        let current = sqlite_data_version(engine).await?;
+        match self.sqlite_last_data_version {
+            Some(previous) if previous == current => Ok(false),
+            _ => {
+                self.sqlite_last_data_version = Some(current);
+                Ok(true)
+            }
         }
     }
 
@@ -191,10 +247,46 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
         query,
         state_commits,
         last_result: None,
+        sqlite_external_polling: engine.sql_dialect() == SqlDialect::Sqlite,
+        sqlite_last_data_version: None,
         emitted_initial: false,
         next_sequence: 0,
         closed: false,
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn observe_poll_sleep(duration: Duration) {
+    futures_timer::Delay::new(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn observe_poll_sleep(duration: Duration) {
+    let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
+    gloo_timers::future::TimeoutFuture::new(millis).await;
+}
+
+async fn sqlite_data_version(engine: &Engine) -> Result<i64, LixError> {
+    let result = engine
+        .execute_backend_sql("PRAGMA data_version", &[])
+        .await?;
+    let value = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .ok_or(LixError {
+            message: "failed to read sqlite data_version: pragma returned no rows".to_string(),
+        })?;
+    match value {
+        Value::Integer(value) => Ok(*value),
+        Value::Real(value) => Ok(*value as i64),
+        Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
+            message: format!("failed to parse sqlite data_version text: {error}"),
+        }),
+        other => Err(LixError {
+            message: format!("failed to parse sqlite data_version value: {other:?}"),
+        }),
+    }
 }
 
 #[derive(Default)]
