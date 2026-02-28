@@ -777,9 +777,7 @@ fn min_depth_by_commit(
     min_depth
 }
 
-fn latest_version_pointer_changes(
-    data: &LoadedData,
-) -> Vec<ChangeRecord> {
+fn latest_version_pointer_changes(data: &LoadedData) -> Vec<ChangeRecord> {
     let mut latest_by_entity: BTreeMap<String, ChangeRecord> = BTreeMap::new();
 
     for change in data.changes.values() {

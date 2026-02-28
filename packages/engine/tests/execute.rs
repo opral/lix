@@ -33,3 +33,39 @@ simulation_test!(explain_lix_state_query_works, |sim| async move {
         "EXPLAIN over lix_state should return a plan"
     );
 });
+
+simulation_test!(
+    dml_without_returning_returns_empty_public_rowset,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ('/contract-delete.md', lix_text_encode('hello'))",
+            &[],
+        )
+        .await
+        .expect("file insert should succeed");
+
+        let deleted = engine
+            .execute(
+                "DELETE FROM lix_file WHERE path = '/contract-delete.md'",
+                &[],
+            )
+            .await
+            .expect("delete should succeed");
+
+        assert!(
+            deleted.columns.is_empty(),
+            "DELETE without RETURNING must not expose internal columns"
+        );
+        assert!(
+            deleted.rows.is_empty(),
+            "DELETE without RETURNING must not expose internal rows"
+        );
+    }
+);

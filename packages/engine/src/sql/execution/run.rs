@@ -15,12 +15,13 @@ use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
 use super::super::contracts::planned_statement::MutationOperation;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
+use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
 use super::followup::{build_delete_followup_statements, build_update_followup_statements};
 
 pub(crate) struct SqlExecutionOutcome {
-    pub(crate) result: QueryResult,
+    pub(crate) public_result: QueryResult,
     pub(crate) postprocess_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) plugin_changes_committed: bool,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
@@ -45,7 +46,7 @@ pub(crate) async fn execute_plan_sql(
     let mut postprocess_file_cache_targets = BTreeSet::new();
     let mut plugin_changes_committed = false;
     let mut state_commit_stream_changes = Vec::new();
-    let result = match &plan.preprocess.postprocess {
+    let internal_result = match &plan.preprocess.postprocess {
         None => {
             let result =
                 execute_prepared_with_backend(engine.backend.as_ref(), &prepared_statements)
@@ -209,9 +210,10 @@ pub(crate) async fn execute_plan_sql(
             result
         }
     };
+    let public_result = public_result_from_contract(plan.result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {
-        result,
+        public_result,
         postprocess_file_cache_targets,
         plugin_changes_committed,
         state_commit_stream_changes,
@@ -243,7 +245,7 @@ pub(crate) async fn execute_plan_sql_with_transaction(
     let mut plugin_changes_committed = false;
     let mut state_commit_stream_changes = Vec::new();
 
-    let result = match &plan.preprocess.postprocess {
+    let internal_result = match &plan.preprocess.postprocess {
         None => {
             let result = execute_prepared_with_transaction(transaction, &prepared_statements)
                 .await
@@ -354,9 +356,10 @@ pub(crate) async fn execute_plan_sql_with_transaction(
             result
         }
     };
+    let public_result = public_result_from_contract(plan.result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {
-        result,
+        public_result,
         postprocess_file_cache_targets,
         plugin_changes_committed,
         state_commit_stream_changes,
@@ -377,4 +380,19 @@ pub(crate) async fn persist_runtime_sequence(
             functions,
         )
         .await
+}
+
+fn public_result_from_contract(
+    contract: ResultContract,
+    internal_result: &QueryResult,
+) -> QueryResult {
+    match contract {
+        ResultContract::DmlNoReturning => QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        },
+        ResultContract::Select | ResultContract::DmlReturning | ResultContract::Other => {
+            internal_result.clone()
+        }
+    }
 }

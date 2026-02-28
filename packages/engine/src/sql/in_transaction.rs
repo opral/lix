@@ -141,6 +141,6 @@ impl Engine {
         .await?;
 
         pending_state_commit_stream_changes.extend(state_commit_stream_changes);
-        Ok(execution.result)
+        Ok(execution.public_result)
     }
 }

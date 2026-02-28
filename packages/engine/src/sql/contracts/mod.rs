@@ -6,3 +6,4 @@ pub(crate) mod planner_error;
 pub(crate) mod postprocess_actions;
 pub(crate) mod prepared_statement;
 pub(crate) mod requirements;
+pub(crate) mod result_contract;

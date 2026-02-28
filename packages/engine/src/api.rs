@@ -170,7 +170,7 @@ impl Engine {
         )
         .await?;
 
-        Ok(execution.result)
+        Ok(execution.public_result)
     }
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
