@@ -154,9 +154,12 @@ impl WasmRuntime for WasmtimeRuntime {
             }));
         }
 
-        let compiled = Arc::new(Component::new(&self.engine, &bytes).map_err(|error| LixError {
-            message: format!("failed to compile wasm component: {error}"),
-        })?);
+        let compiled =
+            Arc::new(
+                Component::new(&self.engine, &bytes).map_err(|error| LixError {
+                    message: format!("failed to compile wasm component: {error}"),
+                })?,
+            );
 
         let component = {
             let mut cache = self
@@ -205,7 +208,9 @@ impl WasmComponentInstance for WasmtimeInstance {
             "detect-changes" | "api#detect-changes" => {
                 let request: WireDetectChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
-                        message: format!("failed to decode detect-changes request payload: {error}"),
+                        message: format!(
+                            "failed to decode detect-changes request payload: {error}"
+                        ),
                     })?;
 
                 let before = request.before.map(wire_file_to_binding);
@@ -236,7 +241,9 @@ impl WasmComponentInstance for WasmtimeInstance {
                             })
                             .collect::<Vec<_>>();
                         serde_json::to_vec(&wire).map_err(|error| LixError {
-                            message: format!("failed to encode detect-changes response payload: {error}"),
+                            message: format!(
+                                "failed to encode detect-changes response payload: {error}"
+                            ),
                         })
                     }
                     Err(error) => Err(map_plugin_error(error)),
