@@ -1342,6 +1342,36 @@ simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
 });
 
 simulation_test!(
+    filesystem_file_auto_id_insert_persists_data,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/auto-id-data.txt', 'HELLO WORLD')",
+                &[],
+            )
+            .await
+            .expect("insert with auto id should succeed");
+
+        let row = engine
+            .execute(
+                "SELECT id, data FROM lix_file WHERE path = '/auto-id-data.txt' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("read auto-id file should succeed");
+        assert_eq!(row.rows.len(), 1);
+        assert_non_empty_text(&row.rows[0][0]);
+        assert_blob_text(&row.rows[0][1], "HELLO WORLD");
+    }
+);
+
+simulation_test!(
     filesystem_hidden_defaults_and_explicit_true_writes,
     |sim| async move {
         let engine = sim

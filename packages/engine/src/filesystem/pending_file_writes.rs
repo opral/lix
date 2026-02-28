@@ -2,11 +2,12 @@ use crate::cel::CelEvaluator;
 #[cfg(test)]
 use crate::engine::sql::ast::utils::parse_sql_statements;
 use crate::engine::sql::ast::utils::{
-    bind_sql_with_state, resolve_expr_cell_with_state, resolve_values_rows, PlaceholderState,
-    ResolvedCell,
+    bind_sql_with_state, insert_values_rows_mut, resolve_expr_cell_with_state, resolve_values_rows,
+    PlaceholderState, ResolvedCell,
 };
 use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
@@ -14,10 +15,12 @@ use crate::version::{
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{
     Assignment, Expr, FromTable, ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
-    TableObject, Update,
+    TableObject, Update, Value as AstValue, ValueWithSpan,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
+
+const AUTO_FILE_ID_SENTINEL_PREFIX: &str = "lix_pending_auto_file_id::";
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFileWrite {
@@ -129,6 +132,51 @@ pub(crate) async fn collect_pending_file_writes_from_statements(
     })
 }
 
+pub(crate) fn ensure_file_insert_ids_for_data_writes<P: LixFunctionProvider>(
+    statements: &mut [Statement],
+    functions: &SharedFunctionProvider<P>,
+) -> Result<(), LixError> {
+    for statement in statements.iter_mut() {
+        let Statement::Insert(insert) = statement else {
+            continue;
+        };
+        if file_write_target_from_insert(&insert.table).is_none() {
+            continue;
+        }
+        let data_index = insert
+            .columns
+            .iter()
+            .position(|column| column.value.eq_ignore_ascii_case("data"));
+        let path_index = insert
+            .columns
+            .iter()
+            .position(|column| column.value.eq_ignore_ascii_case("path"));
+        let id_index = insert
+            .columns
+            .iter()
+            .position(|column| column.value.eq_ignore_ascii_case("id"));
+        if data_index.is_none() || path_index.is_none() || id_index.is_some() {
+            continue;
+        }
+
+        let current_column_count = insert.columns.len();
+        insert.columns.push("id".into());
+        let Some(rows) = insert_values_rows_mut(insert) else {
+            continue;
+        };
+        for row in rows.iter_mut() {
+            if row.len() != current_column_count {
+                return Err(LixError {
+                    message: "filesystem insert row length does not match column count".to_string(),
+                });
+            }
+            row.push(string_literal_expr(functions.call_uuid_v7()));
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn collect_pending_file_delete_targets_from_statements(
     backend: &dyn LixBackend,
     statements: &[Statement],
@@ -224,8 +272,7 @@ fn collect_insert_writes(
             || column.value.eq_ignore_ascii_case("version_id")
     });
 
-    let (Some(data_index), Some(id_index), Some(path_index)) = (data_index, id_index, path_index)
-    else {
+    let (Some(data_index), Some(path_index)) = (data_index, path_index) else {
         return Ok(());
     };
 
@@ -235,12 +282,12 @@ fn collect_insert_writes(
             continue;
         }
 
-        let Some(file_id) = resolved_cell_text(resolved_row.get(id_index)) else {
-            continue;
-        };
         let Some(path) = resolved_cell_text(resolved_row.get(path_index)) else {
             continue;
         };
+        let file_id = id_index
+            .and_then(|index| resolved_cell_text(resolved_row.get(index)))
+            .unwrap_or_else(|| unresolved_auto_file_id_for_path(&path));
         let Some(after_data) = resolved_cell_blob_or_text_bytes(resolved_row.get(data_index))
         else {
             continue;
@@ -271,6 +318,18 @@ fn collect_insert_writes(
     }
 
     Ok(())
+}
+
+fn unresolved_auto_file_id_for_path(path: &str) -> String {
+    format!("{AUTO_FILE_ID_SENTINEL_PREFIX}{path}")
+}
+
+pub(crate) fn unresolved_auto_file_path_from_id(file_id: &str) -> Option<&str> {
+    file_id.strip_prefix(AUTO_FILE_ID_SENTINEL_PREFIX)
+}
+
+fn string_literal_expr(value: String) -> Expr {
+    Expr::Value(ValueWithSpan::from(AstValue::SingleQuotedString(value)))
 }
 
 async fn collect_delete_writes(
