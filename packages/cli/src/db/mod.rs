@@ -15,7 +15,8 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
         return Ok(path.clone());
     }
 
-    let cwd = std::env::current_dir().map_err(|source| CliError::io("failed to read cwd", source))?;
+    let cwd =
+        std::env::current_dir().map_err(|source| CliError::io("failed to read cwd", source))?;
     let mut candidates = find_lix_files(&cwd)?;
 
     if candidates.is_empty() {
@@ -63,9 +64,11 @@ pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
 
 fn find_lix_files(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {
     let mut files = Vec::new();
-    let entries = fs::read_dir(cwd).map_err(|source| CliError::io("failed to read cwd entries", source))?;
+    let entries =
+        fs::read_dir(cwd).map_err(|source| CliError::io("failed to read cwd entries", source))?;
     for entry in entries {
-        let entry = entry.map_err(|source| CliError::io("failed to read directory entry", source))?;
+        let entry =
+            entry.map_err(|source| CliError::io("failed to read directory entry", source))?;
         let path = entry.path();
         if !path.is_file() {
             continue;

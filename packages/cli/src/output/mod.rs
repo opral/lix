@@ -1,6 +1,4 @@
-use comfy_table::{
-    Cell, ContentArrangement, Row, Table, presets::UTF8_BORDERS_ONLY,
-};
+use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, ContentArrangement, Row, Table};
 use lix_rs_sdk::{QueryResult, Value};
 use serde_json::Value as JsonValue;
 
@@ -21,7 +19,11 @@ pub fn print_query_result_table(result: &QueryResult) {
     }
 
     for row in &result.rows {
-        let rendered = Row::from(row.iter().map(|value| Cell::new(value_to_text(value))).collect::<Vec<_>>());
+        let rendered = Row::from(
+            row.iter()
+                .map(|value| Cell::new(value_to_text(value)))
+                .collect::<Vec<_>>(),
+        );
         table.add_row(rendered);
     }
 
@@ -34,7 +36,10 @@ pub fn print_query_result_json(result: &QueryResult) {
         "columns": result.columns,
         "rows": result.rows.iter().map(|row| row.iter().map(value_to_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
     });
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
 }
 
 fn value_to_text(value: &Value) -> String {
