@@ -95,7 +95,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/src/index.ts', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/src/index.ts', X'69676E6F726564')",
             &[],
         )
         .await
@@ -130,7 +130,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-autodir-1', '/docs/readme.md', 'ignored')",
+                 VALUES ('file-autodir-1', '/docs/readme.md', X'69676E6F726564')",
                 &[],
             )
             .await
@@ -167,7 +167,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-autodir-2', '/docs/guides/intro.md', 'ignored')",
+                 VALUES ('file-autodir-2', '/docs/guides/intro.md', X'69676E6F726564')",
                 &[],
             )
             .await
@@ -214,7 +214,7 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-2', '/src/readme.md', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-2', '/src/readme.md', X'69676E6F726564')",
             &[],
         )
         .await
@@ -235,7 +235,7 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
 
     engine
         .execute(
-            "UPDATE lix_file SET data = 'ignored-again' WHERE id = 'file-2'",
+            "UPDATE lix_file SET data = X'69676E6F7265642D616761696E' WHERE id = 'file-2'",
             &[],
         )
         .await
@@ -1302,6 +1302,130 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    file_insert_with_text_data_is_rejected,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-insert', '/bytes-text-insert.bin', 'HELLO WORLD')",
+                &[],
+            )
+            .await
+            .expect_err("text data insert should fail");
+        assert!(
+            err.message
+                .contains("data expects bytes; use X'HEX' or blob parameter"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    file_insert_with_blob_hex_data_succeeds,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-insert', '/bytes-hex-insert.bin', X'48454C4C4F20574F524C44')",
+                &[],
+            )
+            .await
+            .expect("hex data insert should succeed");
+
+        let row = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'bytes-hex-insert' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("read inserted hex data should succeed");
+        assert_eq!(row.rows.len(), 1);
+        assert_blob_text(&row.rows[0][0], "HELLO WORLD");
+    }
+);
+
+simulation_test!(
+    file_update_with_text_data_is_rejected,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-update', '/bytes-text-update.bin', X'00')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let err = engine
+            .execute(
+                "UPDATE lix_file SET data = 'HELLO WORLD' WHERE id = 'bytes-text-update'",
+                &[],
+            )
+            .await
+            .expect_err("text data update should fail");
+        assert!(
+            err.message
+                .contains("data expects bytes; use X'HEX' or blob parameter"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    file_update_with_blob_hex_data_succeeds,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-update', '/bytes-hex-update.bin', X'00')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file SET data = X'48454C4C4F20574F524C44' WHERE id = 'bytes-hex-update'",
+                &[],
+            )
+            .await
+            .expect("hex data update should succeed");
+
+        let row = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'bytes-hex-update' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("read updated hex data should succeed");
+        assert_eq!(row.rows.len(), 1);
+        assert_blob_text(&row.rows[0][0], "HELLO WORLD");
+    }
+);
+
 simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -1311,7 +1435,7 @@ simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_file (path, data) VALUES ('/auto-id.txt', 'ignored')",
+            "INSERT INTO lix_file (path, data) VALUES ('/auto-id.txt', X'69676E6F726564')",
             &[],
         )
         .await
@@ -1352,7 +1476,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/auto-id-data.txt', 'HELLO WORLD')",
+                "INSERT INTO lix_file (path, data) VALUES ('/auto-id-data.txt', X'48454C4C4F20574F524C44')",
                 &[],
             )
             .await
@@ -1382,7 +1506,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('hidden-file-default', '/hidden-default.json', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('hidden-file-default', '/hidden-default.json', X'69676E6F726564')",
             &[],
         )
         .await
@@ -1400,7 +1524,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data, hidden) \
-                 VALUES ('hidden-file-true', '/hidden-true.json', 'ignored', true)",
+                 VALUES ('hidden-file-true', '/hidden-true.json', X'69676E6F726564', true)",
                 &[],
             )
             .await

@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 const AUTO_FILE_ID_SENTINEL_PREFIX: &str = "lix_pending_auto_file_id::";
+const FILE_DATA_TYPE_ERROR: &str = "data expects bytes; use X'HEX' or blob parameter";
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFileWrite {
@@ -288,10 +289,11 @@ fn collect_insert_writes(
         let file_id = id_index
             .and_then(|index| resolved_cell_text(resolved_row.get(index)))
             .unwrap_or_else(|| unresolved_auto_file_id_for_path(&path));
-        let Some(after_data) = resolved_cell_blob_or_text_bytes(resolved_row.get(data_index))
-        else {
-            continue;
-        };
+        let after_data = resolved_cell_blob_bytes(resolved_row.get(data_index)).ok_or_else(|| {
+            LixError {
+                message: FILE_DATA_TYPE_ERROR.to_string(),
+            }
+        })?;
 
         let version_id = match target {
             FileWriteTarget::ActiveVersion => active_version_id.to_string(),
@@ -491,7 +493,7 @@ async fn collect_update_writes(
         };
         if column.eq_ignore_ascii_case("data") {
             saw_data_assignment = true;
-            if let Some(case_values) = resolve_case_assignment_text_or_blob_by_id(
+            if let Some(case_values) = resolve_case_assignment_blob_by_id(
                 &assignment.value,
                 "data",
                 params,
@@ -503,13 +505,10 @@ async fn collect_update_writes(
             }
             let resolved =
                 resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
-            assigned_after_data = resolved_cell_blob_or_text_bytes(Some(&resolved));
+            assigned_after_data = resolved_cell_blob_bytes(Some(&resolved));
             if assigned_after_data.is_none() {
                 return Err(LixError {
-                    message: format!(
-                        "unsupported file data update expression '{}': only literal/blob or bound placeholder values are supported",
-                        assignment.value
-                    ),
+                    message: FILE_DATA_TYPE_ERROR.to_string(),
                 });
             }
         } else if column.eq_ignore_ascii_case("path") {
@@ -1766,7 +1765,7 @@ fn assignment_target_name(assignment: &Assignment) -> Option<String> {
         .map(|ident| ident.value.clone())
 }
 
-fn resolve_case_assignment_text_or_blob_by_id(
+fn resolve_case_assignment_blob_by_id(
     expr: &sqlparser::ast::Expr,
     else_column_name: &str,
     params: &[Value],
@@ -1782,7 +1781,7 @@ fn resolve_case_assignment_text_or_blob_by_id(
             return Ok(None);
         };
         let value_cell = resolve_expr_cell_with_state(&when.result, params, placeholder_state)?;
-        let Some(value) = resolved_cell_blob_or_text_bytes(Some(&value_cell)) else {
+        let Some(value) = resolved_cell_blob_bytes(Some(&value_cell)) else {
             return Ok(None);
         };
         values.insert(key, value);
@@ -1921,9 +1920,9 @@ fn resolved_cell_text(cell: Option<&ResolvedCell>) -> Option<String> {
     }
 }
 
-fn resolved_cell_blob_or_text_bytes(cell: Option<&ResolvedCell>) -> Option<Vec<u8>> {
+fn resolved_cell_blob_bytes(cell: Option<&ResolvedCell>) -> Option<Vec<u8>> {
     cell.and_then(|entry| entry.value.as_ref())
-        .and_then(value_as_blob_or_text_bytes)
+        .and_then(value_as_blob_bytes)
 }
 
 fn value_as_text(value: &Value) -> Option<String> {
@@ -1937,6 +1936,13 @@ fn value_as_blob_or_text_bytes(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::Blob(bytes) => Some(bytes.clone()),
         Value::Text(text) => Some(text.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn value_as_blob_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Blob(bytes) => Some(bytes.clone()),
         _ => None,
     }
 }
