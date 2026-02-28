@@ -69,7 +69,9 @@ pub(crate) async fn materialization_plan_internal(
     let mut warnings = Vec::new();
 
     let all_commit_edges = build_all_commit_edges(&data, &mut stats);
-    let version_pointers = build_version_pointers(&data, &all_commit_edges, &mut stats);
+    let commit_causal_rank = build_commit_causal_rank(&data, &all_commit_edges);
+    let version_pointers =
+        build_version_pointers(&data, &all_commit_edges, &commit_causal_rank, &mut stats);
     let commit_graph = build_commit_graph(&version_pointers, &all_commit_edges, &mut stats);
 
     let latest_visible_state = build_latest_visible_state(
@@ -159,14 +161,32 @@ fn build_all_commit_edges(
 fn build_version_pointers(
     data: &LoadedData,
     all_commit_edges: &BTreeSet<(String, String)>,
+    commit_causal_rank: &BTreeMap<String, usize>,
     stats: &mut Vec<StageStat>,
 ) -> BTreeMap<String, Vec<String>> {
+    let latest_pointer_changes = latest_version_pointer_changes(data);
+
     let mut version_commits: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for tip in &data.version_pointers {
-        version_commits
-            .entry(tip.snapshot.id.clone())
-            .or_default()
-            .insert(tip.snapshot.commit_id.clone());
+    for change in &latest_pointer_changes {
+        let Some(snapshot_raw) = change.snapshot_content.as_deref() else {
+            // Tombstone pointer change: current pointer is deleted.
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<LixVersionPointer>(snapshot_raw) else {
+            continue;
+        };
+        if parsed.id.is_empty() || parsed.commit_id.is_empty() {
+            continue;
+        }
+        let commits = version_commits.entry(parsed.id.clone()).or_default();
+        commits.insert(parsed.commit_id.clone());
+        if let Some(working_commit_id) = parsed
+            .working_commit_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
+            commits.insert(working_commit_id.clone());
+        }
     }
 
     let mut tips = BTreeMap::new();
@@ -189,18 +209,13 @@ fn build_version_pointers(
         tip_set.sort();
 
         if tip_set.is_empty() {
-            // Fallback to the latest observed commit for this version.
-            if let Some(last) = data
-                .version_pointers
-                .iter()
-                .filter(|tip| tip.snapshot.id == *version_id)
-                .max_by(|a, b| {
-                    a.created_at
-                        .cmp(&b.created_at)
-                        .then_with(|| a.id.cmp(&b.id))
-                })
-            {
-                tip_set.push(last.snapshot.commit_id.clone());
+            // Fallback to the highest-ranked commit when all commits appear as non-tips.
+            if let Some(last) = commits.iter().max_by(|left, right| {
+                let left_rank = commit_causal_rank.get(*left).copied().unwrap_or(0);
+                let right_rank = commit_causal_rank.get(*right).copied().unwrap_or(0);
+                left_rank.cmp(&right_rank).then_with(|| left.cmp(right))
+            }) {
+                tip_set.push((*last).clone());
             }
         }
 
@@ -211,7 +226,7 @@ fn build_version_pointers(
 
     stats.push(StageStat {
         stage: "version_pointers".to_string(),
-        input_rows: data.version_pointers.len(),
+        input_rows: latest_pointer_changes.len(),
         output_rows: tips.values().map(|rows| rows.len()).sum(),
     });
 
@@ -762,22 +777,94 @@ fn min_depth_by_commit(
     min_depth
 }
 
-fn latest_version_pointer_changes(data: &LoadedData) -> Vec<ChangeRecord> {
+fn latest_version_pointer_changes(
+    data: &LoadedData,
+) -> Vec<ChangeRecord> {
     let mut latest_by_entity: BTreeMap<String, ChangeRecord> = BTreeMap::new();
+
     for change in data.changes.values() {
         if change.schema_key != "lix_version_pointer" {
             continue;
         }
         match latest_by_entity.get(&change.entity_id) {
-            Some(existing)
-                if existing.created_at > change.created_at
-                    || (existing.created_at == change.created_at && existing.id >= change.id) => {}
+            Some(existing) if !pointer_change_is_newer(change, existing) => {}
             _ => {
                 latest_by_entity.insert(change.entity_id.clone(), change.clone());
             }
         }
     }
+
     latest_by_entity.into_values().collect()
+}
+
+fn pointer_change_is_newer(candidate: &ChangeRecord, existing: &ChangeRecord) -> bool {
+    let candidate_seed = candidate.id.starts_with("seed~");
+    let existing_seed = existing.id.starts_with("seed~");
+    if candidate_seed != existing_seed {
+        return !candidate_seed;
+    }
+    if candidate.id != existing.id {
+        return candidate.id > existing.id;
+    }
+    candidate.created_at > existing.created_at
+}
+
+fn build_commit_causal_rank(
+    data: &LoadedData,
+    all_commit_edges: &BTreeSet<(String, String)>,
+) -> BTreeMap<String, usize> {
+    let mut parents_by_child = BTreeMap::<String, Vec<String>>::new();
+    for commit_id in data.commits.keys() {
+        parents_by_child.entry(commit_id.clone()).or_default();
+    }
+    for (parent_id, child_id) in all_commit_edges {
+        parents_by_child
+            .entry(child_id.clone())
+            .or_default()
+            .push(parent_id.clone());
+    }
+    for parents in parents_by_child.values_mut() {
+        parents.sort();
+        parents.dedup();
+    }
+
+    let mut memo = BTreeMap::<String, usize>::new();
+    for commit_id in data.commits.keys() {
+        let mut active = BTreeSet::new();
+        let _ = commit_causal_rank_for_commit(commit_id, &parents_by_child, &mut memo, &mut active);
+    }
+    memo
+}
+
+fn commit_causal_rank_for_commit(
+    commit_id: &str,
+    parents_by_child: &BTreeMap<String, Vec<String>>,
+    memo: &mut BTreeMap<String, usize>,
+    active: &mut BTreeSet<String>,
+) -> usize {
+    if let Some(rank) = memo.get(commit_id).copied() {
+        return rank;
+    }
+    if !active.insert(commit_id.to_string()) {
+        return 0;
+    }
+
+    let rank = match parents_by_child.get(commit_id) {
+        Some(parents) if !parents.is_empty() => {
+            1 + parents
+                .iter()
+                .map(|parent_id| {
+                    commit_causal_rank_for_commit(parent_id, parents_by_child, memo, active)
+                })
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 0,
+    };
+
+    active.remove(commit_id);
+    memo.insert(commit_id.to_string(), rank);
+    rank
 }
 
 fn build_change_commit_index(data: &LoadedData) -> BTreeMap<String, String> {

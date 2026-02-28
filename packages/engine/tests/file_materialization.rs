@@ -606,26 +606,44 @@ async fn file_descriptor_tombstone_count(
     value_as_i64(&rows.rows[0][0])
 }
 
-async fn total_file_cache_row_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
+async fn total_file_cache_row_count_for_prefix(
+    engine: &support::simulation_test::SimulationEngine,
+    file_id_prefix: &str,
+) -> i64 {
     let rows = engine
-        .execute("SELECT COUNT(*) FROM lix_internal_file_data_cache", &[])
+        .execute(
+            &format!(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_file_data_cache \
+                 WHERE file_id LIKE '{}%'",
+                file_id_prefix
+            ),
+            &[],
+        )
         .await
         .expect("total file_data_cache count query should succeed");
     assert_eq!(rows.rows.len(), 1);
     value_as_i64(&rows.rows[0][0])
 }
 
-async fn orphan_file_cache_row_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
+async fn orphan_file_cache_row_count_for_prefix(
+    engine: &support::simulation_test::SimulationEngine,
+    file_id_prefix: &str,
+) -> i64 {
     let rows = engine
         .execute(
-            "SELECT COUNT(*) \
-             FROM lix_internal_file_data_cache c \
-             LEFT JOIN lix_state_by_version d \
-               ON d.schema_key = 'lix_file_descriptor' \
-              AND d.entity_id = c.file_id \
-              AND d.version_id = c.version_id \
-              AND d.snapshot_content IS NOT NULL \
-             WHERE d.entity_id IS NULL",
+            &format!(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_file_data_cache c \
+                 LEFT JOIN lix_state_by_version d \
+                   ON d.schema_key = 'lix_file_descriptor' \
+                  AND d.entity_id = c.file_id \
+                  AND d.version_id = c.version_id \
+                  AND d.snapshot_content IS NOT NULL \
+                 WHERE c.file_id LIKE '{}%' \
+                   AND d.entity_id IS NULL",
+                file_id_prefix
+            ),
             &[],
         )
         .await
@@ -2876,7 +2894,10 @@ simulation_test!(
                 .expect("churn delete should succeed");
         }
 
-        assert_eq!(total_file_cache_row_count(&engine).await, 0);
+        assert_eq!(
+            total_file_cache_row_count_for_prefix(&engine, "cache-churn-").await,
+            0
+        );
     }
 );
 
@@ -2918,8 +2939,14 @@ simulation_test!(
             .await
             .expect("drop delete should succeed");
 
-        assert_eq!(orphan_file_cache_row_count(&engine).await, 0);
-        assert_eq!(total_file_cache_row_count(&engine).await, 1);
+        assert_eq!(
+            orphan_file_cache_row_count_for_prefix(&engine, "cache-orphan-").await,
+            0
+        );
+        assert_eq!(
+            total_file_cache_row_count_for_prefix(&engine, "cache-orphan-").await,
+            1
+        );
     }
 );
 

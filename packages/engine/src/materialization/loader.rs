@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::builtin_schema::types::{
-    LixCommit, LixCommitEdge, LixVersionDescriptor, LixVersionPointer,
-};
+use crate::builtin_schema::types::{LixCommit, LixCommitEdge, LixVersionDescriptor};
 
 use crate::{LixBackend, LixError, Value};
 
@@ -28,21 +26,6 @@ pub(crate) struct CommitRecord {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct VersionPointerRecord {
-    pub id: String,
-    pub snapshot: LixVersionPointer,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct VersionPointerLatestChange {
-    id: String,
-    entity_id: String,
-    snapshot_content: Option<String>,
-    created_at: String,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct VersionDescriptorRecord {
     pub id: String,
     pub entity_id: String,
@@ -61,7 +44,6 @@ pub(crate) struct CommitEdgeRecord {
 pub(crate) struct LoadedData {
     pub changes: BTreeMap<String, ChangeRecord>,
     pub commits: BTreeMap<String, CommitRecord>,
-    pub version_pointers: Vec<VersionPointerRecord>,
     pub version_descriptors: BTreeMap<String, VersionDescriptorRecord>,
     pub commit_edges: Vec<CommitEdgeRecord>,
 }
@@ -74,9 +56,6 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
 
     let mut changes = BTreeMap::new();
     let mut commits = BTreeMap::new();
-    let mut version_pointers = Vec::new();
-    let mut latest_version_pointer_by_entity: BTreeMap<String, VersionPointerLatestChange> =
-        BTreeMap::new();
     let mut version_descriptors = BTreeMap::new();
     let mut commit_edges = Vec::new();
 
@@ -123,13 +102,6 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         }
 
         if schema_key == "lix_version_pointer" {
-            let candidate = VersionPointerLatestChange {
-                id: id.clone(),
-                entity_id: entity_id.clone(),
-                snapshot_content: snapshot_content.clone(),
-                created_at: created_at.clone(),
-            };
-            upsert_latest_version_pointer_change(&mut latest_version_pointer_by_entity, candidate);
             continue;
         }
 
@@ -163,29 +135,6 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
         }
     }
 
-    for latest in latest_version_pointer_by_entity.into_values() {
-        let Some(snapshot_raw) = latest.snapshot_content.as_deref() else {
-            // Tombstone (NULL snapshot): this version pointer is currently deleted.
-            continue;
-        };
-        if let Some(snapshot) = parse_version_pointer_snapshot(snapshot_raw)? {
-            version_pointers.push(VersionPointerRecord {
-                id: latest.id,
-                snapshot,
-                created_at: latest.created_at,
-            });
-        }
-    }
-
-    version_pointers.sort_by(|a, b| {
-        a.snapshot
-            .id
-            .cmp(&b.snapshot.id)
-            .then_with(|| a.snapshot.commit_id.cmp(&b.snapshot.commit_id))
-            .then_with(|| b.created_at.cmp(&a.created_at))
-            .then_with(|| b.id.cmp(&a.id))
-    });
-
     commit_edges.sort_by(|a, b| {
         a.snapshot
             .parent_id
@@ -198,25 +147,9 @@ pub(crate) async fn load_data(backend: &dyn LixBackend) -> Result<LoadedData, Li
     Ok(LoadedData {
         changes,
         commits,
-        version_pointers,
         version_descriptors,
         commit_edges,
     })
-}
-
-fn upsert_latest_version_pointer_change(
-    target: &mut BTreeMap<String, VersionPointerLatestChange>,
-    candidate: VersionPointerLatestChange,
-) {
-    match target.get(&candidate.entity_id) {
-        Some(existing)
-            if existing.created_at > candidate.created_at
-                || (existing.created_at == candidate.created_at && existing.id >= candidate.id) => {
-        }
-        _ => {
-            target.insert(candidate.entity_id.clone(), candidate);
-        }
-    }
 }
 
 fn upsert_latest_by_entity<T, F>(target: &mut BTreeMap<String, T>, candidate: T, key: F)
@@ -277,18 +210,6 @@ fn parse_commit_snapshot(raw: &str) -> Result<Option<LixCommit>, LixError> {
     parsed.author_account_ids.retain(|value| !value.is_empty());
     parsed.meta_change_ids.retain(|value| !value.is_empty());
     Ok(Some(parsed))
-}
-
-fn parse_version_pointer_snapshot(raw: &str) -> Result<Option<LixVersionPointer>, LixError> {
-    let parsed: LixVersionPointer = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("materialization: invalid lix_version_pointer snapshot JSON: {error}"),
-    })?;
-
-    if parsed.id.is_empty() || parsed.commit_id.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(parsed))
-    }
 }
 
 fn parse_version_descriptor_snapshot(raw: &str) -> Result<Option<LixVersionDescriptor>, LixError> {
