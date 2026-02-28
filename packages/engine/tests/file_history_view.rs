@@ -261,7 +261,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-data', '/history-data.json', '{\"value\":\"v0\"}')",
+                 VALUES ('history-data', '/history-data.json', lix_text_encode('{\"value\":\"v0\"}'))",
                 &[],
             )
             .await
@@ -271,7 +271,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"value\":\"v1\"}' \
+                 SET data = lix_text_encode('{\"value\":\"v1\"}') \
                  WHERE id = 'history-data'",
                 &[],
             )
@@ -334,7 +334,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-ordered-depth', '/config.json', '{\"name\":\"My Project\",\"version\":\"1.0.0\"}')",
+                 VALUES ('history-ordered-depth', '/config.json', lix_text_encode('{\"name\":\"My Project\",\"version\":\"1.0.0\"}'))",
                 &[],
             )
             .await
@@ -344,7 +344,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"name\":\"My Cool Project\",\"version\":\"1.1.0\"}' \
+                 SET data = lix_text_encode('{\"name\":\"My Cool Project\",\"version\":\"1.1.0\"}') \
                  WHERE id = 'history-ordered-depth'",
                 &[],
             )
@@ -397,7 +397,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-cache', '/history-cache.json', '{\"value\":\"before\"}')",
+                 VALUES ('history-cache', '/history-cache.json', lix_text_encode('{\"value\":\"before\"}'))",
                 &[],
             )
             .await
@@ -406,7 +406,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"value\":\"after\"}' \
+                 SET data = lix_text_encode('{\"value\":\"after\"}') \
                  WHERE id = 'history-cache'",
                 &[],
             )
@@ -478,7 +478,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-path', '/docs/a.json', '{\"value\":\"v0\"}')",
+                 VALUES ('history-path', '/docs/a.json', lix_text_encode('{\"value\":\"v0\"}'))",
                 &[],
             )
             .await
@@ -563,7 +563,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-dir-rename-file', '/docs/readme.json', '{\"content\":\"hello\"}')",
+                 VALUES ('history-dir-rename-file', '/docs/readme.json', lix_text_encode('{\"content\":\"hello\"}'))",
                 &[],
             )
             .await
@@ -690,7 +690,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-dir-move-file', '/docs/guides/intro.json', '{\"note\":\"move\"}')",
+                 VALUES ('history-dir-move-file', '/docs/guides/intro.json', lix_text_encode('{\"note\":\"move\"}'))",
                 &[],
             )
             .await
@@ -840,7 +840,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-live', '/history-live.json', '{\"value\":\"old\"}')",
+                 VALUES ('history-live', '/history-live.json', lix_text_encode('{\"value\":\"old\"}'))",
                 &[],
             )
             .await
@@ -849,7 +849,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"value\":\"new\"}' \
+                 SET data = lix_text_encode('{\"value\":\"new\"}') \
                  WHERE id = 'history-live'",
                 &[],
             )
@@ -859,7 +859,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"value\":\"newer\"}' \
+                 SET data = lix_text_encode('{\"value\":\"newer\"}') \
                  WHERE id = 'history-live'",
                 &[],
             )
@@ -931,7 +931,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-partial', '/history-partial.json', '{\"name\":\"test-item\",\"value\":100}')",
+                 VALUES ('history-partial', '/history-partial.json', lix_text_encode('{\"name\":\"test-item\",\"value\":100}'))",
                 &[],
             )
             .await
@@ -941,7 +941,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"name\":\"test-item\",\"value\":105}' \
+                 SET data = lix_text_encode('{\"name\":\"test-item\",\"value\":105}') \
                  WHERE id = 'history-partial'",
                 &[],
             )
@@ -1045,7 +1045,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-mixed-change-id', '/document.json', '{\"title\":\"Original Title\",\"content\":\"Original content\"}')",
+                 VALUES ('history-mixed-change-id', '/document.json', lix_text_encode('{\"title\":\"Original Title\",\"content\":\"Original content\"}'))",
                 &[],
             )
             .await
@@ -1054,7 +1054,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"title\":\"Updated Title\",\"content\":\"Updated content\"}' \
+                 SET data = lix_text_encode('{\"title\":\"Updated Title\",\"content\":\"Updated content\"}') \
                  WHERE id = 'history-mixed-change-id'",
                 &[],
             )
@@ -1174,7 +1174,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-lixcol-file', '/history-lixcol-file.json', '{\"value\":\"x\"}')",
+                 VALUES ('history-lixcol-file', '/history-lixcol-file.json', lix_text_encode('{\"value\":\"x\"}'))",
                 &[],
             )
             .await

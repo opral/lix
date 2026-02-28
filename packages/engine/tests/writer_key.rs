@@ -57,7 +57,7 @@ simulation_test!(
 
         engine
             .execute_with_options(
-                "INSERT INTO lix_file (id, path, data) VALUES ('wk-file-1', '/wk-file-1.json', 'ignored')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-file-1', '/wk-file-1.json', lix_text_encode('ignored'))",
                 &[],
                 ExecuteOptions {
                     writer_key: Some("editor:single".to_string()),
@@ -114,12 +114,12 @@ simulation_test!(
                 |tx| {
                     Box::pin(async move {
                         tx.execute(
-                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-1', '/wk-tx-1.json', 'ignored')",
+                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-1', '/wk-tx-1.json', lix_text_encode('ignored'))",
                             &[],
                         )
                         .await?;
                         tx.execute(
-                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-2', '/wk-tx-2.json', 'ignored')",
+                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-2', '/wk-tx-2.json', lix_text_encode('ignored'))",
                             &[],
                         )
                         .await?;
@@ -165,7 +165,7 @@ simulation_test!(
 
         engine
             .execute_with_options(
-                "INSERT INTO lix_file (id, path, data) VALUES ('wk-clear-update', '/wk-clear-update.json', 'before')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-clear-update', '/wk-clear-update.json', lix_text_encode('before'))",
                 &[],
                 ExecuteOptions {
                     writer_key: Some("editor:initial".to_string()),
@@ -216,7 +216,7 @@ simulation_test!(
 
         engine
             .execute_with_options(
-                "INSERT INTO lix_file (id, path, data) VALUES ('wk-clear-delete', '/wk-clear-delete.json', 'before')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-clear-delete', '/wk-clear-delete.json', lix_text_encode('before'))",
                 &[],
                 ExecuteOptions {
                     writer_key: Some("editor:initial".to_string()),
@@ -269,7 +269,7 @@ simulation_test!(
                 |tx| {
                     Box::pin(async move {
                         tx.execute(
-                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-rolled-back', '/wk-rolled-back.json', 'ignored')",
+                            "INSERT INTO lix_file (id, path, data) VALUES ('wk-rolled-back', '/wk-rolled-back.json', lix_text_encode('ignored'))",
                             &[],
                         )
                         .await?;
@@ -310,7 +310,7 @@ simulation_test!(
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-cache', '/wk-tx-cache.json', 'before')",
+                        "INSERT INTO lix_file (id, path, data) VALUES ('wk-tx-cache', '/wk-tx-cache.json', lix_text_encode('before'))",
                         &[],
                     )
                     .await?;
@@ -324,7 +324,7 @@ simulation_test!(
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE lix_file SET data = 'after' WHERE id = 'wk-tx-cache'",
+                        "UPDATE lix_file SET data = lix_text_encode('after') WHERE id = 'wk-tx-cache'",
                         &[],
                     )
                     .await?;
@@ -369,7 +369,7 @@ simulation_test!(
 
         engine
             .execute_with_options(
-                "INSERT INTO lix_file (id, path, data) VALUES ('wk-update-writer', '/wk-update-writer.json', 'ignored')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('wk-update-writer', '/wk-update-writer.json', lix_text_encode('ignored'))",
                 &[],
                 ExecuteOptions {
                     writer_key: Some("editor:initial".to_string()),

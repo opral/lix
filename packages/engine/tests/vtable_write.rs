@@ -707,23 +707,9 @@ simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
 
     engine
         .execute(
-            "CREATE TABLE source_rows (entity_id TEXT, payload TEXT)",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    engine
-        .execute(
-            "INSERT INTO source_rows (entity_id, payload) VALUES ('entity-1', '{\"key\":\"from-select\"}')",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    engine
-        .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT entity_id, $1, $2, $3, $4, payload, $5 FROM source_rows",
+            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
+             SELECT entity_id, $1, $2, $3, $4, payload, $5 \
+             FROM (SELECT 'entity-1' AS entity_id, '{\"key\":\"from-select\"}' AS payload) source_rows",
             &[
                 Value::Text("test_schema".to_string()),
                 Value::Text("file-1".to_string()),
@@ -761,17 +747,11 @@ simulation_test!(tracked_insert_select_zero_rows_is_noop, |sim| async move {
     engine.init().await.unwrap();
     register_test_schema(&engine).await;
 
-    engine
-        .execute(
-            "CREATE TABLE source_rows (entity_id TEXT, payload TEXT)",
-            &[],
-        )
-        .await
-        .unwrap();
-
     let result = engine
         .execute(
-            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) SELECT entity_id, $1, $2, $3, $4, payload, $5 FROM source_rows",
+            "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
+             SELECT entity_id, $1, $2, $3, $4, payload, $5 \
+             FROM (SELECT 'entity-1' AS entity_id, '{\"key\":\"from-select\"}' AS payload WHERE 0 = 1) source_rows",
             &[
                 Value::Text("test_schema".to_string()),
                 Value::Text("file-1".to_string()),

@@ -289,11 +289,11 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('file-2-expr', '/src/readme.md', 'ignored')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-2-expr', '/src/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
-            .unwrap();
+            .expect("seed insert should succeed");
 
         let err = engine
             .execute(
@@ -304,7 +304,10 @@ simulation_test!(
             .expect_err("data expression updates should fail fast");
         assert!(
             err.message
-                .contains("unsupported file data update expression"),
+                .contains("unsupported file data update expression")
+                || err
+                    .message
+                    .contains("data expects bytes; use X'HEX' or blob parameter"),
             "unexpected error: {}",
             err.message
         );
@@ -373,7 +376,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-cascade-1', '/docs/guides/intro.md', 'ignored')",
+                 VALUES ('file-cascade-1', '/docs/guides/intro.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -438,7 +441,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-cascade-param', '/docs/guides/intro.md', 'ignored')",
+                 VALUES ('file-cascade-param', '/docs/guides/intro.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -547,7 +550,7 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-id-immutable', '/immutable.json', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-id-immutable', '/immutable.json', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -570,7 +573,7 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-             VALUES ('file-id-immutable-by-version', '/immutable-by-version.json', 'ignored', $1)",
+             VALUES ('file-id-immutable-by-version', '/immutable-by-version.json', lix_text_encode('ignored'), $1)",
             &[Value::Text(version_id.clone())],
         )
         .await
@@ -762,7 +765,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .execute(
             &format!(
                 "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                 VALUES ('file-shared', '/shared/config.json', 'ignored', '{version_a}')",
+                 VALUES ('file-shared', '/shared/config.json', lix_text_encode('ignored'), '{version_a}')",
                 version_a = version_a_sql
             ),
             &[],
@@ -774,7 +777,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .execute(
             &format!(
                 "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                 VALUES ('file-shared', '/shared/config.json', 'ignored', '{version_b}')",
+                 VALUES ('file-shared', '/shared/config.json', lix_text_encode('ignored'), '{version_b}')",
                 version_b = version_b_sql
             ),
             &[],
@@ -786,7 +789,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .execute(
             &format!(
                 "UPDATE lix_file_by_version \
-                 SET path = '/shared/config-renamed.json', data = 'ignored-again' \
+                 SET path = '/shared/config-renamed.json', data = lix_text_encode('ignored-again') \
                  WHERE id = 'file-shared' AND lixcol_version_id = '{version_b}'",
                 version_b = version_b_sql
             ),
@@ -875,7 +878,7 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
     let insert_err = engine
         .execute(
             "INSERT INTO lix_file_by_version (id, path, data) \
-             VALUES ('missing-version', '/missing.json', 'ignored')",
+             VALUES ('missing-version', '/missing.json', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -890,7 +893,7 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-             VALUES ('needs-version-predicate', '/needs-version.json', 'ignored', $1)",
+             VALUES ('needs-version-predicate', '/needs-version.json', lix_text_encode('ignored'), $1)",
             &[Value::Text(version_id.clone())],
         )
         .await
@@ -1224,7 +1227,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-mixed', '/mixed.json', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-mixed', '/mixed.json', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -1244,7 +1247,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-             SET data = 'ignored-again', metadata = '{\"owner\":\"sam\"}' \
+             SET data = lix_text_encode('ignored-again'), metadata = '{\"owner\":\"sam\"}' \
              WHERE id = 'file-mixed'",
                 &[],
             )
@@ -1302,41 +1305,36 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    file_insert_with_text_data_is_rejected,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
 
-        let err = engine
+    let err = engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-insert', '/bytes-text-insert.bin', 'HELLO WORLD')",
                 &[],
             )
             .await
             .expect_err("text data insert should fail");
-        assert!(
-            err.message
-                .contains("data expects bytes; use X'HEX' or blob parameter"),
-            "unexpected error: {}",
-            err.message
-        );
-    }
-);
+    assert!(
+        err.message
+            .contains("data expects bytes; use X'HEX' or blob parameter"),
+        "unexpected error: {}",
+        err.message
+    );
+});
 
-simulation_test!(
-    file_insert_with_blob_hex_data_succeeds,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
 
-        engine
+    engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-insert', '/bytes-hex-insert.bin', X'48454C4C4F20574F524C44')",
                 &[],
@@ -1344,28 +1342,25 @@ simulation_test!(
             .await
             .expect("hex data insert should succeed");
 
-        let row = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'bytes-hex-insert' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("read inserted hex data should succeed");
-        assert_eq!(row.rows.len(), 1);
-        assert_blob_text(&row.rows[0][0], "HELLO WORLD");
-    }
-);
+    let row = engine
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'bytes-hex-insert' LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("read inserted hex data should succeed");
+    assert_eq!(row.rows.len(), 1);
+    assert_blob_text(&row.rows[0][0], "HELLO WORLD");
+});
 
-simulation_test!(
-    file_update_with_text_data_is_rejected,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
 
-        engine
+    engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-update', '/bytes-text-update.bin', X'00')",
                 &[],
@@ -1373,32 +1368,29 @@ simulation_test!(
             .await
             .expect("seed insert should succeed");
 
-        let err = engine
-            .execute(
-                "UPDATE lix_file SET data = 'HELLO WORLD' WHERE id = 'bytes-text-update'",
-                &[],
-            )
-            .await
-            .expect_err("text data update should fail");
-        assert!(
-            err.message
-                .contains("data expects bytes; use X'HEX' or blob parameter"),
-            "unexpected error: {}",
-            err.message
-        );
-    }
-);
+    let err = engine
+        .execute(
+            "UPDATE lix_file SET data = 'HELLO WORLD' WHERE id = 'bytes-text-update'",
+            &[],
+        )
+        .await
+        .expect_err("text data update should fail");
+    assert!(
+        err.message
+            .contains("data expects bytes; use X'HEX' or blob parameter"),
+        "unexpected error: {}",
+        err.message
+    );
+});
 
-simulation_test!(
-    file_update_with_blob_hex_data_succeeds,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
 
-        engine
+    engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-update', '/bytes-hex-update.bin', X'00')",
                 &[],
@@ -1406,25 +1398,24 @@ simulation_test!(
             .await
             .expect("seed insert should succeed");
 
-        engine
-            .execute(
-                "UPDATE lix_file SET data = X'48454C4C4F20574F524C44' WHERE id = 'bytes-hex-update'",
-                &[],
-            )
-            .await
-            .expect("hex data update should succeed");
+    engine
+        .execute(
+            "UPDATE lix_file SET data = X'48454C4C4F20574F524C44' WHERE id = 'bytes-hex-update'",
+            &[],
+        )
+        .await
+        .expect("hex data update should succeed");
 
-        let row = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'bytes-hex-update' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("read updated hex data should succeed");
-        assert_eq!(row.rows.len(), 1);
-        assert_blob_text(&row.rows[0][0], "HELLO WORLD");
-    }
-);
+    let row = engine
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'bytes-hex-update' LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("read updated hex data should succeed");
+    assert_eq!(row.rows.len(), 1);
+    assert_blob_text(&row.rows[0][0], "HELLO WORLD");
+});
 
 simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
     let engine = sim
@@ -1669,7 +1660,7 @@ simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-dup-a', '/docs/readme.md', 'ignored')",
+             VALUES ('file-dup-a', '/docs/readme.md', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -1678,7 +1669,7 @@ simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
     let err = engine
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-dup-b', '/docs/readme.md', 'ignored')",
+             VALUES ('file-dup-b', '/docs/readme.md', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -1707,7 +1698,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-readme', '/readme.md', 'ignored')",
+                 VALUES ('file-parent-readme', '/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1727,7 +1718,7 @@ simulation_test!(
         let err = engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-child-readme', '/readme.md', 'ignored')",
+                 VALUES ('file-child-readme', '/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1757,7 +1748,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-docs-readme', '/docs/readme.md', 'ignored')",
+                 VALUES ('file-parent-docs-readme', '/docs/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1777,7 +1768,7 @@ simulation_test!(
         let err = engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-child-docs-readme', '/docs/readme.md', 'ignored')",
+                 VALUES ('file-child-docs-readme', '/docs/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1807,7 +1798,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-readme-tombstone', '/readme.md', 'ignored')",
+                 VALUES ('file-parent-readme-tombstone', '/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1844,7 +1835,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-child-readme-tombstone', '/readme.md', 'ignored')",
+                 VALUES ('file-child-readme-tombstone', '/readme.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1864,6 +1855,171 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_delete_by_path_clause_succeeds,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-delete-by-path-repro', '/delete-by-path-repro.md', X'41')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        engine
+            .execute(
+                "DELETE FROM lix_file WHERE path = '/delete-by-path-repro.md'",
+                &[],
+            )
+            .await
+            .expect("delete by path should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT COUNT(*) FROM lix_file WHERE id = 'file-delete-by-path-repro'",
+                &[],
+            )
+            .await
+            .expect("count query should succeed");
+        assert_eq!(rows.rows.len(), 1);
+        assert_integer(&rows.rows[0][0], 0);
+    }
+);
+
+simulation_test!(
+    file_by_version_delete_with_explicit_version_predicate_succeeds_when_no_rows_match,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "DELETE FROM lix_file_by_version \
+                 WHERE lixcol_version_id = 'global' \
+                   AND id = 'does-not-exist'",
+                &[],
+            )
+            .await
+            .expect(
+                "delete with explicit version predicate should succeed even when no rows match",
+            );
+    }
+);
+
+simulation_test!(
+    file_update_by_path_clause_succeeds,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-update-by-path-repro', '/update-by-path-old.md', X'41')",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/update-by-path-new.md' \
+                 WHERE path = '/update-by-path-old.md'",
+                &[],
+            )
+            .await
+            .expect("update by path should succeed");
+
+        let old_rows = engine
+            .execute(
+                "SELECT COUNT(*) FROM lix_file WHERE path = '/update-by-path-old.md'",
+                &[],
+            )
+            .await
+            .expect("old path count query should succeed");
+        assert_eq!(old_rows.rows.len(), 1);
+        assert_integer(&old_rows.rows[0][0], 0);
+
+        let new_rows = engine
+            .execute(
+                "SELECT COUNT(*) FROM lix_file WHERE path = '/update-by-path-new.md'",
+                &[],
+            )
+            .await
+            .expect("new path count query should succeed");
+        assert_eq!(new_rows.rows.len(), 1);
+        assert_integer(&new_rows.rows[0][0], 1);
+    }
+);
+
+simulation_test!(
+    file_update_rejects_unknown_assignment_column,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute(
+                "UPDATE lix_file SET bogus = 'x' WHERE path = '/no-file.md'",
+                &[],
+            )
+            .await
+            .expect_err("update with unknown assignment should fail");
+        assert!(
+            err.message.contains("strict rewrite violation")
+                && err.message.contains("unknown column")
+                && err.message.contains("bogus"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    file_delete_rejects_unknown_where_column,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute("DELETE FROM lix_file WHERE bogus = 'x'", &[])
+            .await
+            .expect_err("delete with unknown predicate should fail");
+        assert!(
+            err.message.contains("strict rewrite violation")
+                && err.message.contains("unknown column")
+                && err.message.contains("bogus"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
     file_path_update_to_inherited_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
@@ -1879,7 +2035,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-a', '/docs/a.md', 'ignored')",
+                 VALUES ('file-parent-a', '/docs/a.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1899,7 +2055,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-child-b', '/docs/b.md', 'ignored')",
+                 VALUES ('file-child-b', '/docs/b.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1933,7 +2089,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('root-readme', '/readme.md', 'root')",
+                 VALUES ('root-readme', '/readme.md', lix_text_encode('root'))",
                 &[],
             )
             .await
@@ -1942,7 +2098,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('nested-readme', '/docs/readme.md', 'nested')",
+                 VALUES ('nested-readme', '/docs/readme.md', lix_text_encode('nested'))",
                 &[],
             )
             .await
@@ -1972,7 +2128,7 @@ simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-path-a', '/docs/a.md', 'ignored')",
+             VALUES ('file-path-a', '/docs/a.md', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -1980,7 +2136,7 @@ simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-path-b', '/docs/b.md', 'ignored')",
+             VALUES ('file-path-b', '/docs/b.md', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -2013,7 +2169,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-path-auto-dir', '/a.md', 'ignored')",
+                 VALUES ('file-path-auto-dir', '/a.md', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -2210,7 +2366,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-tombstone-fast-path', '/src/tombstone.md', 'seed')",
+                 VALUES ('file-tombstone-fast-path', '/src/tombstone.md', lix_text_encode('seed'))",
                 &[],
             )
             .await
@@ -2276,7 +2432,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-commit-id', '/commit-id.json', 'ignored')",
+             VALUES ('file-commit-id', '/commit-id.json', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -2320,7 +2476,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('switch-file', '/switch-a.json', 'ignored', '{version_a}')",
+                     VALUES ('switch-file', '/switch-a.json', lix_text_encode('ignored'), '{version_a}')",
                     version_a = version_a_sql,
                 ),
                 &[],
@@ -2331,7 +2487,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('switch-file', '/switch-b.json', 'ignored', '{version_b}')",
+                     VALUES ('switch-file', '/switch-b.json', lix_text_encode('ignored'), '{version_b}')",
                     version_b = version_b_sql,
                 ),
                 &[],
@@ -2418,7 +2574,7 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
 
     let file_err = engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('invalid-file', 'invalid-path', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('invalid-file', 'invalid-path', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -2458,7 +2614,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('lixcol-file', '/lixcol.json', 'ignored', '{\"tag\":\"file\"}')",
+             VALUES ('lixcol-file', '/lixcol.json', lix_text_encode('ignored'), '{\"tag\":\"file\"}')",
                 &[],
             )
             .await
@@ -2591,7 +2747,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('change-id-file', '/change-id.json', 'ignored')",
+            "INSERT INTO lix_file (id, path, data) VALUES ('change-id-file', '/change-id.json', lix_text_encode('ignored'))",
             &[],
         )
         .await
@@ -2639,7 +2795,7 @@ simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('metadata-change-file', '/metadata-change.json', 'ignored', '{\"owner\":\"a\"}')",
+             VALUES ('metadata-change-file', '/metadata-change.json', lix_text_encode('ignored'), '{\"owner\":\"a\"}')",
             &[],
         )
         .await
@@ -2700,7 +2856,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-             VALUES ('history-file', '/history.json', 'ignored')",
+             VALUES ('history-file', '/history.json', lix_text_encode('ignored'))",
                 &[],
             )
             .await
