@@ -54,9 +54,10 @@ pub(crate) fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bo
 pub(crate) fn should_invalidate_installed_plugins_cache_for_statements(
     statements: &[Statement],
 ) -> bool {
-    statements
-        .iter()
-        .any(|statement| statement_targets_table_name(statement, "lix_internal_plugin"))
+    statements.iter().any(|statement| {
+        statement_targets_table_name(statement, "lix_file")
+            || statement_targets_table_name(statement, "lix_file_by_version")
+    })
 }
 
 pub(crate) fn statement_targets_table_name(statement: &Statement, table_name: &str) -> bool {
