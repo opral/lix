@@ -17,13 +17,29 @@
 
 ---
 
-Lix is an **embeddable version control system**. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
+Lix is an embeddable version control system that enables Git-like features such as history, versions (branches), diffs, or blame for any file format.
 
-- **It's just a library** — Lix is a library you import. Get branching, diff, rollback in your existing stack
-- **Tracks semantic changes** — diffs, blame, and history are queryable via SQL
-- **Approval workflows for agents** — agents propose changes in isolated versions, humans review and merge
+**What makes Lix unique:**
 
-[How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
+- **Embeddable** - Works on top of your existing SQL database.
+- **Tracks deltas** - Changes are semantically tracked and queryable via SQL.
+- **Supports any file format** - Tracks changes in `.docx`, `.pdf`, `.json`, etc. via plugins.
+
+---
+
+[📖 How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
+
+---
+
+## Use cases 
+
+- **AI agent sandboxing** - Agents making changes to files can be tracked, diffed, and rolled back.
+- **Context management** - Knowing what changed and why for better humant/agent performance.  
+- **In-app version control** - Branching and merging, audit trails, embedded in applications.
+
+## When to use & not to use lix
+
+Use lix if your app or agent is modifying documents e.g. Word, PDFs, etc. Don't use lix if your main use case is not modifying documents, or the documents are on off generated artifacts that do not change.
 
 ## Getting started
 
