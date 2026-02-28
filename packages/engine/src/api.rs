@@ -12,6 +12,18 @@ impl Engine {
         self.state_commit_stream_bus.subscribe(filter)
     }
 
+    pub(crate) fn sql_dialect(&self) -> crate::SqlDialect {
+        self.backend.dialect()
+    }
+
+    pub(crate) async fn execute_backend_sql(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        self.backend.execute(sql, params).await
+    }
+
     pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
         self.state_commit_stream_bus.emit(changes);
     }

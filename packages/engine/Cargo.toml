@@ -50,6 +50,8 @@ harness = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
+futures-timer = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }
+gloo-timers = { version = "0.3", features = ["futures"] }

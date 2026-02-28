@@ -5,7 +5,7 @@ mod timestamp_shuffle;
 
 pub use materialization::materialization_simulation;
 pub use postgres::postgres_simulation;
-pub use sqlite::sqlite_simulation;
+pub use sqlite::{sqlite_backend_with_filename, sqlite_simulation};
 pub use timestamp_shuffle::timestamp_shuffle_simulation;
 
 use crate::support::simulation_test::Simulation;

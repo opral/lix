@@ -21,6 +21,10 @@ pub fn sqlite_simulation() -> Simulation {
     }
 }
 
+pub fn sqlite_backend_with_filename(filename: String) -> Box<dyn LixBackend + Send + Sync> {
+    Box::new(SqliteBackend::new(SqliteConfig { filename }))
+}
+
 struct SqliteBackend {
     config: SqliteConfig,
     pool: OnceCell<SqlitePool>,
