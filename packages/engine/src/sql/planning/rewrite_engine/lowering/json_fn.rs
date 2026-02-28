@@ -6,7 +6,7 @@ use sqlparser::ast::{
 
 use crate::backend::SqlDialect;
 use crate::engine::sql::planning::rewrite_engine::lowering::logical_fn::{
-    LixJsonCall, LixJsonExtractCall,
+    LixJsonCall, LixJsonExtractCall, LixTextCodecCall,
 };
 
 pub(crate) fn lower_lix_json_extract(call: &LixJsonExtractCall, dialect: SqlDialect) -> Expr {
@@ -36,6 +36,52 @@ pub(crate) fn lower_lix_empty_blob(dialect: SqlDialect) -> Expr {
             vec![
                 string_literal_expr("".to_string()),
                 string_literal_expr("hex".to_string()),
+            ],
+        ),
+    }
+}
+
+pub(crate) fn lower_lix_text_encode(call: &LixTextCodecCall, dialect: SqlDialect) -> Expr {
+    match dialect {
+        SqlDialect::Sqlite => Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(call.value_expr.clone()),
+            data_type: DataType::Blob(None),
+            format: None,
+        },
+        SqlDialect::Postgres => function_expr(
+            "convert_to",
+            vec![
+                Expr::Cast {
+                    kind: CastKind::Cast,
+                    expr: Box::new(call.value_expr.clone()),
+                    data_type: DataType::Text,
+                    format: None,
+                },
+                string_literal_expr(call.encoding.clone()),
+            ],
+        ),
+    }
+}
+
+pub(crate) fn lower_lix_text_decode(call: &LixTextCodecCall, dialect: SqlDialect) -> Expr {
+    match dialect {
+        SqlDialect::Sqlite => Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(call.value_expr.clone()),
+            data_type: DataType::Text,
+            format: None,
+        },
+        SqlDialect::Postgres => function_expr(
+            "convert_from",
+            vec![
+                Expr::Cast {
+                    kind: CastKind::Cast,
+                    expr: Box::new(call.value_expr.clone()),
+                    data_type: DataType::Bytea,
+                    format: None,
+                },
+                string_literal_expr(call.encoding.clone()),
             ],
         ),
     }

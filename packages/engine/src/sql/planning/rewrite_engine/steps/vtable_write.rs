@@ -284,6 +284,7 @@ pub fn rewrite_update(
             message: "vtable update cannot change schema_key".to_string(),
         });
     }
+    validate_update_assignment_targets(&update.assignments)?;
 
     let selection = update.selection.as_ref().ok_or_else(|| LixError {
         message: "vtable update requires a WHERE clause".to_string(),
@@ -1171,6 +1172,62 @@ fn filter_update_assignments(assignments: Vec<Assignment>) -> Vec<Assignment> {
         .collect()
 }
 
+fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), LixError> {
+    const ALLOWED_MUTABLE_COLUMNS: &[&str] = &[
+        "entity_id",
+        "file_id",
+        "version_id",
+        "plugin_key",
+        "schema_version",
+        "snapshot_content",
+        "metadata",
+        "writer_key",
+    ];
+    for assignment in assignments {
+        let Some(column) = assignment_target_column_name(&assignment.target) else {
+            return Err(LixError {
+                message:
+                    "strict rewrite violation: vtable update assignment must target a named column"
+                        .to_string(),
+            });
+        };
+        if ALLOWED_MUTABLE_COLUMNS
+            .iter()
+            .any(|candidate| column.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        if column.eq_ignore_ascii_case("updated_at") || column.eq_ignore_ascii_case("change_id") {
+            return Err(LixError {
+                message: format!(
+                    "vtable update cannot set {}; it is managed by rewrite",
+                    column
+                ),
+            });
+        }
+        if column.eq_ignore_ascii_case("untracked") {
+            return Err(LixError {
+                message: "vtable update cannot set untracked; use an untracked predicate instead"
+                    .to_string(),
+            });
+        }
+        if column.eq_ignore_ascii_case("inherited_from_version_id") {
+            return Err(LixError {
+                message: "vtable update cannot set inherited_from_version_id; it is computed"
+                    .to_string(),
+            });
+        }
+        return Err(LixError {
+            message: format!(
+                "strict rewrite violation: vtable update assignment references unknown column '{}'; allowed columns: {}",
+                column,
+                ALLOWED_MUTABLE_COLUMNS.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_updated_at_assignment(assignments: &mut Vec<Assignment>) {
     assignments.push(Assignment {
         target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
@@ -1644,6 +1701,17 @@ fn find_column_index(columns: &[Ident], column: &str) -> Option<usize> {
 
 fn assignment_target_is_untracked(target: &AssignmentTarget) -> bool {
     assignment_target_is_column(target, "untracked")
+}
+
+fn assignment_target_column_name(target: &AssignmentTarget) -> Option<String> {
+    match target {
+        AssignmentTarget::ColumnName(object_name) => object_name
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.clone()),
+        AssignmentTarget::Tuple(_) => None,
+    }
 }
 
 fn assignment_target_is_column(target: &AssignmentTarget, column: &str) -> bool {
@@ -3057,6 +3125,46 @@ mod tests {
             "{:#?}",
             err
         );
+    }
+
+    #[test]
+    fn rewrite_update_rejects_unknown_assignment_column() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET bogus = 'x'
+            WHERE schema_key = 'a' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update, &[]).expect_err("expected error");
+        assert!(
+            err.message.contains("strict rewrite violation")
+                && err.message.contains("unknown column")
+                && err.message.contains("bogus"),
+            "{:#?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rewrite_update_rejects_updated_at_assignment() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET updated_at = '2024-01-01T00:00:00Z'
+            WHERE schema_key = 'a' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update, &[]).expect_err("expected error");
+        assert!(err.message.contains("cannot set updated_at"), "{:#?}", err);
     }
 
     #[test]

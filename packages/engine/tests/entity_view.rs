@@ -876,3 +876,140 @@ simulation_test!(
         assert_text(&rows.rows[0][1], "global");
     }
 );
+
+simulation_test!(
+    lix_entity_view_insert_rejects_unknown_column,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value, bogus) VALUES ('k-unknown', 'v-unknown', 'x')",
+                &[],
+            )
+            .await
+            .expect_err("insert with unknown column should fail");
+        assert!(
+            err.message.contains("strict rewrite violation")
+                && err.message.contains("unknown column")
+                && err.message.contains("bogus"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    lix_entity_view_update_rejects_unknown_assignment_column,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (\
+                 key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
+                 ) VALUES (\
+                 'k-update-unknown', 'v', 'lix', 'lix', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "UPDATE lix_key_value SET bogus = 'x' WHERE key = 'k-update-unknown'",
+                &[],
+            )
+            .await
+            .expect_err("update with unknown column should fail");
+        assert!(
+            err.message.contains("strict rewrite violation")
+                && err.message.contains("unknown column")
+                && err.message.contains("bogus"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    lix_entity_view_delete_rejects_unknown_where_column,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute("DELETE FROM lix_key_value WHERE bogus = 'x'", &[])
+            .await
+            .expect_err("delete with unknown predicate column should fail");
+        assert!(
+            err.message.contains("strict rewrite violation")
+                && err.message.contains("unknown column")
+                && err.message.contains("bogus"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+);
+
+simulation_test!(
+    write_routing_rejects_unsupported_non_lix_targets,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let insert_err = engine
+            .execute(
+                "INSERT INTO some_non_lix_table (id, value) VALUES ('x', 'y')",
+                &[],
+            )
+            .await
+            .expect_err("insert into unsupported target should fail");
+        assert!(
+            insert_err.message.contains("strict rewrite violation")
+                && insert_err.message.contains("unsupported INSERT target"),
+            "unexpected insert error: {}",
+            insert_err.message
+        );
+
+        let update_err = engine
+            .execute(
+                "UPDATE some_non_lix_table SET value = 'z' WHERE id = 'x'",
+                &[],
+            )
+            .await
+            .expect_err("update on unsupported target should fail");
+        assert!(
+            update_err.message.contains("strict rewrite violation")
+                && update_err.message.contains("unsupported UPDATE target"),
+            "unexpected update error: {}",
+            update_err.message
+        );
+
+        let delete_err = engine
+            .execute("DELETE FROM some_non_lix_table WHERE id = 'x'", &[])
+            .await
+            .expect_err("delete on unsupported target should fail");
+        assert!(
+            delete_err.message.contains("strict rewrite violation")
+                && delete_err.message.contains("unsupported DELETE target"),
+            "unexpected delete error: {}",
+            delete_err.message
+        );
+    }
+);

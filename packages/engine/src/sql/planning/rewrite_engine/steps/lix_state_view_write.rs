@@ -121,6 +121,7 @@ pub async fn rewrite_update_with_backend(
     if !table_with_joins_is_lix_state(&update.table) {
         return Ok(None);
     }
+    validate_update_assignments_known(&update)?;
     if update
         .assignments
         .iter()
@@ -223,7 +224,7 @@ fn untracked_true_predicate_expr() -> Expr {
     Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new("untracked"))),
         op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(Value::Number("1".to_string(), false).into())),
+        right: Box::new(Expr::Value(Value::Boolean(true).into())),
     }
 }
 
@@ -423,4 +424,52 @@ fn assignment_target_is_column(target: &AssignmentTarget, name: &str) -> bool {
             .unwrap_or(false),
         AssignmentTarget::Tuple(_) => false,
     }
+}
+
+fn assignment_target_column_name(target: &AssignmentTarget) -> Option<String> {
+    match target {
+        AssignmentTarget::ColumnName(object_name) => object_name
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.clone()),
+        AssignmentTarget::Tuple(_) => None,
+    }
+}
+
+fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
+    const ALLOWED: &[&str] = &[
+        "entity_id",
+        "schema_key",
+        "file_id",
+        "version_id",
+        "plugin_key",
+        "schema_version",
+        "snapshot_content",
+        "metadata",
+        "writer_key",
+        "untracked",
+        "inherited_from_version_id",
+    ];
+    for assignment in &update.assignments {
+        let column = assignment_target_column_name(&assignment.target).ok_or_else(|| LixError {
+            message:
+                "strict rewrite violation: lix_state update assignment must target a named column"
+                    .to_string(),
+        })?;
+        if ALLOWED
+            .iter()
+            .any(|candidate| column.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        return Err(LixError {
+            message: format!(
+                "strict rewrite violation: lix_state update assignment references unknown column '{}'; allowed columns: {}",
+                column,
+                ALLOWED.join(", ")
+            ),
+        });
+    }
+    Ok(())
 }

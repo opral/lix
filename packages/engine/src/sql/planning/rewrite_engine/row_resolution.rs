@@ -116,6 +116,12 @@ fn resolve_expr(
             if let Some(resolved) = resolve_lix_json_function(function, params, state)? {
                 return Ok(resolved);
             }
+            if let Some(resolved) = resolve_lix_text_encode_function(function, params, state)? {
+                return Ok(resolved);
+            }
+            if let Some(resolved) = resolve_lix_text_decode_function(function, params, state)? {
+                return Ok(resolved);
+            }
         }
         return Ok(ResolvedCell {
             value: None,
@@ -170,6 +176,97 @@ fn resolve_lix_json_function(
     Ok(Some(resolve_expr(arg_expr, params, state)?))
 }
 
+fn resolve_lix_text_encode_function(
+    function: &Function,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<Option<ResolvedCell>, LixError> {
+    if !function_name_matches(&function.name, "lix_text_encode") {
+        return Ok(None);
+    }
+    let args = function_args(function, "lix_text_encode()")?;
+    if !(1..=2).contains(&args.len()) {
+        return Err(LixError {
+            message: "lix_text_encode() requires 1 or 2 arguments".to_string(),
+        });
+    }
+    let value_expr = function_arg_expr(&args[0], "lix_text_encode()")?;
+    let resolved = resolve_expr(value_expr, params, state)?;
+    let Some(value) = resolved.value.clone() else {
+        return Ok(Some(ResolvedCell {
+            value: None,
+            placeholder_index: resolved.placeholder_index,
+        }));
+    };
+    let encoding = resolve_codec_encoding_arg(args.get(1), "lix_text_encode()", params, state)?;
+    if encoding != "UTF8" {
+        return Err(LixError {
+            message: format!("lix_text_encode() only supports UTF8 encoding, got '{encoding}'"),
+        });
+    }
+    match value {
+        Value::Text(text) => Ok(Some(ResolvedCell {
+            value: Some(Value::Blob(text.into_bytes())),
+            placeholder_index: resolved.placeholder_index,
+        })),
+        Value::Null => Ok(Some(ResolvedCell {
+            value: Some(Value::Null),
+            placeholder_index: resolved.placeholder_index,
+        })),
+        other => Err(LixError {
+            message: format!("lix_text_encode() expects text input, got {other:?}"),
+        }),
+    }
+}
+
+fn resolve_lix_text_decode_function(
+    function: &Function,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<Option<ResolvedCell>, LixError> {
+    if !function_name_matches(&function.name, "lix_text_decode") {
+        return Ok(None);
+    }
+    let args = function_args(function, "lix_text_decode()")?;
+    if !(1..=2).contains(&args.len()) {
+        return Err(LixError {
+            message: "lix_text_decode() requires 1 or 2 arguments".to_string(),
+        });
+    }
+    let value_expr = function_arg_expr(&args[0], "lix_text_decode()")?;
+    let resolved = resolve_expr(value_expr, params, state)?;
+    let Some(value) = resolved.value.clone() else {
+        return Ok(Some(ResolvedCell {
+            value: None,
+            placeholder_index: resolved.placeholder_index,
+        }));
+    };
+    let encoding = resolve_codec_encoding_arg(args.get(1), "lix_text_decode()", params, state)?;
+    if encoding != "UTF8" {
+        return Err(LixError {
+            message: format!("lix_text_decode() only supports UTF8 encoding, got '{encoding}'"),
+        });
+    }
+    match value {
+        Value::Blob(bytes) => {
+            let text = String::from_utf8(bytes).map_err(|error| LixError {
+                message: format!("lix_text_decode() input is not valid UTF8: {error}"),
+            })?;
+            Ok(Some(ResolvedCell {
+                value: Some(Value::Text(text)),
+                placeholder_index: resolved.placeholder_index,
+            }))
+        }
+        Value::Null => Ok(Some(ResolvedCell {
+            value: Some(Value::Null),
+            placeholder_index: resolved.placeholder_index,
+        })),
+        other => Err(LixError {
+            message: format!("lix_text_decode() expects bytes input, got {other:?}"),
+        }),
+    }
+}
+
 fn function_name_matches(name: &sqlparser::ast::ObjectName, expected: &str) -> bool {
     name.0
         .last()
@@ -193,6 +290,46 @@ fn function_arg_expr<'a>(arg: &'a FunctionArg, fn_name: &str) -> Result<&'a Expr
             message: format!("{fn_name} arguments must be SQL expressions"),
         }),
     }
+}
+
+fn function_args<'a>(function: &'a Function, fn_name: &str) -> Result<&'a [FunctionArg], LixError> {
+    match &function.args {
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return Err(LixError {
+                    message: format!("{fn_name} does not support DISTINCT/ALL/clauses"),
+                });
+            }
+            Ok(&list.args)
+        }
+        _ => Err(LixError {
+            message: format!("{fn_name} requires a regular argument list"),
+        }),
+    }
+}
+
+fn resolve_codec_encoding_arg(
+    arg: Option<&FunctionArg>,
+    fn_name: &str,
+    params: &[Value],
+    state: &mut PlaceholderState,
+) -> Result<String, LixError> {
+    let Some(arg) = arg else {
+        return Ok("UTF8".to_string());
+    };
+    let expr = function_arg_expr(arg, fn_name)?;
+    let resolved = resolve_expr(expr, params, state)?;
+    let Some(value) = resolved.value else {
+        return Err(LixError {
+            message: format!("{fn_name} encoding argument must resolve to text"),
+        });
+    };
+    let Value::Text(encoding) = value else {
+        return Err(LixError {
+            message: format!("{fn_name} encoding argument must be text"),
+        });
+    };
+    Ok(encoding.trim().to_ascii_uppercase().replace('-', ""))
 }
 
 fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {

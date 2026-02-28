@@ -472,6 +472,8 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
             message: format!("{} does not support UPDATE", target.view_name),
         });
     }
+    validate_filesystem_update_assignments(&update, target)?;
+    validate_filesystem_selection_columns(update.selection.as_ref(), target, "update WHERE")?;
     reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
@@ -502,6 +504,8 @@ pub async fn rewrite_update_with_backend(
             message: format!("{} does not support UPDATE", target.view_name),
         });
     }
+    validate_filesystem_update_assignments(&update, target)?;
+    validate_filesystem_selection_columns(update.selection.as_ref(), target, "update WHERE")?;
     reject_immutable_id_update(&update, target)?;
 
     if target.is_file {
@@ -522,6 +526,31 @@ pub async fn rewrite_update_with_backend(
             target,
         )
         .await?;
+        if update.selection.is_some() {
+            let empty_scope_version_id = if target.requires_explicit_version_scope() {
+                extract_predicate_string_with_params_and_dialect(
+                    update.selection.as_ref(),
+                    &["lixcol_version_id", "version_id"],
+                    params,
+                    backend.dialect(),
+                )?
+            } else {
+                None
+            };
+            let mut read_rewrite_session = ReadRewriteSession::default();
+            let selected = file_rows_matching_selection(
+                backend,
+                update.selection.as_ref(),
+                target,
+                params,
+                &mut read_rewrite_session,
+                "update",
+            )
+            .await?;
+            let predicate =
+                build_file_scoped_selection(&selected, target, empty_scope_version_id.as_deref());
+            update.selection = Some(parse_expression(&predicate)?);
+        }
     } else {
         rewrite_directory_update_assignments_with_backend(backend, &mut update, params, target)
             .await?;
@@ -540,6 +569,7 @@ pub fn rewrite_delete(mut delete: Delete) -> Result<Option<Delete>, LixError> {
             message: format!("{} does not support DELETE", target.view_name),
         });
     }
+    validate_filesystem_selection_columns(delete.selection.as_ref(), target, "delete WHERE")?;
 
     replace_delete_target_table(&mut delete, target.rewrite_view_name)?;
     Ok(Some(delete))
@@ -558,6 +588,7 @@ pub async fn rewrite_delete_with_backend(
             message: format!("{} does not support DELETE", target.view_name),
         });
     }
+    validate_filesystem_selection_columns(delete.selection.as_ref(), target, "delete WHERE")?;
     if target.requires_explicit_version_scope() {
         let version_id = extract_predicate_string_with_params_and_dialect(
             delete.selection.as_ref(),
@@ -591,6 +622,29 @@ pub async fn rewrite_delete_with_backend(
             let predicate = build_directory_delete_selection(&expanded, target)?;
             delete.selection = Some(parse_expression(&predicate)?);
         }
+    } else if target.is_file && delete.selection.is_some() {
+        let empty_scope_version_id = if target.requires_explicit_version_scope() {
+            extract_predicate_string_with_params_and_dialect(
+                delete.selection.as_ref(),
+                &["lixcol_version_id", "version_id"],
+                params,
+                backend.dialect(),
+            )?
+        } else {
+            None
+        };
+        let selected = file_rows_matching_selection(
+            backend,
+            delete.selection.as_ref(),
+            target,
+            params,
+            &mut read_rewrite_session,
+            "delete",
+        )
+        .await?;
+        let predicate =
+            build_file_scoped_selection(&selected, target, empty_scope_version_id.as_deref());
+        delete.selection = Some(parse_expression(&predicate)?);
     }
 
     replace_delete_target_table(&mut delete, target.rewrite_view_name)?;
@@ -603,6 +657,12 @@ struct FilesystemTarget {
     rewrite_view_name: &'static str,
     read_only: bool,
     is_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScopedFileSelectionRow {
+    id: String,
+    version_id: String,
 }
 
 impl FilesystemTarget {
@@ -2790,6 +2850,109 @@ async fn directory_rows_matching_delete(
     Ok(rows)
 }
 
+async fn file_rows_matching_selection(
+    backend: &dyn LixBackend,
+    selection: Option<&Expr>,
+    target: FilesystemTarget,
+    params: &[EngineValue],
+    read_rewrite_session: &mut ReadRewriteSession,
+    operation: &str,
+) -> Result<Vec<ScopedFileSelectionRow>, LixError> {
+    let where_clause = selection
+        .map(|selection| format!(" WHERE {selection}"))
+        .unwrap_or_default();
+    let active_version_id = if target.uses_active_version_scope() {
+        Some(load_active_version_id(backend).await?)
+    } else {
+        None
+    };
+    let sql = if target.uses_active_version_scope() {
+        format!(
+            "SELECT id FROM {view_name}{where_clause}",
+            view_name = target.view_name,
+            where_clause = where_clause
+        )
+    } else {
+        format!(
+            "SELECT id, lixcol_version_id FROM {view_name}{where_clause}",
+            view_name = target.view_name,
+            where_clause = where_clause
+        )
+    };
+    let rewritten_sql =
+        rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )
+    .map_err(|error| LixError {
+        message: format!(
+            "file {operation} scope binding failed for '{}': {}",
+            rewritten_sql, error.message
+        ),
+    })?;
+    let result = backend
+        .execute(&bound.sql, &bound.params)
+        .await
+        .map_err(|error| LixError {
+            message: format!(
+                "file {operation} scope prefetch failed for '{}': {}",
+                bound.sql, error.message
+            ),
+        })?;
+
+    let mut rows = Vec::<ScopedFileSelectionRow>::new();
+    for row in result.rows {
+        if target.uses_active_version_scope() {
+            let version_id = active_version_id.clone().ok_or_else(|| LixError {
+                message: "active version id is missing for file scoped selection".to_string(),
+            })?;
+            let id = match row.first() {
+                Some(EngineValue::Text(value)) => value.clone(),
+                Some(other) => {
+                    return Err(LixError {
+                        message: format!(
+                            "file {operation} scoped id lookup expected text, got {other:?}"
+                        ),
+                    })
+                }
+                None => continue,
+            };
+            rows.push(ScopedFileSelectionRow { id, version_id });
+        } else {
+            if row.len() < 2 {
+                continue;
+            }
+            let id = match &row[0] {
+                EngineValue::Text(value) => value.clone(),
+                other => {
+                    return Err(LixError {
+                        message: format!(
+                            "file {operation} scoped id lookup expected text, got {other:?}"
+                        ),
+                    })
+                }
+            };
+            let version_id = match &row[1] {
+                EngineValue::Text(value) => value.clone(),
+                other => {
+                    return Err(LixError {
+                        message: format!(
+                            "file {operation} scoped version lookup expected text, got {other:?}"
+                        ),
+                    })
+                }
+            };
+            rows.push(ScopedFileSelectionRow { id, version_id });
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    Ok(rows)
+}
+
 #[derive(Debug, Clone)]
 struct ScopedFileUpdateRow {
     id: String,
@@ -3322,6 +3485,43 @@ fn build_directory_delete_selection(
     Ok(clauses.join(" OR "))
 }
 
+fn build_file_scoped_selection(
+    rows: &[ScopedFileSelectionRow],
+    target: FilesystemTarget,
+    empty_scope_version_id: Option<&str>,
+) -> String {
+    if rows.is_empty() {
+        if target.requires_explicit_version_scope() {
+            if let Some(version_id) = empty_scope_version_id {
+                return format!(
+                    "lixcol_version_id = '{version_id}' AND 0 = 1",
+                    version_id = escape_sql_string(version_id),
+                );
+            }
+        }
+        return "0 = 1".to_string();
+    }
+    if target.uses_active_version_scope() {
+        let ids = rows
+            .iter()
+            .map(|row| format!("'{}'", escape_sql_string(&row.id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("id IN ({ids})");
+    }
+
+    rows.iter()
+        .map(|row| {
+            format!(
+                "(id = '{id}' AND lixcol_version_id = '{version_id}')",
+                id = escape_sql_string(&row.id),
+                version_id = escape_sql_string(&row.version_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 fn parse_expression(sql: &str) -> Result<Expr, LixError> {
     let wrapped_sql = format!("SELECT 1 WHERE {sql}");
     let mut statements =
@@ -3438,6 +3638,190 @@ fn assignment_target_name(assignment: &sqlparser::ast::Assignment) -> Option<Str
         .last()
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.clone())
+}
+
+fn validate_filesystem_update_assignments(
+    update: &Update,
+    target: FilesystemTarget,
+) -> Result<(), LixError> {
+    let allowed = allowed_filesystem_assignment_columns(target);
+    for assignment in &update.assignments {
+        let column = assignment_target_name(assignment).ok_or_else(|| LixError {
+            message: format!(
+                "strict rewrite violation: filesystem view '{}' update assignment must target a named column",
+                target.view_name
+            ),
+        })?;
+        if allowed
+            .iter()
+            .any(|candidate| column.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        return Err(unknown_filesystem_column_error(
+            target,
+            "update assignment",
+            &column,
+            &allowed,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_filesystem_selection_columns(
+    selection: Option<&Expr>,
+    target: FilesystemTarget,
+    context: &str,
+) -> Result<(), LixError> {
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+    let allowed = allowed_filesystem_selection_columns(target);
+    let mut referenced = BTreeSet::new();
+    collect_expr_column_references(selection, &mut referenced);
+    for column in referenced {
+        if allowed
+            .iter()
+            .any(|candidate| column.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        return Err(unknown_filesystem_column_error(
+            target, context, &column, &allowed,
+        ));
+    }
+    Ok(())
+}
+
+fn collect_expr_column_references(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Identifier(ident) => {
+            out.insert(ident.value.clone());
+        }
+        Expr::CompoundIdentifier(idents) => {
+            if let Some(last) = idents.last() {
+                out.insert(last.value.clone());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_column_references(left, out);
+            collect_expr_column_references(right, out);
+        }
+        Expr::UnaryOp { expr, .. } => collect_expr_column_references(expr, out),
+        Expr::Nested(inner) => collect_expr_column_references(inner, out),
+        Expr::InList { expr, list, .. } => {
+            collect_expr_column_references(expr, out);
+            for item in list {
+                collect_expr_column_references(item, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_column_references(expr, out);
+            collect_expr_column_references(low, out);
+            collect_expr_column_references(high, out);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_expr_column_references(expr, out);
+            collect_expr_column_references(pattern, out);
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => collect_expr_column_references(inner, out),
+        Expr::Cast { expr, .. } => collect_expr_column_references(expr, out),
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            collect_expr_column_references(left, out);
+            collect_expr_column_references(right, out);
+        }
+        Expr::Function(function) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &function.args {
+                for argument in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) = argument
+                    {
+                        collect_expr_column_references(expr, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn allowed_filesystem_assignment_columns(target: FilesystemTarget) -> Vec<&'static str> {
+    if target.is_file {
+        vec!["id", "path", "data", "metadata", "lixcol_metadata"]
+    } else {
+        vec![
+            "id",
+            "path",
+            "name",
+            "parent_id",
+            "metadata",
+            "lixcol_metadata",
+        ]
+    }
+}
+
+fn allowed_filesystem_selection_columns(target: FilesystemTarget) -> Vec<&'static str> {
+    let mut allowed = vec![
+        "id",
+        "path",
+        "name",
+        "parent_id",
+        "metadata",
+        "lixcol_metadata",
+        "version_id",
+        "lixcol_version_id",
+        "file_id",
+        "lixcol_file_id",
+        "entity_id",
+        "lixcol_entity_id",
+        "schema_key",
+        "lixcol_schema_key",
+        "schema_version",
+        "lixcol_schema_version",
+        "plugin_key",
+        "lixcol_plugin_key",
+        "snapshot_content",
+        "lixcol_snapshot_content",
+        "change_id",
+        "lixcol_change_id",
+        "commit_id",
+        "lixcol_commit_id",
+        "root_commit_id",
+        "lixcol_root_commit_id",
+        "depth",
+        "lixcol_depth",
+        "inherited_from_version_id",
+        "lixcol_inherited_from_version_id",
+        "untracked",
+        "lixcol_untracked",
+        "created_at",
+        "lixcol_created_at",
+        "updated_at",
+        "lixcol_updated_at",
+    ];
+    if target.is_file {
+        allowed.push("data");
+    }
+    allowed
+}
+
+fn unknown_filesystem_column_error(
+    target: FilesystemTarget,
+    context: &str,
+    column: &str,
+    allowed: &[&str],
+) -> LixError {
+    LixError {
+        message: format!(
+            "strict rewrite violation: filesystem view '{}' {context} references unknown column '{}'; allowed columns: {}",
+            target.view_name,
+            column,
+            allowed.join(", "),
+        ),
+    }
 }
 
 fn object_name_terminal(name: &ObjectName) -> Option<String> {

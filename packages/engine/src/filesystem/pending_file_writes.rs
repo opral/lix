@@ -289,11 +289,10 @@ fn collect_insert_writes(
         let file_id = id_index
             .and_then(|index| resolved_cell_text(resolved_row.get(index)))
             .unwrap_or_else(|| unresolved_auto_file_id_for_path(&path));
-        let after_data = resolved_cell_blob_bytes(resolved_row.get(data_index)).ok_or_else(|| {
-            LixError {
+        let after_data =
+            resolved_cell_blob_bytes(resolved_row.get(data_index)).ok_or_else(|| LixError {
                 message: FILE_DATA_TYPE_ERROR.to_string(),
-            }
-        })?;
+            })?;
 
         let version_id = match target {
             FileWriteTarget::ActiveVersion => active_version_id.to_string(),
@@ -344,6 +343,7 @@ async fn collect_delete_writes(
     let Some(target) = file_write_target_from_delete(delete) else {
         return Ok(Vec::new());
     };
+    validate_file_selection_columns(delete.selection.as_ref(), "delete WHERE")?;
 
     let mut query_sql = match target {
         FileWriteTarget::ActiveVersion => format!(
@@ -478,6 +478,7 @@ async fn collect_update_writes(
     let Some(target) = file_write_target_from_update(update) else {
         return Ok(());
     };
+    validate_file_selection_columns(update.selection.as_ref(), "update WHERE")?;
 
     let mut placeholder_state = PlaceholderState::new();
     let mut assigned_after_data: Option<Vec<u8>> = None;
@@ -757,6 +758,7 @@ async fn collect_delete_targets(
     let Some(target) = file_write_target_from_delete(delete) else {
         return Ok(BTreeSet::new());
     };
+    validate_file_selection_columns(delete.selection.as_ref(), "delete WHERE")?;
     let mut statement_targets = BTreeSet::new();
 
     let mut exact_placeholder_state = PlaceholderState::new();
@@ -1755,6 +1757,134 @@ fn delete_projection_column_allowed(column: &str) -> bool {
         || column.eq_ignore_ascii_case("version_id")
 }
 
+fn validate_file_selection_columns(
+    selection: Option<&Expr>,
+    context: &str,
+) -> Result<(), LixError> {
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+    let allowed = allowed_file_selection_columns();
+    let mut referenced = BTreeSet::new();
+    collect_expr_column_references(selection, &mut referenced);
+    for column in referenced {
+        if allowed
+            .iter()
+            .any(|candidate| column.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        return Err(LixError {
+            message: format!(
+                "strict rewrite violation: lix_file {context} references unknown column '{}'; allowed columns: {}",
+                column,
+                allowed.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn collect_expr_column_references(expr: &Expr, out: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Identifier(ident) => {
+            out.insert(ident.value.clone());
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                out.insert(last.value.clone());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_column_references(left, out);
+            collect_expr_column_references(right, out);
+        }
+        Expr::UnaryOp { expr, .. } => collect_expr_column_references(expr, out),
+        Expr::Nested(inner) => collect_expr_column_references(inner, out),
+        Expr::InList { expr, list, .. } => {
+            collect_expr_column_references(expr, out);
+            for item in list {
+                collect_expr_column_references(item, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_column_references(expr, out);
+            collect_expr_column_references(low, out);
+            collect_expr_column_references(high, out);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            collect_expr_column_references(expr, out);
+            collect_expr_column_references(pattern, out);
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => collect_expr_column_references(inner, out),
+        Expr::Cast { expr, .. } => collect_expr_column_references(expr, out),
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            collect_expr_column_references(left, out);
+            collect_expr_column_references(right, out);
+        }
+        Expr::Function(function) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &function.args {
+                for argument in &list.args {
+                    match argument {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(expr),
+                        ) => collect_expr_column_references(expr, out),
+                        sqlparser::ast::FunctionArg::Named { arg, .. }
+                        | sqlparser::ast::FunctionArg::ExprNamed { arg, .. } => {
+                            if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+                                collect_expr_column_references(expr, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn allowed_file_selection_columns() -> Vec<&'static str> {
+    vec![
+        "id",
+        "path",
+        "data",
+        "metadata",
+        "version_id",
+        "lixcol_version_id",
+        "file_id",
+        "lixcol_file_id",
+        "entity_id",
+        "lixcol_entity_id",
+        "schema_key",
+        "lixcol_schema_key",
+        "schema_version",
+        "lixcol_schema_version",
+        "plugin_key",
+        "lixcol_plugin_key",
+        "snapshot_content",
+        "lixcol_snapshot_content",
+        "change_id",
+        "lixcol_change_id",
+        "commit_id",
+        "lixcol_commit_id",
+        "root_commit_id",
+        "lixcol_root_commit_id",
+        "depth",
+        "lixcol_depth",
+        "inherited_from_version_id",
+        "lixcol_inherited_from_version_id",
+        "untracked",
+        "lixcol_untracked",
+        "created_at",
+        "lixcol_created_at",
+        "updated_at",
+        "lixcol_updated_at",
+    ]
+}
+
 fn assignment_target_name(assignment: &Assignment) -> Option<String> {
     let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
         return None;
@@ -2184,7 +2314,7 @@ mod tests {
     async fn case_path_update_keeps_case_selected_path_with_overlay() {
         let writes = collect_pending_file_writes(
             &CasePathOverlayBackend,
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/seed.md', 'seed'); \
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/seed.md', X'73656564'); \
              UPDATE lix_file \
              SET path = CASE id WHEN 'file-1' THEN '/next.md' ELSE path END \
              WHERE id = 'file-1'",

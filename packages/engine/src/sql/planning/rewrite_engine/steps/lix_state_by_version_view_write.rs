@@ -99,6 +99,7 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Update>, LixError> {
     if !table_with_joins_is_lix_state_by_version(&update.table) {
         return Ok(None);
     }
+    validate_update_assignments_known(&update)?;
     if update.assignments.iter().any(|assignment| {
         assignment_target_is_column(&assignment.target, "inherited_from_version_id")
     }) {
@@ -220,6 +221,52 @@ fn assignment_target_is_column(target: &AssignmentTarget, name: &str) -> bool {
             .unwrap_or(false),
         AssignmentTarget::Tuple(_) => false,
     }
+}
+
+fn assignment_target_column_name(target: &AssignmentTarget) -> Option<String> {
+    match target {
+        AssignmentTarget::ColumnName(object_name) => object_name
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.clone()),
+        AssignmentTarget::Tuple(_) => None,
+    }
+}
+
+fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
+    const ALLOWED: &[&str] = &[
+        "entity_id",
+        "schema_key",
+        "file_id",
+        "version_id",
+        "plugin_key",
+        "schema_version",
+        "snapshot_content",
+        "metadata",
+        "writer_key",
+        "untracked",
+        "inherited_from_version_id",
+    ];
+    for assignment in &update.assignments {
+        let column = assignment_target_column_name(&assignment.target).ok_or_else(|| LixError {
+            message: "strict rewrite violation: lix_state_by_version update assignment must target a named column".to_string(),
+        })?;
+        if ALLOWED
+            .iter()
+            .any(|candidate| column.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        return Err(LixError {
+            message: format!(
+                "strict rewrite violation: lix_state_by_version update assignment references unknown column '{}'; allowed columns: {}",
+                column,
+                ALLOWED.join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn contains_column_reference(expr: &Expr, column: &str) -> bool {

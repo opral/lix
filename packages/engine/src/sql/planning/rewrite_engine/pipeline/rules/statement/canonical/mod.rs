@@ -199,7 +199,17 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     statements = rewritten.statements;
                 }
                 if statements.is_empty() {
-                    statements.push(Statement::Insert(current_insert));
+                    let target = insert_target_name(&current_insert);
+                    if is_allowed_internal_write_target(&target) {
+                        statements.push(Statement::Insert(current_insert));
+                    } else {
+                        return Err(LixError {
+                            message: format!(
+                                "strict rewrite violation: statement routing: unsupported INSERT target '{}'",
+                                target
+                            ),
+                        });
+                    }
                 }
 
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
@@ -468,7 +478,17 @@ where
                 }
 
                 if statements.is_empty() {
-                    statements.push(Statement::Insert(current_insert));
+                    let target = insert_target_name(&current_insert);
+                    if is_allowed_internal_write_target(&target) {
+                        statements.push(Statement::Insert(current_insert));
+                    } else {
+                        return Err(LixError {
+                            message: format!(
+                                "strict rewrite violation: statement routing: unsupported INSERT target '{}'",
+                                target
+                            ),
+                        });
+                    }
                 }
 
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
@@ -699,6 +719,18 @@ where
     }
 
     Ok(StatementRuleOutcome::Continue(current))
+}
+
+fn insert_target_name(insert: &sqlparser::ast::Insert) -> String {
+    match &insert.table {
+        sqlparser::ast::TableObject::TableName(name) => name.to_string(),
+        _ => "<non-table-target>".to_string(),
+    }
+}
+
+fn is_allowed_internal_write_target(target: &str) -> bool {
+    let normalized = target.trim_matches('"').to_ascii_lowercase();
+    normalized.starts_with("lix_internal_")
 }
 
 fn sql_change_to_detected_file_domain_change(

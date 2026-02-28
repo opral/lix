@@ -396,7 +396,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('checkpoint-file-tombstone', '/checkpoint-file-tombstone.json', '{\"before\":true}')",
+                 VALUES ('checkpoint-file-tombstone', '/checkpoint-file-tombstone.json', lix_text_encode('{\"before\":true}'))",
                 &[],
             )
             .await
@@ -469,7 +469,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('checkpoint-file-plugin-tombstone', '/checkpoint-file-plugin-tombstone.json', '{\"before\":true}')",
+                 VALUES ('checkpoint-file-plugin-tombstone', '/checkpoint-file-plugin-tombstone.json', lix_text_encode('{\"before\":true}'))",
                 &[],
             )
             .await
