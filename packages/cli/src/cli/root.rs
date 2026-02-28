@@ -10,10 +10,6 @@ pub struct Cli {
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     pub path: Option<PathBuf>,
 
-    /// Print machine-readable JSON output.
-    #[arg(long, global = true, default_value_t = false)]
-    pub json: bool,
-
     #[command(subcommand)]
     pub command: Command,
 }

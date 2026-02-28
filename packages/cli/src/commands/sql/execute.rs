@@ -1,5 +1,5 @@
 use crate::app::AppContext;
-use crate::cli::sql::SqlExecuteArgs;
+use crate::cli::sql::{SqlExecuteArgs, SqlOutputFormat};
 use crate::db;
 use crate::error::CliError;
 use crate::output;
@@ -13,10 +13,9 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<(), CliError> {
     let result = pollster::block_on(lix.execute(&sql, &[] as &[Value]))
         .map_err(|err| CliError::msg(format!("sql execution failed: {}", err.message)))?;
 
-    if context.json {
-        output::print_query_result_json(&result);
-    } else {
-        output::print_query_result_table(&result);
+    match args.format {
+        SqlOutputFormat::Json => output::print_query_result_json(&result),
+        SqlOutputFormat::Table => output::print_query_result_table(&result),
     }
 
     Ok(())
