@@ -221,6 +221,15 @@ fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
     Ok(())
 }
 
+pub(crate) fn normalize_missing_relation_error(error: LixError) -> LixError {
+    if crate::error_classification::is_missing_relation_error(&error) {
+        return LixError {
+            message: "table not found".to_string(),
+        };
+    }
+    error
+}
+
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql(sql) else {
         return false;
@@ -647,6 +656,11 @@ mod tests {
                     columns: vec!["snapshot_content".to_string()],
                 });
             }
+            if sql.to_ascii_lowercase().contains("unknown_table") {
+                return Err(LixError {
+                    message: "no such table: unknown_table".to_string(),
+                });
+            }
             Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
@@ -793,6 +807,34 @@ mod tests {
         assert!(!is_query_only_sql(
             "UPDATE lix_file SET path = '/x' WHERE id = 'f'"
         ));
+    }
+
+    #[tokio::test]
+    async fn unknown_read_query_returns_table_not_found_message() {
+        let commit_called = Arc::new(AtomicBool::new(false));
+        let rollback_called = Arc::new(AtomicBool::new(false));
+        let engine = boot(BootArgs::new(
+            Box::new(TestBackend {
+                commit_called,
+                rollback_called,
+                active_version_snapshot: Arc::new(RwLock::new(active_version_snapshot_json(
+                    "global",
+                ))),
+                restored_active_version_snapshot: active_version_snapshot_json("global"),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let error = engine
+            .execute(
+                "SELECT * FROM unknown_table",
+                &[],
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect_err("unknown relation query should fail");
+
+        assert_eq!(error.message, "table not found");
     }
 
     #[test]

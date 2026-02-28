@@ -137,7 +137,8 @@ impl Engine {
             writer_key,
         )
         .await
-        .map_err(LixError::from)?;
+        .map_err(LixError::from)
+        .map_err(normalize_missing_relation_error)?;
 
         run::persist_runtime_sequence(
             self,
