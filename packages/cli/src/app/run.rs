@@ -8,7 +8,6 @@ pub fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let context = AppContext {
         lix_path: cli.path,
-        json: cli.json,
     };
 
     match cli.command {
