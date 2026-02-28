@@ -38,7 +38,9 @@ pub(crate) fn validate_postprocess_plan(plan: &PostprocessPlan) -> Result<(), Li
     };
     if !schema_key_is_valid(schema_key) {
         return Err(LixError {
-            message: "vtable postprocess plan requires a valid schema_key".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "vtable postprocess plan requires a valid schema_key".to_string(),
         });
     }
     Ok(())
@@ -71,6 +73,6 @@ mod tests {
             writer_key_assignment_present: false,
         });
         let err = validate_postprocess_plan(&plan).expect_err("invalid plan");
-        assert!(err.message.contains("schema_key"));
+        assert!(err.description.contains("schema_key"));
     }
 }

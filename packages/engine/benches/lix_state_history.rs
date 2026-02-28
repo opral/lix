@@ -455,13 +455,11 @@ async fn seed_engine_with_history_config(
     config: HistorySeedConfig,
 ) -> Result<HistorySeed, LixError> {
     if config.entity_count == 0 {
-        return Err(LixError {
-            message: "history benchmark seed requires entity_count > 0".to_string(),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "history benchmark seed requires entity_count > 0".to_string(),
         });
     }
     if config.history_updates == 0 {
-        return Err(LixError {
-            message: "history benchmark seed requires history_updates > 0".to_string(),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "history benchmark seed requires history_updates > 0".to_string(),
         });
     }
 
@@ -487,8 +485,7 @@ async fn seed_engine_with_history_config(
     } else {
         vec![load_active_commit_id(&engine).await?]
     };
-    let root_commit_id = root_commit_ids.last().cloned().ok_or_else(|| LixError {
-        message: "history benchmark seed produced no root commits".to_string(),
+    let root_commit_id = root_commit_ids.last().cloned().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "history benchmark seed produced no root commits".to_string(),
     })?;
     let target_entity_id = entity_id_at(TARGET_ENTITY_INDEX.min(config.entity_count - 1));
     let (depth_range_start, depth_range_end) =
@@ -621,8 +618,7 @@ async fn create_branch_roots(
         .get(tip_timeline.len().saturating_div(2))
         .or_else(|| tip_timeline.last())
         .cloned()
-        .ok_or_else(|| LixError {
-            message: "branch root seeding requires a non-empty commit timeline".to_string(),
+        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "branch root seeding requires a non-empty commit timeline".to_string(),
         })?;
     let active_version_id = load_active_version_id(engine).await?;
     let mut roots = Vec::with_capacity(config.branch_roots);
@@ -639,8 +635,7 @@ async fn create_branch_roots(
     roots.dedup();
 
     if roots.len() < 2 {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "branch root seeding expected >= 2 unique roots, produced {}",
                 roots.len()
             ),
@@ -664,14 +659,11 @@ async fn load_active_commit_tip(engine: &lix_engine::Engine) -> Result<CommitTip
             ExecuteOptions::default(),
         )
         .await?;
-    let row = result.rows.first().ok_or_else(|| LixError {
-        message: "active commit query returned no rows".to_string(),
+    let row = result.rows.first().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active commit query returned no rows".to_string(),
     })?;
-    let commit_id = row.first().ok_or_else(|| LixError {
-        message: "active commit query missing commit_id column".to_string(),
+    let commit_id = row.first().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active commit query missing commit_id column".to_string(),
     })?;
-    let working_commit_id = row.get(1).ok_or_else(|| LixError {
-        message: "active commit query missing working_commit_id column".to_string(),
+    let working_commit_id = row.get(1).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active commit query missing working_commit_id column".to_string(),
     })?;
 
     Ok(CommitTip {
@@ -694,8 +686,7 @@ async fn load_active_version_id(engine: &lix_engine::Engine) -> Result<String, L
         .rows
         .first()
         .and_then(|row| row.first())
-        .ok_or_else(|| LixError {
-            message: "active version query returned no rows".to_string(),
+        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active version query returned no rows".to_string(),
         })?;
     value_as_text(value, "version_id")
 }
@@ -739,13 +730,11 @@ async fn ensure_commit_graph_is_branchy(engine: &lix_engine::Engine) -> Result<(
         .rows
         .first()
         .and_then(|row| row.first())
-        .ok_or_else(|| LixError {
-            message: "branch parent count query returned no rows".to_string(),
+        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "branch parent count query returned no rows".to_string(),
         })?;
     let branch_parent_count = value_as_i64(count, "branch_parent_count")?;
     if branch_parent_count < 1 {
-        return Err(LixError {
-            message: "branch seed did not create commit-parent fan-out".to_string(),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "branch seed did not create commit-parent fan-out".to_string(),
         });
     }
     Ok(())
@@ -865,8 +854,7 @@ fn escape_sql_literal(value: &str) -> String {
 fn value_as_text(value: &Value, column: &str) -> Result<String, LixError> {
     match value {
         Value::Text(text) => Ok(text.clone()),
-        other => Err(LixError {
-            message: format!("{column} must be text, got {other:?}"),
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{column} must be text, got {other:?}"),
         }),
     }
 }
@@ -875,8 +863,7 @@ fn value_as_i64(value: &Value, column: &str) -> Result<i64, LixError> {
     match value {
         Value::Integer(number) => Ok(*number),
         Value::Null => Ok(0),
-        other => Err(LixError {
-            message: format!("{column} must be integer, got {other:?}"),
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{column} must be integer, got {other:?}"),
         }),
     }
 }

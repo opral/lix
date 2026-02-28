@@ -67,9 +67,11 @@ pub(crate) fn advance_placeholder_state_for_statement(
     let statement_sql = statement.to_string();
     let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
         |error| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.message
+                statement_sql, error.description
             ),
         },
     )?;
@@ -93,8 +95,7 @@ async fn resolve_pending_write_file_id_with_backend(
     )
     .await?;
     let Some(file_id) = resolved else {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "pending file write: unable to resolve auto-generated file id for path '{}' in version '{}'",
                 path, write.version_id
             ),
@@ -122,8 +123,7 @@ async fn resolve_pending_write_file_id_in_transaction(
         .await?
     };
     let Some(file_id) = resolved else {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "pending file write: unable to resolve auto-generated file id for path '{}' in version '{}'",
                 path, write.version_id
             ),
@@ -197,7 +197,12 @@ impl Engine {
             )
             .await
             .map_err(|error| LixError {
-                message: format!("pending file writes collection failed: {}", error.message),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
+                    "pending file writes collection failed: {}",
+                    error.description
+                ),
             })?;
         let crate::filesystem::pending_file_writes::PendingFileWriteCollection {
             writes: pending_file_writes,
@@ -211,8 +216,7 @@ impl Engine {
                 active_version_id,
             )
             .await
-            .map_err(|error| LixError {
-                message: format!("pending file delete collection failed: {}", error.message),
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("pending file delete collection failed: {}", error.description),
             })?;
 
         let detected_file_changes_by_statement = if detect_plugin_file_changes {
@@ -238,9 +242,11 @@ impl Engine {
             )
             .await
             .map_err(|error| LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "filesystem update side-effect detection failed: {}",
-                    error.message
+                    error.description
                 ),
             })?;
         let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
@@ -382,7 +388,9 @@ impl Engine {
             self.plugin_component_cache
                 .lock()
                 .map_err(|_| LixError {
-                    message: "plugin component cache lock poisoned".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "plugin component cache lock poisoned".to_string(),
                 })?
                 .clone()
         };
@@ -414,13 +422,17 @@ impl Engine {
             )
             .await
             .map_err(|error| LixError {
-                message: format!("file detect stage failed: {}", error.message),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("file detect stage failed: {}", error.description),
             })?;
             detected_by_statement.push(dedupe_detected_file_changes(&detected));
         }
         {
             let mut guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-                message: "plugin component cache lock poisoned".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "plugin component cache lock poisoned".to_string(),
             })?;
             *guard = loaded_instances;
         }
@@ -692,24 +704,21 @@ impl Engine {
 
             let data = load_file_cache_blob(self.backend.as_ref(), file_id, version_id)
                 .await?
-                .ok_or_else(|| LixError {
-                    message: format!(
+                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "builtin binary fallback: missing file_data_cache bytes for file '{}' version '{}' while backfilling blob hash '{}'",
                         file_id, version_id, snapshot.blob_hash
                     ),
                 })?;
             let actual_hash = crate::plugin::runtime::binary_blob_hash_hex(&data);
             if actual_hash != snapshot.blob_hash {
-                return Err(LixError {
-                    message: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "builtin binary fallback: cache bytes hash mismatch for file '{}' version '{}': expected '{}' from state, got '{}'",
                         file_id, version_id, snapshot.blob_hash, actual_hash
                     ),
                 });
             }
             if data.len() as u64 != snapshot.size_bytes {
-                return Err(LixError {
-                    message: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "builtin binary fallback: cache bytes size mismatch for file '{}' version '{}': expected {} bytes from state, got {}",
                         file_id,
                         version_id,
@@ -753,24 +762,21 @@ impl Engine {
 
             let data = load_file_cache_blob_in_transaction(transaction, file_id, version_id)
                 .await?
-                .ok_or_else(|| LixError {
-                    message: format!(
+                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "builtin binary fallback: missing file_data_cache bytes for file '{}' version '{}' while backfilling blob hash '{}'",
                         file_id, version_id, snapshot.blob_hash
                     ),
                 })?;
             let actual_hash = crate::plugin::runtime::binary_blob_hash_hex(&data);
             if actual_hash != snapshot.blob_hash {
-                return Err(LixError {
-                    message: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "builtin binary fallback: cache bytes hash mismatch for file '{}' version '{}': expected '{}' from state, got '{}'",
                         file_id, version_id, snapshot.blob_hash, actual_hash
                     ),
                 });
             }
             if data.len() as u64 != snapshot.size_bytes {
-                return Err(LixError {
-                    message: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "builtin binary fallback: cache bytes size mismatch for file '{}' version '{}': expected {} bytes from state, got {}",
                         file_id,
                         version_id,
@@ -1009,7 +1015,9 @@ fn parse_builtin_binary_blob_ref_snapshot(
     raw: &str,
 ) -> Result<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot, LixError> {
     serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!(
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "builtin binary fallback: invalid lix_binary_blob_ref snapshot_content: {error}"
         ),
     })
@@ -1038,7 +1046,9 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target(
     let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
     if parsed.id != file_id {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
                 parsed.id, file_id
             ),
@@ -1070,7 +1080,9 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
     let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
     if parsed.id != file_id {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
                 parsed.id, file_id
             ),
@@ -1230,14 +1242,18 @@ async fn persist_binary_blob_with_fastcdc(
 
     let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
     let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
-        message: format!(
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "binary blob size exceeds supported range for file '{}' version '{}'",
             file_id, version_id
         ),
     })?;
     let chunk_ranges = fastcdc_chunk_ranges(data);
     let chunk_count = i64::try_from(chunk_ranges.len()).map_err(|_| LixError {
-        message: format!(
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "binary chunk count exceeds supported range for file '{}' version '{}'",
             file_id, version_id
         ),
@@ -1261,19 +1277,25 @@ async fn persist_binary_blob_with_fastcdc(
         let encoded_chunk = encode_binary_chunk_payload(&chunk_data)?;
         let chunk_hash = crate::plugin::runtime::binary_blob_hash_hex(&chunk_data);
         let chunk_size = i64::try_from(chunk_data.len()).map_err(|_| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "binary chunk size exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
             ),
         })?;
         let stored_chunk_size = i64::try_from(encoded_chunk.data.len()).map_err(|_| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "binary stored chunk size exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
             ),
         })?;
         let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "binary chunk index exceeds supported range for file '{}' version '{}'",
                 file_id, version_id
             ),
@@ -1364,7 +1386,9 @@ fn encode_binary_chunk_payload(chunk_data: &[u8]) -> Result<EncodedBinaryChunkPa
 #[cfg(not(target_arch = "wasm32"))]
 fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError> {
     zstd::bulk::compress(chunk_data, 3).map_err(|error| LixError {
-        message: format!("binary chunk compression failed: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("binary chunk compression failed: {error}"),
     })
 }
 
@@ -1380,7 +1404,9 @@ fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<Stri
     match row.get(index) {
         Some(Value::Text(value)) => Ok(value.clone()),
         _ => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "builtin binary fallback: expected text column '{}' at index {}",
                 column, index
             ),
@@ -1392,7 +1418,9 @@ fn blob_value_required(row: &[Value], index: usize, column: &str) -> Result<Vec<
     match row.get(index) {
         Some(Value::Blob(value)) => Ok(value.clone()),
         _ => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "builtin binary fallback: expected blob column '{}' at index {}",
                 column, index
             ),

@@ -321,10 +321,10 @@ simulation_test!(
             .expect_err("DO NOTHING should be rejected");
 
         assert!(
-            err.message
+            err.description
                 .contains("ON CONFLICT DO NOTHING is not supported"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -516,9 +516,9 @@ simulation_test!(
             .await
             .expect_err("expected schema validation failure");
         assert!(
-            err.message.contains("expects one of [string], got integer"),
+            err.description.contains("expects one of [string], got integer"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -894,11 +894,11 @@ simulation_test!(
             .await
             .expect_err("insert with unknown column should fail");
         assert!(
-            err.message.contains("strict rewrite violation")
-                && err.message.contains("unknown column")
-                && err.message.contains("bogus"),
+            err.description.contains("strict rewrite violation")
+                && err.description.contains("unknown column")
+                && err.description.contains("bogus"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -932,11 +932,11 @@ simulation_test!(
             .await
             .expect_err("update with unknown column should fail");
         assert!(
-            err.message.contains("strict rewrite violation")
-                && err.message.contains("unknown column")
-                && err.message.contains("bogus"),
+            err.description.contains("strict rewrite violation")
+                && err.description.contains("unknown column")
+                && err.description.contains("bogus"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -955,11 +955,11 @@ simulation_test!(
             .await
             .expect_err("delete with unknown predicate column should fail");
         assert!(
-            err.message.contains("strict rewrite violation")
-                && err.message.contains("unknown column")
-                && err.message.contains("bogus"),
+            err.description.contains("strict rewrite violation")
+                && err.description.contains("unknown column")
+                && err.description.contains("bogus"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -981,10 +981,10 @@ simulation_test!(
             .await
             .expect_err("insert into unsupported target should fail");
         assert!(
-            insert_err.message.contains("strict rewrite violation")
-                && insert_err.message.contains("unsupported INSERT target"),
+            insert_err.description.contains("strict rewrite violation")
+                && insert_err.description.contains("unsupported INSERT target"),
             "unexpected insert error: {}",
-            insert_err.message
+            insert_err.description
         );
 
         let update_err = engine
@@ -995,10 +995,10 @@ simulation_test!(
             .await
             .expect_err("update on unsupported target should fail");
         assert!(
-            update_err.message.contains("strict rewrite violation")
-                && update_err.message.contains("unsupported UPDATE target"),
+            update_err.description.contains("strict rewrite violation")
+                && update_err.description.contains("unsupported UPDATE target"),
             "unexpected update error: {}",
-            update_err.message
+            update_err.description
         );
 
         let delete_err = engine
@@ -1006,10 +1006,10 @@ simulation_test!(
             .await
             .expect_err("delete on unsupported target should fail");
         assert!(
-            delete_err.message.contains("strict rewrite violation")
-                && delete_err.message.contains("unsupported DELETE target"),
+            delete_err.description.contains("strict rewrite violation")
+                && delete_err.description.contains("unsupported DELETE target"),
             "unexpected delete error: {}",
-            delete_err.message
+            delete_err.description
         );
     }
 );

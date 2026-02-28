@@ -21,8 +21,7 @@ impl Engine {
         if let Some(row) = pointer_result.rows.first() {
             if let Some(Value::Text(snapshot_content)) = row.first() {
                 let snapshot: crate::builtin_schema::types::LixVersionPointer =
-                    serde_json::from_str(snapshot_content).map_err(|error| LixError {
-                        message: format!(
+                    serde_json::from_str(snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                             "version pointer snapshot_content invalid JSON while loading latest commit id: {error}"
                         ),
                     })?;
@@ -50,7 +49,9 @@ impl Engine {
             .is_some();
         if has_commits {
             return Err(LixError {
-                message:
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description:
                     "init invariant violation: commits exist but global version pointer is missing"
                         .to_string(),
             });
@@ -64,15 +65,21 @@ impl Engine {
             .execute("SELECT lix_uuid_v7()", &[], ExecuteOptions::default())
             .await?;
         let row = result.rows.first().ok_or_else(|| LixError {
-            message: "lix_uuid_v7 query returned no rows".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_uuid_v7 query returned no rows".to_string(),
         })?;
         let value = row.first().ok_or_else(|| LixError {
-            message: "lix_uuid_v7 query returned no columns".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_uuid_v7 query returned no columns".to_string(),
         })?;
         match value {
             Value::Text(text) => Ok(text.clone()),
             other => Err(LixError {
-                message: format!("lix_uuid_v7 query returned non-text value: {other:?}"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("lix_uuid_v7 query returned non-text value: {other:?}"),
             }),
         }
     }
@@ -99,13 +106,17 @@ impl Engine {
 
         if let Some(row) = result.rows.first() {
             let snapshot_content = row.first().ok_or_else(|| LixError {
-                message: "active version query row is missing snapshot_content".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "active version query row is missing snapshot_content".to_string(),
             })?;
             let snapshot_content = match snapshot_content {
                 Value::Text(value) => value.as_str(),
                 other => {
                     return Err(LixError {
-                        message: format!(
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "active version snapshot_content must be text, got {other:?}"
                         ),
                     })

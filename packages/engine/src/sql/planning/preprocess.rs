@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::{errors, LixBackend, LixError, SqlDialect, Value};
 
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::utils::parse_sql_statements;
@@ -66,7 +66,9 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
 
     if postprocess.is_some() && rewritten.len() != 1 {
         return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "postprocess rewrites require a single statement".to_string(),
         });
     }
 
@@ -132,7 +134,9 @@ where
 
     if postprocess.is_some() && rewritten.len() != 1 {
         return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "postprocess rewrites require a single statement".to_string(),
         });
     }
 
@@ -257,9 +261,7 @@ fn reject_disallowed_backend_catalog_reads(statements: &[Statement]) -> Result<(
         }
 
         if statement_matches_any_table(statement, DISALLOWED_TABLES) {
-            return Err(LixError {
-                message: "table not found".to_string(),
-            });
+            return Err(errors::table_not_found_read_error());
         }
     }
 
@@ -280,7 +282,9 @@ fn accumulate_rewrite_output<P: LixFunctionProvider>(
     if let Some(plan) = output.postprocess {
         if postprocess.is_some() {
             return Err(LixError {
-                message: "only one postprocess rewrite is supported per query".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "only one postprocess rewrite is supported per query".to_string(),
             });
         }
         *postprocess = Some(plan);

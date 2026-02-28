@@ -306,10 +306,10 @@ simulation_test!(
         };
         assert!(
             error
-                .message
+                .description
                 .contains("observe requires one or more SELECT statements"),
             "unexpected error message: {}",
-            error.message
+            error.description
         );
     }
 );

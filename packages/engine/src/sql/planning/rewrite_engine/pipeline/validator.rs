@@ -49,34 +49,46 @@ pub(crate) fn validate_phase_invariants(
 pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
     if output.statements.is_empty() {
         return Err(LixError {
-            message: "statement rewrite produced no statements".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "statement rewrite produced no statements".to_string(),
         });
     }
     if output.postprocess.is_some() && output.statements.len() != 1 {
         return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "postprocess rewrites require a single statement".to_string(),
         });
     }
     if output.postprocess.is_some() && !output.mutations.is_empty() {
         return Err(LixError {
-            message: "postprocess rewrites cannot emit mutation rows".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "postprocess rewrites cannot emit mutation rows".to_string(),
         });
     }
     if !output.update_validations.is_empty() && output.statements.len() != 1 {
         return Err(LixError {
-            message: "update validation rewrites require a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "update validation rewrites require a single statement".to_string(),
         });
     }
     if !output.mutations.is_empty() && !output.update_validations.is_empty() {
         return Err(LixError {
-            message: "mutation rewrites cannot emit update validations".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "mutation rewrites cannot emit update validations".to_string(),
         });
     }
     if !output.update_validations.is_empty()
         && !matches!(output.statements[0], sqlparser::ast::Statement::Update(_))
     {
         return Err(LixError {
-            message: "update validations require an UPDATE statement output".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "update validations require an UPDATE statement output".to_string(),
         });
     }
     if let Some(postprocess) = &output.postprocess {
@@ -84,7 +96,9 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
             PostprocessPlan::VtableUpdate(_) => {
                 if !matches!(output.statements[0], sqlparser::ast::Statement::Update(_)) {
                     return Err(LixError {
-                        message: "vtable update postprocess requires an UPDATE statement"
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "vtable update postprocess requires an UPDATE statement"
                             .to_string(),
                     });
                 }
@@ -95,8 +109,11 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
                     sqlparser::ast::Statement::Update(_) | sqlparser::ast::Statement::Delete(_)
                 ) {
                     return Err(LixError {
-                        message: "vtable delete postprocess requires an UPDATE or DELETE statement"
-                            .to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description:
+                            "vtable delete postprocess requires an UPDATE or DELETE statement"
+                                .to_string(),
                     });
                 }
             }
@@ -137,7 +154,9 @@ pub(crate) fn validate_no_unresolved_logical_read_views_except(
     }
 
     Err(LixError {
-        message: format!(
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "read rewrite left unresolved logical views: {}",
             unresolved.into_iter().collect::<Vec<_>>().join(", ")
         ),
@@ -177,7 +196,7 @@ mod tests {
         let context = AnalysisContext::from_query(&query);
         let err = validate_phase_invariants(RewritePhase::Canonicalize, &query, &context)
             .expect_err("canonical phase should reject unresolved state views");
-        assert!(err.message.contains("lix_state_by_version"));
+        assert!(err.description.contains("lix_state_by_version"));
     }
 
     #[test]
@@ -186,7 +205,7 @@ mod tests {
         let context = AnalysisContext::from_query(&query);
         let err = validate_phase_invariants(RewritePhase::Optimize, &query, &context)
             .expect_err("optimize phase should reject unresolved state views");
-        assert!(err.message.contains("lix_state_by_version"));
+        assert!(err.description.contains("lix_state_by_version"));
     }
 
     #[test]
@@ -216,7 +235,7 @@ mod tests {
 
         let err = validate_statement_output(&output)
             .expect_err("postprocess output with mutations should be rejected");
-        assert!(err.message.contains("cannot emit mutation rows"));
+        assert!(err.description.contains("cannot emit mutation rows"));
     }
 
     #[test]
@@ -240,7 +259,7 @@ mod tests {
         let err = validate_statement_output(&output)
             .expect_err("update validations with multiple statements should be rejected");
         assert!(err
-            .message
+            .description
             .contains("update validation rewrites require a single statement"));
     }
 
@@ -265,7 +284,7 @@ mod tests {
         let err = validate_statement_output(&output)
             .expect_err("update validation on query statement should be rejected");
         assert!(err
-            .message
+            .description
             .contains("update validations require an UPDATE statement output"));
     }
 
@@ -287,7 +306,7 @@ mod tests {
         let err = validate_statement_output(&output)
             .expect_err("vtable update postprocess on query statement should be rejected");
         assert!(err
-            .message
+            .description
             .contains("vtable update postprocess requires an UPDATE statement"));
     }
 
@@ -309,7 +328,7 @@ mod tests {
         let err = validate_statement_output(&output)
             .expect_err("vtable delete postprocess on query statement should be rejected");
         assert!(err
-            .message
+            .description
             .contains("vtable delete postprocess requires an UPDATE or DELETE statement"));
     }
 }

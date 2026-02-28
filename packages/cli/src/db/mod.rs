@@ -44,7 +44,7 @@ pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
         CliError::msg(format!(
             "failed to open sqlite backend at {}: {}",
             path.display(),
-            err.message
+            err
         ))
     })?;
 
@@ -57,7 +57,7 @@ pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
         CliError::msg(format!(
             "failed to open lix database at {}: {}",
             path.display(),
-            err.message
+            err
         ))
     })
 }

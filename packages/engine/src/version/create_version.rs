@@ -123,23 +123,19 @@ fn first_row<'a>(result: &'a QueryResult, context: &str) -> Result<&'a [Value], 
         .rows
         .first()
         .map(std::vec::Vec::as_slice)
-        .ok_or_else(|| LixError {
-            message: format!("missing {context}"),
+        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("missing {context}"),
         })
 }
 
 fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
     match row.get(index) {
         Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
-        Some(Value::Text(_)) => Err(LixError {
-            message: format!("{field} is empty"),
+        Some(Value::Text(_)) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{field} is empty"),
         }),
         Some(Value::Integer(value)) => Ok(value.to_string()),
-        Some(other) => Err(LixError {
-            message: format!("expected text-like value for {field}, got {other:?}"),
+        Some(other) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("expected text-like value for {field}, got {other:?}"),
         }),
-        None => Err(LixError {
-            message: format!("missing {field}"),
+        None => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("missing {field}"),
         }),
     }
 }
@@ -149,8 +145,7 @@ fn normalize_optional_non_empty_text(
     field: &str,
 ) -> Result<Option<String>, LixError> {
     match value {
-        Some(value) if value.trim().is_empty() => Err(LixError {
-            message: format!("{field} must be a non-empty string when provided"),
+        Some(value) if value.trim().is_empty() => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{field} must be a non-empty string when provided"),
         }),
         Some(value) => Ok(Some(value)),
         None => Ok(None),
@@ -163,8 +158,7 @@ async fn ensure_commit_edge(
     child_id: &str,
 ) -> Result<(), LixError> {
     if parent_id == child_id {
-        return Err(LixError {
-            message: format!("refusing self-edge for commit '{parent_id}'"),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("refusing self-edge for commit '{parent_id}'"),
         });
     }
 

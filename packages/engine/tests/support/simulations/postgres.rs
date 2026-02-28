@@ -54,13 +54,19 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
                 let _ = std::fs::remove_file(pg.settings().password_file.clone());
             }
             std::fs::create_dir_all(pg.settings().data_dir.clone()).map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
             pg.setup().await.map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
             pg.start().await.map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
 
             let settings = pg.settings().clone();
@@ -96,7 +102,9 @@ pub fn postgres_simulation() -> Simulation {
                 {
                     let pg = instance.postgresql.lock().await;
                     pg.create_database(&db_name).await.map_err(|err| LixError {
-                        message: err.to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: err.to_string(),
                     })?;
                 }
 
@@ -150,7 +158,9 @@ impl PostgresBackend {
                 PgPool::connect(&self.config.connection_string)
                     .await
                     .map_err(|err| LixError {
-                        message: err.to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: err.to_string(),
                     })
             })
             .await
@@ -168,7 +178,9 @@ impl LixBackend for PostgresBackend {
 
         if params.is_empty() && sql.contains(';') {
             pool.execute(sql).await.map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -183,7 +195,9 @@ impl LixBackend for PostgresBackend {
         }
 
         let rows = query.fetch_all(pool).await.map_err(|err| LixError {
-            message: err.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.to_string(),
         })?;
         let columns = rows
             .first()
@@ -213,13 +227,17 @@ impl LixBackend for PostgresBackend {
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|err| LixError {
-            message: err.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.to_string(),
         })?;
         sqlx::query("BEGIN")
             .execute(&mut *conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         Ok(Box::new(PostgresBackendTransaction { conn }))
     }
@@ -234,7 +252,9 @@ impl LixTransaction for PostgresBackendTransaction {
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         if params.is_empty() && sql.contains(';') {
             self.conn.execute(sql).await.map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -251,7 +271,9 @@ impl LixTransaction for PostgresBackendTransaction {
             .fetch_all(&mut *self.conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         let columns = rows
             .first()
@@ -283,7 +305,9 @@ impl LixTransaction for PostgresBackendTransaction {
             .execute(&mut *self.conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         Ok(())
     }
@@ -293,7 +317,9 @@ impl LixTransaction for PostgresBackendTransaction {
             .execute(&mut *self.conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         Ok(())
     }
@@ -317,7 +343,9 @@ fn map_postgres_value(row: &sqlx::postgres::PgRow, index: usize) -> Result<Value
     if row
         .try_get_raw(index)
         .map_err(|err| LixError {
-            message: err.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.to_string(),
         })?
         .is_null()
     {
@@ -402,7 +430,9 @@ async fn acquire_lock(path: &std::path::Path) -> Result<FileLock, LixError> {
 
                 if started.elapsed() > timeout {
                     return Err(LixError {
-                        message: format!(
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "Timed out acquiring postgres simulation lock at {}",
                             path.display()
                         ),
@@ -413,7 +443,9 @@ async fn acquire_lock(path: &std::path::Path) -> Result<FileLock, LixError> {
             }
             Err(error) => {
                 return Err(LixError {
-                    message: format!(
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!(
                         "Failed to acquire postgres simulation lock at {}: {}",
                         path.display(),
                         error
@@ -440,7 +472,11 @@ fn cleanup_stale_embedded_postgres_processes() -> Result<(), LixError> {
         .args(["-ax", "-o", "pid=,command="])
         .output()
         .map_err(|error| LixError {
-            message: format!("failed to list processes for postgres simulation cleanup: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
+                "failed to list processes for postgres simulation cleanup: {error}"
+            ),
         })?;
 
     let listing = String::from_utf8_lossy(&output.stdout);

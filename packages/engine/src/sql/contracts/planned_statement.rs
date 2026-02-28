@@ -55,7 +55,9 @@ impl PlannedStatementSet {
             [statement] => Ok(statement.params.as_slice()),
             [] => Ok(&[]),
             _ => Err(LixError {
-                message: "preprocess output expected a single prepared statement".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "preprocess output expected a single prepared statement".to_string(),
             }),
         }
     }

@@ -129,7 +129,9 @@ impl<'a> EngineTransaction<'a> {
     ) -> Result<QueryResult, LixError> {
         let previous_active_version_id = self.active_version_id.clone();
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
-            message: "transaction is no longer active".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "transaction is no longer active".to_string(),
         })?;
         let result = self
             .engine
@@ -155,7 +157,9 @@ impl<'a> EngineTransaction<'a> {
 
     pub async fn commit(mut self) -> Result<(), LixError> {
         let transaction = self.transaction.take().ok_or_else(|| LixError {
-            message: "transaction is no longer active".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "transaction is no longer active".to_string(),
         })?;
         transaction.commit().await?;
         if self.active_version_changed {
@@ -173,7 +177,9 @@ impl<'a> EngineTransaction<'a> {
 
     pub async fn rollback(mut self) -> Result<(), LixError> {
         let transaction = self.transaction.take().ok_or_else(|| LixError {
-            message: "transaction is no longer active".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "transaction is no longer active".to_string(),
         })?;
         transaction.rollback().await
     }
@@ -212,20 +218,14 @@ pub(crate) struct DeferredTransactionSideEffects {
 
 fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
     if sql.to_ascii_lowercase().contains("lix_internal_") {
-        return Err(LixError {
-            message:
-                "queries against lix_internal_* tables are not allowed; use public lix_* views"
-                    .to_string(),
-        });
+        return Err(crate::errors::internal_table_access_denied_error());
     }
     Ok(())
 }
 
 pub(crate) fn normalize_missing_relation_error(error: LixError) -> LixError {
     if crate::error_classification::is_missing_relation_error(&error) {
-        return LixError {
-            message: "table not found".to_string(),
-        };
+        return crate::errors::table_not_found_read_error();
     }
     error
 }
@@ -261,7 +261,9 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let mut guard = self.transaction.lock().map_err(|_| LixError {
-            message: "transaction adapter lock poisoned".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "transaction adapter lock poisoned".to_string(),
         })?;
         // SAFETY: the pointer is created from a live `&mut dyn LixTransaction` and
         // this mutex serializes all calls so the mutable borrow is not aliased.
@@ -270,7 +272,9 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         Err(LixError {
-            message: "nested transactions are not supported".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "nested transactions are not supported".to_string(),
         })
     }
 }
@@ -408,24 +412,33 @@ fn collect_postprocess_file_cache_targets(
     for row in rows {
         let Some(file_id) = row.get(1) else {
             return Err(LixError {
-                message: "postprocess file cache refresh expected file_id column".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "postprocess file cache refresh expected file_id column".to_string(),
             });
         };
         let Some(version_id) = row.get(2) else {
             return Err(LixError {
-                message: "postprocess file cache refresh expected version_id column".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "postprocess file cache refresh expected version_id column"
+                    .to_string(),
             });
         };
         let Value::Text(file_id) = file_id else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "postprocess file cache refresh expected text file_id, got {file_id:?}"
                 ),
             });
         };
         let Value::Text(version_id) = version_id else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "postprocess file cache refresh expected text version_id, got {version_id:?}"
                 ),
             });
@@ -533,13 +546,17 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
         .get("x-lix-key")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
-            message: "builtin schema must define string x-lix-key".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "builtin schema must define string x-lix-key".to_string(),
         })?;
     let schema_version = schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
-            message: "builtin schema must define string x-lix-version".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "builtin schema must define string x-lix-version".to_string(),
         })?;
 
     Ok(format!("{schema_key}~{schema_version}"))
@@ -658,7 +675,9 @@ mod tests {
             }
             if sql.to_ascii_lowercase().contains("unknown_table") {
                 return Err(LixError {
-                    message: "no such table: unknown_table".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "no such table: unknown_table".to_string(),
                 });
             }
             Ok(QueryResult {
@@ -834,7 +853,7 @@ mod tests {
             .await
             .expect_err("unknown relation query should fail");
 
-        assert_eq!(error.message, "table not found");
+        assert_eq!(error.code, "LIX_ERROR_TABLE_NOT_FOUND");
     }
 
     #[test]

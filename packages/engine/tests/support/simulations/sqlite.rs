@@ -59,7 +59,9 @@ impl SqliteBackend {
 
                 let options = SqliteConnectOptions::from_str(&conn)
                     .map_err(|err| LixError {
-                        message: err.to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: err.to_string(),
                     })?
                     .foreign_keys(true);
 
@@ -67,7 +69,9 @@ impl SqliteBackend {
                     .connect_with(options)
                     .await
                     .map_err(|err| LixError {
-                        message: err.to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: err.to_string(),
                     })
             })
             .await
@@ -85,7 +89,9 @@ impl LixBackend for SqliteBackend {
 
         if params.is_empty() && sql.contains(';') {
             pool.execute(sql).await.map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -100,7 +106,9 @@ impl LixBackend for SqliteBackend {
         }
 
         let rows = query.fetch_all(pool).await.map_err(|err| LixError {
-            message: err.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.to_string(),
         })?;
         let columns = rows
             .first()
@@ -130,13 +138,17 @@ impl LixBackend for SqliteBackend {
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|err| LixError {
-            message: err.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.to_string(),
         })?;
         sqlx::query("BEGIN")
             .execute(&mut *conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         Ok(Box::new(SqliteBackendTransaction { conn }))
     }
@@ -151,7 +163,9 @@ impl LixTransaction for SqliteBackendTransaction {
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         if params.is_empty() && sql.contains(';') {
             self.conn.execute(sql).await.map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -168,7 +182,9 @@ impl LixTransaction for SqliteBackendTransaction {
             .fetch_all(&mut *self.conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         let columns = rows
             .first()
@@ -200,7 +216,9 @@ impl LixTransaction for SqliteBackendTransaction {
             .execute(&mut *self.conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         Ok(())
     }
@@ -210,7 +228,9 @@ impl LixTransaction for SqliteBackendTransaction {
             .execute(&mut *self.conn)
             .await
             .map_err(|err| LixError {
-                message: err.to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: err.to_string(),
             })?;
         Ok(())
     }
@@ -234,7 +254,9 @@ fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value
     if row
         .try_get_raw(index)
         .map_err(|err| LixError {
-            message: err.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.to_string(),
         })?
         .is_null()
     {

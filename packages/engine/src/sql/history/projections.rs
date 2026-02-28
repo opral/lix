@@ -465,13 +465,17 @@ async fn refresh_working_change_projection_with_backend(
 fn text_column(row: &[Value], index: usize, name: &str) -> Result<String, LixError> {
     let Some(value) = row.get(index) else {
         return Err(LixError {
-            message: format!("working projection row is missing '{name}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("working projection row is missing '{name}'"),
         });
     };
     match value {
         Value::Text(text) => Ok(text.clone()),
         other => Err(LixError {
-            message: format!("working projection '{name}' must be text, got {other:?}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("working projection '{name}' must be text, got {other:?}"),
         }),
     }
 }
@@ -490,7 +494,9 @@ fn first_row_json_text_field(
         Value::Null => Ok(None),
         Value::Text(raw) => parse_json_text_field(raw, field),
         other => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "working projection expected JSON snapshot text for '{field}', got {other:?}"
             ),
         }),
@@ -508,7 +514,9 @@ fn first_row_text(result: &QueryResult) -> Result<Option<String>, LixError> {
         Value::Null => Ok(None),
         Value::Text(raw) => Ok(Some(raw.clone())),
         other => Err(LixError {
-            message: format!("working projection expected JSON snapshot text, got {other:?}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("working projection expected JSON snapshot text, got {other:?}"),
         }),
     }
 }
@@ -521,14 +529,18 @@ fn build_working_commit_projection_snapshot(
 ) -> Result<String, LixError> {
     let mut snapshot = if let Some(raw_snapshot) = raw_snapshot {
         serde_json::from_str::<JsonValue>(raw_snapshot).map_err(|error| LixError {
-            message: format!("working projection commit snapshot invalid JSON: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("working projection commit snapshot invalid JSON: {error}"),
         })?
     } else {
         JsonValue::Object(serde_json::Map::new())
     };
     let Some(object) = snapshot.as_object_mut() else {
         return Err(LixError {
-            message: "working projection commit snapshot must be a JSON object".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "working projection commit snapshot must be a JSON object".to_string(),
         });
     };
 
@@ -565,7 +577,9 @@ fn build_working_commit_projection_snapshot(
 
 fn parse_json_text_field(raw: &str, field: &str) -> Result<Option<String>, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection snapshot_content invalid JSON: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("working projection snapshot_content invalid JSON: {error}"),
     })?;
     let value = parsed
         .get(field)
@@ -608,10 +622,14 @@ fn optional_json_column(value: Option<&Value>, name: &str) -> Result<JsonValue, 
     match value {
         Value::Null => Ok(JsonValue::Null),
         Value::Text(raw) => serde_json::from_str(raw).map_err(|error| LixError {
-            message: format!("working projection '{name}' invalid JSON: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("working projection '{name}' invalid JSON: {error}"),
         }),
         other => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "working projection '{name}' must be JSON text or null, got {other:?}"
             ),
         }),
@@ -620,7 +638,9 @@ fn optional_json_column(value: Option<&Value>, name: &str) -> Result<JsonValue, 
 
 fn parse_commit_snapshot(raw: &str) -> Result<Option<(String, String)>, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection commit snapshot invalid JSON: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("working projection commit snapshot invalid JSON: {error}"),
     })?;
     let commit_id = parsed
         .get("id")
@@ -640,7 +660,9 @@ fn parse_commit_snapshot(raw: &str) -> Result<Option<(String, String)>, LixError
 
 fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<(String, String)>, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection commit_edge snapshot invalid JSON: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("working projection commit_edge snapshot invalid JSON: {error}"),
     })?;
     let parent_id = parsed
         .get("parent_id")
@@ -663,7 +685,11 @@ fn parse_change_set_element_snapshot(
     created_at: String,
 ) -> Result<Option<WorkingProjectionChangeSetElement>, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("working projection change_set_element snapshot invalid JSON: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
+            "working projection change_set_element snapshot invalid JSON: {error}"
+        ),
     })?;
     let change_set_id = parsed
         .get("change_set_id")
@@ -721,7 +747,7 @@ fn build_working_projection_change_id(
 }
 
 fn is_missing_internal_relation_error(error: &LixError) -> bool {
-    let message = error.message.to_ascii_lowercase();
+    let message = error.description.to_ascii_lowercase();
     is_missing_relation_error(error)
         && (message.contains("lix_internal_state_materialized_v1_")
             || message.contains("lix_internal_state_untracked")

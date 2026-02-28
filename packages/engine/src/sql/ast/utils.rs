@@ -38,7 +38,9 @@ pub(crate) struct ResolvedCell {
 
 pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })
 }
 
@@ -203,13 +205,14 @@ pub(crate) fn resolve_placeholder_index(
         parsed - 1
     } else {
         return Err(LixError {
-            message: format!("unsupported SQL placeholder format '{trimmed}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("unsupported SQL placeholder format '{trimmed}'"),
         });
     };
 
     if source_index >= params_len {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "placeholder '{trimmed}' references parameter {} but only {} parameters were provided",
                 source_index + 1,
                 params_len
@@ -243,11 +246,15 @@ fn placeholder_for_dialect(dialect: SqlDialect, dense_index_1_based: usize) -> S
 
 fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     let parsed = numeric.parse::<usize>().map_err(|_| LixError {
-        message: format!("invalid SQL placeholder '{token}'"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("invalid SQL placeholder '{token}'"),
     })?;
     if parsed == 0 {
         return Err(LixError {
-            message: format!("invalid SQL placeholder '{token}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("invalid SQL placeholder '{token}'"),
         });
     }
     Ok(parsed)
@@ -299,7 +306,9 @@ fn resolve_lix_text_encode_function(
     let args = function_args(function, "lix_text_encode()")?;
     if !(1..=2).contains(&args.len()) {
         return Err(LixError {
-            message: "lix_text_encode() requires 1 or 2 arguments".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_text_encode() requires 1 or 2 arguments".to_string(),
         });
     }
     let value_expr = function_arg_expr(&args[0], "lix_text_encode()")?;
@@ -313,7 +322,9 @@ fn resolve_lix_text_encode_function(
     let encoding = resolve_codec_encoding_arg(args.get(1), "lix_text_encode()", params, state)?;
     if encoding != "UTF8" {
         return Err(LixError {
-            message: format!("lix_text_encode() only supports UTF8 encoding, got '{encoding}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("lix_text_encode() only supports UTF8 encoding, got '{encoding}'"),
         });
     }
     match value {
@@ -326,7 +337,9 @@ fn resolve_lix_text_encode_function(
             placeholder_index: resolved.placeholder_index,
         })),
         other => Err(LixError {
-            message: format!("lix_text_encode() expects text input, got {other:?}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("lix_text_encode() expects text input, got {other:?}"),
         }),
     }
 }
@@ -342,7 +355,9 @@ fn resolve_lix_text_decode_function(
     let args = function_args(function, "lix_text_decode()")?;
     if !(1..=2).contains(&args.len()) {
         return Err(LixError {
-            message: "lix_text_decode() requires 1 or 2 arguments".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_text_decode() requires 1 or 2 arguments".to_string(),
         });
     }
     let value_expr = function_arg_expr(&args[0], "lix_text_decode()")?;
@@ -356,13 +371,17 @@ fn resolve_lix_text_decode_function(
     let encoding = resolve_codec_encoding_arg(args.get(1), "lix_text_decode()", params, state)?;
     if encoding != "UTF8" {
         return Err(LixError {
-            message: format!("lix_text_decode() only supports UTF8 encoding, got '{encoding}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("lix_text_decode() only supports UTF8 encoding, got '{encoding}'"),
         });
     }
     match value {
         Value::Blob(bytes) => {
             let text = String::from_utf8(bytes).map_err(|error| LixError {
-                message: format!("lix_text_decode() input is not valid UTF8: {error}"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("lix_text_decode() input is not valid UTF8: {error}"),
             })?;
             Ok(Some(ResolvedCell {
                 value: Some(Value::Text(text)),
@@ -374,7 +393,9 @@ fn resolve_lix_text_decode_function(
             placeholder_index: resolved.placeholder_index,
         })),
         other => Err(LixError {
-            message: format!("lix_text_decode() expects bytes input, got {other:?}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("lix_text_decode() expects bytes input, got {other:?}"),
         }),
     }
 }
@@ -392,13 +413,17 @@ fn function_args<'a>(function: &'a Function, fn_name: &str) -> Result<&'a [Funct
         FunctionArguments::List(list) => {
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(LixError {
-                    message: format!("{fn_name} does not support DISTINCT/ALL/clauses"),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("{fn_name} does not support DISTINCT/ALL/clauses"),
                 });
             }
             Ok(&list.args)
         }
         _ => Err(LixError {
-            message: format!("{fn_name} requires a regular argument list"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{fn_name} requires a regular argument list"),
         }),
     }
 }
@@ -408,14 +433,18 @@ fn function_arg_expr<'a>(arg: &'a FunctionArg, fn_name: &str) -> Result<&'a Expr
         FunctionArg::Unnamed(arg) => arg,
         _ => {
             return Err(LixError {
-                message: format!("{fn_name} does not support named arguments"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("{fn_name} does not support named arguments"),
             });
         }
     };
     match inner {
         FunctionArgExpr::Expr(expr) => Ok(expr),
         _ => Err(LixError {
-            message: format!("{fn_name} arguments must be SQL expressions"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{fn_name} arguments must be SQL expressions"),
         }),
     }
 }
@@ -433,12 +462,16 @@ fn resolve_codec_encoding_arg(
     let resolved = resolve_expr(expr, params, state)?;
     let Some(value) = resolved.value else {
         return Err(LixError {
-            message: format!("{fn_name} encoding argument must resolve to text"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{fn_name} encoding argument must resolve to text"),
         });
     };
     let Value::Text(encoding) = value else {
         return Err(LixError {
-            message: format!("{fn_name} encoding argument must be text"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{fn_name} encoding argument must be text"),
         });
     };
     let normalized = encoding.trim().to_ascii_uppercase().replace('-', "");
@@ -454,7 +487,9 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
                 Ok(Value::Real(real))
             } else {
                 Err(LixError {
-                    message: format!("unsupported numeric literal '{raw}'"),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("unsupported numeric literal '{raw}'"),
                 })
             }
         }
@@ -478,7 +513,9 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
         SqlValue::Boolean(value) => Ok(Value::Boolean(*value)),
         SqlValue::Null => Ok(Value::Null),
         SqlValue::Placeholder(token) => Err(LixError {
-            message: format!("unexpected placeholder '{token}' while resolving row"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("unexpected placeholder '{token}' while resolving row"),
         }),
     }
 }
@@ -486,7 +523,9 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
 fn parse_hex_literal(text: &str) -> Result<Vec<u8>, LixError> {
     if text.len() % 2 != 0 {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "hex literal must contain an even number of digits, got {}",
                 text.len()
             ),
@@ -511,7 +550,9 @@ fn hex_nibble(byte: u8) -> Result<u8, LixError> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(LixError {
-            message: format!("invalid hex digit '{}'", char::from(byte)),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("invalid hex digit '{}'", char::from(byte)),
         }),
     }
 }

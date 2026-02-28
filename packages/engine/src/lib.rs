@@ -10,6 +10,7 @@ mod deterministic_mode;
 mod engine;
 mod error;
 mod error_classification;
+mod errors;
 mod filesystem;
 mod functions;
 mod init;
@@ -45,6 +46,7 @@ pub use engine::{
     boot, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction, EngineTransactionFuture,
     ExecuteOptions,
 };
+pub use errors::ErrorCode;
 pub use error::LixError;
 pub use materialization::{
     apply_materialization_plan, materialization_plan, materialize, InheritanceWinnerDebugRow,

@@ -22,8 +22,7 @@ struct SqliteTransaction<'a> {
 
 impl SqliteBackend {
     pub fn in_memory() -> Result<Self, LixError> {
-        let conn = Connection::open_in_memory().map_err(|err| LixError {
-            message: err.to_string(),
+        let conn = Connection::open_in_memory().map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -31,8 +30,7 @@ impl SqliteBackend {
     }
 
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LixError> {
-        let conn = Connection::open(path).map_err(|err| LixError {
-            message: err.to_string(),
+        let conn = Connection::open(path).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -47,19 +45,16 @@ impl LixBackend for SqliteBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let conn = self.conn.lock().map_err(|_| LixError {
-            message: "sqlite mutex poisoned".to_string(),
+        let conn = self.conn.lock().map_err(|_| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "sqlite mutex poisoned".to_string(),
         })?;
         execute_sql(&conn, sql, params)
     }
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-        let conn = self.conn.lock().map_err(|_| LixError {
-            message: "sqlite mutex poisoned".to_string(),
+        let conn = self.conn.lock().map_err(|_| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "sqlite mutex poisoned".to_string(),
         })?;
         conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")
-            .map_err(|err| LixError {
-                message: err.to_string(),
+            .map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
             })?;
 
         Ok(Box::new(SqliteTransaction {
@@ -69,24 +64,20 @@ impl LixBackend for SqliteBackend {
     }
 
     async fn export_snapshot(&self, writer: &mut dyn SnapshotChunkWriter) -> Result<(), LixError> {
-        let conn = self.conn.lock().map_err(|_| LixError {
-            message: "sqlite mutex poisoned".to_string(),
+        let conn = self.conn.lock().map_err(|_| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "sqlite mutex poisoned".to_string(),
         })?;
         let snapshot_path = temp_snapshot_path("export");
 
         let export_result = (|| -> Result<(), LixError> {
-            let mut snapshot_conn = Connection::open(&snapshot_path).map_err(|err| LixError {
-                message: err.to_string(),
+            let mut snapshot_conn = Connection::open(&snapshot_path).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
             })?;
-            let backup = Backup::new(&conn, &mut snapshot_conn).map_err(|err| LixError {
-                message: err.to_string(),
+            let backup = Backup::new(&conn, &mut snapshot_conn).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
             })?;
             run_backup_to_completion(&backup)?;
             Ok(())
         })();
 
-        let bytes = std::fs::read(&snapshot_path).map_err(|err| LixError {
-            message: err.to_string(),
+        let bytes = std::fs::read(&snapshot_path).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         });
         let _ = std::fs::remove_file(&snapshot_path);
         export_result?;
@@ -108,25 +99,20 @@ impl LixBackend for SqliteBackend {
             bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
-            return Err(LixError {
-                message: "snapshot stream is empty".to_string(),
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "snapshot stream is empty".to_string(),
             });
         }
 
         let snapshot_path = temp_snapshot_path("restore");
-        std::fs::write(&snapshot_path, &bytes).map_err(|err| LixError {
-            message: err.to_string(),
+        std::fs::write(&snapshot_path, &bytes).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
 
         let restore_result = (|| -> Result<(), LixError> {
-            let source_conn = Connection::open(&snapshot_path).map_err(|err| LixError {
-                message: err.to_string(),
+            let source_conn = Connection::open(&snapshot_path).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
             })?;
-            let mut conn = self.conn.lock().map_err(|_| LixError {
-                message: "sqlite mutex poisoned".to_string(),
+            let mut conn = self.conn.lock().map_err(|_| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "sqlite mutex poisoned".to_string(),
             })?;
-            let backup = Backup::new(&source_conn, &mut conn).map_err(|err| LixError {
-                message: err.to_string(),
+            let backup = Backup::new(&source_conn, &mut conn).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
             })?;
             run_backup_to_completion(&backup)?;
             Ok(())
@@ -147,8 +133,7 @@ impl LixTransaction for SqliteTransaction<'_> {
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
-        self.conn.execute_batch("COMMIT").map_err(|err| LixError {
-            message: err.to_string(),
+        self.conn.execute_batch("COMMIT").map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
         self.finalized = true;
         Ok(())
@@ -157,8 +142,7 @@ impl LixTransaction for SqliteTransaction<'_> {
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
         self.conn
             .execute_batch("ROLLBACK")
-            .map_err(|err| LixError {
-                message: err.to_string(),
+            .map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
             })?;
         self.finalized = true;
         Ok(())
@@ -175,8 +159,7 @@ impl Drop for SqliteTransaction<'_> {
 
 fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
     if params.is_empty() && sql.contains(';') {
-        conn.execute_batch(sql).map_err(|err| LixError {
-            message: err.to_string(),
+        conn.execute_batch(sql).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
         return Ok(QueryResult {
             rows: Vec::new(),
@@ -184,8 +167,7 @@ fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryRe
         });
     }
 
-    let mut stmt = conn.prepare(sql).map_err(|err| LixError {
-        message: err.to_string(),
+    let mut stmt = conn.prepare(sql).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
     })?;
     let columns = stmt
         .column_names()
@@ -195,12 +177,10 @@ fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryRe
     let bound_params = params.iter().cloned().map(to_sql_value);
     let mut rows = stmt
         .query(params_from_iter(bound_params))
-        .map_err(|err| LixError {
-            message: err.to_string(),
+        .map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
     let mut result_rows = Vec::new();
-    while let Some(row) = rows.next().map_err(|err| LixError {
-        message: err.to_string(),
+    while let Some(row) = rows.next().map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
     })? {
         result_rows.push(map_row(row)?);
     }
@@ -212,8 +192,7 @@ fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<QueryRe
 
 fn run_backup_to_completion(backup: &Backup<'_, '_>) -> Result<(), LixError> {
     loop {
-        match backup.step(-1).map_err(|err| LixError {
-            message: err.to_string(),
+        match backup.step(-1).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })? {
             StepResult::Done => return Ok(()),
             StepResult::More => continue,
@@ -237,8 +216,7 @@ fn temp_snapshot_path(operation: &str) -> PathBuf {
 fn map_row(row: &Row<'_>) -> Result<Vec<Value>, LixError> {
     let mut values = Vec::new();
     for idx in 0..row.as_ref().column_count() {
-        let value = row.get_ref(idx).map_err(|err| LixError {
-            message: err.to_string(),
+        let value = row.get_ref(idx).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.to_string(),
         })?;
         values.push(match value {
             rusqlite::types::ValueRef::Null => Value::Null,

@@ -70,13 +70,11 @@ pub(crate) fn active_version_snapshot_content(entity_id: &str, version_id: &str)
 
 pub(crate) fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
     let parsed: LixActiveVersion =
-        serde_json::from_str(snapshot_content).map_err(|error| LixError {
-            message: format!("active version snapshot_content invalid JSON: {error}"),
+        serde_json::from_str(snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("active version snapshot_content invalid JSON: {error}"),
         })?;
 
     if parsed.version_id.is_empty() {
-        return Err(LixError {
-            message: "active version must not be empty".to_string(),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active version must not be empty".to_string(),
         });
     }
 

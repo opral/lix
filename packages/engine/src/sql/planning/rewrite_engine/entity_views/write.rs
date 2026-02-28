@@ -22,7 +22,7 @@ use crate::engine::sql::planning::rewrite_engine::{
     resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
-use crate::{LixBackend, LixError, Value as EngineValue};
+use crate::{errors, LixBackend, LixError, Value as EngineValue};
 
 use super::target::{
     resolve_target_from_object_name, resolve_target_from_object_name_with_backend,
@@ -177,7 +177,9 @@ where
     let is_default_values_insert = insert.columns.is_empty() && insert.source.is_none();
     if insert.columns.is_empty() && !is_default_values_insert {
         return Err(LixError {
-            message: format!("{} insert requires explicit columns", target.view_name),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} insert requires explicit columns", target.view_name),
         });
     }
     if is_default_values_insert {
@@ -199,11 +201,15 @@ where
         }));
     }
     let source = insert.source.as_mut().ok_or_else(|| LixError {
-        message: format!("{} insert requires VALUES rows", target.view_name),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("{} insert requires VALUES rows", target.view_name),
     })?;
     let SetExpr::Values(values) = source.body.as_mut() else {
         return Err(LixError {
-            message: format!("{} insert requires VALUES rows", target.view_name),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} insert requires VALUES rows", target.view_name),
         });
     };
 
@@ -213,7 +219,9 @@ where
     }
     if column_index.contains_key("schema_key") || column_index.contains_key("lixcol_schema_key") {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert cannot set schema_key; view schema is fixed",
                 target.view_name
             ),
@@ -226,7 +234,9 @@ where
     );
     if snapshot_index.is_some() {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert cannot set snapshot_content directly; set schema properties instead",
                 target.view_name
             ),
@@ -237,7 +247,9 @@ where
             || column_index.contains_key("lixcol_version_id"))
     {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert cannot set version_id; version scope is resolved by the view/schema",
                 target.view_name
             ),
@@ -265,7 +277,9 @@ where
     for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
         if row.len() != insert.columns.len() {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} insert row length does not match column count",
                     target.view_name
                 ),
@@ -333,7 +347,9 @@ where
                         Some(value) => string_literal_expr(value),
                         None => {
                             return Err(LixError {
-                                message: format!(
+                                code: "LIX_ERROR_UNKNOWN".to_string(),
+                                title: "Unknown error".to_string(),
+                                description: format!(
                                 "{} insert requires lixcol_version_id or schema default override",
                                 target.view_name
                             ),
@@ -405,7 +421,9 @@ fn validate_and_strip_insert_on_conflict(
 
     let OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert only supports ON CONFLICT ... DO UPDATE",
                 view_name
             ),
@@ -416,7 +434,9 @@ fn validate_and_strip_insert_on_conflict(
         Some(ConflictTarget::Columns(columns)) if !columns.is_empty() => {}
         Some(_) => {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} insert ON CONFLICT only supports explicit column targets",
                     view_name
                 ),
@@ -424,7 +444,9 @@ fn validate_and_strip_insert_on_conflict(
         }
         None => {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} insert ON CONFLICT requires explicit conflict columns",
                     view_name
                 ),
@@ -436,7 +458,9 @@ fn validate_and_strip_insert_on_conflict(
         OnConflictAction::DoUpdate(update) => {
             if update.selection.is_some() {
                 return Err(LixError {
-                    message: format!(
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!(
                         "{} insert ON CONFLICT DO UPDATE does not support WHERE",
                         view_name
                     ),
@@ -449,7 +473,9 @@ fn validate_and_strip_insert_on_conflict(
                 Ok(())
             } else {
                 Err(LixError {
-                    message: format!(
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!(
                         "{} insert ON CONFLICT DO NOTHING is not supported",
                         view_name
                     ),
@@ -491,7 +517,9 @@ fn rewrite_update_with_target(
         derive_entity_id_predicate_from_where(update.selection.as_ref(), target);
     if !update.table.joins.is_empty() {
         return Err(LixError {
-            message: format!("{} update does not support JOIN targets", target.view_name),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} update does not support JOIN targets", target.view_name),
         });
     }
     set_update_target_table(&mut update.table, write_variant)?;
@@ -502,7 +530,9 @@ fn rewrite_update_with_target(
     for mut assignment in update.assignments {
         let AssignmentTarget::ColumnName(column_name) = &mut assignment.target else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} update does not support tuple assignments",
                     target.view_name
                 ),
@@ -510,7 +540,9 @@ fn rewrite_update_with_target(
         };
         let Some(terminal) = column_name.0.last().and_then(ObjectNamePart::as_ident) else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "strict rewrite violation: entity view update unknown assignment target in {}",
                     target.view_name
                 ),
@@ -546,7 +578,9 @@ fn rewrite_update_with_target(
         };
         if mapped == "schema_key" {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} update cannot set schema_key; view schema is fixed",
                     target.view_name
                 ),
@@ -554,7 +588,9 @@ fn rewrite_update_with_target(
         }
         if mapped == "snapshot_content" {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} update cannot set snapshot_content directly; set schema properties instead",
                     target.view_name
                 ),
@@ -1404,7 +1440,9 @@ fn append_entity_scope_predicate(
     {
         let Some(version_id) = target.version_id_override.as_deref() else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} {} requires explicit lixcol_version_id or schema default override",
                     target.view_name, operation
                 ),
@@ -1633,7 +1671,9 @@ where
         )?;
         let JsonValue::Object(object) = snapshot else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} insert snapshot_content must be a JSON object",
                     target.view_name
                 ),
@@ -1760,7 +1800,9 @@ fn enforce_property_type_constraints(
         ""
     };
     Err(LixError {
-        message: format!(
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "{context} expects one of [{}], got {}.{}",
             expected.join(", "),
             json_value_type(value),
@@ -1891,9 +1933,11 @@ where
         let value = evaluator
             .evaluate_with_functions(expression, &context, functions)
             .map_err(|err| LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} insert failed to evaluate x-lix-default for '{}.{}': {}",
-                    target.view_name, target.schema_key, property, err.message
+                    target.view_name, target.schema_key, property, err.description
                 ),
             })?;
         return Ok(Some(value));
@@ -1991,7 +2035,9 @@ fn json_value_from_lix_json_argument(
 
 fn parse_json_value(raw: &str, context: &str) -> Result<JsonValue, LixError> {
     serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("{context} lix_json() argument must be valid JSON ({error})"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("{context} lix_json() argument must be valid JSON ({error})"),
     })
 }
 
@@ -2008,13 +2054,17 @@ fn json_text_input_from_engine_value(
                 Ok(value.to_string())
             } else {
                 Err(LixError {
-                    message: format!("{context} contains non-finite numeric value"),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("{context} contains non-finite numeric value"),
                 })
             }
         }
         EngineValue::Text(value) => Ok(value.clone()),
         EngineValue::Blob(_) => Err(LixError {
-            message: format!("{context} does not support blob values"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{context} does not support blob values"),
         }),
     }
 }
@@ -2022,7 +2072,9 @@ fn json_text_input_from_engine_value(
 fn json_text_input_from_literal_expr(expr: &Expr, context: &str) -> Result<String, LixError> {
     let Expr::Value(ValueWithSpan { value, .. }) = expr else {
         return Err(LixError {
-            message: format!("{context} requires literal or placeholder values"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{context} requires literal or placeholder values"),
         });
     };
     match value {
@@ -2047,7 +2099,9 @@ fn json_text_input_from_literal_expr(expr: &Expr, context: &str) -> Result<Strin
         | AstValue::TripleDoubleQuotedByteStringLiteral(value) => Ok(value.clone()),
         AstValue::DollarQuotedString(value) => Ok(value.value.clone()),
         AstValue::Placeholder(token) => Err(LixError {
-            message: format!("{context} unresolved placeholder '{token}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{context} unresolved placeholder '{token}'"),
         }),
     }
 }
@@ -2063,32 +2117,42 @@ fn lix_json_argument_expr<'a>(expr: &'a Expr) -> Result<Option<&'a Expr>, LixErr
         sqlparser::ast::FunctionArguments::List(list) => {
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(LixError {
-                    message: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
                 });
             }
             &list.args
         }
         _ => {
             return Err(LixError {
-                message: "lix_json() requires a regular argument list".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "lix_json() requires a regular argument list".to_string(),
             });
         }
     };
     if args.len() != 1 {
         return Err(LixError {
-            message: "lix_json() requires exactly 1 argument".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_json() requires exactly 1 argument".to_string(),
         });
     }
     let arg = match &args[0] {
         sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => expr,
         sqlparser::ast::FunctionArg::Unnamed(_) => {
             return Err(LixError {
-                message: "lix_json() arguments must be SQL expressions".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "lix_json() arguments must be SQL expressions".to_string(),
             });
         }
         _ => {
             return Err(LixError {
-                message: "lix_json() does not support named arguments".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "lix_json() does not support named arguments".to_string(),
             });
         }
     };
@@ -2111,22 +2175,30 @@ fn json_value_from_engine_value(value: &EngineValue, context: &str) -> Result<Js
         EngineValue::Real(value) => JsonNumber::from_f64(*value)
             .map(JsonValue::Number)
             .ok_or_else(|| LixError {
-                message: format!("{context} contains non-finite numeric value"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("{context} contains non-finite numeric value"),
             }),
         EngineValue::Text(value) => Ok(JsonValue::String(value.clone())),
         EngineValue::Blob(_) => Err(LixError {
-            message: format!("{context} does not support blob values"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{context} does not support blob values"),
         }),
     }
 }
 
 fn json_value_from_literal_expr(expr: Option<&Expr>, context: &str) -> Result<JsonValue, LixError> {
     let expr = expr.ok_or_else(|| LixError {
-        message: format!("{context} is missing a value"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("{context} is missing a value"),
     })?;
     let Expr::Value(ValueWithSpan { value, .. }) = expr else {
         return Err(LixError {
-            message: format!("{context} requires literal or placeholder values"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{context} requires literal or placeholder values"),
         });
     };
 
@@ -2140,11 +2212,17 @@ fn json_value_from_literal_expr(expr: Option<&Expr>, context: &str) -> Result<Js
                 JsonNumber::from_f64(real)
                     .map(JsonValue::Number)
                     .ok_or_else(|| LixError {
-                        message: format!("{context} contains non-finite numeric value"),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!("{context} contains non-finite numeric value"),
                     })
             } else {
                 Err(LixError {
-                    message: format!("{context} contains unsupported numeric literal '{value}'"),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!(
+                        "{context} contains unsupported numeric literal '{value}'"
+                    ),
                 })
             }
         }
@@ -2168,7 +2246,9 @@ fn json_value_from_literal_expr(expr: Option<&Expr>, context: &str) -> Result<Js
         }
         AstValue::DollarQuotedString(value) => Ok(JsonValue::String(value.value.clone())),
         AstValue::Placeholder(token) => Err(LixError {
-            message: format!("{context} unresolved placeholder '{token}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{context} unresolved placeholder '{token}'"),
         }),
     }
 }
@@ -2183,7 +2263,9 @@ fn derive_entity_id_expr(
 ) -> Result<Expr, LixError> {
     if target.primary_key_fields.is_empty() {
         return Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert requires entity_id (schema has no x-lix-primary-key)",
                 target.view_name
             ),
@@ -2193,7 +2275,9 @@ fn derive_entity_id_expr(
     for field in &target.primary_key_fields {
         let Some(value) = json_pointer_get_from_snapshot(snapshot, &field.path) else {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} insert requires entity_id or all primary-key properties ({})",
                     target.view_name,
                     target
@@ -2226,7 +2310,9 @@ fn entity_id_component_from_json_value(
 ) -> Result<String, LixError> {
     match value {
         JsonValue::Null => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert cannot derive entity_id from null primary-key property '{}'",
                 target.view_name, key_ref
             ),
@@ -2370,8 +2456,7 @@ fn unknown_entity_view_column_error(
     allowed.sort();
     allowed.dedup();
 
-    LixError {
-        message: format!(
+    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
             "strict rewrite violation: entity view '{view_name}' {context} references unknown column '{}'; allowed columns: {}",
             column.as_ref(),
             allowed.join(", ")
@@ -2409,7 +2494,9 @@ fn set_update_target_table(
             Ok(())
         }
         _ => Err(LixError {
-            message: "entity view update requires a table target".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "entity view update requires a table target".to_string(),
         }),
     }
 }
@@ -2423,15 +2510,21 @@ fn replace_delete_target_table(
     };
     if tables.len() != 1 {
         return Err(LixError {
-            message: "entity view delete requires a single table target".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "entity view delete requires a single table target".to_string(),
         });
     }
     let table = tables.first_mut().ok_or_else(|| LixError {
-        message: "entity view delete requires a table target".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "entity view delete requires a table target".to_string(),
     })?;
     if !table.joins.is_empty() {
         return Err(LixError {
-            message: "entity view delete does not support JOIN targets".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "entity view delete does not support JOIN targets".to_string(),
         });
     }
     match &mut table.relation {
@@ -2446,7 +2539,9 @@ fn replace_delete_target_table(
             Ok(())
         }
         _ => Err(LixError {
-            message: "entity view delete requires a table target".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "entity view delete requires a table target".to_string(),
         }),
     }
 }
@@ -2507,9 +2602,7 @@ fn property_name_set(target: &EntityViewTarget) -> HashSet<String> {
 }
 
 fn read_only_error(view_name: &str, operation: &str) -> LixError {
-    LixError {
-        message: format!("{view_name} is read-only; {operation} is not supported"),
-    }
+    errors::read_only_view_write_error(view_name, operation)
 }
 
 fn string_literal_expr(value: &str) -> Expr {
@@ -2528,33 +2621,45 @@ fn parse_expression_from_sql(sql: &str) -> Result<Expr, LixError> {
     let wrapper_sql = format!("SELECT {sql}");
     let mut statements =
         Parser::parse_sql(&GenericDialect {}, &wrapper_sql).map_err(|error| LixError {
-            message: error.to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: error.to_string(),
         })?;
     if statements.len() != 1 {
         return Err(LixError {
-            message: "expected a single expression statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected a single expression statement".to_string(),
         });
     }
     let statement = statements.remove(0);
     let Statement::Query(query) = statement else {
         return Err(LixError {
-            message: "expected SELECT expression statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected SELECT expression statement".to_string(),
         });
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(LixError {
-            message: "expected SELECT expression".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected SELECT expression".to_string(),
         });
     };
     let Some(item) = select.projection.first() else {
         return Err(LixError {
-            message: "missing projected expression".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "missing projected expression".to_string(),
         });
     };
     match item {
         SelectItem::UnnamedExpr(expr) => Ok(expr.clone()),
         _ => Err(LixError {
-            message: "expected unnamed projected expression".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected unnamed projected expression".to_string(),
         }),
     }
 }
@@ -2734,7 +2839,7 @@ mod tests {
         };
         let err = rewrite_insert(insert, &[]).expect_err("insert should require lix_json()");
         assert!(err
-            .message
+            .description
             .contains("Wrap JSON object/array input with lix_json(...)"));
     }
 

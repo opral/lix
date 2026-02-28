@@ -226,8 +226,7 @@ fn parse_integer_value(value: &JsonValue) -> Option<i64> {
 fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
     match value {
         Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            message: format!("expected text value for {name}"),
+        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("expected text value for {name}"),
         }),
     }
 }
@@ -237,8 +236,7 @@ fn parse_first_payload(row: Option<&Vec<Value>>) -> Result<Option<JsonValue>, Li
         return Ok(None);
     };
     let raw = value_to_string(&row[0], "snapshot_content")?;
-    let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
-        message: format!("deterministic mode snapshot_content invalid JSON: {err}"),
+    let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("deterministic mode snapshot_content invalid JSON: {err}"),
     })?;
     Ok(parsed.get("value").cloned())
 }

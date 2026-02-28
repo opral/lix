@@ -175,13 +175,13 @@ simulation_test!(switch_version_rejects_invalid_inputs, |sim| async move {
         .switch_version("".to_string())
         .await
         .expect_err("empty version id should fail");
-    assert!(empty.message.contains("non-empty"));
+    assert!(empty.description.contains("non-empty"));
 
     let missing = engine
         .switch_version("missing-version-id".to_string())
         .await
         .expect_err("unknown version id should fail");
-    assert!(missing.message.contains("does not exist"));
+    assert!(missing.description.contains("does not exist"));
 });
 
 simulation_test!(create_version_switch_then_checkpoint, |sim| async move {

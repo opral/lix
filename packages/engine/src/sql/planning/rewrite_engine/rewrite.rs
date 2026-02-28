@@ -40,8 +40,7 @@ pub(crate) fn extract_explicit_transaction_script_from_statements(
                 | Statement::Rollback { .. }
         )
     }) {
-        return Err(LixError {
-            message:
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description:
                 "nested transaction statements are not supported inside BEGIN ... COMMIT scripts"
                     .to_string(),
         });

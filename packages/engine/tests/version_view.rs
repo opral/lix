@@ -235,10 +235,10 @@ simulation_test!(
 
         assert!(
             error
-                .message
+                .description
                 .contains("lix_version insert requires column 'working_commit_id'"),
             "unexpected error message: {}",
-            error.message
+            error.description
         );
     }
 );
@@ -328,10 +328,10 @@ simulation_test!(
 
         assert!(
             error
-                .message
+                .description
                 .contains("must set both commit_id and working_commit_id together"),
             "unexpected error message: {}",
-            error.message
+            error.description
         );
     }
 );
@@ -646,20 +646,20 @@ simulation_test!(
             .expect_err("duplicate working_commit_id should fail");
         assert!(
             duplicate_error
-                .message
+                .description
                 .contains("Unique constraint violation"),
             "unexpected error message: {}",
-            duplicate_error.message
+            duplicate_error.description
         );
         assert!(
-            duplicate_error.message.contains("working_commit_id"),
+            duplicate_error.description.contains("working_commit_id"),
             "unexpected error message: {}",
-            duplicate_error.message
+            duplicate_error.description
         );
         assert!(
-            duplicate_error.message.contains("working-unique-1"),
+            duplicate_error.description.contains("working-unique-1"),
             "unexpected error message: {}",
-            duplicate_error.message
+            duplicate_error.description
         );
 
         engine

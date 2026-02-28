@@ -49,8 +49,7 @@ impl WasmRuntime for NoopWasmRuntime {
         _bytes: Vec<u8>,
         _limits: WasmLimits,
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        Err(LixError {
-            message: "wasm runtime is required to execute plugins; provide a non-noop runtime"
+        Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "wasm runtime is required to execute plugins; provide a non-noop runtime"
                 .to_string(),
         })
     }

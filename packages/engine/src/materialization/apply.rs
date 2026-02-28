@@ -147,21 +147,18 @@ async fn clear_scope_rows(
 
 fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
     let Some(value) = rows.first().and_then(|row| row.first()) else {
-        return Err(LixError {
-            message: "materialization apply: count query returned no rows".to_string(),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "materialization apply: count query returned no rows".to_string(),
         });
     };
 
     match value {
         Value::Integer(count) if *count >= 0 => Ok(*count as usize),
-        Value::Text(text) => text.parse::<usize>().map_err(|error| LixError {
-            message: format!(
+        Value::Text(text) => text.parse::<usize>().map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "materialization apply: invalid count text '{}': {}",
                 text, error
             ),
         }),
-        _ => Err(LixError {
-            message: "materialization apply: count query returned non-integer value".to_string(),
+        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "materialization apply: count query returned non-integer value".to_string(),
         }),
     }
 }

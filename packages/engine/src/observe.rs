@@ -235,8 +235,7 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
             .iter()
             .all(|statement| matches!(statement, Statement::Query(_)))
     {
-        return Err(LixError {
-            message: "observe requires one or more SELECT statements".to_string(),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "observe requires one or more SELECT statements".to_string(),
         });
     }
 
@@ -274,17 +273,14 @@ async fn sqlite_data_version(engine: &Engine) -> Result<i64, LixError> {
         .rows
         .first()
         .and_then(|row| row.first())
-        .ok_or(LixError {
-            message: "failed to read sqlite data_version: pragma returned no rows".to_string(),
+        .ok_or(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "failed to read sqlite data_version: pragma returned no rows".to_string(),
         })?;
     match value {
         Value::Integer(value) => Ok(*value),
         Value::Real(value) => Ok(*value as i64),
-        Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
-            message: format!("failed to parse sqlite data_version text: {error}"),
+        Value::Text(value) => value.parse::<i64>().map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("failed to parse sqlite data_version text: {error}"),
         }),
-        other => Err(LixError {
-            message: format!("failed to parse sqlite data_version value: {other:?}"),
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("failed to parse sqlite data_version value: {other:?}"),
         }),
     }
 }

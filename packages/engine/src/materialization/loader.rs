@@ -198,8 +198,7 @@ impl HasOrder for VersionDescriptorRecord {
 }
 
 fn parse_commit_snapshot(raw: &str) -> Result<Option<LixCommit>, LixError> {
-    let mut parsed: LixCommit = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("materialization: invalid lix_commit snapshot JSON: {error}"),
+    let mut parsed: LixCommit = serde_json::from_str(raw).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("materialization: invalid lix_commit snapshot JSON: {error}"),
     })?;
 
     if parsed.id.is_empty() {
@@ -213,8 +212,7 @@ fn parse_commit_snapshot(raw: &str) -> Result<Option<LixCommit>, LixError> {
 }
 
 fn parse_version_descriptor_snapshot(raw: &str) -> Result<Option<LixVersionDescriptor>, LixError> {
-    let parsed: LixVersionDescriptor = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("materialization: invalid lix_version_descriptor snapshot JSON: {error}"),
+    let parsed: LixVersionDescriptor = serde_json::from_str(raw).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("materialization: invalid lix_version_descriptor snapshot JSON: {error}"),
     })?;
 
     if parsed.id.is_empty() {
@@ -224,8 +222,7 @@ fn parse_version_descriptor_snapshot(raw: &str) -> Result<Option<LixVersionDescr
 }
 
 fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<LixCommitEdge>, LixError> {
-    let parsed: LixCommitEdge = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("materialization: invalid lix_commit_edge snapshot JSON: {error}"),
+    let parsed: LixCommitEdge = serde_json::from_str(raw).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("materialization: invalid lix_commit_edge snapshot JSON: {error}"),
     })?;
 
     if parsed.parent_id.is_empty() || parsed.child_id.is_empty() {
@@ -237,14 +234,12 @@ fn parse_commit_edge_snapshot(raw: &str) -> Result<Option<LixCommitEdge>, LixErr
 
 fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, LixError> {
     let Some(value) = row.get(index) else {
-        return Err(LixError {
-            message: format!("materialization: missing column '{label}' at index {index}"),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("materialization: missing column '{label}' at index {index}"),
         });
     };
     match value {
         Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            message: format!(
+        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "materialization: expected text for column '{label}' at index {index}"
             ),
         }),
@@ -253,15 +248,13 @@ fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, Lix
 
 fn text_optional(row: &[Value], index: usize, label: &str) -> Result<Option<String>, LixError> {
     let Some(value) = row.get(index) else {
-        return Err(LixError {
-            message: format!("materialization: missing column '{label}' at index {index}"),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("materialization: missing column '{label}' at index {index}"),
         });
     };
     match value {
         Value::Null => Ok(None),
         Value::Text(text) => Ok(Some(text.clone())),
-        _ => Err(LixError {
-            message: format!(
+        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "materialization: expected nullable text for column '{label}' at index {index}"
             ),
         }),

@@ -503,10 +503,10 @@ simulation_test!(
             .expect_err("DO NOTHING should be rejected");
 
         assert!(
-            err.message
+            err.description
                 .contains("ON CONFLICT DO NOTHING is not supported"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -536,10 +536,10 @@ simulation_test!(
             .expect_err("insert without version_id should fail");
 
         assert!(
-            err.message
+            err.description
                 .contains("lix_state_by_version insert requires version_id"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -629,10 +629,10 @@ simulation_test!(
             .expect_err("update without version predicate should fail");
 
         assert!(
-            err.message
+            err.description
                 .contains("lix_state_by_version update requires a version_id predicate"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -670,11 +670,11 @@ simulation_test!(
             .expect_err("update with unknown assignment should fail");
 
         assert!(
-            err.message.contains("strict rewrite violation")
-                && err.message.contains("unknown column")
-                && err.message.contains("bogus"),
+            err.description.contains("strict rewrite violation")
+                && err.description.contains("unknown column")
+                && err.description.contains("bogus"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -823,10 +823,10 @@ simulation_test!(
             .expect_err("delete without version predicate should fail");
 
         assert!(
-            err.message
+            err.description
                 .contains("lix_state_by_version delete requires a version_id predicate"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );

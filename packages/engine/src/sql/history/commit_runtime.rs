@@ -111,7 +111,9 @@ pub(crate) async fn load_commit_active_accounts(
             EngineValue::Null => continue,
             _ => {
                 return Err(LixError {
-                    message: "active account snapshot_content must be text".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "active account snapshot_content must be text".to_string(),
                 });
             }
         };
@@ -174,7 +176,9 @@ pub(crate) async fn load_version_info_for_versions(
                     EngineValue::Null => continue,
                     _ => {
                         return Err(LixError {
-                            message: "version tip entity_id must be text".to_string(),
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            title: "Unknown error".to_string(),
+                            description: "version tip entity_id must be text".to_string(),
                         });
                     }
                 };
@@ -204,14 +208,18 @@ fn parse_version_info_from_tip_snapshot(
         EngineValue::Null => return Ok(None),
         _ => {
             return Err(LixError {
-                message: "version tip snapshot_content must be text".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "version tip snapshot_content must be text".to_string(),
             });
         }
     };
 
     let snapshot: LixVersionPointer =
         serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-            message: format!("version tip snapshot_content invalid JSON: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("version tip snapshot_content invalid JSON: {error}"),
         })?;
     let version_id = if snapshot.id.is_empty() {
         fallback_version_id.to_string()
@@ -538,7 +546,9 @@ fn parse_commit_edge_snapshot_for_ancestry(
     raw: &str,
 ) -> Result<Option<(String, String)>, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
-        message: format!("commit_edge snapshot invalid JSON: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("commit_edge snapshot invalid JSON: {error}"),
     })?;
     let parent_id = parsed
         .get("parent_id")
@@ -558,11 +568,15 @@ fn parse_commit_edge_snapshot_for_ancestry(
 
 fn parse_single_statement_from_sql(sql: &str) -> Result<Statement, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
-            message: "expected a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected a single statement".to_string(),
         });
     }
     Ok(statements.remove(0))

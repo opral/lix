@@ -35,13 +35,11 @@ async fn create_checkpoint_in_transaction(
 
     let working_commit = load_commit(tx, &working_commit_id)
         .await?
-        .ok_or_else(|| LixError {
-            message: format!("working commit '{working_commit_id}' is missing"),
+        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("working commit '{working_commit_id}' is missing"),
         })?;
     let working_change_set_id = working_commit.change_set_id.clone();
     if working_change_set_id.trim().is_empty() {
-        return Err(LixError {
-            message: format!("working commit '{working_commit_id}' has empty change_set_id"),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("working commit '{working_commit_id}' has empty change_set_id"),
         });
     }
     let working_change_ids = working_commit.change_ids.clone();
@@ -83,8 +81,7 @@ async fn create_checkpoint_in_transaction(
     if !has_working_elements {
         let tip_commit = load_commit(tx, &effective_previous_tip_id)
             .await?
-            .ok_or_else(|| LixError {
-                message: format!("tip commit '{effective_previous_tip_id}' is missing"),
+            .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("tip commit '{effective_previous_tip_id}' is missing"),
             })?;
         return Ok(CreateCheckpointResult {
             id: effective_previous_tip_id,
@@ -362,8 +359,7 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
     for row in &result.rows {
         let snapshot_content = text_at(row, 0, "snapshot_content")?;
         let parsed: serde_json::Value =
-            serde_json::from_str(&snapshot_content).map_err(|error| LixError {
-                message: format!("checkpoint label snapshot invalid JSON: {error}"),
+            serde_json::from_str(&snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("checkpoint label snapshot invalid JSON: {error}"),
             })?;
         if parsed.get("name").and_then(serde_json::Value::as_str) != Some("checkpoint") {
             continue;
@@ -376,8 +372,7 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
             return Ok(label_id.to_string());
         }
     }
-    Err(LixError {
-        message: "checkpoint label row is missing in global version".to_string(),
+    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "checkpoint label row is missing in global version".to_string(),
     })
 }
 
@@ -439,8 +434,7 @@ async fn ensure_change_set_elements_for_checkpoint(
         .await?;
 
     if working_elements.rows.is_empty() {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "working change_set '{change_set_id}' has change_ids but no change_set elements"
             ),
         });
@@ -556,8 +550,7 @@ async fn ensure_change_exists_for_checkpoint(
         )
         .await?;
     let Some(row) = row.rows.first() else {
-        return Err(LixError {
-            message: format!("change '{change_id}' is missing while checkpointing"),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("change '{change_id}' is missing while checkpointing"),
         });
     };
     let id = text_at(row, 0, "id")?;
@@ -646,8 +639,7 @@ async fn ensure_commit_edge(
     child_id: &str,
 ) -> Result<(), LixError> {
     if parent_id == child_id {
-        return Err(LixError {
-            message: format!("refusing self-edge for commit '{parent_id}'"),
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("refusing self-edge for commit '{parent_id}'"),
         });
     }
 
@@ -749,19 +741,16 @@ fn first_row<'a>(result: &'a crate::QueryResult, label: &str) -> Result<&'a [Val
         .rows
         .first()
         .map(|row| row.as_slice())
-        .ok_or_else(|| LixError {
-            message: format!("expected {label}, but query returned no rows"),
+        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("expected {label}, but query returned no rows"),
         })
 }
 
 fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
-    let value = row.get(index).ok_or_else(|| LixError {
-        message: format!("row is missing required field '{field}'"),
+    let value = row.get(index).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("row is missing required field '{field}'"),
     })?;
     match value {
         Value::Text(text) => Ok(text.clone()),
-        other => Err(LixError {
-            message: format!("field '{field}' must be text, got {other:?}"),
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("field '{field}' must be text, got {other:?}"),
         }),
     }
 }
@@ -783,23 +772,19 @@ fn parse_string_array(value: Option<&Value>, field: &str) -> Result<Vec<String>,
         Value::Text(raw) if raw.trim().is_empty() => Ok(Vec::new()),
         Value::Text(raw) => {
             let parsed: serde_json::Value =
-                serde_json::from_str(raw).map_err(|error| LixError {
-                    message: format!("field '{field}' must be JSON array text: {error}"),
+                serde_json::from_str(raw).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("field '{field}' must be JSON array text: {error}"),
                 })?;
-            let array = parsed.as_array().ok_or_else(|| LixError {
-                message: format!("field '{field}' must be a JSON array"),
+            let array = parsed.as_array().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("field '{field}' must be a JSON array"),
             })?;
             let mut out = Vec::with_capacity(array.len());
             for item in array {
-                let id = item.as_str().ok_or_else(|| LixError {
-                    message: format!("field '{field}' must contain only string commit ids"),
+                let id = item.as_str().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("field '{field}' must contain only string commit ids"),
                 })?;
                 out.push(id.to_string());
             }
             Ok(out)
         }
-        other => Err(LixError {
-            message: format!("field '{field}' must be text or null, got {other:?}"),
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("field '{field}' must be text or null, got {other:?}"),
         }),
     }
 }

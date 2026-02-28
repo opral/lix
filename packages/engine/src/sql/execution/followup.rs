@@ -147,7 +147,9 @@ async fn build_update_followup_statement_batch(
     for row in rows {
         if row.len() < UPDATE_RETURNING_COLUMNS.len() {
             return Err(LixError {
-                message: "vtable update returning row missing columns".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "vtable update returning row missing columns".to_string(),
             });
         }
 
@@ -243,7 +245,9 @@ async fn build_delete_followup_statement_batch(
     for row in rows {
         if row.len() < UPDATE_RETURNING_COLUMNS.len() {
             return Err(LixError {
-                message: "vtable delete returning row missing columns".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "vtable delete returning row missing columns".to_string(),
             });
         }
 
@@ -476,7 +480,9 @@ async fn load_effective_scope_delete_rows(
     for row in result.rows {
         if row.len() < 6 {
             return Err(LixError {
-                message: "effective scope delete row loader expected six columns".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "effective scope delete row loader expected six columns".to_string(),
             });
         }
         resolved.push(EffectiveScopeDeleteRow {
@@ -543,7 +549,9 @@ async fn load_cascaded_file_delete_changes(
         for row in result.rows {
             if row.len() < 6 {
                 return Err(LixError {
-                    message: "filesystem directory delete cascade expected six file columns"
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "filesystem directory delete cascade expected six file columns"
                         .to_string(),
                 });
             }
@@ -579,11 +587,15 @@ async fn load_cascaded_file_delete_changes(
 
 fn lower_single_statement_for_dialect(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
-            message: "expected a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected a single statement".to_string(),
         });
     }
     let statement = statements.remove(0);
@@ -596,7 +608,9 @@ fn value_to_optional_text(value: &EngineValue, name: &str) -> Result<Option<Stri
         EngineValue::Null => Ok(None),
         EngineValue::Text(text) => Ok(Some(text.clone())),
         _ => Err(LixError {
-            message: format!("vtable update expected text or null for {name}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("vtable update expected text or null for {name}"),
         }),
     }
 }
@@ -605,7 +619,9 @@ fn value_to_string(value: &EngineValue, name: &str) -> Result<String, LixError> 
     match value {
         EngineValue::Text(text) => Ok(text.clone()),
         _ => Err(LixError {
-            message: format!("vtable update expected text for {name}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("vtable update expected text for {name}"),
         }),
     }
 }
