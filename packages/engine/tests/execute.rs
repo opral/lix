@@ -69,3 +69,24 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    sqlite_master_query_returns_table_not_found,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        let error = engine
+            .execute(
+                "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name",
+                &[],
+            )
+            .await
+            .expect_err("sqlite_master read should be rejected");
+
+        assert_eq!(error.message, "table not found");
+    }
+);

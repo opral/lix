@@ -13,6 +13,7 @@ use super::super::contracts::planned_statement::{
 };
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
+use super::super::surfaces::matcher::statement_matches_any_table;
 use super::bind_once::{bind_statements_with_appended_params_once, StatementWithAppendedParams};
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
@@ -218,6 +219,7 @@ where
 {
     let params = params.to_vec();
     let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
+    reject_disallowed_backend_catalog_reads(&statements)?;
 
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
 
@@ -240,6 +242,28 @@ where
         writer_key,
     )
     .await
+}
+
+fn reject_disallowed_backend_catalog_reads(statements: &[Statement]) -> Result<(), LixError> {
+    const DISALLOWED_TABLES: &[&str] = &["sqlite_master", "sqlite_schema"];
+
+    for statement in statements {
+        let is_read = matches!(
+            statement,
+            Statement::Query(_) | Statement::Explain { .. } | Statement::ExplainTable { .. }
+        );
+        if !is_read {
+            continue;
+        }
+
+        if statement_matches_any_table(statement, DISALLOWED_TABLES) {
+            return Err(LixError {
+                message: "table not found".to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn accumulate_rewrite_output<P: LixFunctionProvider>(
