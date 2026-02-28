@@ -1,6 +1,7 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::SimulationBootArgs;
 
 simulation_test!(select_works, |sim| async move {
     let engine = sim
@@ -94,8 +95,10 @@ simulation_test!(
 simulation_test!(
     internal_table_read_returns_access_denied,
     |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_engine(Some(boot_args))
             .await
             .expect("boot_simulated_engine should succeed");
 
