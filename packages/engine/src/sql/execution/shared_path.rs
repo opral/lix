@@ -54,8 +54,7 @@ pub(crate) async fn prepare_execution_with_backend(
     crate::filesystem::pending_file_writes::ensure_file_insert_ids_for_data_writes(
         &mut statements,
         &functions,
-    )
-    ?;
+    )?;
 
     let requirements = derive_plan_requirements(&statements);
     if requirements.read_only_query {
