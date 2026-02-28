@@ -44,8 +44,7 @@ pub struct BinaryHistoryStorageMetrics {
 
 pub async fn collect_storage_metrics(db_path: &Path) -> Result<StorageMetrics, LixError> {
     let conn = format!("sqlite://{}", db_path.display());
-    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
-        message: format!(
+    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
             "failed to open sqlite db for storage metrics ({}): {error}",
             db_path.display()
         ),
@@ -87,8 +86,7 @@ pub async fn collect_binary_history_storage_metrics(
     db_path: &Path,
 ) -> Result<BinaryHistoryStorageMetrics, LixError> {
     let conn = format!("sqlite://{}", db_path.display());
-    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
-        message: format!(
+    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
             "failed to open sqlite db for binary history storage metrics ({}): {error}",
             db_path.display()
         ),
@@ -166,8 +164,7 @@ pub async fn collect_binary_chunk_diagnostics(
     db_path: &Path,
 ) -> Result<Option<BinaryChunkDiagnostics>, LixError> {
     let conn = format!("sqlite://{}", db_path.display());
-    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError {
-        message: format!(
+    let pool = SqlitePool::connect(&conn).await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
             "failed to open sqlite db for binary chunk diagnostics ({}): {error}",
             db_path.display()
         ),
@@ -190,8 +187,7 @@ pub async fn collect_binary_chunk_diagnostics(
     )
     .fetch_one(&pool)
     .await
-    .map_err(|error| LixError {
-        message: format!("binary chunk diagnostics query failed: {error}"),
+    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("binary chunk diagnostics query failed: {error}"),
     })?;
 
     let manifest_rows = row.try_get::<i64, _>(0).unwrap_or(0).max(0) as u64;
@@ -236,8 +232,7 @@ async fn query_scalar_u64(pool: &SqlitePool, sql: &str) -> Result<u64, LixError>
     let row = sqlx::query(sql)
         .fetch_one(pool)
         .await
-        .map_err(|error| LixError {
-            message: format!("storage metrics query failed ({sql}): {error}"),
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("storage metrics query failed ({sql}): {error}"),
         })?;
     let value = row.try_get::<i64, _>(0).unwrap_or(0);
     Ok(value.max(0) as u64)
@@ -252,8 +247,7 @@ async fn query_dbstat_bytes(pool: &SqlitePool, object_type: &str) -> Result<u64,
         .bind(object_type)
         .fetch_one(pool)
         .await
-        .map_err(|error| LixError {
-            message: format!("storage metrics dbstat query failed ({object_type}): {error}"),
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("storage metrics dbstat query failed ({object_type}): {error}"),
         })?;
     let value = row.try_get::<i64, _>(0).unwrap_or(0);
     Ok(value.max(0) as u64)
@@ -271,8 +265,7 @@ async fn query_dbstat_table_bytes_for_table(
         .bind(table_name)
         .fetch_one(pool)
         .await
-        .map_err(|error| LixError {
-            message: format!("storage metrics dbstat table query failed ({table_name}): {error}"),
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("storage metrics dbstat table query failed ({table_name}): {error}"),
         })?;
     let value = row.try_get::<i64, _>(0).unwrap_or(0);
     Ok(value.max(0) as u64)
@@ -290,8 +283,7 @@ async fn query_dbstat_index_bytes_for_table(
         .bind(table_name)
         .fetch_one(pool)
         .await
-        .map_err(|error| LixError {
-            message: format!("storage metrics dbstat index query failed ({table_name}): {error}"),
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("storage metrics dbstat index query failed ({table_name}): {error}"),
         })?;
     let value = row.try_get::<i64, _>(0).unwrap_or(0);
     Ok(value.max(0) as u64)
@@ -303,8 +295,7 @@ async fn query_table_exists(pool: &SqlitePool, table_name: &str) -> Result<bool,
             .bind(table_name)
             .fetch_one(pool)
             .await
-            .map_err(|error| LixError {
-                message: format!(
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                     "storage metrics table-exists query failed ({table_name}): {error}"
                 ),
             })?;

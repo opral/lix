@@ -53,7 +53,9 @@ struct RewrittenStatementBinding {
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     let dialect = GenericDialect {};
     Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
-        message: err.to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: err.to_string(),
     })
 }
 
@@ -97,7 +99,9 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         if let Some(plan) = output.postprocess {
             if postprocess.is_some() {
                 return Err(LixError {
-                    message: "only one postprocess rewrite is supported per query".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "only one postprocess rewrite is supported per query".to_string(),
                 });
             }
             postprocess = Some(plan);
@@ -116,7 +120,9 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
 
     if postprocess.is_some() && rewritten.len() != 1 {
         return Err(LixError {
-            message: "postprocess rewrites require a single statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "postprocess rewrites require a single statement".to_string(),
         });
     }
 
@@ -379,12 +385,16 @@ fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
 fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixError> {
     let incoming_rows = plain_values_rows(incoming)
         .ok_or_else(|| LixError {
-            message: "transaction insert coalescing expected VALUES rows".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "transaction insert coalescing expected VALUES rows".to_string(),
         })?
         .to_vec();
 
     let target_rows = plain_values_rows_mut(target).ok_or_else(|| LixError {
-        message: "transaction insert coalescing expected mutable VALUES rows".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "transaction insert coalescing expected mutable VALUES rows".to_string(),
     })?;
     target_rows.extend(incoming_rows);
     Ok(())

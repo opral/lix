@@ -612,10 +612,10 @@ simulation_test!(
             .expect_err("DO NOTHING should be rejected");
 
         assert!(
-            err.message
+            err.description
                 .contains("ON CONFLICT DO NOTHING is not supported"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -653,10 +653,10 @@ simulation_test!(
 
         assert!(
             error
-                .message
+                .description
                 .contains("lix_state insert cannot set version_id"),
             "unexpected error message: {}",
-            error.message
+            error.description
         );
     }
 );
@@ -828,10 +828,10 @@ simulation_test!(
             .expect_err("lix_state update with version_id assignment should fail");
         assert!(
             error
-                .message
+                .description
                 .contains("lix_state update cannot set version_id"),
             "unexpected error message: {}",
-            error.message
+            error.description
         );
     }
 );
@@ -874,11 +874,11 @@ simulation_test!(
             .await
             .expect_err("lix_state update with unknown assignment should fail");
         assert!(
-            error.message.contains("strict rewrite violation")
-                && error.message.contains("unknown column")
-                && error.message.contains("bogus"),
+            error.description.contains("strict rewrite violation")
+                && error.description.contains("unknown column")
+                && error.description.contains("bogus"),
             "unexpected error message: {}",
-            error.message
+            error.description
         );
     }
 );

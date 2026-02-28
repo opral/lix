@@ -33,8 +33,7 @@ pub(crate) fn validate_relation_discovery_consistency(query: &Query) -> Result<(
         .cloned()
         .collect();
 
-    Err(LixError {
-        message: format!(
+    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
             "analyze phase relation discovery mismatch: walker missing {:?} (walker={:?} select_visit={:?})",
             missing_from_walker, walker_relations, select_visit_relations
         ),

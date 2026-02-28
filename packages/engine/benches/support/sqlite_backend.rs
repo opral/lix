@@ -23,8 +23,7 @@ impl BenchSqliteBackend {
 
     pub fn file_backed(path: &Path) -> Result<Self, LixError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| LixError {
-                message: format!(
+            std::fs::create_dir_all(parent).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                     "failed to create sqlite benchmark directory {}: {error}",
                     parent.display()
                 ),
@@ -32,8 +31,7 @@ impl BenchSqliteBackend {
         }
 
         if !path.exists() {
-            std::fs::File::create(path).map_err(|error| LixError {
-                message: format!(
+            std::fs::File::create(path).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                     "failed to create sqlite benchmark file {}: {error}",
                     path.display()
                 ),
@@ -52,8 +50,7 @@ impl BenchSqliteBackend {
             .get_or_try_init(|| async {
                 SqlitePool::connect(&self.conn)
                     .await
-                    .map_err(|error| LixError {
-                        message: error.to_string(),
+                    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
                     })
             })
             .await
@@ -70,8 +67,7 @@ impl LixBackend for BenchSqliteBackend {
         let pool = self.pool().await?;
 
         if params.is_empty() && sql.contains(';') {
-            pool.execute(sql).await.map_err(|error| LixError {
-                message: error.to_string(),
+            pool.execute(sql).await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
             })?;
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -84,8 +80,7 @@ impl LixBackend for BenchSqliteBackend {
             query = bind_sqlite(query, param);
         }
 
-        let rows = query.fetch_all(pool).await.map_err(|error| LixError {
-            message: error.to_string(),
+        let rows = query.fetch_all(pool).await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
         })?;
         let columns = rows
             .first()
@@ -113,14 +108,12 @@ impl LixBackend for BenchSqliteBackend {
 
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         let pool = self.pool().await?;
-        let mut conn = pool.acquire().await.map_err(|error| LixError {
-            message: error.to_string(),
+        let mut conn = pool.acquire().await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
         })?;
         sqlx::query("BEGIN")
             .execute(&mut *conn)
             .await
-            .map_err(|error| LixError {
-                message: error.to_string(),
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
             })?;
         Ok(Box::new(BenchSqliteTransaction { conn }))
     }
@@ -134,8 +127,7 @@ impl LixTransaction for BenchSqliteTransaction {
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         if params.is_empty() && sql.contains(';') {
-            self.conn.execute(sql).await.map_err(|error| LixError {
-                message: error.to_string(),
+            self.conn.execute(sql).await.map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
             })?;
             return Ok(QueryResult {
                 rows: Vec::new(),
@@ -151,8 +143,7 @@ impl LixTransaction for BenchSqliteTransaction {
         let rows = query
             .fetch_all(&mut *self.conn)
             .await
-            .map_err(|error| LixError {
-                message: error.to_string(),
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
             })?;
         let columns = rows
             .first()
@@ -182,8 +173,7 @@ impl LixTransaction for BenchSqliteTransaction {
         sqlx::query("COMMIT")
             .execute(&mut *self.conn)
             .await
-            .map_err(|error| LixError {
-                message: error.to_string(),
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
             })?;
         Ok(())
     }
@@ -192,8 +182,7 @@ impl LixTransaction for BenchSqliteTransaction {
         sqlx::query("ROLLBACK")
             .execute(&mut *self.conn)
             .await
-            .map_err(|error| LixError {
-                message: error.to_string(),
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
             })?;
         Ok(())
     }
@@ -215,8 +204,7 @@ fn bind_sqlite<'q>(
 fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value, LixError> {
     if row
         .try_get_raw(index)
-        .map_err(|error| LixError {
-            message: error.to_string(),
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
         })?
         .is_null()
     {

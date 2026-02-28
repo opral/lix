@@ -108,8 +108,7 @@ impl SchemaProvider for SqlStoredSchemaProvider<'_> {
             return Ok(schema.clone());
         }
 
-        let schema = self.load_schema_row(key).await?.ok_or_else(|| LixError {
-            message: format!(
+        let schema = self.load_schema_row(key).await?.ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "schema '{}' ({}) is not stored",
                 key.schema_key, key.schema_version
             ),
@@ -128,8 +127,7 @@ impl SchemaProvider for SqlStoredSchemaProvider<'_> {
         }
 
         let Some((_, schema)) = self.load_latest_schema_entry(schema_key).await? else {
-            return Err(LixError {
-                message: format!("schema '{}' is not stored", schema_key),
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("schema '{}' is not stored", schema_key),
             });
         };
 
@@ -167,20 +165,17 @@ fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
 }
 
 fn schema_from_snapshot_content(raw: &str) -> Result<JsonValue, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|err| LixError {
-        message: format!("stored schema snapshot_content invalid JSON: {err}"),
+    let parsed: JsonValue = serde_json::from_str(raw).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("stored schema snapshot_content invalid JSON: {err}"),
     })?;
 
-    parsed.get("value").cloned().ok_or_else(|| LixError {
-        message: "stored schema snapshot_content missing value".to_string(),
+    parsed.get("value").cloned().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "stored schema snapshot_content missing value".to_string(),
     })
 }
 
 fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
     match value {
         Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            message: format!("expected text value for {name}"),
+        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("expected text value for {name}"),
         }),
     }
 }
@@ -283,14 +278,12 @@ mod tests {
                 });
             }
 
-            Err(LixError {
-                message: format!("unexpected SQL in FakeBackend: {sql}"),
+            Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("unexpected SQL in FakeBackend: {sql}"),
             })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
-            Err(LixError {
-                message: "FakeBackend does not support transactions".to_string(),
+            Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "FakeBackend does not support transactions".to_string(),
             })
         }
     }
@@ -340,7 +333,7 @@ mod tests {
             .load_schema(&key)
             .await
             .expect_err("should return missing schema error");
-        assert!(err.message.contains("is not stored"), "{err:?}");
+        assert!(err.description.contains("is not stored"), "{err:?}");
     }
 
     #[tokio::test]
@@ -386,7 +379,7 @@ mod tests {
             .load_schema(&SchemaKey::new("users", "1"))
             .await
             .expect_err("should fail");
-        assert!(err.message.contains("invalid JSON"), "{err:?}");
+        assert!(err.description.contains("invalid JSON"), "{err:?}");
     }
 
     #[tokio::test]

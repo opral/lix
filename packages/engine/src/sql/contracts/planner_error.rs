@@ -32,7 +32,7 @@ impl From<PlannerError> for LixError {
             PlannerError::Parse(error)
             | PlannerError::BindOnce(error)
             | PlannerError::Preprocess(error) => error,
-            PlannerError::Invariant(message) => LixError { message },
+            PlannerError::Invariant(message) => LixError::unknown(message),
         }
     }
 }

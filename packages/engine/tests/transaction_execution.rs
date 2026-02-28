@@ -124,10 +124,10 @@ simulation_test!(
 
         assert!(
             error
-                .message
+                .description
                 .contains("snapshot_content does not match schema 'tx_validation_schema' (1)"),
             "unexpected error: {}",
-            error.message
+            error.description
         );
     }
 );

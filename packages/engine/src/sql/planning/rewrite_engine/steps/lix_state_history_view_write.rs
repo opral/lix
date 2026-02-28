@@ -1,7 +1,7 @@
 use sqlparser::ast::{Delete, FromTable, Insert, TableFactor, TableObject, Update};
 
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
-use crate::LixError;
+use crate::{errors, LixError};
 
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
 
@@ -27,9 +27,7 @@ pub fn reject_delete(delete: &Delete) -> Result<(), LixError> {
 }
 
 fn read_only_error(operation: &str) -> LixError {
-    LixError {
-        message: format!("lix_state_history is read-only; {operation} is not supported"),
-    }
+    errors::read_only_view_write_error(LIX_STATE_HISTORY_VIEW_NAME, operation)
 }
 
 fn table_object_is_lix_state_history(table: &TableObject) -> bool {

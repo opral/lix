@@ -87,6 +87,23 @@ simulation_test!(
             .await
             .expect_err("sqlite_master read should be rejected");
 
-        assert_eq!(error.message, "table not found");
+        assert_eq!(error.code, "LIX_ERROR_TABLE_NOT_FOUND");
+    }
+);
+
+simulation_test!(
+    internal_table_read_returns_access_denied,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        let error = engine
+            .execute("SELECT * FROM lix_internal_state_vtable", &[])
+            .await
+            .expect_err("internal table read should be rejected");
+
+        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
     }
 );

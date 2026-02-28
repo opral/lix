@@ -51,12 +51,16 @@ pub async fn rewrite_update_with_backend(
     }
     if update.from.is_some() {
         return Err(LixError {
-            message: "lix_active_version update does not support FROM".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version update does not support FROM".to_string(),
         });
     }
     if update.returning.is_some() {
         return Err(LixError {
-            message: "lix_active_version update does not support RETURNING".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version update does not support RETURNING".to_string(),
         });
     }
 
@@ -83,7 +87,9 @@ pub async fn rewrite_update_with_backend(
                 &active_version_snapshot_content(&row.id, &assignments.version_id),
             )
             .map_err(|error| LixError {
-                message: format!("failed to encode active version snapshot: {error}"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("failed to encode active version snapshot: {error}"),
             })?;
             Ok(InsertSnapshotRow {
                 entity_id: row.id,
@@ -103,25 +109,33 @@ fn parse_update_assignments(
     let mut version_id: Option<String> = None;
     for assignment in assignments {
         let column = assignment_target_column(&assignment.target).ok_or_else(|| LixError {
-            message: "lix_active_version update requires single-column assignments".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version update requires single-column assignments".to_string(),
         })?;
         let resolved = resolve_expr_cell_with_state(&assignment.value, params, placeholder_state)?;
         let value = resolved.value.as_ref().ok_or_else(|| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "lix_active_version update assignment for '{column}' must be literal or parameter"
             ),
         })?;
         match column.as_str() {
             "id" => {
                 return Err(LixError {
-                    message: "lix_active_version update cannot modify id".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "lix_active_version update cannot modify id".to_string(),
                 })
             }
             "version_id" => {
                 let next_value = value_required_string(value, "version_id")?;
                 if next_value.is_empty() {
                     return Err(LixError {
-                        message: "lix_active_version update cannot set empty version_id"
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "lix_active_version update cannot set empty version_id"
                             .to_string(),
                     });
                 }
@@ -129,7 +143,9 @@ fn parse_update_assignments(
             }
             _ => {
                 return Err(LixError {
-                    message: format!(
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!(
                         "lix_active_version update does not support column '{column}'"
                     ),
                 })
@@ -138,7 +154,9 @@ fn parse_update_assignments(
     }
 
     let version_id = version_id.ok_or_else(|| LixError {
-        message: "lix_active_version update must set version_id".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "lix_active_version update must set version_id".to_string(),
     })?;
 
     Ok(UpdateAssignments { version_id })
@@ -148,10 +166,14 @@ fn value_required_string(value: &EngineValue, field: &str) -> Result<String, Lix
     match value {
         EngineValue::Text(text) => Ok(text.clone()),
         EngineValue::Null => Err(LixError {
-            message: format!("lix_active_version field '{field}' cannot be NULL"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("lix_active_version field '{field}' cannot be NULL"),
         }),
         _ => Err(LixError {
-            message: format!("lix_active_version field '{field}' must be a string"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("lix_active_version field '{field}' must be a string"),
         }),
     }
 }
@@ -176,8 +198,7 @@ async fn ensure_version_descriptor_exists(
         .await?;
 
     if result.rows.is_empty() {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "Foreign key constraint violation: lix_active_version.version_id '{}' references missing lix_version_descriptor.id",
                 version_id
             ),
@@ -199,18 +220,25 @@ async fn query_lix_active_version_rows(
     }
 
     let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: format!("failed to parse lix_active_version row loader query: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("failed to parse lix_active_version row loader query: {error}"),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
-            message: "expected a single SELECT statement while querying lix_active_version rows"
-                .to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description:
+                "expected a single SELECT statement while querying lix_active_version rows"
+                    .to_string(),
         });
     }
     let statement = statements.remove(0);
     let Statement::Query(query) = statement else {
         return Err(LixError {
-            message: "lix_active_version row loader query must be SELECT".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version row loader query must be SELECT".to_string(),
         });
     };
 
@@ -220,7 +248,10 @@ async fn query_lix_active_version_rows(
     let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
     let Statement::Query(lowered_query) = lowered else {
         return Err(LixError {
-            message: "lix_active_version row loader rewrite expected query statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version row loader rewrite expected query statement"
+                .to_string(),
         });
     };
     let bound = bind_sql_with_state(
@@ -235,7 +266,9 @@ async fn query_lix_active_version_rows(
     for row in result.rows {
         if row.len() != 1 {
             return Err(LixError {
-                message: "lix_active_version rewrite expected 1 column from row loader query"
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "lix_active_version rewrite expected 1 column from row loader query"
                     .to_string(),
             });
         }
@@ -271,18 +304,27 @@ fn build_vtable_insert(rows: Vec<InsertSnapshotRow>) -> Result<Insert, LixError>
         values = values,
     );
     let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
-        message: format!("failed to build vtable insert for lix_active_version rewrite: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
+            "failed to build vtable insert for lix_active_version rewrite: {error}"
+        ),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
-            message: "lix_active_version rewrite expected one INSERT statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version rewrite expected one INSERT statement".to_string(),
         });
     }
     let statement = statements.remove(0);
     match statement {
         Statement::Insert(insert) => Ok(insert),
         _ => Err(LixError {
-            message: "lix_active_version rewrite expected generated INSERT statement".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_active_version rewrite expected generated INSERT statement"
+                .to_string(),
         }),
     }
 }

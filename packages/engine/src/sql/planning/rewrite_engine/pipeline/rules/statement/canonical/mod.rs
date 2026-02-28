@@ -39,8 +39,7 @@ pub(crate) fn rewrite_sync_statement<P: LixFunctionProvider>(
 
     match outcome {
         StatementRuleOutcome::Emit(output) => Ok(Some(output)),
-        StatementRuleOutcome::Continue(statement) => Err(LixError {
-            message: format!(
+        StatementRuleOutcome::Continue(statement) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "write canonical sync rewrite terminated without convergence for statement: {statement}"
             ),
         }),
@@ -91,8 +90,7 @@ where
 
                 match outcome {
                     StatementRuleOutcome::Continue(statement) => {
-                        return Err(LixError {
-                            message: format!(
+                        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                                 "write canonical backend rewrite terminated without convergence for statement: {statement}"
                             ),
                         });
@@ -181,7 +179,10 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     context.mutations.push(rewritten.mutation);
                     let Statement::Insert(insert_statement) = rewritten.statement else {
                         return Err(LixError {
-                            message: "stored schema rewrite expected insert statement".to_string(),
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            title: "Unknown error".to_string(),
+                            description: "stored schema rewrite expected insert statement"
+                                .to_string(),
                         });
                     };
                     current_insert = insert_statement;
@@ -203,8 +204,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     if is_allowed_internal_write_target(&target) {
                         statements.push(Statement::Insert(current_insert));
                     } else {
-                        return Err(LixError {
-                            message: format!(
+                        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                                 "strict rewrite violation: statement routing: unsupported INSERT target '{}'",
                                 target
                             ),
@@ -335,7 +335,9 @@ where
 {
     let Some(backend) = context.backend else {
         return Err(LixError {
-            message: "backend rewrite requested without backend context".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "backend rewrite requested without backend context".to_string(),
         });
     };
 
@@ -453,7 +455,10 @@ where
                     context.mutations.push(rewritten.mutation);
                     let Statement::Insert(insert_statement) = rewritten.statement else {
                         return Err(LixError {
-                            message: "stored schema rewrite expected insert statement".to_string(),
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            title: "Unknown error".to_string(),
+                            description: "stored schema rewrite expected insert statement"
+                                .to_string(),
                         });
                     };
                     current_insert = insert_statement;
@@ -482,8 +487,7 @@ where
                     if is_allowed_internal_write_target(&target) {
                         statements.push(Statement::Insert(current_insert));
                     } else {
-                        return Err(LixError {
-                            message: format!(
+                        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                                 "strict rewrite violation: statement routing: unsupported INSERT target '{}'",
                                 target
                             ),

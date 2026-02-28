@@ -94,35 +94,17 @@ simulation_test!(lix_entity_history_rejects_writes, |sim| async move {
         )
         .await
         .expect_err("history insert should fail");
-    assert!(
-        insert_err
-            .message
-            .contains("lix_key_value_history is read-only; INSERT is not supported"),
-        "unexpected insert error: {}",
-        insert_err.message
-    );
+    assert_eq!(insert_err.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
 
     let update_err = engine
         .execute("UPDATE lix_key_value_history SET entity_id = 'x'", &[])
         .await
         .expect_err("history update should fail");
-    assert!(
-        update_err
-            .message
-            .contains("lix_key_value_history is read-only; UPDATE is not supported"),
-        "unexpected update error: {}",
-        update_err.message
-    );
+    assert_eq!(update_err.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
 
     let delete_err = engine
         .execute("DELETE FROM lix_key_value_history", &[])
         .await
         .expect_err("history delete should fail");
-    assert!(
-        delete_err
-            .message
-            .contains("lix_key_value_history is read-only; DELETE is not supported"),
-        "unexpected delete error: {}",
-        delete_err.message
-    );
+    assert_eq!(delete_err.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
 });

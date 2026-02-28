@@ -135,10 +135,14 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
     let files = read_archive_files(archive_bytes)?;
 
     let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
-        message: "Plugin archive must contain manifest.json".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "Plugin archive must contain manifest.json".to_string(),
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
-        message: format!("Plugin archive manifest.json must be UTF-8: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Plugin archive manifest.json must be UTF-8: {error}"),
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
 
@@ -146,7 +150,9 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
     let wasm_bytes = files
         .get(&entry_path)
         .ok_or_else(|| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "Plugin archive is missing manifest entry file '{}'",
                 validated_manifest.manifest.entry
             ),
@@ -158,11 +164,17 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
     for schema_path in &validated_manifest.manifest.schemas {
         let normalized_schema_path = normalize_archive_path(schema_path)?;
         let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
-            message: format!("Plugin archive is missing schema file '{schema_path}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Plugin archive is missing schema file '{schema_path}'"),
         })?;
         let schema_json: JsonValue =
             serde_json::from_slice(schema_bytes).map_err(|error| LixError {
-                message: format!("Plugin archive schema '{schema_path}' is invalid JSON: {error}"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
+                    "Plugin archive schema '{schema_path}' is invalid JSON: {error}"
+                ),
             })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = extract_schema_key(&schema_json)?;
@@ -171,7 +183,9 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
             schema_key.schema_version.clone(),
         )) {
             return Err(LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "Plugin archive declares duplicate schema '{}~{}'",
                     schema_key.schema_key, schema_key.schema_version
                 ),
@@ -179,7 +193,9 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
         }
         let normalized_schema_json =
             serde_json::to_string(&schema_json).map_err(|error| LixError {
-                message: format!(
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "Failed to normalize schema JSON '{}' from plugin archive: {error}",
                     schema_path
                 ),
@@ -198,19 +214,25 @@ fn parse_plugin_archive(archive_bytes: &[u8]) -> Result<ParsedPluginArchive, Lix
 
 fn extract_schema_key(schema: &JsonValue) -> Result<SchemaKey, LixError> {
     let object = schema.as_object().ok_or_else(|| LixError {
-        message: "schema definition must be a JSON object".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "schema definition must be a JSON object".to_string(),
     })?;
     let schema_key = object
         .get("x-lix-key")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
-            message: "schema definition must include string x-lix-key".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "schema definition must include string x-lix-key".to_string(),
         })?;
     let schema_version = object
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
-            message: "schema definition must include string x-lix-version".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "schema definition must include string x-lix-version".to_string(),
         })?;
     Ok(SchemaKey::new(
         schema_key.to_string(),
@@ -221,18 +243,24 @@ fn extract_schema_key(schema: &JsonValue) -> Result<SchemaKey, LixError> {
 fn read_archive_files(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, LixError> {
     if archive_bytes.is_empty() {
         return Err(LixError {
-            message: "Plugin archive bytes must not be empty".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Plugin archive bytes must not be empty".to_string(),
         });
     }
 
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
-        message: format!("Plugin archive is not a valid zip file: {error}"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Plugin archive is not a valid zip file: {error}"),
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| LixError {
-            message: format!("Failed to read plugin archive entry at index {index}: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Failed to read plugin archive entry at index {index}: {error}"),
         })?;
         let raw_name = entry.name().to_string();
 
@@ -241,18 +269,24 @@ fn read_archive_files(archive_bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>,
         }
         if is_symlink_mode(entry.unix_mode()) {
             return Err(LixError {
-                message: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
             });
         }
 
         let normalized_path = normalize_archive_path(&raw_name)?;
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
-            message: format!("Failed to read plugin archive entry '{raw_name}': {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Failed to read plugin archive entry '{raw_name}': {error}"),
         })?;
         if files.insert(normalized_path.clone(), bytes).is_some() {
             return Err(LixError {
-                message: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
             });
         }
     }
@@ -269,17 +303,23 @@ fn is_symlink_mode(mode: Option<u32>) -> bool {
 fn normalize_archive_path(path: &str) -> Result<String, LixError> {
     if path.is_empty() {
         return Err(LixError {
-            message: "Plugin archive path must not be empty".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Plugin archive path must not be empty".to_string(),
         });
     }
     if path.starts_with('/') || path.starts_with('\\') {
         return Err(LixError {
-            message: format!("Plugin archive path '{path}' must be relative"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Plugin archive path '{path}' must be relative"),
         });
     }
     if path.contains('\\') {
         return Err(LixError {
-            message: format!("Plugin archive path '{path}' must use forward slash separators"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Plugin archive path '{path}' must use forward slash separators"),
         });
     }
 
@@ -287,21 +327,18 @@ fn normalize_archive_path(path: &str) -> Result<String, LixError> {
     for component in Path::new(path).components() {
         match component {
             Component::Normal(value) => {
-                let segment = value.to_str().ok_or_else(|| LixError {
-                    message: format!(
+                let segment = value.to_str().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "Plugin archive path '{path}' contains non-UTF-8 components"
                     ),
                 })?;
                 if segment.is_empty() {
-                    return Err(LixError {
-                        message: format!("Plugin archive path '{path}' is invalid"),
+                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Plugin archive path '{path}' is invalid"),
                     });
                 }
                 segments.push(segment.to_string());
             }
             Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(LixError {
-                    message: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "Plugin archive path '{path}' must not contain traversal or absolute components"
                     ),
                 })
@@ -311,7 +348,9 @@ fn normalize_archive_path(path: &str) -> Result<String, LixError> {
 
     if segments.is_empty() {
         return Err(LixError {
-            message: format!("Plugin archive path '{path}' is invalid"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Plugin archive path '{path}' is invalid"),
         });
     }
 
@@ -321,12 +360,16 @@ fn normalize_archive_path(path: &str) -> Result<String, LixError> {
 fn ensure_valid_wasm_binary(wasm_bytes: &[u8]) -> Result<(), LixError> {
     if wasm_bytes.is_empty() {
         return Err(LixError {
-            message: "Plugin wasm bytes must not be empty".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Plugin wasm bytes must not be empty".to_string(),
         });
     }
     if wasm_bytes.len() < 8 || !wasm_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]) {
         return Err(LixError {
-            message: "Plugin wasm bytes must start with a valid wasm header".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Plugin wasm bytes must start with a valid wasm header".to_string(),
         });
     }
     Ok(())

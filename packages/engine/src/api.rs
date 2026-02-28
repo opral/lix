@@ -38,7 +38,9 @@ impl Engine {
                 .installed_plugins_cache
                 .read()
                 .map_err(|_| LixError {
-                    message: "installed plugin cache lock poisoned".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "installed plugin cache lock poisoned".to_string(),
                 })?
                 .clone();
             if let Some(plugins) = cached {
@@ -49,7 +51,9 @@ impl Engine {
         let loaded = crate::plugin::runtime::load_installed_plugins(backend).await?;
         if allow_cache {
             let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-                message: "installed plugin cache lock poisoned".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "installed plugin cache lock poisoned".to_string(),
             })?;
             *guard = Some(loaded.clone());
         }
@@ -58,11 +62,15 @@ impl Engine {
 
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
         let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-            message: "installed plugin cache lock poisoned".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "installed plugin cache lock poisoned".to_string(),
         })?;
         *guard = None;
         let mut component_guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-            message: "plugin component cache lock poisoned".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "plugin component cache lock poisoned".to_string(),
         })?;
         component_guard.clear();
         Ok(())

@@ -118,8 +118,7 @@ where
         )? {
             let serialized =
                 serde_json::to_string(&JsonValue::Object(snapshot_object)).map_err(|err| {
-                    LixError {
-                        message: format!(
+                    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                             "failed to serialize snapshot_content for schema '{}' ({}): {err}",
                             schema_key, schema_version
                         ),
@@ -183,10 +182,9 @@ where
         {
             let value = evaluator
                 .evaluate_with_functions(expression, context, functions.clone())
-                .map_err(|err| LixError {
-                    message: format!(
+                .map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                         "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
-                        schema_key, field_name, schema_version, err.message
+                        schema_key, field_name, schema_version, err.description
                     ),
                 })?;
             snapshot.insert(field_name.clone(), value);
@@ -237,8 +235,7 @@ fn resolved_json(cell: Option<&ResolvedCell>) -> Result<Option<JsonValue>, LixEr
     };
     match &cell.value {
         Some(Value::Null) => Ok(None),
-        Some(Value::Text(raw)) => serde_json::from_str(raw).map(Some).map_err(|err| LixError {
-            message: format!("vtable insert snapshot_content invalid JSON: {err}"),
+        Some(Value::Text(raw)) => serde_json::from_str(raw).map(Some).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("vtable insert snapshot_content invalid JSON: {err}"),
         }),
         _ => Ok(None),
     }

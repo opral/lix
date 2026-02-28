@@ -39,8 +39,7 @@ impl WasmComponentInstance for PathEchoInstance {
                     .to_vec(),
             ),
             "apply-changes" | "api#apply-changes" => Ok(b"{}".to_vec()),
-            other => Err(LixError {
-                message: format!("unsupported test export: {other}"),
+            other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("unsupported test export: {other}"),
             }),
         }
     }

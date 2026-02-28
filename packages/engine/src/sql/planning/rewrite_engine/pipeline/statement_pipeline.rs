@@ -80,7 +80,9 @@ impl<'a> StatementRuleEngine<'a> {
             }
         }
         Err(LixError {
-            message: "statement rewrite engine could not match statement rule".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "statement rewrite engine could not match statement rule".to_string(),
         })
     }
 
@@ -110,7 +112,10 @@ impl<'a> StatementRuleEngine<'a> {
             }
         }
         Err(LixError {
-            message: "statement backend rewrite engine could not match statement rule".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "statement backend rewrite engine could not match statement rule"
+                .to_string(),
         })
     }
 }

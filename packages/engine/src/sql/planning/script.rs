@@ -37,7 +37,9 @@ pub(crate) fn extract_explicit_transaction_script_from_statements(
         )
     }) {
         return Err(LixError {
-            message:
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description:
                 "nested transaction statements are not supported inside BEGIN ... COMMIT scripts"
                     .to_string(),
         });
@@ -310,12 +312,16 @@ fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
 fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixError> {
     let incoming_rows = plain_values_rows(incoming)
         .ok_or_else(|| LixError {
-            message: "transaction insert coalescing expected VALUES rows".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "transaction insert coalescing expected VALUES rows".to_string(),
         })?
         .to_vec();
 
     let target_rows = plain_values_rows_mut(target).ok_or_else(|| LixError {
-        message: "transaction insert coalescing expected mutable VALUES rows".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "transaction insert coalescing expected mutable VALUES rows".to_string(),
     })?;
     target_rows.extend(incoming_rows);
     Ok(())

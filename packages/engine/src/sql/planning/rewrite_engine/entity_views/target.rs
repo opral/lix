@@ -101,7 +101,7 @@ pub(crate) async fn resolve_target_from_view_name_with_backend(
     let mut provider = SqlStoredSchemaProvider::new(backend);
     let schema = match provider.load_latest_schema(&schema_key).await {
         Ok(schema) => schema,
-        Err(err) if err.message.contains("is not stored") => return Ok(None),
+        Err(err) if err.description.contains("is not stored") => return Ok(None),
         Err(err) => return Err(err),
     };
 
@@ -282,7 +282,9 @@ fn parse_json_pointer_path(pointer: &str) -> Result<Vec<String>, LixError> {
     }
     if !pointer.starts_with('/') {
         return Err(LixError {
-            message: format!("invalid x-lix-primary-key pointer '{pointer}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("invalid x-lix-primary-key pointer '{pointer}'"),
         });
     }
     let mut path = Vec::new();
@@ -306,7 +308,9 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                 Some('1') => out.push('/'),
                 _ => {
                     return Err(LixError {
-                        message: format!("invalid JSON pointer segment '{segment}'"),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!("invalid JSON pointer segment '{segment}'"),
                     })
                 }
             }
@@ -342,9 +346,11 @@ fn evaluate_lixcol_override(
         .evaluate(expression, &JsonMap::new())
         .map(Some)
         .map_err(|err| LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "invalid x-lix-override-lixcols expression for '{}.{}': {}",
-                schema_key, key, err.message
+                schema_key, key, err.description
             ),
         })
 }
@@ -361,7 +367,9 @@ fn extract_lixcol_string_override(
     match value {
         JsonValue::String(text) => Ok(Some(text)),
         _ => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "x-lix-override-lixcols '{}.{}' must evaluate to a string",
                 schema_key, key
             ),
@@ -383,7 +391,9 @@ fn extract_lixcol_scalar_override(
             Ok(Some(value))
         }
         JsonValue::Array(_) | JsonValue::Object(_) => Err(LixError {
-            message: format!(
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "x-lix-override-lixcols '{}.{}' must evaluate to a scalar or null",
                 schema_key, key
             ),

@@ -303,13 +303,13 @@ simulation_test!(
             .await
             .expect_err("data expression updates should fail fast");
         assert!(
-            err.message
+            err.description
                 .contains("unsupported file data update expression")
                 || err
-                    .message
+                    .description
                     .contains("data expects bytes; use X'HEX' or blob parameter"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -564,9 +564,9 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
         .await
         .expect_err("lix_file id update should fail");
     assert!(
-        file_update_err.message.contains("id is immutable"),
+        file_update_err.description.contains("id is immutable"),
         "unexpected error: {}",
-        file_update_err.message
+        file_update_err.description
     );
 
     let version_id = active_version_id(&engine).await;
@@ -589,9 +589,9 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
         .await
         .expect_err("lix_file_by_version id update should fail");
     assert!(
-        by_version_update_err.message.contains("id is immutable"),
+        by_version_update_err.description.contains("id is immutable"),
         "unexpected error: {}",
-        by_version_update_err.message
+        by_version_update_err.description
     );
 });
 
@@ -621,9 +621,9 @@ simulation_test!(
             .await
             .expect_err("lix_directory id update should fail");
         assert!(
-            directory_update_err.message.contains("id is immutable"),
+            directory_update_err.description.contains("id is immutable"),
             "unexpected error: {}",
-            directory_update_err.message
+            directory_update_err.description
         );
 
         let version_id = active_version_id(&engine).await;
@@ -646,9 +646,9 @@ simulation_test!(
             .await
             .expect_err("lix_directory_by_version id update should fail");
         assert!(
-            by_version_update_err.message.contains("id is immutable"),
+            by_version_update_err.description.contains("id is immutable"),
             "unexpected error: {}",
-            by_version_update_err.message
+            by_version_update_err.description
         );
     }
 );
@@ -669,10 +669,10 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .expect_err("lix_file_history insert should fail");
     assert!(
         file_history_err
-            .message
+            .description
             .contains("lix_file_history does not support INSERT"),
         "unexpected error: {}",
-        file_history_err.message
+        file_history_err.description
     );
 
     let file_history_update_err = engine
@@ -684,10 +684,10 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .expect_err("lix_file_history update should fail");
     assert!(
         file_history_update_err
-            .message
+            .description
             .contains("lix_file_history does not support UPDATE"),
         "unexpected error: {}",
-        file_history_update_err.message
+        file_history_update_err.description
     );
 
     let file_history_delete_err = engine
@@ -696,10 +696,10 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .expect_err("lix_file_history delete should fail");
     assert!(
         file_history_delete_err
-            .message
+            .description
             .contains("lix_file_history does not support DELETE"),
         "unexpected error: {}",
-        file_history_delete_err.message
+        file_history_delete_err.description
     );
 
     let directory_history_err = engine
@@ -711,10 +711,10 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .expect_err("lix_directory_history delete should fail");
     assert!(
         directory_history_err
-            .message
+            .description
             .contains("lix_directory_history does not support DELETE"),
         "unexpected error: {}",
-        directory_history_err.message
+        directory_history_err.description
     );
 
     let directory_history_insert_err = engine
@@ -726,10 +726,10 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .expect_err("lix_directory_history insert should fail");
     assert!(
         directory_history_insert_err
-            .message
+            .description
             .contains("lix_directory_history does not support INSERT"),
         "unexpected error: {}",
-        directory_history_insert_err.message
+        directory_history_insert_err.description
     );
 
     let directory_history_update_err = engine
@@ -741,10 +741,10 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .expect_err("lix_directory_history update should fail");
     assert!(
         directory_history_update_err
-            .message
+            .description
             .contains("lix_directory_history does not support UPDATE"),
         "unexpected error: {}",
-        directory_history_update_err.message
+        directory_history_update_err.description
     );
 });
 
@@ -884,10 +884,10 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         .await
         .expect_err("insert without version should fail");
     assert!(
-        insert_err.message.contains("requires lixcol_version_id")
-            || insert_err.message.contains("requires version_id"),
+        insert_err.description.contains("requires lixcol_version_id")
+            || insert_err.description.contains("requires version_id"),
         "unexpected error: {}",
-        insert_err.message
+        insert_err.description
     );
 
     engine
@@ -910,14 +910,14 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         .expect_err("update without version predicate should fail");
     assert!(
         update_err
-            .message
+            .description
             .contains("requires a version_id predicate")
             || update_err
-                .message
+                .description
                 .contains("requires explicit lixcol_version_id")
-            || update_err.message.contains("requires version_id"),
+            || update_err.description.contains("requires version_id"),
         "unexpected error: {}",
-        update_err.message
+        update_err.description
     );
 
     let delete_err = engine
@@ -929,14 +929,14 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         .expect_err("delete without version predicate should fail");
     assert!(
         delete_err
-            .message
+            .description
             .contains("requires a version_id predicate")
             || delete_err
-                .message
+                .description
                 .contains("requires explicit lixcol_version_id")
-            || delete_err.message.contains("requires version_id"),
+            || delete_err.description.contains("requires version_id"),
         "unexpected error: {}",
-        delete_err.message
+        delete_err.description
     );
 
     engine
@@ -1119,10 +1119,10 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         .await
         .expect_err("insert without version should fail");
     assert!(
-        insert_err.message.contains("requires lixcol_version_id")
-            || insert_err.message.contains("requires version_id"),
+        insert_err.description.contains("requires lixcol_version_id")
+            || insert_err.description.contains("requires version_id"),
         "unexpected error: {}",
-        insert_err.message
+        insert_err.description
     );
 
     engine
@@ -1145,14 +1145,14 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         .expect_err("update without version predicate should fail");
     assert!(
         update_err
-            .message
+            .description
             .contains("requires a version_id predicate")
             || update_err
-                .message
+                .description
                 .contains("requires explicit lixcol_version_id")
-            || update_err.message.contains("requires version_id"),
+            || update_err.description.contains("requires version_id"),
         "unexpected error: {}",
-        update_err.message
+        update_err.description
     );
 
     let delete_err = engine
@@ -1164,14 +1164,14 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         .expect_err("delete without version predicate should fail");
     assert!(
         delete_err
-            .message
+            .description
             .contains("requires a version_id predicate")
             || delete_err
-                .message
+                .description
                 .contains("requires explicit lixcol_version_id")
-            || delete_err.message.contains("requires version_id"),
+            || delete_err.description.contains("requires version_id"),
         "unexpected error: {}",
-        delete_err.message
+        delete_err.description
     );
 
     engine
@@ -1297,10 +1297,10 @@ simulation_test!(
             .await
             .expect_err("insert with only data should fail");
         assert!(
-            err.message
+            err.description
                 .contains("file insert requires at least one non-data column"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -1320,10 +1320,10 @@ simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
             .await
             .expect_err("text data insert should fail");
     assert!(
-        err.message
+        err.description
             .contains("data expects bytes; use X'HEX' or blob parameter"),
         "unexpected error: {}",
-        err.message
+        err.description
     );
 });
 
@@ -1376,10 +1376,10 @@ simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
         .await
         .expect_err("text data update should fail");
     assert!(
-        err.message
+        err.description
             .contains("data expects bytes; use X'HEX' or blob parameter"),
         "unexpected error: {}",
-        err.message
+        err.description
     );
 });
 
@@ -1593,10 +1593,10 @@ simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
         .await
         .expect_err("duplicate directory path should fail");
     assert!(
-        err.message.contains("Unique constraint violation")
-            || err.message.contains("already exists"),
+        err.description.contains("Unique constraint violation")
+            || err.description.contains("already exists"),
         "unexpected error: {}",
-        err.message
+        err.description
     );
 });
 
@@ -1642,10 +1642,10 @@ simulation_test!(
             .await
             .expect_err("duplicate inherited directory path should fail");
         assert!(
-            err.message.contains("Unique constraint violation")
-                || err.message.contains("already exists"),
+            err.description.contains("Unique constraint violation")
+                || err.description.contains("already exists"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -1675,10 +1675,10 @@ simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
         .await
         .expect_err("duplicate file path should fail");
     assert!(
-        err.message.contains("Unique constraint violation")
-            || err.message.contains("already exists"),
+        err.description.contains("Unique constraint violation")
+            || err.description.contains("already exists"),
         "unexpected error: {}",
-        err.message
+        err.description
     );
 });
 
@@ -1724,10 +1724,10 @@ simulation_test!(
             .await
             .expect_err("duplicate inherited file path should fail");
         assert!(
-            err.message.contains("Unique constraint violation")
-                || err.message.contains("already exists"),
+            err.description.contains("Unique constraint violation")
+                || err.description.contains("already exists"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -1774,10 +1774,10 @@ simulation_test!(
             .await
             .expect_err("duplicate inherited nested file path should fail");
         assert!(
-            err.message.contains("Unique constraint violation")
-                || err.message.contains("already exists"),
+            err.description.contains("Unique constraint violation")
+                || err.description.contains("already exists"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -1986,11 +1986,11 @@ simulation_test!(
             .await
             .expect_err("update with unknown assignment should fail");
         assert!(
-            err.message.contains("strict rewrite violation")
-                && err.message.contains("unknown column")
-                && err.message.contains("bogus"),
+            err.description.contains("strict rewrite violation")
+                && err.description.contains("unknown column")
+                && err.description.contains("bogus"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -2010,11 +2010,11 @@ simulation_test!(
             .await
             .expect_err("delete with unknown predicate should fail");
         assert!(
-            err.message.contains("strict rewrite violation")
-                && err.message.contains("unknown column")
-                && err.message.contains("bogus"),
+            err.description.contains("strict rewrite violation")
+                && err.description.contains("unknown column")
+                && err.description.contains("bogus"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -2069,10 +2069,10 @@ simulation_test!(
             .await
             .expect_err("updating to inherited path should fail");
         assert!(
-            err.message.contains("Unique constraint violation")
-                || err.message.contains("already exists"),
+            err.description.contains("Unique constraint violation")
+                || err.description.contains("already exists"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -2150,10 +2150,10 @@ simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
         .await
         .expect_err("path update collision should fail");
     assert!(
-        err.message.contains("Unique constraint violation")
-            || err.message.contains("already exists"),
+        err.description.contains("Unique constraint violation")
+            || err.description.contains("already exists"),
         "unexpected error: {}",
-        err.message
+        err.description
     );
 });
 
@@ -2580,10 +2580,10 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         .await
         .expect_err("invalid file path should fail");
     assert!(
-        file_err.message.contains("lix_file_descriptor")
-            || file_err.message.contains("does not match schema"),
+        file_err.description.contains("lix_file_descriptor")
+            || file_err.description.contains("does not match schema"),
         "unexpected error: {}",
-        file_err.message
+        file_err.description
     );
 
     let directory_err = engine
@@ -2595,10 +2595,10 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         .await
         .expect_err("invalid directory path should fail");
     assert!(
-        directory_err.message.contains("lix_directory_descriptor")
-            || directory_err.message.contains("does not match schema"),
+        directory_err.description.contains("lix_directory_descriptor")
+            || directory_err.description.contains("does not match schema"),
         "unexpected error: {}",
-        directory_err.message
+        directory_err.description
     );
 });
 
@@ -2933,11 +2933,11 @@ simulation_test!(
             .await
             .expect_err("non-prefixed file should not be supported");
         assert!(
-            file_err.message.contains("file")
-                && (file_err.message.contains("no such table")
-                    || file_err.message.contains("does not exist")),
+            file_err.description.contains("file")
+                && (file_err.description.contains("no such table")
+                    || file_err.description.contains("does not exist")),
             "unexpected error: {}",
-            file_err.message
+            file_err.description
         );
 
         let directory_err = engine
@@ -2945,11 +2945,11 @@ simulation_test!(
             .await
             .expect_err("non-prefixed directory should not be supported");
         assert!(
-            directory_err.message.contains("directory")
-                && (directory_err.message.contains("no such table")
-                    || directory_err.message.contains("does not exist")),
+            directory_err.description.contains("directory")
+                && (directory_err.description.contains("no such table")
+                    || directory_err.description.contains("does not exist")),
             "unexpected error: {}",
-            directory_err.message
+            directory_err.description
         );
     }
 );

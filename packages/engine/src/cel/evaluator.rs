@@ -46,8 +46,7 @@ impl CelEvaluator {
     {
         let compiled = self.compile(expression)?;
         let context = build_context_with_functions(variables, functions)?;
-        let value = compiled.program.execute(&context).map_err(|err| LixError {
-            message: format!("failed to evaluate CEL expression '{expression}': {err}"),
+        let value = compiled.program.execute(&context).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("failed to evaluate CEL expression '{expression}': {err}"),
         })?;
         cel_to_json(&value)
     }
@@ -57,8 +56,7 @@ impl CelEvaluator {
             return Ok(existing);
         }
 
-        let program = Program::compile(expression).map_err(|err| LixError {
-            message: format!("failed to parse CEL expression '{expression}': {err}"),
+        let program = Program::compile(expression).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("failed to parse CEL expression '{expression}': {err}"),
         })?;
         let compiled = Arc::new(CompiledProgram { program });
 

@@ -86,7 +86,9 @@ impl TestWasmtimeRuntime {
         config.consume_fuel(true);
 
         let engine = Engine::new(&config).map_err(|error| LixError {
-            message: format!("Failed to initialize wasmtime engine: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Failed to initialize wasmtime engine: {error}"),
         })?;
 
         Ok(Self {
@@ -158,7 +160,9 @@ impl WasmRuntime for TestWasmtimeRuntime {
         let compiled =
             Arc::new(
                 Component::new(&self.engine, &bytes).map_err(|error| LixError {
-                    message: format!("Failed to compile wasm component: {error}"),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("Failed to compile wasm component: {error}"),
                 })?,
             );
 
@@ -191,25 +195,33 @@ impl WasmComponentInstance for TestWasmtimeInstance {
             },
         );
         store.set_fuel(u64::MAX).map_err(|error| LixError {
-            message: format!("Failed to configure wasm fuel: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Failed to configure wasm fuel: {error}"),
         })?;
 
         let mut linker = Linker::new(&self.engine);
         wasmtime_wasi::add_to_linker_sync(&mut linker).map_err(|error| LixError {
-            message: format!("Failed to add wasi imports to linker: {error}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Failed to add wasi imports to linker: {error}"),
         })?;
 
         let bindings =
             plugin_bindings::Plugin::instantiate(&mut store, self.component.as_ref(), &linker)
                 .map_err(|error| LixError {
-                    message: format!("Failed to instantiate wasm component: {error}"),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("Failed to instantiate wasm component: {error}"),
                 })?;
 
         match export {
             "detect-changes" | "api#detect-changes" => {
                 let request: WireDetectChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
-                        message: format!(
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "Failed to decode detect-changes request payload: {error}"
                         ),
                     })?;
@@ -227,7 +239,9 @@ impl WasmComponentInstance for TestWasmtimeInstance {
                         state_context.as_ref(),
                     )
                     .map_err(|error| LixError {
-                        message: format!("Wasm call failed for export '{export}': {error}"),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!("Wasm call failed for export '{export}': {error}"),
                     })?;
 
                 match result {
@@ -242,7 +256,9 @@ impl WasmComponentInstance for TestWasmtimeInstance {
                             })
                             .collect::<Vec<_>>();
                         serde_json::to_vec(&wire).map_err(|error| LixError {
-                            message: format!(
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            title: "Unknown error".to_string(),
+                            description: format!(
                                 "Failed to encode detect-changes response payload: {error}"
                             ),
                         })
@@ -253,7 +269,11 @@ impl WasmComponentInstance for TestWasmtimeInstance {
             "apply-changes" | "api#apply-changes" => {
                 let request: WireApplyChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
-                        message: format!("Failed to decode apply-changes request payload: {error}"),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
+                            "Failed to decode apply-changes request payload: {error}"
+                        ),
                     })?;
 
                 let file = wire_file_to_binding(request.file);
@@ -267,7 +287,9 @@ impl WasmComponentInstance for TestWasmtimeInstance {
                     .lix_plugin_api()
                     .call_apply_changes(&mut store, &file, &changes)
                     .map_err(|error| LixError {
-                        message: format!("Wasm call failed for export '{export}': {error}"),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!("Wasm call failed for export '{export}': {error}"),
                     })?;
 
                 match result {
@@ -276,7 +298,9 @@ impl WasmComponentInstance for TestWasmtimeInstance {
                 }
             }
             other => Err(LixError {
-                message: format!("Unsupported export '{other}' for TestWasmtimeRuntime"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Unsupported export '{other}' for TestWasmtimeRuntime"),
             }),
         }
     }
@@ -341,11 +365,15 @@ fn map_plugin_error(error: plugin_bindings::exports::lix::plugin::api::PluginErr
     match error {
         plugin_bindings::exports::lix::plugin::api::PluginError::InvalidInput(message) => {
             LixError {
-                message: format!("Plugin invalid-input error: {message}"),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Plugin invalid-input error: {message}"),
             }
         }
         plugin_bindings::exports::lix::plugin::api::PluginError::Internal(message) => LixError {
-            message: format!("Plugin internal error: {message}"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Plugin internal error: {message}"),
         },
     }
 }

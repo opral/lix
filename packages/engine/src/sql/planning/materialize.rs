@@ -54,7 +54,9 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
             } else {
                 if insert.columns.is_empty() {
                     return Err(LixError {
-                        message: "vtable insert requires explicit columns".to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "vtable insert requires explicit columns".to_string(),
                     });
                 }
 
@@ -63,7 +65,9 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                 for row in result.rows {
                     if row.len() != expected_columns {
                         return Err(LixError {
-                            message: format!(
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            title: "Unknown error".to_string(),
+                            description: format!(
                                 "vtable insert SELECT returned {} columns but {} were expected",
                                 row.len(),
                                 expected_columns
@@ -133,7 +137,9 @@ fn engine_value_to_expr(value: &Value) -> Result<Expr, LixError> {
             SqlValue::Number(value.to_string(), false).into(),
         )),
         Value::Blob(_) => Err(LixError {
-            message: "blob values are not supported in vtable insert SELECT materialization"
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "blob values are not supported in vtable insert SELECT materialization"
                 .to_string(),
         }),
     }
@@ -142,6 +148,8 @@ fn engine_value_to_expr(value: &Value) -> Result<Expr, LixError> {
 fn no_op_statement() -> Result<Statement, LixError> {
     let mut statements = parse_sql_statements("SELECT 1 WHERE 0 = 1")?;
     statements.pop().ok_or_else(|| LixError {
-        message: "failed to build no-op statement".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "failed to build no-op statement".to_string(),
     })
 }

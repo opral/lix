@@ -12,7 +12,9 @@ pub(crate) fn merge_rewrite_output(
 ) -> Result<(), LixError> {
     if base.postprocess.is_some() && next.postprocess.is_some() {
         return Err(LixError {
-            message: "only one postprocess rewrite is supported per query".to_string(),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "only one postprocess rewrite is supported per query".to_string(),
         });
     }
     if base.postprocess.is_none() {
@@ -42,7 +44,9 @@ pub(crate) fn rewrite_vtable_inserts<P: LixFunctionProvider>(
             vtable_write::rewrite_insert_with_writer_key(insert, params, writer_key, functions)?
         else {
             return Err(LixError {
-                message: "lix_version rewrite expected vtable insert rewrite".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "lix_version rewrite expected vtable insert rewrite".to_string(),
             });
         };
         statements.extend(rewritten.statements);
@@ -88,7 +92,10 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
         .await?
         else {
             return Err(LixError {
-                message: "lix_version rewrite expected backend vtable insert rewrite".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "lix_version rewrite expected backend vtable insert rewrite"
+                    .to_string(),
             });
         };
         statements.extend(rewritten.statements);

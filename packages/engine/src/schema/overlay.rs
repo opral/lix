@@ -182,14 +182,12 @@ mod tests {
                 });
             }
 
-            Err(LixError {
-                message: format!("unexpected SQL in FakeBackend: {sql}"),
+            Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("unexpected SQL in FakeBackend: {sql}"),
             })
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
-            Err(LixError {
-                message: "FakeBackend does not support transactions".to_string(),
+            Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "FakeBackend does not support transactions".to_string(),
             })
         }
     }
@@ -324,6 +322,6 @@ mod tests {
         let err = provider
             .remember_pending_schema_from_snapshot(&json!({}))
             .expect_err("should fail");
-        assert!(err.message.contains("missing value"), "{err:?}");
+        assert!(err.description.contains("missing value"), "{err:?}");
     }
 }

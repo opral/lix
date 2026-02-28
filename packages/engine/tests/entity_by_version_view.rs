@@ -141,10 +141,10 @@ simulation_test!(
             .await
             .expect_err("insert without version should fail");
         assert!(
-            err.message.contains("requires lixcol_version_id")
-                || err.message.contains("requires version_id"),
+            err.description.contains("requires lixcol_version_id")
+                || err.description.contains("requires version_id"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );
@@ -230,10 +230,10 @@ simulation_test!(
             .expect_err("DO NOTHING should be rejected");
 
         assert!(
-            err.message
+            err.description
                 .contains("ON CONFLICT DO NOTHING is not supported"),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 );

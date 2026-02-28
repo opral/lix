@@ -273,8 +273,7 @@ simulation_test!(
                             &[],
                         )
                         .await?;
-                        Err::<(), LixError>(LixError {
-                            message: "rollback test".to_string(),
+                        Err::<(), LixError>(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "rollback test".to_string(),
                         })
                     })
                 },
@@ -282,9 +281,9 @@ simulation_test!(
             .await
             .expect_err("transaction should roll back on closure error");
         assert!(
-            error.message.contains("rollback test"),
+            error.description.contains("rollback test"),
             "unexpected error: {}",
-            error.message
+            error.description
         );
 
         let file_rows = engine

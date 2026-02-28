@@ -152,7 +152,7 @@ simulation_test!(install_plugin_rejects_missing_manifest, |sim| async move {
         .await
         .expect_err("missing manifest must fail");
 
-    assert!(err.message.contains("manifest.json"));
+    assert!(err.description.contains("manifest.json"));
 });
 
 simulation_test!(
@@ -180,7 +180,7 @@ simulation_test!(
             .await
             .expect_err("missing entry must fail");
 
-        assert!(err.message.contains("missing manifest entry file"));
+        assert!(err.description.contains("missing manifest entry file"));
     }
 );
 
@@ -212,7 +212,7 @@ simulation_test!(
             .await
             .expect_err("missing schema must fail");
 
-        assert!(err.message.contains("missing schema file"));
+        assert!(err.description.contains("missing schema file"));
     }
 );
 
@@ -245,7 +245,7 @@ simulation_test!(
             .await
             .expect_err("invalid schema JSON must fail");
 
-        assert!(err.message.contains("invalid JSON"));
+        assert!(err.description.contains("invalid JSON"));
     }
 );
 
@@ -278,7 +278,7 @@ simulation_test!(
             .await
             .expect_err("duplicate schema key+version must fail");
 
-        assert!(err.message.contains("duplicate schema"));
+        assert!(err.description.contains("duplicate schema"));
     }
 );
 
@@ -312,7 +312,7 @@ simulation_test!(
             .await
             .expect_err("traversal entry must fail");
 
-        assert!(err.message.contains("traversal") || err.message.contains("relative"));
+        assert!(err.description.contains("traversal") || err.description.contains("relative"));
     }
 );
 

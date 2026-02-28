@@ -143,13 +143,14 @@ pub(crate) fn resolve_placeholder_index(
         parsed - 1
     } else {
         return Err(LixError {
-            message: format!("unsupported SQL placeholder format '{trimmed}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("unsupported SQL placeholder format '{trimmed}'"),
         });
     };
 
     if source_index >= params_len {
-        return Err(LixError {
-            message: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "placeholder '{trimmed}' references parameter {} but only {} parameters were provided",
                 source_index + 1,
                 params_len
@@ -183,11 +184,15 @@ fn placeholder_for_dialect(dialect: SqlDialect, dense_index_1_based: usize) -> S
 
 fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     let parsed = numeric.parse::<usize>().map_err(|_| LixError {
-        message: format!("invalid SQL placeholder '{token}'"),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("invalid SQL placeholder '{token}'"),
     })?;
     if parsed == 0 {
         return Err(LixError {
-            message: format!("invalid SQL placeholder '{token}'"),
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("invalid SQL placeholder '{token}'"),
         });
     }
     Ok(parsed)
@@ -195,7 +200,9 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
 
 fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
-        message: error.to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })
 }
 
