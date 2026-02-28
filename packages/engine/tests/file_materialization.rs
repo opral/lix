@@ -855,7 +855,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-no-plugin', '/assets/video.mp4', 'ignored')",
+                 VALUES ('file-no-plugin', '/assets/video.mp4', lix_text_encode('ignored'))",
                 &[],
             )
             .await
@@ -1035,7 +1035,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json', '/config.json', '{\"hello\":\"from-write\"}')",
+                 VALUES ('file-json', '/config.json', lix_text_encode('{\"hello\":\"from-write\"}'))",
                 &[],
             )
             .await
@@ -1122,7 +1122,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-update', '/config.json', '{\"hello\":\"before\",\"remove\":\"soon-gone\"}')",
+                 VALUES ('file-json-update', '/config.json', lix_text_encode('{\"hello\":\"before\",\"remove\":\"soon-gone\"}'))",
                 &[],
             )
             .await
@@ -1131,7 +1131,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"hello\":\"after\",\"add\":\"new-value\"}' \
+                 SET data = lix_text_encode('{\"hello\":\"after\",\"add\":\"new-value\"}') \
                  WHERE id = 'file-json-update'",
                 &[],
             )
@@ -1190,7 +1190,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-param', '/config.json', '{\"hello\":\"before\",\"drop\":\"gone\"}')",
+                 VALUES ('file-json-param', '/config.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"gone\"}'))",
                 &[],
             )
             .await
@@ -1200,7 +1200,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_file SET data = $1 WHERE id = $2",
                 &[
-                    Value::Text("{\"hello\":\"after-param\",\"new\":1}".to_string()),
+                    Value::Blob(b"{\"hello\":\"after-param\",\"new\":1}".to_vec()),
                     Value::Text("file-json-param".to_string()),
                 ],
             )
@@ -1238,7 +1238,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-combined', '/combined.json', '{\"hello\":\"before\"}')",
+                 VALUES ('file-json-combined', '/combined.json', lix_text_encode('{\"hello\":\"before\"}'))",
                 &[],
             )
             .await
@@ -1250,7 +1250,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_file \
                  SET path = '/combined-renamed.json', \
-                     data = '{\"hello\":\"after\",\"added\":true}' \
+                     data = lix_text_encode('{\"hello\":\"after\",\"added\":true}') \
                  WHERE id = 'file-json-combined'",
                 &[],
             )
@@ -1316,7 +1316,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-insert-cache', '/state-insert-cache.json', '{\"content\":\"Start\"}')",
+                 VALUES ('file-json-state-insert-cache', '/state-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
                 &[],
             )
             .await
@@ -1371,7 +1371,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-cache', '/state-cache.json', '{\"content\":\"Start\"}')",
+                 VALUES ('file-json-state-cache', '/state-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
                 &[],
             )
             .await
@@ -1423,7 +1423,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-delete-cache', '/state-delete-cache.json', '{\"content\":\"Start\"}')",
+                 VALUES ('file-json-state-delete-cache', '/state-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
                 &[],
             )
             .await
@@ -1474,7 +1474,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-by-version-insert-cache', '/state-by-version-insert-cache.json', '{\"content\":\"Start\"}')",
+                 VALUES ('file-json-state-by-version-insert-cache', '/state-by-version-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
                 &[],
             )
             .await
@@ -1544,7 +1544,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-by-version-cache', '/state-by-version-cache.json', '{\"content\":\"Start\"}')",
+                 VALUES ('file-json-state-by-version-cache', '/state-by-version-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
                 &[],
             )
             .await
@@ -1612,7 +1612,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-by-version-delete-cache', '/state-by-version-delete-cache.json', '{\"content\":\"Start\"}')",
+                 VALUES ('file-json-state-by-version-delete-cache', '/state-by-version-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
                 &[],
             )
             .await
@@ -1679,7 +1679,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path', '/before.json', '{\"hello\":\"before\",\"remove\":true}')",
+                 VALUES ('file-json-path', '/before.json', lix_text_encode('{\"hello\":\"before\",\"remove\":true}'))",
                 &[],
             )
             .await
@@ -1688,7 +1688,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET path = '/after.json', data = '{\"hello\":\"after-path\"}' \
+                 SET path = '/after.json', data = lix_text_encode('{\"hello\":\"after-path\"}') \
                  WHERE id = 'file-json-path'",
                 &[],
             )
@@ -1744,7 +1744,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path-only-switch', '/switch.json', '{\"hello\":\"before\"}')",
+                 VALUES ('file-json-path-only-switch', '/switch.json', lix_text_encode('{\"hello\":\"before\"}'))",
                 &[],
             )
             .await
@@ -1841,7 +1841,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path-only-cache-guard', '/cache-guard.json', '{\"hello\":\"before\"}')",
+                 VALUES ('file-json-path-only-cache-guard', '/cache-guard.json', lix_text_encode('{\"hello\":\"before\"}'))",
                 &[],
             )
             .await
@@ -1899,7 +1899,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-before-aware', '/before-aware.json', '{\"hello\":\"before\"}')",
+                 VALUES ('file-before-aware', '/before-aware.json', lix_text_encode('{\"hello\":\"before\"}'))",
                 &[],
             )
             .await
@@ -1924,7 +1924,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"hello\":\"after\"}' \
+                 SET data = lix_text_encode('{\"hello\":\"after\"}') \
                  WHERE id = 'file-before-aware'",
                 &[],
             )
@@ -1970,7 +1970,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('file-json-by-version', '/config.json', '{{\"hello\":\"before\",\"remove\":\"gone\"}}', '{}')",
+                     VALUES ('file-json-by-version', '/config.json', lix_text_encode('{{\"hello\":\"before\",\"remove\":\"gone\"}}'), '{}')",
                     main_version_id
                 ),
                 &[],
@@ -1982,7 +1982,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "UPDATE lix_file_by_version \
-                     SET data = '{{\"hello\":\"after-by-version\",\"add\":\"v\"}}' \
+                     SET data = lix_text_encode('{{\"hello\":\"after-by-version\",\"add\":\"v\"}}') \
                      WHERE id = 'file-json-by-version' \
                        AND lixcol_version_id = '{}'",
                     main_version_id
@@ -2029,8 +2029,8 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
-                 ('file-json-bulk-1', '/bulk-1.json', '{\"old\":1}'), \
-                 ('file-json-bulk-2', '/bulk-2.json', '{\"old\":2}')",
+                 ('file-json-bulk-1', '/bulk-1.json', lix_text_encode('{\"old\":1}')), \
+                 ('file-json-bulk-2', '/bulk-2.json', lix_text_encode('{\"old\":2}'))",
                 &[],
             )
             .await
@@ -2039,7 +2039,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = '{\"common\":\"updated\"}' \
+                 SET data = lix_text_encode('{\"common\":\"updated\"}') \
                  WHERE id IN ('file-json-bulk-1', 'file-json-bulk-2')",
                 &[],
             )
@@ -2089,9 +2089,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-multi-insert-1', '/multi-insert-1.json', '{\"first\":1}'); \
+                 VALUES ('file-json-multi-insert-1', '/multi-insert-1.json', lix_text_encode('{\"first\":1}')); \
                  INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-multi-insert-2', '/multi-insert-2.json', '{\"second\":2}')",
+                 VALUES ('file-json-multi-insert-2', '/multi-insert-2.json', lix_text_encode('{\"second\":2}'))",
                 &[],
             )
             .await
@@ -2126,7 +2126,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-seq', '/seq.json', '{\"a\":1}')",
+                 VALUES ('file-json-seq', '/seq.json', lix_text_encode('{\"a\":1}'))",
                 &[],
             )
             .await
@@ -2134,8 +2134,8 @@ simulation_test!(
 
         engine
             .execute(
-                "UPDATE lix_file SET data = '{\"a\":2,\"b\":true}' WHERE id = 'file-json-seq'; \
-                 UPDATE lix_file SET data = '{\"a\":4}' WHERE id = 'file-json-seq'",
+                "UPDATE lix_file SET data = lix_text_encode('{\"a\":2,\"b\":true}') WHERE id = 'file-json-seq'; \
+                 UPDATE lix_file SET data = lix_text_encode('{\"a\":4}') WHERE id = 'file-json-seq'",
                 &[],
             )
             .await
@@ -2166,7 +2166,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-seq-param', '/seq-param.json', '{\"seed\":0}')",
+                 VALUES ('file-json-seq-param', '/seq-param.json', lix_text_encode('{\"seed\":0}'))",
                 &[],
             )
             .await
@@ -2177,8 +2177,8 @@ simulation_test!(
                 "UPDATE lix_file SET data = $1 WHERE id = 'file-json-seq-param'; \
                  UPDATE lix_file SET data = $2 WHERE id = 'file-json-seq-param'",
                 &[
-                    Value::Text("{\"step\":1,\"keep\":true}".to_string()),
-                    Value::Text("{\"final\":2}".to_string()),
+                    Value::Blob(b"{\"step\":1,\"keep\":true}".to_vec()),
+                    Value::Blob(b"{\"final\":2}".to_vec()),
                 ],
             )
             .await
@@ -2227,7 +2227,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('file-active-switch', '/active-switch.json', '{{\"hello\":\"before\"}}', '{}')",
+                     VALUES ('file-active-switch', '/active-switch.json', lix_text_encode('{{\"hello\":\"before\"}}'), '{}')",
                     version_b
                 ),
                 &[],
@@ -2239,7 +2239,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "UPDATE lix_active_version SET version_id = '{}'; \
-                     UPDATE lix_file SET data = '{{\"hello\":\"after\"}}' WHERE id = 'file-active-switch'",
+                     UPDATE lix_file SET data = lix_text_encode('{{\"hello\":\"after\"}}') WHERE id = 'file-active-switch'",
                     version_b
                 ),
                 &[],
@@ -2294,7 +2294,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-delete', '/delete.json', '{\"hello\":\"before\",\"drop\":\"x\"}')",
+                 VALUES ('file-json-delete', '/delete.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"x\"}'))",
                 &[],
             )
             .await
@@ -2368,7 +2368,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('file-delete-by-version', '/delete-by-version.json', '{{\"hello\":\"by-version\"}}', '{}')",
+                     VALUES ('file-delete-by-version', '/delete-by-version.json', lix_text_encode('{{\"hello\":\"by-version\"}}'), '{}')",
                     version_b
                 ),
                 &[],
@@ -2447,13 +2447,13 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-mixed-drop', '/drop.json', '{\"a\":1}'); \
+                 VALUES ('file-json-mixed-drop', '/drop.json', lix_text_encode('{\"a\":1}')); \
                  UPDATE lix_file \
-                 SET data = '{\"a\":2,\"b\":true}' \
+                 SET data = lix_text_encode('{\"a\":2,\"b\":true}') \
                  WHERE id = 'file-json-mixed-drop'; \
                  DELETE FROM lix_file WHERE id = 'file-json-mixed-drop'; \
                  INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-mixed-keep', '/keep.json', '{\"keep\":\"yes\"}')",
+                 VALUES ('file-json-mixed-keep', '/keep.json', lix_text_encode('{\"keep\":\"yes\"}'))",
                 &[],
             )
             .await
@@ -2493,7 +2493,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data, metadata) \
-                 VALUES ('file-json-overlay-meta-delete', '/overlay-meta-delete.json', '{\"v\":1}', '{\"tag\":\"x\"}'); \
+                 VALUES ('file-json-overlay-meta-delete', '/overlay-meta-delete.json', lix_text_encode('{\"v\":1}'), '{\"tag\":\"x\"}'); \
                  DELETE FROM lix_file \
                  WHERE metadata IS NOT NULL \
                    AND id = 'file-json-overlay-meta-delete'",
@@ -2528,7 +2528,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-read-miss', '/read-miss.json', '{\"hello\":\"from-read\"}')",
+                 VALUES ('file-read-miss', '/read-miss.json', lix_text_encode('{\"hello\":\"from-read\"}'))",
                 &[],
             )
             .await
@@ -2600,7 +2600,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('file-read-miss-by-version', '/read-miss-by-version.json', '{{\"hello\":\"by-version\"}}', '{}')",
+                     VALUES ('file-read-miss-by-version', '/read-miss-by-version.json', lix_text_encode('{{\"hello\":\"by-version\"}}'), '{}')",
                     version_b
                 ),
                 &[],
@@ -2663,7 +2663,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-read-insert-select', '/insert-select.json', '{\"hello\":\"from-insert-select\"}')",
+                 VALUES ('file-read-insert-select', '/insert-select.json', lix_text_encode('{\"hello\":\"from-insert-select\"}'))",
                 &[],
             )
             .await
@@ -2750,7 +2750,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-                     VALUES ('file-read-insert-select-by-version', '/insert-select-by-version.json', '{{\"hello\":\"from-version-b\"}}', '{}')",
+                     VALUES ('file-read-insert-select-by-version', '/insert-select-by-version.json', lix_text_encode('{{\"hello\":\"from-version-b\"}}'), '{}')",
                     version_b
                 ),
                 &[],
@@ -2822,7 +2822,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-path-echo', '/docs/readme.json', '{\"hello\":\"world\"}')",
+                 VALUES ('file-path-echo', '/docs/readme.json', lix_text_encode('{\"hello\":\"world\"}'))",
                 &[],
             )
             .await
@@ -2872,7 +2872,7 @@ simulation_test!(
             let path = format!("/{file_id}.json");
             let insert_sql = format!(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('{}', '{}', '{{\"i\":{}}}')",
+                 VALUES ('{}', '{}', lix_text_encode('{{\"i\":{}}}'))",
                 file_id, path, i
             );
             engine
@@ -2910,8 +2910,8 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
-                 ('cache-orphan-keep', '/cache-orphan-keep.json', '{\"keep\":true}'), \
-                 ('cache-orphan-drop', '/cache-orphan-drop.json', '{\"drop\":true}')",
+                 ('cache-orphan-keep', '/cache-orphan-keep.json', lix_text_encode('{\"keep\":true}')), \
+                 ('cache-orphan-drop', '/cache-orphan-drop.json', lix_text_encode('{\"drop\":true}'))",
                 &[],
             )
             .await
@@ -2970,7 +2970,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', 'AAAA-AAAA-AAAA-AAAA')",
+                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', lix_text_encode('AAAA-AAAA-AAAA-AAAA'))",
                 &[],
             )
             .await
@@ -2983,7 +2983,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET data = 'BBBB-BBBB-BBBB-BBBB-BBBB-BBBB' \
+                 SET data = lix_text_encode('BBBB-BBBB-BBBB-BBBB-BBBB-BBBB') \
                  WHERE id = 'binary-gc-overwrite'",
                 &[],
             )
@@ -3044,7 +3044,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-fk-guard', '/assets/blob.mp4', 'FK-GUARD-DATA-123456')",
+                 VALUES ('binary-fk-guard', '/assets/blob.mp4', lix_text_encode('FK-GUARD-DATA-123456'))",
                 &[],
             )
             .await

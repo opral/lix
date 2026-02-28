@@ -196,7 +196,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-sequential-fallback', '/tx-sequential-fallback.json', 'before')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-sequential-fallback', '/tx-sequential-fallback.json', lix_text_encode('before'))",
                 &[],
             )
             .await
@@ -206,7 +206,7 @@ simulation_test!(
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE lix_file SET data = 'after' WHERE id = 'tx-sequential-fallback'; \
+                        "UPDATE lix_file SET data = lix_text_encode('after') WHERE id = 'tx-sequential-fallback'; \
                          SELECT 1",
                         &[],
                     )
@@ -242,7 +242,7 @@ simulation_test!(
         engine
             .execute(
                 "BEGIN; \
-                 INSERT INTO lix_file (id, path, data) VALUES ('tx-script-preprocess', '/tx-script-preprocess.json', 'before'); \
+                 INSERT INTO lix_file (id, path, data) VALUES ('tx-script-preprocess', '/tx-script-preprocess.json', lix_text_encode('before')); \
                  COMMIT;",
                 &[],
             )
@@ -314,7 +314,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-param-update', '/before.md', 'before')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-param-update', '/before.md', lix_text_encode('before'))",
                 &[],
             )
             .await
@@ -367,7 +367,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-single-update', '/before.md', 'before')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-single-update', '/before.md', lix_text_encode('before'))",
                 &[],
             )
             .await
@@ -447,7 +447,7 @@ simulation_test!(
             |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "INSERT INTO lix_file (id, path, data) VALUES ('tx-panic-rollback', '/tx-panic-rollback.json', 'before')",
+                        "INSERT INTO lix_file (id, path, data) VALUES ('tx-panic-rollback', '/tx-panic-rollback.json', lix_text_encode('before'))",
                         &[],
                     )
                     .await?;
