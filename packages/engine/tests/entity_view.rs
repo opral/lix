@@ -516,7 +516,8 @@ simulation_test!(
             .await
             .expect_err("expected schema validation failure");
         assert!(
-            err.description.contains("expects one of [string], got integer"),
+            err.description
+                .contains("expects one of [string], got integer"),
             "unexpected error: {}",
             err.description
         );

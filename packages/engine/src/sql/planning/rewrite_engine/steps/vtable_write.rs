@@ -2929,11 +2929,16 @@ mod tests {
         };
 
         assert!(
-            update.table.to_string().contains("lix_internal_state_untracked"),
+            update
+                .table
+                .to_string()
+                .contains("lix_internal_state_untracked"),
             "expected rewrite target to be untracked table, got: {}",
             update.table
         );
-        let selection = update.selection.expect("selection should remain after stripping");
+        let selection = update
+            .selection
+            .expect("selection should remain after stripping");
         let selection_sql = selection.to_string();
         assert!(selection_sql.contains("schema_key = 'lix_active_version'"));
         assert!(selection_sql.contains("file_id = 'lix'"));
