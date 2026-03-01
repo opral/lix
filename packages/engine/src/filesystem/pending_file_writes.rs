@@ -167,7 +167,11 @@ pub(crate) fn ensure_file_insert_ids_for_data_writes<P: LixFunctionProvider>(
         };
         for row in rows.iter_mut() {
             if row.len() != current_column_count {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert row length does not match column count".to_string(),
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: "filesystem insert row length does not match column count"
+                        .to_string(),
                 });
             }
             row.push(string_literal_expr(functions.call_uuid_v7()));
@@ -289,7 +293,10 @@ fn collect_insert_writes(
             .and_then(|index| resolved_cell_text(resolved_row.get(index)))
             .unwrap_or_else(|| unresolved_auto_file_id_for_path(&path));
         let after_data =
-            resolved_cell_blob_bytes(resolved_row.get(data_index)).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: FILE_DATA_TYPE_ERROR.to_string(),
+            resolved_cell_blob_bytes(resolved_row.get(data_index)).ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: FILE_DATA_TYPE_ERROR.to_string(),
             })?;
 
         let version_id = match target {
@@ -378,7 +385,10 @@ async fn collect_delete_writes(
         &bound.params,
     )
     .await
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "pending_file_writes delete prefetch failed for '{}': {}",
             bound.sql, error.description
         ),
@@ -505,7 +515,10 @@ async fn collect_update_writes(
                 resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
             assigned_after_data = resolved_cell_blob_bytes(Some(&resolved));
             if assigned_after_data.is_none() {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: FILE_DATA_TYPE_ERROR.to_string(),
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: FILE_DATA_TYPE_ERROR.to_string(),
                 });
             }
         } else if column.eq_ignore_ascii_case("path") {
@@ -630,7 +643,10 @@ async fn collect_update_writes(
         &bound.params,
     )
     .await
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "pending_file_writes prefetch failed for '{}': {}",
             bound.sql, error.description
         ),
@@ -858,7 +874,10 @@ async fn collect_delete_targets(
         &bound.params,
     )
     .await
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "pending_file_writes delete prefetch failed for '{}': {}",
             bound.sql, error.description
         ),
@@ -1000,7 +1019,10 @@ async fn active_version_id_from_lix_active_version_update(
         &bound.params,
     )
     .await
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "active version update prefetch failed for '{}': {}",
             bound.sql, error.description
         ),
@@ -1076,7 +1098,10 @@ async fn active_version_id_from_internal_state_update(
         &bound.params,
     )
     .await
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "active version internal update prefetch failed for '{}': {}",
             bound.sql, error.description
         ),

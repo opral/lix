@@ -11,17 +11,26 @@ static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
 
 pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
-    let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Plugin manifest must be valid JSON: {error}"),
+    let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Plugin manifest must be valid JSON: {error}"),
     })?;
 
     validate_plugin_manifest_json(&manifest_json)?;
 
     let manifest: PluginManifest =
-        serde_json::from_value(manifest_json.clone()).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Plugin manifest does not match expected shape: {error}"),
+        serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Plugin manifest does not match expected shape: {error}"),
         })?;
     validate_path_glob(&manifest.file_match.path_glob)?;
 
-    let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Failed to normalize plugin manifest JSON: {error}"),
+    let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Failed to normalize plugin manifest JSON: {error}"),
     })?;
 
     Ok(ValidatedPluginManifest {
@@ -31,7 +40,10 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
 }
 
 fn validate_path_glob(glob: &str) -> Result<(), LixError> {
-    Glob::new(glob).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
+    Glob::new(glob).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
     })?;
     Ok(())
 }
@@ -40,7 +52,10 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
     let validator = plugin_manifest_validator()?;
     if let Err(errors) = validator.validate(manifest) {
         let details = format_validation_errors(errors);
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Invalid plugin manifest: {details}"),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Invalid plugin manifest: {details}"),
         });
     }
     Ok(())
@@ -51,13 +66,19 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
         JSONSchema::options()
             .with_meta_schemas()
             .compile(plugin_manifest_schema())
-            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Failed to compile plugin manifest schema: {error}"),
+            .map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Failed to compile plugin manifest schema: {error}"),
             })
     });
 
     match result {
         Ok(schema) => Ok(schema),
-        Err(error) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.description.clone(),
+        Err(error) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: error.description.clone(),
         }),
     }
 }

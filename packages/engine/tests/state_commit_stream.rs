@@ -239,14 +239,19 @@ simulation_test!(
                         &[],
                     )
                     .await?;
-                    Err::<(), LixError>(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "rollback state commit stream test".to_string(),
+                    Err::<(), LixError>(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "rollback state commit stream test".to_string(),
                     })
                 })
             })
             .await
             .expect_err("transaction should roll back on callback error");
         assert!(
-            error.description.contains("rollback state commit stream test"),
+            error
+                .description
+                .contains("rollback state commit stream test"),
             "unexpected rollback error: {}",
             error.description
         );

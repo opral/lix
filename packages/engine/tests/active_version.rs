@@ -225,7 +225,9 @@ simulation_test!(
             .await
             .expect_err("missing version_id should violate active version FK");
         assert!(
-            error.description.contains("Foreign key constraint violation"),
+            error
+                .description
+                .contains("Foreign key constraint violation"),
             "unexpected error message: {}",
             error.description
         );

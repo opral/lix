@@ -26,7 +26,10 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     let validator = lix_schema_validator()?;
     if let Err(errors) = validator.validate(schema) {
         let details = format_validation_errors(errors);
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Invalid Lix schema definition: {details}"),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Invalid Lix schema definition: {details}"),
         });
     }
 
@@ -43,7 +46,10 @@ pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), L
     let validator = compile_schema(schema)?;
     if let Err(errors) = validator.validate(data) {
         let details = format_validation_errors(errors);
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Data validation failed: {details}"),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("Data validation failed: {details}"),
         });
     }
 
@@ -54,7 +60,10 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
     let result = LIX_SCHEMA_VALIDATOR.get_or_init(|| compile_schema(lix_schema_definition()));
     match result {
         Ok(schema) => Ok(schema),
-        Err(err) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: err.description.clone(),
+        Err(err) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: err.description.clone(),
         }),
     }
 }
@@ -65,7 +74,10 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
     options.with_format("json-pointer", is_json_pointer);
     options.with_format("cel", is_cel_expression);
 
-    options.compile(schema).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Failed to compile Lix schema definition: {err}"),
+    options.compile(schema).map_err(|err| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Failed to compile Lix schema definition: {err}"),
     })
 }
 
@@ -82,7 +94,10 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
         return Ok(Vec::new());
     }
     if !pointer.starts_with('/') {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Invalid JSON pointer".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Invalid JSON pointer".to_string(),
         });
     }
 
@@ -102,7 +117,10 @@ fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
                 Some('0') => out.push('~'),
                 Some('1') => out.push('/'),
                 _ => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Invalid JSON pointer".to_string(),
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "Invalid JSON pointer".to_string(),
                     })
                 }
             }

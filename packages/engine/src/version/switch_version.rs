@@ -2,7 +2,10 @@ use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 pub async fn switch_version(engine: &Engine, version_id: String) -> Result<(), LixError> {
     if version_id.trim().is_empty() {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "version_id must be a non-empty string".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "version_id must be a non-empty string".to_string(),
         });
     }
 
@@ -41,7 +44,10 @@ async fn ensure_version_exists(
         )
         .await?;
     if result.rows.is_empty() {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("version '{version_id}' does not exist"),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("version '{version_id}' does not exist"),
         });
     }
     Ok(())

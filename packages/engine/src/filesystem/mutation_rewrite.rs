@@ -70,7 +70,10 @@ pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
         return Ok(None);
     };
     if target.read_only {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} does not support INSERT", target.view_name),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} does not support INSERT", target.view_name),
         });
     }
 
@@ -93,7 +96,10 @@ pub async fn rewrite_insert_with_backend(
         return Ok(None);
     };
     if target.read_only {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} does not support INSERT", target.view_name),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} does not support INSERT", target.view_name),
         });
     }
 
@@ -178,7 +184,10 @@ pub async fn insert_side_effect_statements_with_backend(
 
     for (row, resolved_row) in values.rows.iter().zip(resolved_rows.iter()) {
         if row.len() != insert.columns.len() {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert row length does not match column count".to_string(),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "filesystem insert row length does not match column count".to_string(),
             });
         }
 
@@ -373,7 +382,10 @@ pub async fn update_side_effects_with_backend(
         backend.dialect(),
         statement_start_state,
     )
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "filesystem update placeholder binding failed for '{}': {}",
             statement_sql, error.description
         ),
@@ -464,7 +476,10 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
         return Ok(None);
     };
     if target.read_only {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} does not support UPDATE", target.view_name),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} does not support UPDATE", target.view_name),
         });
     }
     validate_filesystem_update_assignments(&update, target)?;
@@ -495,7 +510,10 @@ pub async fn rewrite_update_with_backend(
         return Ok(None);
     };
     if target.read_only {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} does not support UPDATE", target.view_name),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} does not support UPDATE", target.view_name),
         });
     }
     validate_filesystem_update_assignments(&update, target)?;
@@ -559,7 +577,10 @@ pub fn rewrite_delete(mut delete: Delete) -> Result<Option<Delete>, LixError> {
         return Ok(None);
     };
     if target.read_only {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} does not support DELETE", target.view_name),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} does not support DELETE", target.view_name),
         });
     }
     validate_filesystem_selection_columns(delete.selection.as_ref(), target, "delete WHERE")?;
@@ -577,7 +598,10 @@ pub async fn rewrite_delete_with_backend(
         return Ok(None);
     };
     if target.read_only {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} does not support DELETE", target.view_name),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} does not support DELETE", target.view_name),
         });
     }
     validate_filesystem_selection_columns(delete.selection.as_ref(), target, "delete WHERE")?;
@@ -589,7 +613,10 @@ pub async fn rewrite_delete_with_backend(
             backend.dialect(),
         )?;
         if version_id.is_none() {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "{} delete requires a version_id predicate",
                     target.view_name
                 ),
@@ -763,7 +790,10 @@ async fn rewrite_file_insert_columns_with_backend(
         .columns
         .iter()
         .position(|column| column.value.eq_ignore_ascii_case("path"))
-        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{} insert requires path", target.view_name),
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("{} insert requires path", target.view_name),
         })?;
     let by_version_index = insert.columns.iter().position(|column| {
         column.value.eq_ignore_ascii_case("lixcol_version_id")
@@ -779,10 +809,16 @@ async fn rewrite_file_insert_columns_with_backend(
         None
     };
 
-    let source = insert.source.as_ref().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert requires VALUES rows".to_string(),
+    let source = insert.source.as_ref().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "filesystem insert requires VALUES rows".to_string(),
     })?;
     let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert requires VALUES rows".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert requires VALUES rows".to_string(),
         });
     };
     let row_exprs = values.rows.clone();
@@ -794,9 +830,15 @@ async fn rewrite_file_insert_columns_with_backend(
     let rows = insert_values_rows_mut(insert)?;
 
     for (row_index, row) in rows.iter_mut().enumerate() {
-        let resolved_row = resolved_rows.get(row_index).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert row resolution mismatch".to_string(),
+        let resolved_row = resolved_rows.get(row_index).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert row resolution mismatch".to_string(),
         })?;
-        let row_expr = row_exprs.get(row_index).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert row expression mismatch".to_string(),
+        let row_expr = row_exprs.get(row_index).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert row expression mismatch".to_string(),
         })?;
 
         let raw_path = resolve_text_expr(
@@ -804,7 +846,10 @@ async fn rewrite_file_insert_columns_with_backend(
             resolved_row.get(path_index),
             "file path",
         )?
-        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "lix_file insert requires path".to_string(),
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_file insert requires path".to_string(),
         })?;
         let parsed = parse_file_path(&raw_path)?;
         let version_id = resolve_insert_row_version_id(
@@ -856,7 +901,10 @@ async fn rewrite_file_insert_columns_with_backend(
         .await?
         .is_some()
         {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "File path collides with existing directory path: {}/",
                     parsed.normalized_path
                 ),
@@ -929,10 +977,16 @@ async fn rewrite_directory_insert_columns_with_backend(
         None
     };
 
-    let source = insert.source.as_ref().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert requires VALUES rows".to_string(),
+    let source = insert.source.as_ref().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "filesystem insert requires VALUES rows".to_string(),
     })?;
     let SetExpr::Values(values) = source.body.as_ref() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert requires VALUES rows".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert requires VALUES rows".to_string(),
         });
     };
     let row_exprs = values.rows.clone();
@@ -943,9 +997,15 @@ async fn rewrite_directory_insert_columns_with_backend(
     let rows = insert_values_rows_mut(insert)?;
 
     for (row_index, row) in rows.iter_mut().enumerate() {
-        let resolved_row = resolved_rows.get(row_index).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert row resolution mismatch".to_string(),
+        let resolved_row = resolved_rows.get(row_index).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert row resolution mismatch".to_string(),
         })?;
-        let row_expr = row_exprs.get(row_index).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert row expression mismatch".to_string(),
+        let row_expr = row_exprs.get(row_index).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert row expression mismatch".to_string(),
         })?;
         let version_id = resolve_insert_row_version_id(
             target,
@@ -996,7 +1056,10 @@ async fn rewrite_directory_insert_columns_with_backend(
             if let Some(raw_path) = explicit_path {
                 let normalized_path = normalize_directory_path(&raw_path)?;
                 let derived_name =
-                    directory_name_from_path(&normalized_path).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory name must be provided".to_string(),
+                    directory_name_from_path(&normalized_path).ok_or_else(|| LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "Directory name must be provided".to_string(),
                     })?;
                 let parent_path = parent_directory_path(&normalized_path);
                 let derived_parent_id = match parent_path {
@@ -1020,7 +1083,10 @@ async fn rewrite_directory_insert_columns_with_backend(
                 if explicit_parent_id.as_deref() != derived_parent_id.as_deref()
                     && explicit_parent_id.is_some()
                 {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "Provided parent_id does not match parent derived from path {}",
                             normalized_path
                         ),
@@ -1028,7 +1094,10 @@ async fn rewrite_directory_insert_columns_with_backend(
                 }
                 if let Some(name) = explicit_name {
                     if normalize_path_segment(&name)? != derived_name {
-                        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                        return Err(LixError {
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            title: "Unknown error".to_string(),
+                            description: format!(
                                 "Provided directory name '{}' does not match path '{}'",
                                 name, normalized_path
                             ),
@@ -1040,7 +1109,10 @@ async fn rewrite_directory_insert_columns_with_backend(
             } else {
                 let raw_name = explicit_name.unwrap_or_default();
                 if raw_name.trim().is_empty() {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory name must be provided".to_string(),
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: "Directory name must be provided".to_string(),
                     });
                 }
                 let name = normalize_path_segment(&raw_name)?;
@@ -1052,7 +1124,10 @@ async fn rewrite_directory_insert_columns_with_backend(
                         &mut read_rewrite_session,
                     )
                     .await?
-                    .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Parent directory does not exist for id {parent_id}"),
+                    .ok_or_else(|| LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!("Parent directory does not exist for id {parent_id}"),
                     })?,
                     None => "/".to_string(),
                 };
@@ -1315,7 +1390,10 @@ async fn rewrite_directory_update_assignments_with_backend(
     let current_directory_id =
         extract_predicate_string(update.selection.as_ref(), &["id", "lixcol_entity_id"]);
     let Some(current_directory_id) = current_directory_id else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "lix_directory update requires an id predicate".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "lix_directory update requires an id predicate".to_string(),
         });
     };
 
@@ -1326,12 +1404,18 @@ async fn rewrite_directory_update_assignments_with_backend(
         &mut read_rewrite_session,
     )
     .await?
-    .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Directory does not exist for id {}", current_directory_id),
+    .ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Directory does not exist for id {}", current_directory_id),
     })?;
 
     let (resolved_parent_id, resolved_name, resolved_path) = if let Some(raw_path) = next_path {
         let normalized_path = normalize_directory_path(&raw_path)?;
-        let name = directory_name_from_path(&normalized_path).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory name must be provided".to_string(),
+        let name = directory_name_from_path(&normalized_path).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Directory name must be provided".to_string(),
         })?;
         let parent_id = match parent_directory_path(&normalized_path) {
             Some(parent_path) => find_directory_id_by_path(
@@ -1341,7 +1425,10 @@ async fn rewrite_directory_update_assignments_with_backend(
                 &mut read_rewrite_session,
             )
             .await?
-            .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Parent directory does not exist for path {}", parent_path),
+            .ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Parent directory does not exist for path {}", parent_path),
             })?,
             None => String::new(),
         };
@@ -1356,13 +1443,19 @@ async fn rewrite_directory_update_assignments_with_backend(
         let name_raw = next_name.unwrap_or(existing.name.clone());
         let name = normalize_path_segment(&name_raw)?;
         if name.is_empty() {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory name must be provided".to_string(),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "Directory name must be provided".to_string(),
             });
         }
         let parent_path = if let Some(parent_id) = parent_id.as_deref() {
             read_directory_path_by_id(backend, &version_id, parent_id, &mut read_rewrite_session)
                 .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Parent directory does not exist for id {}", parent_id),
+                .ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("Parent directory does not exist for id {}", parent_id),
                 })?
         } else {
             "/".to_string()
@@ -1372,7 +1465,10 @@ async fn rewrite_directory_update_assignments_with_backend(
     };
 
     if resolved_parent_id.as_deref() == Some(current_directory_id.as_str()) {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory cannot be its own parent".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "Directory cannot be its own parent".to_string(),
         });
     }
     if let Some(parent_id) = resolved_parent_id.as_deref() {
@@ -1431,7 +1527,10 @@ fn resolve_insert_row_version_id(
         return Ok(version_id.clone());
     }
     if target.requires_explicit_version_scope() {
-        let version_index = by_version_index.ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        let version_index = by_version_index.ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert requires lixcol_version_id or version_id",
                 target.view_name
             ),
@@ -1441,13 +1540,19 @@ fn resolve_insert_row_version_id(
             resolved_row.get(version_index),
             "version_id",
         )?
-        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} insert requires lixcol_version_id or version_id",
                 target.view_name
             ),
         });
     }
-    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert could not resolve version scope".to_string(),
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "filesystem insert could not resolve version scope".to_string(),
     })
 }
 
@@ -1469,18 +1574,27 @@ async fn resolve_update_version_id(
             placeholder_state,
             backend.dialect(),
         )
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} update version predicate failed: {}",
                 target.view_name, error.description
             ),
         })?
-        .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "{} update requires a version_id predicate",
                 target.view_name
             ),
         });
     }
-    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem update could not resolve version scope".to_string(),
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "filesystem update could not resolve version scope".to_string(),
     })
 }
 
@@ -1511,7 +1625,10 @@ fn reject_immutable_id_update(update: &Update, target: FilesystemTarget) -> Resu
         return Ok(());
     }
 
-    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "{} id is immutable; create a new row and delete the old row instead",
             target.view_name
         ),
@@ -1551,17 +1668,26 @@ fn remove_insert_column(insert: &mut Insert, column: &str) -> Result<(), LixErro
 }
 
 fn insert_values_rows_mut(insert: &mut Insert) -> Result<&mut Vec<Vec<Expr>>, LixError> {
-    let source = insert.source.as_mut().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert requires VALUES rows".to_string(),
+    let source = insert.source.as_mut().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "filesystem insert requires VALUES rows".to_string(),
     })?;
     let SetExpr::Values(values) = source.body.as_mut() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem insert requires VALUES rows".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem insert requires VALUES rows".to_string(),
         });
     };
     Ok(&mut values.rows)
 }
 
 fn directory_unique_error(path: &str, version_id: &str) -> LixError {
-    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "Unique constraint violation: directory path '{}' already exists in version '{}'",
             path, version_id
         ),
@@ -1569,7 +1695,10 @@ fn directory_unique_error(path: &str, version_id: &str) -> LixError {
 }
 
 fn file_unique_error(path: &str, version_id: &str) -> LixError {
-    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "Unique constraint violation: file path '{}' already exists in version '{}'",
             path, version_id
         ),
@@ -2050,15 +2179,24 @@ async fn rewrite_single_read_query_for_backend(
         return Ok(cached);
     }
 
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })?;
     if statements.len() != 1 {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "expected a single SELECT statement".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected a single SELECT statement".to_string(),
         });
     }
     let statement = statements.remove(0);
     let Statement::Query(query) = statement else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "expected SELECT statement".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected SELECT statement".to_string(),
         });
     };
     let rewritten = rewrite_read_query_with_backend_and_params_in_session(
@@ -2097,7 +2235,10 @@ fn resolve_text_expr(
                 EngineValue::Text(value) => Ok(Some(value.clone())),
                 EngineValue::Integer(value) => Ok(Some(value.to_string())),
                 EngineValue::Real(value) => Ok(Some(value.to_string())),
-                EngineValue::Blob(_) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("{context} does not support blob values"),
+                EngineValue::Blob(_) => Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!("{context} does not support blob values"),
                 }),
             };
         }
@@ -2506,15 +2647,25 @@ async fn load_active_version_id(backend: &dyn LixBackend) -> Result<String, LixE
         )
         .await?;
     let Some(row) = result.rows.first() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem rewrite requires an active version".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem rewrite requires an active version".to_string(),
         });
     };
     let Some(snapshot_content) = row.first() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem active version query row is missing snapshot_content".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem active version query row is missing snapshot_content"
+                .to_string(),
         });
     };
     let EngineValue::Text(snapshot_content) = snapshot_content else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "filesystem active version snapshot_content must be text, got {snapshot_content:?}"
             ),
         });
@@ -2562,7 +2713,10 @@ async fn assert_no_directory_at_file_path(
     {
         return Ok(());
     }
-    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("File path collides with existing directory path: {directory_path}"),
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("File path collides with existing directory path: {directory_path}"),
     })
 }
 
@@ -2579,7 +2733,10 @@ async fn assert_no_file_at_directory_path(
     {
         return Ok(());
     }
-    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Directory path collides with existing file path: {file_path}"),
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!("Directory path collides with existing file path: {file_path}"),
     })
 }
 
@@ -2615,7 +2772,10 @@ async fn read_directory_path_by_id(
     };
     match value {
         EngineValue::Text(path) => Ok(Some(path.clone())),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("directory path lookup expected text path, got {other:?}"),
+        other => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("directory path lookup expected text path, got {other:?}"),
         }),
     }
 }
@@ -2653,14 +2813,20 @@ async fn read_directory_descriptor_by_id(
         return Ok(None);
     };
     if row.len() < 2 {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "directory descriptor lookup expected two columns".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "directory descriptor lookup expected two columns".to_string(),
         });
     }
     let parent_id = match &row[0] {
         EngineValue::Null => None,
         EngineValue::Text(value) => Some(value.clone()),
         other => {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!(
                     "directory descriptor parent_id expected text/null, got {other:?}"
                 ),
             })
@@ -2669,7 +2835,10 @@ async fn read_directory_descriptor_by_id(
     let name = match &row[1] {
         EngineValue::Text(value) => value.clone(),
         other => {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("directory descriptor name expected text, got {other:?}"),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("directory descriptor name expected text, got {other:?}"),
             })
         }
     };
@@ -2687,11 +2856,17 @@ async fn assert_no_directory_cycle(
     let mut current_parent: Option<String> = Some(parent_id.to_string());
     while let Some(parent_id) = current_parent {
         if parent_id == directory_id {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory parent would create a cycle".to_string(),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "Directory parent would create a cycle".to_string(),
             });
         }
         if safety > 1024 {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "Directory hierarchy appears to be cyclic".to_string(),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "Directory hierarchy appears to be cyclic".to_string(),
             });
         }
         safety += 1;
@@ -2700,7 +2875,10 @@ async fn assert_no_directory_cycle(
             read_directory_descriptor_by_id(backend, version_id, &parent_id, read_rewrite_session)
                 .await?
         else {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("Parent directory does not exist for id {}", parent_id),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("Parent directory does not exist for id {}", parent_id),
             });
         };
         current_parent = snapshot.parent_id;
@@ -2757,7 +2935,10 @@ async fn directory_rows_matching_delete(
     let result = backend
         .execute(&bound.sql, &bound.params)
         .await
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "directory delete scope prefetch failed for '{}': {}",
                 bound.sql, error.description
             ),
@@ -2766,12 +2947,20 @@ async fn directory_rows_matching_delete(
     let mut rows: Vec<ScopedDirectoryId> = Vec::new();
     for row in result.rows {
         if target.uses_active_version_scope() {
-            let version_id = active_version_id.clone().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active version id is missing for directory delete".to_string(),
+            let version_id = active_version_id.clone().ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "active version id is missing for directory delete".to_string(),
             })?;
             let id = match row.first() {
                 Some(EngineValue::Text(value)) => value.clone(),
                 Some(other) => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("directory delete id lookup expected text, got {other:?}"),
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
+                            "directory delete id lookup expected text, got {other:?}"
+                        ),
                     })
                 }
                 None => continue,
@@ -2784,14 +2973,22 @@ async fn directory_rows_matching_delete(
             let id = match &row[0] {
                 EngineValue::Text(value) => value.clone(),
                 other => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("directory delete id lookup expected text, got {other:?}"),
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
+                            "directory delete id lookup expected text, got {other:?}"
+                        ),
                     })
                 }
             };
             let version_id = match &row[1] {
                 EngineValue::Text(value) => value.clone(),
                 other => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "directory delete version lookup expected text, got {other:?}"
                         ),
                     })
@@ -2842,7 +3039,10 @@ async fn file_rows_matching_selection(
         backend.dialect(),
         PlaceholderState::new(),
     )
-    .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
             "file {operation} scope binding failed for '{}': {}",
             rewritten_sql, error.description
         ),
@@ -2850,7 +3050,10 @@ async fn file_rows_matching_selection(
     let result = backend
         .execute(&bound.sql, &bound.params)
         .await
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "file {operation} scope prefetch failed for '{}': {}",
                 bound.sql, error.description
             ),
@@ -2859,12 +3062,18 @@ async fn file_rows_matching_selection(
     let mut rows = Vec::<ScopedFileSelectionRow>::new();
     for row in result.rows {
         if target.uses_active_version_scope() {
-            let version_id = active_version_id.clone().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "active version id is missing for file scoped selection".to_string(),
+            let version_id = active_version_id.clone().ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "active version id is missing for file scoped selection".to_string(),
             })?;
             let id = match row.first() {
                 Some(EngineValue::Text(value)) => value.clone(),
                 Some(other) => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "file {operation} scoped id lookup expected text, got {other:?}"
                         ),
                     })
@@ -2879,7 +3088,10 @@ async fn file_rows_matching_selection(
             let id = match &row[0] {
                 EngineValue::Text(value) => value.clone(),
                 other => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "file {operation} scoped id lookup expected text, got {other:?}"
                         ),
                     })
@@ -2888,7 +3100,10 @@ async fn file_rows_matching_selection(
             let version_id = match &row[1] {
                 EngineValue::Text(value) => value.clone(),
                 other => {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        title: "Unknown error".to_string(),
+                        description: format!(
                             "file {operation} scoped version lookup expected text, got {other:?}"
                         ),
                     })
@@ -2961,7 +3176,10 @@ async fn file_ids_matching_update(
     let result = backend
         .execute(&bound.sql, &bound.params)
         .await
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "file update scope prefetch failed for '{}': {}",
                 bound.sql, error.description
             ),
@@ -2981,7 +3199,10 @@ async fn file_ids_matching_update(
             continue;
         };
         let EngineValue::Text(id) = id_value else {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("file update id lookup expected text, got {id_value:?}"),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("file update id lookup expected text, got {id_value:?}"),
             });
         };
         let untracked = row
@@ -3061,7 +3282,10 @@ async fn try_file_ids_matching_update_fast(
     let result = backend
         .execute(&bound.sql, &bound.params)
         .await
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "file update fast-path prefetch failed for '{}': {}",
                 bound.sql, error.description
             ),
@@ -3073,7 +3297,10 @@ async fn try_file_ids_matching_update_fast(
             continue;
         };
         let EngineValue::Text(id) = id_value else {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("file update id lookup expected text, got {id_value:?}"),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: format!("file update id lookup expected text, got {id_value:?}"),
             });
         };
         let untracked = row
@@ -3110,7 +3337,10 @@ async fn try_exact_file_descriptor_lookup_current_version(
             ],
         )
         .await
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "file update exact current-version prefetch failed for '{}': {}",
                 untracked_sql, error.description
             ),
@@ -3137,7 +3367,10 @@ async fn try_exact_file_descriptor_lookup_current_version(
             ],
         )
         .await
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "file update exact current-version prefetch failed for '{}': {}",
                 materialized_sql, error.description
             ),
@@ -3156,7 +3389,10 @@ fn parse_exact_file_descriptor_lookup_rows(
         return Ok(Some(Vec::new()));
     };
     let EngineValue::Text(id) = id_value else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!("file update id lookup expected text, got {id_value:?}"),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!("file update id lookup expected text, got {id_value:?}"),
         });
     };
     let untracked = row
@@ -3318,14 +3554,20 @@ fn parse_untracked_value(value: &EngineValue) -> Result<bool, LixError> {
             match normalized.as_str() {
                 "1" | "true" => Ok(true),
                 "0" | "false" | "" => Ok(false),
-                _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                _ => Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    title: "Unknown error".to_string(),
+                    description: format!(
                         "file update untracked lookup expected boolean-like text, got '{v}'"
                     ),
                 }),
             }
         }
         EngineValue::Null => Ok(false),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        other => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: format!(
                 "file update untracked lookup expected boolean-like value, got {other:?}"
             ),
         }),
@@ -3411,7 +3653,10 @@ fn build_directory_delete_selection(
     target: FilesystemTarget,
 ) -> Result<String, LixError> {
     if rows.is_empty() {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "directory delete selection expansion returned empty result".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "directory delete selection expansion returned empty result".to_string(),
         });
     }
     if target.uses_active_version_scope() {
@@ -3476,29 +3721,50 @@ fn build_file_scoped_selection(
 fn parse_expression(sql: &str) -> Result<Expr, LixError> {
     let wrapped_sql = format!("SELECT 1 WHERE {sql}");
     let mut statements =
-        Parser::parse_sql(&GenericDialect {}, &wrapped_sql).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
+        Parser::parse_sql(&GenericDialect {}, &wrapped_sql).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: error.to_string(),
         })?;
     if statements.len() != 1 {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "failed to parse expression".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "failed to parse expression".to_string(),
         });
     }
     let Statement::Query(query) = statements.remove(0) else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "failed to parse expression query".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "failed to parse expression query".to_string(),
         });
     };
     let SetExpr::Select(select) = *query.body else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "failed to parse expression SELECT".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "failed to parse expression SELECT".to_string(),
         });
     };
-    select.selection.ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "failed to parse expression selection".to_string(),
+    select.selection.ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "failed to parse expression selection".to_string(),
     })
 }
 
 fn parse_single_statement(sql: &str) -> Result<Statement, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })?;
     if statements.len() != 1 {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "expected a single statement".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected a single statement".to_string(),
         });
     }
     Ok(statements.remove(0))
@@ -3514,23 +3780,35 @@ fn strip_file_data_from_insert(insert: &mut Insert) -> Result<(), LixError> {
     };
 
     insert.columns.remove(data_column_index);
-    let source = insert.source.as_mut().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "file insert with data requires VALUES rows".to_string(),
+    let source = insert.source.as_mut().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: "file insert with data requires VALUES rows".to_string(),
     })?;
     let SetExpr::Values(Values { rows, .. }) = source.body.as_mut() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "file insert with data requires VALUES rows".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "file insert with data requires VALUES rows".to_string(),
         });
     };
 
     for row in rows.iter_mut() {
         if data_column_index >= row.len() {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "file insert row length does not match column count".to_string(),
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "file insert row length does not match column count".to_string(),
             });
         }
         row.remove(data_column_index);
     }
 
     if insert.columns.is_empty() {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "file insert requires at least one non-data column".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "file insert requires at least one non-data column".to_string(),
         });
     }
 
@@ -3542,11 +3820,17 @@ fn replace_update_target_table(
     rewrite_view_name: &str,
 ) -> Result<(), LixError> {
     if !table.joins.is_empty() {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem update does not support JOIN targets".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem update does not support JOIN targets".to_string(),
         });
     }
     let TableFactor::Table { name, .. } = &mut table.relation else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem update requires table target".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem update requires table target".to_string(),
         });
     };
     *name = table_name(rewrite_view_name);
@@ -3561,7 +3845,10 @@ fn replace_delete_target_table(
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
     };
     let Some(table) = tables.first_mut() else {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "filesystem delete requires table target".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "filesystem delete requires table target".to_string(),
         });
     };
     replace_update_target_table(table, rewrite_view_name)
@@ -3773,11 +4060,17 @@ fn table_name(name: &str) -> ObjectName {
 fn noop_statement() -> Result<Statement, LixError> {
     let mut statements =
         Parser::parse_sql(&GenericDialect {}, "SELECT 0 WHERE 1 = 0").map_err(|error| {
-            LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: error.to_string(),
             }
         })?;
     if statements.len() != 1 {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "failed to build filesystem no-op statement".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "failed to build filesystem no-op statement".to_string(),
         });
     }
     Ok(statements.remove(0))
@@ -4115,7 +4408,10 @@ mod tests {
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-            Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "transactions are not used in this unit test".to_string(),
+            Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                title: "Unknown error".to_string(),
+                description: "transactions are not used in this unit test".to_string(),
             })
         }
     }

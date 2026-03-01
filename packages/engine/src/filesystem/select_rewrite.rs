@@ -795,16 +795,25 @@ fn active_version_scope_predicate(version_column: &str) -> String {
 }
 
 fn parse_single_query(sql: &str) -> Result<Query, LixError> {
-    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: error.to_string(),
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: error.to_string(),
     })?;
     if statements.len() != 1 {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "expected a single SELECT statement".to_string(),
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected a single SELECT statement".to_string(),
         });
     }
     let statement = statements.remove(0);
     match statement {
         Statement::Query(query) => Ok(*query),
-        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: "expected SELECT statement".to_string(),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "expected SELECT statement".to_string(),
         }),
     }
 }
