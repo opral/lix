@@ -235,12 +235,21 @@ export async function openLix(
     const releaseSlot = await acquireTransactionSlot();
     const transactionOptions = normalizeExecuteOptions(options, "beginTransaction");
     let transactionClosed = false;
+    if (typeof (wasmLix as any).beginTransaction !== "function") {
+      releaseSlot();
+      throw new Error("beginTransaction is not available in this wasm build");
+    }
 
+    let wasmTransaction: any;
     try {
-      await runExecute("BEGIN", [], transactionOptions);
+      wasmTransaction = await (wasmLix as any).beginTransaction(transactionOptions);
     } catch (error) {
       releaseSlot();
       throw error;
+    }
+    if (!wasmTransaction || typeof wasmTransaction.execute !== "function") {
+      releaseSlot();
+      throw new Error("beginTransaction() returned an invalid transaction object");
     }
 
     const tx = {
@@ -254,14 +263,17 @@ export async function openLix(
         if (closing || closed) {
           throw new Error("lix is closed; transaction.execute() is unavailable");
         }
-        return runExecute(sql, params, transactionOptions);
+        return wasmTransaction.execute(
+          sql,
+          params.map((param: unknown) => Value.from(normalizeSqlParam(param))),
+        );
       },
       commit: async (): Promise<void> => {
         if (transactionClosed) {
           return;
         }
         try {
-          await runExecute("COMMIT", [], transactionOptions);
+          await wasmTransaction.commit();
         } finally {
           transactionClosed = true;
           openSqlTransactions.delete(txHandle);
@@ -273,7 +285,7 @@ export async function openLix(
           return;
         }
         try {
-          await runExecute("ROLLBACK", [], transactionOptions);
+          await wasmTransaction.rollback();
         } finally {
           transactionClosed = true;
           openSqlTransactions.delete(txHandle);
@@ -288,7 +300,7 @@ export async function openLix(
           return;
         }
         try {
-          await runExecute("ROLLBACK", [], transactionOptions);
+          await wasmTransaction.rollback();
         } finally {
           transactionClosed = true;
           releaseSlot();

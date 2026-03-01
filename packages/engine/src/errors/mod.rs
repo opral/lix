@@ -6,6 +6,8 @@ pub enum ErrorCode {
     InternalTableAccessDenied,
     ReadOnlyViewWriteDenied,
     VtableSchemaKeyRequired,
+    TransactionControlStatementDenied,
+    TransactionHandleNotFound,
 }
 
 impl ErrorCode {
@@ -15,6 +17,10 @@ impl ErrorCode {
             Self::InternalTableAccessDenied => "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
             Self::ReadOnlyViewWriteDenied => "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED",
             Self::VtableSchemaKeyRequired => "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED",
+            Self::TransactionControlStatementDenied => {
+                "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
+            }
+            Self::TransactionHandleNotFound => "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND",
         }
     }
 
@@ -24,6 +30,8 @@ impl ErrorCode {
             Self::InternalTableAccessDenied,
             Self::ReadOnlyViewWriteDenied,
             Self::VtableSchemaKeyRequired,
+            Self::TransactionControlStatementDenied,
+            Self::TransactionHandleNotFound,
         ]
     }
 }
@@ -69,10 +77,27 @@ pub(crate) fn vtable_schema_key_required_error() -> LixError {
     )
 }
 
+pub(crate) fn transaction_control_statement_denied_error() -> LixError {
+    build_error(
+        ErrorCode::TransactionControlStatementDenied,
+        "Transaction control statements are not allowed in execute()",
+        "Use transaction APIs instead: beginTransaction(), transaction(), or executeTransaction().",
+    )
+}
+
+pub(crate) fn transaction_handle_not_found_error() -> LixError {
+    build_error(
+        ErrorCode::TransactionHandleNotFound,
+        "Transaction handle does not exist",
+        "The transaction handle is invalid or already closed. Open a new transaction with beginTransaction().",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         internal_table_access_denied_error, read_only_view_write_error, table_not_found_read_error,
+        transaction_control_statement_denied_error, transaction_handle_not_found_error,
         vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
@@ -105,6 +130,18 @@ mod tests {
             schema_key_required.code,
             "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED"
         );
+
+        let transaction_control_denied = transaction_control_statement_denied_error();
+        assert_eq!(
+            transaction_control_denied.code,
+            "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
+        );
+
+        let transaction_handle_not_found = transaction_handle_not_found_error();
+        assert_eq!(
+            transaction_handle_not_found.code,
+            "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND"
+        );
     }
 
     #[test]
@@ -126,5 +163,8 @@ mod tests {
 
         let vtable_write_src = include_str!("../sql/planning/rewrite_engine/steps/vtable_write.rs");
         assert!(vtable_write_src.contains("errors::vtable_schema_key_required_error"));
+
+        let api_src = include_str!("../api.rs");
+        assert!(api_src.contains("errors::transaction_control_statement_denied_error()"));
     }
 }

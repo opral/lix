@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -93,6 +93,8 @@ pub struct Engine {
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
+    active_transactions: Mutex<BTreeMap<u64, EngineTransaction<'static>>>,
+    next_transaction_handle_id: AtomicU64,
 }
 
 #[must_use = "EngineTransaction must be committed or rolled back"]
@@ -299,6 +301,8 @@ impl Engine {
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
+            active_transactions: Mutex::new(BTreeMap::new()),
+            next_transaction_handle_id: AtomicU64::new(1),
         }
     }
 }

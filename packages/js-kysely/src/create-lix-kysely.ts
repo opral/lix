@@ -162,18 +162,17 @@ class LixConnection implements DatabaseConnection {
 }
 
 class LixDriver implements Driver {
-	readonly #lix: LixExecuteLike;
-	readonly #lixWithTransactions?: LixExecuteLike & LixBeginTransactionLike;
+	readonly #lix: LixExecuteLike & LixBeginTransactionLike;
 	readonly #connection: LixConnection;
 	readonly #options?: LixExecuteOptions;
 	#activeTransaction?: LixSqlTransactionLike;
 
-	constructor(lix: LixExecuteLike, options?: LixExecuteOptions) {
+	constructor(
+		lix: LixExecuteLike & LixBeginTransactionLike,
+		options?: LixExecuteOptions,
+	) {
 		this.#lix = lix;
 		this.#options = options;
-		this.#lixWithTransactions = isLixBeginTransactionLike(lix)
-			? lix
-			: undefined;
 		this.#connection = new LixConnection((sql, params) =>
 			this.#executeSql(sql, params),
 		);
@@ -186,13 +185,7 @@ class LixDriver implements Driver {
 	}
 
 	async beginTransaction(): Promise<void> {
-		if (this.#lixWithTransactions) {
-			this.#activeTransaction = await this.#lixWithTransactions.beginTransaction(
-				this.#options,
-			);
-			return;
-		}
-		await this.#lix.execute("BEGIN", undefined, this.#options);
+		this.#activeTransaction = await this.#lix.beginTransaction(this.#options);
 	}
 
 	async commitTransaction(): Promise<void> {
@@ -204,7 +197,7 @@ class LixDriver implements Driver {
 			}
 			return;
 		}
-		await this.#lix.execute("COMMIT", undefined, this.#options);
+		throw new Error("commitTransaction called without active transaction");
 	}
 
 	async rollbackTransaction(): Promise<void> {
@@ -216,7 +209,7 @@ class LixDriver implements Driver {
 			}
 			return;
 		}
-		await this.#lix.execute("ROLLBACK", undefined, this.#options);
+		throw new Error("rollbackTransaction called without active transaction");
 	}
 
 	async savepoint(
@@ -280,6 +273,11 @@ export function createLixKysely(
 	if (!isLixExecuteLike(lix)) {
 		throw new TypeError(
 			"createLixKysely requires either lix.execute(sql, params) or lix.db",
+		);
+	}
+	if (!isLixBeginTransactionLike(lix)) {
+		throw new TypeError(
+			"createLixKysely requires lix.beginTransaction(options); raw SQL transaction fallback is not supported",
 		);
 	}
 
