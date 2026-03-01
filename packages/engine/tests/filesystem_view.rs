@@ -589,7 +589,9 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
         .await
         .expect_err("lix_file_by_version id update should fail");
     assert!(
-        by_version_update_err.description.contains("id is immutable"),
+        by_version_update_err
+            .description
+            .contains("id is immutable"),
         "unexpected error: {}",
         by_version_update_err.description
     );
@@ -646,7 +648,9 @@ simulation_test!(
             .await
             .expect_err("lix_directory_by_version id update should fail");
         assert!(
-            by_version_update_err.description.contains("id is immutable"),
+            by_version_update_err
+                .description
+                .contains("id is immutable"),
             "unexpected error: {}",
             by_version_update_err.description
         );
@@ -884,7 +888,9 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         .await
         .expect_err("insert without version should fail");
     assert!(
-        insert_err.description.contains("requires lixcol_version_id")
+        insert_err
+            .description
+            .contains("requires lixcol_version_id")
             || insert_err.description.contains("requires version_id"),
         "unexpected error: {}",
         insert_err.description
@@ -1119,7 +1125,9 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         .await
         .expect_err("insert without version should fail");
     assert!(
-        insert_err.description.contains("requires lixcol_version_id")
+        insert_err
+            .description
+            .contains("requires lixcol_version_id")
             || insert_err.description.contains("requires version_id"),
         "unexpected error: {}",
         insert_err.description
@@ -2595,7 +2603,9 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         .await
         .expect_err("invalid directory path should fail");
     assert!(
-        directory_err.description.contains("lix_directory_descriptor")
+        directory_err
+            .description
+            .contains("lix_directory_descriptor")
             || directory_err.description.contains("does not match schema"),
         "unexpected error: {}",
         directory_err.description
@@ -2932,12 +2942,12 @@ simulation_test!(
             .execute("SELECT id FROM file", &[])
             .await
             .expect_err("non-prefixed file should not be supported");
-        assert_eq!(file_err.code, "LIX_ERROR_TABLE_NOT_FOUND");
+        assert_eq!(file_err.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
 
         let directory_err = engine
             .execute("SELECT id FROM \"directory\"", &[])
             .await
             .expect_err("non-prefixed directory should not be supported");
-        assert_eq!(directory_err.code, "LIX_ERROR_TABLE_NOT_FOUND");
+        assert_eq!(directory_err.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
     }
 );

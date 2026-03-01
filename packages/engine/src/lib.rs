@@ -16,6 +16,7 @@ mod functions;
 mod init;
 mod json_truthiness;
 mod key_value;
+mod lix_table_registry;
 mod materialization;
 mod observe;
 mod plugin;
@@ -46,8 +47,8 @@ pub use engine::{
     boot, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction, EngineTransactionFuture,
     ExecuteOptions,
 };
-pub use errors::ErrorCode;
 pub use error::LixError;
+pub use errors::ErrorCode;
 pub use materialization::{
     apply_materialization_plan, materialization_plan, materialize, InheritanceWinnerDebugRow,
     LatestVisibleWinnerDebugRow, MaterializationApplyReport, MaterializationDebugMode,
