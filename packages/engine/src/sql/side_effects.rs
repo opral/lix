@@ -196,7 +196,7 @@ impl Engine {
             )
             .await
             .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: error.code,
                 description: format!(
                     "pending file writes collection failed: {}",
                     error.description
@@ -214,7 +214,12 @@ impl Engine {
                 active_version_id,
             )
             .await
-            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!("pending file delete collection failed: {}", error.description),
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "pending file delete collection failed: {}",
+                    error.description
+                ),
             })?;
 
         let detected_file_changes_by_statement = if detect_plugin_file_changes {

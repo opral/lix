@@ -11,6 +11,7 @@ pub enum ErrorCode {
     VtableSchemaKeyRequired,
     TransactionControlStatementDenied,
     TransactionHandleNotFound,
+    FileDataExpectsBytes,
 }
 
 impl ErrorCode {
@@ -26,6 +27,7 @@ impl ErrorCode {
                 "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED"
             }
             Self::TransactionHandleNotFound => "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND",
+            Self::FileDataExpectsBytes => "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
         }
     }
 
@@ -39,6 +41,7 @@ impl ErrorCode {
             Self::VtableSchemaKeyRequired,
             Self::TransactionControlStatementDenied,
             Self::TransactionHandleNotFound,
+            Self::FileDataExpectsBytes,
         ]
     }
 }
@@ -141,13 +144,20 @@ pub(crate) fn transaction_handle_not_found_error() -> LixError {
     )
 }
 
+pub(crate) fn file_data_expects_bytes_error() -> LixError {
+    build_error(
+        ErrorCode::FileDataExpectsBytes,
+        "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        internal_table_access_denied_error, read_only_view_write_error, sql_unknown_column_error,
-        sql_unknown_table_error, table_not_found_read_error,
-        transaction_control_statement_denied_error, transaction_handle_not_found_error,
-        vtable_schema_key_required_error, ErrorCode,
+        file_data_expects_bytes_error, internal_table_access_denied_error,
+        read_only_view_write_error, sql_unknown_column_error, sql_unknown_table_error,
+        table_not_found_read_error, transaction_control_statement_denied_error,
+        transaction_handle_not_found_error, vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -201,6 +211,12 @@ mod tests {
         assert_eq!(
             transaction_handle_not_found.code,
             "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND"
+        );
+
+        let file_data_expects_bytes = file_data_expects_bytes_error();
+        assert_eq!(
+            file_data_expects_bytes.code,
+            "LIX_ERROR_FILE_DATA_EXPECTS_BYTES"
         );
     }
 
