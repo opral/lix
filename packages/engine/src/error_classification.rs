@@ -177,22 +177,18 @@ mod tests {
     fn classifies_missing_relation_messages() {
         assert!(is_missing_relation_error(&LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "no such table: foo".to_string(),
         }));
         assert!(is_missing_relation_error(&LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "ERROR: relation \"foo\" does not exist".to_string(),
         }));
         assert!(is_missing_relation_error(&LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "undefined table: relation foo".to_string(),
         }));
         assert!(!is_missing_relation_error(&LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "CHECK constraint failed".to_string(),
         }));
     }
@@ -207,7 +203,6 @@ mod tests {
         let error = normalize_sql_error(
             LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "no such column: plugin_key in SELECT ... at offset 47".to_string(),
             },
             &statements,
@@ -227,7 +222,6 @@ mod tests {
         let error = normalize_sql_error(
             LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "no such table: lix_sate".to_string(),
             },
             &statements,

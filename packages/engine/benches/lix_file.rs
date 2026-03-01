@@ -328,7 +328,6 @@ async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> 
         if count <= 0 {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "plugin benchmark warmup produced no detected rows".to_string(),
             });
         }
@@ -418,7 +417,6 @@ fn scalar_count(result: &lix_engine::QueryResult) -> Result<i64, LixError> {
         .and_then(|row| row.first())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "count query returned no rows".to_string(),
         })?;
 
@@ -427,7 +425,6 @@ fn scalar_count(result: &lix_engine::QueryResult) -> Result<i64, LixError> {
         Value::Real(value) => Ok(*value as i64),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("count query returned unexpected value: {other:?}"),
         }),
     }

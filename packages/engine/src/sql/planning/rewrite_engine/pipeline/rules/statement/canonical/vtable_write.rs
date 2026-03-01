@@ -69,7 +69,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
                     update_validations: Vec::new(),
                 })
             } else {
-                Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "strict rewrite violation: statement routing: unsupported UPDATE target '{}'",
                         target
                     ),
@@ -119,7 +119,7 @@ pub(crate) fn rewrite_delete(
                     update_validations: Vec::new(),
                 })
             } else {
-                Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "strict rewrite violation: statement routing: unsupported DELETE target '{}'",
                         target
                     ),

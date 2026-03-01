@@ -57,7 +57,6 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                 if insert.columns.is_empty() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: "vtable insert requires explicit columns".to_string(),
                     });
                 }
@@ -68,7 +67,6 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                     if row.len() != expected_columns {
                         return Err(LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
-                            title: "Unknown error".to_string(),
                             description: format!(
                                 "vtable insert SELECT returned {} columns but {} were expected",
                                 row.len(),
@@ -140,7 +138,6 @@ fn engine_value_to_expr(value: &Value) -> Result<Expr, LixError> {
         )),
         Value::Blob(_) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "blob values are not supported in vtable insert SELECT materialization"
                 .to_string(),
         }),
@@ -151,7 +148,6 @@ fn no_op_statement() -> Result<Statement, LixError> {
     let mut statements = parse_sql_statements("SELECT 1 WHERE 0 = 1")?;
     statements.pop().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "failed to build no-op statement".to_string(),
     })
 }

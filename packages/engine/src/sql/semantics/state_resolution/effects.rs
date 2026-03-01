@@ -47,12 +47,10 @@ pub(crate) fn active_version_from_mutations(
 
         let snapshot = mutation.snapshot_content.as_ref().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "active version mutation is missing snapshot_content".to_string(),
         })?;
         let snapshot_content = serde_json::to_string(snapshot).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("active version mutation snapshot_content invalid JSON: {error}"),
         })?;
         return parse_active_version_snapshot(&snapshot_content).map(Some);
@@ -80,7 +78,6 @@ pub(crate) fn active_version_from_update_validations(
 
         let snapshot_content = serde_json::to_string(snapshot).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("active version update snapshot_content invalid JSON: {error}"),
         })?;
         return parse_active_version_snapshot(&snapshot_content).map(Some);

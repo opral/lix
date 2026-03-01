@@ -37,14 +37,12 @@ async fn create_checkpoint_in_transaction(
         .await?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("working commit '{working_commit_id}' is missing"),
         })?;
     let working_change_set_id = working_commit.change_set_id.clone();
     if working_change_set_id.trim().is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("working commit '{working_commit_id}' has empty change_set_id"),
         });
     }
@@ -89,7 +87,6 @@ async fn create_checkpoint_in_transaction(
             .await?
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("tip commit '{effective_previous_tip_id}' is missing"),
             })?;
         return Ok(CreateCheckpointResult {
@@ -370,7 +367,6 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
         let parsed: serde_json::Value =
             serde_json::from_str(&snapshot_content).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("checkpoint label snapshot invalid JSON: {error}"),
             })?;
         if parsed.get("name").and_then(serde_json::Value::as_str) != Some("checkpoint") {
@@ -386,7 +382,6 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
     }
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "checkpoint label row is missing in global version".to_string(),
     })
 }
@@ -451,7 +446,6 @@ async fn ensure_change_set_elements_for_checkpoint(
     if working_elements.rows.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "working change_set '{change_set_id}' has change_ids but no change_set elements"
             ),
@@ -570,7 +564,6 @@ async fn ensure_change_exists_for_checkpoint(
     let Some(row) = row.rows.first() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("change '{change_id}' is missing while checkpointing"),
         });
     };
@@ -662,7 +655,6 @@ async fn ensure_commit_edge(
     if parent_id == child_id {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("refusing self-edge for commit '{parent_id}'"),
         });
     }
@@ -767,7 +759,6 @@ fn first_row<'a>(result: &'a crate::QueryResult, label: &str) -> Result<&'a [Val
         .map(|row| row.as_slice())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("expected {label}, but query returned no rows"),
         })
 }
@@ -775,14 +766,12 @@ fn first_row<'a>(result: &'a crate::QueryResult, label: &str) -> Result<&'a [Val
 fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
     let value = row.get(index).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("row is missing required field '{field}'"),
     })?;
     match value {
         Value::Text(text) => Ok(text.clone()),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("field '{field}' must be text, got {other:?}"),
         }),
     }
@@ -807,19 +796,16 @@ fn parse_string_array(value: Option<&Value>, field: &str) -> Result<Vec<String>,
             let parsed: serde_json::Value =
                 serde_json::from_str(raw).map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("field '{field}' must be JSON array text: {error}"),
                 })?;
             let array = parsed.as_array().ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("field '{field}' must be a JSON array"),
             })?;
             let mut out = Vec::with_capacity(array.len());
             for item in array {
                 let id = item.as_str().ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("field '{field}' must contain only string commit ids"),
                 })?;
                 out.push(id.to_string());
@@ -828,7 +814,6 @@ fn parse_string_array(value: Option<&Value>, field: &str) -> Result<Vec<String>,
         }
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("field '{field}' must be text or null, got {other:?}"),
         }),
     }

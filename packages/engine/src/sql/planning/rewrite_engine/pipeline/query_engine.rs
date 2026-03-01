@@ -101,7 +101,6 @@ fn run_phase_sync(
 
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "read rewrite phase '{phase:?}' exceeded maximum pass count ({MAX_PASSES_PER_PHASE})"
         ),
@@ -170,7 +169,7 @@ async fn run_phase_with_backend(
         }
     }
 
-    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
             "read rewrite backend phase '{phase:?}' exceeded maximum pass count ({MAX_PASSES_PER_PHASE})"
         ),
     })

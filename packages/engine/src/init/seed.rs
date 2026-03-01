@@ -9,7 +9,6 @@ impl Engine {
         for schema_key in builtin_schema_keys() {
             let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("builtin schema '{schema_key}' is not available"),
             })?;
             let entity_id = builtin_schema_entity_id(schema)?;
@@ -144,7 +143,6 @@ impl Engine {
             let parsed: JsonValue =
                 serde_json::from_str(snapshot_content.as_str()).map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("checkpoint label snapshot invalid JSON: {error}"),
                 })?;
             if parsed.get("name").and_then(JsonValue::as_str) == Some("checkpoint") {
@@ -453,7 +451,6 @@ impl Engine {
             let snapshot: LixVersionDescriptor =
                 serde_json::from_str(snapshot_content).map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "version descriptor snapshot_content invalid JSON: {error}"
                     ),
@@ -622,7 +619,6 @@ impl Engine {
         let Some(row) = commit_row.rows.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "init invariant violation: commit '{commit_id}' is missing from lix_commit"
                 ),
@@ -631,7 +627,6 @@ impl Engine {
         let Some(Value::Text(change_set_id)) = row.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "init invariant violation: commit '{commit_id}' has non-text change_set_id"
                 ),
@@ -640,7 +635,6 @@ impl Engine {
         if change_set_id.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "init invariant violation: commit '{commit_id}' has empty change_set_id"
                 ),
@@ -658,7 +652,7 @@ impl Engine {
             )
             .await?;
         if existing.rows.is_empty() {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "init invariant violation: commit '{commit_id}' references missing change_set '{change_set_id}'"
                 ),
             });
@@ -716,19 +710,16 @@ fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, Li
         .and_then(|row| row.first())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{label} query returned no rows"),
         })?;
     match value {
         Value::Integer(number) => Ok(*number),
         Value::Text(raw) => raw.parse::<i64>().map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{label} query returned invalid integer '{raw}': {error}"),
         }),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{label} query returned non-integer value: {other:?}"),
         }),
     }

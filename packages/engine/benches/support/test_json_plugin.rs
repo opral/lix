@@ -31,7 +31,6 @@ pub fn build_test_plugin_archive() -> Result<Vec<u8>, LixError> {
         .start_file("manifest.json", options)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "failed to start manifest.json for benchmark plugin archive: {error}"
             ),
@@ -40,7 +39,6 @@ pub fn build_test_plugin_archive() -> Result<Vec<u8>, LixError> {
         .write_all(TEST_PLUGIN_MANIFEST_JSON.as_bytes())
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "failed to write manifest.json for benchmark plugin archive: {error}"
             ),
@@ -50,7 +48,6 @@ pub fn build_test_plugin_archive() -> Result<Vec<u8>, LixError> {
         .start_file("plugin.wasm", options)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "failed to start plugin.wasm for benchmark plugin archive: {error}"
             ),
@@ -59,7 +56,6 @@ pub fn build_test_plugin_archive() -> Result<Vec<u8>, LixError> {
         .write_all(&dummy_wasm_header())
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "failed to write plugin.wasm for benchmark plugin archive: {error}"
             ),
@@ -67,13 +63,13 @@ pub fn build_test_plugin_archive() -> Result<Vec<u8>, LixError> {
 
     writer
         .start_file("schema/test_json_pointer.json", options)
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "failed to start schema/test_json_pointer.json for benchmark plugin archive: {error}"
             ),
         })?;
     writer
         .write_all(TEST_JSON_POINTER_SCHEMA_JSON.as_bytes())
-        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "failed to write schema/test_json_pointer.json for benchmark plugin archive: {error}"
             ),
         })?;
@@ -83,7 +79,6 @@ pub fn build_test_plugin_archive() -> Result<Vec<u8>, LixError> {
         .map(|cursor| cursor.into_inner())
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("failed to finalize benchmark plugin archive: {error}"),
         })
 }
@@ -129,7 +124,6 @@ impl WasmRuntime for BenchJsonPluginRuntime {
         if bytes.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "benchmark runtime received empty wasm bytes".to_string(),
             });
         }
@@ -145,7 +139,6 @@ impl WasmComponentInstance for BenchJsonPluginInstance {
             "apply-changes" | "api#apply-changes" => apply_changes(input),
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("unsupported benchmark export: {other}"),
             }),
         }
@@ -156,7 +149,6 @@ fn detect_changes(input: &[u8]) -> Result<Vec<u8>, LixError> {
     let request: WireDetectChangesRequest =
         serde_json::from_slice(input).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "benchmark runtime: failed to decode detect-changes payload: {error}"
             ),
@@ -164,7 +156,6 @@ fn detect_changes(input: &[u8]) -> Result<Vec<u8>, LixError> {
     let value: JsonValue =
         serde_json::from_slice(&request.after.data).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("benchmark runtime: after.data is invalid JSON: {error}"),
         })?;
 
@@ -172,7 +163,6 @@ fn detect_changes(input: &[u8]) -> Result<Vec<u8>, LixError> {
     collect_nodes_as_changes("", &value, &mut changes)?;
     serde_json::to_vec(&changes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("benchmark runtime: failed to encode detect-changes output: {error}"),
     })
 }
@@ -181,7 +171,6 @@ fn apply_changes(input: &[u8]) -> Result<Vec<u8>, LixError> {
     let request: WireApplyChangesRequest =
         serde_json::from_slice(input).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "benchmark runtime: failed to decode apply-changes payload: {error}"
             ),

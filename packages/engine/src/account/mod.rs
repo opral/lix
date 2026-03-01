@@ -101,14 +101,12 @@ pub(crate) fn parse_active_account_snapshot(snapshot_content: &str) -> Result<St
     let parsed: LixActiveAccount =
         serde_json::from_str(snapshot_content).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("active account snapshot_content invalid JSON: {error}"),
         })?;
 
     if parsed.account_id.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "active account id must not be empty".to_string(),
         });
     }

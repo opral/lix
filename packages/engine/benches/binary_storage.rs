@@ -116,7 +116,6 @@ fn main() {
 fn run() -> Result<(), LixError> {
     let runtime = Runtime::new().map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to initialize tokio runtime: {error}"),
     })?;
 
@@ -124,7 +123,6 @@ fn run() -> Result<(), LixError> {
     let results_dir = manifest_dir.join("benches").join("results");
     std::fs::create_dir_all(&results_dir).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "failed to create benchmark results directory {}: {error}",
             results_dir.display()
@@ -152,7 +150,6 @@ fn run() -> Result<(), LixError> {
     let wasm_runtime = Arc::new(bench_wasmtime_runtime::TestWasmtimeRuntime::new().map_err(
         |error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "failed to initialize bench wasmtime runtime: {}",
                 error.description
@@ -186,7 +183,6 @@ fn run() -> Result<(), LixError> {
             .map(|entry| entry.id.clone())
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "dataset is empty; expected at least one file for history validation"
                     .to_string(),
             })?;
@@ -265,12 +261,10 @@ fn run() -> Result<(), LixError> {
         .unwrap_or_else(|_| results_dir.join("binary-storage-report.json"));
     let report_json = serde_json::to_string_pretty(&report).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to serialize benchmark report: {error}"),
     })?;
     std::fs::write(&report_path, report_json).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "failed to write benchmark report {}: {error}",
             report_path.display()
@@ -316,7 +310,6 @@ fn env_usize(name: &str, default_value: usize) -> Result<usize, LixError> {
         .parse::<usize>()
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "{name} must be a positive integer, got '{}': {error}",
                 raw.to_string_lossy()
@@ -325,7 +318,6 @@ fn env_usize(name: &str, default_value: usize) -> Result<usize, LixError> {
     if parsed == 0 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{name} must be > 0"),
         });
     }
@@ -396,7 +388,6 @@ fn run_update_workload(
 
     let sample_before_last = sample_before_last.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "update workload could not capture pre-update payload for sample file '{}'",
             sample_file_id
@@ -404,7 +395,6 @@ fn run_update_workload(
     })?;
     let sample_after_last = sample_after_last.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "update workload could not capture post-update payload for sample file '{}'",
             sample_file_id
@@ -440,7 +430,6 @@ fn run_history_validation_workload(
             if result.rows.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "history validation returned no rows for file '{}'",
                         file_id
@@ -454,7 +443,6 @@ fn run_history_validation_workload(
                 if row.is_empty() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: "history validation returned row with fewer than 1 column"
                             .to_string(),
                     });
@@ -468,7 +456,7 @@ fn run_history_validation_workload(
             let has_expected_after = rows.iter().any(|payload| payload == &expected_after);
 
             if !has_expected_before || !has_expected_after {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "history validation missing expected payload(s) for file '{}': has_before={}, has_after={}, before={} bytes, after={} bytes",
                         file_id,
                         has_expected_before,
@@ -542,7 +530,6 @@ fn value_binary_bytes(value: &Value, column: &str) -> Result<Vec<u8>, LixError> 
         Value::Null => Ok(Vec::new()),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "expected blob/text value for column '{}' but got {:?}",
                 column, other
@@ -836,7 +823,6 @@ fn cleanup_db_artifacts(path: &Path) -> Result<(), LixError> {
         if item.exists() {
             std::fs::remove_file(&item).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "failed to remove existing benchmark artifact {}: {error}",
                     item.display()

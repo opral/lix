@@ -27,7 +27,6 @@ pub async fn rewrite_insert_with_backend(
     if insert.columns.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state insert requires explicit columns".to_string(),
         });
     }
@@ -38,7 +37,6 @@ pub async fn rewrite_insert_with_backend(
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description:
                 "lix_state insert cannot set version_id; active version is resolved automatically"
                     .to_string(),
@@ -49,13 +47,11 @@ pub async fn rewrite_insert_with_backend(
     let expected_columns = insert.columns.len();
     let source = insert.source.as_mut().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "lix_state insert requires VALUES rows".to_string(),
     })?;
     let SetExpr::Values(values) = source.body.as_mut() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state insert requires VALUES rows".to_string(),
         });
     };
@@ -64,7 +60,6 @@ pub async fn rewrite_insert_with_backend(
         if row.len() != expected_columns {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "lix_state insert row length does not match column count".to_string(),
             });
         }
@@ -88,7 +83,6 @@ fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixE
     let OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state insert only supports ON CONFLICT ... DO UPDATE".to_string(),
         });
     };
@@ -98,7 +92,6 @@ fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixE
         Some(_) => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "lix_state insert ON CONFLICT only supports explicit column targets"
                     .to_string(),
             })
@@ -106,7 +99,6 @@ fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixE
         None => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "lix_state insert ON CONFLICT requires explicit conflict columns"
                     .to_string(),
             })
@@ -118,7 +110,6 @@ fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixE
             if update.selection.is_some() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: "lix_state insert ON CONFLICT DO UPDATE does not support WHERE"
                         .to_string(),
                 });
@@ -127,7 +118,6 @@ fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixE
         }
         OnConflictAction::DoNothing => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state insert ON CONFLICT DO NOTHING is not supported".to_string(),
         }),
     }
@@ -149,7 +139,6 @@ pub async fn rewrite_update_with_backend(
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description:
                 "lix_state update cannot set version_id; active version is resolved automatically"
                     .to_string(),
@@ -302,12 +291,10 @@ async fn load_active_version_id(backend: &dyn LixBackend) -> Result<String, LixE
 
     let row = result.rows.first().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "lix_state write requires an active version".to_string(),
     })?;
     let snapshot_content = row.first().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "active version query row is missing snapshot_content".to_string(),
     })?;
     let snapshot_content = match snapshot_content {
@@ -315,7 +302,6 @@ async fn load_active_version_id(backend: &dyn LixBackend) -> Result<String, LixE
         other => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("active version snapshot_content must be text, got {other:?}"),
             })
         }
@@ -350,7 +336,6 @@ fn replace_table_with_vtable(table: &mut TableWithJoins) -> Result<(), LixError>
     if !table.joins.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state update does not support JOIN targets".to_string(),
         });
     }
@@ -361,7 +346,6 @@ fn replace_table_with_vtable(table: &mut TableWithJoins) -> Result<(), LixError>
         }
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state update requires table target".to_string(),
         }),
     }
@@ -374,7 +358,6 @@ fn replace_delete_from_vtable(delete: &mut Delete) -> Result<(), LixError> {
     let Some(table) = tables.first_mut() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_state delete requires table target".to_string(),
         });
     };
@@ -414,7 +397,7 @@ fn strip_inherited_from_version_predicate(expr: Expr) -> Result<Option<Expr>, Li
         Expr::IsNotNull(inner) if expr_is_inherited_from_version_column(&inner) => {
             Ok(Some(false_predicate_expr()))
         }
-        other if contains_column_reference(&other, "inherited_from_version_id") => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description:
+        other if contains_column_reference(&other, "inherited_from_version_id") => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description:
                 "lix_state mutation only supports inherited_from_version_id filters via IS NULL/IS NOT NULL"
                     .to_string(),
         }),
@@ -487,7 +470,6 @@ fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
     for assignment in &update.assignments {
         let column = assignment_target_column_name(&assignment.target).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description:
                 "strict rewrite violation: lix_state update assignment must target a named column"
                     .to_string(),
@@ -498,7 +480,7 @@ fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
         {
             continue;
         }
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "strict rewrite violation: lix_state update assignment references unknown column '{}'; allowed columns: {}",
                 column,
                 ALLOWED.join(", ")

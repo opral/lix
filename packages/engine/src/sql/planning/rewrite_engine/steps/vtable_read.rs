@@ -915,14 +915,12 @@ fn build_untracked_union_query(
 
     let mut statements = Parser::parse_sql(&dialect, &sql).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: err.to_string(),
     })?;
 
     if statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "expected single derived query statement".to_string(),
         });
     }
@@ -931,7 +929,6 @@ fn build_untracked_union_query(
         Statement::Query(query) => Ok(*query),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "derived query did not parse as SELECT".to_string(),
         }),
     }

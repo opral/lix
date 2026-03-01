@@ -82,7 +82,6 @@ impl Engine {
     fn take_transaction_handle(&self, handle: u64) -> Result<EngineTransaction<'static>, LixError> {
         let mut guard = self.active_transactions.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction registry lock poisoned".to_string(),
         })?;
         guard
@@ -97,7 +96,6 @@ impl Engine {
     ) -> Result<(), LixError> {
         let mut guard = self.active_transactions.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction registry lock poisoned".to_string(),
         })?;
         guard.insert(handle, transaction);

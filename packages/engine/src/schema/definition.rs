@@ -28,7 +28,6 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
         let details = format_validation_errors(errors);
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("Invalid Lix schema definition: {details}"),
         });
     }
@@ -48,7 +47,6 @@ pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), L
         let details = format_validation_errors(errors);
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("Data validation failed: {details}"),
         });
     }
@@ -62,7 +60,6 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
         Ok(schema) => Ok(schema),
         Err(err) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: err.description.clone(),
         }),
     }
@@ -76,7 +73,6 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
 
     options.compile(schema).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("Failed to compile Lix schema definition: {err}"),
     })
 }
@@ -96,7 +92,6 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
     if !pointer.starts_with('/') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "Invalid JSON pointer".to_string(),
         });
     }
@@ -119,7 +114,6 @@ fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
                 _ => {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: "Invalid JSON pointer".to_string(),
                     })
                 }
@@ -145,7 +139,7 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
         };
         let segments = parse_json_pointer(pointer)?;
         if segments.is_empty() || !schema_has_property(schema, &segments) {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "Invalid Lix schema definition: x-lix-primary-key references missing property \"{}\".",
                     pointer
                 ),
@@ -174,7 +168,7 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
             };
             let segments = parse_json_pointer(pointer)?;
             if segments.is_empty() || !schema_has_property(schema, &segments) {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "Invalid Lix schema definition: x-lix-unique references missing property \"{}\".",
                         pointer
                     ),
@@ -207,7 +201,7 @@ fn assert_non_aliased_lix_foreign_key_references(schema: &JsonValue) -> Result<(
             continue;
         };
 
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "Invalid Lix schema definition: x-lix-foreign-keys references.schemaKey uses deprecated alias \"{schema_key}\"; use \"{replacement}\"."
             ),
         });

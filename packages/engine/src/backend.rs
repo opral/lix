@@ -23,7 +23,6 @@ pub trait LixBackend: Send + Sync {
     async fn export_snapshot(&self, _writer: &mut dyn SnapshotChunkWriter) -> Result<(), LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "export_snapshot is not supported by this backend".to_string(),
         })
     }
@@ -35,7 +34,6 @@ pub trait LixBackend: Send + Sync {
     ) -> Result<(), LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "restore_from_snapshot is not supported by this backend".to_string(),
         })
     }
