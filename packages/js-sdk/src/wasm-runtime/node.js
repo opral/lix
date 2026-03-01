@@ -32,6 +32,26 @@ function toUint8Array(value) {
   return new Uint8Array();
 }
 
+function toSnapshotString(value) {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return textDecoder.decode(value);
+  }
+  if (value instanceof ArrayBuffer) {
+    return textDecoder.decode(new Uint8Array(value));
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function decodeJsonBytes(input) {
   const decoded = textDecoder.decode(toUint8Array(input));
   return JSON.parse(decoded);
@@ -74,8 +94,9 @@ function toPluginEntityChange(change) {
     change?.snapshot_content !== undefined
       ? change.snapshot_content
       : change?.snapshotContent;
-  if (snapshot !== null && snapshot !== undefined) {
-    normalized.snapshotContent = String(snapshot);
+  const snapshotString = toSnapshotString(snapshot);
+  if (snapshotString !== undefined) {
+    normalized.snapshotContent = snapshotString;
   }
 
   return normalized;
@@ -102,8 +123,9 @@ function toPluginActiveStateRow(row) {
     row?.snapshot_content !== undefined
       ? row.snapshot_content
       : row?.snapshotContent;
-  if (snapshotContent !== null && snapshotContent !== undefined) {
-    normalized.snapshotContent = String(snapshotContent);
+  const snapshotString = toSnapshotString(snapshotContent);
+  if (snapshotString !== undefined) {
+    normalized.snapshotContent = snapshotString;
   }
 
   const fileId = row?.file_id !== undefined ? row.file_id : row?.fileId;
@@ -273,6 +295,10 @@ function createModuleInstance(componentApi) {
         const changes = Array.isArray(request.changes)
           ? request.changes.map(toPluginEntityChange)
           : [];
+        if (globalThis?.process?.env?.LIX_DEBUG_PLUGIN_APPLY_CHANGES) {
+          console.debug("[lix-js-sdk][plugin-apply] file", file.id, file.path);
+          console.debug("[lix-js-sdk][plugin-apply] changes", changes);
+        }
         const outputBytes = await componentApi.applyChanges(file, changes);
         return toUint8Array(outputBytes);
       }

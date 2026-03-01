@@ -26,6 +26,7 @@ use crate::engine::sql::planning::rewrite_engine::{
     object_name_matches, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
     RowSourceResolver,
 };
+use crate::errors;
 use crate::functions::LixFunctionProvider;
 #[cfg(test)]
 use crate::SqlDialect;
@@ -2283,11 +2284,7 @@ fn unwrap_cast_expr(mut expr: &Expr) -> &Expr {
 
 fn extract_single_schema_key(expr: &Expr, params: &[EngineValue]) -> Result<String, LixError> {
     let keys = extract_string_column_values_from_expr(expr, expr_is_schema_key_column, params)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
-            description: "vtable update requires schema_key predicate".to_string(),
-        })?;
+        .ok_or_else(errors::vtable_schema_key_required_error)?;
     if keys.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

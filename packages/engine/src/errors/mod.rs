@@ -5,6 +5,7 @@ pub enum ErrorCode {
     TableNotFound,
     InternalTableAccessDenied,
     ReadOnlyViewWriteDenied,
+    VtableSchemaKeyRequired,
 }
 
 impl ErrorCode {
@@ -13,6 +14,7 @@ impl ErrorCode {
             Self::TableNotFound => "LIX_ERROR_TABLE_NOT_FOUND",
             Self::InternalTableAccessDenied => "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
             Self::ReadOnlyViewWriteDenied => "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED",
+            Self::VtableSchemaKeyRequired => "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED",
         }
     }
 
@@ -21,6 +23,7 @@ impl ErrorCode {
             Self::TableNotFound,
             Self::InternalTableAccessDenied,
             Self::ReadOnlyViewWriteDenied,
+            Self::VtableSchemaKeyRequired,
         ]
     }
 }
@@ -58,11 +61,19 @@ pub(crate) fn read_only_view_write_error(view_name: &str, operation: &str) -> Li
     )
 }
 
+pub(crate) fn vtable_schema_key_required_error() -> LixError {
+    build_error(
+        ErrorCode::VtableSchemaKeyRequired,
+        "schema_key predicate required",
+        "This write targets a schema-scoped vtable. Add a WHERE predicate that resolves schema_key (for example: schema_key = 'markdown_v2_block' or schema_key = ?). This prevents accidental cross-schema updates/deletes.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         internal_table_access_denied_error, read_only_view_write_error, table_not_found_read_error,
-        ErrorCode,
+        vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -88,6 +99,12 @@ mod tests {
 
         let read_only = read_only_view_write_error("lix_state_history", "INSERT");
         assert_eq!(read_only.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
+
+        let schema_key_required = vtable_schema_key_required_error();
+        assert_eq!(
+            schema_key_required.code,
+            "LIX_ERROR_VTABLE_SCHEMA_KEY_REQUIRED"
+        );
     }
 
     #[test]
@@ -106,5 +123,8 @@ mod tests {
         let entity_view_write_src =
             include_str!("../sql/planning/rewrite_engine/entity_views/write.rs");
         assert!(entity_view_write_src.contains("errors::read_only_view_write_error("));
+
+        let vtable_write_src = include_str!("../sql/planning/rewrite_engine/steps/vtable_write.rs");
+        assert!(vtable_write_src.contains("errors::vtable_schema_key_required_error"));
     }
 }
