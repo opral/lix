@@ -125,8 +125,8 @@ fn expr_has_schema_key_predicate(expr: &Expr) -> bool {
             op: BinaryOperator::Eq,
             right,
         } => {
-            (expr_is_schema_key_column(left) && expr_is_string_literal(right))
-                || (expr_is_schema_key_column(right) && expr_is_string_literal(left))
+            (expr_is_schema_key_column(left) && expr_is_schema_key_value(right))
+                || (expr_is_schema_key_column(right) && expr_is_schema_key_value(left))
         }
         Expr::BinaryOp {
             left,
@@ -145,7 +145,7 @@ fn expr_has_schema_key_predicate(expr: &Expr) -> bool {
         } => {
             expr_is_schema_key_column(expr)
                 && !list.is_empty()
-                && list.iter().all(expr_is_string_literal)
+                && list.iter().all(expr_is_schema_key_value)
         }
         Expr::Nested(inner) => expr_has_schema_key_predicate(inner),
         _ => false,
@@ -163,14 +163,17 @@ fn expr_is_schema_key_column(expr: &Expr) -> bool {
     }
 }
 
-fn expr_is_string_literal(expr: &Expr) -> bool {
+fn expr_is_schema_key_value(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(_),
+            value: Value::SingleQuotedString(_) | Value::Placeholder(_),
             ..
         })
-    )
+    ) || matches!(
+        expr,
+        Expr::Identifier(ident) if ident.quote_style == Some('"')
+    ) || matches!(expr, Expr::Nested(inner) if expr_is_schema_key_value(inner))
 }
 
 #[cfg(test)]
@@ -198,6 +201,16 @@ mod tests {
         let statements = Parser::parse_sql(
             &GenericDialect {},
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE schema_key IN ('a')",
+        )
+        .expect("parse SQL");
+        assert!(statement_has_schema_key_predicate(&statements[0]));
+    }
+
+    #[test]
+    fn detects_schema_key_placeholder_predicate() {
+        let statements = Parser::parse_sql(
+            &GenericDialect {},
+            "UPDATE lix_internal_state_vtable SET snapshot_content = '{}' WHERE schema_key = ?1",
         )
         .expect("parse SQL");
         assert!(statement_has_schema_key_predicate(&statements[0]));

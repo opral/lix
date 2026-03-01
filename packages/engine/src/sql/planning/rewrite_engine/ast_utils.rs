@@ -7,6 +7,9 @@ use sqlparser::ast::{Visit, VisitMut, Visitor, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::engine::sql::planning::param_context::{
+    normalize_query_placeholders, PlaceholderOrdinalState,
+};
 use crate::LixError;
 
 pub(crate) fn object_name_matches(name: &ObjectName, target: &str) -> bool {
@@ -105,6 +108,9 @@ pub(crate) fn rewrite_query_with_select_rewriter(
     query: Query,
     rewrite_select: &mut dyn FnMut(&mut Select, &mut bool) -> Result<(), LixError>,
 ) -> Result<Option<Query>, LixError> {
+    let mut query = query;
+    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
+
     rewrite_query_selects(query, &mut |select| {
         let mut changed = false;
         rewrite_select(select, &mut changed)?;

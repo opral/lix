@@ -14,6 +14,8 @@ use sqlparser::parser::Parser;
 #[cfg(test)]
 use crate::backend::SqlDialect;
 #[cfg(test)]
+use crate::engine::sql::planning::param_context::normalize_statement_placeholders_in_batch;
+#[cfg(test)]
 use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
 #[cfg(test)]
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
@@ -87,6 +89,9 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     dialect: SqlDialect,
     writer_key: Option<&str>,
 ) -> Result<PreprocessOutput, LixError> {
+    let mut statements = statements;
+    normalize_statement_placeholders_in_batch(&mut statements)?;
+
     let statement_pipeline = StatementPipeline::new(params, writer_key);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;

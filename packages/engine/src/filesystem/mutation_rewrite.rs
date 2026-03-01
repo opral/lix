@@ -2600,7 +2600,13 @@ async fn read_directory_path_by_id(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
-    let result = backend.execute(&rewritten_sql, &query_params).await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        &query_params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
+    let result = backend.execute(&bound.sql, &bound.params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -2636,7 +2642,13 @@ async fn read_directory_descriptor_by_id(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
-    let result = backend.execute(&rewritten_sql, &query_params).await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        &query_params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
+    let result = backend.execute(&bound.sql, &bound.params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -2728,12 +2740,26 @@ async fn directory_rows_matching_delete(
     };
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        title: "Unknown error".to_string(),
+        description: format!(
+            "directory delete scope binding failed for '{}': {}",
+            rewritten_sql, error.description
+        ),
+    })?;
     let result = backend
-        .execute(&rewritten_sql, params)
+        .execute(&bound.sql, &bound.params)
         .await
         .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "directory delete scope prefetch failed for '{}': {}",
-                rewritten_sql, error.description
+                bound.sql, error.description
             ),
         })?;
 
@@ -3026,12 +3052,18 @@ async fn try_file_ids_matching_update_fast(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        &query_params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
     let result = backend
-        .execute(&rewritten_sql, &query_params)
+        .execute(&bound.sql, &bound.params)
         .await
         .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
                 "file update fast-path prefetch failed for '{}': {}",
-                rewritten_sql, error.description
+                bound.sql, error.description
             ),
         })?;
 
@@ -3356,7 +3388,13 @@ async fn load_directory_descendants(
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, sql, &query_params, read_rewrite_session)
             .await?;
-    let result = backend.execute(&rewritten_sql, &query_params).await?;
+    let bound = bind_sql_with_state(
+        &rewritten_sql,
+        &query_params,
+        backend.dialect(),
+        PlaceholderState::new(),
+    )?;
+    let result = backend.execute(&bound.sql, &bound.params).await?;
     let mut ids = Vec::new();
     for row in result.rows {
         if let Some(EngineValue::Text(id)) = row.first() {

@@ -216,15 +216,19 @@ pub async fn rewrite_update_with_backend(
                     description: "lix_version update cannot set empty commit_id".to_string(),
                 });
             }
-            let next_working_commit_id = assignment_values.working_commit_id.clone().ok_or_else(
-                || LixError {
+            let next_working_commit_id =
+                assignment_values
+                    .working_commit_id
+                    .clone()
+                    .ok_or_else(|| {
+                        LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     title: "Unknown error".to_string(),
                     description:
                         "lix_version update must set both commit_id and working_commit_id together"
                             .to_string(),
-                },
-            )?;
+                }
+                    })?;
             if next_working_commit_id.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -631,7 +635,7 @@ async fn query_lix_version_rows(
 
     let query = *query;
     let query = lix_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
+    let query = vtable_read::rewrite_query(query.clone(), params)?.unwrap_or(query);
     let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
     let bound = bind_sql_with_state(
         &lowered.to_string(),

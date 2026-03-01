@@ -5,6 +5,7 @@ use sqlparser::ast::{
 use crate::{LixBackend, LixError, Value};
 
 use super::super::ast::lowering::lower_statement;
+use super::super::ast::utils::bind_sql;
 use super::super::ast::utils::parse_sql_statements;
 use super::super::ast::walk::object_name_matches;
 use super::rewrite_engine::{
@@ -47,7 +48,8 @@ pub(crate) async fn materialize_vtable_insert_select_sources(
                 backend.dialect(),
             )?;
             let select_sql = lowered_source.to_string();
-            let result = backend.execute(&select_sql, params).await?;
+            let bound = bind_sql(&select_sql, params, backend.dialect())?;
+            let result = backend.execute(&bound.sql, &bound.params).await?;
 
             if result.rows.is_empty() {
                 replace_with_noop = true;

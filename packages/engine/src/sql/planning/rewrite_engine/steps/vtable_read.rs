@@ -1,11 +1,15 @@
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    TableWithJoins, UnaryOperator,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
+use crate::engine::sql::planning::param_context::{
+    expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
+    PlaceholderOrdinalState,
+};
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::StatePushdown;
 use crate::engine::sql::planning::rewrite_engine::{
     escape_sql_string, object_name_matches, parse_single_query, quote_ident,
@@ -616,12 +620,15 @@ fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<
     parse_single_query(&sql)
 }
 
-pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    let schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
+pub fn rewrite_query(query: Query, params: &[LixValue]) -> Result<Option<Query>, LixError> {
+    let mut query = query;
+    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
+
+    let schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(&mut new_query, &schema_keys, &mut changed)?;
+    rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed)?;
 
     if changed {
         Ok(Some(new_query))
@@ -633,14 +640,18 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
 pub async fn rewrite_query_with_backend(
     backend: &dyn LixBackend,
     query: Query,
+    params: &[LixValue],
 ) -> Result<Option<Query>, LixError> {
-    let mut schema_keys = extract_schema_keys_from_query(&query).unwrap_or_default();
+    let mut query = query;
+    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
+
+    let mut schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
 
     // If no schema-key literal is available, fall back to plugin-key derived
     // schema resolution and finally to all materialized schema tables.
     if schema_keys.is_empty() {
-        let plugin_keys = extract_plugin_keys_from_query(&query)
-            .or_else(|| extract_plugin_keys_from_top_level_derived_subquery(&query))
+        let plugin_keys = extract_plugin_keys_from_query(&query, params)
+            .or_else(|| extract_plugin_keys_from_top_level_derived_subquery(&query, params))
             .unwrap_or_default();
         if !plugin_keys.is_empty() {
             schema_keys = fetch_schema_keys_for_plugins(backend, &plugin_keys).await?;
@@ -652,7 +663,7 @@ pub async fn rewrite_query_with_backend(
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(&mut new_query, &schema_keys, &mut changed)?;
+    rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed)?;
 
     if changed {
         Ok(Some(new_query))
@@ -664,9 +675,10 @@ pub async fn rewrite_query_with_backend(
 fn rewrite_query_inner(
     query: &mut Query,
     schema_keys: &[String],
+    params: &[LixValue],
     changed: &mut bool,
 ) -> Result<(), LixError> {
-    let query_schema_keys = resolve_schema_keys_for_query(query, schema_keys);
+    let query_schema_keys = resolve_schema_keys_for_query(query, schema_keys, params);
     let top_level_targets_vtable = query_targets_vtable(&query);
     let pushdown_predicate = if top_level_targets_vtable {
         extract_pushdown_predicate(&query)
@@ -676,13 +688,14 @@ fn rewrite_query_inner(
 
     if let Some(with) = query.with.as_mut() {
         for cte in &mut with.cte_tables {
-            rewrite_query_inner(&mut cte.query, &query_schema_keys, changed)?;
+            rewrite_query_inner(&mut cte.query, &query_schema_keys, params, changed)?;
         }
     }
     query.body = Box::new(rewrite_set_expr(
         (*query.body).clone(),
         &query_schema_keys,
         pushdown_predicate.as_ref(),
+        params,
         changed,
     )?);
     Ok(())
@@ -692,17 +705,24 @@ fn rewrite_set_expr(
     expr: SetExpr,
     schema_keys: &[String],
     pushdown_predicate: Option<&Expr>,
+    params: &[LixValue],
     changed: &mut bool,
 ) -> Result<SetExpr, LixError> {
     Ok(match expr {
         SetExpr::Select(select) => {
             let mut select = *select;
-            rewrite_select(&mut select, schema_keys, pushdown_predicate, changed)?;
+            rewrite_select(
+                &mut select,
+                schema_keys,
+                pushdown_predicate,
+                params,
+                changed,
+            )?;
             SetExpr::Select(Box::new(select))
         }
         SetExpr::Query(query) => {
             let mut query = *query;
-            rewrite_query_inner(&mut query, schema_keys, changed)?;
+            rewrite_query_inner(&mut query, schema_keys, params, changed)?;
             SetExpr::Query(Box::new(query))
         }
         SetExpr::SetOperation {
@@ -717,12 +737,14 @@ fn rewrite_set_expr(
                 *left,
                 schema_keys,
                 pushdown_predicate,
+                params,
                 changed,
             )?),
             right: Box::new(rewrite_set_expr(
                 *right,
                 schema_keys,
                 pushdown_predicate,
+                params,
                 changed,
             )?),
         },
@@ -734,10 +756,11 @@ fn rewrite_select(
     select: &mut Select,
     schema_keys: &[String],
     pushdown_predicate: Option<&Expr>,
+    params: &[LixValue],
     changed: &mut bool,
 ) -> Result<(), LixError> {
     for table in &mut select.from {
-        rewrite_table_with_joins(table, schema_keys, pushdown_predicate, changed)?;
+        rewrite_table_with_joins(table, schema_keys, pushdown_predicate, params, changed)?;
     }
     Ok(())
 }
@@ -746,16 +769,24 @@ fn rewrite_table_with_joins(
     table: &mut TableWithJoins,
     schema_keys: &[String],
     pushdown_predicate: Option<&Expr>,
+    params: &[LixValue],
     changed: &mut bool,
 ) -> Result<(), LixError> {
     rewrite_table_factor(
         &mut table.relation,
         schema_keys,
         pushdown_predicate,
+        params,
         changed,
     )?;
     for join in &mut table.joins {
-        rewrite_table_factor(&mut join.relation, schema_keys, pushdown_predicate, changed)?;
+        rewrite_table_factor(
+            &mut join.relation,
+            schema_keys,
+            pushdown_predicate,
+            params,
+            changed,
+        )?;
     }
     Ok(())
 }
@@ -764,13 +795,15 @@ fn rewrite_table_factor(
     relation: &mut TableFactor,
     schema_keys: &[String],
     pushdown_predicate: Option<&Expr>,
+    params: &[LixValue],
     changed: &mut bool,
 ) -> Result<(), LixError> {
     match relation {
         TableFactor::Table { name, alias, .. }
             if !schema_keys.is_empty() && object_name_matches(name, VTABLE_NAME) =>
         {
-            let derived_query = build_untracked_union_query(schema_keys, pushdown_predicate)?;
+            let derived_query =
+                build_untracked_union_query(schema_keys, pushdown_predicate, params)?;
             let derived_alias = alias.clone().or_else(|| Some(default_vtable_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,
@@ -782,7 +815,12 @@ fn rewrite_table_factor(
         TableFactor::Derived { subquery, .. } => {
             let mut subquery_changed = false;
             let mut rewritten_subquery = (**subquery).clone();
-            rewrite_query_inner(&mut rewritten_subquery, schema_keys, &mut subquery_changed)?;
+            rewrite_query_inner(
+                &mut rewritten_subquery,
+                schema_keys,
+                params,
+                &mut subquery_changed,
+            )?;
             if subquery_changed {
                 *subquery = Box::new(rewritten_subquery);
                 *changed = true;
@@ -791,7 +829,13 @@ fn rewrite_table_factor(
         TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            rewrite_table_with_joins(table_with_joins, schema_keys, pushdown_predicate, changed)?;
+            rewrite_table_with_joins(
+                table_with_joins,
+                schema_keys,
+                pushdown_predicate,
+                params,
+                changed,
+            )?;
         }
         _ => {}
     }
@@ -801,13 +845,14 @@ fn rewrite_table_factor(
 fn build_untracked_union_query(
     schema_keys: &[String],
     pushdown_predicate: Option<&Expr>,
+    params: &[LixValue],
 ) -> Result<Query, LixError> {
     let dialect = GenericDialect {};
     let stripped_predicate = pushdown_predicate.and_then(|expr| strip_qualifiers(expr.clone()));
     let predicate_sql = stripped_predicate.as_ref().map(ToString::to_string);
     let predicate_schema_keys = stripped_predicate
         .as_ref()
-        .and_then(|expr| extract_column_keys_from_expr(expr, expr_is_schema_key_column));
+        .and_then(|expr| extract_column_keys_from_expr(expr, expr_is_schema_key_column, params));
     let effective_schema_keys = narrow_schema_keys(schema_keys, predicate_schema_keys.as_deref());
 
     let schema_list = effective_schema_keys
@@ -914,8 +959,8 @@ fn table_factor_is_vtable(relation: &TableFactor) -> bool {
     )
 }
 
-fn extract_schema_keys_from_query(query: &Query) -> Option<Vec<String>> {
-    extract_column_keys_from_query(query, expr_is_schema_key_column)
+fn extract_schema_keys_from_query(query: &Query, params: &[LixValue]) -> Option<Vec<String>> {
+    extract_column_keys_from_query(query, expr_is_schema_key_column, params)
 }
 
 #[cfg(test)]
@@ -927,7 +972,7 @@ fn extract_schema_keys_from_query_deep(query: &Query) -> Vec<String> {
 
 #[cfg(test)]
 fn collect_schema_keys_from_query(query: &Query, keys: &mut Vec<String>) {
-    if let Some(found) = extract_schema_keys_from_query(query) {
+    if let Some(found) = extract_schema_keys_from_query(query, &[]) {
         keys.extend(found);
     }
     if let Some(with) = query.with.as_ref() {
@@ -977,15 +1022,22 @@ fn collect_schema_keys_from_table_factor(relation: &TableFactor, keys: &mut Vec<
     }
 }
 
-fn resolve_schema_keys_for_query(query: &Query, inherited_schema_keys: &[String]) -> Vec<String> {
-    extract_schema_keys_from_query(query).unwrap_or_else(|| inherited_schema_keys.to_vec())
+fn resolve_schema_keys_for_query(
+    query: &Query,
+    inherited_schema_keys: &[String],
+    params: &[LixValue],
+) -> Vec<String> {
+    extract_schema_keys_from_query(query, params).unwrap_or_else(|| inherited_schema_keys.to_vec())
 }
 
-fn extract_plugin_keys_from_query(query: &Query) -> Option<Vec<String>> {
-    extract_column_keys_from_query(query, expr_is_plugin_key_column)
+fn extract_plugin_keys_from_query(query: &Query, params: &[LixValue]) -> Option<Vec<String>> {
+    extract_column_keys_from_query(query, expr_is_plugin_key_column, params)
 }
 
-fn extract_plugin_keys_from_top_level_derived_subquery(query: &Query) -> Option<Vec<String>> {
+fn extract_plugin_keys_from_top_level_derived_subquery(
+    query: &Query,
+    params: &[LixValue],
+) -> Option<Vec<String>> {
     let select = match query.body.as_ref() {
         SetExpr::Select(select) => select,
         _ => return None,
@@ -1015,7 +1067,7 @@ fn extract_plugin_keys_from_top_level_derived_subquery(query: &Query) -> Option<
     let TableFactor::Derived { subquery, .. } = &table.relation else {
         return None;
     };
-    extract_plugin_keys_from_query(subquery)
+    extract_plugin_keys_from_query(subquery, params)
 }
 
 fn extract_pushdown_predicate(query: &Query) -> Option<Expr> {
@@ -1030,20 +1082,26 @@ fn extract_pushdown_predicate(query: &Query) -> Option<Expr> {
 fn extract_column_keys_from_query(
     query: &Query,
     is_target_column: fn(&Expr) -> bool,
+    params: &[LixValue],
 ) -> Option<Vec<String>> {
-    extract_column_keys_from_set_expr(&query.body, is_target_column)
+    extract_column_keys_from_set_expr(&query.body, is_target_column, params)
 }
 
 fn extract_column_keys_from_set_expr(
     expr: &SetExpr,
     is_target_column: fn(&Expr) -> bool,
+    params: &[LixValue],
 ) -> Option<Vec<String>> {
     match expr {
-        SetExpr::Select(select) => extract_column_keys_from_select(select, is_target_column),
-        SetExpr::Query(query) => extract_column_keys_from_set_expr(&query.body, is_target_column),
+        SetExpr::Select(select) => {
+            extract_column_keys_from_select(select, is_target_column, params)
+        }
+        SetExpr::Query(query) => {
+            extract_column_keys_from_set_expr(&query.body, is_target_column, params)
+        }
         SetExpr::SetOperation { left, right, .. } => {
-            extract_column_keys_from_set_expr(left, is_target_column)
-                .or_else(|| extract_column_keys_from_set_expr(right, is_target_column))
+            extract_column_keys_from_set_expr(left, is_target_column, params)
+                .or_else(|| extract_column_keys_from_set_expr(right, is_target_column, params))
         }
         _ => None,
     }
@@ -1052,83 +1110,20 @@ fn extract_column_keys_from_set_expr(
 fn extract_column_keys_from_select(
     select: &Select,
     is_target_column: fn(&Expr) -> bool,
+    params: &[LixValue],
 ) -> Option<Vec<String>> {
     select
         .selection
         .as_ref()
-        .and_then(|expr| extract_column_keys_from_expr(expr, is_target_column))
+        .and_then(|expr| extract_column_keys_from_expr(expr, is_target_column, params))
 }
 
 fn extract_column_keys_from_expr(
     expr: &Expr,
     is_target_column: fn(&Expr) -> bool,
+    params: &[LixValue],
 ) -> Option<Vec<String>> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            if is_target_column(left) {
-                return string_literal_value(right).map(|value| vec![value]);
-            }
-            if is_target_column(right) {
-                return string_literal_value(left).map(|value| vec![value]);
-            }
-            None
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => match (
-            extract_column_keys_from_expr(left, is_target_column),
-            extract_column_keys_from_expr(right, is_target_column),
-        ) {
-            (Some(left), Some(right)) => {
-                let intersection = intersect_strings(&left, &right);
-                if intersection.is_empty() {
-                    None
-                } else {
-                    Some(intersection)
-                }
-            }
-            (Some(keys), None) | (None, Some(keys)) => Some(keys),
-            (None, None) => None,
-        },
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => match (
-            extract_column_keys_from_expr(left, is_target_column),
-            extract_column_keys_from_expr(right, is_target_column),
-        ) {
-            (Some(left), Some(right)) => Some(union_strings(&left, &right)),
-            _ => None,
-        },
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } => {
-            if !is_target_column(expr) {
-                return None;
-            }
-            let mut values = Vec::with_capacity(list.len());
-            for item in list {
-                let value = string_literal_value(item)?;
-                values.push(value);
-            }
-            if values.is_empty() {
-                None
-            } else {
-                Some(dedup_strings(values))
-            }
-        }
-        Expr::Nested(inner) => extract_column_keys_from_expr(inner, is_target_column),
-        _ => None,
-    }
+    extract_string_column_values_from_expr(expr, is_target_column, params)
 }
 
 fn expr_is_schema_key_column(expr: &Expr) -> bool {
@@ -1137,27 +1132,6 @@ fn expr_is_schema_key_column(expr: &Expr) -> bool {
 
 fn expr_is_plugin_key_column(expr: &Expr) -> bool {
     expr_last_identifier_eq(expr, "plugin_key")
-}
-
-fn expr_last_identifier_eq(expr: &Expr, target: &str) -> bool {
-    match expr {
-        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(target),
-        Expr::CompoundIdentifier(idents) => idents
-            .last()
-            .map(|ident| ident.value.eq_ignore_ascii_case(target))
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn string_literal_value(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(value),
-            ..
-        }) => Some(value.clone()),
-        _ => None,
-    }
 }
 
 fn strip_qualifiers(expr: Expr) -> Option<Expr> {
@@ -1315,21 +1289,12 @@ fn is_simple_binary_op(op: &BinaryOperator) -> bool {
     )
 }
 
+#[cfg(test)]
 fn dedup_strings(values: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for value in values {
         if !out.contains(&value) {
             out.push(value);
-        }
-    }
-    out
-}
-
-fn union_strings(left: &[String], right: &[String]) -> Vec<String> {
-    let mut out = left.to_vec();
-    for value in right {
-        if !out.contains(value) {
-            out.push(value.clone());
         }
     }
     out
@@ -1746,7 +1711,8 @@ mod tests {
             "SELECT * FROM lix_internal_state_vtable \
              WHERE plugin_key = 'plugin_json' OR plugin_key IN ('plugin_text', 'plugin_json')",
         );
-        let keys = extract_plugin_keys_from_query(&query).expect("plugin keys should be extracted");
+        let keys =
+            extract_plugin_keys_from_query(&query, &[]).expect("plugin keys should be extracted");
         assert_eq!(
             keys,
             vec!["plugin_json".to_string(), "plugin_text".to_string()]
@@ -1758,7 +1724,8 @@ mod tests {
         let query = parse_query(
             "SELECT * FROM lix_internal_state_vtable AS s WHERE s.plugin_key = 'plugin_json'",
         );
-        let keys = extract_plugin_keys_from_query(&query).expect("plugin keys should be extracted");
+        let keys =
+            extract_plugin_keys_from_query(&query, &[]).expect("plugin keys should be extracted");
         assert_eq!(keys, vec!["plugin_json".to_string()]);
     }
 
@@ -1768,7 +1735,7 @@ mod tests {
             "SELECT COUNT(*) \
              FROM (SELECT * FROM lix_internal_state_vtable WHERE plugin_key = 'plugin_json') AS ranked",
         );
-        let keys = extract_plugin_keys_from_top_level_derived_subquery(&query)
+        let keys = extract_plugin_keys_from_top_level_derived_subquery(&query, &[])
             .expect("plugin keys should be extracted");
         assert_eq!(keys, vec!["plugin_json".to_string()]);
     }
@@ -1780,7 +1747,7 @@ mod tests {
              WHERE plugin_key = 'plugin_json' OR schema_key = 'json_pointer'",
         );
         assert!(
-            extract_plugin_keys_from_query(&query).is_none(),
+            extract_plugin_keys_from_query(&query, &[]).is_none(),
             "mixed OR should not produce a plugin-only key set"
         );
     }
@@ -1809,6 +1776,7 @@ mod tests {
                 "schema_c".to_string(),
             ],
             Some(&predicate),
+            &[],
         )
         .expect("derived query");
         let compact = compact_sql(&derived.to_string());

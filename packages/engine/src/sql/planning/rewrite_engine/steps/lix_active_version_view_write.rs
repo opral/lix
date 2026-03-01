@@ -244,7 +244,7 @@ async fn query_lix_active_version_rows(
 
     let query = *query;
     let query = lix_active_version_view_read::rewrite_query(query.clone())?.unwrap_or(query);
-    let query = vtable_read::rewrite_query(query.clone())?.unwrap_or(query);
+    let query = vtable_read::rewrite_query(query.clone(), params)?.unwrap_or(query);
     let lowered = lower_statement(Statement::Query(Box::new(query)), backend.dialect())?;
     let Statement::Query(lowered_query) = lowered else {
         return Err(LixError {

@@ -733,6 +733,69 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_update_supports_placeholder_schema_key_predicate,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-placeholder-schema",
+            "version-a",
+            "{\"value\":\"before\"}",
+            false,
+        )
+        .await;
+
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = $1 \
+                 WHERE file_id = $2 \
+                   AND schema_key = $3 \
+                   AND entity_id = $4",
+                &[
+                    Value::Text("{\"value\":\"after\"}".to_string()),
+                    Value::Text("test-file".to_string()),
+                    Value::Text("test_state_schema".to_string()),
+                    Value::Text("entity-placeholder-schema".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-placeholder-schema' \
+                   AND file_id = 'test-file'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.rows.clone());
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "{\"value\":\"after\"}");
+    }
+);
+
+simulation_test!(
     lix_state_update_allows_untracked_with_untracked_predicate,
     |sim| async move {
         let engine = sim

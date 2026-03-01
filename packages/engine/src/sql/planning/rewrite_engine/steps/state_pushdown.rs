@@ -10,13 +10,11 @@ pub(crate) struct StatePushdown {
 enum PushdownBucket {
     Source = 0,
     Ranked = 1,
-    Remaining = 2,
 }
 
 struct PredicatePart {
     predicate: Expr,
     extracted: Option<(PushdownBucket, String)>,
-    has_bare_placeholder: bool,
 }
 
 pub(crate) fn select_supports_count_fast_path(select: &Select) -> bool {
@@ -85,56 +83,26 @@ pub(crate) fn take_pushdown_predicates(
                 }
                 _ => None,
             });
-        let has_bare_placeholder = expr_contains_bare_placeholder(&predicate);
         parts.push(PredicatePart {
             predicate,
             extracted,
-            has_bare_placeholder,
         });
     }
-
-    let has_bare_placeholder_reordering = has_bare_placeholder_reordering(&parts);
 
     let mut pushdown = StatePushdown::default();
     let mut remaining = Vec::new();
     for part in parts {
         match part.extracted {
-            Some((bucket, sql))
-                if !(part.has_bare_placeholder && has_bare_placeholder_reordering) =>
-            {
-                match bucket {
-                    PushdownBucket::Source => pushdown.source_predicates.push(sql),
-                    PushdownBucket::Ranked => pushdown.ranked_predicates.push(sql),
-                    PushdownBucket::Remaining => remaining.push(part.predicate),
-                }
-            }
+            Some((bucket, sql)) => match bucket {
+                PushdownBucket::Source => pushdown.source_predicates.push(sql),
+                PushdownBucket::Ranked => pushdown.ranked_predicates.push(sql),
+            },
             _ => remaining.push(part.predicate),
         }
     }
 
     *selection = join_conjunction(remaining);
     pushdown
-}
-
-fn has_bare_placeholder_reordering(parts: &[PredicatePart]) -> bool {
-    let mut last_bucket = PushdownBucket::Source;
-    let mut saw_any = false;
-    for part in parts {
-        if !part.has_bare_placeholder {
-            continue;
-        }
-        let bucket = part
-            .extracted
-            .as_ref()
-            .map(|(bucket, _)| *bucket)
-            .unwrap_or(PushdownBucket::Remaining);
-        if saw_any && bucket < last_bucket {
-            return true;
-        }
-        last_bucket = bucket;
-        saw_any = true;
-    }
-    false
 }
 
 fn split_conjunction(expr: Expr) -> Vec<Expr> {
@@ -243,67 +211,4 @@ fn render_in_list_sql(list: &[Expr]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn expr_contains_bare_placeholder(expr: &Expr) -> bool {
-    let sql = expr.to_string();
-    sql_contains_bare_placeholder(&sql)
-}
-
-fn sql_contains_bare_placeholder(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut index = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-
-        if in_single_quote {
-            if byte == b'\'' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    index += 2;
-                    continue;
-                }
-                in_single_quote = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if in_double_quote {
-            if byte == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    index += 2;
-                    continue;
-                }
-                in_double_quote = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'\'' => {
-                in_single_quote = true;
-                index += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                index += 1;
-            }
-            b'?' => {
-                let mut lookahead = index + 1;
-                while lookahead < bytes.len() && bytes[lookahead].is_ascii_digit() {
-                    lookahead += 1;
-                }
-                if lookahead == index + 1 {
-                    return true;
-                }
-                index = lookahead;
-            }
-            _ => index += 1,
-        }
-    }
-    false
 }

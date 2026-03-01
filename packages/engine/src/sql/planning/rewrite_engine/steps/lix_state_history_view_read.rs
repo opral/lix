@@ -5,6 +5,9 @@ use sqlparser::ast::{
 };
 
 use crate::backend::SqlDialect;
+use crate::engine::sql::planning::param_context::{
+    normalize_query_placeholders, PlaceholderOrdinalState,
+};
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::select_supports_count_fast_path;
 use crate::engine::sql::planning::rewrite_engine::{
     bind_sql, default_alias, escape_sql_string, object_name_matches, parse_single_query,
@@ -49,8 +52,10 @@ pub async fn rewrite_query_with_backend(
 }
 
 fn rewrite_query_collect_requests(
-    query: Query,
+    mut query: Query,
 ) -> Result<(Option<Query>, Vec<HistoryPushdown>), LixError> {
+    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
+
     let mut requests = Vec::new();
     let rewritten = rewrite_query_with_select_rewriter(query, &mut |select, changed| {
         rewrite_select(select, changed, &mut requests)
@@ -162,7 +167,6 @@ struct HistoryPushdown {
     change_predicates: Vec<String>,
     requested_predicates: Vec<String>,
     cse_predicates: Vec<String>,
-    requested_pushdown_blocked_by_bare_placeholders: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -170,7 +174,6 @@ enum HistoryPushdownBucket {
     Change = 0,
     Requested = 1,
     Cse = 2,
-    Remaining = 3,
 }
 
 enum ExtractedPredicate {
@@ -181,7 +184,6 @@ enum ExtractedPredicate {
 struct PredicatePart {
     predicate: Expr,
     extracted: Option<ExtractedPredicate>,
-    has_bare_placeholder: bool,
 }
 
 fn take_history_pushdown_predicates(
@@ -197,61 +199,28 @@ fn take_history_pushdown_predicates(
     for predicate in split_conjunction(selection_expr) {
         let extracted =
             extract_history_pushdown_predicate(&predicate, relation_name, allow_unqualified);
-        let has_bare_placeholder = expr_contains_bare_placeholder(&predicate);
         parts.push(PredicatePart {
             predicate,
             extracted,
-            has_bare_placeholder,
         });
     }
-
-    let has_cross_bucket_bare_placeholders = has_cross_bucket_bare_placeholders(&parts);
 
     let mut pushdown = HistoryPushdown::default();
     let mut remaining = Vec::new();
     for part in parts {
-        let blocked_by_cross_bucket =
-            part.has_bare_placeholder && has_cross_bucket_bare_placeholders;
         match part.extracted {
-            Some(ExtractedPredicate::Push(bucket, sql)) if !blocked_by_cross_bucket => match bucket
-            {
+            Some(ExtractedPredicate::Push(bucket, sql)) => match bucket {
                 HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
                 HistoryPushdownBucket::Requested => pushdown.requested_predicates.push(sql),
                 HistoryPushdownBucket::Cse => pushdown.cse_predicates.push(sql),
-                HistoryPushdownBucket::Remaining => remaining.push(part.predicate),
             },
-            Some(ExtractedPredicate::Push(HistoryPushdownBucket::Requested, _))
-                if blocked_by_cross_bucket =>
-            {
-                pushdown.requested_pushdown_blocked_by_bare_placeholders = true;
-                remaining.push(part.predicate);
-            }
-            Some(ExtractedPredicate::Drop) if !blocked_by_cross_bucket => {}
+            Some(ExtractedPredicate::Drop) => {}
             _ => remaining.push(part.predicate),
         }
     }
 
     *selection = join_conjunction(remaining);
     pushdown
-}
-
-fn has_cross_bucket_bare_placeholders(parts: &[PredicatePart]) -> bool {
-    let mut first_bucket: Option<HistoryPushdownBucket> = None;
-    for part in parts {
-        if !part.has_bare_placeholder {
-            continue;
-        }
-        let bucket = match &part.extracted {
-            Some(ExtractedPredicate::Push(bucket, _)) => *bucket,
-            Some(ExtractedPredicate::Drop) | None => HistoryPushdownBucket::Remaining,
-        };
-        match first_bucket {
-            None => first_bucket = Some(bucket),
-            Some(existing) if existing != bucket => return true,
-            Some(_) => {}
-        }
-    }
-    false
 }
 
 fn extract_history_pushdown_predicate(
@@ -507,69 +476,6 @@ fn render_in_list_sql(list: &[Expr]) -> String {
         .join(", ")
 }
 
-fn expr_contains_bare_placeholder(expr: &Expr) -> bool {
-    let sql = expr.to_string();
-    sql_contains_bare_placeholder(&sql)
-}
-
-fn sql_contains_bare_placeholder(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let mut index = 0usize;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-
-        if in_single_quote {
-            if byte == b'\'' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    index += 2;
-                    continue;
-                }
-                in_single_quote = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        if in_double_quote {
-            if byte == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    index += 2;
-                    continue;
-                }
-                in_double_quote = false;
-            }
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'\'' => {
-                in_single_quote = true;
-                index += 1;
-            }
-            b'"' => {
-                in_double_quote = true;
-                index += 1;
-            }
-            b'?' => {
-                let mut lookahead = index + 1;
-                while lookahead < bytes.len() && bytes[lookahead].is_ascii_digit() {
-                    lookahead += 1;
-                }
-                if lookahead == index + 1 {
-                    return true;
-                }
-                index = lookahead;
-            }
-            _ => index += 1,
-        }
-    }
-    false
-}
-
 fn render_where_clause(predicates: &[String]) -> String {
     if predicates.is_empty() {
         String::new()
@@ -703,11 +609,10 @@ fn build_lix_state_history_view_query(
 }
 
 fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
-    pushdown.requested_pushdown_blocked_by_bare_placeholders
-        || pushdown
-            .cse_predicates
-            .iter()
-            .any(|predicate| predicate.contains("rc.commit_id"))
+    pushdown
+        .cse_predicates
+        .iter()
+        .any(|predicate| predicate.contains("rc.commit_id"))
 }
 
 fn build_lix_state_history_view_query_phase1(
@@ -1527,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_push_down_bare_placeholders_when_it_would_reorder_bindings() {
+    fn canonicalizes_bare_placeholders_and_pushes_down_root_then_schema() {
         let query = parse_query(
             "SELECT COUNT(*) \
              FROM lix_state_history AS sh \
@@ -1540,14 +1445,14 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(!sql.contains("c.id = ?"));
-        assert!(!sql.contains("bp.schema_key = ?"));
-        assert!(sql.contains("sh.root_commit_id = ?"));
-        assert!(sql.contains("sh.schema_key = ?"));
+        assert!(sql.contains("c.id = ?1"));
+        assert!(sql.contains("bp.schema_key = ?2"));
+        assert!(!sql.contains("sh.root_commit_id = ?1"));
+        assert!(!sql.contains("sh.schema_key = ?2"));
     }
 
     #[test]
-    fn does_not_push_down_bare_placeholders_across_buckets_when_schema_precedes_root() {
+    fn canonicalizes_bare_placeholders_and_pushes_down_schema_then_root() {
         let query = parse_query(
             "SELECT COUNT(*) \
              FROM lix_state_history AS sh \
@@ -1560,16 +1465,14 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(!sql.contains("c.id = ?"));
-        assert!(!sql.contains("bp.schema_key = ?"));
-        assert!(sql.contains("sh.schema_key = ?"));
-        assert!(sql.contains("sh.root_commit_id = ?"));
-        assert!(!sql.contains("FROM lix_internal_entity_state_timeline_breakpoint"));
-        assert!(sql.contains("ranked_cse"));
+        assert!(sql.contains("bp.schema_key = ?1"));
+        assert!(sql.contains("c.id = ?2"));
+        assert!(!sql.contains("sh.schema_key = ?1"));
+        assert!(!sql.contains("sh.root_commit_id = ?2"));
     }
 
     #[test]
-    fn marks_requested_pushdown_as_blocked_when_bare_placeholders_cross_buckets() {
+    fn collects_requested_pushdown_after_placeholder_canonicalization() {
         let query = parse_query(
             "SELECT COUNT(*) \
              FROM lix_state_history AS sh \
@@ -1582,8 +1485,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = requests.into_iter().next().expect("request should exist");
 
-        assert!(request.requested_pushdown_blocked_by_bare_placeholders);
-        assert!(request.requested_predicates.is_empty());
+        assert_eq!(request.requested_predicates, vec!["c.id = ?2".to_string()]);
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use sqlparser::ast::{Expr, GroupByExpr, Query, Select, SelectItem, TableFactor, TableWithJoins};
 
+use crate::engine::sql::planning::param_context::{
+    normalize_query_placeholders, PlaceholderOrdinalState,
+};
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::{
     select_supports_count_fast_path, take_pushdown_predicates,
 };
@@ -13,6 +16,8 @@ use crate::LixError;
 const LIX_STATE_VIEW_NAME: &str = "lix_state";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
+    let mut query = query;
+    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
     rewrite_query_with_select_rewriter(query, &mut rewrite_select)
 }
 
@@ -189,16 +194,16 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.file_id = ?"));
+        assert!(sql.contains("s.file_id = ?1"));
         assert!(sql.contains("ranked.plugin_key = 'plugin_json'"));
-        assert!(!sql.contains("WHERE file_id = ?"));
+        assert!(!sql.contains("WHERE file_id = ? AND plugin_key = 'plugin_json'"));
         assert!(!sql.contains("commit_by_version"));
         assert!(!sql.contains("change_set_element_by_version"));
         assert!(!sql.contains("change_commit_by_change_id"));
     }
 
     #[test]
-    fn does_not_push_down_bare_placeholders_when_it_would_reorder_bindings() {
+    fn canonicalizes_bare_placeholders_and_pushes_down_predicates() {
         let query =
             parse_query("SELECT COUNT(*) FROM lix_state WHERE plugin_key = ? AND file_id = ?");
 
@@ -207,10 +212,9 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(!sql.contains("ranked.plugin_key = ?"));
-        assert!(!sql.contains("s.file_id = ?"));
-        assert!(sql.contains("plugin_key = ?"));
-        assert!(sql.contains("file_id = ?"));
+        assert!(sql.contains("ranked.plugin_key = ?1"));
+        assert!(sql.contains("s.file_id = ?2"));
+        assert!(!sql.contains("plugin_key = ? AND file_id = ?"));
     }
 
     #[test]

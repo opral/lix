@@ -15,6 +15,9 @@ use crate::engine::sql::history::commit_runtime::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
 };
+use crate::engine::sql::planning::param_context::{
+    expr_last_identifier_eq, extract_string_column_values_from_expr, match_bool_column_equality,
+};
 use crate::engine::sql::planning::rewrite_engine::types::{
     MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
@@ -309,8 +312,8 @@ pub fn rewrite_update(
         description: "vtable update requires a WHERE clause".to_string(),
     })?;
 
-    let has_untracked_true = contains_untracked_true(selection);
-    let has_untracked_false = contains_untracked_false(selection);
+    let has_untracked_true = contains_untracked_true(selection, params);
+    let has_untracked_false = contains_untracked_false(selection, params);
     if has_untracked_true && has_untracked_false {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -320,7 +323,7 @@ pub fn rewrite_update(
     }
 
     if has_untracked_true {
-        if !can_strip_untracked_predicate(selection) {
+        if !can_strip_untracked_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 title: "Unknown error".to_string(),
@@ -331,7 +334,7 @@ pub fn rewrite_update(
         replace_table_with_untracked(&mut new_update.table);
         new_update.assignments = filter_update_assignments(update.assignments);
         ensure_updated_at_assignment(&mut new_update.assignments);
-        new_update.selection = try_strip_untracked_predicate(selection).unwrap_or(None);
+        new_update.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
         let validation =
             build_update_validation_plan(&new_update, Some(UNTRACKED_TABLE.to_string()), params)?;
         return Ok(Some(UpdateRewrite::Statement(VtableUpdateStatement {
@@ -357,14 +360,14 @@ pub fn rewrite_update(
     }
 
     let stripped_selection = if has_untracked_false {
-        if !can_strip_untracked_false_predicate(selection) {
+        if !can_strip_untracked_false_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 title: "Unknown error".to_string(),
                 description: "vtable update could not strip untracked predicate".to_string(),
             });
         }
-        try_strip_untracked_false_predicate(selection).unwrap_or(None)
+        try_strip_untracked_false_predicate(selection, params).unwrap_or(None)
     } else {
         Some(selection.clone())
     };
@@ -375,7 +378,7 @@ pub fn rewrite_update(
         description: "vtable update requires a WHERE clause after stripping untracked".to_string(),
     })?;
 
-    let schema_key = extract_single_schema_key(&stripped_selection)?;
+    let schema_key = extract_single_schema_key(&stripped_selection, params)?;
     let writer_key_assignment_present = update
         .assignments
         .iter()
@@ -406,13 +409,17 @@ pub fn rewrite_update(
     })))
 }
 
-pub fn rewrite_delete(delete: Delete) -> Result<Option<DeleteRewrite>, LixError> {
-    rewrite_delete_with_options(delete, false)
+pub fn rewrite_delete(
+    delete: Delete,
+    params: &[EngineValue],
+) -> Result<Option<DeleteRewrite>, LixError> {
+    rewrite_delete_with_options(delete, false, params)
 }
 
 pub fn rewrite_delete_with_options(
     delete: Delete,
     effective_scope_fallback: bool,
+    params: &[EngineValue],
 ) -> Result<Option<DeleteRewrite>, LixError> {
     if !delete_from_is_vtable(&delete) {
         return Ok(None);
@@ -424,8 +431,8 @@ pub fn rewrite_delete_with_options(
         description: "vtable delete requires a WHERE clause".to_string(),
     })?;
 
-    let has_untracked_true = contains_untracked_true(selection);
-    let has_untracked_false = contains_untracked_false(selection);
+    let has_untracked_true = contains_untracked_true(selection, params);
+    let has_untracked_false = contains_untracked_false(selection, params);
     if has_untracked_true && has_untracked_false {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -435,7 +442,7 @@ pub fn rewrite_delete_with_options(
     }
 
     if has_untracked_true {
-        if !can_strip_untracked_predicate(selection) {
+        if !can_strip_untracked_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 title: "Unknown error".to_string(),
@@ -444,7 +451,7 @@ pub fn rewrite_delete_with_options(
         }
         let mut new_delete = delete.clone();
         replace_delete_from_untracked(&mut new_delete);
-        new_delete.selection = try_strip_untracked_predicate(selection).unwrap_or(None);
+        new_delete.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
         return Ok(Some(DeleteRewrite::Statement(Statement::Delete(
             new_delete,
         ))));
@@ -473,14 +480,14 @@ pub fn rewrite_delete_with_options(
     }
 
     let stripped_selection = if has_untracked_false {
-        if !can_strip_untracked_false_predicate(selection) {
+        if !can_strip_untracked_false_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 title: "Unknown error".to_string(),
                 description: "vtable delete could not strip untracked predicate".to_string(),
             });
         }
-        try_strip_untracked_false_predicate(selection).unwrap_or(None)
+        try_strip_untracked_false_predicate(selection, params).unwrap_or(None)
     } else {
         Some(selection.clone())
     };
@@ -491,7 +498,7 @@ pub fn rewrite_delete_with_options(
         description: "vtable delete requires a WHERE clause after stripping untracked".to_string(),
     })?;
 
-    let schema_key = extract_single_schema_key(&stripped_selection)?;
+    let schema_key = extract_single_schema_key(&stripped_selection, params)?;
     let effective_scope_selection_sql = if effective_scope_fallback {
         Some(stripped_selection.to_string())
     } else {
@@ -1809,55 +1816,56 @@ fn assignment_target_is_column(target: &AssignmentTarget, column: &str) -> bool 
     }
 }
 
-fn contains_untracked_true(expr: &Expr) -> bool {
-    if is_untracked_equals_true(expr) {
+fn contains_untracked_true(expr: &Expr, params: &[EngineValue]) -> bool {
+    if is_untracked_equals_true(expr, params) {
         return true;
     }
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
-                contains_untracked_true(left) || contains_untracked_true(right)
+                contains_untracked_true(left, params) || contains_untracked_true(right, params)
             }
             _ => false,
         },
-        Expr::Nested(inner) => contains_untracked_true(inner),
+        Expr::Nested(inner) => contains_untracked_true(inner, params),
         _ => false,
     }
 }
 
-fn contains_untracked_false(expr: &Expr) -> bool {
-    if is_untracked_equals_false(expr) {
+fn contains_untracked_false(expr: &Expr, params: &[EngineValue]) -> bool {
+    if is_untracked_equals_false(expr, params) {
         return true;
     }
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And | BinaryOperator::Or => {
-                contains_untracked_false(left) || contains_untracked_false(right)
+                contains_untracked_false(left, params) || contains_untracked_false(right, params)
             }
             _ => false,
         },
-        Expr::Nested(inner) => contains_untracked_false(inner),
+        Expr::Nested(inner) => contains_untracked_false(inner, params),
         _ => false,
     }
 }
 
-fn can_strip_untracked_predicate(expr: &Expr) -> bool {
-    contains_untracked_true(expr) && try_strip_untracked_predicate(expr).is_some()
+fn can_strip_untracked_predicate(expr: &Expr, params: &[EngineValue]) -> bool {
+    contains_untracked_true(expr, params) && try_strip_untracked_predicate(expr, params).is_some()
 }
 
-fn can_strip_untracked_false_predicate(expr: &Expr) -> bool {
-    contains_untracked_false(expr) && try_strip_untracked_false_predicate(expr).is_some()
+fn can_strip_untracked_false_predicate(expr: &Expr, params: &[EngineValue]) -> bool {
+    contains_untracked_false(expr, params)
+        && try_strip_untracked_false_predicate(expr, params).is_some()
 }
 
-fn try_strip_untracked_predicate(expr: &Expr) -> Option<Option<Expr>> {
-    if is_untracked_equals_true(expr) {
+fn try_strip_untracked_predicate(expr: &Expr, params: &[EngineValue]) -> Option<Option<Expr>> {
+    if is_untracked_equals_true(expr, params) {
         return Some(None);
     }
 
     match expr {
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            let left = try_strip_untracked_predicate(left)?;
-            let right = try_strip_untracked_predicate(right)?;
+            let left = try_strip_untracked_predicate(left, params)?;
+            let right = try_strip_untracked_predicate(right, params)?;
 
             match (left, right) {
                 (None, None) => Some(None),
@@ -1870,22 +1878,25 @@ fn try_strip_untracked_predicate(expr: &Expr) -> Option<Option<Expr>> {
             }
         }
         Expr::Nested(inner) => {
-            let stripped = try_strip_untracked_predicate(inner)?;
+            let stripped = try_strip_untracked_predicate(inner, params)?;
             Some(stripped.map(|expr| Expr::Nested(Box::new(expr))))
         }
         _ => Some(Some(expr.clone())),
     }
 }
 
-fn try_strip_untracked_false_predicate(expr: &Expr) -> Option<Option<Expr>> {
-    if is_untracked_equals_false(expr) {
+fn try_strip_untracked_false_predicate(
+    expr: &Expr,
+    params: &[EngineValue],
+) -> Option<Option<Expr>> {
+    if is_untracked_equals_false(expr, params) {
         return Some(None);
     }
 
     match expr {
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            let left = try_strip_untracked_false_predicate(left)?;
-            let right = try_strip_untracked_false_predicate(right)?;
+            let left = try_strip_untracked_false_predicate(left, params)?;
+            let right = try_strip_untracked_false_predicate(right, params)?;
 
             match (left, right) {
                 (None, None) => Some(None),
@@ -1898,70 +1909,23 @@ fn try_strip_untracked_false_predicate(expr: &Expr) -> Option<Option<Expr>> {
             }
         }
         Expr::Nested(inner) => {
-            let stripped = try_strip_untracked_false_predicate(inner)?;
+            let stripped = try_strip_untracked_false_predicate(inner, params)?;
             Some(stripped.map(|expr| Expr::Nested(Box::new(expr))))
         }
         _ => Some(Some(expr.clone())),
     }
 }
 
-fn is_untracked_equals_true(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            (expr_is_untracked_column(left) && is_untracked_true_literal(right))
-                || (expr_is_untracked_column(right) && is_untracked_true_literal(left))
-        }
-        _ => false,
-    }
+fn is_untracked_equals_true(expr: &Expr, params: &[EngineValue]) -> bool {
+    match_bool_column_equality(expr, expr_is_untracked_column, params) == Some(true)
 }
 
-fn is_untracked_equals_false(expr: &Expr) -> bool {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            (expr_is_untracked_column(left) && is_untracked_false_literal(right))
-                || (expr_is_untracked_column(right) && is_untracked_false_literal(left))
-        }
-        _ => false,
-    }
+fn is_untracked_equals_false(expr: &Expr, params: &[EngineValue]) -> bool {
+    match_bool_column_equality(expr, expr_is_untracked_column, params) == Some(false)
 }
 
 fn expr_is_untracked_column(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("untracked"),
-        Expr::CompoundIdentifier(idents) => idents
-            .last()
-            .map(|ident| ident.value.eq_ignore_ascii_case("untracked"))
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn is_untracked_true_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::Boolean(value),
-            ..
-        }) => *value,
-        _ => false,
-    }
-}
-
-fn is_untracked_false_literal(expr: &Expr) -> bool {
-    match expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::Boolean(value),
-            ..
-        }) => !*value,
-        _ => false,
-    }
+    expr_last_identifier_eq(expr, "untracked")
 }
 
 fn parse_untracked_bool_like_value(cell: &ResolvedCell) -> Option<bool> {
@@ -2317,12 +2281,13 @@ fn unwrap_cast_expr(mut expr: &Expr) -> &Expr {
     }
 }
 
-fn extract_single_schema_key(expr: &Expr) -> Result<String, LixError> {
-    let keys = extract_schema_keys_from_expr(expr).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
-        description: "vtable update requires schema_key predicate".to_string(),
-    })?;
+fn extract_single_schema_key(expr: &Expr, params: &[EngineValue]) -> Result<String, LixError> {
+    let keys = extract_string_column_values_from_expr(expr, expr_is_schema_key_column, params)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            title: "Unknown error".to_string(),
+            description: "vtable update requires schema_key predicate".to_string(),
+        })?;
     if keys.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -2333,124 +2298,8 @@ fn extract_single_schema_key(expr: &Expr) -> Result<String, LixError> {
     Ok(keys[0].clone())
 }
 
-fn extract_schema_keys_from_expr(expr: &Expr) -> Option<Vec<String>> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            if expr_is_schema_key_column(left) {
-                return string_literal_value(right).map(|value| vec![value]);
-            }
-            if expr_is_schema_key_column(right) {
-                return string_literal_value(left).map(|value| vec![value]);
-            }
-            None
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => match (
-            extract_schema_keys_from_expr(left),
-            extract_schema_keys_from_expr(right),
-        ) {
-            (Some(left), Some(right)) => {
-                let intersection = intersect_strings(&left, &right);
-                if intersection.is_empty() {
-                    None
-                } else {
-                    Some(intersection)
-                }
-            }
-            (Some(keys), None) | (None, Some(keys)) => Some(keys),
-            (None, None) => None,
-        },
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => match (
-            extract_schema_keys_from_expr(left),
-            extract_schema_keys_from_expr(right),
-        ) {
-            (Some(left), Some(right)) => Some(union_strings(&left, &right)),
-            _ => None,
-        },
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } => {
-            if !expr_is_schema_key_column(expr) {
-                return None;
-            }
-            let mut values = Vec::with_capacity(list.len());
-            for item in list {
-                let value = string_literal_value(item)?;
-                values.push(value);
-            }
-            if values.is_empty() {
-                None
-            } else {
-                Some(dedup_strings(values))
-            }
-        }
-        Expr::Nested(inner) => extract_schema_keys_from_expr(inner),
-        _ => None,
-    }
-}
-
 fn expr_is_schema_key_column(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case("schema_key"),
-        Expr::CompoundIdentifier(idents) => idents
-            .last()
-            .map(|ident| ident.value.eq_ignore_ascii_case("schema_key"))
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn string_literal_value(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(value),
-            ..
-        }) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn dedup_strings(values: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    for value in values {
-        if !out.contains(&value) {
-            out.push(value);
-        }
-    }
-    out
-}
-
-fn union_strings(left: &[String], right: &[String]) -> Vec<String> {
-    let mut out = left.to_vec();
-    for value in right {
-        if !out.contains(value) {
-            out.push(value.clone());
-        }
-    }
-    out
-}
-
-fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for value in left {
-        if right.contains(value) && !out.contains(value) {
-            out.push(value.clone());
-        }
-    }
-    out
+    expr_last_identifier_eq(expr, "schema_key")
 }
 
 #[cfg(test)]
@@ -3046,6 +2895,56 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_untracked_update_strips_only_untracked_predicate() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET snapshot_content = $1
+            WHERE untracked = true
+              AND schema_key = 'lix_active_version'
+              AND file_id = 'lix'
+              AND version_id = 'global'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(
+            update,
+            &[EngineValue::Text(
+                json!({
+                    "id": "active-version-id",
+                    "version_id": "version-a"
+                })
+                .to_string(),
+            )],
+        )
+        .expect("rewrite ok")
+        .expect("rewrite applied");
+
+        let statement = match rewrite {
+            UpdateRewrite::Statement(statement) => statement.statement,
+            _ => panic!("expected untracked statement rewrite"),
+        };
+        let Statement::Update(update) = statement else {
+            panic!("expected update statement");
+        };
+
+        assert!(
+            update.table.to_string().contains("lix_internal_state_untracked"),
+            "expected rewrite target to be untracked table, got: {}",
+            update.table
+        );
+        let selection = update.selection.expect("selection should remain after stripping");
+        let selection_sql = selection.to_string();
+        assert!(selection_sql.contains("schema_key = 'lix_active_version'"));
+        assert!(selection_sql.contains("file_id = 'lix'"));
+        assert!(selection_sql.contains("version_id = 'global'"));
+        assert!(!selection_sql.contains("untracked = true"));
+    }
+
+    #[test]
     fn rewrite_update_extracts_writer_key_after_prior_placeholders() {
         let sql = r#"UPDATE lix_internal_state_vtable
             SET metadata = ? || '', writer_key = ?
@@ -3144,7 +3043,7 @@ mod tests {
             _ => panic!("expected delete"),
         };
 
-        let rewrite = rewrite_delete(delete)
+        let rewrite = rewrite_delete(delete, &[])
             .expect("rewrite ok")
             .expect("rewrite applied");
 
@@ -3293,7 +3192,7 @@ mod tests {
             _ => panic!("expected delete"),
         };
 
-        let err = rewrite_delete(delete).expect_err("expected error");
+        let err = rewrite_delete(delete, &[]).expect_err("expected error");
         assert!(err.description.contains("schema_key"), "{:#?}", err);
     }
 
@@ -3309,7 +3208,7 @@ mod tests {
             _ => panic!("expected delete"),
         };
 
-        let err = rewrite_delete(delete).expect_err("expected error");
+        let err = rewrite_delete(delete, &[]).expect_err("expected error");
         assert!(err.description.contains("single schema_key"), "{:#?}", err);
     }
 
