@@ -37,21 +37,18 @@ pub fn rewrite_insert(
     if insert.on.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account insert does not support ON CONFLICT".to_string(),
         });
     }
     if insert.columns.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account insert requires explicit columns".to_string(),
         });
     }
 
     let resolved_rows = resolve_insert_rows(&insert, params)?.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "lix_active_account insert requires VALUES rows".to_string(),
     })?;
     let mut rows = Vec::with_capacity(resolved_rows.len());
@@ -64,7 +61,6 @@ pub fn rewrite_insert(
                 .and_then(|cell| cell.value.as_ref())
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "lix_active_account insert '{}' must be literal or parameter",
                         column.value
@@ -75,7 +71,6 @@ pub fn rewrite_insert(
                 other => {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!(
                             "lix_active_account insert does not support column '{other}'"
                         ),
@@ -86,13 +81,11 @@ pub fn rewrite_insert(
 
         let account_id = account_id.ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account insert requires column 'account_id'".to_string(),
         })?;
         if account_id.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "lix_active_account insert requires non-empty account_id".to_string(),
             });
         }
@@ -104,7 +97,6 @@ pub fn rewrite_insert(
             ))
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("failed to encode active account snapshot: {error}"),
             })?,
         });
@@ -124,21 +116,18 @@ pub async fn rewrite_delete_with_backend(
     if delete.using.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account delete does not support USING".to_string(),
         });
     }
     if delete.returning.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account delete does not support RETURNING".to_string(),
         });
     }
     if !delete.order_by.is_empty() || delete.limit.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account delete does not support LIMIT or ORDER BY".to_string(),
         });
     }
@@ -157,12 +146,10 @@ fn value_required_string(value: &EngineValue, field: &str) -> Result<String, Lix
         EngineValue::Text(text) => Ok(text.clone()),
         EngineValue::Null => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_active_account field '{field}' cannot be NULL"),
         }),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_active_account field '{field}' must be a string"),
         }),
     }
@@ -181,13 +168,11 @@ async fn query_entity_ids_for_delete(
 
     let mut statements = Parser::parse_sql(&GenericDialect {}, &sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to parse lix_active_account row loader query: {error}"),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description:
                 "expected a single SELECT statement while querying lix_active_account rows"
                     .to_string(),
@@ -197,7 +182,6 @@ async fn query_entity_ids_for_delete(
     let Statement::Query(query) = statement else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account row loader query must be SELECT".to_string(),
         });
     };
@@ -209,7 +193,6 @@ async fn query_entity_ids_for_delete(
     let Statement::Query(lowered_query) = lowered else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_active_account row loader rewrite expected query statement"
                 .to_string(),
         });
@@ -227,7 +210,6 @@ async fn query_entity_ids_for_delete(
         if row.len() != 1 {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "lix_active_account rewrite expected 1 column from row loader query"
                     .to_string(),
             });
@@ -304,7 +286,6 @@ fn parse_insert(sql: &str, error_message: &str) -> Result<Insert, LixError> {
         Statement::Insert(insert) => Ok(insert),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: error_message.to_string(),
         }),
     }
@@ -313,13 +294,11 @@ fn parse_insert(sql: &str, error_message: &str) -> Result<Insert, LixError> {
 fn parse_statement(sql: &str, error_message: &str) -> Result<Statement, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to build lix_active_account rewrite statement: {error}"),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: error_message.to_string(),
         });
     }

@@ -43,15 +43,14 @@ impl ErrorCode {
     }
 }
 
-fn build_error(code: ErrorCode, title: &str, description: &str) -> LixError {
-    LixError::new(code.as_str(), title, description)
+fn build_error(code: ErrorCode, description: &str) -> LixError {
+    LixError::new(code.as_str(), description)
 }
 
 pub(crate) fn table_not_found_read_error() -> LixError {
     let available_tables = public_lix_table_names().join(", ");
     build_error(
         ErrorCode::TableNotFound,
-        "Table does not exist",
         &format!(
             "Read queries must target Lix views (`lix_*`) only. Available tables: {available_tables}. Schemas are available via `lix_stored_schema`."
         ),
@@ -73,7 +72,6 @@ pub(crate) fn sql_unknown_table_error(
         .unwrap_or_default();
     build_error(
         ErrorCode::SqlUnknownTable,
-        "Unknown table in query",
         &format!("Table `{table_name}` does not exist. {available_tables}{location}"),
     )
 }
@@ -97,7 +95,6 @@ pub(crate) fn sql_unknown_column_error(
         .unwrap_or_default();
     build_error(
         ErrorCode::SqlUnknownColumn,
-        "Unknown column in query",
         &format!(
             "Column `{column_name}` does not exist{table_segment}. {available_columns}{location}"
         ),
@@ -107,7 +104,6 @@ pub(crate) fn sql_unknown_column_error(
 pub(crate) fn internal_table_access_denied_error() -> LixError {
     build_error(
         ErrorCode::InternalTableAccessDenied,
-        "Internal table access denied",
         "Queries against `lix_internal_*` are not allowed. Use public `lix_*` views.",
     )
 }
@@ -120,7 +116,6 @@ pub(crate) fn read_only_view_write_error(view_name: &str, operation: &str) -> Li
     };
     build_error(
         ErrorCode::ReadOnlyViewWriteDenied,
-        "View is read-only",
         &format!("`{view_name}` is read-only. `{operation}` is not supported. {guidance}"),
     )
 }
@@ -128,7 +123,6 @@ pub(crate) fn read_only_view_write_error(view_name: &str, operation: &str) -> Li
 pub(crate) fn vtable_schema_key_required_error() -> LixError {
     build_error(
         ErrorCode::VtableSchemaKeyRequired,
-        "schema_key predicate required",
         "This write targets a schema-scoped vtable. Add a WHERE predicate that resolves schema_key (for example: schema_key = 'markdown_v2_block' or schema_key = ?). This prevents accidental cross-schema updates/deletes.",
     )
 }
@@ -136,7 +130,6 @@ pub(crate) fn vtable_schema_key_required_error() -> LixError {
 pub(crate) fn transaction_control_statement_denied_error() -> LixError {
     build_error(
         ErrorCode::TransactionControlStatementDenied,
-        "Transaction control statements are not allowed in execute()",
         "Use transaction APIs instead: beginTransaction(), transaction(), or executeTransaction().",
     )
 }
@@ -144,7 +137,6 @@ pub(crate) fn transaction_control_statement_denied_error() -> LixError {
 pub(crate) fn transaction_handle_not_found_error() -> LixError {
     build_error(
         ErrorCode::TransactionHandleNotFound,
-        "Transaction handle does not exist",
         "The transaction handle is invalid or already closed. Open a new transaction with beginTransaction().",
     )
 }

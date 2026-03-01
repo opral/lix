@@ -853,28 +853,24 @@ fn parse_phase1_predicate_expr(predicate: &str) -> Result<Expr, LixError> {
     let Some(statement) = statements.pop() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "phase1 change predicate parse produced no statements".to_string(),
         });
     };
     let Statement::Query(query) = statement else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "phase1 change predicate parse did not produce a query".to_string(),
         });
     };
     let SetExpr::Select(select) = *query.body else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "phase1 change predicate parse did not produce a SELECT body".to_string(),
         });
     };
     let Some(selection) = select.selection else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "phase1 change predicate parse produced no WHERE expression".to_string(),
         });
     };
@@ -1344,12 +1340,10 @@ fn required_text_value(row: &[Value], index: usize, field: &str) -> Result<Strin
         Some(Value::Text(value)) => Ok(value.clone()),
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("expected text for {field}, got {other:?}"),
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("missing column {field} at index {index}"),
         }),
     }
@@ -1365,7 +1359,6 @@ fn optional_text_value(
         Some(Value::Text(value)) => Ok(Some(value.clone())),
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("expected nullable text for {field}, got {other:?}"),
         }),
     }
@@ -1375,12 +1368,10 @@ fn required_integer_value(row: &[Value], index: usize, field: &str) -> Result<i6
     match row.get(index) {
         Some(value) => integer_from_value(value).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("expected integer for {field}, got {value:?}"),
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("missing column {field} at index {index}"),
         }),
     }

@@ -22,35 +22,30 @@ pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
     if normalized.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "path segment must not be empty".to_string(),
         });
     }
     if normalized == "." || normalized == ".." {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "path segment cannot be '.' or '..'".to_string(),
         });
     }
     if normalized.contains('/') || normalized.contains('\\') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "path segment must not contain slashes".to_string(),
         });
     }
     if !segment_has_valid_percent_encoding(&normalized) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "path segment contains invalid percent encoding".to_string(),
         });
     }
     if !normalized.chars().all(is_allowed_segment_char) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "path segment contains unsupported characters".to_string(),
         });
     }
@@ -87,14 +82,12 @@ pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
     if !normalized.starts_with('/') || normalized.ends_with('/') || normalized == "/" {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
         });
     }
     if normalized.contains('\\') || normalized.contains("//") {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
         });
     }
@@ -105,7 +98,6 @@ pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
     if segments.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
         });
     }
@@ -120,14 +112,12 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
     if !normalized.starts_with('/') || !normalized.ends_with('/') || normalized == "/" {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
         });
     }
     if normalized.contains('\\') || normalized.contains("//") {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
         });
     }
@@ -138,7 +128,6 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
     if normalized_segments.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
         });
     }
@@ -153,7 +142,6 @@ pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
         .collect::<Vec<_>>();
     let file_name = segments.last().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("Invalid file path {path}"),
     })?;
     let directory_path = if segments.len() > 1 {
@@ -241,7 +229,6 @@ pub(crate) fn compose_directory_path(parent_path: &str, name: &str) -> Result<St
     } else {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("Invalid directory parent path {parent_path}"),
         })
     }

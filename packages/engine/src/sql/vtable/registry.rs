@@ -39,7 +39,6 @@ pub(crate) fn validate_postprocess_plan(plan: &PostprocessPlan) -> Result<(), Li
     if !schema_key_is_valid(schema_key) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable postprocess plan requires a valid schema_key".to_string(),
         });
     }

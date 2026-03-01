@@ -289,7 +289,7 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
                 blob_hash: after_blob_hash,
                 size_bytes: blob_bytes.len() as u64,
             })
-            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            .map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "plugin detect-changes: failed to encode builtin binary fallback snapshot: {error}"
                 ),
             })?;
@@ -390,7 +390,6 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         })
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin detect-changes: failed to encode request payload: {error}"
             ),
@@ -399,7 +398,6 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         let mut plugin_changes: Vec<PluginEntityChange> = serde_json::from_slice(&detect_output)
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "plugin detect-changes: failed to decode plugin output for key '{}': {error}",
                     plugin.key
@@ -435,7 +433,7 @@ pub(crate) async fn detect_file_changes_with_plugins_with_cache(
         for change in plugin_changes {
             let dedupe_key = (change.schema_key.clone(), change.entity_id.clone());
             if !seen_keys.insert(dedupe_key.clone()) {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "plugin detect-changes: duplicate change key for plugin '{}' file '{}' version '{}': schema_key='{}' entity_id='{}'",
                         plugin.key,
                         write.file_id,
@@ -563,7 +561,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
         for write in grouped_writes {
             let dedupe_key = (write.schema_key.clone(), write.entity_id.clone());
             if !seen_keys.insert(dedupe_key.clone()) {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "plugin materialization: duplicate change key for plugin '{}' file '{}' version '{}': schema_key='{}' entity_id='{}'",
                         target_plugin_key,
                         descriptor.file_id,
@@ -595,7 +593,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
             if let Some(blob_ref) = blob_ref {
                 let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
                     .await?
-                    .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                    .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                             "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
                             blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
                         ),
@@ -627,7 +625,6 @@ pub(crate) async fn materialize_file_data_with_plugins(
         };
         let payload = serde_json::to_vec(&request_payload).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: failed to encode apply-changes payload: {error}"
             ),
@@ -684,7 +681,7 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
             };
             let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
                 .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
                         blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
                     ),
@@ -721,7 +718,6 @@ pub(crate) async fn materialize_missing_file_data_with_plugins(
         })
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: failed to encode on-demand apply-changes payload: {error}"
             ),
@@ -782,7 +778,7 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
             };
             let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
                 .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "plugin materialization: missing builtin binary history blob payload for hash '{}' (file_id='{}' root_commit_id='{}' depth='{}')",
                         blob_ref.blob_hash,
                         descriptor.file_id,
@@ -825,7 +821,6 @@ pub(crate) async fn materialize_missing_file_history_data_with_plugins(
         })
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: failed to encode history apply-changes payload: {error}"
             ),
@@ -903,7 +898,7 @@ fn no_matching_plugin_for_detect_error(
     reason: &str,
 ) -> LixError {
     let path = write.after_path.as_deref().unwrap_or("<none>");
-    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
             "plugin detect-changes: no plugin matched file type for file_id='{}' version_id='{}' path='{}' content_type='{}': {}",
             write.file_id,
             write.version_id,
@@ -932,7 +927,6 @@ async fn call_apply_changes(
 
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin materialization: failed to call apply-changes export ({})",
             errors.join("; ")
@@ -954,7 +948,6 @@ async fn call_detect_changes(
 
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin detect-changes: failed to call detect-changes export ({})",
             errors.join("; ")
@@ -986,7 +979,6 @@ async fn reconstruct_before_file_data_from_state(
     })
     .map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin detect-changes: failed to encode apply fallback payload: {error}"
         ),
@@ -1041,7 +1033,7 @@ async fn load_plugin_state_changes_for_file(
 fn parse_builtin_binary_blob_ref_snapshot(
     raw_snapshot: &str,
 ) -> Result<BuiltinBinaryBlobRefSnapshot, LixError> {
-    serde_json::from_str(raw_snapshot).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    serde_json::from_str(raw_snapshot).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
             "plugin materialization: builtin binary fallback snapshot_content is invalid JSON: {error}"
         ),
     })
@@ -1056,7 +1048,7 @@ fn builtin_binary_blob_ref_from_changes(
             continue;
         }
         if change.schema_version != BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "plugin materialization: builtin binary fallback schema version mismatch for file '{}' (got '{}', expected '{}')",
                     file_id, change.schema_version, BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION
                 ),
@@ -1067,7 +1059,7 @@ fn builtin_binary_blob_ref_from_changes(
         };
         let parsed = parse_builtin_binary_blob_ref_snapshot(raw_snapshot)?;
         if parsed.id != file_id {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "plugin materialization: builtin binary fallback snapshot id '{}' does not match file_id '{}'",
                     parsed.id, file_id
                 ),
@@ -1099,7 +1091,6 @@ fn resolve_state_context_columns(
     let manifest: PluginManifest =
         serde_json::from_str(&plugin.manifest_json).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin detect-changes: invalid stored manifest_json for plugin '{}': {error}",
                 plugin.key
@@ -1217,7 +1208,6 @@ async fn load_active_state_context_rows(
         if payload.entity_id.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description:
                     "plugin detect-changes: state_context row is missing required entity_id"
                         .to_string(),
@@ -1550,7 +1540,6 @@ async fn load_installed_plugin_from_blob_ref_row(
     let Some(plugin_key) = plugin_key_from_archive_path(&archive_path) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: unsupported plugin archive path '{}'",
                 archive_path
@@ -1561,7 +1550,6 @@ async fn load_installed_plugin_from_blob_ref_row(
         .await?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
                 blob_hash, archive_path, file_id
@@ -1570,7 +1558,6 @@ async fn load_installed_plugin_from_blob_ref_row(
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: archive '{}' is empty",
                 archive_path
@@ -1588,7 +1575,6 @@ fn parse_installed_plugin_from_archive_bytes(
     let files = read_plugin_archive_files(archive_path, archive_bytes)?;
     let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin materialization: archive '{}' is missing manifest.json",
             archive_path
@@ -1596,7 +1582,6 @@ fn parse_installed_plugin_from_archive_bytes(
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin materialization: archive '{}' manifest.json must be UTF-8: {error}",
             archive_path
@@ -1604,7 +1589,7 @@ fn parse_installed_plugin_from_archive_bytes(
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
     if validated_manifest.manifest.key != plugin_key {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: archive '{}' key mismatch: path key '{}' vs manifest key '{}'",
                 archive_path, plugin_key, validated_manifest.manifest.key
             ),
@@ -1614,7 +1599,6 @@ fn parse_installed_plugin_from_archive_bytes(
     let entry_path = normalize_plugin_archive_path(&validated_manifest.manifest.entry)?;
     let wasm = files.get(&entry_path).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin materialization: archive '{}' is missing entry file '{}'",
             archive_path, validated_manifest.manifest.entry
@@ -1644,7 +1628,6 @@ fn read_plugin_archive_files(
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: archive '{}' is empty",
                 archive_path
@@ -1654,7 +1637,6 @@ fn read_plugin_archive_files(
 
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin materialization: archive '{}' is not a valid zip file: {error}",
             archive_path
@@ -1665,7 +1647,6 @@ fn read_plugin_archive_files(
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: failed to read archive '{}' entry index {}: {error}",
                 archive_path, index
@@ -1678,7 +1659,6 @@ fn read_plugin_archive_files(
         if is_plugin_archive_symlink(entry.unix_mode()) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "plugin materialization: archive '{}' entry '{}' must not be a symlink",
                     archive_path, raw_name
@@ -1689,7 +1669,6 @@ fn read_plugin_archive_files(
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: failed to read archive '{}' entry '{}': {error}",
                 archive_path, raw_name
@@ -1698,7 +1677,6 @@ fn read_plugin_archive_files(
         if files.insert(normalized_name.clone(), bytes).is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "plugin materialization: archive '{}' contains duplicate entry '{}'",
                     archive_path, normalized_name
@@ -1720,21 +1698,18 @@ fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
     if path.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "plugin archive path must not be empty".to_string(),
         });
     }
     if path.starts_with('/') || path.starts_with('\\') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("plugin archive path '{}' must be relative", path),
         });
     }
     if path.contains('\\') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin archive path '{}' must use forward slash separators",
                 path
@@ -1748,7 +1723,6 @@ fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
             Component::Normal(value) => {
                 let segment = value.to_str().ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "plugin archive path '{}' contains non-UTF-8 components",
                         path
@@ -1757,7 +1731,6 @@ fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
                 if segment.is_empty() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("plugin archive path '{}' is invalid", path),
                     });
                 }
@@ -1767,7 +1740,7 @@ fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
             | Component::ParentDir
             | Component::RootDir
             | Component::Prefix(_) => {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                         "plugin archive path '{}' must not contain traversal or absolute components",
                         path
                     ),
@@ -1779,7 +1752,6 @@ fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
     if segments.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("plugin archive path '{}' is invalid", path),
         });
     }
@@ -1790,14 +1762,12 @@ fn ensure_valid_plugin_wasm(wasm_bytes: &[u8]) -> Result<(), LixError> {
     if wasm_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "plugin materialization: wasm bytes must not be empty".to_string(),
         });
     }
     if wasm_bytes.len() < 8 || !wasm_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "plugin materialization: wasm bytes must start with a valid wasm header"
                 .to_string(),
         });
@@ -1840,7 +1810,6 @@ async fn load_binary_blob_data_by_hash(
     if manifest_size_bytes < 0 || manifest_chunk_count < 0 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: invalid negative manifest values for blob hash '{}'",
                 blob_hash
@@ -1861,14 +1830,13 @@ async fn load_binary_blob_data_by_hash(
 
     let expected_chunk_count = usize::try_from(manifest_chunk_count).map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "plugin materialization: chunk count out of range for blob hash '{}'",
             blob_hash
         ),
     })?;
     if chunk_rows.rows.len() != expected_chunk_count {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: chunk manifest mismatch for blob hash '{}': expected {} chunks, got {}",
                 blob_hash,
                 expected_chunk_count,
@@ -1883,14 +1851,14 @@ async fn load_binary_blob_data_by_hash(
         let chunk_hash = text_required(row, 1, "chunk_hash")?;
         let chunk_size = i64_required(row, 2, "chunk_size")?;
         if chunk_index != expected_index as i64 {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "plugin materialization: unexpected chunk order for blob hash '{}': expected index {}, got {}",
                     blob_hash, expected_index, chunk_index
                 ),
             });
         }
         if chunk_size < 0 {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "plugin materialization: invalid negative chunk size for blob hash '{}' chunk '{}'",
                     blob_hash, chunk_hash
                 ),
@@ -1898,7 +1866,6 @@ async fn load_binary_blob_data_by_hash(
         }
         let chunk_data = blob_required(row, 3, "data").map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: missing chunk payload for blob hash '{}' chunk '{}'",
                 blob_hash, chunk_hash
@@ -1907,7 +1874,6 @@ async fn load_binary_blob_data_by_hash(
         let codec = nullable_text(row, 4, "codec")?;
         let expected_chunk_size = usize::try_from(chunk_size).map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: chunk size out of range for blob hash '{}' chunk '{}': {}",
                 blob_hash, chunk_hash, chunk_size
@@ -1921,7 +1887,7 @@ async fn load_binary_blob_data_by_hash(
             &chunk_hash,
         )?;
         if decoded_chunk_data.len() as i64 != chunk_size {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "plugin materialization: chunk size mismatch for blob hash '{}' chunk '{}': expected {}, got {}",
                     blob_hash,
                     chunk_hash,
@@ -1934,7 +1900,7 @@ async fn load_binary_blob_data_by_hash(
     }
 
     if reconstructed.len() as i64 != manifest_size_bytes {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: reconstructed size mismatch for blob hash '{}': expected {}, got {}",
                 blob_hash,
                 manifest_size_bytes,
@@ -1961,7 +1927,7 @@ fn decode_binary_chunk_payload(
         Some(BINARY_CHUNK_CODEC_LEGACY) | None => {
             decode_legacy_binary_chunk_payload(chunk_data, expected_chunk_size, blob_hash, chunk_hash)
         }
-        Some(other) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        Some(other) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: unsupported chunk codec '{}' for blob hash '{}' chunk '{}'",
                 other, blob_hash, chunk_hash
             ),
@@ -1999,7 +1965,7 @@ fn decode_binary_chunk_zstd_payload(
     blob_hash: &str,
     chunk_hash: &str,
 ) -> Result<Vec<u8>, LixError> {
-    zstd::bulk::decompress(compressed_payload, expected_chunk_size).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    zstd::bulk::decompress(compressed_payload, expected_chunk_size).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
             "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
             blob_hash, chunk_hash
         ),
@@ -2016,7 +1982,7 @@ fn decode_binary_chunk_zstd_payload(
     use std::io::Read as _;
 
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(compressed_payload).map_err(
-        |error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        |error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
                 blob_hash, chunk_hash
             ),
@@ -2024,7 +1990,7 @@ fn decode_binary_chunk_zstd_payload(
     )?;
 
     let mut output = Vec::new();
-    decoder.read_to_end(&mut output).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+    decoder.read_to_end(&mut output).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
             "plugin materialization: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
             blob_hash, chunk_hash
         ),
@@ -2124,7 +2090,6 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
     let Some(value) = row.get(index) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: row missing column '{column}' at index {index}"
             ),
@@ -2132,7 +2097,7 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
     };
     match value {
         Value::Text(text) => Ok(text.clone()),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: expected text column '{column}' at index {index}, got {other:?}"
             ),
         }),
@@ -2143,7 +2108,6 @@ fn nullable_text(row: &[Value], index: usize, column: &str) -> Result<Option<Str
     let Some(value) = row.get(index) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: row missing column '{column}' at index {index}"
             ),
@@ -2152,7 +2116,7 @@ fn nullable_text(row: &[Value], index: usize, column: &str) -> Result<Option<Str
     match value {
         Value::Null => Ok(None),
         Value::Text(text) => Ok(Some(text.clone())),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: expected nullable text column '{column}' at index {index}, got {other:?}"
             ),
         }),
@@ -2163,7 +2127,6 @@ fn i64_required(row: &[Value], index: usize, column: &str) -> Result<i64, LixErr
     let Some(value) = row.get(index) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: row missing column '{column}' at index {index}"
             ),
@@ -2171,7 +2134,7 @@ fn i64_required(row: &[Value], index: usize, column: &str) -> Result<i64, LixErr
     };
     match value {
         Value::Integer(number) => Ok(*number),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: expected integer column '{column}' at index {index}, got {other:?}"
             ),
         }),
@@ -2182,7 +2145,6 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
     let Some(value) = row.get(index) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "plugin materialization: row missing column '{column}' at index {index}"
             ),
@@ -2191,7 +2153,7 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
     match value {
         Value::Blob(bytes) => Ok(bytes.clone()),
         Value::Text(text) => Ok(text.as_bytes().to_vec()),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "plugin materialization: expected blob column '{column}' at index {index}, got {other:?}"
             ),
         }),

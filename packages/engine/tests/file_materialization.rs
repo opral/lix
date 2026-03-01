@@ -113,7 +113,6 @@ impl WasmComponentInstance for PathEchoInstance {
                 let request: WireDetectChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("failed to decode detect-changes payload: {error}"),
                     })?;
                 let _ = (
@@ -131,7 +130,6 @@ impl WasmComponentInstance for PathEchoInstance {
                 }])
                 .map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("failed to encode detect-changes response: {error}"),
                 })
             }
@@ -139,7 +137,6 @@ impl WasmComponentInstance for PathEchoInstance {
                 let request: WireApplyChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("failed to decode apply-changes payload: {error}"),
                     })?;
                 let _ = request.changes.iter().all(|change| {
@@ -152,7 +149,6 @@ impl WasmComponentInstance for PathEchoInstance {
             }
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("unsupported test export: {other}"),
             }),
         }
@@ -178,7 +174,6 @@ impl WasmComponentInstance for BeforeAwareInstance {
                 let request: WireDetectChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("failed to decode detect-changes payload: {error}"),
                     })?;
                 let marker = match request.before {
@@ -196,7 +191,6 @@ impl WasmComponentInstance for BeforeAwareInstance {
                 }])
                 .map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("failed to encode detect-changes response: {error}"),
                 })
             }
@@ -204,7 +198,6 @@ impl WasmComponentInstance for BeforeAwareInstance {
                 let request: WireApplyChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("failed to decode apply-changes payload: {error}"),
                     })?;
                 let _ = request;
@@ -212,7 +205,6 @@ impl WasmComponentInstance for BeforeAwareInstance {
             }
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("unsupported test export: {other}"),
             }),
         }
@@ -242,14 +234,12 @@ impl WasmComponentInstance for TxtNoopInstance {
                 let request: WireApplyChangesRequest =
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("failed to decode apply-changes payload: {error}"),
                     })?;
                 Ok(request.file.data)
             }
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("unsupported test export: {other}"),
             }),
         }

@@ -283,7 +283,6 @@ fn parse_json_pointer_path(pointer: &str) -> Result<Vec<String>, LixError> {
     if !pointer.starts_with('/') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("invalid x-lix-primary-key pointer '{pointer}'"),
         });
     }
@@ -309,7 +308,6 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                 _ => {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("invalid JSON pointer segment '{segment}'"),
                     })
                 }
@@ -347,7 +345,6 @@ fn evaluate_lixcol_override(
         .map(Some)
         .map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "invalid x-lix-override-lixcols expression for '{}.{}': {}",
                 schema_key, key, err.description
@@ -368,7 +365,6 @@ fn extract_lixcol_string_override(
         JsonValue::String(text) => Ok(Some(text)),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "x-lix-override-lixcols '{}.{}' must evaluate to a string",
                 schema_key, key
@@ -392,7 +388,6 @@ fn extract_lixcol_scalar_override(
         }
         JsonValue::Array(_) | JsonValue::Object(_) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "x-lix-override-lixcols '{}.{}' must evaluate to a scalar or null",
                 schema_key, key

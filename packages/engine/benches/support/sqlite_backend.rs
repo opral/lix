@@ -25,7 +25,6 @@ impl BenchSqliteBackend {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "failed to create sqlite benchmark directory {}: {error}",
                     parent.display()
@@ -36,7 +35,6 @@ impl BenchSqliteBackend {
         if !path.exists() {
             std::fs::File::create(path).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "failed to create sqlite benchmark file {}: {error}",
                     path.display()
@@ -58,7 +56,6 @@ impl BenchSqliteBackend {
                     .await
                     .map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: error.to_string(),
                     })
             })
@@ -78,7 +75,6 @@ impl LixBackend for BenchSqliteBackend {
         if params.is_empty() && sql.contains(';') {
             pool.execute(sql).await.map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: error.to_string(),
             })?;
             return Ok(QueryResult {
@@ -94,7 +90,6 @@ impl LixBackend for BenchSqliteBackend {
 
         let rows = query.fetch_all(pool).await.map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: error.to_string(),
         })?;
         let columns = rows
@@ -125,7 +120,6 @@ impl LixBackend for BenchSqliteBackend {
         let pool = self.pool().await?;
         let mut conn = pool.acquire().await.map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: error.to_string(),
         })?;
         sqlx::query("BEGIN")
@@ -133,7 +127,6 @@ impl LixBackend for BenchSqliteBackend {
             .await
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: error.to_string(),
             })?;
         Ok(Box::new(BenchSqliteTransaction { conn }))
@@ -150,7 +143,6 @@ impl LixTransaction for BenchSqliteTransaction {
         if params.is_empty() && sql.contains(';') {
             self.conn.execute(sql).await.map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: error.to_string(),
             })?;
             return Ok(QueryResult {
@@ -169,7 +161,6 @@ impl LixTransaction for BenchSqliteTransaction {
             .await
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: error.to_string(),
             })?;
         let columns = rows
@@ -202,7 +193,6 @@ impl LixTransaction for BenchSqliteTransaction {
             .await
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: error.to_string(),
             })?;
         Ok(())
@@ -214,7 +204,6 @@ impl LixTransaction for BenchSqliteTransaction {
             .await
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: error.to_string(),
             })?;
         Ok(())
@@ -239,7 +228,6 @@ fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value
         .try_get_raw(index)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: error.to_string(),
         })?
         .is_null()

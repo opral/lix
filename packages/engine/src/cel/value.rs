@@ -6,7 +6,6 @@ use crate::LixError;
 pub fn json_to_cel(value: &JsonValue) -> Result<CelValue, LixError> {
     cel::to_value(value).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to convert JSON value to CEL value: {err}"),
     })
 }
@@ -14,7 +13,6 @@ pub fn json_to_cel(value: &JsonValue) -> Result<CelValue, LixError> {
 pub fn cel_to_json(value: &CelValue) -> Result<JsonValue, LixError> {
     value.json().map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to convert CEL value to JSON value: {err}"),
     })
 }

@@ -30,12 +30,10 @@ pub fn schema_from_stored_snapshot(
 ) -> Result<(SchemaKey, JsonValue), LixError> {
     let value = snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema snapshot_content missing value".to_string(),
     })?;
     let value = value.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema snapshot_content value must be an object".to_string(),
     })?;
 
@@ -44,7 +42,6 @@ pub fn schema_from_stored_snapshot(
         .and_then(|value| value.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema value.x-lix-key must be string".to_string(),
         })?;
     let schema_version = value
@@ -52,7 +49,6 @@ pub fn schema_from_stored_snapshot(
         .and_then(|value| value.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema value.x-lix-version must be string".to_string(),
         })?;
 

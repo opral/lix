@@ -61,7 +61,6 @@ impl<'a> RowSourceResolver<'a> {
     ) -> Result<ResolvedInsertRowSource, LixError> {
         self.resolve_insert(insert)?.ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{operation} requires VALUES rows"),
         })
     }
@@ -159,7 +158,6 @@ fn resolve_lix_json_function(
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
                 });
             }
@@ -168,7 +166,6 @@ fn resolve_lix_json_function(
         _ => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "lix_json() requires a regular argument list".to_string(),
             });
         }
@@ -176,7 +173,6 @@ fn resolve_lix_json_function(
     if args.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_json() requires exactly 1 argument".to_string(),
         });
     }
@@ -196,7 +192,6 @@ fn resolve_lix_text_encode_function(
     if !(1..=2).contains(&args.len()) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_text_encode() requires 1 or 2 arguments".to_string(),
         });
     }
@@ -212,7 +207,6 @@ fn resolve_lix_text_encode_function(
     if encoding != "UTF8" {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_text_encode() only supports UTF8 encoding, got '{encoding}'"),
         });
     }
@@ -227,7 +221,6 @@ fn resolve_lix_text_encode_function(
         })),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_text_encode() expects text input, got {other:?}"),
         }),
     }
@@ -245,7 +238,6 @@ fn resolve_lix_text_decode_function(
     if !(1..=2).contains(&args.len()) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "lix_text_decode() requires 1 or 2 arguments".to_string(),
         });
     }
@@ -261,7 +253,6 @@ fn resolve_lix_text_decode_function(
     if encoding != "UTF8" {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_text_decode() only supports UTF8 encoding, got '{encoding}'"),
         });
     }
@@ -269,7 +260,6 @@ fn resolve_lix_text_decode_function(
         Value::Blob(bytes) => {
             let text = String::from_utf8(bytes).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("lix_text_decode() input is not valid UTF8: {error}"),
             })?;
             Ok(Some(ResolvedCell {
@@ -283,7 +273,6 @@ fn resolve_lix_text_decode_function(
         })),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("lix_text_decode() expects bytes input, got {other:?}"),
         }),
     }
@@ -303,7 +292,6 @@ fn function_arg_expr<'a>(arg: &'a FunctionArg, fn_name: &str) -> Result<&'a Expr
         _ => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("{fn_name} does not support named arguments"),
             });
         }
@@ -312,7 +300,6 @@ fn function_arg_expr<'a>(arg: &'a FunctionArg, fn_name: &str) -> Result<&'a Expr
         FunctionArgExpr::Expr(expr) => Ok(expr),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{fn_name} arguments must be SQL expressions"),
         }),
     }
@@ -324,7 +311,6 @@ fn function_args<'a>(function: &'a Function, fn_name: &str) -> Result<&'a [Funct
             if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("{fn_name} does not support DISTINCT/ALL/clauses"),
                 });
             }
@@ -332,7 +318,6 @@ fn function_args<'a>(function: &'a Function, fn_name: &str) -> Result<&'a [Funct
         }
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{fn_name} requires a regular argument list"),
         }),
     }
@@ -352,14 +337,12 @@ fn resolve_codec_encoding_arg(
     let Some(value) = resolved.value else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{fn_name} encoding argument must resolve to text"),
         });
     };
     let Value::Text(encoding) = value else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("{fn_name} encoding argument must be text"),
         });
     };
@@ -376,7 +359,6 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
             } else {
                 Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!("unsupported numeric literal '{raw}'"),
                 })
             }
@@ -402,7 +384,6 @@ fn sql_literal_to_engine_value(value: &SqlValue) -> Result<Value, LixError> {
         SqlValue::Null => Ok(Value::Null),
         SqlValue::Placeholder(token) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("unexpected placeholder '{token}' while resolving row"),
         }),
     }
@@ -412,7 +393,6 @@ fn parse_hex_literal(text: &str) -> Result<Vec<u8>, LixError> {
     if !text.len().is_multiple_of(2) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "hex literal must contain an even number of digits, got {}",
                 text.len()
@@ -439,7 +419,6 @@ fn hex_nibble(byte: u8) -> Result<u8, LixError> {
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("invalid hex digit '{}'", char::from(byte)),
         }),
     }

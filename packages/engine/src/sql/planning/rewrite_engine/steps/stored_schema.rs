@@ -67,7 +67,6 @@ pub fn rewrite_insert(
         None => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "stored schema insert requires snapshot_content".to_string(),
             })
         }
@@ -76,7 +75,6 @@ pub fn rewrite_insert(
     if rows.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema insert supports a single row at a time".to_string(),
         });
     }
@@ -88,7 +86,6 @@ pub fn rewrite_insert(
     for (row_idx, row) in rows.iter().enumerate() {
         let snapshot_expr = row.get(snapshot_index).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema insert missing snapshot_content value".to_string(),
         })?;
         let literal = snapshot_literal(
@@ -109,7 +106,6 @@ pub fn rewrite_insert(
             if existing != &derived_id {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: "stored schema insert must use a single schema identity"
                         .to_string(),
                 });
@@ -121,28 +117,23 @@ pub fn rewrite_insert(
 
     let entity_id = entity_id_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema insert requires schema identity".to_string(),
     })?;
     let schema_key_value = schema_key_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema insert requires schema key".to_string(),
     })?;
     let schema_version_value = schema_version_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema insert requires schema version".to_string(),
     })?;
     let snapshot_literal_value = snapshot_literal_value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema insert requires snapshot_content".to_string(),
     })?;
     let snapshot_value: JsonValue =
         serde_json::from_str(&snapshot_literal_value).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("stored schema snapshot_content must be valid JSON: {err}"),
         })?;
 
@@ -153,7 +144,6 @@ pub fn rewrite_insert(
         {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "stored schema insert entity_id must match schema key + version"
                     .to_string(),
             });
@@ -354,7 +344,6 @@ fn ensure_literal_column(
         if !ok {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("stored schema insert requires {name} = '{value}'"),
             });
         }
@@ -386,7 +375,7 @@ fn snapshot_literal(expr: &Expr, cell: Option<&ResolvedCell>) -> Result<String, 
             value: Value::SingleQuotedString(value),
             ..
         }) => Ok(value.clone()),
-        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description:
+        _ => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description:
                 "stored schema insert requires literal snapshot_content (prepared statement support TODO)"
                     .to_string(),
         }),
@@ -396,17 +385,14 @@ fn snapshot_literal(expr: &Expr, cell: Option<&ResolvedCell>) -> Result<String, 
 fn parse_schema_identity(snapshot: &str) -> Result<(String, String), LixError> {
     let parsed: JsonValue = serde_json::from_str(snapshot).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("stored schema snapshot_content must be valid JSON: {err}"),
     })?;
     let value = parsed.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema snapshot_content must contain value".to_string(),
     })?;
     let obj = value.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema value must be an object".to_string(),
     })?;
     let schema_key = obj
@@ -414,7 +400,6 @@ fn parse_schema_identity(snapshot: &str) -> Result<(String, String), LixError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema value.x-lix-key must be string".to_string(),
         })?;
     let schema_version = obj
@@ -422,7 +407,6 @@ fn parse_schema_identity(snapshot: &str) -> Result<(String, String), LixError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema value.x-lix-version must be string".to_string(),
         })?;
 
@@ -437,7 +421,6 @@ fn ensure_monotonic_version(version: &str) -> Result<(), LixError> {
     if version.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema x-lix-version must be a monotonic integer".to_string(),
         });
     }
@@ -445,14 +428,12 @@ fn ensure_monotonic_version(version: &str) -> Result<(), LixError> {
     let Some(first) = chars.next() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "stored schema x-lix-version must be a monotonic integer".to_string(),
         });
     };
     if first == '0' || !first.is_ascii_digit() || !chars.all(|c| c.is_ascii_digit()) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description:
                 "stored schema x-lix-version must be a monotonic integer without leading zeros"
                     .to_string(),

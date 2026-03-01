@@ -130,7 +130,6 @@ pub fn rewrite_insert_with_writer_key(
     if insert.columns.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable insert requires explicit columns".to_string(),
         });
     }
@@ -187,7 +186,6 @@ pub async fn rewrite_insert_with_backend(
     if insert.columns.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable insert requires explicit columns".to_string(),
         });
     }
@@ -241,7 +239,6 @@ fn validate_and_strip_insert_on_conflict(
     let OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable insert only supports ON CONFLICT ... DO UPDATE".to_string(),
         });
     };
@@ -251,7 +248,6 @@ fn validate_and_strip_insert_on_conflict(
         Some(_) => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable insert ON CONFLICT only supports explicit column targets"
                     .to_string(),
             })
@@ -259,7 +255,6 @@ fn validate_and_strip_insert_on_conflict(
         None => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable insert ON CONFLICT requires explicit conflict columns"
                     .to_string(),
             })
@@ -271,7 +266,6 @@ fn validate_and_strip_insert_on_conflict(
             if update.selection.is_some() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: "vtable insert ON CONFLICT DO UPDATE does not support WHERE"
                         .to_string(),
                 });
@@ -280,7 +274,6 @@ fn validate_and_strip_insert_on_conflict(
         }
         OnConflictAction::DoNothing => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable insert ON CONFLICT DO NOTHING is not supported".to_string(),
         }),
     }
@@ -301,7 +294,6 @@ pub fn rewrite_update(
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update cannot change schema_key".to_string(),
         });
     }
@@ -309,7 +301,6 @@ pub fn rewrite_update(
 
     let selection = update.selection.as_ref().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "vtable update requires a WHERE clause".to_string(),
     })?;
 
@@ -318,7 +309,6 @@ pub fn rewrite_update(
     if has_untracked_true && has_untracked_false {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update cannot mix untracked predicates".to_string(),
         });
     }
@@ -327,7 +317,6 @@ pub fn rewrite_update(
         if !can_strip_untracked_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable update could not strip untracked predicate".to_string(),
             });
         }
@@ -347,7 +336,6 @@ pub fn rewrite_update(
     if update.from.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update does not support FROM".to_string(),
         });
     }
@@ -355,7 +343,6 @@ pub fn rewrite_update(
     if update.returning.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update does not support custom RETURNING".to_string(),
         });
     }
@@ -364,7 +351,6 @@ pub fn rewrite_update(
         if !can_strip_untracked_false_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable update could not strip untracked predicate".to_string(),
             });
         }
@@ -375,7 +361,6 @@ pub fn rewrite_update(
 
     let stripped_selection = stripped_selection.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "vtable update requires a WHERE clause after stripping untracked".to_string(),
     })?;
 
@@ -428,7 +413,6 @@ pub fn rewrite_delete_with_options(
 
     let selection = delete.selection.as_ref().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "vtable delete requires a WHERE clause".to_string(),
     })?;
 
@@ -437,7 +421,6 @@ pub fn rewrite_delete_with_options(
     if has_untracked_true && has_untracked_false {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable delete cannot mix untracked predicates".to_string(),
         });
     }
@@ -446,7 +429,6 @@ pub fn rewrite_delete_with_options(
         if !can_strip_untracked_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable delete could not strip untracked predicate".to_string(),
             });
         }
@@ -461,21 +443,18 @@ pub fn rewrite_delete_with_options(
     if delete.using.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable delete does not support USING".to_string(),
         });
     }
     if delete.returning.is_some() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable delete does not support custom RETURNING".to_string(),
         });
     }
     if delete.limit.is_some() || !delete.order_by.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable delete does not support LIMIT or ORDER BY".to_string(),
         });
     }
@@ -484,7 +463,6 @@ pub fn rewrite_delete_with_options(
         if !can_strip_untracked_false_predicate(selection, params) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable delete could not strip untracked predicate".to_string(),
             });
         }
@@ -495,7 +473,6 @@ pub fn rewrite_delete_with_options(
 
     let stripped_selection = stripped_selection.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "vtable delete requires a WHERE clause after stripping untracked".to_string(),
     })?;
 
@@ -711,7 +688,6 @@ fn split_insert_rows(
             None => false,
             Some(cell) => parse_untracked_bool_like_value(cell).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable insert requires literal or parameter untracked values"
                     .to_string(),
             })?,
@@ -757,7 +733,6 @@ fn rewrite_tracked_rows(
     for (row, materialized) in rows {
         let schema_key_expr = row.get(schema_idx).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable insert missing schema_key".to_string(),
         })?;
         let schema_key = resolved_string_required(
@@ -1247,7 +1222,6 @@ fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), 
         let Some(column) = assignment_target_column_name(&assignment.target) else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description:
                     "strict rewrite violation: vtable update assignment must target a named column"
                         .to_string(),
@@ -1262,7 +1236,6 @@ fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), 
         if column.eq_ignore_ascii_case("updated_at") || column.eq_ignore_ascii_case("change_id") {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "vtable update cannot set {}; it is managed by rewrite",
                     column
@@ -1272,7 +1245,6 @@ fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), 
         if column.eq_ignore_ascii_case("untracked") {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description:
                     "vtable update cannot set untracked; use an untracked predicate instead"
                         .to_string(),
@@ -1281,12 +1253,11 @@ fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), 
         if column.eq_ignore_ascii_case("inherited_from_version_id") {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "vtable update cannot set inherited_from_version_id; it is computed"
                     .to_string(),
             });
         }
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "strict rewrite violation: vtable update assignment references unknown column '{}'; allowed columns: {}",
                 column,
                 ALLOWED_MUTABLE_COLUMNS.join(", ")
@@ -1330,7 +1301,6 @@ fn extract_explicit_writer_key_assignment(
             None => Ok(None),
             Some(other) => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("writer_key assignment expects text or null, got {other:?}"),
             }),
         };
@@ -1462,7 +1432,6 @@ fn value_to_expr(value: &EngineValue) -> Result<Expr, LixError> {
         EngineValue::Real(value) => Ok(Expr::Value(Value::Number(value.to_string(), false).into())),
         EngineValue::Blob(_) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update does not support blob snapshot_content".to_string(),
         }),
     }
@@ -1521,7 +1490,6 @@ fn make_insert_statement(
 fn required_column_index(columns: &[Ident], name: &str) -> Result<usize, LixError> {
     find_column_index(columns, name).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("vtable insert requires {name}"),
     })
 }
@@ -1545,7 +1513,6 @@ fn resolved_string_required(
 fn literal_string_required(expr: Option<&Expr>, name: &str) -> Result<String, LixError> {
     let expr = expr.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("vtable insert missing {name}"),
     })?;
     match expr {
@@ -1555,7 +1522,6 @@ fn literal_string_required(expr: Option<&Expr>, name: &str) -> Result<String, Li
         }) => Ok(value.clone()),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("vtable insert requires literal {name}"),
         }),
     }
@@ -1564,7 +1530,6 @@ fn literal_string_required(expr: Option<&Expr>, name: &str) -> Result<String, Li
 fn literal_snapshot_json(expr: Option<&Expr>) -> Result<Option<JsonValue>, LixError> {
     let expr = expr.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "vtable insert missing snapshot_content".to_string(),
     })?;
     match expr {
@@ -1578,12 +1543,10 @@ fn literal_snapshot_json(expr: Option<&Expr>) -> Result<Option<JsonValue>, LixEr
             .map(Some)
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("vtable insert snapshot_content invalid JSON: {err}"),
             }),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable insert requires literal snapshot_content".to_string(),
         }),
     }
@@ -1601,7 +1564,6 @@ fn resolved_snapshot_json(
                     .map(Some)
                     .map_err(|err| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("vtable insert snapshot_content invalid JSON: {err}"),
                     })
             }
@@ -1631,12 +1593,10 @@ fn literal_optional_json(
             .map(Some)
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("vtable insert {field_name} invalid JSON: {err}"),
             }),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("vtable insert requires literal {field_name}"),
         }),
     }
@@ -1655,7 +1615,6 @@ fn resolved_optional_json(
                     .map(Some)
                     .map_err(|err| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("vtable insert {field_name} invalid JSON: {err}"),
                     })
             }
@@ -1693,7 +1652,6 @@ fn resolved_optional_string(
         }) => Ok(Some(value.clone())),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("vtable insert requires literal {field_name}"),
         }),
     }
@@ -1946,7 +1904,6 @@ fn build_update_validation_plan(
     let where_clause = update.selection.clone();
     let table = table_name.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "update validation requires target table".to_string(),
     })?;
 
@@ -1985,12 +1942,10 @@ fn resolved_snapshot_json_value(value: Option<EngineValue>) -> Result<Option<Jso
             .map(Some)
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("vtable update snapshot_content invalid JSON: {err}"),
             }),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update requires literal snapshot_content".to_string(),
         }),
     }
@@ -2114,13 +2069,11 @@ fn parse_postgres_patch_value(value: &Expr) -> Result<JsonValue, LixError> {
     let value = unwrap_cast_expr(value);
     let raw = single_quoted_literal(value).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "vtable update requires JSONB patch values to be single-quoted JSON literals"
             .to_string(),
     })?;
     serde_json::from_str(raw).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("vtable update JSONB patch value is not valid JSON: {err}"),
     })
 }
@@ -2143,7 +2096,6 @@ fn parse_json_function_value(expr: &Expr) -> Result<Option<JsonValue>, LixError>
     };
     serde_json::from_str(raw).map(Some).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("vtable update json(...) patch value is not valid JSON: {err}"),
     })
 }
@@ -2152,7 +2104,6 @@ fn parse_json_literal_value(expr: &Expr) -> Result<JsonValue, LixError> {
     let Expr::Value(ValueWithSpan { value, .. }) = expr else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update patch requires literal property values".to_string(),
         });
     };
@@ -2168,13 +2119,11 @@ fn parse_json_literal_value(expr: &Expr) -> Result<JsonValue, LixError> {
                     .map(JsonValue::Number)
                     .ok_or_else(|| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: "vtable update patch contains non-finite number".to_string(),
                     })
             } else {
                 Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "vtable update patch contains invalid numeric literal '{value}'"
                     ),
@@ -2200,7 +2149,6 @@ fn parse_json_literal_value(expr: &Expr) -> Result<JsonValue, LixError> {
         Value::DollarQuotedString(value) => Ok(JsonValue::String(value.value.clone())),
         Value::Placeholder(token) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("vtable update patch contains unresolved placeholder '{token}'"),
         }),
     }
@@ -2288,7 +2236,6 @@ fn extract_single_schema_key(expr: &Expr, params: &[EngineValue]) -> Result<Stri
     if keys.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "vtable update requires a single schema_key".to_string(),
         });
     }

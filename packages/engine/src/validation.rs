@@ -112,7 +112,6 @@ pub async fn validate_updates(
             if schema.get("x-lix-immutable").and_then(|v| v.as_bool()) == Some(true) {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "Schema '{}' is immutable and cannot be updated.",
                         schema_key
@@ -163,7 +162,6 @@ async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
     if let Some(details) = details {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "snapshot_content does not match schema '{}' ({}): {details}",
                 key.schema_key, key.schema_version
@@ -177,7 +175,6 @@ async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
 fn extract_stored_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, LixError> {
     snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema snapshot_content missing value".to_string(),
     })
 }
@@ -198,7 +195,6 @@ async fn validate_stored_schema_insert<P: SchemaProvider + ?Sized>(
 ) -> Result<(), LixError> {
     let snapshot = row.snapshot_content.as_ref().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "stored schema insert requires snapshot_content".to_string(),
     })?;
     validate_stored_schema_snapshot(provider, snapshot).await?;
@@ -220,7 +216,6 @@ async fn validate_foreign_key_reference_targets<P: SchemaProvider + ?Sized>(
             .and_then(|v| v.as_object())
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "foreign key at index {index} missing references object in schema definition"
                 ),
@@ -230,7 +225,6 @@ async fn validate_foreign_key_reference_targets<P: SchemaProvider + ?Sized>(
             .and_then(|v| v.as_str())
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "foreign key at index {index} references.schemaKey must be a string"
                 ),
@@ -240,7 +234,6 @@ async fn validate_foreign_key_reference_targets<P: SchemaProvider + ?Sized>(
             .and_then(|v| v.as_array())
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "foreign key at index {index} references.properties must be an array"
                 ),
@@ -258,7 +251,7 @@ async fn validate_foreign_key_reference_targets<P: SchemaProvider + ?Sized>(
             .iter()
             .any(|group| group == &referenced_properties)
         {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "foreign key at index {index} references properties that are not a primary key or unique key on schema '{}'",
                     referenced_key
                 ),
@@ -317,7 +310,6 @@ async fn load_compiled_schema<P: SchemaProvider + ?Sized>(
     let schema = provider.load_schema(key).await?;
     let compiled = JSONSchema::compile(&schema).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "failed to compile schema '{}' ({}): {err}",
             key.schema_key, key.schema_version
@@ -339,7 +331,6 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
         Value::Text(text) => Ok(text.clone()),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("expected text value for {name}"),
         }),
     }
@@ -367,12 +358,12 @@ fn parse_row_snapshot_content(
 ) -> Result<JsonValue, LixError> {
     match value {
         None | Some(Value::Null) => Ok(JsonValue::Object(JsonMap::new())),
-        Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text).map_err(|err| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "snapshot_content for schema '{}' is not valid JSON during update validation: {err}",
                 schema_key
             ),
         }),
-        Some(other) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        Some(other) => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "snapshot_content for schema '{}' must be text or null during update validation, got {other:?}",
                 schema_key
             ),
@@ -387,7 +378,6 @@ fn apply_snapshot_patch(
 ) -> Result<(), LixError> {
     let object = snapshot.as_object_mut().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "snapshot_content for schema '{}' must be a JSON object for property update validation",
             schema_key
@@ -420,7 +410,6 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
     for pointer_value in primary_key {
         let pointer = pointer_value.as_str().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "schema '{}' ({}) has non-string x-lix-primary-key entry",
                 key.schema_key, key.schema_version
@@ -430,7 +419,6 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
         if pointer_path.is_empty() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "schema '{}' ({}) has invalid empty x-lix-primary-key pointer",
                     key.schema_key, key.schema_version
@@ -438,7 +426,7 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
             });
         }
 
-        let value = json_pointer_get(snapshot, &pointer_path).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        let value = json_pointer_get(snapshot, &pointer_path).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "entity_id '{}' is inconsistent for schema '{}' ({}): missing primary-key field at pointer '{}'",
                 entity_id, key.schema_key, key.schema_version, pointer
             ),
@@ -455,7 +443,6 @@ async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
     if expected != entity_id {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "entity_id '{}' is inconsistent for schema '{}' ({}): expected '{}'",
                 entity_id, key.schema_key, key.schema_version, expected
@@ -473,7 +460,6 @@ fn entity_id_component_from_json_value(
     match value {
         JsonValue::Null => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "cannot derive entity_id from null primary-key value at pointer '{}'",
                 pointer
@@ -493,7 +479,6 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
     if !pointer.starts_with('/') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("invalid JSON pointer '{pointer}'"),
         });
     }
@@ -514,7 +499,6 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                 _ => {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: format!("invalid JSON pointer segment '{segment}'"),
                     })
                 }

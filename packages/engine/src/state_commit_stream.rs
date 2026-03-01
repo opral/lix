@@ -525,7 +525,6 @@ pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
 fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
     let value = row.get(index).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "postprocess state commit stream rows expected {column} column at index {index}"
         ),
@@ -534,7 +533,6 @@ fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixErro
         Value::Text(text) => Ok(text.clone()),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "postprocess state commit stream expected text {column}, got {other:?}"
             ),
@@ -545,7 +543,6 @@ fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixErro
 fn row_snapshot_content(row: &[Value], index: usize) -> Result<Option<JsonValue>, LixError> {
     let value = row.get(index).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "postprocess state commit stream rows expected snapshot_content column at index {index}"
         ),
@@ -555,7 +552,6 @@ fn row_snapshot_content(row: &[Value], index: usize) -> Result<Option<JsonValue>
         Value::Text(text) => {
             let parsed = serde_json::from_str(text).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "postprocess state commit stream expected JSON snapshot_content text: {error}"
                 ),
@@ -564,7 +560,6 @@ fn row_snapshot_content(row: &[Value], index: usize) -> Result<Option<JsonValue>
         }
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "postprocess state commit stream expected null/text snapshot_content, got {other:?}"
             ),

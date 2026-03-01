@@ -31,13 +31,11 @@ pub(crate) fn default_alias(name: &str) -> TableAlias {
 pub(crate) fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: error.to_string(),
     })?;
     if statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "expected a single SELECT statement".to_string(),
         });
     }
@@ -46,7 +44,6 @@ pub(crate) fn parse_single_query(sql: &str) -> Result<Query, LixError> {
         Statement::Query(query) => Ok(*query),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "expected SELECT statement".to_string(),
         }),
     }

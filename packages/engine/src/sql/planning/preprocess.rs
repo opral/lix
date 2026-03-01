@@ -71,7 +71,6 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
     if postprocess.is_some() && rewritten.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
         });
     }
@@ -139,7 +138,6 @@ where
     if postprocess.is_some() && rewritten.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
         });
     }
@@ -288,7 +286,6 @@ fn accumulate_rewrite_output<P: LixFunctionProvider>(
         if postprocess.is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "only one postprocess rewrite is supported per query".to_string(),
             });
         }

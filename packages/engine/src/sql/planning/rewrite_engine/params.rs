@@ -144,13 +144,12 @@ pub(crate) fn resolve_placeholder_index(
     } else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("unsupported SQL placeholder format '{trimmed}'"),
         });
     };
 
     if source_index >= params_len {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), title: "Unknown error".to_string(), description: format!(
+        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "placeholder '{trimmed}' references parameter {} but only {} parameters were provided",
                 source_index + 1,
                 params_len
@@ -185,13 +184,11 @@ fn placeholder_for_dialect(dialect: SqlDialect, dense_index_1_based: usize) -> S
 fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     let parsed = numeric.parse::<usize>().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("invalid SQL placeholder '{token}'"),
     })?;
     if parsed == 0 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("invalid SQL placeholder '{token}'"),
         });
     }
@@ -201,7 +198,6 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
 fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: error.to_string(),
     })
 }

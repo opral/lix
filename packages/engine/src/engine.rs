@@ -132,7 +132,6 @@ impl<'a> EngineTransaction<'a> {
         let previous_active_version_id = self.active_version_id.clone();
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
         let result = self
@@ -160,7 +159,6 @@ impl<'a> EngineTransaction<'a> {
     pub async fn commit(mut self) -> Result<(), LixError> {
         let transaction = self.transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
         transaction.commit().await?;
@@ -180,7 +178,6 @@ impl<'a> EngineTransaction<'a> {
     pub async fn rollback(mut self) -> Result<(), LixError> {
         let transaction = self.transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
         transaction.rollback().await
@@ -261,7 +258,6 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         let mut guard = self.transaction.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
         })?;
         // SAFETY: the pointer is created from a live `&mut dyn LixTransaction` and
@@ -272,7 +268,6 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
     async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "nested transactions are not supported".to_string(),
         })
     }
@@ -414,14 +409,12 @@ fn collect_postprocess_file_cache_targets(
         let Some(file_id) = row.get(1) else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "postprocess file cache refresh expected file_id column".to_string(),
             });
         };
         let Some(version_id) = row.get(2) else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "postprocess file cache refresh expected version_id column"
                     .to_string(),
             });
@@ -429,7 +422,6 @@ fn collect_postprocess_file_cache_targets(
         let Value::Text(file_id) = file_id else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "postprocess file cache refresh expected text file_id, got {file_id:?}"
                 ),
@@ -438,7 +430,6 @@ fn collect_postprocess_file_cache_targets(
         let Value::Text(version_id) = version_id else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "postprocess file cache refresh expected text version_id, got {version_id:?}"
                 ),
@@ -548,7 +539,6 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "builtin schema must define string x-lix-key".to_string(),
         })?;
     let schema_version = schema
@@ -556,7 +546,6 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "builtin schema must define string x-lix-version".to_string(),
         })?;
 
@@ -677,7 +666,6 @@ mod tests {
             if sql.to_ascii_lowercase().contains("unknown_table") {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: "no such table: unknown_table".to_string(),
                 });
             }

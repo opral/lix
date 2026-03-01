@@ -40,7 +40,6 @@ where
     if args.versions.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "generate_commit: versions map is required".to_string(),
         });
     }
@@ -50,7 +49,6 @@ where
         if info.snapshot.id != *version_id {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "generate_commit: versions['{version_id}'].snapshot.id must equal version id"
                 ),
@@ -64,7 +62,6 @@ where
         if !seen_ids.insert(change.id.clone()) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("generate_commit: duplicate change id '{}'", change.id),
             });
         }
@@ -94,7 +91,6 @@ where
     for version_id in versions_to_commit {
         let version_info = args.versions.get(&version_id).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: missing version context for '{}'",
                 version_id
@@ -120,7 +116,6 @@ where
     for (version_id, meta) in &meta_by_version {
         let version_info = args.versions.get(version_id).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: missing version context for '{}'",
                 version_id
@@ -198,7 +193,6 @@ where
     for (version_id, domain_changes) in &domain_by_version {
         let meta = meta_by_version.get(version_id).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("generate_commit: missing version meta for '{}'", version_id),
         })?;
         let cse_commit_id = global_commit_id
@@ -251,7 +245,6 @@ where
     for (version_id, domain_changes) in &domain_by_version {
         let meta = meta_by_version.get(version_id).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("generate_commit: missing version meta for '{}'", version_id),
         })?;
         let commit_change_id =
@@ -259,7 +252,6 @@ where
                 .get(version_id)
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "generate_commit: missing commit change id for version '{}'",
                         version_id
@@ -299,7 +291,6 @@ where
                 .get(version_id)
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "generate_commit: missing commit row index for version '{}'",
                         version_id
@@ -309,7 +300,6 @@ where
             .get_mut(commit_row_idx)
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "generate_commit: missing commit row for version '{}'",
                     version_id
@@ -321,7 +311,6 @@ where
             .as_ref()
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "generate_commit: commit row for version '{}' is missing snapshot_content",
                     version_id
@@ -330,7 +319,6 @@ where
         let mut snapshot: serde_json::Value =
             serde_json::from_str(raw_snapshot).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "generate_commit: commit snapshot for version '{}' is invalid JSON: {}",
                     version_id, error
@@ -380,7 +368,6 @@ where
                 .get(version_id)
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: format!(
                         "generate_commit: missing commit row index for version '{}'",
                         version_id
@@ -388,7 +375,6 @@ where
                 })?;
         let commit_row = meta_changes.get(commit_row_idx).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: missing commit row for version '{}'",
                 version_id
@@ -399,7 +385,6 @@ where
             .as_ref()
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "generate_commit: commit row for version '{}' is missing snapshot_content",
                     version_id
@@ -440,7 +425,6 @@ where
             .cloned()
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "generate_commit: missing finalized commit snapshot for version '{}'",
                     version_id
@@ -463,7 +447,6 @@ where
 
         let version_info = args.versions.get(version_id).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: missing version context for '{}'",
                 version_id
@@ -550,7 +533,6 @@ fn sanitize_domain_change(change: &DomainChangeInput) -> ChangeRow {
 fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> {
     let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("generate_commit: builtin schema '{}' not found", schema_key),
     })?;
     let schema_version = schema
@@ -558,7 +540,6 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: builtin schema '{}' is missing string x-lix-version",
                 schema_key
@@ -570,7 +551,6 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: builtin schema '{}' is missing x-lix-override-lixcols",
                 schema_key
@@ -581,7 +561,6 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: builtin schema '{}' is missing string lixcol_file_id",
                 schema_key
@@ -592,7 +571,6 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!(
                 "generate_commit: builtin schema '{}' is missing string lixcol_plugin_key",
                 schema_key

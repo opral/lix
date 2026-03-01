@@ -56,7 +56,6 @@ pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     let dialect = GenericDialect {};
     Parser::parse_sql(&dialect, sql).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: err.to_string(),
     })
 }
@@ -105,7 +104,6 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
             if postprocess.is_some() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    title: "Unknown error".to_string(),
                     description: "only one postprocess rewrite is supported per query".to_string(),
                 });
             }
@@ -126,7 +124,6 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     if postprocess.is_some() && rewritten.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
         });
     }
@@ -391,14 +388,12 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
     let incoming_rows = plain_values_rows(incoming)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "transaction insert coalescing expected VALUES rows".to_string(),
         })?
         .to_vec();
 
     let target_rows = plain_values_rows_mut(target).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: "transaction insert coalescing expected mutable VALUES rows".to_string(),
     })?;
     target_rows.extend(incoming_rows);

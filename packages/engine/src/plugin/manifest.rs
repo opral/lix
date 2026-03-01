@@ -13,7 +13,6 @@ static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceL
 pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
     let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("Plugin manifest must be valid JSON: {error}"),
     })?;
 
@@ -22,14 +21,12 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
     let manifest: PluginManifest =
         serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("Plugin manifest does not match expected shape: {error}"),
         })?;
     validate_path_glob(&manifest.file_match.path_glob)?;
 
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("Failed to normalize plugin manifest JSON: {error}"),
     })?;
 
@@ -42,7 +39,6 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
 fn validate_path_glob(glob: &str) -> Result<(), LixError> {
     Glob::new(glob).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
     })?;
     Ok(())
@@ -54,7 +50,6 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
         let details = format_validation_errors(errors);
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("Invalid plugin manifest: {details}"),
         });
     }
@@ -68,7 +63,6 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
             .compile(plugin_manifest_schema())
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!("Failed to compile plugin manifest schema: {error}"),
             })
     });
@@ -77,7 +71,6 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
         Ok(schema) => Ok(schema),
         Err(error) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: error.description.clone(),
         }),
     }

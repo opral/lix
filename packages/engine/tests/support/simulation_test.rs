@@ -197,13 +197,11 @@ pub fn build_test_plugin_archive(
     let mut manifest_value: serde_json::Value =
         serde_json::from_str(manifest_json).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("test plugin manifest must be valid JSON: {error}"),
         })?;
     {
         let manifest_object = manifest_value.as_object_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "test plugin manifest must be a JSON object".to_string(),
         })?;
 
@@ -225,7 +223,6 @@ pub fn build_test_plugin_archive(
 
     let normalized_manifest = serde_json::to_vec(&manifest_value).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to normalize test plugin manifest JSON: {error}"),
     })?;
     let schemas = manifest_value
@@ -233,14 +230,12 @@ pub fn build_test_plugin_archive(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "test plugin manifest schemas must be an array".to_string(),
         })?
         .iter()
         .map(|value| {
             value.as_str().map(str::to_string).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: "test plugin manifest schemas must contain string paths".to_string(),
             })
         })
@@ -252,14 +247,12 @@ pub fn build_test_plugin_archive(
         .start_file("manifest.json", options)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("failed to start manifest.json in test plugin archive: {error}"),
         })?;
     writer
         .write_all(&normalized_manifest)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("failed to write manifest.json in test plugin archive: {error}"),
         })?;
 
@@ -267,12 +260,10 @@ pub fn build_test_plugin_archive(
         .start_file("plugin.wasm", options)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("failed to start plugin.wasm in test plugin archive: {error}"),
         })?;
     writer.write_all(wasm_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!("failed to write plugin.wasm in test plugin archive: {error}"),
     })?;
 
@@ -281,7 +272,6 @@ pub fn build_test_plugin_archive(
             .start_file(schema_path, options)
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "failed to start schema '{schema_path}' in test plugin archive: {error}"
                 ),
@@ -290,7 +280,6 @@ pub fn build_test_plugin_archive(
             .write_all(DEFAULT_TEST_SCHEMA_JSON.as_bytes())
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                title: "Unknown error".to_string(),
                 description: format!(
                     "failed to write schema '{schema_path}' in test plugin archive: {error}"
                 ),
@@ -302,7 +291,6 @@ pub fn build_test_plugin_archive(
         .map(|cursor| cursor.into_inner())
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: format!("failed to finish test plugin archive: {error}"),
         })
 }

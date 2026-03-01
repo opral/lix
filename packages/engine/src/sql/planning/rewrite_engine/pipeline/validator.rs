@@ -50,35 +50,30 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
     if output.statements.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "statement rewrite produced no statements".to_string(),
         });
     }
     if output.postprocess.is_some() && output.statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
         });
     }
     if output.postprocess.is_some() && !output.mutations.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "postprocess rewrites cannot emit mutation rows".to_string(),
         });
     }
     if !output.update_validations.is_empty() && output.statements.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "update validation rewrites require a single statement".to_string(),
         });
     }
     if !output.mutations.is_empty() && !output.update_validations.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "mutation rewrites cannot emit update validations".to_string(),
         });
     }
@@ -87,7 +82,6 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            title: "Unknown error".to_string(),
             description: "update validations require an UPDATE statement output".to_string(),
         });
     }
@@ -97,7 +91,6 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
                 if !matches!(output.statements[0], sqlparser::ast::Statement::Update(_)) {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description: "vtable update postprocess requires an UPDATE statement"
                             .to_string(),
                     });
@@ -110,7 +103,6 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
                 ) {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        title: "Unknown error".to_string(),
                         description:
                             "vtable delete postprocess requires an UPDATE or DELETE statement"
                                 .to_string(),
@@ -155,7 +147,6 @@ pub(crate) fn validate_no_unresolved_logical_read_views_except(
 
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        title: "Unknown error".to_string(),
         description: format!(
             "read rewrite left unresolved logical views: {}",
             unresolved.into_iter().collect::<Vec<_>>().join(", ")
