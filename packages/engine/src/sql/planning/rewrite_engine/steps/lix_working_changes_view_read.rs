@@ -93,6 +93,10 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                     lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
                     lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
                     lix_json_extract(snapshot_content, 'file_id') AS file_id, \
+                    COALESCE( \
+                        lix_json_extract(snapshot_content, 'metadata', 'lix_internal_source_change_id'), \
+                        entity_id \
+                    ) AS effective_change_id, \
                     lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_change' \
@@ -113,80 +117,10 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                   AND version_id = 'global' \
                   AND snapshot_content IS NOT NULL \
             ), \
-            commit_edge_rows AS ( \
-                SELECT \
-                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_extract(snapshot_content, 'child_id') AS child_id \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = 'lix_commit_edge' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND snapshot_content IS NOT NULL \
- \
-                UNION \
- \
-                SELECT \
-                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_extract(snapshot_content, 'child_id') AS child_id \
-                FROM lix_internal_state_materialized_v1_lix_commit_edge \
-                WHERE schema_key = 'lix_commit_edge' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND snapshot_content IS NOT NULL \
-            ), \
-            label_rows AS ( \
-                SELECT \
-                    entity_id AS id, \
-                    lix_json_extract(snapshot_content, 'name') AS name \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = 'lix_label' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND snapshot_content IS NOT NULL \
- \
-                UNION \
- \
-                SELECT \
-                    entity_id AS id, \
-                    lix_json_extract(snapshot_content, 'name') AS name \
-                FROM lix_internal_state_materialized_v1_lix_label \
-                WHERE schema_key = 'lix_label' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND snapshot_content IS NOT NULL \
-            ), \
-            entity_label_rows AS ( \
-                SELECT \
-                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_extract(snapshot_content, 'label_id') AS label_id \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = 'lix_entity_label' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND snapshot_content IS NOT NULL \
- \
-                UNION \
- \
-                SELECT \
-                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_extract(snapshot_content, 'label_id') AS label_id \
-                FROM lix_internal_state_materialized_v1_lix_entity_label \
-                WHERE schema_key = 'lix_entity_label' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND snapshot_content IS NOT NULL \
-            ), \
-            checkpoint_change_rows AS ( \
+            baseline_change_rows AS ( \
                 SELECT \
                     entity_id AS change_id, \
-                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_change' \
                   AND file_id = 'lix' \
@@ -198,9 +132,7 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
  \
                 SELECT \
                     entity_id AS change_id, \
-                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
+                    lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
                 FROM lix_internal_state_materialized_v1_lix_change \
                 WHERE schema_key = 'lix_change' \
                   AND file_id = 'lix' \
@@ -238,20 +170,9 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                   AND snapshot_content IS NOT NULL \
             ), \
             cc AS ( \
-                SELECT COALESCE( \
-                    ( \
-                        SELECT ce.parent_id \
-                        FROM commit_edge_rows ce \
-                        INNER JOIN entity_label_rows el \
-                            ON el.entity_id = ce.parent_id \
-                           AND el.schema_key = 'lix_commit' \
-                        INNER JOIN label_rows l ON l.id = el.label_id \
-                        WHERE ce.child_id = (SELECT id FROM wc) \
-                          AND l.name = 'checkpoint' \
-                        LIMIT 1 \
-                    ), \
-                    (SELECT id FROM wc) \
-                ) AS id \
+                SELECT lix_json_extract(snapshot_content, 'commit_id') AS id \
+                FROM version_pointer \
+                LIMIT 1 \
             ), \
             wcs AS ( \
                 SELECT c.change_set_id \
@@ -269,16 +190,38 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                     ch.entity_id AS entity_id, \
                     ch.schema_key AS schema_key, \
                     ch.file_id AS file_id, \
-                    bcse.change_id AS before_change_id, \
-                    ch.change_id AS after_change_id, \
-                    (SELECT id FROM cc) AS before_commit_id, \
-                    (SELECT id FROM wc) AS after_commit_id, \
                     CASE \
-                        WHEN bcse.change_id IS NOT NULL AND ch.row_snapshot IS NULL THEN 'removed' \
-                        WHEN bcse.change_id IS NULL AND ch.row_snapshot IS NOT NULL THEN 'added' \
+                        WHEN (bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
+                             AND ch.row_snapshot IS NOT NULL THEN NULL \
+                        ELSE bcse.change_id \
+                    END AS before_change_id, \
+                    CASE \
                         WHEN bcse.change_id IS NOT NULL \
+                             AND bch.row_snapshot IS NOT NULL \
+                             AND ch.row_snapshot IS NULL THEN NULL \
+                        ELSE ch.effective_change_id \
+                    END AS after_change_id, \
+                    CASE \
+                        WHEN (bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
+                             AND ch.row_snapshot IS NOT NULL THEN NULL \
+                        ELSE (SELECT id FROM cc) \
+                    END AS before_commit_id, \
+                    CASE \
+                        WHEN bcse.change_id IS NOT NULL \
+                             AND bch.row_snapshot IS NOT NULL \
+                             AND ch.row_snapshot IS NULL THEN NULL \
+                        ELSE (SELECT id FROM wc) \
+                    END AS after_commit_id, \
+                    CASE \
+                        WHEN bcse.change_id IS NOT NULL \
+                             AND bch.row_snapshot IS NOT NULL \
+                             AND ch.row_snapshot IS NULL THEN 'removed' \
+                        WHEN (bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
+                             AND ch.row_snapshot IS NOT NULL THEN 'added' \
+                        WHEN bcse.change_id IS NOT NULL \
+                             AND bch.row_snapshot IS NOT NULL \
                              AND ch.row_snapshot IS NOT NULL \
-                             AND bcse.change_id != ch.change_id THEN 'modified' \
+                             AND bcse.change_id != ch.effective_change_id THEN 'modified' \
                     END AS status \
                 FROM working_change_rows ch \
                 INNER JOIN working_change_set_element_rows cse ON cse.change_id = ch.change_id \
@@ -287,14 +230,19 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                    AND bcse.schema_key = ch.schema_key \
                    AND bcse.file_id = ch.file_id \
                    AND bcse.change_set_id = (SELECT change_set_id FROM ccs) \
+                LEFT JOIN baseline_change_rows bch ON bch.change_id = bcse.change_id \
                 WHERE cse.change_set_id = (SELECT change_set_id FROM wcs) \
                   AND ( \
-                    (bcse.change_id IS NOT NULL AND ch.row_snapshot IS NULL) \
-                    OR (bcse.change_id IS NULL AND ch.row_snapshot IS NOT NULL) \
+                    (bcse.change_id IS NOT NULL \
+                        AND bch.row_snapshot IS NOT NULL \
+                        AND ch.row_snapshot IS NULL) \
+                    OR ((bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
+                        AND ch.row_snapshot IS NOT NULL) \
                     OR ( \
                         bcse.change_id IS NOT NULL \
+                        AND bch.row_snapshot IS NOT NULL \
                         AND ch.row_snapshot IS NOT NULL \
-                        AND bcse.change_id != ch.change_id \
+                        AND bcse.change_id != ch.effective_change_id \
                     ) \
                   ) \
             ) AS working_changes";
@@ -328,6 +276,10 @@ mod tests {
         assert!(!sql.contains("FROM lix_working_changes"));
         assert!(sql.contains("FROM lix_internal_state_untracked"));
         assert!(sql.contains("working_change_set_element_rows"));
+        assert!(sql.contains("baseline_change_rows"));
+        assert!(sql.contains("LEFT JOIN baseline_change_rows bch"));
+        assert!(sql.contains("lix_json_extract(snapshot_content, 'commit_id')"));
+        assert!(!sql.contains("l.name = 'checkpoint'"));
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
