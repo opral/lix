@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::super::storage::sql_text::escape_sql_string;
 
+const WORKING_PROJECTION_SOURCE_CHANGE_ID_KEY: &str = "lix_internal_source_change_id";
+
 pub(crate) async fn refresh_working_projection_for_read_query(
     backend: &dyn LixBackend,
     active_version_id: &str,
@@ -228,10 +230,6 @@ async fn refresh_working_change_projection_with_backend(
             }
         }
     }
-    if depth_by_commit_id.is_empty() {
-        return Ok(());
-    }
-
     let cse_rows = backend
         .execute(
             "SELECT \
@@ -413,6 +411,10 @@ async fn refresh_working_change_projection_with_backend(
             schema_key,
             file_id,
         );
+        let metadata = with_projection_source_change_metadata(
+            change_row.metadata.clone(),
+            &selected.change_id,
+        );
         let change_snapshot = serde_json::json!({
             "id": change_id,
             "entity_id": entity_id,
@@ -422,7 +424,7 @@ async fn refresh_working_change_projection_with_backend(
             "plugin_key": change_row.plugin_key,
             "created_at": change_row.created_at,
             "snapshot_content": change_row.snapshot_content,
-            "metadata": change_row.metadata,
+            "metadata": metadata,
         })
         .to_string();
         upsert_working_projection_row(
@@ -732,6 +734,24 @@ fn build_working_projection_change_id(
     format!(
         "working_projection:{active_version_id}:{change_set_id}:{schema_key}:{file_id}:{entity_id}"
     )
+}
+
+fn with_projection_source_change_metadata(
+    metadata: JsonValue,
+    source_change_id: &str,
+) -> JsonValue {
+    match metadata {
+        JsonValue::Object(mut object) => {
+            object.insert(
+                WORKING_PROJECTION_SOURCE_CHANGE_ID_KEY.to_string(),
+                JsonValue::String(source_change_id.to_string()),
+            );
+            JsonValue::Object(object)
+        }
+        _ => serde_json::json!({
+            WORKING_PROJECTION_SOURCE_CHANGE_ID_KEY: source_change_id,
+        }),
+    }
 }
 
 fn is_missing_internal_relation_error(error: &LixError) -> bool {
