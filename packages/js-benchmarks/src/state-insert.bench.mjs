@@ -46,7 +46,7 @@ const oldSchema = {
   },
   required: ["source"],
   "x-lix-key": BENCH_SCHEMA_KEY,
-  "x-lix-version": "1.0",
+  "x-lix-version": "1",
   "x-lix-primary-key": ["/source"],
 };
 
