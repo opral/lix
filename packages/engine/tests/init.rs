@@ -1,6 +1,34 @@
 mod support;
 use std::collections::BTreeSet;
 
+fn text_value(value: &lix_engine::Value, field: &str) -> String {
+    match value {
+        lix_engine::Value::Text(value) => value.clone(),
+        other => panic!("expected text value for {field}, got {other:?}"),
+    }
+}
+
+fn i64_value(value: &lix_engine::Value, field: &str) -> i64 {
+    match value {
+        lix_engine::Value::Integer(value) => *value,
+        lix_engine::Value::Text(value) => value.parse::<i64>().unwrap_or_else(|error| {
+            panic!("expected i64 text for {field}, got '{value}': {error}")
+        }),
+        other => panic!("expected i64 value for {field}, got {other:?}"),
+    }
+}
+
+fn string_array_value(value: &lix_engine::Value, field: &str) -> Vec<String> {
+    match value {
+        lix_engine::Value::Text(value) => serde_json::from_str::<Vec<String>>(value)
+            .unwrap_or_else(|error| {
+                panic!("expected JSON string array for {field}, got '{value}': {error}")
+            }),
+        lix_engine::Value::Null => Vec::new(),
+        other => panic!("expected text JSON array for {field}, got {other:?}"),
+    }
+}
+
 simulation_test!(init_creates_untracked_table, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
@@ -274,6 +302,176 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(change_set_exists.rows.clone());
         assert_eq!(change_set_exists.rows.len(), 1);
+    }
+);
+
+simulation_test!(
+    init_seeds_per_version_commit_and_working_commit_ids,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+
+        engine.init().await.unwrap();
+
+        let active_version = engine
+            .execute(
+                "SELECT version_id \
+                 FROM lix_active_version \
+                 ORDER BY id \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(active_version.rows.len(), 1);
+        let main_version_id = text_value(&active_version.rows[0][0], "version_id");
+        assert_ne!(main_version_id, "global");
+
+        let versions = engine
+            .execute(
+                "SELECT id, commit_id, working_commit_id \
+                 FROM lix_version \
+                 WHERE id IN ('global', $1) \
+                 ORDER BY id",
+                &[lix_engine::Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(versions.rows.clone());
+        assert_eq!(
+            versions.rows.len(),
+            2,
+            "expected global + main version rows"
+        );
+        let versions_before_second_init = versions.rows.clone();
+
+        let mut global_commit_id = String::new();
+        let mut global_working_commit_id = String::new();
+        let mut main_commit_id = String::new();
+        let mut main_working_commit_id = String::new();
+
+        for row in &versions.rows {
+            let version_id = text_value(&row[0], "id");
+            let commit_id = text_value(&row[1], "commit_id");
+            let working_commit_id = text_value(&row[2], "working_commit_id");
+            if version_id == "global" {
+                global_commit_id = commit_id;
+                global_working_commit_id = working_commit_id;
+            } else {
+                main_commit_id = commit_id;
+                main_working_commit_id = working_commit_id;
+            }
+        }
+
+        assert!(
+            !global_commit_id.is_empty(),
+            "global version row must exist"
+        );
+        assert!(!main_commit_id.is_empty(), "main version row must exist");
+        assert!(
+            !global_working_commit_id.is_empty(),
+            "global working commit id must exist"
+        );
+        assert!(
+            !main_working_commit_id.is_empty(),
+            "main working commit id must exist"
+        );
+
+        assert_ne!(global_working_commit_id, "global");
+        assert_ne!(main_working_commit_id, "global");
+        assert_ne!(global_working_commit_id, main_working_commit_id);
+        assert_ne!(global_working_commit_id, global_commit_id);
+        assert_ne!(main_working_commit_id, main_commit_id);
+
+        for (version_id, commit_id, working_commit_id) in [
+            (
+                "global",
+                global_commit_id.as_str(),
+                global_working_commit_id.as_str(),
+            ),
+            (
+                main_version_id.as_str(),
+                main_commit_id.as_str(),
+                main_working_commit_id.as_str(),
+            ),
+        ] {
+            let commit_exists = engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_commit \
+                     WHERE id = $1",
+                    &[lix_engine::Value::Text(commit_id.to_string())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                i64_value(&commit_exists.rows[0][0], "commit_count"),
+                1,
+                "commit '{commit_id}' must exist exactly once"
+            );
+
+            let working_row = engine
+                .execute(
+                    "SELECT change_set_id, parent_commit_ids \
+                     FROM lix_commit \
+                     WHERE id = $1 \
+                     LIMIT 1",
+                    &[lix_engine::Value::Text(working_commit_id.to_string())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                working_row.rows.len(),
+                1,
+                "working commit '{working_commit_id}' must exist for version '{version_id}'"
+            );
+            let working_change_set_id =
+                text_value(&working_row.rows[0][0], "working_change_set_id");
+            assert!(
+                !working_change_set_id.is_empty(),
+                "working commit '{working_commit_id}' must reference a change set"
+            );
+
+            let parents = string_array_value(&working_row.rows[0][1], "parent_commit_ids");
+            assert!(
+                parents.iter().any(|parent| parent == commit_id),
+                "working commit '{working_commit_id}' for version '{version_id}' must list tip commit '{commit_id}' as parent; parents={parents:?}"
+            );
+
+            let change_set_exists = engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_change_set \
+                     WHERE id = $1",
+                    &[lix_engine::Value::Text(working_change_set_id)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                i64_value(&change_set_exists.rows[0][0], "change_set_count"),
+                1,
+                "working commit '{working_commit_id}' must reference an existing change set"
+            );
+        }
+
+        engine.init().await.unwrap();
+        let versions_after_second_init = engine
+            .execute(
+                "SELECT id, commit_id, working_commit_id \
+                 FROM lix_version \
+                 WHERE id IN ('global', $1) \
+                 ORDER BY id",
+                &[lix_engine::Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(versions_after_second_init.rows.clone());
+        assert_eq!(
+            versions_after_second_init.rows, versions_before_second_init,
+            "init() should be idempotent for seeded version pointers"
+        );
     }
 );
 

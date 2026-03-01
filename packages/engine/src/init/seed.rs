@@ -502,7 +502,11 @@ impl Engine {
             return Ok(());
         }
 
-        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id, commit_id);
+        let working_commit_id = self
+            .seed_working_commit_for_version(entity_id, commit_id)
+            .await?;
+        let snapshot_content =
+            version_pointer_snapshot_content(entity_id, commit_id, &working_commit_id);
         let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
@@ -521,6 +525,167 @@ impl Engine {
             change_id = escape_sql_string(&change_id),
         );
         self.backend.execute(&insert_sql, &[]).await?;
+
+        Ok(())
+    }
+
+    async fn seed_working_commit_for_version(
+        &self,
+        version_id: &str,
+        parent_commit_id: &str,
+    ) -> Result<String, LixError> {
+        if version_id.is_empty() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "cannot seed working commit for empty version id".to_string(),
+            });
+        }
+        if parent_commit_id.is_empty() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "cannot seed working commit for version '{version_id}' with empty parent"
+                ),
+            });
+        }
+
+        self.assert_commit_change_set_integrity(parent_commit_id)
+            .await?;
+
+        let working_change_set_id = self.generate_runtime_uuid().await?;
+        let working_commit_id = self.generate_runtime_uuid().await?;
+
+        let change_set_snapshot_content = serde_json::json!({
+            "id": working_change_set_id,
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', true)",
+            &[
+                Value::Text(working_change_set_id.clone()),
+                Value::Text(change_set_snapshot_content),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+        let commit_snapshot_content = serde_json::json!({
+            "id": working_commit_id,
+            "change_set_id": working_change_set_id,
+            "parent_commit_ids": [parent_commit_id],
+            "change_ids": [],
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', true)",
+            &[
+                Value::Text(working_commit_id.clone()),
+                Value::Text(commit_snapshot_content),
+            ],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+        self.seed_commit_edge(parent_commit_id, &working_commit_id)
+            .await?;
+        self.seed_commit_ancestry_for_commit(&working_commit_id, &[parent_commit_id.to_string()])
+            .await?;
+
+        Ok(working_commit_id)
+    }
+
+    async fn seed_commit_edge(&self, parent_id: &str, child_id: &str) -> Result<(), LixError> {
+        if parent_id.is_empty() || child_id.is_empty() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "cannot seed commit edge with empty id(s): parent='{parent_id}', child='{child_id}'"
+                ),
+            });
+        }
+        if parent_id == child_id {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("refusing self-edge for commit '{parent_id}'"),
+            });
+        }
+
+        let edge_entity_id = format!("{parent_id}~{child_id}");
+        let existing = self
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_commit_edge' \
+                   AND entity_id = $1 \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(edge_entity_id.clone())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = serde_json::json!({
+            "parent_id": parent_id,
+            "child_id": child_id,
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_commit_edge', 'lix', 'global', 'lix', $2, '1', true)",
+            &[Value::Text(edge_entity_id), Value::Text(snapshot_content)],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn seed_commit_ancestry_for_commit(
+        &self,
+        commit_id: &str,
+        parent_ids: &[String],
+    ) -> Result<(), LixError> {
+        self.execute_internal(
+            "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+             VALUES ($1, $1, 0) \
+             ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
+            &[Value::Text(commit_id.to_string())],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+        for parent_id in normalize_parent_commit_ids(parent_ids.to_vec(), commit_id) {
+            self.execute_internal(
+                "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
+                 SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
+                 FROM ( \
+                   SELECT $2 AS ancestor_id, 1 AS depth \
+                   UNION ALL \
+                   SELECT ancestor_id, depth + 1 AS depth \
+                   FROM lix_internal_commit_ancestry \
+                   WHERE commit_id = $2 \
+                 ) AS candidate \
+                 GROUP BY candidate.ancestor_id \
+                 ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
+                 SET depth = CASE \
+                   WHEN excluded.depth < lix_internal_commit_ancestry.depth THEN excluded.depth \
+                   ELSE lix_internal_commit_ancestry.depth \
+                 END",
+                &[Value::Text(commit_id.to_string()), Value::Text(parent_id)],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -723,4 +888,14 @@ fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, Li
             description: format!("{label} query returned non-integer value: {other:?}"),
         }),
     }
+}
+
+fn normalize_parent_commit_ids(
+    mut parent_commit_ids: Vec<String>,
+    self_commit_id: &str,
+) -> Vec<String> {
+    parent_commit_ids.retain(|id| !id.is_empty() && id != self_commit_id);
+    parent_commit_ids.sort();
+    parent_commit_ids.dedup();
+    parent_commit_ids
 }
