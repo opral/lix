@@ -109,7 +109,7 @@ impl QueryRule {
                 optimize::projection_cleanup::rewrite_query(query)?,
             )),
             Self::VtableRead => Ok(QueryRuleOutcome::from_option(
-                lower::vtable_read::rewrite_query(query)?,
+                lower::vtable_read::rewrite_query(query, params)?,
             )),
         }
     }
@@ -140,7 +140,7 @@ impl QueryRule {
                 optimize::projection_cleanup::rewrite_query(query)?,
             )),
             Self::VtableRead => Ok(QueryRuleOutcome::from_option(
-                lower::vtable_read::rewrite_query_with_backend(backend, query).await?,
+                lower::vtable_read::rewrite_query_with_backend(backend, query, params).await?,
             )),
         }
     }

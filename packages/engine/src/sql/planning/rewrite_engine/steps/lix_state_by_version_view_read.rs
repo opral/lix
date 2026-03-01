@@ -1,5 +1,8 @@
 use sqlparser::ast::{Expr, GroupByExpr, Query, Select, SelectItem, TableFactor, TableWithJoins};
 
+use crate::engine::sql::planning::param_context::{
+    normalize_query_placeholders, PlaceholderOrdinalState,
+};
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::{
     select_supports_count_fast_path, take_pushdown_predicates,
 };
@@ -13,6 +16,8 @@ use crate::LixError;
 const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
+    let mut query = query;
+    normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
     rewrite_query_with_select_rewriter(query, &mut rewrite_select)
 }
 
@@ -199,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_push_down_bare_placeholders_when_it_would_reorder_bindings() {
+    fn canonicalizes_bare_placeholders_and_pushes_down_predicates() {
         let query = parse_query(
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.plugin_key = ? AND sv.file_id = ?",
@@ -210,10 +215,9 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(!sql.contains("ranked.plugin_key = ?"));
-        assert!(!sql.contains("s.file_id = ?"));
-        assert!(sql.contains("sv.plugin_key = ?"));
-        assert!(sql.contains("sv.file_id = ?"));
+        assert!(sql.contains("ranked.plugin_key = ?1"));
+        assert!(sql.contains("s.file_id = ?2"));
+        assert!(!sql.contains("sv.plugin_key = ? AND sv.file_id = ?"));
     }
 
     #[test]
@@ -286,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn pushes_safe_bare_placeholders_for_schema_and_version() {
+    fn canonicalizes_bare_placeholders_for_schema_and_version() {
         let query = parse_query(
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.schema_key = ? AND sv.version_id = ?",
@@ -297,15 +301,15 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.schema_key = ?"));
-        assert!(sql.contains("version_id = ?"));
-        assert!(!sql.contains("ranked.version_id = ?"));
+        assert!(sql.contains("s.schema_key = ?1"));
+        assert!(sql.contains("version_id = ?2"));
+        assert!(!sql.contains("ranked.version_id = ?2"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id = ?"));
     }
 
     #[test]
-    fn pushes_safe_bare_placeholders_for_version_in_list() {
+    fn canonicalizes_bare_placeholders_for_version_in_list() {
         let query = parse_query(
             "SELECT COUNT(*) FROM lix_state_by_version AS sv \
              WHERE sv.schema_key = ? AND sv.version_id IN (?, ?)",
@@ -316,9 +320,9 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.schema_key = ?"));
+        assert!(sql.contains("s.schema_key = ?1"));
         assert!(sql.contains("version_id IN ("));
-        assert!(!sql.contains("ranked.version_id IN (?, ?)"));
+        assert!(!sql.contains("ranked.version_id IN (?2, ?3)"));
         assert!(!sql.contains("sv.schema_key = ?"));
         assert!(!sql.contains("sv.version_id IN (?, ?)"));
     }

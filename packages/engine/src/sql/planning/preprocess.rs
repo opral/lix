@@ -17,6 +17,7 @@ use super::super::surfaces::matcher::statement_matches_any_table;
 use super::bind_once::{bind_statements_with_appended_params_once, StatementWithAppendedParams};
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
+use super::param_context::normalize_statement_placeholders_in_batch;
 use super::rewrite_engine::StatementPipeline;
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
@@ -43,6 +44,9 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
     dialect: SqlDialect,
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError> {
+    let mut statements = statements;
+    normalize_statement_placeholders_in_batch(&mut statements)?;
+
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
@@ -223,6 +227,7 @@ where
 {
     let params = params.to_vec();
     let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
+    normalize_statement_placeholders_in_batch(&mut statements)?;
     reject_disallowed_backend_catalog_reads(&statements)?;
 
     materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;

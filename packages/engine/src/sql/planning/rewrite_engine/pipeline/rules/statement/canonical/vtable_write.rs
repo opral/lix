@@ -82,11 +82,12 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
 pub(crate) fn rewrite_delete(
     delete: Delete,
     effective_scope_fallback: bool,
+    params: &[Value],
 ) -> Result<RewriteOutput, LixError> {
     let rewritten = if effective_scope_fallback {
-        vtable_write::rewrite_delete_with_options(delete.clone(), true)?
+        vtable_write::rewrite_delete_with_options(delete.clone(), true, params)?
     } else {
-        vtable_write::rewrite_delete(delete.clone())?
+        vtable_write::rewrite_delete(delete.clone(), params)?
     };
 
     match rewritten {

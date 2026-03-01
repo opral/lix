@@ -261,7 +261,8 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                     delete
                 };
 
-                let output = vtable_write::rewrite_delete(delete, effective_scope_fallback)?;
+                let output =
+                    vtable_write::rewrite_delete(delete, effective_scope_fallback, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Query(query) => {
@@ -658,7 +659,8 @@ where
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
-                let output = vtable_write::rewrite_delete(delete, effective_scope_fallback)?;
+                let output =
+                    vtable_write::rewrite_delete(delete, effective_scope_fallback, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Query(query) => {
