@@ -2,6 +2,7 @@ use super::sql::execution::{apply_effects_post_commit, apply_effects_tx, run, sh
 use super::sql::planning::parse::parse_sql;
 use super::sql::planning::script::extract_explicit_transaction_script_from_statements;
 use super::*;
+use crate::errors;
 
 impl Engine {
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -106,12 +107,17 @@ impl Engine {
         }
 
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        if let Some(statements) =
-            extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
-        {
-            return self
-                .execute_transaction_script_with_options(statements, params, options)
-                .await;
+        if !allow_internal_tables && contains_transaction_control_statement(&parsed_statements) {
+            return Err(errors::transaction_control_statement_denied_error());
+        }
+        if allow_internal_tables {
+            if let Some(statements) =
+                extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
+            {
+                return self
+                    .execute_transaction_script_with_options(statements, params, options)
+                    .await;
+            }
         }
         if parsed_statements.len() > 1 {
             return self
@@ -259,4 +265,15 @@ impl Engine {
 
         Ok(MaterializationReport { plan, apply })
     }
+}
+
+fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
+    statements.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
+        )
+    })
 }

@@ -172,6 +172,13 @@ export type LixObserveEvents = {
         engine: Arc<lix_engine::Engine>,
     }
 
+    #[wasm_bindgen(js_name = SqlTransaction)]
+    pub struct JsSqlTransaction {
+        engine: Arc<lix_engine::Engine>,
+        handle: u64,
+        closed: AtomicBool,
+    }
+
     #[wasm_bindgen(js_name = StateCommitStream)]
     pub struct JsStateCommitStream {
         inner: std::sync::Mutex<Option<EngineStateCommitStream>>,
@@ -214,16 +221,49 @@ export type LixObserveEvents = {
             options: Option<JsValue>,
         ) -> Result<JsValue, JsValue> {
             let statements = parse_transaction_statements(statements).map_err(js_error)?;
-            let (transaction_sql, transaction_params) =
-                build_transaction_script_and_params(statements).map_err(js_error)?;
             let execute_options =
                 parse_execute_options(options, "executeTransaction").map_err(js_error)?;
-            let result = self
+            let mut transaction = self
                 .engine
-                .execute(&transaction_sql, &transaction_params, execute_options)
+                .begin_transaction_with_options(execute_options)
                 .await
                 .map_err(js_error)?;
-            Ok(query_result_to_js(result))
+            let mut last_result = EngineQueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            };
+
+            for statement in statements {
+                match transaction.execute(&statement.sql, &statement.params).await {
+                    Ok(result) => last_result = result,
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(js_error(error));
+                    }
+                }
+            }
+
+            transaction.commit().await.map_err(js_error)?;
+            Ok(query_result_to_js(last_result))
+        }
+
+        #[wasm_bindgen(js_name = beginTransaction)]
+        pub async fn begin_transaction(
+            &self,
+            options: Option<JsValue>,
+        ) -> Result<JsSqlTransaction, JsValue> {
+            let execute_options =
+                parse_execute_options(options, "beginTransaction").map_err(js_error)?;
+            let handle = self
+                .engine
+                .begin_transaction_handle_with_options(execute_options)
+                .await
+                .map_err(js_error)?;
+            Ok(JsSqlTransaction {
+                engine: Arc::clone(&self.engine),
+                handle,
+                closed: AtomicBool::new(false),
+            })
         }
 
         #[wasm_bindgen(js_name = installPlugin)]
@@ -448,6 +488,55 @@ export type LixObserveEvents = {
             if let Some(mut events) = guard.take() {
                 events.close();
             }
+            Ok(())
+        }
+    }
+
+    #[wasm_bindgen(js_class = SqlTransaction)]
+    impl JsSqlTransaction {
+        #[wasm_bindgen(js_name = execute)]
+        pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(js_error(LixError {
+                    code: "LIX_ERROR_JS_SDK".to_string(),
+                    title: "JS SDK error".to_string(),
+                    description: "transaction is already closed".to_string(),
+                }));
+            }
+            let params = Array::from(&params);
+            let mut values = Vec::new();
+            for value in params.iter() {
+                values.push(value_from_js(value).map_err(js_error)?);
+            }
+            let result = self
+                .engine
+                .execute_in_transaction_handle(self.handle, &sql, &values)
+                .await
+                .map_err(js_error)?;
+            Ok(query_result_to_js(result))
+        }
+
+        #[wasm_bindgen(js_name = commit)]
+        pub async fn commit(&self) -> Result<(), JsValue> {
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.engine
+                .commit_transaction_handle(self.handle)
+                .await
+                .map_err(js_error)?;
+            Ok(())
+        }
+
+        #[wasm_bindgen(js_name = rollback)]
+        pub async fn rollback(&self) -> Result<(), JsValue> {
+            if self.closed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            self.engine
+                .rollback_transaction_handle(self.handle)
+                .await
+                .map_err(js_error)?;
             Ok(())
         }
     }
@@ -742,33 +831,6 @@ export type LixObserveEvents = {
         }
 
         Ok(parsed)
-    }
-
-    fn build_transaction_script_and_params(
-        statements: Vec<TransactionStatement>,
-    ) -> Result<(String, Vec<EngineValue>), LixError> {
-        let mut sql = String::from("BEGIN;");
-        let mut params = Vec::new();
-
-        for (index, statement) in statements.into_iter().enumerate() {
-            let normalized_sql = statement.sql.trim();
-            if normalized_sql.is_empty() {
-                return Err(LixError {
-                    code: "LIX_ERROR_JS_SDK".to_string(),
-                    title: "JS SDK error".to_string(),
-                    description: format!("executeTransaction statements[{index}] has empty sql"),
-                });
-            }
-            sql.push(' ');
-            sql.push_str(normalized_sql);
-            if !normalized_sql.ends_with(';') {
-                sql.push(';');
-            }
-            params.extend(statement.params);
-        }
-
-        sql.push_str(" COMMIT;");
-        Ok((sql, params))
     }
 
     fn read_optional_string_array_property(
@@ -1252,7 +1314,6 @@ export type LixObserveEvents = {
     }
 
     enum JsTransactionKind {
-        Sql,
         Js { transaction: JsValue },
     }
 
@@ -1281,32 +1342,28 @@ export type LixObserveEvents = {
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
-            if let Some(begin_transaction) =
-                Self::get_optional_method(&self.backend, "beginTransaction")?
-            {
-                let transaction = begin_transaction
-                    .call0(&self.backend)
-                    .map_err(js_to_lix_error)?;
-                let transaction = Self::await_if_promise(transaction).await?;
-                if transaction.is_null() || transaction.is_undefined() {
-                    return Err(LixError {
-                        code: "LIX_ERROR_JS_SDK".to_string(),
-                        title: "JS SDK error".to_string(),
-                        description: "beginTransaction() returned no transaction object"
+            let begin_transaction = Self::get_optional_method(&self.backend, "beginTransaction")?
+                .ok_or_else(|| LixError {
+                    code: "LIX_ERROR_JS_SDK_BACKEND_BEGIN_TRANSACTION_REQUIRED".to_string(),
+                    title: "JS SDK backend error".to_string(),
+                    description:
+                        "backend.beginTransaction is required; raw SQL transaction control is not supported"
                             .to_string(),
-                    });
-                }
-                return Ok(Box::new(JsTransaction {
-                    backend: self,
-                    kind: JsTransactionKind::Js { transaction },
-                    closed: false,
-                }));
+                })?;
+            let transaction = begin_transaction
+                .call0(&self.backend)
+                .map_err(js_to_lix_error)?;
+            let transaction = Self::await_if_promise(transaction).await?;
+            if transaction.is_null() || transaction.is_undefined() {
+                return Err(LixError {
+                    code: "LIX_ERROR_JS_SDK".to_string(),
+                    title: "JS SDK error".to_string(),
+                    description: "beginTransaction() returned no transaction object".to_string(),
+                });
             }
-
-            self.execute_raw("BEGIN", &[]).await?;
             Ok(Box::new(JsTransaction {
                 backend: self,
-                kind: JsTransactionKind::Sql,
+                kind: JsTransactionKind::Js { transaction },
                 closed: false,
             }))
         }
@@ -1336,7 +1393,6 @@ export type LixObserveEvents = {
     impl LixTransaction for JsTransaction<'_> {
         fn dialect(&self) -> SqlDialect {
             match &self.kind {
-                JsTransactionKind::Sql => self.backend.dialect(),
                 JsTransactionKind::Js { transaction } => {
                     JsBackend::dialect_from_object(transaction).unwrap_or(self.backend.dialect())
                 }
@@ -1356,7 +1412,6 @@ export type LixObserveEvents = {
                 });
             }
             match &self.kind {
-                JsTransactionKind::Sql => self.backend.execute_raw(sql, params).await,
                 JsTransactionKind::Js { transaction } => {
                     self.backend.execute_raw_on(transaction, sql, params).await
                 }
@@ -1368,9 +1423,6 @@ export type LixObserveEvents = {
                 return Ok(());
             }
             match &self.kind {
-                JsTransactionKind::Sql => {
-                    self.backend.execute_raw("COMMIT", &[]).await?;
-                }
                 JsTransactionKind::Js { transaction } => {
                     let commit = JsBackend::get_optional_method(transaction, "commit")?
                         .ok_or_else(|| LixError {
@@ -1391,9 +1443,6 @@ export type LixObserveEvents = {
                 return Ok(());
             }
             match &self.kind {
-                JsTransactionKind::Sql => {
-                    self.backend.execute_raw("ROLLBACK", &[]).await?;
-                }
                 JsTransactionKind::Js { transaction } => {
                     let rollback = JsBackend::get_optional_method(transaction, "rollback")?
                         .ok_or_else(|| LixError {
