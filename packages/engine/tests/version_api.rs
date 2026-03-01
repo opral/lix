@@ -112,6 +112,56 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
 });
 
 simulation_test!(
+    tracked_write_moves_active_working_commit_id_off_global,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.expect("init should succeed");
+
+        let active_before = engine
+            .execute(
+                "SELECT av.version_id, v.commit_id, v.working_commit_id \
+                 FROM lix_active_version av \
+                 JOIN lix_version v ON v.id = av.version_id \
+                 ORDER BY av.id \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("active version query should succeed");
+        assert_eq!(active_before.rows.len(), 1);
+        let active_version_id = value_as_text(&active_before.rows[0][0]);
+        assert_ne!(active_version_id, "global");
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('working-pointer-regression', '1')",
+                &[],
+            )
+            .await
+            .expect("tracked write should succeed");
+
+        let active_after = engine
+            .execute(
+                "SELECT av.version_id, v.commit_id, v.working_commit_id \
+                 FROM lix_active_version av \
+                 JOIN lix_version v ON v.id = av.version_id \
+                 ORDER BY av.id \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("active version query should succeed");
+        assert_eq!(active_after.rows.len(), 1);
+        assert_eq!(value_as_text(&active_after.rows[0][0]), active_version_id);
+        assert_ne!(value_as_text(&active_after.rows[0][1]), "global");
+        assert_ne!(value_as_text(&active_after.rows[0][2]), "global");
+    }
+);
+
+simulation_test!(
     create_version_with_options_and_switch_version,
     |sim| async move {
         let engine = sim
