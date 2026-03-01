@@ -225,11 +225,8 @@ fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
     Ok(())
 }
 
-pub(crate) fn normalize_missing_relation_error(error: LixError) -> LixError {
-    if crate::error_classification::is_missing_relation_error(&error) {
-        return crate::errors::table_not_found_read_error();
-    }
-    error
+pub(crate) fn normalize_sql_execution_error(error: LixError, statements: &[Statement]) -> LixError {
+    crate::error_classification::normalize_sql_error(error, statements)
 }
 
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
@@ -833,7 +830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_read_query_returns_table_not_found_message() {
+    async fn unknown_read_query_returns_unknown_table_error() {
         let commit_called = Arc::new(AtomicBool::new(false));
         let rollback_called = Arc::new(AtomicBool::new(false));
         let engine = boot(BootArgs::new(
@@ -857,7 +854,7 @@ mod tests {
             .await
             .expect_err("unknown relation query should fail");
 
-        assert_eq!(error.code, "LIX_ERROR_TABLE_NOT_FOUND");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
     }
 
     #[test]

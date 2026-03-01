@@ -43,7 +43,7 @@ impl Engine {
         )
         .await
         .map_err(LixError::from)
-        .map_err(normalize_missing_relation_error)?;
+        .map_err(|error| normalize_sql_execution_error(error, &parsed_statements))?;
 
         if let Some(version_id) = &prepared.plan.effects.next_active_version_id {
             *active_version_id = version_id.clone();

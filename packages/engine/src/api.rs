@@ -102,15 +102,17 @@ impl Engine {
         options: ExecuteOptions,
         allow_internal_tables: bool,
     ) -> Result<QueryResult, LixError> {
-        if !allow_internal_tables && !self.access_to_internal {
+        let allow_internal_sql = allow_internal_tables || self.access_to_internal;
+
+        if !allow_internal_sql {
             reject_internal_table_access(sql)?;
         }
 
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        if !allow_internal_tables && contains_transaction_control_statement(&parsed_statements) {
+        if !allow_internal_sql && contains_transaction_control_statement(&parsed_statements) {
             return Err(errors::transaction_control_statement_denied_error());
         }
-        if allow_internal_tables {
+        if allow_internal_sql {
             if let Some(statements) =
                 extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
             {
@@ -152,7 +154,7 @@ impl Engine {
         )
         .await
         .map_err(LixError::from)
-        .map_err(normalize_missing_relation_error)?;
+        .map_err(|error| normalize_sql_execution_error(error, &parsed_statements))?;
 
         run::persist_runtime_sequence(
             self,
