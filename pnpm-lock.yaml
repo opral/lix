@@ -133,9 +133,6 @@ importers:
 
   packages/js-kysely:
     dependencies:
-      '@lix-js/sdk':
-        specifier: workspace:*
-        version: link:../js-sdk
       json-schema-to-ts:
         specifier: ^3.1.1
         version: 3.1.1
@@ -143,9 +140,15 @@ importers:
         specifier: ^0.28.7
         version: 0.28.7
     devDependencies:
+      '@lix-js/sdk':
+        specifier: workspace:*
+        version: link:../js-sdk
       typescript:
         specifier: ^5.5.4
         version: 5.9.3
+      vitest:
+        specifier: ^4.0.18
+        version: 4.0.18(@opentelemetry/api@1.9.0)(@types/node@24.10.2)(happy-dom@18.0.1)(jiti@2.6.1)(jsdom@27.3.0(postcss@8.5.6))(lightningcss@1.30.2)(msw@2.10.2(@types/node@24.10.2)(typescript@5.9.3))(sass-embedded@1.89.2)(terser@5.36.0)(tsx@4.20.5)(yaml@2.8.1)
 
   packages/js-sdk:
     dependencies:
@@ -301,6 +304,9 @@ importers:
 
   packages/react-utils:
     devDependencies:
+      '@lix-js/kysely':
+        specifier: workspace:*
+        version: link:../js-kysely
       '@lix-js/sdk':
         specifier: workspace:*
         version: link:../js-sdk
@@ -3347,6 +3353,7 @@ packages:
   basic-ftp@5.0.5:
     resolution: {integrity: sha512-4Bcg1P8xhUuqcii/S0Z9wiHIrQVPMermM1any+MX5GeGD7faD3/msQUDGLol9wOcz4/jbg/WJnGqoJF6LiBdtg==}
     engines: {node: '>=10.0.0'}
+    deprecated: Security vulnerability fixed in 5.2.0, please upgrade
 
   better-path-resolve@1.0.0:
     resolution: {integrity: sha512-pbnl5XzGBdrFU/wT4jqmJVPn2B6UHPBOhzMQkY/SPUPB6QtUXtmBHBIwCbXJol93mOpGMnQyP/+BB19q04xj7g==}

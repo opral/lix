@@ -2159,6 +2159,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "markdown_wc_core"
+version = "0.1.0"
+dependencies = [
+ "markdown",
+ "serde",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "matchit"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2620,6 +2630,7 @@ version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
  "markdown",
+ "markdown_wc_core",
  "serde",
  "serde_json",
  "strsim",
