@@ -180,7 +180,7 @@ simulation_test!(lix_working_changes_reports_removed_rows, |sim| async move {
 });
 
 simulation_test!(
-    lix_working_changes_reports_unchanged_rows,
+    lix_working_changes_excludes_unchanged_rows,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -214,14 +214,6 @@ simulation_test!(
             .await
             .expect("working changes query should succeed");
 
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(as_text(&result.rows[0][0]), "unchanged");
-        assert_non_empty_text(&result.rows[0][1]);
-        assert_non_empty_text(&result.rows[0][2]);
-        assert_eq!(
-            as_text(&result.rows[0][1]),
-            as_text(&result.rows[0][2]),
-            "before/after change ids should match for unchanged rows",
-        );
+        assert_eq!(result.rows.len(), 0);
     }
 );

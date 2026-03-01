@@ -279,7 +279,6 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                         WHEN bcse.change_id IS NOT NULL \
                              AND ch.row_snapshot IS NOT NULL \
                              AND bcse.change_id != ch.change_id THEN 'modified' \
-                        ELSE 'unchanged' \
                     END AS status \
                 FROM working_change_rows ch \
                 INNER JOIN working_change_set_element_rows cse ON cse.change_id = ch.change_id \
@@ -289,27 +288,15 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                    AND bcse.file_id = ch.file_id \
                    AND bcse.change_set_id = (SELECT change_set_id FROM ccs) \
                 WHERE cse.change_set_id = (SELECT change_set_id FROM wcs) \
- \
-                UNION ALL \
- \
-                SELECT \
-                    bc.entity_id AS entity_id, \
-                    bc.schema_key AS schema_key, \
-                    bc.file_id AS file_id, \
-                    bc.change_id AS before_change_id, \
-                    bc.change_id AS after_change_id, \
-                    (SELECT id FROM cc) AS before_commit_id, \
-                    (SELECT id FROM wc) AS after_commit_id, \
-                    'unchanged' AS status \
-                FROM checkpoint_change_set_element_rows bcse \
-                INNER JOIN checkpoint_change_rows bc ON bc.change_id = bcse.change_id \
-                LEFT JOIN working_change_set_element_rows wcse \
-                    ON wcse.entity_id = bc.entity_id \
-                   AND wcse.schema_key = bc.schema_key \
-                   AND wcse.file_id = bc.file_id \
-                   AND wcse.change_set_id = (SELECT change_set_id FROM wcs) \
-                WHERE bcse.change_set_id = (SELECT change_set_id FROM ccs) \
-                  AND wcse.change_id IS NULL \
+                  AND ( \
+                    (bcse.change_id IS NOT NULL AND ch.row_snapshot IS NULL) \
+                    OR (bcse.change_id IS NULL AND ch.row_snapshot IS NOT NULL) \
+                    OR ( \
+                        bcse.change_id IS NOT NULL \
+                        AND ch.row_snapshot IS NOT NULL \
+                        AND bcse.change_id != ch.change_id \
+                    ) \
+                  ) \
             ) AS working_changes";
     parse_single_query(sql)
 }
