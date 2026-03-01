@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 const AUTO_FILE_ID_SENTINEL_PREFIX: &str = "lix_pending_auto_file_id::";
-const FILE_DATA_TYPE_ERROR: &str = "data expects bytes; use X'HEX' or blob parameter";
+const FILE_DATA_TYPE_ERROR: &str =
+    "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter";
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFileWrite {
