@@ -1278,7 +1278,7 @@ mod tests {
         let detected = vec![crate::plugin::runtime::DetectedFileChange {
             entity_id: "entity-1".to_string(),
             schema_key: "schema-1".to_string(),
-            schema_version: "1.0".to_string(),
+            schema_version: "1".to_string(),
             file_id: "file-1".to_string(),
             version_id: "version-1".to_string(),
             plugin_key: "plugin-1".to_string(),
@@ -1295,7 +1295,7 @@ mod tests {
         let detected = vec![DetectedFileDomainChange {
             entity_id: "entity-1".to_string(),
             schema_key: "schema-1".to_string(),
-            schema_version: "1.0".to_string(),
+            schema_version: "1".to_string(),
             file_id: "file-1".to_string(),
             version_id: "version-1".to_string(),
             plugin_key: "plugin-1".to_string(),
