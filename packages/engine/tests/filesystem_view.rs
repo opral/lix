@@ -302,7 +302,7 @@ simulation_test!(
             )
             .await
             .expect_err("data expression updates should fail fast");
-        assert_eq!(err.code, "LIX_ERROR_UNKNOWN");
+        assert_eq!(err.code, "LIX_ERROR_FILE_DATA_EXPECTS_BYTES");
     }
 );
 
@@ -1319,7 +1319,7 @@ simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
             )
             .await
             .expect_err("text data insert should fail");
-    assert_eq!(err.code, "LIX_ERROR_UNKNOWN");
+    assert_eq!(err.code, "LIX_ERROR_FILE_DATA_EXPECTS_BYTES");
 });
 
 simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
@@ -1370,7 +1370,7 @@ simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
         )
         .await
         .expect_err("text data update should fail");
-    assert_eq!(err.code, "LIX_ERROR_UNKNOWN");
+    assert_eq!(err.code, "LIX_ERROR_FILE_DATA_EXPECTS_BYTES");
 });
 
 simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {

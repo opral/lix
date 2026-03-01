@@ -7,6 +7,7 @@ use crate::engine::sql::ast::utils::{
 };
 use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::errors;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -21,9 +22,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 const AUTO_FILE_ID_SENTINEL_PREFIX: &str = "lix_pending_auto_file_id::";
-const FILE_DATA_TYPE_ERROR: &str =
-    "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter";
-
 #[derive(Debug, Clone)]
 pub(crate) struct PendingFileWrite {
     pub(crate) file_id: String,
@@ -292,11 +290,8 @@ fn collect_insert_writes(
         let file_id = id_index
             .and_then(|index| resolved_cell_text(resolved_row.get(index)))
             .unwrap_or_else(|| unresolved_auto_file_id_for_path(&path));
-        let after_data =
-            resolved_cell_blob_bytes(resolved_row.get(data_index)).ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: FILE_DATA_TYPE_ERROR.to_string(),
-            })?;
+        let after_data = resolved_cell_blob_bytes(resolved_row.get(data_index))
+            .ok_or_else(errors::file_data_expects_bytes_error)?;
 
         let version_id = match target {
             FileWriteTarget::ActiveVersion => active_version_id.to_string(),
@@ -513,10 +508,7 @@ async fn collect_update_writes(
                 resolve_expr_cell_with_state(&assignment.value, params, &mut placeholder_state)?;
             assigned_after_data = resolved_cell_blob_bytes(Some(&resolved));
             if assigned_after_data.is_none() {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: FILE_DATA_TYPE_ERROR.to_string(),
-                });
+                return Err(errors::file_data_expects_bytes_error());
             }
         } else if column.eq_ignore_ascii_case("path") {
             if let Some(case_values) = resolve_case_assignment_text_by_id(
