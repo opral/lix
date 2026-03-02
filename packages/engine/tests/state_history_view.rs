@@ -9,6 +9,16 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_non_empty_text(value: &Value) {
+    match value {
+        Value::Text(actual) => assert!(
+            !actual.is_empty(),
+            "expected non-empty text value, got empty string"
+        ),
+        other => panic!("expected text value, got {other:?}"),
+    }
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -66,7 +76,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 &format!(
-                    "SELECT entity_id, commit_id, root_commit_id, depth, snapshot_content, metadata, version_id \
+                    "SELECT entity_id, commit_id, root_commit_id, depth, snapshot_content, metadata, commit_created_at, version_id \
                      FROM lix_state_history \
                      WHERE entity_id = 'paragraph0' \
                        AND schema_key = 'test_state_history_schema' \
@@ -85,7 +95,8 @@ simulation_test!(
         assert_eq!(rows.rows[0][3], Value::Integer(0));
         assert_text(&rows.rows[0][4], "{\"value\":\"initial\"}");
         assert_eq!(rows.rows[0][5], Value::Null);
-        assert_text(&rows.rows[0][6], "global");
+        assert_non_empty_text(&rows.rows[0][6]);
+        assert_text(&rows.rows[0][7], "global");
     }
 );
 
@@ -156,6 +167,66 @@ simulation_test!(
         assert_text(&rows.rows[1][1], "{\"value\":\"value1\"}");
         assert_eq!(rows.rows[2][0], Value::Integer(2));
         assert_text(&rows.rows[2][1], "{\"value\":\"value0\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_history_exposes_commit_created_at,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'history-created-at', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"value1\"}' \
+                 WHERE entity_id = 'history-created-at' \
+                   AND schema_key = 'test_state_history_schema' \
+                   AND file_id = 'f0'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let root_commit_id = active_commit_id(&engine).await;
+        let rows = engine
+            .execute(
+                &format!(
+                    "SELECT depth, commit_id, commit_created_at \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'history-created-at' \
+                       AND schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{root_commit_id}' \
+                     ORDER BY depth ASC"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.rows.clone());
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0][0], Value::Integer(0));
+        assert_non_empty_text(&rows.rows[0][1]);
+        assert_non_empty_text(&rows.rows[0][2]);
+        assert_eq!(rows.rows[1][0], Value::Integer(1));
+        assert_non_empty_text(&rows.rows[1][1]);
+        assert_non_empty_text(&rows.rows[1][2]);
     }
 );
 
