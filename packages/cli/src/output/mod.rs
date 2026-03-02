@@ -1,4 +1,5 @@
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, ContentArrangement, Row, Table};
+use base64::Engine as _;
 use lix_rs_sdk::{QueryResult, Value};
 use serde_json::Value as JsonValue;
 
@@ -55,14 +56,15 @@ fn value_to_text(value: &Value) -> String {
 
 fn value_to_json(value: &Value) -> JsonValue {
     match value {
-        Value::Null => JsonValue::Null,
-        Value::Boolean(v) => JsonValue::from(*v),
-        Value::Integer(v) => JsonValue::from(*v),
-        Value::Real(v) => serde_json::Number::from_f64(*v)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        Value::Text(v) => JsonValue::from(v.clone()),
-        Value::Blob(bytes) => JsonValue::from(bytes_to_hex(bytes)),
+        Value::Null => serde_json::json!({ "kind": "null", "value": null }),
+        Value::Boolean(v) => serde_json::json!({ "kind": "bool", "value": v }),
+        Value::Integer(v) => serde_json::json!({ "kind": "int", "value": v }),
+        Value::Real(v) => serde_json::json!({ "kind": "float", "value": v }),
+        Value::Text(v) => serde_json::json!({ "kind": "text", "value": v }),
+        Value::Blob(bytes) => serde_json::json!({
+            "kind": "blob",
+            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
     }
 }
 
@@ -81,5 +83,36 @@ fn hex_digit(value: u8) -> char {
         0..=9 => (b'0' + value) as char,
         10..=15 => (b'a' + (value - 10)) as char,
         _ => '0',
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_to_json_uses_canonical_blob_shape() {
+        let value = Value::Blob(vec![0x01, 0x02, 0x03]);
+        let json = value_to_json(&value);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "blob",
+                "base64": "AQID"
+            })
+        );
+    }
+
+    #[test]
+    fn value_to_json_uses_canonical_int_shape() {
+        let value = Value::Integer(7);
+        let json = value_to_json(&value);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "int",
+                "value": 7
+            })
+        );
     }
 }

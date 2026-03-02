@@ -1,14 +1,14 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "allowJs": true,
-    "strict": true,
-    "declaration": true,
-    "outDir": "dist",
-    "skipLibCheck": true
-  },
-  "include": ["src", "tests"],
-  "exclude": ["src/engine-wasm/wasm/lix_engine_wasm_bindgen_bg.wasm.d.ts"]
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"allowJs": true,
+		"strict": true,
+		"declaration": true,
+		"outDir": "dist",
+		"skipLibCheck": true
+	},
+	"include": ["src", "tests"],
+	"exclude": ["src/engine-wasm/wasm/lix_engine_wasm_bindgen_bg.wasm.d.ts"]
 }

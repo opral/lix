@@ -1,53 +1,53 @@
 {
-  "name": "@lix-js/sdk",
-  "type": "module",
-  "version": "0.6.0",
-  "private": true,
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
-  },
-  "description": "WASM-backed JS SDK wrapper for Lix",
-  "scripts": {
-    "build": "node ./scripts/build.js",
-    "sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",
-    "typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
-    "test": "node ./scripts/build.js && vitest run",
-    "test:watch": "node ./scripts/build.js && vitest"
-  },
-  "dependencies": {
-    "@bytecodealliance/jco": "^1.17.0",
-    "@bytecodealliance/preview2-shim": "^0.17.8",
-    "@sqlite.org/sqlite-wasm": "^3.50.4-build1"
-  },
-  "devDependencies": {
-    "typescript": "^5.5.4",
-    "vitest": "^4.0.18"
-  },
-  "nx": {
-    "targets": {
-      "build": {
-        "inputs": [
-          "default",
-          "^default",
-          "publicEnv",
-          "nodeVersion",
-          "platform",
-          "{workspaceRoot}/Cargo.toml",
-          "{workspaceRoot}/Cargo.lock",
-          "{workspaceRoot}/packages/engine/**/*",
-          "{workspaceRoot}/packages/js-sdk/Cargo.toml",
-          "{workspaceRoot}/packages/js-sdk/wasm-bindgen.rs"
-        ],
-        "outputs": [
-          "{projectRoot}/dist",
-          "{projectRoot}/src/engine-wasm/wasm"
-        ]
-      }
-    }
-  }
+	"name": "@lix-js/sdk",
+	"type": "module",
+	"version": "0.6.0",
+	"private": true,
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"description": "WASM-backed JS SDK wrapper for Lix",
+	"scripts": {
+		"build": "node ./scripts/build.js",
+		"sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",
+		"typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
+		"test": "node ./scripts/build.js && vitest run",
+		"test:watch": "node ./scripts/build.js && vitest"
+	},
+	"dependencies": {
+		"@bytecodealliance/jco": "^1.17.0",
+		"@bytecodealliance/preview2-shim": "^0.17.8",
+		"@sqlite.org/sqlite-wasm": "^3.50.4-build1"
+	},
+	"devDependencies": {
+		"typescript": "^5.5.4",
+		"vitest": "^4.0.18"
+	},
+	"nx": {
+		"targets": {
+			"build": {
+				"inputs": [
+					"default",
+					"^default",
+					"publicEnv",
+					"nodeVersion",
+					"platform",
+					"{workspaceRoot}/Cargo.toml",
+					"{workspaceRoot}/Cargo.lock",
+					"{workspaceRoot}/packages/engine/**/*",
+					"{workspaceRoot}/packages/js-sdk/Cargo.toml",
+					"{workspaceRoot}/packages/js-sdk/wasm-bindgen.rs"
+				],
+				"outputs": [
+					"{projectRoot}/dist",
+					"{projectRoot}/src/engine-wasm/wasm"
+				]
+			}
+		}
+	}
 }
