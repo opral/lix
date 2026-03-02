@@ -1,10 +1,12 @@
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins,
+    Ident, ObjectName, ObjectNamePart, Query, Select, Statement, TableAlias, TableFactor,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use crate::engine::sql::planning::rewrite_engine::{
+    rewrite_query_with_select_rewriter, rewrite_table_factors_in_select,
+};
 use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -26,60 +28,9 @@ pub fn rewrite_query_with_params(
     query: Query,
     _params: &[Value],
 ) -> Result<Option<Query>, LixError> {
-    let mut changed = false;
-    let mut new_query = query.clone();
-    new_query.body = Box::new(rewrite_set_expr(*query.body, &mut changed)?);
-
-    if changed {
-        Ok(Some(new_query))
-    } else {
-        Ok(None)
-    }
-}
-
-fn rewrite_set_expr(expr: SetExpr, changed: &mut bool) -> Result<SetExpr, LixError> {
-    Ok(match expr {
-        SetExpr::Select(select) => {
-            let mut select = *select;
-            rewrite_select(&mut select, changed)?;
-            SetExpr::Select(Box::new(select))
-        }
-        SetExpr::Query(query) => {
-            let mut query = *query;
-            query.body = Box::new(rewrite_set_expr(*query.body, changed)?);
-            SetExpr::Query(Box::new(query))
-        }
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left: Box::new(rewrite_set_expr(*left, changed)?),
-            right: Box::new(rewrite_set_expr(*right, changed)?),
-        },
-        other => other,
+    rewrite_query_with_select_rewriter(query, &mut |select: &mut Select, changed: &mut bool| {
+        rewrite_table_factors_in_select(select, &mut rewrite_table_factor, changed)
     })
-}
-
-fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
-    for table in &mut select.from {
-        rewrite_table_with_joins(table, changed)?;
-    }
-    Ok(())
-}
-
-fn rewrite_table_with_joins(
-    table: &mut TableWithJoins,
-    changed: &mut bool,
-) -> Result<(), LixError> {
-    rewrite_table_factor(&mut table.relation, changed)?;
-    for join in &mut table.joins {
-        rewrite_table_factor(&mut join.relation, changed)?;
-    }
-    Ok(())
 }
 
 fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Result<(), LixError> {
@@ -98,17 +49,6 @@ fn rewrite_table_factor(relation: &mut TableFactor, changed: &mut bool) -> Resul
                 alias: derived_alias,
             };
             *changed = true;
-        }
-        TableFactor::Derived { subquery, .. } => {
-            if let Some(rewritten) = rewrite_query((**subquery).clone())? {
-                *subquery = Box::new(rewritten);
-                *changed = true;
-            }
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            rewrite_table_with_joins(table_with_joins, changed)?;
         }
         _ => {}
     }
@@ -906,5 +846,43 @@ mod tests {
         };
         let rewritten = rewrite_query(query).expect("rewrite");
         assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn rewrites_lix_file_in_in_subquery() {
+        let sql = "SELECT wc.entity_id \
+                   FROM lix_working_changes wc \
+                   WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = '/hello.md')";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let query = match statements.into_iter().next().expect("statement") {
+            sqlparser::ast::Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        };
+        let rewritten = rewrite_query(query)
+            .expect("rewrite")
+            .expect("query should be rewritten")
+            .to_string();
+
+        assert!(!rewritten.contains("FROM lix_file"));
+        assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
+    }
+
+    #[test]
+    fn rewrites_lix_file_in_exists_subquery() {
+        let sql = "SELECT wc.entity_id \
+                   FROM lix_working_changes wc \
+                   WHERE EXISTS (SELECT 1 FROM lix_file f WHERE f.id = wc.file_id)";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let query = match statements.into_iter().next().expect("statement") {
+            sqlparser::ast::Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        };
+        let rewritten = rewrite_query(query)
+            .expect("rewrite")
+            .expect("query should be rewritten")
+            .to_string();
+
+        assert!(!rewritten.contains("FROM lix_file"));
+        assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
     }
 }

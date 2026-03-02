@@ -2,8 +2,10 @@ use sqlparser::ast::{
     BinaryOperator, Expr, Ident, Query, Select, SetExpr, Statement, TableAlias, TableFactor,
     TableWithJoins, UnaryOperator,
 };
+use sqlparser::ast::{VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::ops::ControlFlow;
 
 use crate::backend::SqlDialect;
 use crate::engine::sql::planning::param_context::{
@@ -762,6 +764,47 @@ fn rewrite_select(
     for table in &mut select.from {
         rewrite_table_with_joins(table, schema_keys, pushdown_predicate, params, changed)?;
     }
+    rewrite_subqueries_in_select(select, schema_keys, params, changed)?;
+    Ok(())
+}
+
+fn rewrite_subqueries_in_select(
+    select: &mut Select,
+    schema_keys: &[String],
+    params: &[LixValue],
+    changed: &mut bool,
+) -> Result<(), LixError> {
+    struct NestedQueryRewriter<'a> {
+        schema_keys: &'a [String],
+        params: &'a [LixValue],
+        changed: &'a mut bool,
+    }
+
+    impl VisitorMut for NestedQueryRewriter<'_> {
+        type Break = LixError;
+
+        fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+            let mut nested_changed = false;
+            if let Err(error) =
+                rewrite_query_inner(query, self.schema_keys, self.params, &mut nested_changed)
+            {
+                return ControlFlow::Break(error);
+            }
+            if nested_changed {
+                *self.changed = true;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = NestedQueryRewriter {
+        schema_keys,
+        params,
+        changed,
+    };
+    if let ControlFlow::Break(error) = VisitMut::visit(select, &mut visitor) {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -811,20 +854,6 @@ fn rewrite_table_factor(
                 alias: derived_alias,
             };
             *changed = true;
-        }
-        TableFactor::Derived { subquery, .. } => {
-            let mut subquery_changed = false;
-            let mut rewritten_subquery = (**subquery).clone();
-            rewrite_query_inner(
-                &mut rewritten_subquery,
-                schema_keys,
-                params,
-                &mut subquery_changed,
-            )?;
-            if subquery_changed {
-                *subquery = Box::new(rewritten_subquery);
-                *changed = true;
-            }
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
@@ -1757,6 +1786,27 @@ mod tests {
         );
         let keys = extract_schema_keys_from_query_deep(&query);
         assert_eq!(keys, vec!["schema_a".to_string()]);
+    }
+
+    #[test]
+    fn rewrites_vtable_in_expression_subquery() {
+        let sql = "SELECT 1 \
+             WHERE EXISTS ( \
+                 SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'schema_a' \
+             )";
+        let output = preprocess_sql(sql).expect("preprocess_sql");
+        let compact = compact_sql(&output.sql);
+
+        assert!(
+            !compact.contains("FROMlix_internal_state_vtable"),
+            "expected nested vtable in expression subquery to be lowered, got: {compact}"
+        );
+        assert!(
+            compact.contains("lix_internal_state_untracked"),
+            "expected lowered query to include untracked branch, got: {compact}"
+        );
     }
 
     #[test]

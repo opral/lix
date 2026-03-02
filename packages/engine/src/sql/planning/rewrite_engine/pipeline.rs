@@ -543,6 +543,21 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_only_rewrites_filesystem_view_in_nested_subquery() {
+        let rewritten = preprocess_sql_rewrite_only(
+            "SELECT wc.entity_id \
+             FROM lix_working_changes wc \
+             WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = '/hello.md')",
+        )
+        .expect("rewrite should succeed");
+
+        assert!(
+            !rewritten.sql.contains("FROM lix_file"),
+            "nested lix_file should be rewritten"
+        );
+    }
+
+    #[test]
     fn preprocess_multi_statement_sqlite_anonymous_placeholders_keep_ordinal_progression() {
         let statements = parse_sql_statements("SELECT ?; SELECT ?").expect("parse should succeed");
         let rewritten = preprocess_statements(
