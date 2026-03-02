@@ -966,6 +966,63 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_entity_view_read_unknown_column_lists_builtin_entity_view_columns,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute("SELECT bogus FROM lix_key_value LIMIT 1", &[])
+            .await
+            .expect_err("read with unknown column should fail");
+
+        assert_eq!(err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(err.description.contains("on `lix_key_value`"));
+        assert!(err.description.contains("Available columns: key"));
+        assert!(err.description.contains("value"));
+        assert!(err.description.contains("lixcol_entity_id"));
+        assert!(!err.description.contains("Available columns: (unknown)."));
+    }
+);
+
+simulation_test!(
+    lix_entity_view_read_unknown_column_lists_custom_entity_view_columns,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES (\
+                 lix_json('{\"x-lix-key\":\"lix_custom_error_columns\",\"x-lix-version\":\"1\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"]}'),\
+                 'global'\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema insert should succeed");
+
+        let err = engine
+            .execute("SELECT bogus FROM lix_custom_error_columns LIMIT 1", &[])
+            .await
+            .expect_err("read with unknown column should fail");
+
+        assert_eq!(err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(err.description.contains("on `lix_custom_error_columns`"));
+        assert!(err.description.contains("Available columns: id"));
+        assert!(err.description.contains("name"));
+        assert!(err.description.contains("lixcol_entity_id"));
+        assert!(!err.description.contains("Available columns: (unknown)."));
+    }
+);
+
+simulation_test!(
     write_routing_rejects_unsupported_non_lix_targets,
     |sim| async move {
         let engine = sim

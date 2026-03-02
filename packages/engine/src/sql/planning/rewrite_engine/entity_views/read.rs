@@ -9,8 +9,8 @@ use crate::engine::sql::planning::rewrite_engine::{
 use crate::{LixBackend, LixError};
 
 use super::target::{
-    resolve_target_from_object_name, resolve_targets_with_backend, EntityViewTarget,
-    EntityViewVariant,
+    projected_lixcol_aliases_for_variant, resolve_target_from_object_name,
+    resolve_targets_with_backend, EntityViewTarget, EntityViewVariant,
 };
 
 pub(crate) fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
@@ -93,7 +93,7 @@ fn build_entity_view_query(target: &EntityViewTarget) -> Result<Query, LixError>
             alias = quote_ident(property),
         ));
     }
-    for (column, alias) in lixcol_aliases_for_variant(target.variant) {
+    for (column, alias) in projected_lixcol_aliases_for_variant(target.variant) {
         select_parts.push(format!("{column} AS {alias}"));
     }
     let mut predicates = vec![format!(
@@ -156,59 +156,6 @@ fn render_literal(value: &JsonValue) -> String {
         JsonValue::Array(_) | JsonValue::Object(_) => {
             format!("'{}'", escape_sql_string(&value.to_string()))
         }
-    }
-}
-
-fn lixcol_aliases_for_variant(
-    variant: EntityViewVariant,
-) -> &'static [(&'static str, &'static str)] {
-    match variant {
-        EntityViewVariant::Base => &[
-            ("entity_id", "lixcol_entity_id"),
-            ("schema_key", "lixcol_schema_key"),
-            ("file_id", "lixcol_file_id"),
-            ("plugin_key", "lixcol_plugin_key"),
-            ("schema_version", "lixcol_schema_version"),
-            ("created_at", "lixcol_created_at"),
-            ("updated_at", "lixcol_updated_at"),
-            (
-                "inherited_from_version_id",
-                "lixcol_inherited_from_version_id",
-            ),
-            ("change_id", "lixcol_change_id"),
-            ("untracked", "lixcol_untracked"),
-            ("metadata", "lixcol_metadata"),
-        ],
-        EntityViewVariant::ByVersion => &[
-            ("entity_id", "lixcol_entity_id"),
-            ("schema_key", "lixcol_schema_key"),
-            ("file_id", "lixcol_file_id"),
-            ("version_id", "lixcol_version_id"),
-            ("plugin_key", "lixcol_plugin_key"),
-            ("schema_version", "lixcol_schema_version"),
-            ("created_at", "lixcol_created_at"),
-            ("updated_at", "lixcol_updated_at"),
-            (
-                "inherited_from_version_id",
-                "lixcol_inherited_from_version_id",
-            ),
-            ("change_id", "lixcol_change_id"),
-            ("untracked", "lixcol_untracked"),
-            ("metadata", "lixcol_metadata"),
-        ],
-        EntityViewVariant::History => &[
-            ("entity_id", "lixcol_entity_id"),
-            ("schema_key", "lixcol_schema_key"),
-            ("file_id", "lixcol_file_id"),
-            ("version_id", "lixcol_version_id"),
-            ("plugin_key", "lixcol_plugin_key"),
-            ("schema_version", "lixcol_schema_version"),
-            ("change_id", "lixcol_change_id"),
-            ("metadata", "lixcol_metadata"),
-            ("commit_id", "lixcol_commit_id"),
-            ("root_commit_id", "lixcol_root_commit_id"),
-            ("depth", "lixcol_depth"),
-        ],
     }
 }
 

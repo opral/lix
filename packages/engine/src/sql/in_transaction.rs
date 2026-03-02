@@ -17,23 +17,25 @@ impl Engine {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let writer_key = options.writer_key.as_deref();
         let defer_side_effects = deferred_side_effects.is_some();
-        let backend = TransactionBackendAdapter::new(transaction);
-        let prepared = shared_path::prepare_execution_with_backend(
-            self,
-            &backend,
-            &parsed_statements,
-            params,
-            active_version_id.as_str(),
-            writer_key,
-            shared_path::PreparationPolicy {
-                allow_plugin_cache: false,
-                detect_plugin_file_changes: !defer_side_effects,
-                skip_side_effect_collection,
-            },
-        )
-        .await?;
+        let prepared = {
+            let backend = TransactionBackendAdapter::new(transaction);
+            shared_path::prepare_execution_with_backend(
+                self,
+                &backend,
+                &parsed_statements,
+                params,
+                active_version_id.as_str(),
+                writer_key,
+                shared_path::PreparationPolicy {
+                    allow_plugin_cache: false,
+                    detect_plugin_file_changes: !defer_side_effects,
+                    skip_side_effect_collection,
+                },
+            )
+            .await?
+        };
 
-        let execution = run::execute_plan_sql_with_transaction(
+        let execution = match run::execute_plan_sql_with_transaction(
             transaction,
             &prepared.plan,
             &prepared.detected_file_domain_changes,
@@ -43,7 +45,18 @@ impl Engine {
         )
         .await
         .map_err(LixError::from)
-        .map_err(|error| normalize_sql_execution_error(error, &parsed_statements))?;
+        {
+            Ok(execution) => execution,
+            Err(error) => {
+                let backend = TransactionBackendAdapter::new(transaction);
+                return Err(normalize_sql_execution_error_with_backend(
+                    &backend,
+                    error,
+                    &parsed_statements,
+                )
+                .await);
+            }
+        };
 
         if let Some(version_id) = &prepared.plan.effects.next_active_version_id {
             *active_version_id = version_id.clone();
