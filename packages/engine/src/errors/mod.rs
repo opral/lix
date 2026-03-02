@@ -3,6 +3,7 @@ use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
+    AlreadyInitialized,
     TableNotFound,
     SqlUnknownTable,
     SqlUnknownColumn,
@@ -17,6 +18,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AlreadyInitialized => "LIX_ERROR_ALREADY_INITIALIZED",
             Self::TableNotFound => "LIX_ERROR_TABLE_NOT_FOUND",
             Self::SqlUnknownTable => "LIX_ERROR_SQL_UNKNOWN_TABLE",
             Self::SqlUnknownColumn => "LIX_ERROR_SQL_UNKNOWN_COLUMN",
@@ -33,6 +35,7 @@ impl ErrorCode {
 
     pub const fn all() -> &'static [Self] {
         &[
+            Self::AlreadyInitialized,
             Self::TableNotFound,
             Self::SqlUnknownTable,
             Self::SqlUnknownColumn,
@@ -48,6 +51,13 @@ impl ErrorCode {
 
 fn build_error(code: ErrorCode, description: &str) -> LixError {
     LixError::new(code.as_str(), description)
+}
+
+pub(crate) fn already_initialized_error() -> LixError {
+    build_error(
+        ErrorCode::AlreadyInitialized,
+        "Engine is already initialized. Create a new Engine instance to initialize again.",
+    )
 }
 
 pub(crate) fn table_not_found_read_error() -> LixError {
@@ -154,10 +164,11 @@ pub(crate) fn file_data_expects_bytes_error() -> LixError {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_data_expects_bytes_error, internal_table_access_denied_error,
-        read_only_view_write_error, sql_unknown_column_error, sql_unknown_table_error,
-        table_not_found_read_error, transaction_control_statement_denied_error,
-        transaction_handle_not_found_error, vtable_schema_key_required_error, ErrorCode,
+        already_initialized_error, file_data_expects_bytes_error,
+        internal_table_access_denied_error, read_only_view_write_error, sql_unknown_column_error,
+        sql_unknown_table_error, table_not_found_read_error,
+        transaction_control_statement_denied_error, transaction_handle_not_found_error,
+        vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -172,6 +183,9 @@ mod tests {
 
     #[test]
     fn constructors_include_code() {
+        let already_initialized = already_initialized_error();
+        assert_eq!(already_initialized.code, "LIX_ERROR_ALREADY_INITIALIZED");
+
         let table_not_found = table_not_found_read_error();
         assert_eq!(table_not_found.code, "LIX_ERROR_TABLE_NOT_FOUND");
 

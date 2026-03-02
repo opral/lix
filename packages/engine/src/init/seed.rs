@@ -3,6 +3,8 @@ use super::*;
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
 const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
 const SYSTEM_PLUGIN_DIRECTORY_PATH: &str = "/.lix/plugins/";
+const BOOTSTRAP_CHANGE_SET_ID: &str = "00000000-0000-7000-8000-000000000001";
+const BOOTSTRAP_COMMIT_ID: &str = "00000000-0000-7000-8000-000000000002";
 
 impl Engine {
     pub(crate) async fn ensure_builtin_schemas_installed(&self) -> Result<(), LixError> {
@@ -121,9 +123,10 @@ impl Engine {
     }
 
     pub(crate) async fn seed_default_checkpoint_label(&self) -> Result<(), LixError> {
+        let bootstrap_commit_id = self.load_global_version_commit_id().await?;
         let existing = self
             .execute_internal(
-                "SELECT snapshot_content \
+                "SELECT entity_id, snapshot_content \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_label' \
                    AND file_id = 'lix' \
@@ -134,10 +137,10 @@ impl Engine {
             )
             .await?;
         for row in &existing.rows {
-            let Some(value) = row.first() else {
+            let Some(Value::Text(row_entity_id)) = row.first() else {
                 continue;
             };
-            let Value::Text(snapshot_content) = value else {
+            let Some(Value::Text(snapshot_content)) = row.get(1) else {
                 continue;
             };
             let parsed: JsonValue =
@@ -146,6 +149,13 @@ impl Engine {
                     description: format!("checkpoint label snapshot invalid JSON: {error}"),
                 })?;
             if parsed.get("name").and_then(JsonValue::as_str) == Some("checkpoint") {
+                let label_id = parsed
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(row_entity_id.as_str())
+                    .to_string();
+                self.ensure_checkpoint_label_on_bootstrap_commit(&bootstrap_commit_id, &label_id)
+                    .await?;
                 return Ok(());
             }
         }
@@ -160,10 +170,87 @@ impl Engine {
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES ($1, 'lix_label', 'lix', 'global', 'lix', $2, '1', true)",
-            &[Value::Text(label_id), Value::Text(snapshot_content)],
+            &[Value::Text(label_id.clone()), Value::Text(snapshot_content)],
             ExecuteOptions::default(),
         )
         .await?;
+        self.ensure_checkpoint_label_on_bootstrap_commit(&bootstrap_commit_id, &label_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn load_global_version_commit_id(&self) -> Result<String, LixError> {
+        let rows = self
+            .execute_internal(
+                "SELECT commit_id \
+                 FROM lix_version \
+                 WHERE id = 'global' \
+                 LIMIT 1",
+                &[],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        let Some(first) = rows.rows.first() else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "init invariant violation: global version pointer is missing"
+                    .to_string(),
+            });
+        };
+        text_value(first.first(), "lix_version.commit_id")
+    }
+
+    async fn ensure_checkpoint_label_on_bootstrap_commit(
+        &self,
+        bootstrap_commit_id: &str,
+        label_id: &str,
+    ) -> Result<(), LixError> {
+        let entity_label_id = format!("{bootstrap_commit_id}~lix_commit~lix~{label_id}");
+        let existing = self
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_internal_state_vtable \
+                 WHERE entity_id = $1 \
+                   AND schema_key = 'lix_entity_label' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(entity_label_id.clone())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        self.execute_internal(
+            "DELETE FROM lix_internal_state_vtable \
+             WHERE entity_id = $1 \
+               AND schema_key = 'lix_entity_label' \
+               AND file_id = 'lix' \
+               AND version_id = 'global'",
+            &[Value::Text(entity_label_id.clone())],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
+        let snapshot_content = serde_json::json!({
+            "entity_id": bootstrap_commit_id,
+            "schema_key": "lix_commit",
+            "file_id": "lix",
+            "label_id": label_id,
+        })
+        .to_string();
+        self.execute_internal(
+            "INSERT INTO lix_internal_state_vtable (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+             ) VALUES ($1, 'lix_entity_label', 'lix', 'global', 'lix', $2, '1', true)",
+            &[Value::Text(entity_label_id), Value::Text(snapshot_content)],
+            ExecuteOptions::default(),
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -190,20 +277,18 @@ impl Engine {
         let bootstrap_commit_id = self
             .load_latest_commit_id()
             .await?
-            .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
-        if bootstrap_commit_id == GLOBAL_VERSION_ID {
-            self.seed_bootstrap_change_set().await?;
-            self.seed_bootstrap_commit().await?;
+            .unwrap_or_else(|| BOOTSTRAP_COMMIT_ID.to_string());
+        if bootstrap_commit_id == BOOTSTRAP_COMMIT_ID {
+            self.seed_bootstrap_change_set(BOOTSTRAP_CHANGE_SET_ID)
+                .await?;
+            self.seed_bootstrap_commit(BOOTSTRAP_COMMIT_ID, BOOTSTRAP_CHANGE_SET_ID)
+                .await?;
         }
         self.assert_commit_change_set_integrity(&bootstrap_commit_id)
             .await?;
         self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
         self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
-            .await?;
-        self.upsert_last_checkpoint_for_version(GLOBAL_VERSION_ID, &bootstrap_commit_id)
-            .await?;
-        self.upsert_last_checkpoint_for_version(&main_version_id, &bootstrap_commit_id)
             .await?;
 
         Ok(main_version_id)
@@ -529,7 +614,7 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn upsert_last_checkpoint_for_version(
+    pub(crate) async fn insert_last_checkpoint_for_version(
         &self,
         version_id: &str,
         checkpoint_commit_id: &str,
@@ -537,9 +622,7 @@ impl Engine {
         self.backend
             .execute(
                 "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
-                 VALUES ($1, $2) \
-                 ON CONFLICT (version_id) DO UPDATE \
-                 SET checkpoint_commit_id = excluded.checkpoint_commit_id",
+                 VALUES ($1, $2)",
                 &[
                     Value::Text(version_id.to_string()),
                     Value::Text(checkpoint_commit_id.to_string()),
@@ -571,7 +654,7 @@ impl Engine {
                 .resolve_last_checkpoint_commit_id_for_tip(&commit_id)
                 .await?
                 .unwrap_or_else(|| commit_id.clone());
-            self.upsert_last_checkpoint_for_version(&version_id, &checkpoint_commit_id)
+            self.insert_last_checkpoint_for_version(&version_id, &checkpoint_commit_id)
                 .await?;
         }
 
@@ -635,7 +718,11 @@ impl Engine {
         Ok(Some(text_value(first.get(0), "checkpoint ancestor id")?))
     }
 
-    pub(crate) async fn seed_bootstrap_commit(&self) -> Result<(), LixError> {
+    pub(crate) async fn seed_bootstrap_commit(
+        &self,
+        commit_id: &str,
+        change_set_id: &str,
+    ) -> Result<(), LixError> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
@@ -646,7 +733,7 @@ impl Engine {
                    AND version_id = 'global' \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
-                &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+                &[Value::Text(commit_id.to_string())],
                 ExecuteOptions::default(),
             )
             .await?;
@@ -655,8 +742,8 @@ impl Engine {
         }
 
         let snapshot_content = serde_json::json!({
-            "id": GLOBAL_VERSION_ID,
-            "change_set_id": GLOBAL_VERSION_ID,
+            "id": commit_id,
+            "change_set_id": change_set_id,
             "parent_commit_ids": [],
             "change_ids": [],
         })
@@ -666,7 +753,7 @@ impl Engine {
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', true)",
             &[
-                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text(commit_id.to_string()),
                 Value::Text(snapshot_content),
             ],
             ExecuteOptions::default(),
@@ -675,7 +762,10 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn seed_bootstrap_change_set(&self) -> Result<(), LixError> {
+    pub(crate) async fn seed_bootstrap_change_set(
+        &self,
+        change_set_id: &str,
+    ) -> Result<(), LixError> {
         let existing = self
             .execute_internal(
                 "SELECT 1 \
@@ -686,7 +776,7 @@ impl Engine {
                    AND version_id = 'global' \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
-                &[Value::Text(GLOBAL_VERSION_ID.to_string())],
+                &[Value::Text(change_set_id.to_string())],
                 ExecuteOptions::default(),
             )
             .await?;
@@ -695,7 +785,7 @@ impl Engine {
         }
 
         let snapshot_content = serde_json::json!({
-            "id": GLOBAL_VERSION_ID,
+            "id": change_set_id,
         })
         .to_string();
         self.execute_internal(
@@ -703,7 +793,7 @@ impl Engine {
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', true)",
             &[
-                Value::Text(GLOBAL_VERSION_ID.to_string()),
+                Value::Text(change_set_id.to_string()),
                 Value::Text(snapshot_content),
             ],
             ExecuteOptions::default(),

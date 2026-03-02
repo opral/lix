@@ -5,8 +5,11 @@ const INIT_STATEMENTS: &[&str] = &[
      id TEXT PRIMARY KEY,\
      content TEXT\
      )",
-    "INSERT INTO lix_internal_snapshot (id, content) VALUES ('no-content', NULL) \
-     ON CONFLICT (id) DO NOTHING",
+    "INSERT INTO lix_internal_snapshot (id, content) \
+     SELECT 'no-content', NULL \
+     WHERE NOT EXISTS ( \
+       SELECT 1 FROM lix_internal_snapshot WHERE id = 'no-content' \
+     )",
     "CREATE TABLE IF NOT EXISTS lix_internal_change (\
      id TEXT PRIMARY KEY,\
      entity_id TEXT NOT NULL,\
