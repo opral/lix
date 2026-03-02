@@ -15,6 +15,7 @@ use super::registry::RewritePhase;
 const LOGICAL_READ_VIEW_NAMES: &[&str] = &[
     "lix_active_account",
     "lix_active_version",
+    "lix_change",
     "lix_state",
     "lix_state_by_version",
     "lix_state_history",

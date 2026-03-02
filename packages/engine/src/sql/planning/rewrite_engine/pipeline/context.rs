@@ -72,6 +72,7 @@ impl AnalysisContext {
     pub(crate) fn references_any_logical_read_view(&self) -> bool {
         self.references_any_filesystem_view()
             || self.references_entity_views()
+            || self.references_relation("lix_change")
             || self.references_relation("lix_version")
             || self.references_relation("lix_active_version")
             || self.references_relation("lix_active_account")
@@ -97,7 +98,8 @@ fn is_physical_internal_relation(name: &str) -> bool {
 }
 
 fn is_builtin_logical_relation(name: &str) -> bool {
-    name == "lix_version"
+    name == "lix_change"
+        || name == "lix_version"
         || name == "lix_active_version"
         || name == "lix_active_account"
         || name == "lix_state"

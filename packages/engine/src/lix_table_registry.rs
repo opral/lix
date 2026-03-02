@@ -15,6 +15,18 @@ const LIX_WORKING_CHANGES_COLUMNS: &[&str] = &[
     "status",
 ];
 
+const LIX_CHANGE_COLUMNS: &[&str] = &[
+    "id",
+    "entity_id",
+    "schema_key",
+    "schema_version",
+    "file_id",
+    "plugin_key",
+    "metadata",
+    "created_at",
+    "snapshot_content",
+];
+
 const LIX_FILE_COLUMNS: &[&str] = &[
     "id",
     "directory_id",
@@ -73,6 +85,10 @@ const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     LixTableSpec {
         name: "lix_state_history",
         columns: &[],
+    },
+    LixTableSpec {
+        name: "lix_change",
+        columns: LIX_CHANGE_COLUMNS,
     },
     LixTableSpec {
         name: "lix_working_changes",

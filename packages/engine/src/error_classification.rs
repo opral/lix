@@ -232,4 +232,27 @@ mod tests {
             .contains("Table `lix_sate` does not exist."));
         assert!(error.description.contains("lix_state"));
     }
+
+    #[test]
+    fn normalizes_unknown_column_for_lix_change_with_columns() {
+        let statements = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT snapshot_json FROM lix_change WHERE id = 'c1'",
+        )
+        .expect("parse SQL");
+        let error = normalize_sql_error(
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "no such column: snapshot_json".to_string(),
+            },
+            &statements,
+        );
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(error
+            .description
+            .contains("Column `snapshot_json` does not exist on `lix_change`."));
+        assert!(error
+            .description
+            .contains("Available columns: id, entity_id"));
+    }
 }
