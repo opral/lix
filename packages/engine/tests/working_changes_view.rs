@@ -774,3 +774,37 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_working_changes_supports_nested_filesystem_subquery_filters,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.expect("init should succeed");
+
+        let file_path = format!("/{}.txt", unique_key("wc-view-nested-subquery"));
+        engine
+            .execute(
+                "INSERT INTO lix_file (path, data, metadata) VALUES ($1, lix_text_encode('hello'), NULL)",
+                &[Value::Text(file_path.clone())],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_working_changes wc \
+                 WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = $1)",
+                &[Value::Text(file_path)],
+            )
+            .await
+            .expect("nested subquery filter over lix_file should succeed");
+
+        assert_eq!(rows.rows.len(), 1);
+        let count = as_i64(&rows.rows[0][0]);
+        assert!(count >= 0, "count should be non-negative");
+    }
+);
