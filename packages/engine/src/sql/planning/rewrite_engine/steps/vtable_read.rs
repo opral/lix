@@ -7,7 +7,6 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
 
-use crate::backend::SqlDialect;
 use crate::engine::sql::planning::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
     PlaceholderOrdinalState,
@@ -630,7 +629,7 @@ pub fn rewrite_query(query: Query, params: &[LixValue]) -> Result<Option<Query>,
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed)?;
+    rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed, None)?;
 
     if changed {
         Ok(Some(new_query))
@@ -646,13 +645,11 @@ pub async fn rewrite_query_with_backend(
 ) -> Result<Option<Query>, LixError> {
     let mut query = query;
     normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
+    let available_schema_keys = fetch_registered_schema_keys(backend).await?;
 
     let mut schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
-    if schema_keys.is_empty() {
-        schema_keys = extract_schema_keys_from_query_deep(&query);
-    }
     if !schema_keys.is_empty() {
-        validate_registered_schema_keys(backend, &schema_keys).await?;
+        validate_schema_keys_against_available(&schema_keys, &available_schema_keys)?;
     }
 
     // If no schema-key literal is available, fall back to plugin-key derived
@@ -666,12 +663,18 @@ pub async fn rewrite_query_with_backend(
         }
     }
     if schema_keys.is_empty() {
-        schema_keys = fetch_materialized_schema_keys(backend).await?;
+        schema_keys = available_schema_keys.clone();
     }
 
     let mut changed = false;
     let mut new_query = query.clone();
-    rewrite_query_inner(&mut new_query, &schema_keys, params, &mut changed)?;
+    rewrite_query_inner(
+        &mut new_query,
+        &schema_keys,
+        params,
+        &mut changed,
+        Some(&available_schema_keys),
+    )?;
 
     if changed {
         Ok(Some(new_query))
@@ -685,8 +688,12 @@ fn rewrite_query_inner(
     schema_keys: &[String],
     params: &[LixValue],
     changed: &mut bool,
+    available_schema_keys: Option<&[String]>,
 ) -> Result<(), LixError> {
     let query_schema_keys = resolve_schema_keys_for_query(query, schema_keys, params);
+    if let Some(available) = available_schema_keys {
+        validate_schema_keys_against_available(&query_schema_keys, available)?;
+    }
     let top_level_targets_vtable = query_targets_vtable(&query);
     let pushdown_predicate = if top_level_targets_vtable {
         extract_pushdown_predicate(&query)
@@ -696,7 +703,13 @@ fn rewrite_query_inner(
 
     if let Some(with) = query.with.as_mut() {
         for cte in &mut with.cte_tables {
-            rewrite_query_inner(&mut cte.query, &query_schema_keys, params, changed)?;
+            rewrite_query_inner(
+                &mut cte.query,
+                &query_schema_keys,
+                params,
+                changed,
+                available_schema_keys,
+            )?;
         }
     }
     query.body = Box::new(rewrite_set_expr(
@@ -705,6 +718,7 @@ fn rewrite_query_inner(
         pushdown_predicate.as_ref(),
         params,
         changed,
+        available_schema_keys,
     )?);
     Ok(())
 }
@@ -715,6 +729,7 @@ fn rewrite_set_expr(
     pushdown_predicate: Option<&Expr>,
     params: &[LixValue],
     changed: &mut bool,
+    available_schema_keys: Option<&[String]>,
 ) -> Result<SetExpr, LixError> {
     Ok(match expr {
         SetExpr::Select(select) => {
@@ -725,12 +740,19 @@ fn rewrite_set_expr(
                 pushdown_predicate,
                 params,
                 changed,
+                available_schema_keys,
             )?;
             SetExpr::Select(Box::new(select))
         }
         SetExpr::Query(query) => {
             let mut query = *query;
-            rewrite_query_inner(&mut query, schema_keys, params, changed)?;
+            rewrite_query_inner(
+                &mut query,
+                schema_keys,
+                params,
+                changed,
+                available_schema_keys,
+            )?;
             SetExpr::Query(Box::new(query))
         }
         SetExpr::SetOperation {
@@ -747,6 +769,7 @@ fn rewrite_set_expr(
                 pushdown_predicate,
                 params,
                 changed,
+                available_schema_keys,
             )?),
             right: Box::new(rewrite_set_expr(
                 *right,
@@ -754,6 +777,7 @@ fn rewrite_set_expr(
                 pushdown_predicate,
                 params,
                 changed,
+                available_schema_keys,
             )?),
         },
         other => other,
@@ -766,11 +790,12 @@ fn rewrite_select(
     pushdown_predicate: Option<&Expr>,
     params: &[LixValue],
     changed: &mut bool,
+    available_schema_keys: Option<&[String]>,
 ) -> Result<(), LixError> {
     for table in &mut select.from {
         rewrite_table_with_joins(table, schema_keys, pushdown_predicate, params, changed)?;
     }
-    rewrite_subqueries_in_select(select, schema_keys, params, changed)?;
+    rewrite_subqueries_in_select(select, schema_keys, params, changed, available_schema_keys)?;
     Ok(())
 }
 
@@ -779,11 +804,13 @@ fn rewrite_subqueries_in_select(
     schema_keys: &[String],
     params: &[LixValue],
     changed: &mut bool,
+    available_schema_keys: Option<&[String]>,
 ) -> Result<(), LixError> {
     struct NestedQueryRewriter<'a> {
         schema_keys: &'a [String],
         params: &'a [LixValue],
         changed: &'a mut bool,
+        available_schema_keys: Option<&'a [String]>,
     }
 
     impl VisitorMut for NestedQueryRewriter<'_> {
@@ -791,9 +818,13 @@ fn rewrite_subqueries_in_select(
 
         fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
             let mut nested_changed = false;
-            if let Err(error) =
-                rewrite_query_inner(query, self.schema_keys, self.params, &mut nested_changed)
-            {
+            if let Err(error) = rewrite_query_inner(
+                query,
+                self.schema_keys,
+                self.params,
+                &mut nested_changed,
+                self.available_schema_keys,
+            ) {
                 return ControlFlow::Break(error);
             }
             if nested_changed {
@@ -807,6 +838,7 @@ fn rewrite_subqueries_in_select(
         schema_keys,
         params,
         changed,
+        available_schema_keys,
     };
     if let ControlFlow::Break(error) = VisitMut::visit(select, &mut visitor) {
         return Err(error);
@@ -993,60 +1025,6 @@ fn table_factor_is_vtable(relation: &TableFactor) -> bool {
 
 fn extract_schema_keys_from_query(query: &Query, params: &[LixValue]) -> Option<Vec<String>> {
     extract_column_keys_from_query(query, expr_is_schema_key_column, params)
-}
-
-fn extract_schema_keys_from_query_deep(query: &Query) -> Vec<String> {
-    let mut keys = Vec::new();
-    collect_schema_keys_from_query(query, &mut keys);
-    dedup_strings(keys)
-}
-
-fn collect_schema_keys_from_query(query: &Query, keys: &mut Vec<String>) {
-    if let Some(found) = extract_schema_keys_from_query(query, &[]) {
-        keys.extend(found);
-    }
-    if let Some(with) = query.with.as_ref() {
-        for cte in &with.cte_tables {
-            collect_schema_keys_from_query(&cte.query, keys);
-        }
-    }
-    collect_schema_keys_from_set_expr(&query.body, keys);
-}
-
-fn collect_schema_keys_from_set_expr(expr: &SetExpr, keys: &mut Vec<String>) {
-    match expr {
-        SetExpr::Select(select) => collect_schema_keys_from_select(select, keys),
-        SetExpr::Query(query) => collect_schema_keys_from_query(query, keys),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_schema_keys_from_set_expr(left, keys);
-            collect_schema_keys_from_set_expr(right, keys);
-        }
-        _ => {}
-    }
-}
-
-fn collect_schema_keys_from_select(select: &Select, keys: &mut Vec<String>) {
-    for table in &select.from {
-        collect_schema_keys_from_table_factor(&table.relation, keys);
-        for join in &table.joins {
-            collect_schema_keys_from_table_factor(&join.relation, keys);
-        }
-    }
-}
-
-fn collect_schema_keys_from_table_factor(relation: &TableFactor, keys: &mut Vec<String>) {
-    match relation {
-        TableFactor::Derived { subquery, .. } => collect_schema_keys_from_query(subquery, keys),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            collect_schema_keys_from_table_factor(&table_with_joins.relation, keys);
-            for join in &table_with_joins.joins {
-                collect_schema_keys_from_table_factor(&join.relation, keys);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn resolve_schema_keys_for_query(
@@ -1316,16 +1294,6 @@ fn is_simple_binary_op(op: &BinaryOperator) -> bool {
     )
 }
 
-fn dedup_strings(values: Vec<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    for value in values {
-        if !out.contains(&value) {
-            out.push(value);
-        }
-    }
-    out
-}
-
 fn intersect_strings(left: &[String], right: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for value in left {
@@ -1366,28 +1334,28 @@ fn escape_string_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {
-    let sql = match backend.dialect() {
-        SqlDialect::Sqlite => {
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'lix_internal_state_materialized_v1_%'"
-        }
-        SqlDialect::Postgres => {
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = current_schema() \
-               AND table_type = 'BASE TABLE' \
-               AND table_name LIKE 'lix_internal_state_materialized_v1_%'"
-        }
-    };
-    let result = backend.execute(sql, &[]).await?;
+async fn fetch_registered_schema_keys(backend: &dyn LixBackend) -> Result<Vec<String>, LixError> {
+    let result = backend
+        .execute(
+            "SELECT entity_id \
+             FROM lix_internal_state_materialized_v1_lix_stored_schema \
+             WHERE schema_key = 'lix_stored_schema' \
+               AND version_id = 'global' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL",
+            &[],
+        )
+        .await?;
 
     let mut keys = Vec::new();
     for row in &result.rows {
-        let Some(LixValue::Text(name)) = row.first() else {
+        let Some(LixValue::Text(entity_id)) = row.first() else {
             continue;
         };
-        let Some(schema_key) = name.strip_prefix(MATERIALIZED_PREFIX) else {
-            continue;
-        };
+        let schema_key = entity_id
+            .split_once('~')
+            .map(|(key, _)| key)
+            .unwrap_or(entity_id.as_str());
         if schema_key.is_empty() {
             continue;
         }
@@ -1400,11 +1368,10 @@ async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<
     Ok(keys)
 }
 
-async fn validate_registered_schema_keys(
-    backend: &dyn LixBackend,
+fn validate_schema_keys_against_available(
     schema_keys: &[String],
+    available: &[String],
 ) -> Result<(), LixError> {
-    let available = fetch_materialized_schema_keys(backend).await?;
     if available.is_empty() {
         return Ok(());
     }
@@ -1480,7 +1447,6 @@ mod tests {
     use super::{
         build_untracked_union_query, extract_plugin_keys_from_query,
         extract_plugin_keys_from_top_level_derived_subquery, extract_pushdown_predicate,
-        extract_schema_keys_from_query_deep,
     };
     use crate::engine::sql::planning::rewrite_engine::preprocess_sql_rewrite_only as preprocess_sql;
     use sqlparser::ast::{Query, Statement};
@@ -1796,16 +1762,6 @@ mod tests {
             extract_plugin_keys_from_query(&query, &[]).is_none(),
             "mixed OR should not produce a plugin-only key set"
         );
-    }
-
-    #[test]
-    fn extracts_schema_keys_from_nested_derived_subquery_filter() {
-        let query = parse_query(
-            "SELECT COUNT(*) \
-             FROM (SELECT * FROM lix_internal_state_vtable WHERE schema_key = 'schema_a') AS ranked",
-        );
-        let keys = extract_schema_keys_from_query_deep(&query);
-        assert_eq!(keys, vec!["schema_a".to_string()]);
     }
 
     #[test]
