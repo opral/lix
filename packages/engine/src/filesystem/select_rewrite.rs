@@ -130,7 +130,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                COALESCE(fd.data, lix_empty_blob()) AS data, \
+                fd.data AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -229,7 +229,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                COALESCE(fd.data, lix_empty_blob()) AS data, \
+                fd.data AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -460,7 +460,7 @@ fn build_filesystem_projection_query(view_name: &str) -> Result<Option<Query>, L
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                COALESCE(fd.data, lix_empty_blob()) AS data, \
+                fd.data AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -789,7 +789,7 @@ mod tests {
             .expect("query should be rewritten")
             .to_string();
 
-        assert!(rewritten.contains("COALESCE(fd.data, lix_empty_blob()) AS data"));
+        assert!(rewritten.contains("fd.data AS data"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("FROM lix_internal_state_untracked"));
@@ -808,7 +808,7 @@ mod tests {
             .expect("query should be rewritten")
             .to_string();
 
-        assert!(rewritten.contains("COALESCE(fd.data, lix_empty_blob()) AS data"));
+        assert!(rewritten.contains("fd.data AS data"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("LEFT JOIN lix_version v"));

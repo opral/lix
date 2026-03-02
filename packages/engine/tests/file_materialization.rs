@@ -2584,6 +2584,81 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_read_cache_miss_does_not_return_empty_when_blob_ref_is_non_empty,
+    simulations = [sqlite],
+    |sim| async move {
+        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-empty-read-regression', '/empty-read-regression.json', lix_text_encode('{\"hello\":\"from-read\"}'))",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+
+        let blob_ref_rows = engine
+            .execute(
+                "SELECT size_bytes \
+                 FROM lix_internal_binary_file_version_ref \
+                 WHERE file_id = 'file-empty-read-regression' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("blob ref query should succeed");
+        assert_eq!(blob_ref_rows.rows.len(), 1);
+        assert!(
+            value_as_i64(&blob_ref_rows.rows[0][0]) > 0,
+            "expected non-empty blob ref before read cache miss"
+        );
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_file_data_cache \
+                 WHERE file_id = 'file-empty-read-regression'",
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+
+        let cache_rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_file_data_cache \
+                 WHERE file_id = 'file-empty-read-regression'",
+                &[],
+            )
+            .await
+            .expect("cache count query should succeed");
+        assert_eq!(cache_rows.rows.len(), 1);
+        assert_eq!(value_as_i64(&cache_rows.rows[0][0]), 0);
+
+        let rows = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'file-empty-read-regression' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("lix_file read should succeed");
+        let cache_rows_after_read = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_file_data_cache \
+                 WHERE file_id = 'file-empty-read-regression'",
+                &[],
+            )
+            .await
+            .expect("cache count after read should succeed");
+        assert_eq!(cache_rows_after_read.rows.len(), 1);
+        assert_eq!(value_as_i64(&cache_rows_after_read.rows[0][0]), 1);
+        assert_eq!(rows.rows.len(), 1);
+        assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"hello":"from-read"}));
+    }
+);
+
+simulation_test!(
     file_by_version_read_materializes_cache_miss_for_non_active_version,
     simulations = [sqlite, postgres],
     |sim| async move {
