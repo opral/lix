@@ -210,6 +210,32 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_by_version_select_unknown_schema_key_returns_schema_not_registered_error,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let err = engine
+            .execute(
+                "SELECT entity_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'markdown_v2_document' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect_err("unknown schema key should fail before execution");
+
+        assert_eq!(err.code, "LIX_ERROR_SCHEMA_NOT_REGISTERED");
+        assert!(err.description.contains("Schema `markdown_v2_document`"));
+        assert!(err.description.contains("SELECT * FROM lix_stored_schema"));
+    }
+);
+
+simulation_test!(
     lix_state_by_version_select_child_tombstone_hides_parent_row,
     |sim| async move {
         let engine = sim

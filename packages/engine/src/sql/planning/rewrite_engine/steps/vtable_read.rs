@@ -21,7 +21,7 @@ use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
     version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, Value as LixValue};
+use crate::{errors, LixBackend, LixError, Value as LixValue};
 
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
@@ -648,6 +648,12 @@ pub async fn rewrite_query_with_backend(
     normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
 
     let mut schema_keys = extract_schema_keys_from_query(&query, params).unwrap_or_default();
+    if schema_keys.is_empty() {
+        schema_keys = extract_schema_keys_from_query_deep(&query);
+    }
+    if !schema_keys.is_empty() {
+        validate_registered_schema_keys(backend, &schema_keys).await?;
+    }
 
     // If no schema-key literal is available, fall back to plugin-key derived
     // schema resolution and finally to all materialized schema tables.
@@ -989,14 +995,12 @@ fn extract_schema_keys_from_query(query: &Query, params: &[LixValue]) -> Option<
     extract_column_keys_from_query(query, expr_is_schema_key_column, params)
 }
 
-#[cfg(test)]
 fn extract_schema_keys_from_query_deep(query: &Query) -> Vec<String> {
     let mut keys = Vec::new();
     collect_schema_keys_from_query(query, &mut keys);
     dedup_strings(keys)
 }
 
-#[cfg(test)]
 fn collect_schema_keys_from_query(query: &Query, keys: &mut Vec<String>) {
     if let Some(found) = extract_schema_keys_from_query(query, &[]) {
         keys.extend(found);
@@ -1009,7 +1013,6 @@ fn collect_schema_keys_from_query(query: &Query, keys: &mut Vec<String>) {
     collect_schema_keys_from_set_expr(&query.body, keys);
 }
 
-#[cfg(test)]
 fn collect_schema_keys_from_set_expr(expr: &SetExpr, keys: &mut Vec<String>) {
     match expr {
         SetExpr::Select(select) => collect_schema_keys_from_select(select, keys),
@@ -1022,7 +1025,6 @@ fn collect_schema_keys_from_set_expr(expr: &SetExpr, keys: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
 fn collect_schema_keys_from_select(select: &Select, keys: &mut Vec<String>) {
     for table in &select.from {
         collect_schema_keys_from_table_factor(&table.relation, keys);
@@ -1032,7 +1034,6 @@ fn collect_schema_keys_from_select(select: &Select, keys: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
 fn collect_schema_keys_from_table_factor(relation: &TableFactor, keys: &mut Vec<String>) {
     match relation {
         TableFactor::Derived { subquery, .. } => collect_schema_keys_from_query(subquery, keys),
@@ -1315,7 +1316,6 @@ fn is_simple_binary_op(op: &BinaryOperator) -> bool {
     )
 }
 
-#[cfg(test)]
 fn dedup_strings(values: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for value in values {
@@ -1398,6 +1398,26 @@ async fn fetch_materialized_schema_keys(backend: &dyn LixBackend) -> Result<Vec<
 
     keys.sort();
     Ok(keys)
+}
+
+async fn validate_registered_schema_keys(
+    backend: &dyn LixBackend,
+    schema_keys: &[String],
+) -> Result<(), LixError> {
+    let available = fetch_materialized_schema_keys(backend).await?;
+    if available.is_empty() {
+        return Ok(());
+    }
+    let available_refs = available.iter().map(String::as_str).collect::<Vec<_>>();
+    for schema_key in schema_keys {
+        if !available.iter().any(|existing| existing == schema_key) {
+            return Err(errors::schema_not_registered_error(
+                schema_key,
+                &available_refs,
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_schema_keys_for_plugins(
