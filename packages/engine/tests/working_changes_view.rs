@@ -699,3 +699,78 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_working_changes_second_init_error_does_not_clear_rows,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (path, data, metadata) \
+                 VALUES ('/wc-reinit.md', lix_text_encode('hello'), NULL)",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let file = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_file \
+                 WHERE path = '/wc-reinit.md' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("file lookup should succeed");
+        assert_eq!(file.rows.len(), 1);
+        let file_id = as_text(&file.rows[0][0]);
+
+        let before = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_working_changes \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND file_id = 'lix' \
+                   AND entity_id = $1",
+                &[Value::Text(file_id.clone())],
+            )
+            .await
+            .expect("working changes query before reinit should succeed");
+        let before_count = as_i64(&before.rows[0][0]);
+        assert!(
+            before_count > 0,
+            "expected file insert to produce working changes before reinit"
+        );
+
+        let init_err = engine
+            .init()
+            .await
+            .expect_err("second init should return already initialized");
+        assert_eq!(init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
+
+        let after = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_working_changes \
+                 WHERE schema_key = 'lix_file_descriptor' \
+                   AND file_id = 'lix' \
+                   AND entity_id = $1",
+                &[Value::Text(file_id)],
+            )
+            .await
+            .expect("working changes query after reinit should succeed");
+        let after_count = as_i64(&after.rows[0][0]);
+
+        assert!(
+            after_count > 0,
+            "working changes disappeared after reinit (before={before_count}, after={after_count})"
+        );
+    }
+);

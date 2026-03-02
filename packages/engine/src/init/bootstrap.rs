@@ -2,7 +2,19 @@ use super::*;
 
 impl Engine {
     pub async fn init(&self) -> Result<(), LixError> {
-        let clear_boot_pending = self.deterministic_boot_pending.load(Ordering::SeqCst);
+        if self
+            .init_state
+            .compare_exchange(
+                INIT_STATE_NOT_STARTED,
+                INIT_STATE_IN_PROGRESS,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(crate::errors::already_initialized_error());
+        }
+
         let result = async {
             init_backend(self.backend.as_ref()).await?;
             self.ensure_builtin_schemas_installed().await?;
@@ -19,9 +31,16 @@ impl Engine {
         }
         .await;
 
-        if clear_boot_pending && result.is_ok() {
-            self.deterministic_boot_pending
-                .store(false, Ordering::SeqCst);
+        if result.is_ok() {
+            if self.deterministic_boot_pending.load(Ordering::SeqCst) {
+                self.deterministic_boot_pending
+                    .store(false, Ordering::SeqCst);
+            }
+            self.init_state
+                .store(INIT_STATE_COMPLETED, Ordering::SeqCst);
+        } else {
+            self.init_state
+                .store(INIT_STATE_NOT_STARTED, Ordering::SeqCst);
         }
 
         result

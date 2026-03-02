@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -72,6 +72,9 @@ pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+pub(crate) const INIT_STATE_NOT_STARTED: u8 = 0;
+pub(crate) const INIT_STATE_IN_PROGRESS: u8 = 1;
+pub(crate) const INIT_STATE_COMPLETED: u8 = 2;
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub writer_key: Option<String>,
@@ -88,6 +91,7 @@ pub struct Engine {
     boot_active_account: Option<BootAccount>,
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
+    init_state: AtomicU8,
     active_version_id: RwLock<String>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
@@ -288,6 +292,7 @@ impl Engine {
             boot_active_account: args.active_account,
             boot_deterministic_settings,
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
+            init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             active_version_id: RwLock::new(GLOBAL_VERSION_ID.to_string()),
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
