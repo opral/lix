@@ -167,14 +167,13 @@ async fn insert_versions(engine: &lix_engine::Engine) -> Result<(), LixError> {
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
-                 ) VALUES (?, ?, ?, 0, ?, ?)",
+                 id, name, inherits_from_version_id, hidden, commit_id\
+                 ) VALUES (?, ?, ?, 0, ?)",
                 &[
                     Value::Text(version_id.clone()),
                     Value::Text(version_id.clone()),
                     Value::Text(parent),
                     Value::Text(format!("commit-{version_id}")),
-                    Value::Text(format!("working-{version_id}")),
                 ],
                 ExecuteOptions::default(),
             )

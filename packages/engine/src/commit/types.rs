@@ -18,7 +18,6 @@ pub struct DomainChangeInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionSnapshot {
     pub id: String,
-    pub working_commit_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

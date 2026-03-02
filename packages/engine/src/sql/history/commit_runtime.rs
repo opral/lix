@@ -139,7 +139,6 @@ pub(crate) async fn load_version_info_for_versions(
                 parent_commit_ids: Vec::new(),
                 snapshot: VersionSnapshot {
                     id: version_id.clone(),
-                    working_commit_id: version_id.clone(),
                 },
             },
         );
@@ -222,23 +221,15 @@ fn parse_version_info_from_tip_snapshot(
     } else {
         snapshot.id
     };
-    let working_commit_id = snapshot
-        .working_commit_id
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fallback_version_id.to_string());
-    let parent_commit_ids =
-        if snapshot.commit_id.is_empty() || snapshot.commit_id == working_commit_id {
-            Vec::new()
-        } else {
-            vec![snapshot.commit_id]
-        };
+    let parent_commit_ids = if snapshot.commit_id.is_empty() {
+        Vec::new()
+    } else {
+        vec![snapshot.commit_id]
+    };
 
     Ok(Some(VersionInfo {
         parent_commit_ids,
-        snapshot: VersionSnapshot {
-            id: version_id,
-            working_commit_id,
-        },
+        snapshot: VersionSnapshot { id: version_id },
     }))
 }
 

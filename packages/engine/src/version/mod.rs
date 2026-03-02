@@ -140,15 +140,10 @@ pub(crate) fn version_pointer_storage_version_id() -> &'static str {
     &version_pointer_schema_metadata().storage_version_id
 }
 
-pub(crate) fn version_pointer_snapshot_content(
-    id: &str,
-    commit_id: &str,
-    working_commit_id: &str,
-) -> String {
+pub(crate) fn version_pointer_snapshot_content(id: &str, commit_id: &str) -> String {
     serde_json::to_string(&LixVersionPointer {
         id: id.to_string(),
         commit_id: commit_id.to_string(),
-        working_commit_id: Some(working_commit_id.to_string()),
     })
     .expect("lix_version_pointer snapshot serialization must succeed")
 }

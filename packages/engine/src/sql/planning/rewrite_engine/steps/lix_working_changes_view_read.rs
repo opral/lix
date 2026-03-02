@@ -60,15 +60,27 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                   AND snapshot_content IS NOT NULL \
                 LIMIT 1 \
             ), \
-            wc AS ( \
-                SELECT lix_json_extract(snapshot_content, 'working_commit_id') AS id \
+            tip_commit AS ( \
+                SELECT lix_json_extract(snapshot_content, 'commit_id') AS id \
                 FROM version_pointer \
                 LIMIT 1 \
+            ), \
+            baseline_commit AS ( \
+                SELECT COALESCE( \
+                    ( \
+                        SELECT checkpoint_commit_id \
+                        FROM lix_internal_last_checkpoint \
+                        WHERE version_id = (SELECT version_id FROM active_version) \
+                        LIMIT 1 \
+                    ), \
+                    (SELECT id FROM tip_commit) \
+                ) AS id \
             ), \
             commit_rows AS ( \
                 SELECT \
                     entity_id AS id, \
-                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+                    created_at \
                 FROM lix_internal_state_untracked \
                 WHERE schema_key = 'lix_commit' \
                   AND file_id = 'lix' \
@@ -79,7 +91,8 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
  \
                 SELECT \
                     entity_id AS id, \
-                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
+                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+                    created_at \
                 FROM lix_internal_state_materialized_v1_lix_commit \
                 WHERE schema_key = 'lix_commit' \
                   AND file_id = 'lix' \
@@ -87,24 +100,15 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                   AND is_tombstone = 0 \
                   AND snapshot_content IS NOT NULL \
             ), \
-            working_change_rows AS ( \
+            change_rows AS ( \
                 SELECT \
-                    entity_id AS change_id, \
-                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_extract(snapshot_content, 'file_id') AS file_id, \
-                    COALESCE( \
-                        lix_json_extract(snapshot_content, 'metadata', 'lix_internal_source_change_id'), \
-                        entity_id \
-                    ) AS effective_change_id, \
-                    lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = 'lix_change' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND snapshot_content IS NOT NULL \
+                    ch.id AS change_id, \
+                    snap.content AS row_snapshot \
+                FROM lix_internal_change ch \
+                LEFT JOIN lix_internal_snapshot snap \
+                    ON snap.id = ch.snapshot_id \
             ), \
-            working_change_set_element_rows AS ( \
+            change_set_element_rows AS ( \
                 SELECT \
                     lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
                     lix_json_extract(snapshot_content, 'change_id') AS change_id, \
@@ -115,43 +119,6 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                 WHERE schema_key = 'lix_change_set_element' \
                   AND file_id = 'lix' \
                   AND version_id = 'global' \
-                  AND snapshot_content IS NOT NULL \
-            ), \
-            baseline_change_rows AS ( \
-                SELECT \
-                    entity_id AS change_id, \
-                    lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = 'lix_change' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND (metadata IS NULL OR metadata != '{\"lix_internal_working_projection\":true}') \
-                  AND snapshot_content IS NOT NULL \
- \
-                UNION \
- \
-                SELECT \
-                    entity_id AS change_id, \
-                    lix_json_extract(snapshot_content, 'snapshot_content') AS row_snapshot \
-                FROM lix_internal_state_materialized_v1_lix_change \
-                WHERE schema_key = 'lix_change' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND snapshot_content IS NOT NULL \
-            ), \
-            checkpoint_change_set_element_rows AS ( \
-                SELECT \
-                    lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
-                    lix_json_extract(snapshot_content, 'change_id') AS change_id, \
-                    lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
-                    lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
-                    lix_json_extract(snapshot_content, 'file_id') AS file_id \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = 'lix_change_set_element' \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND (metadata IS NULL OR metadata != '{\"lix_internal_working_projection\":true}') \
                   AND snapshot_content IS NOT NULL \
  \
                 UNION \
@@ -169,83 +136,206 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                   AND is_tombstone = 0 \
                   AND snapshot_content IS NOT NULL \
             ), \
-            cc AS ( \
-                SELECT lix_json_extract(snapshot_content, 'commit_id') AS id \
-                FROM version_pointer \
-                LIMIT 1 \
-            ), \
-            wcs AS ( \
-                SELECT c.change_set_id \
-                FROM commit_rows c \
-                WHERE c.id = (SELECT id FROM wc) \
-            ), \
-            ccs AS ( \
-                SELECT c.change_set_id \
-                FROM commit_rows c \
-                WHERE c.id = (SELECT id FROM cc) \
-            ) \
-            SELECT * \
-            FROM ( \
+            tip_ancestry AS ( \
                 SELECT \
-                    ch.entity_id AS entity_id, \
-                    ch.schema_key AS schema_key, \
-                    ch.file_id AS file_id, \
+                    ancestor_id AS commit_id, \
+                    depth \
+                FROM lix_internal_commit_ancestry \
+                WHERE commit_id = (SELECT id FROM tip_commit) \
+            ), \
+            baseline_ancestry AS ( \
+                SELECT \
+                    ancestor_id AS commit_id, \
+                    depth \
+                FROM lix_internal_commit_ancestry \
+                WHERE commit_id = (SELECT id FROM baseline_commit) \
+            ), \
+            tip_candidates AS ( \
+                SELECT \
+                    cse.entity_id, \
+                    cse.schema_key, \
+                    cse.file_id, \
+                    cse.change_id, \
+                    anc.depth, \
+                    c.created_at AS commit_created_at \
+                FROM tip_ancestry anc \
+                JOIN commit_rows c \
+                    ON c.id = anc.commit_id \
+                JOIN change_set_element_rows cse \
+                    ON cse.change_set_id = c.change_set_id \
+            ), \
+            tip_min_depth AS ( \
+                SELECT \
+                    entity_id, \
+                    schema_key, \
+                    file_id, \
+                    MIN(depth) AS depth \
+                FROM tip_candidates \
+                GROUP BY entity_id, schema_key, file_id \
+            ), \
+            tip_best_created_at AS ( \
+                SELECT \
+                    tc.entity_id, \
+                    tc.schema_key, \
+                    tc.file_id, \
+                    MAX(tc.commit_created_at) AS commit_created_at \
+                FROM tip_candidates tc \
+                JOIN tip_min_depth d \
+                    ON d.entity_id = tc.entity_id \
+                   AND d.schema_key = tc.schema_key \
+                   AND d.file_id = tc.file_id \
+                   AND d.depth = tc.depth \
+                GROUP BY tc.entity_id, tc.schema_key, tc.file_id \
+            ), \
+            tip_entries AS ( \
+                SELECT \
+                    tc.entity_id, \
+                    tc.schema_key, \
+                    tc.file_id, \
+                    MAX(tc.change_id) AS change_id \
+                FROM tip_candidates tc \
+                JOIN tip_min_depth d \
+                    ON d.entity_id = tc.entity_id \
+                   AND d.schema_key = tc.schema_key \
+                   AND d.file_id = tc.file_id \
+                   AND d.depth = tc.depth \
+                JOIN tip_best_created_at bc \
+                    ON bc.entity_id = tc.entity_id \
+                   AND bc.schema_key = tc.schema_key \
+                   AND bc.file_id = tc.file_id \
+                   AND bc.commit_created_at = tc.commit_created_at \
+                GROUP BY tc.entity_id, tc.schema_key, tc.file_id \
+            ), \
+            baseline_candidates AS ( \
+                SELECT \
+                    cse.entity_id, \
+                    cse.schema_key, \
+                    cse.file_id, \
+                    cse.change_id, \
+                    anc.depth, \
+                    c.created_at AS commit_created_at \
+                FROM baseline_ancestry anc \
+                JOIN commit_rows c \
+                    ON c.id = anc.commit_id \
+                JOIN change_set_element_rows cse \
+                    ON cse.change_set_id = c.change_set_id \
+            ), \
+            baseline_min_depth AS ( \
+                SELECT \
+                    entity_id, \
+                    schema_key, \
+                    file_id, \
+                    MIN(depth) AS depth \
+                FROM baseline_candidates \
+                GROUP BY entity_id, schema_key, file_id \
+            ), \
+            baseline_best_created_at AS ( \
+                SELECT \
+                    bc.entity_id, \
+                    bc.schema_key, \
+                    bc.file_id, \
+                    MAX(bc.commit_created_at) AS commit_created_at \
+                FROM baseline_candidates bc \
+                JOIN baseline_min_depth d \
+                    ON d.entity_id = bc.entity_id \
+                   AND d.schema_key = bc.schema_key \
+                   AND d.file_id = bc.file_id \
+                   AND d.depth = bc.depth \
+                GROUP BY bc.entity_id, bc.schema_key, bc.file_id \
+            ), \
+            baseline_entries AS ( \
+                SELECT \
+                    bc.entity_id, \
+                    bc.schema_key, \
+                    bc.file_id, \
+                    MAX(bc.change_id) AS change_id \
+                FROM baseline_candidates bc \
+                JOIN baseline_min_depth d \
+                    ON d.entity_id = bc.entity_id \
+                   AND d.schema_key = bc.schema_key \
+                   AND d.file_id = bc.file_id \
+                   AND d.depth = bc.depth \
+                JOIN baseline_best_created_at bca \
+                    ON bca.entity_id = bc.entity_id \
+                   AND bca.schema_key = bc.schema_key \
+                   AND bca.file_id = bc.file_id \
+                   AND bca.commit_created_at = bc.commit_created_at \
+                GROUP BY bc.entity_id, bc.schema_key, bc.file_id \
+            ), \
+            paired_entries AS ( \
+                SELECT \
+                    tip.entity_id AS entity_id, \
+                    tip.schema_key AS schema_key, \
+                    tip.file_id AS file_id, \
+                    base.change_id AS before_change_id, \
+                    tip.change_id AS after_change_id \
+                FROM tip_entries tip \
+                LEFT JOIN baseline_entries base \
+                    ON base.entity_id = tip.entity_id \
+                   AND base.schema_key = tip.schema_key \
+                   AND base.file_id = tip.file_id \
+ \
+                UNION ALL \
+ \
+                SELECT \
+                    base.entity_id AS entity_id, \
+                    base.schema_key AS schema_key, \
+                    base.file_id AS file_id, \
+                    base.change_id AS before_change_id, \
+                    NULL AS after_change_id \
+                FROM baseline_entries base \
+                LEFT JOIN tip_entries tip \
+                    ON tip.entity_id = base.entity_id \
+                   AND tip.schema_key = base.schema_key \
+                   AND tip.file_id = base.file_id \
+                WHERE tip.entity_id IS NULL \
+            ), \
+            resolved_rows AS ( \
+                SELECT \
+                    pair.entity_id AS entity_id, \
+                    pair.schema_key AS schema_key, \
+                    pair.file_id AS file_id, \
+                    pair.before_change_id AS before_change_id, \
+                    pair.after_change_id AS after_change_id, \
+                    before_change.row_snapshot AS before_row_snapshot, \
+                    after_change.row_snapshot AS after_row_snapshot \
+                FROM paired_entries pair \
+                LEFT JOIN change_rows before_change \
+                    ON before_change.change_id = pair.before_change_id \
+                LEFT JOIN change_rows after_change \
+                    ON after_change.change_id = pair.after_change_id \
+            ) \
+            SELECT * FROM ( \
+                SELECT \
+                    entity_id, \
+                    schema_key, \
+                    file_id, \
                     CASE \
-                        WHEN (bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
-                             AND ch.row_snapshot IS NOT NULL THEN NULL \
-                        ELSE bcse.change_id \
+                        WHEN before_row_snapshot IS NULL AND after_row_snapshot IS NOT NULL THEN NULL \
+                        ELSE before_change_id \
                     END AS before_change_id, \
                     CASE \
-                        WHEN bcse.change_id IS NOT NULL \
-                             AND bch.row_snapshot IS NOT NULL \
-                             AND ch.row_snapshot IS NULL THEN NULL \
-                        ELSE ch.effective_change_id \
+                        WHEN before_row_snapshot IS NOT NULL AND after_row_snapshot IS NULL THEN NULL \
+                        ELSE after_change_id \
                     END AS after_change_id, \
                     CASE \
-                        WHEN (bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
-                             AND ch.row_snapshot IS NOT NULL THEN NULL \
-                        ELSE (SELECT id FROM cc) \
+                        WHEN before_row_snapshot IS NULL AND after_row_snapshot IS NOT NULL THEN NULL \
+                        ELSE (SELECT id FROM baseline_commit) \
                     END AS before_commit_id, \
                     CASE \
-                        WHEN bcse.change_id IS NOT NULL \
-                             AND bch.row_snapshot IS NOT NULL \
-                             AND ch.row_snapshot IS NULL THEN NULL \
-                        ELSE (SELECT id FROM wc) \
+                        WHEN before_row_snapshot IS NOT NULL AND after_row_snapshot IS NULL THEN NULL \
+                        ELSE (SELECT id FROM tip_commit) \
                     END AS after_commit_id, \
                     CASE \
-                        WHEN bcse.change_id IS NOT NULL \
-                             AND bch.row_snapshot IS NOT NULL \
-                             AND ch.row_snapshot IS NULL THEN 'removed' \
-                        WHEN (bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
-                             AND ch.row_snapshot IS NOT NULL THEN 'added' \
-                        WHEN bcse.change_id IS NOT NULL \
-                             AND bch.row_snapshot IS NOT NULL \
-                             AND ch.row_snapshot IS NOT NULL \
-                             AND bcse.change_id != ch.effective_change_id THEN 'modified' \
+                        WHEN before_row_snapshot IS NOT NULL AND after_row_snapshot IS NULL THEN 'removed' \
+                        WHEN before_row_snapshot IS NULL AND after_row_snapshot IS NOT NULL THEN 'added' \
+                        WHEN before_row_snapshot IS NOT NULL \
+                             AND after_row_snapshot IS NOT NULL \
+                             AND before_change_id != after_change_id THEN 'modified' \
                     END AS status \
-                FROM working_change_rows ch \
-                INNER JOIN working_change_set_element_rows cse ON cse.change_id = ch.change_id \
-                LEFT JOIN checkpoint_change_set_element_rows bcse \
-                    ON bcse.entity_id = ch.entity_id \
-                   AND bcse.schema_key = ch.schema_key \
-                   AND bcse.file_id = ch.file_id \
-                   AND bcse.change_set_id = (SELECT change_set_id FROM ccs) \
-                LEFT JOIN baseline_change_rows bch ON bch.change_id = bcse.change_id \
-                WHERE cse.change_set_id = (SELECT change_set_id FROM wcs) \
-                  AND ( \
-                    (bcse.change_id IS NOT NULL \
-                        AND bch.row_snapshot IS NOT NULL \
-                        AND ch.row_snapshot IS NULL) \
-                    OR ((bcse.change_id IS NULL OR bch.row_snapshot IS NULL) \
-                        AND ch.row_snapshot IS NOT NULL) \
-                    OR ( \
-                        bcse.change_id IS NOT NULL \
-                        AND bch.row_snapshot IS NOT NULL \
-                        AND ch.row_snapshot IS NOT NULL \
-                        AND bcse.change_id != ch.effective_change_id \
-                    ) \
-                  ) \
-            ) AS working_changes";
+                FROM resolved_rows \
+            ) AS working_changes \
+            WHERE status IS NOT NULL";
     parse_single_query(sql)
 }
 
@@ -274,12 +364,11 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(!sql.contains("FROM lix_working_changes"));
-        assert!(sql.contains("FROM lix_internal_state_untracked"));
-        assert!(sql.contains("working_change_set_element_rows"));
-        assert!(sql.contains("baseline_change_rows"));
-        assert!(sql.contains("LEFT JOIN baseline_change_rows bch"));
-        assert!(sql.contains("lix_json_extract(snapshot_content, 'commit_id')"));
-        assert!(!sql.contains("l.name = 'checkpoint'"));
+        assert!(sql.contains("lix_internal_last_checkpoint"));
+        assert!(sql.contains("tip_entries"));
+        assert!(sql.contains("baseline_entries"));
+        assert!(sql.contains("paired_entries"));
+        assert!(sql.contains("WHERE status IS NOT NULL"));
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {

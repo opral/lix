@@ -135,9 +135,9 @@ async fn seed_engine(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                 id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
-                 'bench-child', 'bench-child', 'global', 0, 'commit-bench-child', 'working-bench-child'\
+                 'bench-child', 'bench-child', 'global', 0, 'commit-bench-child'\
                  )",
                 &[],
                 ExecuteOptions::default(),

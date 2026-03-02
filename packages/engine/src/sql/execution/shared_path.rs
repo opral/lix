@@ -57,11 +57,6 @@ pub(crate) async fn prepare_execution_with_backend(
     )?;
 
     let requirements = derive_plan_requirements(&statements);
-    if requirements.read_only_query {
-        engine
-            .maybe_refresh_working_change_projection_for_read_query(backend, active_version_id)
-            .await?;
-    }
 
     engine
         .maybe_materialize_reads_with_backend_from_statements(

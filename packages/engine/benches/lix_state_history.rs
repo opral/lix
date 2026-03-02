@@ -444,7 +444,6 @@ struct HistorySeed {
 #[derive(Clone)]
 struct CommitTip {
     commit_id: String,
-    working_commit_id: String,
 }
 
 async fn seed_engine_with_history() -> Result<HistorySeed, LixError> {
@@ -661,7 +660,7 @@ async fn load_active_commit_id(engine: &lix_engine::Engine) -> Result<String, Li
 async fn load_active_commit_tip(engine: &lix_engine::Engine) -> Result<CommitTip, LixError> {
     let result = engine
         .execute(
-            "SELECT v.commit_id, v.working_commit_id \
+            "SELECT v.commit_id \
              FROM lix_active_version av \
              JOIN lix_version v ON v.id = av.version_id \
              LIMIT 1",
@@ -677,14 +676,9 @@ async fn load_active_commit_tip(engine: &lix_engine::Engine) -> Result<CommitTip
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "active commit query missing commit_id column".to_string(),
     })?;
-    let working_commit_id = row.get(1).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "active commit query missing working_commit_id column".to_string(),
-    })?;
 
     Ok(CommitTip {
         commit_id: value_as_text(commit_id, "commit_id")?,
-        working_commit_id: value_as_text(working_commit_id, "working_commit_id")?,
     })
 }
 
@@ -717,11 +711,10 @@ async fn rewind_active_version_tip(
     engine
         .execute(
             "UPDATE lix_version \
-             SET commit_id = ?, working_commit_id = ? \
+             SET commit_id = ? \
              WHERE id = ?",
             &[
                 Value::Text(tip.commit_id.clone()),
-                Value::Text(tip.working_commit_id.clone()),
                 Value::Text(active_version_id.to_string()),
             ],
             ExecuteOptions::default(),
@@ -928,6 +921,7 @@ fn explain_only_mode() -> bool {
 fn value_for_explain(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
+        Value::Boolean(boolean) => boolean.to_string(),
         Value::Integer(number) => number.to_string(),
         Value::Real(number) => number.to_string(),
         Value::Text(text) => text.clone(),

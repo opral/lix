@@ -4,27 +4,10 @@
   "x-lix-primary-key": [
     "/id"
   ],
-  "x-lix-unique": [
-    [
-      "/working_commit_id"
-    ]
-  ],
   "x-lix-foreign-keys": [
     {
       "properties": [
         "/commit_id"
-      ],
-      "references": {
-        "schemaKey": "lix_commit",
-        "properties": [
-          "/id"
-        ]
-      },
-      "mode": "materialized"
-    },
-    {
-      "properties": [
-        "/working_commit_id"
       ],
       "references": {
         "schemaKey": "lix_commit",
@@ -47,15 +30,11 @@
     },
     "commit_id": {
       "type": "string"
-    },
-    "working_commit_id": {
-      "type": "string"
     }
   },
   "required": [
     "id",
-    "commit_id",
-    "working_commit_id"
+    "commit_id"
   ],
   "additionalProperties": false
 }

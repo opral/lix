@@ -76,9 +76,9 @@ async fn insert_version(
 ) {
     let sql = format!(
         "INSERT INTO lix_version (\
-         id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+         id, name, inherits_from_version_id, hidden, commit_id\
          ) VALUES (\
-         '{version_id}', '{version_id}', '{parent_version_id}', false, 'commit-{version_id}', 'working-{version_id}'\
+         '{version_id}', '{version_id}', '{parent_version_id}', false, 'commit-{version_id}'\
          )",
     );
     engine.execute(&sql, &[]).await.unwrap();

@@ -28,7 +28,6 @@ mod types;
 mod validation;
 mod version;
 mod wasm_runtime;
-mod working_projection;
 
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

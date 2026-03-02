@@ -93,6 +93,12 @@ const INIT_STATEMENTS: &[&str] = &[
      ON lix_internal_commit_ancestry (commit_id, depth)",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_ancestry_ancestor \
      ON lix_internal_commit_ancestry (ancestor_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_last_checkpoint (\
+     version_id TEXT PRIMARY KEY,\
+     checkpoint_commit_id TEXT NOT NULL\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_last_checkpoint_commit \
+     ON lix_internal_last_checkpoint (checkpoint_commit_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_entity_state_timeline_breakpoint (\
      root_commit_id TEXT NOT NULL,\
      entity_id TEXT NOT NULL,\

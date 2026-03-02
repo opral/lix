@@ -180,13 +180,6 @@ fn build_version_pointers(
         }
         let commits = version_commits.entry(parsed.id.clone()).or_default();
         commits.insert(parsed.commit_id.clone());
-        if let Some(working_commit_id) = parsed
-            .working_commit_id
-            .as_ref()
-            .filter(|value| !value.is_empty())
-        {
-            commits.insert(working_commit_id.clone());
-        }
     }
 
     let mut tips = BTreeMap::new();
@@ -458,16 +451,9 @@ fn build_global_projection_rows(
             .as_ref()
             .filter(|snapshot| !snapshot.id.is_empty() && !snapshot.commit_id.is_empty())
             .map(|snapshot| {
-                let working_commit_id = snapshot
-                    .working_commit_id
-                    .as_ref()
-                    .filter(|value| !value.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| snapshot.commit_id.clone());
                 json!({
                     "id": snapshot.id,
                     "commit_id": snapshot.commit_id,
-                    "working_commit_id": working_commit_id,
                 })
                 .to_string()
             });
@@ -529,7 +515,6 @@ fn build_global_projection_rows(
                     json!({
                         "id": version_id,
                         "commit_id": tip_commit_id,
-                        "working_commit_id": tip_commit_id,
                     })
                     .to_string(),
                 ),
