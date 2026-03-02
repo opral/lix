@@ -73,6 +73,21 @@ const LIX_DIRECTORY_COLUMNS: &[&str] = &[
     "lixcol_metadata",
 ];
 
+const LIX_STORED_SCHEMA_COLUMNS: &[&str] = &[
+    "value",
+    "lixcol_entity_id",
+    "lixcol_schema_key",
+    "lixcol_file_id",
+    "lixcol_plugin_key",
+    "lixcol_schema_version",
+    "lixcol_created_at",
+    "lixcol_updated_at",
+    "lixcol_inherited_from_version_id",
+    "lixcol_change_id",
+    "lixcol_untracked",
+    "lixcol_metadata",
+];
+
 const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     LixTableSpec {
         name: "lix_state",
@@ -128,7 +143,7 @@ const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     },
     LixTableSpec {
         name: "lix_stored_schema",
-        columns: &[],
+        columns: LIX_STORED_SCHEMA_COLUMNS,
     },
 ];
 

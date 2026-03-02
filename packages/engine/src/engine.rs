@@ -226,8 +226,12 @@ fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
     Ok(())
 }
 
-pub(crate) fn normalize_sql_execution_error(error: LixError, statements: &[Statement]) -> LixError {
-    crate::error_classification::normalize_sql_error(error, statements)
+pub(crate) async fn normalize_sql_execution_error_with_backend(
+    backend: &dyn LixBackend,
+    error: LixError,
+    statements: &[Statement],
+) -> LixError {
+    crate::error_classification::normalize_sql_error_with_backend(backend, error, statements).await
 }
 
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {

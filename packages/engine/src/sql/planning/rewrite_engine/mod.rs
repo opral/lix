@@ -16,6 +16,10 @@ pub(crate) use ast_utils::{
     rewrite_table_factors_in_select_decision, visit_query_selects, visit_table_factors_in_select,
     RewriteDecision,
 };
+pub(crate) use entity_views::target::{
+    projected_columns_for_target as projected_columns_for_entity_view_target,
+    resolve_target_from_view_name_with_backend as resolve_entity_view_target_from_view_name_with_backend,
+};
 #[cfg(test)]
 pub(crate) use params::bind_sql_with_state_and_appended_params;
 pub(crate) use params::{bind_sql, bind_sql_with_state, PlaceholderState};

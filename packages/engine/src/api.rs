@@ -140,7 +140,7 @@ impl Engine {
         )
         .await?;
 
-        let execution = run::execute_plan_sql(
+        let execution = match run::execute_plan_sql(
             self,
             &prepared.plan,
             &prepared.detected_file_domain_changes,
@@ -150,7 +150,17 @@ impl Engine {
         )
         .await
         .map_err(LixError::from)
-        .map_err(|error| normalize_sql_execution_error(error, &parsed_statements))?;
+        {
+            Ok(execution) => execution,
+            Err(error) => {
+                return Err(normalize_sql_execution_error_with_backend(
+                    self.backend.as_ref(),
+                    error,
+                    &parsed_statements,
+                )
+                .await)
+            }
+        };
 
         run::persist_runtime_sequence(
             self,

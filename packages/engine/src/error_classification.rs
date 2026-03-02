@@ -1,8 +1,14 @@
+use crate::engine::sql::planning::rewrite_engine::{
+    projected_columns_for_entity_view_target,
+    resolve_entity_view_target_from_view_name_with_backend,
+};
 use crate::lix_table_registry::{columns_for_public_lix_table, public_lix_table_names};
+use crate::LixBackend;
 use crate::{errors, LixError};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use std::ops::ControlFlow;
 
+#[cfg(test)]
 pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> LixError {
     if let Some(missing_column) = parse_unknown_column_name(&error.description) {
         let relation_names = relation_names_from_statements(statements);
@@ -36,6 +42,73 @@ pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> 
     }
 
     error
+}
+
+pub(crate) async fn normalize_sql_error_with_backend(
+    backend: &dyn LixBackend,
+    error: LixError,
+    statements: &[Statement],
+) -> LixError {
+    if let Some(missing_column) = parse_unknown_column_name(&error.description) {
+        let relation_names = relation_names_from_statements(statements);
+        let table_name = choose_table_for_unknown_column(&missing_column, &relation_names);
+        let available_columns = if let Some(table_name) = table_name.as_deref() {
+            resolve_available_columns(table_name, Some(backend)).await
+        } else {
+            Vec::new()
+        };
+        let available_column_refs = available_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        return errors::sql_unknown_column_error(
+            &missing_column,
+            table_name.as_deref(),
+            available_column_refs.as_slice(),
+            parse_sql_offset(&error.description),
+        );
+    }
+
+    if is_missing_relation_error(&error) {
+        if let Some(table_name) = parse_unknown_table_name(&error.description).or_else(|| {
+            relation_names_from_statements(statements)
+                .into_iter()
+                .next()
+        }) {
+            let available_tables = public_lix_table_names();
+            return errors::sql_unknown_table_error(
+                &table_name,
+                available_tables.as_slice(),
+                parse_sql_offset(&error.description),
+            );
+        }
+        return errors::table_not_found_read_error();
+    }
+
+    error
+}
+
+async fn resolve_available_columns(
+    table_name: &str,
+    backend: Option<&dyn LixBackend>,
+) -> Vec<String> {
+    if let Some(columns) = columns_for_public_lix_table(table_name) {
+        return columns.iter().map(|column| (*column).to_string()).collect();
+    }
+
+    let Some(backend) = backend else {
+        return Vec::new();
+    };
+
+    let target =
+        match resolve_entity_view_target_from_view_name_with_backend(backend, table_name).await {
+            Ok(target) => target,
+            Err(_) => return Vec::new(),
+        };
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    projected_columns_for_entity_view_target(&target)
 }
 
 pub(crate) fn is_missing_relation_error(err: &LixError) -> bool {
@@ -254,5 +327,26 @@ mod tests {
         assert!(error
             .description
             .contains("Available columns: id, entity_id"));
+    }
+
+    #[test]
+    fn normalizes_unknown_column_for_lix_stored_schema_with_column_catalog() {
+        let statements = Parser::parse_sql(&GenericDialect {}, "SELECT id FROM lix_stored_schema")
+            .expect("parse SQL");
+        let error = normalize_sql_error(
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "no such column: id at offset 7".to_string(),
+            },
+            &statements,
+        );
+
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(error
+            .description
+            .contains("Column `id` does not exist on `lix_stored_schema`."));
+        assert!(error.description.contains("Available columns: value"));
+        assert!(error.description.contains("lixcol_entity_id"));
+        assert!(!error.description.contains("Available columns: (unknown)."));
     }
 }
