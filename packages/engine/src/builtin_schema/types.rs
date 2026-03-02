@@ -51,6 +51,4 @@ pub(crate) struct LixVersionDescriptor {
 pub(crate) struct LixVersionPointer {
     pub id: String,
     pub commit_id: String,
-    #[serde(default)]
-    pub working_commit_id: Option<String>,
 }

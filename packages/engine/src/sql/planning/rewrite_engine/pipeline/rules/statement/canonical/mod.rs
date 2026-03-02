@@ -386,22 +386,25 @@ where
                     insert
                 };
 
-                if let Some(version_inserts) = lix_version_write::rewrite_insert_with_backend(
+                if let Some(version_rewrite) = lix_version_write::rewrite_insert_with_backend(
                     backend,
                     insert.clone(),
                     context.params,
                 )
                 .await?
                 {
-                    let output = rewrite_vtable_inserts_with_backend(
+                    let mut output = rewrite_vtable_inserts_with_backend(
                         backend,
-                        version_inserts,
+                        version_rewrite.vtable_inserts,
                         context.params,
                         functions,
                         &insert_detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
+                    output
+                        .statements
+                        .extend(version_rewrite.supplemental_statements);
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
@@ -559,22 +562,25 @@ where
                     continue;
                 }
 
-                if let Some(version_inserts) = lix_version_write::rewrite_update_with_backend(
+                if let Some(version_rewrite) = lix_version_write::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
                 )
                 .await?
                 {
-                    let output = rewrite_vtable_inserts_with_backend(
+                    let mut output = rewrite_vtable_inserts_with_backend(
                         backend,
-                        version_inserts,
+                        version_rewrite.vtable_inserts,
                         context.params,
                         functions,
                         context.detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
+                    output
+                        .statements
+                        .extend(version_rewrite.supplemental_statements);
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
@@ -637,22 +643,25 @@ where
                     delete
                 };
 
-                if let Some(version_inserts) = lix_version_write::rewrite_delete_with_backend(
+                if let Some(version_rewrite) = lix_version_write::rewrite_delete_with_backend(
                     backend,
                     delete.clone(),
                     context.params,
                 )
                 .await?
                 {
-                    let output = rewrite_vtable_inserts_with_backend(
+                    let mut output = rewrite_vtable_inserts_with_backend(
                         backend,
-                        version_inserts,
+                        version_rewrite.vtable_inserts,
                         context.params,
                         functions,
                         context.detected_file_domain_changes,
                         context.writer_key,
                     )
                     .await?;
+                    output
+                        .statements
+                        .extend(version_rewrite.supplemental_statements);
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 

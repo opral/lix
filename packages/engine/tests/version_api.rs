@@ -19,16 +19,6 @@ fn value_as_bool(value: &Value) -> bool {
     }
 }
 
-fn value_as_i64(value: &Value) -> i64 {
-    match value {
-        Value::Integer(value) => *value,
-        Value::Text(value) => value
-            .parse::<i64>()
-            .unwrap_or_else(|error| panic!("expected i64-compatible text, got '{value}': {error}")),
-        other => panic!("expected integer-compatible value, got {other:?}"),
-    }
-}
-
 simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -61,7 +51,7 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
 
     let created_row = engine
         .execute(
-            "SELECT id, name, inherits_from_version_id, hidden, commit_id, working_commit_id \
+            "SELECT id, name, inherits_from_version_id, hidden, commit_id \
              FROM lix_version \
              WHERE id = $1",
             &[Value::Text(created.id.clone())],
@@ -75,31 +65,17 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     assert_eq!(value_as_text(&row[2]), created.inherits_from_version_id);
     assert!(!value_as_bool(&row[3]));
     assert_eq!(value_as_text(&row[4]), active_commit_id);
-    let working_commit_id = value_as_text(&row[5]);
-    assert!(!working_commit_id.is_empty());
-
-    let working_commit_rows = engine
+    let baseline_row = engine
         .execute(
-            "SELECT COUNT(*) \
-             FROM lix_commit \
-             WHERE id = $1",
-            &[Value::Text(working_commit_id.clone())],
+            "SELECT checkpoint_commit_id \
+             FROM lix_internal_last_checkpoint \
+             WHERE version_id = $1",
+            &[Value::Text(created.id.clone())],
         )
         .await
-        .expect("working commit existence query should succeed");
-    assert_eq!(value_as_i64(&working_commit_rows.rows[0][0]), 1);
-
-    let working_change_set_rows = engine
-        .execute(
-            "SELECT COUNT(*) \
-             FROM lix_change_set cs \
-             JOIN lix_commit c ON c.change_set_id = cs.id \
-             WHERE c.id = $1",
-            &[Value::Text(working_commit_id)],
-        )
-        .await
-        .expect("working change set existence query should succeed");
-    assert_eq!(value_as_i64(&working_change_set_rows.rows[0][0]), 1);
+        .expect("baseline pointer query should succeed");
+    assert_eq!(baseline_row.rows.len(), 1);
+    assert_eq!(value_as_text(&baseline_row.rows[0][0]), active_commit_id);
 
     let active_after = engine
         .execute(
@@ -112,7 +88,7 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
 });
 
 simulation_test!(
-    tracked_write_moves_active_working_commit_id_off_global,
+    tracked_write_moves_active_commit_id_off_global,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -122,7 +98,7 @@ simulation_test!(
 
         let active_before = engine
             .execute(
-                "SELECT av.version_id, v.commit_id, v.working_commit_id \
+                "SELECT av.version_id, v.commit_id \
                  FROM lix_active_version av \
                  JOIN lix_version v ON v.id = av.version_id \
                  ORDER BY av.id \
@@ -145,7 +121,7 @@ simulation_test!(
 
         let active_after = engine
             .execute(
-                "SELECT av.version_id, v.commit_id, v.working_commit_id \
+                "SELECT av.version_id, v.commit_id \
                  FROM lix_active_version av \
                  JOIN lix_version v ON v.id = av.version_id \
                  ORDER BY av.id \
@@ -157,7 +133,6 @@ simulation_test!(
         assert_eq!(active_after.rows.len(), 1);
         assert_eq!(value_as_text(&active_after.rows[0][0]), active_version_id);
         assert_ne!(value_as_text(&active_after.rows[0][1]), "global");
-        assert_ne!(value_as_text(&active_after.rows[0][2]), "global");
     }
 );
 

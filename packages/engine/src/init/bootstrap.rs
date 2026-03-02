@@ -12,6 +12,7 @@ impl Engine {
             self.seed_default_active_version(&default_active_version_id)
                 .await?;
             self.seed_default_checkpoint_label().await?;
+            self.rebuild_internal_last_checkpoint().await?;
             self.seed_boot_key_values().await?;
             self.seed_boot_account().await?;
             self.load_and_cache_active_version().await

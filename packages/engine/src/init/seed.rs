@@ -201,6 +201,10 @@ impl Engine {
             .await?;
         self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
             .await?;
+        self.upsert_last_checkpoint_for_version(GLOBAL_VERSION_ID, &bootstrap_commit_id)
+            .await?;
+        self.upsert_last_checkpoint_for_version(&main_version_id, &bootstrap_commit_id)
+            .await?;
 
         Ok(main_version_id)
     }
@@ -502,11 +506,7 @@ impl Engine {
             return Ok(());
         }
 
-        let working_commit_id = self
-            .seed_working_commit_for_version(entity_id, commit_id)
-            .await?;
-        let snapshot_content =
-            version_pointer_snapshot_content(entity_id, commit_id, &working_commit_id);
+        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id);
         let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
@@ -529,165 +529,110 @@ impl Engine {
         Ok(())
     }
 
-    async fn seed_working_commit_for_version(
+    pub(crate) async fn upsert_last_checkpoint_for_version(
         &self,
         version_id: &str,
-        parent_commit_id: &str,
-    ) -> Result<String, LixError> {
-        if version_id.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "cannot seed working commit for empty version id".to_string(),
-            });
-        }
-        if parent_commit_id.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "cannot seed working commit for version '{version_id}' with empty parent"
-                ),
-            });
-        }
-
-        self.assert_commit_change_set_integrity(parent_commit_id)
-            .await?;
-
-        let working_change_set_id = self.generate_runtime_uuid().await?;
-        let working_commit_id = self.generate_runtime_uuid().await?;
-
-        let change_set_snapshot_content = serde_json::json!({
-            "id": working_change_set_id,
-        })
-        .to_string();
-        self.execute_internal(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, 'lix_change_set', 'lix', 'global', 'lix', $2, '1', true)",
-            &[
-                Value::Text(working_change_set_id.clone()),
-                Value::Text(change_set_snapshot_content),
-            ],
-            ExecuteOptions::default(),
-        )
-        .await?;
-
-        let commit_snapshot_content = serde_json::json!({
-            "id": working_commit_id,
-            "change_set_id": working_change_set_id,
-            "parent_commit_ids": [parent_commit_id],
-            "change_ids": [],
-        })
-        .to_string();
-        self.execute_internal(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, 'lix_commit', 'lix', 'global', 'lix', $2, '1', true)",
-            &[
-                Value::Text(working_commit_id.clone()),
-                Value::Text(commit_snapshot_content),
-            ],
-            ExecuteOptions::default(),
-        )
-        .await?;
-
-        self.seed_commit_edge(parent_commit_id, &working_commit_id)
-            .await?;
-        self.seed_commit_ancestry_for_commit(&working_commit_id, &[parent_commit_id.to_string()])
-            .await?;
-
-        Ok(working_commit_id)
-    }
-
-    async fn seed_commit_edge(&self, parent_id: &str, child_id: &str) -> Result<(), LixError> {
-        if parent_id.is_empty() || child_id.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "cannot seed commit edge with empty id(s): parent='{parent_id}', child='{child_id}'"
-                ),
-            });
-        }
-        if parent_id == child_id {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("refusing self-edge for commit '{parent_id}'"),
-            });
-        }
-
-        let edge_entity_id = format!("{parent_id}~{child_id}");
-        let existing = self
-            .execute_internal(
-                "SELECT 1 \
-                 FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_commit_edge' \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
-                 LIMIT 1",
-                &[Value::Text(edge_entity_id.clone())],
-                ExecuteOptions::default(),
-            )
-            .await?;
-        if !existing.rows.is_empty() {
-            return Ok(());
-        }
-
-        let snapshot_content = serde_json::json!({
-            "parent_id": parent_id,
-            "child_id": child_id,
-        })
-        .to_string();
-        self.execute_internal(
-            "INSERT INTO lix_internal_state_vtable (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
-             ) VALUES ($1, 'lix_commit_edge', 'lix', 'global', 'lix', $2, '1', true)",
-            &[Value::Text(edge_entity_id), Value::Text(snapshot_content)],
-            ExecuteOptions::default(),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn seed_commit_ancestry_for_commit(
-        &self,
-        commit_id: &str,
-        parent_ids: &[String],
+        checkpoint_commit_id: &str,
     ) -> Result<(), LixError> {
-        self.execute_internal(
-            "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
-             VALUES ($1, $1, 0) \
-             ON CONFLICT (commit_id, ancestor_id) DO NOTHING",
-            &[Value::Text(commit_id.to_string())],
-            ExecuteOptions::default(),
-        )
-        .await?;
+        self.backend
+            .execute(
+                "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
+                 VALUES ($1, $2) \
+                 ON CONFLICT (version_id) DO UPDATE \
+                 SET checkpoint_commit_id = excluded.checkpoint_commit_id",
+                &[
+                    Value::Text(version_id.to_string()),
+                    Value::Text(checkpoint_commit_id.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 
-        for parent_id in normalize_parent_commit_ids(parent_ids.to_vec(), commit_id) {
-            self.execute_internal(
-                "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) \
-                 SELECT $1, candidate.ancestor_id, MIN(candidate.depth) AS depth \
-                 FROM ( \
-                   SELECT $2 AS ancestor_id, 1 AS depth \
-                   UNION ALL \
-                   SELECT ancestor_id, depth + 1 AS depth \
-                   FROM lix_internal_commit_ancestry \
-                   WHERE commit_id = $2 \
-                 ) AS candidate \
-                 GROUP BY candidate.ancestor_id \
-                 ON CONFLICT (commit_id, ancestor_id) DO UPDATE \
-                 SET depth = CASE \
-                   WHEN excluded.depth < lix_internal_commit_ancestry.depth THEN excluded.depth \
-                   ELSE lix_internal_commit_ancestry.depth \
-                 END",
-                &[Value::Text(commit_id.to_string()), Value::Text(parent_id)],
+    pub(crate) async fn rebuild_internal_last_checkpoint(&self) -> Result<(), LixError> {
+        let versions = self
+            .execute_internal(
+                "SELECT id, commit_id \
+                 FROM lix_version \
+                 ORDER BY id",
+                &[],
                 ExecuteOptions::default(),
             )
             .await?;
+
+        self.backend
+            .execute("DELETE FROM lix_internal_last_checkpoint", &[])
+            .await?;
+
+        for row in &versions.rows {
+            let version_id = text_value(row.get(0), "lix_version.id")?;
+            let commit_id = text_value(row.get(1), "lix_version.commit_id")?;
+            let checkpoint_commit_id = self
+                .resolve_last_checkpoint_commit_id_for_tip(&commit_id)
+                .await?
+                .unwrap_or_else(|| commit_id.clone());
+            self.upsert_last_checkpoint_for_version(&version_id, &checkpoint_commit_id)
+                .await?;
         }
 
         Ok(())
+    }
+
+    async fn resolve_last_checkpoint_commit_id_for_tip(
+        &self,
+        tip_commit_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        let rows = self
+            .execute_internal(
+                "SELECT anc.ancestor_id \
+                 FROM lix_internal_commit_ancestry anc \
+                 JOIN ( \
+                   SELECT \
+                     lix_json_extract(snapshot_content, 'entity_id') AS entity_id, \
+                     lix_json_extract(snapshot_content, 'schema_key') AS schema_key, \
+                     lix_json_extract(snapshot_content, 'label_id') AS label_id \
+                   FROM lix_internal_state_vtable \
+                   WHERE schema_key = 'lix_entity_label' \
+                     AND file_id = 'lix' \
+                     AND version_id = 'global' \
+                     AND snapshot_content IS NOT NULL \
+                 ) el \
+                   ON el.entity_id = anc.ancestor_id \
+                  AND el.schema_key = 'lix_commit' \
+                 JOIN ( \
+                   SELECT \
+                     entity_id AS id, \
+                     lix_json_extract(snapshot_content, 'name') AS name \
+                   FROM lix_internal_state_vtable \
+                   WHERE schema_key = 'lix_label' \
+                     AND file_id = 'lix' \
+                     AND version_id = 'global' \
+                     AND snapshot_content IS NOT NULL \
+                 ) l \
+                   ON l.id = el.label_id \
+                  AND l.name = 'checkpoint' \
+                 LEFT JOIN ( \
+                   SELECT entity_id AS id, created_at \
+                   FROM lix_internal_state_vtable \
+                   WHERE schema_key = 'lix_commit' \
+                     AND file_id = 'lix' \
+                     AND version_id = 'global' \
+                     AND snapshot_content IS NOT NULL \
+                 ) c ON c.id = anc.ancestor_id \
+                 WHERE anc.commit_id = $1 \
+                 ORDER BY \
+                   anc.depth ASC, \
+                   c.created_at DESC, \
+                   anc.ancestor_id DESC \
+                 LIMIT 1",
+                &[Value::Text(tip_commit_id.to_string())],
+                ExecuteOptions::default(),
+            )
+            .await?;
+        let Some(first) = rows.rows.first() else {
+            return Ok(None);
+        };
+        Ok(Some(text_value(first.get(0), "checkpoint ancestor id")?))
     }
 
     pub(crate) async fn seed_bootstrap_commit(&self) -> Result<(), LixError> {
@@ -890,12 +835,21 @@ fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, Li
     }
 }
 
-fn normalize_parent_commit_ids(
-    mut parent_commit_ids: Vec<String>,
-    self_commit_id: &str,
-) -> Vec<String> {
-    parent_commit_ids.retain(|id| !id.is_empty() && id != self_commit_id);
-    parent_commit_ids.sort();
-    parent_commit_ids.dedup();
-    parent_commit_ids
+fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
+    match value {
+        Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
+        Some(Value::Text(_)) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("{label} must not be empty"),
+        }),
+        Some(Value::Integer(number)) => Ok(number.to_string()),
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("{label} must be text-like, got {other:?}"),
+        }),
+        None => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("missing {label}"),
+        }),
+    }
 }

@@ -74,16 +74,19 @@ where
     let commit_edge_schema = builtin_schema_meta(COMMIT_EDGE_SCHEMA_KEY)?;
     let change_author_schema = builtin_schema_meta(CHANGE_AUTHOR_SCHEMA_KEY)?;
 
-    let mut output_changes: Vec<ChangeRow> =
-        args.changes.iter().map(sanitize_domain_change).collect();
+    let effective_domain_changes = collapse_domain_changes_last_wins(&args.changes);
+    let mut output_changes: Vec<ChangeRow> = effective_domain_changes
+        .iter()
+        .map(|change| sanitize_domain_change(change))
+        .collect();
     let mut materialized_state: Vec<MaterializedStateRow> = Vec::new();
 
     let mut domain_by_version: BTreeMap<String, Vec<&DomainChangeInput>> = BTreeMap::new();
-    for change in &args.changes {
+    for change in &effective_domain_changes {
         domain_by_version
             .entry(change.version_id.clone())
             .or_default()
-            .push(change);
+            .push(*change);
     }
 
     let versions_to_commit: BTreeSet<String> = domain_by_version.keys().cloned().collect();
@@ -114,14 +117,6 @@ where
     let mut commit_row_index_by_version: BTreeMap<String, usize> = BTreeMap::new();
 
     for (version_id, meta) in &meta_by_version {
-        let version_info = args.versions.get(version_id).ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: missing version context for '{}'",
-                version_id
-            ),
-        })?;
-
         let version_pointer_change_id = generate_uuid();
         tip_change_id_by_version.insert(version_id.clone(), version_pointer_change_id.clone());
 
@@ -136,7 +131,6 @@ where
                 json!({
                     "id": version_id,
                     "commit_id": meta.commit_id,
-                    "working_commit_id": version_info.snapshot.working_commit_id,
                 })
                 .to_string(),
             ),
@@ -445,13 +439,6 @@ where
             writer_key: None,
         });
 
-        let version_info = args.versions.get(version_id).ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: missing version context for '{}'",
-                version_id
-            ),
-        })?;
         let tip_id = tip_change_id_by_version
             .get(version_id)
             .cloned()
@@ -467,7 +454,6 @@ where
                 json!({
                     "id": version_id,
                     "commit_id": meta.commit_id,
-                    "working_commit_id": version_info.snapshot.working_commit_id,
                 })
                 .to_string(),
             ),
@@ -595,6 +581,29 @@ fn dedupe_ordered(values: &[String]) -> Vec<String> {
     deduped
 }
 
+fn collapse_domain_changes_last_wins(changes: &[DomainChangeInput]) -> Vec<&DomainChangeInput> {
+    let mut latest_index_by_key: BTreeMap<(String, String, String, String), usize> =
+        BTreeMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        latest_index_by_key.insert(
+            (
+                change.version_id.clone(),
+                change.entity_id.clone(),
+                change.schema_key.clone(),
+                change.file_id.clone(),
+            ),
+            index,
+        );
+    }
+
+    let mut kept_indexes = latest_index_by_key.into_values().collect::<Vec<_>>();
+    kept_indexes.sort_unstable();
+    kept_indexes
+        .into_iter()
+        .map(|index| &changes[index])
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,13 +631,10 @@ mod tests {
         }
     }
 
-    fn version_info(id: &str, working_commit_id: &str, parent_commit_ids: &[&str]) -> VersionInfo {
+    fn version_info(id: &str, parent_commit_ids: &[&str]) -> VersionInfo {
         VersionInfo {
             parent_commit_ids: parent_commit_ids.iter().map(ToString::to_string).collect(),
-            snapshot: VersionSnapshot {
-                id: id.to_string(),
-                working_commit_id: working_commit_id.to_string(),
-            },
+            snapshot: VersionSnapshot { id: id.to_string() },
         }
     }
 
@@ -645,12 +651,9 @@ mod tests {
         let mut versions = BTreeMap::new();
         versions.insert(
             "version-main".to_string(),
-            version_info("version-main", "work-main", &["P_active"]),
+            version_info("version-main", &["P_active"]),
         );
-        versions.insert(
-            "global".to_string(),
-            version_info("global", "work-global", &["P_global"]),
-        );
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
@@ -758,10 +761,7 @@ mod tests {
     #[test]
     fn generates_commit_for_global_change() {
         let mut versions = BTreeMap::new();
-        versions.insert(
-            "global".to_string(),
-            version_info("global", "work-global", &["P_global"]),
-        );
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
@@ -866,13 +866,10 @@ mod tests {
     #[test]
     fn generates_commits_for_multiple_versions() {
         let mut versions = BTreeMap::new();
-        versions.insert(
-            "global".to_string(),
-            version_info("global", "work-global", &["P_global"]),
-        );
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
         versions.insert(
             "version-main".to_string(),
-            version_info("version-main", "work-main", &["P_main"]),
+            version_info("version-main", &["P_main"]),
         );
 
         let args = GenerateCommitArgs {
@@ -995,12 +992,84 @@ mod tests {
     }
 
     #[test]
+    fn collapses_domain_changes_per_entity_schema_file_with_last_wins() {
+        let mut versions = BTreeMap::new();
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
+
+        let args = GenerateCommitArgs {
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            active_accounts: vec!["acct-1".to_string()],
+            changes: vec![
+                domain_change("chg_a1", "entity-a", "lix_key_value", "global", None),
+                domain_change("chg_b1", "entity-b", "lix_key_value", "global", None),
+                domain_change("chg_a2", "entity-a", "lix_key_value", "global", None),
+            ],
+            versions,
+        };
+
+        let mut n = 0u64;
+        let result = generate_commit(args, || {
+            let id = format!("uuid-{n}");
+            n += 1;
+            id
+        })
+        .expect("generate_commit should succeed");
+
+        let domain_change_ids = result
+            .changes
+            .iter()
+            .filter(|row| row.schema_key == "lix_key_value")
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(domain_change_ids, vec!["chg_b1", "chg_a2"]);
+
+        let commit_row = result
+            .changes
+            .iter()
+            .find(|row| row.schema_key == "lix_commit")
+            .expect("expected commit row");
+        let commit_snapshot: serde_json::Value =
+            serde_json::from_str(commit_row.snapshot_content.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            commit_snapshot["change_ids"],
+            serde_json::json!(["chg_b1", "chg_a2"])
+        );
+
+        let cse_change_ids = result
+            .materialized_state
+            .iter()
+            .filter(|row| row.schema_key == "lix_change_set_element")
+            .map(|row| {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(row.snapshot_content.as_ref().unwrap())
+                        .expect("cse snapshot should be valid JSON");
+                snapshot["change_id"]
+                    .as_str()
+                    .expect("cse change_id should be string")
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cse_change_ids,
+            BTreeSet::from(["chg_b1".to_string(), "chg_a2".to_string()])
+        );
+
+        let change_author_entities = result
+            .materialized_state
+            .iter()
+            .filter(|row| row.schema_key == "lix_change_author")
+            .map(|row| row.entity_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            change_author_entities,
+            BTreeSet::from(["chg_b1~acct-1".to_string(), "chg_a2~acct-1".to_string(),])
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_domain_change_ids() {
         let mut versions = BTreeMap::new();
-        versions.insert(
-            "global".to_string(),
-            version_info("global", "work-global", &["P_global"]),
-        );
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
@@ -1024,10 +1093,7 @@ mod tests {
     #[test]
     fn rejects_missing_version_context_for_domain_change() {
         let mut versions = BTreeMap::new();
-        versions.insert(
-            "global".to_string(),
-            version_info("global", "work-global", &["P_global"]),
-        );
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
@@ -1054,13 +1120,10 @@ mod tests {
     #[test]
     fn writer_key_is_propagated_only_to_domain_materialized_rows() {
         let mut versions = BTreeMap::new();
-        versions.insert(
-            "global".to_string(),
-            version_info("global", "work-global", &["P_global"]),
-        );
+        versions.insert("global".to_string(), version_info("global", &["P_global"]));
         versions.insert(
             "version-main".to_string(),
-            version_info("version-main", "work-main", &["P_main"]),
+            version_info("version-main", &["P_main"]),
         );
 
         let args = GenerateCommitArgs {

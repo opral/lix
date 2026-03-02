@@ -1,14 +1,12 @@
 use super::super::*;
 use super::ast::utils::{bind_sql_with_state, PlaceholderState};
 use super::execution::execute_prepared::execute_prepared_with_transaction;
+use super::history::plugin_inputs as history_plugin_inputs;
 use super::planning::preprocess::preprocess_sql_to_plan;
 use super::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
 use super::storage::tables;
-use super::{
-    history::plugin_inputs as history_plugin_inputs, history::projections as history_projections,
-};
 use crate::SqlDialect;
 
 pub(crate) struct FilesystemUpdateDomainChangeCollection {
@@ -166,15 +164,6 @@ impl Engine {
             .await?;
         }
         Ok(())
-    }
-
-    pub(crate) async fn maybe_refresh_working_change_projection_for_read_query(
-        &self,
-        backend: &dyn LixBackend,
-        active_version_id: &str,
-    ) -> Result<(), LixError> {
-        history_projections::refresh_working_projection_for_read_query(backend, active_version_id)
-            .await
     }
 
     pub(crate) async fn collect_execution_side_effects_with_backend_from_statements(

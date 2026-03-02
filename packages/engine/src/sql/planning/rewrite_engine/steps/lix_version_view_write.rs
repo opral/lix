@@ -5,7 +5,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
 use crate::engine::sql::planning::rewrite_engine::steps::{lix_version_view_read, vtable_read};
@@ -24,7 +24,6 @@ use crate::{LixBackend, LixError, Value as EngineValue};
 
 const LIX_VERSION_VIEW_NAME: &str = "lix_version";
 const VTABLE_NAME: &str = "lix_internal_state_vtable";
-const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
 
 pub fn rewrite_insert(
     insert: Insert,
@@ -68,10 +67,10 @@ pub fn rewrite_insert(
 }
 
 pub async fn rewrite_insert_with_backend(
-    backend: &dyn LixBackend,
+    _backend: &dyn LixBackend,
     insert: Insert,
     params: &[EngineValue],
-) -> Result<Option<Vec<Insert>>, LixError> {
+) -> Result<Option<VersionRewritePlan>, LixError> {
     if !table_object_is_lix_version(&insert.table) {
         return Ok(None);
     }
@@ -97,7 +96,6 @@ pub async fn rewrite_insert_with_backend(
         rows_source.resolved_rows,
         "lix_version insert",
     )?;
-    validate_tip_working_commit_uniqueness(backend, &parsed_rows).await?;
 
     let descriptor_rows = parsed_rows
         .iter()
@@ -107,14 +105,30 @@ pub async fn rewrite_insert_with_backend(
         .iter()
         .map(|row| row.tip_row.clone())
         .collect::<Vec<_>>();
-    Ok(Some(build_vtable_inserts(descriptor_rows, tip_rows)?))
+    let baseline_rows = parsed_rows
+        .iter()
+        .map(|row| (row.version_id.clone(), row.commit_id.clone()))
+        .collect::<Vec<_>>();
+
+    let mut supplemental_statements = Vec::new();
+    if let Some(statement) = build_last_checkpoint_upsert_statement(
+        &baseline_rows,
+        LastCheckpointUpsertMode::UpdateExisting,
+    )? {
+        supplemental_statements.push(statement);
+    }
+
+    Ok(Some(VersionRewritePlan {
+        vtable_inserts: build_vtable_inserts(descriptor_rows, tip_rows)?,
+        supplemental_statements,
+    }))
 }
 
 pub async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     update: Update,
     params: &[EngineValue],
-) -> Result<Option<Vec<Insert>>, LixError> {
+) -> Result<Option<VersionRewritePlan>, LixError> {
     if !table_with_joins_is_lix_version(&update.table) {
         return Ok(None);
     }
@@ -148,12 +162,18 @@ pub async fn rewrite_update_with_backend(
     )
     .await?;
     if existing_rows.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(VersionRewritePlan::default()));
     }
 
     let mut descriptor_rows = Vec::new();
     let mut tip_rows = Vec::new();
+    let mut baseline_rows = Vec::new();
     for existing in existing_rows {
+        let next_commit_id = assignment_values
+            .commit_id
+            .clone()
+            .unwrap_or(existing.commit_id.clone());
+
         if assignment_values.touches_descriptor() {
             let next_name = assignment_values
                 .name
@@ -190,64 +210,48 @@ pub async fn rewrite_update_with_backend(
         }
 
         if assignment_values.touches_tip() {
-            let next_commit_id = assignment_values
-                .commit_id
-                .clone()
-                .ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description:
-                        "lix_version update must set both commit_id and working_commit_id together"
-                            .to_string(),
-                })?;
             if next_commit_id.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "lix_version update cannot set empty commit_id".to_string(),
                 });
             }
-            let next_working_commit_id =
-                assignment_values
-                    .working_commit_id
-                    .clone()
-                    .ok_or_else(|| {
-                        LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description:
-                        "lix_version update must set both commit_id and working_commit_id together"
-                            .to_string(),
-                }
-                    })?;
-            if next_working_commit_id.is_empty() {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "lix_version update cannot set empty working_commit_id"
-                        .to_string(),
-                });
-            }
             let snapshot = serde_json::from_str::<JsonValue>(&version_pointer_snapshot_content(
                 &existing.id,
                 &next_commit_id,
-                &next_working_commit_id,
             ))
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("failed to encode updated version tip snapshot: {error}"),
             })?;
             tip_rows.push(InsertSnapshotRow {
-                entity_id: existing.id,
+                entity_id: existing.id.clone(),
                 snapshot_content: Some(snapshot),
             });
         }
+
+        baseline_rows.push((existing.id, next_commit_id));
     }
 
-    Ok(Some(build_vtable_inserts(descriptor_rows, tip_rows)?))
+    let mut supplemental_statements = Vec::new();
+    if let Some(statement) = build_last_checkpoint_upsert_statement(
+        &baseline_rows,
+        LastCheckpointUpsertMode::DoNothingOnConflict,
+    )? {
+        supplemental_statements.push(statement);
+    }
+
+    Ok(Some(VersionRewritePlan {
+        vtable_inserts: build_vtable_inserts(descriptor_rows, tip_rows)?,
+        supplemental_statements,
+    }))
 }
 
 pub async fn rewrite_delete_with_backend(
     backend: &dyn LixBackend,
     delete: Delete,
     params: &[EngineValue],
-) -> Result<Option<Vec<Insert>>, LixError> {
+) -> Result<Option<VersionRewritePlan>, LixError> {
     if !delete_from_is_lix_version(&delete) {
         return Ok(None);
     }
@@ -278,23 +282,33 @@ pub async fn rewrite_delete_with_backend(
     )
     .await?;
     if existing_rows.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(VersionRewritePlan::default()));
     }
 
     let mut descriptor_rows = Vec::new();
     let mut tip_rows = Vec::new();
+    let mut deleted_version_ids = Vec::new();
     for row in existing_rows {
         descriptor_rows.push(InsertSnapshotRow {
             entity_id: row.id.clone(),
             snapshot_content: None,
         });
         tip_rows.push(InsertSnapshotRow {
-            entity_id: row.id,
+            entity_id: row.id.clone(),
             snapshot_content: None,
         });
+        deleted_version_ids.push(row.id);
     }
 
-    Ok(Some(build_vtable_inserts(descriptor_rows, tip_rows)?))
+    let mut supplemental_statements = Vec::new();
+    if let Some(statement) = build_last_checkpoint_delete_statement(&deleted_version_ids)? {
+        supplemental_statements.push(statement);
+    }
+
+    Ok(Some(VersionRewritePlan {
+        vtable_inserts: build_vtable_inserts(descriptor_rows, tip_rows)?,
+        supplemental_statements,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +323,7 @@ struct VersionRow {
     name: String,
     inherits_from_version_id: Option<String>,
     hidden: bool,
+    commit_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -317,15 +332,20 @@ struct VersionAssignments {
     inherits_from_version_id: Option<Option<String>>,
     hidden: Option<bool>,
     commit_id: Option<String>,
-    working_commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ParsedInsertRow {
-    entity_id: String,
-    working_commit_id: String,
+    version_id: String,
+    commit_id: String,
     descriptor_row: InsertSnapshotRow,
     tip_row: InsertSnapshotRow,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VersionRewritePlan {
+    pub vtable_inserts: Vec<Insert>,
+    pub supplemental_statements: Vec<Statement>,
 }
 
 impl VersionAssignments {
@@ -334,7 +354,7 @@ impl VersionAssignments {
     }
 
     fn touches_tip(&self) -> bool {
-        self.commit_id.is_some() || self.working_commit_id.is_some()
+        self.commit_id.is_some()
     }
 }
 
@@ -377,10 +397,6 @@ fn parse_update_assignments(
             "commit_id" => {
                 parsed.commit_id = Some(value_required_string(&value, "commit_id")?);
             }
-            "working_commit_id" => {
-                parsed.working_commit_id =
-                    Some(value_required_string(&value, "working_commit_id")?);
-            }
             _ => {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -388,15 +404,6 @@ fn parse_update_assignments(
                 });
             }
         }
-    }
-
-    if parsed.commit_id.is_some() ^ parsed.working_commit_id.is_some() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "lix_version update must set both commit_id and working_commit_id together"
-                    .to_string(),
-        });
     }
 
     Ok(parsed)
@@ -423,12 +430,6 @@ fn parse_insert_rows(
 
         let commit_id =
             field_required_string(field_map.get("commit_id"), resolved_row, row, "commit_id")?;
-        let working_commit_id = field_required_string(
-            field_map.get("working_commit_id"),
-            resolved_row,
-            row,
-            "working_commit_id",
-        )?;
 
         if id.is_empty() {
             return Err(LixError {
@@ -440,12 +441,6 @@ fn parse_insert_rows(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("{operation_name} field 'commit_id' cannot be empty"),
-            });
-        }
-        if working_commit_id.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("{operation_name} field 'working_commit_id' cannot be empty"),
             });
         }
 
@@ -460,19 +455,16 @@ fn parse_insert_rows(
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("failed to encode version descriptor snapshot: {error}"),
             })?;
-        let tip_snapshot = serde_json::from_str::<JsonValue>(&version_pointer_snapshot_content(
-            &id,
-            &commit_id,
-            &working_commit_id,
-        ))
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to encode version tip snapshot: {error}"),
-        })?;
+        let tip_snapshot =
+            serde_json::from_str::<JsonValue>(&version_pointer_snapshot_content(&id, &commit_id))
+                .map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("failed to encode version tip snapshot: {error}"),
+            })?;
 
         parsed_rows.push(ParsedInsertRow {
-            entity_id: id.clone(),
-            working_commit_id,
+            version_id: id.clone(),
+            commit_id: commit_id.clone(),
             descriptor_row: InsertSnapshotRow {
                 entity_id: id.clone(),
                 snapshot_content: Some(descriptor_snapshot),
@@ -486,89 +478,6 @@ fn parse_insert_rows(
     Ok(parsed_rows)
 }
 
-async fn validate_tip_working_commit_uniqueness(
-    backend: &dyn LixBackend,
-    parsed_rows: &[ParsedInsertRow],
-) -> Result<(), LixError> {
-    let mut incoming_working_to_entity = HashMap::<String, String>::new();
-    for row in parsed_rows {
-        if let Some(existing_entity_id) =
-            incoming_working_to_entity.insert(row.working_commit_id.clone(), row.entity_id.clone())
-        {
-            if existing_entity_id != row.entity_id {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "Unique constraint violation: working_commit_id '{}' already used by version '{}'",
-                        row.working_commit_id, existing_entity_id
-                    ),
-                });
-            }
-        }
-    }
-
-    if incoming_working_to_entity.is_empty() {
-        return Ok(());
-    }
-
-    let result = backend
-        .execute(
-            &format!(
-                "SELECT entity_id, snapshot_content \
-                 FROM {table_name} \
-                 WHERE schema_key = $1 \
-                   AND version_id = $2 \
-                   AND is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL",
-                table_name = VERSION_POINTER_TABLE
-            ),
-            &[
-                EngineValue::Text(version_pointer_schema_key().to_string()),
-                EngineValue::Text(version_pointer_storage_version_id().to_string()),
-            ],
-        )
-        .await?;
-
-    let mut seen = HashSet::<String>::new();
-    for row in result.rows {
-        if row.len() < 2 {
-            continue;
-        }
-        let entity_id = match &row[0] {
-            EngineValue::Text(value) => value,
-            _ => continue,
-        };
-        let snapshot_content = match &row[1] {
-            EngineValue::Text(value) => value,
-            _ => continue,
-        };
-        let snapshot: JsonValue = match serde_json::from_str(snapshot_content) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let Some(working_commit_id) = snapshot
-            .get("working_commit_id")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if !seen.insert(working_commit_id.clone()) {
-            // Keep behavior stable when prior data already violates uniqueness.
-            continue;
-        }
-        if let Some(incoming_entity_id) = incoming_working_to_entity.get(&working_commit_id) {
-            if incoming_entity_id != entity_id {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "Unique constraint violation: working_commit_id '{}' already used by version '{}'",
-                        working_commit_id, entity_id
-                    ),
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn query_lix_version_rows(
     backend: &dyn LixBackend,
     selection: Option<&Expr>,
@@ -580,7 +489,7 @@ async fn query_lix_version_rows(
         .unwrap_or_default();
     let sql = format!(
         "SELECT \
-         id, name, inherits_from_version_id, hidden, commit_id, working_commit_id \
+         id, name, inherits_from_version_id, hidden, commit_id \
          FROM {view}{where_sql}",
         view = LIX_VERSION_VIEW_NAME
     );
@@ -617,10 +526,10 @@ async fn query_lix_version_rows(
 
     let mut rows = Vec::new();
     for row in result.rows {
-        if row.len() < 6 {
+        if row.len() < 5 {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "lix_version rewrite expected 6 columns from row loader query"
+                description: "lix_version rewrite expected 5 columns from row loader query"
                     .to_string(),
             });
         }
@@ -628,14 +537,14 @@ async fn query_lix_version_rows(
         let name = value_required_string(&row[1], "name")?;
         let inherits_from_version_id = value_optional_string(&row[2], "inherits_from_version_id")?;
         let hidden = value_bool_from_existing_row(&row[3], "hidden")?;
-        let _commit_id = value_required_string(&row[4], "commit_id")?;
-        let _working_commit_id = value_required_string(&row[5], "working_commit_id")?;
+        let commit_id = value_required_string(&row[4], "commit_id")?;
 
         rows.push(VersionRow {
             id,
             name,
             inherits_from_version_id,
             hidden,
+            commit_id,
         });
     }
 
@@ -668,6 +577,80 @@ fn build_vtable_inserts(
         )?);
     }
     Ok(inserts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastCheckpointUpsertMode {
+    UpdateExisting,
+    DoNothingOnConflict,
+}
+
+fn build_last_checkpoint_upsert_statement(
+    rows: &[(String, String)],
+    mode: LastCheckpointUpsertMode,
+) -> Result<Option<Statement>, LixError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let values_sql = rows
+        .iter()
+        .map(|(version_id, checkpoint_commit_id)| {
+            format!(
+                "('{version_id}', '{checkpoint_commit_id}')",
+                version_id = escape_sql_string(version_id),
+                checkpoint_commit_id = escape_sql_string(checkpoint_commit_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let on_conflict = match mode {
+        LastCheckpointUpsertMode::UpdateExisting => {
+            "DO UPDATE SET checkpoint_commit_id = excluded.checkpoint_commit_id"
+        }
+        LastCheckpointUpsertMode::DoNothingOnConflict => "DO NOTHING",
+    };
+
+    let sql = format!(
+        "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
+         VALUES {values_sql} \
+         ON CONFLICT (version_id) {on_conflict}"
+    );
+    Ok(Some(parse_single_statement(&sql)?))
+}
+
+fn build_last_checkpoint_delete_statement(
+    version_ids: &[String],
+) -> Result<Option<Statement>, LixError> {
+    if version_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let in_list = version_ids
+        .iter()
+        .map(|id| format!("'{}'", escape_sql_string(id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "DELETE FROM lix_internal_last_checkpoint \
+         WHERE version_id IN ({in_list})"
+    );
+    Ok(Some(parse_single_statement(&sql)?))
+}
+
+fn parse_single_statement(sql: &str) -> Result<Statement, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error.to_string(),
+    })?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "lix_version rewrite expected a single generated statement".to_string(),
+        });
+    }
+    Ok(statements.remove(0))
 }
 
 fn build_vtable_insert_for_schema(
@@ -735,7 +718,6 @@ fn insert_field_map(columns: &[Ident]) -> Result<BTreeMap<String, usize>, LixErr
         "inherits_from_version_id",
         "hidden",
         "commit_id",
-        "working_commit_id",
     ]);
     let mut map = BTreeMap::new();
     for (index, column) in columns.iter().enumerate() {

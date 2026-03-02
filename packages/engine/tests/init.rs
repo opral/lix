@@ -18,15 +18,98 @@ fn i64_value(value: &lix_engine::Value, field: &str) -> i64 {
     }
 }
 
-fn string_array_value(value: &lix_engine::Value, field: &str) -> Vec<String> {
-    match value {
-        lix_engine::Value::Text(value) => serde_json::from_str::<Vec<String>>(value)
-            .unwrap_or_else(|error| {
-                panic!("expected JSON string array for {field}, got '{value}': {error}")
-            }),
-        lix_engine::Value::Null => Vec::new(),
-        other => panic!("expected text JSON array for {field}, got {other:?}"),
-    }
+async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let active = engine
+        .execute(
+            "SELECT version_id \
+             FROM lix_active_version \
+             ORDER BY id \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("active version query should succeed");
+    assert_eq!(active.rows.len(), 1);
+    text_value(&active.rows[0][0], "active_version.version_id")
+}
+
+async fn checkpoint_label_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let rows = engine
+        .execute(
+            "SELECT id \
+             FROM lix_label \
+             WHERE name = 'checkpoint' \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("checkpoint label query should succeed");
+    assert_eq!(rows.rows.len(), 1);
+    text_value(&rows.rows[0][0], "lix_label.id")
+}
+
+async fn insert_untracked_snapshot(
+    engine: &support::simulation_test::SimulationEngine,
+    entity_id: &str,
+    schema_key: &str,
+    snapshot_content: &str,
+    created_at: &str,
+) {
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_untracked (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, created_at, updated_at\
+             ) VALUES ($1, $2, 'lix', 'global', 'lix', $3, NULL, '1', $4, $4)",
+            &[
+                lix_engine::Value::Text(entity_id.to_string()),
+                lix_engine::Value::Text(schema_key.to_string()),
+                lix_engine::Value::Text(snapshot_content.to_string()),
+                lix_engine::Value::Text(created_at.to_string()),
+            ],
+        )
+        .await
+        .expect("insert into lix_internal_state_untracked should succeed");
+}
+
+async fn insert_commit(
+    engine: &support::simulation_test::SimulationEngine,
+    commit_id: &str,
+    change_set_id: &str,
+    created_at: &str,
+) {
+    let snapshot = serde_json::json!({
+        "id": commit_id,
+        "change_set_id": change_set_id,
+        "parent_commit_ids": [],
+        "change_ids": [],
+    })
+    .to_string();
+    insert_untracked_snapshot(engine, commit_id, "lix_commit", &snapshot, created_at).await;
+}
+
+async fn label_commit_as_checkpoint(
+    engine: &support::simulation_test::SimulationEngine,
+    commit_id: &str,
+    checkpoint_label_id: &str,
+    created_at: &str,
+) {
+    let entity_label_id = format!("{commit_id}~lix_commit~lix~{checkpoint_label_id}");
+    let snapshot = serde_json::json!({
+        "id": entity_label_id,
+        "entity_id": commit_id,
+        "schema_key": "lix_commit",
+        "file_id": "lix",
+        "label_id": checkpoint_label_id,
+    })
+    .to_string();
+    insert_untracked_snapshot(
+        engine,
+        &entity_label_id,
+        "lix_entity_label",
+        &snapshot,
+        created_at,
+    )
+    .await;
 }
 
 simulation_test!(init_creates_untracked_table, |sim| async move {
@@ -306,7 +389,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    init_seeds_per_version_commit_and_working_commit_ids,
+    init_seeds_per_version_commit_ids_and_last_checkpoint_pointers,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -331,7 +414,7 @@ simulation_test!(
 
         let versions = engine
             .execute(
-                "SELECT id, commit_id, working_commit_id \
+                "SELECT id, commit_id \
                  FROM lix_version \
                  WHERE id IN ('global', $1) \
                  ORDER BY id",
@@ -347,62 +430,55 @@ simulation_test!(
         );
         let versions_before_second_init = versions.rows.clone();
 
-        let mut global_commit_id = String::new();
-        let mut global_working_commit_id = String::new();
-        let mut main_commit_id = String::new();
-        let mut main_working_commit_id = String::new();
-
-        for row in &versions.rows {
-            let version_id = text_value(&row[0], "id");
-            let commit_id = text_value(&row[1], "commit_id");
-            let working_commit_id = text_value(&row[2], "working_commit_id");
-            if version_id == "global" {
-                global_commit_id = commit_id;
-                global_working_commit_id = working_commit_id;
-            } else {
-                main_commit_id = commit_id;
-                main_working_commit_id = working_commit_id;
-            }
-        }
-
-        assert!(
-            !global_commit_id.is_empty(),
-            "global version row must exist"
+        let baselines = engine
+            .execute(
+                "SELECT version_id, checkpoint_commit_id \
+                 FROM lix_internal_last_checkpoint \
+                 WHERE version_id IN ('global', $1) \
+                 ORDER BY version_id",
+                &[lix_engine::Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(baselines.rows.clone());
+        assert_eq!(
+            baselines.rows.len(),
+            2,
+            "expected baseline pointer rows for global + main"
         );
-        assert!(!main_commit_id.is_empty(), "main version row must exist");
-        assert!(
-            !global_working_commit_id.is_empty(),
-            "global working commit id must exist"
-        );
-        assert!(
-            !main_working_commit_id.is_empty(),
-            "main working commit id must exist"
-        );
+        let baselines_before_second_init = baselines.rows.clone();
 
-        assert_ne!(global_working_commit_id, "global");
-        assert_ne!(main_working_commit_id, "global");
-        assert_ne!(global_working_commit_id, main_working_commit_id);
-        assert_ne!(global_working_commit_id, global_commit_id);
-        assert_ne!(main_working_commit_id, main_commit_id);
+        for version_row in &versions.rows {
+            let version_id = text_value(&version_row[0], "id");
+            let commit_id = text_value(&version_row[1], "commit_id");
+            assert!(
+                !commit_id.is_empty(),
+                "version '{version_id}' must have commit_id"
+            );
 
-        for (version_id, commit_id, working_commit_id) in [
-            (
-                "global",
-                global_commit_id.as_str(),
-                global_working_commit_id.as_str(),
-            ),
-            (
-                main_version_id.as_str(),
-                main_commit_id.as_str(),
-                main_working_commit_id.as_str(),
-            ),
-        ] {
+            let baseline_commit_id = baselines
+                .rows
+                .iter()
+                .find_map(|row| {
+                    if text_value(&row[0], "version_id") == version_id {
+                        Some(text_value(&row[1], "checkpoint_commit_id"))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("missing baseline pointer for version '{version_id}'"));
+
+            assert_eq!(
+                baseline_commit_id, commit_id,
+                "seeded baseline must point to seeded tip commit for version '{version_id}'"
+            );
+
             let commit_exists = engine
                 .execute(
                     "SELECT COUNT(*) \
                      FROM lix_commit \
                      WHERE id = $1",
-                    &[lix_engine::Value::Text(commit_id.to_string())],
+                    &[lix_engine::Value::Text(commit_id.clone())],
                 )
                 .await
                 .unwrap();
@@ -411,55 +487,12 @@ simulation_test!(
                 1,
                 "commit '{commit_id}' must exist exactly once"
             );
-
-            let working_row = engine
-                .execute(
-                    "SELECT change_set_id, parent_commit_ids \
-                     FROM lix_commit \
-                     WHERE id = $1 \
-                     LIMIT 1",
-                    &[lix_engine::Value::Text(working_commit_id.to_string())],
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                working_row.rows.len(),
-                1,
-                "working commit '{working_commit_id}' must exist for version '{version_id}'"
-            );
-            let working_change_set_id =
-                text_value(&working_row.rows[0][0], "working_change_set_id");
-            assert!(
-                !working_change_set_id.is_empty(),
-                "working commit '{working_commit_id}' must reference a change set"
-            );
-
-            let parents = string_array_value(&working_row.rows[0][1], "parent_commit_ids");
-            assert!(
-                parents.iter().any(|parent| parent == commit_id),
-                "working commit '{working_commit_id}' for version '{version_id}' must list tip commit '{commit_id}' as parent; parents={parents:?}"
-            );
-
-            let change_set_exists = engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_change_set \
-                     WHERE id = $1",
-                    &[lix_engine::Value::Text(working_change_set_id)],
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                i64_value(&change_set_exists.rows[0][0], "change_set_count"),
-                1,
-                "working commit '{working_commit_id}' must reference an existing change set"
-            );
         }
 
         engine.init().await.unwrap();
         let versions_after_second_init = engine
             .execute(
-                "SELECT id, commit_id, working_commit_id \
+                "SELECT id, commit_id \
                  FROM lix_version \
                  WHERE id IN ('global', $1) \
                  ORDER BY id",
@@ -471,6 +504,235 @@ simulation_test!(
         assert_eq!(
             versions_after_second_init.rows, versions_before_second_init,
             "init() should be idempotent for seeded version pointers"
+        );
+
+        let baselines_after_second_init = engine
+            .execute(
+                "SELECT version_id, checkpoint_commit_id \
+                 FROM lix_internal_last_checkpoint \
+                 WHERE version_id IN ('global', $1) \
+                 ORDER BY version_id",
+                &[lix_engine::Value::Text(main_version_id)],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic(baselines_after_second_init.rows.clone());
+        assert_eq!(
+            baselines_after_second_init.rows, baselines_before_second_init,
+            "init() should be idempotent for seeded baseline pointers"
+        );
+    }
+);
+
+simulation_test!(
+    init_rebuild_last_checkpoint_prefers_nearest_checkpoint_ancestor,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let checkpoint_label_id = checkpoint_label_id(&engine).await;
+
+        let tip = "rebuild-depth-tip";
+        let near = "rebuild-depth-near";
+        let far = "rebuild-depth-far";
+
+        insert_commit(
+            &engine,
+            tip,
+            "rebuild-depth-cs-tip",
+            "2025-01-10T00:00:00.000Z",
+        )
+        .await;
+        insert_commit(
+            &engine,
+            near,
+            "rebuild-depth-cs-near",
+            "2025-01-01T00:00:00.000Z",
+        )
+        .await;
+        insert_commit(
+            &engine,
+            far,
+            "rebuild-depth-cs-far",
+            "2025-02-01T00:00:00.000Z",
+        )
+        .await;
+
+        label_commit_as_checkpoint(
+            &engine,
+            near,
+            &checkpoint_label_id,
+            "2025-01-20T00:00:00.000Z",
+        )
+        .await;
+        label_commit_as_checkpoint(
+            &engine,
+            far,
+            &checkpoint_label_id,
+            "2025-01-20T00:00:00.000Z",
+        )
+        .await;
+
+        engine
+            .execute(
+                "UPDATE lix_version SET commit_id = $1 WHERE id = $2",
+                &[
+                    lix_engine::Value::Text(tip.to_string()),
+                    lix_engine::Value::Text(version_id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) VALUES \
+                 ($1, $1, 0), \
+                 ($1, $2, 1), \
+                 ($1, $3, 2)",
+                &[
+                    lix_engine::Value::Text(tip.to_string()),
+                    lix_engine::Value::Text(near.to_string()),
+                    lix_engine::Value::Text(far.to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        engine.init().await.unwrap();
+
+        let baseline = engine
+            .execute(
+                "SELECT checkpoint_commit_id \
+                 FROM lix_internal_last_checkpoint \
+                 WHERE version_id = $1",
+                &[lix_engine::Value::Text(version_id)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(baseline.rows.len(), 1);
+        assert_eq!(
+            text_value(&baseline.rows[0][0], "checkpoint_commit_id"),
+            near,
+            "nearest checkpoint ancestor should win over deeper ancestors even if deeper is newer"
+        );
+    }
+);
+
+simulation_test!(
+    init_rebuild_last_checkpoint_tie_breaks_by_created_at_then_ancestor_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let checkpoint_label_id = checkpoint_label_id(&engine).await;
+
+        let tip = "rebuild-tiebreak-tip";
+        let old = "rebuild-tiebreak-old";
+        let tie_low = "rebuild-tiebreak-b";
+        let tie_high = "rebuild-tiebreak-z";
+
+        insert_commit(
+            &engine,
+            tip,
+            "rebuild-tiebreak-cs-tip",
+            "2025-03-01T00:00:00.000Z",
+        )
+        .await;
+        insert_commit(
+            &engine,
+            old,
+            "rebuild-tiebreak-cs-old",
+            "2025-01-01T00:00:00.000Z",
+        )
+        .await;
+        insert_commit(
+            &engine,
+            tie_low,
+            "rebuild-tiebreak-cs-b",
+            "2025-02-01T00:00:00.000Z",
+        )
+        .await;
+        insert_commit(
+            &engine,
+            tie_high,
+            "rebuild-tiebreak-cs-z",
+            "2025-02-01T00:00:00.000Z",
+        )
+        .await;
+
+        label_commit_as_checkpoint(
+            &engine,
+            old,
+            &checkpoint_label_id,
+            "2025-01-10T00:00:00.000Z",
+        )
+        .await;
+        label_commit_as_checkpoint(
+            &engine,
+            tie_low,
+            &checkpoint_label_id,
+            "2025-02-10T00:00:00.000Z",
+        )
+        .await;
+        label_commit_as_checkpoint(
+            &engine,
+            tie_high,
+            &checkpoint_label_id,
+            "2025-02-10T00:00:00.000Z",
+        )
+        .await;
+
+        engine
+            .execute(
+                "UPDATE lix_version SET commit_id = $1 WHERE id = $2",
+                &[
+                    lix_engine::Value::Text(tip.to_string()),
+                    lix_engine::Value::Text(version_id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "INSERT INTO lix_internal_commit_ancestry (commit_id, ancestor_id, depth) VALUES \
+                 ($1, $1, 0), \
+                 ($1, $2, 1), \
+                 ($1, $3, 1), \
+                 ($1, $4, 1)",
+                &[
+                    lix_engine::Value::Text(tip.to_string()),
+                    lix_engine::Value::Text(old.to_string()),
+                    lix_engine::Value::Text(tie_low.to_string()),
+                    lix_engine::Value::Text(tie_high.to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        engine.init().await.unwrap();
+
+        let baseline = engine
+            .execute(
+                "SELECT checkpoint_commit_id \
+                 FROM lix_internal_last_checkpoint \
+                 WHERE version_id = $1",
+                &[lix_engine::Value::Text(version_id)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(baseline.rows.len(), 1);
+        assert_eq!(
+            text_value(&baseline.rows[0][0], "checkpoint_commit_id"),
+            tie_high,
+            "with equal depth, newer created_at wins; ties then resolve by ancestor_id DESC"
         );
     }
 );

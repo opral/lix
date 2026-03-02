@@ -42,7 +42,6 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                  d.inherits_from_version_id AS inherits_from_version_id, \
                  d.hidden AS hidden, \
                  t.commit_id AS commit_id, \
-                 t.working_commit_id AS working_commit_id, \
                  d.entity_id AS entity_id, \
                  'lix_version' AS schema_key, \
                  d.file_id AS file_id, \
@@ -78,8 +77,7 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    created_at, \
                    updated_at, \
                    lix_json_extract(snapshot_content, 'id') AS id, \
-                   lix_json_extract(snapshot_content, 'commit_id') AS commit_id, \
-                   lix_json_extract(snapshot_content, 'working_commit_id') AS working_commit_id \
+                   lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_pointer' \
                    AND version_id = 'global' \

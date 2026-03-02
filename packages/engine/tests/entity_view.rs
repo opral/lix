@@ -443,9 +443,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                 id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
-                 'version-child', 'version-child', 'global', false, 'commit-child', 'working-child'\
+                 'version-child', 'version-child', 'global', false, 'commit-child'\
                  )",
                 &[],
             )
@@ -537,9 +537,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                 id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
-                 'active-test', 'active-test', NULL, false, 'commit-active', 'working-active'\
+                 'active-test', 'active-test', NULL, false, 'commit-active'\
                  )",
                 &[],
             )
@@ -702,9 +702,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                 id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
-                 'version-child', 'version-child', 'global', false, 'commit-child', 'working-child'\
+                 'version-child', 'version-child', 'global', false, 'commit-child'\
                  )",
                 &[],
             )
@@ -833,10 +833,10 @@ simulation_test!(
 
         engine
             .execute(
-                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id, working_commit_id\
+                "INSERT INTO lix_version (\
+                 id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
-                 'active-inherited', 'active-inherited', 'global', false, 'commit-inherited', 'working-inherited'\
+                 'active-inherited', 'active-inherited', 'global', false, 'commit-inherited'\
                  )",
                 &[],
             )
