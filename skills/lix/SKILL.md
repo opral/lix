@@ -1,3 +1,8 @@
+---
+name: lix
+description: Use this skill when working with .lix repositories via the lix CLI.
+---
+
 # Lix Skill
 
 Use this skill when working with `.lix` repositories.

@@ -4,6 +4,7 @@ use sqlparser::ast::Statement;
 
 use crate::engine::sql::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
 use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
+use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
 use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
@@ -131,6 +132,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
     for _ in 0..MAX_REWRITE_PASSES {
         match current {
             Statement::Insert(insert) => {
+                lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
                 if let Some(rewritten) = filesystem_write::rewrite_insert(insert.clone())? {
@@ -214,6 +216,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }
             Statement::Update(update) => {
+                lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
                 if let Some(rewritten) = filesystem_write::rewrite_update(update.clone())? {
@@ -239,6 +242,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
+                lix_change_view_write::reject_delete(&delete)?;
                 lix_state_history_view_write::reject_delete(&delete)?;
 
                 if let Some(rewritten) = filesystem_write::rewrite_delete(delete.clone())? {
@@ -352,6 +356,7 @@ where
     for _ in 0..MAX_REWRITE_PASSES {
         match current {
             Statement::Insert(insert) => {
+                lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
                 let filesystem_insert_side_effects =
@@ -499,6 +504,7 @@ where
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }
             Statement::Update(update) => {
+                lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
                 if let Some(rewritten) = filesystem_write::rewrite_update_with_backend(
@@ -588,6 +594,7 @@ where
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
+                lix_change_view_write::reject_delete(&delete)?;
                 lix_state_history_view_write::reject_delete(&delete)?;
 
                 let mut effective_scope_fallback = false;

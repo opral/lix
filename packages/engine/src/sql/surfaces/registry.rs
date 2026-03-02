@@ -7,7 +7,8 @@ use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::planning::preprocess::preprocess_with_surfaces_to_plan;
 use super::super::vtable;
 use super::{
-    entity, filesystem, lix_state, lix_state_by_version, lix_state_history, lix_working_changes,
+    entity, filesystem, lix_change, lix_state, lix_state_by_version, lix_state_history,
+    lix_working_changes,
 };
 use sqlparser::ast::Statement;
 
@@ -16,6 +17,7 @@ pub(crate) type DetectedFileDomainChangesByStatement = [Vec<DetectedFileDomainCh
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SurfaceKind {
     Vtable,
+    LixChange,
     LixState,
     LixStateByVersion,
     LixStateHistory,
@@ -28,6 +30,7 @@ pub(crate) enum SurfaceKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SurfaceCoverage {
     pub(crate) vtable: usize,
+    pub(crate) lix_change: usize,
     pub(crate) lix_state: usize,
     pub(crate) lix_state_by_version: usize,
     pub(crate) lix_state_history: usize,
@@ -40,6 +43,9 @@ pub(crate) struct SurfaceCoverage {
 pub(crate) fn classify_statement(statement: &Statement) -> SurfaceKind {
     if vtable::registry::detect_registered_vtable(statement).is_some() {
         return SurfaceKind::Vtable;
+    }
+    if lix_change::planner::matches(statement) {
+        return SurfaceKind::LixChange;
     }
     if lix_state_by_version::planner::matches(statement) {
         return SurfaceKind::LixStateByVersion;
@@ -74,6 +80,10 @@ pub(crate) fn collect_surface_coverage(statements: &[Statement]) -> SurfaceCover
                     );
                 let _ = vtable::internal_state_vtable::lower_write::supports_internal_state_vtable_write(statement);
                 coverage.vtable += 1;
+            }
+            SurfaceKind::LixChange => {
+                let _ = lix_change::lower::lowering_kind(statement);
+                coverage.lix_change += 1;
             }
             SurfaceKind::LixState => {
                 let _ = lix_state::lower::lowering_kind(statement);
@@ -150,6 +160,16 @@ mod tests {
             classify_statement(&statements[0]),
             SurfaceKind::LixStateByVersion
         );
+    }
+
+    #[test]
+    fn classifies_lix_change_surface() {
+        let statements = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT id, schema_key FROM lix_change WHERE entity_id = 'e1'",
+        )
+        .expect("parse SQL");
+        assert_eq!(classify_statement(&statements[0]), SurfaceKind::LixChange);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
 use crate::{LixBackend, LixError};
 
 const RESERVED_VIEW_NAMES: &[&str] = &[
+    "lix_change",
     "lix_state",
     "lix_state_by_version",
     "lix_state_history",
