@@ -462,6 +462,7 @@ fn normalize_history_column(raw: &str) -> Option<String> {
         "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
         "change_id" | "lixcol_change_id" => Some("change_id".to_string()),
         "commit_id" | "lixcol_commit_id" => Some("commit_id".to_string()),
+        "commit_created_at" => Some("commit_created_at".to_string()),
         "root_commit_id" | "lixcol_root_commit_id" => Some("root_commit_id".to_string()),
         "depth" | "lixcol_depth" => Some("depth".to_string()),
         "snapshot_content" => Some("snapshot_content".to_string()),
@@ -515,6 +516,7 @@ fn build_lix_state_history_view_query(
                h.schema_version AS schema_version, \
                h.change_id AS change_id, \
                h.commit_id AS commit_id, \
+               h.commit_created_at AS commit_created_at, \
                h.root_commit_id AS root_commit_id, \
                h.depth AS depth, \
                '{global_version}' AS version_id \
@@ -532,6 +534,7 @@ fn build_lix_state_history_view_query(
              SELECT \
                entity_id AS id, \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+               created_at AS created_at, \
                version_id AS lixcol_version_id \
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
@@ -558,8 +561,11 @@ fn build_lix_state_history_view_query(
              SELECT \
                rc.commit_id, \
                rc.root_commit_id, \
-               rc.commit_depth \
+               rc.commit_depth, \
+               c.created_at AS commit_created_at \
              FROM reachable_commits rc \
+             JOIN commit_by_version c \
+               ON c.id = rc.commit_id \
              {reachable_where_sql} \
            ), \
            breakpoint_rows AS ( \
@@ -590,6 +596,7 @@ fn build_lix_state_history_view_query(
                bp.snapshot_id, \
                bp.change_id, \
                rc.commit_id AS commit_id, \
+               rc.commit_created_at AS commit_created_at, \
                rc.root_commit_id AS root_commit_id, \
                rc.commit_depth AS depth \
              FROM filtered_reachable_commits rc \
@@ -683,6 +690,7 @@ fn build_lix_state_history_view_query_phase1(
            r.target_schema_key, \
            r.target_change_id, \
            r.origin_commit_id, \
+           r.commit_created_at, \
            r.root_commit_id, \
            r.commit_depth, \
            ROW_NUMBER() OVER ( \
@@ -711,6 +719,7 @@ fn build_lix_state_history_view_query_phase1(
            target_change.schema_version AS schema_version, \
            r.target_change_id AS target_change_id, \
            r.origin_commit_id AS origin_commit_id, \
+           r.commit_created_at AS commit_created_at, \
            r.root_commit_id AS root_commit_id, \
            r.commit_depth AS commit_depth, \
            ROW_NUMBER() OVER ( \
@@ -747,6 +756,7 @@ fn build_lix_state_history_view_query_phase1(
                ranked.schema_version AS schema_version, \
                ranked.target_change_id AS change_id, \
                ranked.origin_commit_id AS commit_id, \
+               ranked.commit_created_at AS commit_created_at, \
                ranked.root_commit_id AS root_commit_id, \
                ranked.commit_depth AS depth, \
                '{global_version}' AS version_id \
@@ -763,6 +773,7 @@ fn build_lix_state_history_view_query_phase1(
              SELECT \
                entity_id AS id, \
                lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+               created_at AS commit_created_at, \
                version_id AS lixcol_version_id \
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
@@ -806,6 +817,7 @@ fn build_lix_state_history_view_query_phase1(
              SELECT \
                c.id AS commit_id, \
                c.change_set_id AS change_set_id, \
+               c.commit_created_at AS commit_created_at, \
                rc.root_commit_id, \
                rc.depth AS commit_depth \
              FROM commit_by_version c \
@@ -819,6 +831,7 @@ fn build_lix_state_history_view_query_phase1(
                cse_raw.schema_key AS target_schema_key, \
                cse_raw.change_id AS target_change_id, \
                cc_raw.commit_id AS origin_commit_id, \
+               cc_raw.commit_created_at AS commit_created_at, \
                cc_raw.root_commit_id AS root_commit_id, \
                cc_raw.commit_depth AS commit_depth \
              FROM change_set_element_by_version cse_raw \
@@ -1562,6 +1575,23 @@ mod tests {
         assert!(
             !sql.contains("FROM lix_internal_state_vtable WHERE schema_key = 'lix_commit_edge'")
         );
+    }
+
+    #[test]
+    fn projects_commit_created_at_column() {
+        let query = parse_query(
+            "SELECT commit_created_at \
+             FROM lix_state_history AS sh \
+             WHERE sh.root_commit_id = 'commit-root' \
+             ORDER BY sh.depth ASC",
+        );
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("h.commit_created_at AS commit_created_at"));
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
