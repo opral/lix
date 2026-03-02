@@ -11,11 +11,6 @@ import {
 } from "kysely";
 import type { LixDatabaseSchema } from "./schema.js";
 
-type LixValue = {
-	kind?: string;
-	value?: unknown;
-};
-
 type LixQueryResult = {
 	rows?: unknown;
 	columns?: unknown;
@@ -34,7 +29,10 @@ type LixExecuteLike = {
 };
 
 type LixSqlTransactionLike = {
-	execute(sql: string, params?: ReadonlyArray<unknown>): Promise<LixQueryResult>;
+	execute(
+		sql: string,
+		params?: ReadonlyArray<unknown>,
+	): Promise<LixQueryResult>;
 	commit(): Promise<void>;
 	rollback(): Promise<void>;
 };
@@ -47,7 +45,10 @@ type LixDbLike = {
 	db: unknown;
 };
 
-type LixLike = LixExecuteLike | LixDbLike | (LixExecuteLike & LixBeginTransactionLike);
+type LixLike =
+	| LixExecuteLike
+	| LixDbLike
+	| (LixExecuteLike & LixBeginTransactionLike);
 export type CreateLixKyselyOptions = {
 	writerKey?: string | null;
 };
@@ -68,7 +69,10 @@ class LixConnection implements DatabaseConnection {
 	}
 
 	async executeQuery<R>(compiledQuery: CompiledQuery): Promise<QueryResult<R>> {
-		const raw = await this.#executeSql(compiledQuery.sql, compiledQuery.parameters);
+		const raw = await this.#executeSql(
+			compiledQuery.sql,
+			compiledQuery.parameters,
+		);
 		const decodedRows = decodeRows(raw.rows);
 		const columnNames =
 			decodeColumnNames(raw.columns) ??
@@ -112,17 +116,7 @@ class LixConnection implements DatabaseConnection {
 		if (!rows[0] || rows[0].length === 0) {
 			return undefined;
 		}
-		const value = rows[0][0];
-		if (typeof value === "number" && Number.isInteger(value)) {
-			return BigInt(value);
-		}
-		if (typeof value === "bigint") {
-			return value;
-		}
-		if (typeof value === "string" && /^-?\d+$/.test(value)) {
-			return BigInt(value);
-		}
-		return undefined;
+		return extractIntegerValue(rows[0][0]);
 	}
 
 	async resolveColumnNames(queryNode: unknown): Promise<string[] | undefined> {
@@ -217,7 +211,10 @@ class LixDriver implements Driver {
 		savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#executeSql(`SAVEPOINT ${quoteIdentifier(savepointName)}`, undefined);
+		await this.#executeSql(
+			`SAVEPOINT ${quoteIdentifier(savepointName)}`,
+			undefined,
+		);
 	}
 
 	async rollbackToSavepoint(
@@ -236,7 +233,10 @@ class LixDriver implements Driver {
 		savepointName: string,
 		_compileQuery: QueryCompiler["compileQuery"],
 	): Promise<void> {
-		await this.#executeSql(`RELEASE SAVEPOINT ${quoteIdentifier(savepointName)}`, undefined);
+		await this.#executeSql(
+			`RELEASE SAVEPOINT ${quoteIdentifier(savepointName)}`,
+			undefined,
+		);
 	}
 
 	async releaseConnection(): Promise<void> {}
@@ -317,7 +317,8 @@ function isLixBeginTransactionLike(
 		return false;
 	}
 	return (
-		typeof (value as { beginTransaction?: unknown }).beginTransaction === "function"
+		typeof (value as { beginTransaction?: unknown }).beginTransaction ===
+		"function"
 	);
 }
 
@@ -363,20 +364,8 @@ function decodeRows(rawRows: unknown): unknown[][] {
 		if (!Array.isArray(row)) {
 			return [];
 		}
-		return row.map((value) => decodeValue(value));
+		return [...row];
 	});
-}
-
-function decodeValue(value: unknown): unknown {
-	if (!value || typeof value !== "object") {
-		return value;
-	}
-
-	const raw = value as LixValue;
-	if (typeof raw.kind === "string" && "value" in raw) {
-		return raw.value;
-	}
-	return value;
 }
 
 function decodeColumnNames(rawColumns: unknown): string[] | undefined {
@@ -389,6 +378,19 @@ function decodeColumnNames(rawColumns: unknown): string[] | undefined {
 	);
 
 	return names.length > 0 ? names : undefined;
+}
+
+function extractIntegerValue(value: unknown): bigint | undefined {
+	if (typeof value === "number" && Number.isInteger(value)) {
+		return BigInt(value);
+	}
+	if (typeof value === "bigint") {
+		return value;
+	}
+	if (typeof value === "string" && /^-?\d+$/.test(value)) {
+		return BigInt(value);
+	}
+	return undefined;
 }
 
 function rowToObject(

@@ -281,7 +281,11 @@ export type LixDatabaseSchema = {
 	> &
 	EntityViews<typeof LixLabelSchema, "lix_label"> &
 	EntityViews<typeof LixEntityLabelSchema, "lix_entity_label"> &
-	EntityViews<typeof LixStoredSchemaSchema, "lix_stored_schema", { value: any }> &
+	EntityViews<
+		typeof LixStoredSchemaSchema,
+		"lix_stored_schema",
+		{ value: any }
+	> &
 	EntityViews<
 		typeof LixVersionDescriptorSchema,
 		"lix_version",

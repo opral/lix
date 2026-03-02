@@ -72,8 +72,6 @@ test("qb(lix) serializes concurrent transactions on one Lix instance", async () 
 		.where("path", "in", ["/tx-concurrent-a.md", "/tx-concurrent-b.md"])
 		.select(["path"])
 		.execute();
-	expect(rows.map((row) => row.path).sort()).toEqual([
-		"/tx-concurrent-a.md",
-		"/tx-concurrent-b.md",
-	]);
+	const paths = rows.map((row) => row.path).sort();
+	expect(paths).toEqual(["/tx-concurrent-a.md", "/tx-concurrent-b.md"]);
 });

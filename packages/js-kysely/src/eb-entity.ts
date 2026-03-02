@@ -70,19 +70,19 @@ export function ebEntity<
 				const columnRef = entityType
 					? `${entityType}.${entityIdCol}`
 					: entityIdCol;
-					return eb(eb.ref(columnRef as any), "in", (subquery: any) =>
-						subquery
-							.selectFrom("lix_entity_label")
-							.innerJoin("lix_label", "lix_label.id", "lix_entity_label.label_id")
-							.select("lix_entity_label.entity_id")
-							.$if("name" in label, (qb: any) =>
-								qb.where("lix_label.name", "=", label.name!),
-							)
-							.$if("id" in label, (qb: any) =>
-								qb.where("lix_label.id", "=", label.id!),
-							),
-					);
-				};
+				return eb(eb.ref(columnRef as any), "in", (subquery: any) =>
+					subquery
+						.selectFrom("lix_entity_label")
+						.innerJoin("lix_label", "lix_label.id", "lix_entity_label.label_id")
+						.select("lix_entity_label.entity_id")
+						.$if("name" in label, (qb: any) =>
+							qb.where("lix_label.name", "=", label.name!),
+						)
+						.$if("id" in label, (qb: any) =>
+							qb.where("lix_label.id", "=", label.id!),
+						),
+				);
+			};
 		},
 		equals(entity: LixEntity | LixEntityCanonical) {
 			return (

@@ -2,149 +2,265 @@ export { default } from "./wasm/lix_engine_wasm_bindgen.js";
 export * from "./wasm/lix_engine_wasm_bindgen.js";
 import type { InitInput } from "./wasm/lix_engine_wasm_bindgen.js";
 
-export type ValueKind = "Null" | "Boolean" | "Integer" | "Real" | "Text" | "Blob";
+export type ValueKind = "null" | "bool" | "int" | "float" | "text" | "blob";
+
+export type LixValue =
+	| { kind: "null"; value: null }
+	| { kind: "bool"; value: boolean }
+	| { kind: "int"; value: number }
+	| { kind: "float"; value: number }
+	| { kind: "text"; value: string }
+	| { kind: "blob"; base64: string };
 
 export class Value {
-  kind: ValueKind;
-  value: unknown;
+	kind: ValueKind;
+	value: null | boolean | number | string | undefined;
+	base64: string | undefined;
 
-  constructor(kind: ValueKind, value: unknown) {
-    this.kind = kind;
-    this.value = value;
-  }
+	constructor(
+		kind: ValueKind,
+		value: null | boolean | number | string | undefined,
+		base64?: string,
+	) {
+		this.kind = kind;
+		this.value = value;
+		this.base64 = base64;
+	}
 
-  static null(): Value {
-    return new Value("Null", null);
-  }
+	static null(): Value {
+		return new Value("null", null);
+	}
 
-  static integer(value: number): Value {
-    return new Value("Integer", value);
-  }
+	static integer(value: number): Value {
+		if (!Number.isFinite(value) || !Number.isInteger(value)) {
+			throw new TypeError("Value.integer() requires a finite integer number");
+		}
+		return new Value("int", value);
+	}
 
-  static boolean(value: boolean): Value {
-    return new Value("Boolean", value);
-  }
+	static boolean(value: boolean): Value {
+		return new Value("bool", value);
+	}
 
-  static real(value: number): Value {
-    return new Value("Real", value);
-  }
+	static real(value: number): Value {
+		if (!Number.isFinite(value)) {
+			throw new TypeError("Value.real() requires a finite number");
+		}
+		return new Value("float", value);
+	}
 
-  static text(value: string): Value {
-    return new Value("Text", value);
-  }
+	static text(value: string): Value {
+		return new Value("text", value);
+	}
 
-  static blob(value: Uint8Array): Value {
-    return new Value("Blob", value);
-  }
+	static blob(value: Uint8Array): Value {
+		return new Value("blob", undefined, bytesToBase64(value));
+	}
 
-  static from(raw: unknown): Value {
-    if (raw instanceof Value) return raw;
-    if (raw && typeof raw === "object") {
-      const kind = (raw as { kind?: unknown }).kind;
-      const value = (raw as { value?: unknown }).value;
-      if (typeof kind === "string") {
-        return new Value(kind as ValueKind, value);
-      }
-      const kindFn = (raw as { kind?: unknown }).kind;
-      if (typeof kindFn === "function") {
-        const resolved = kindFn.call(raw);
-        if (typeof resolved === "string") {
-          if (resolved === "Integer") return Value.integer((raw as any).asInteger?.() ?? 0);
-          if (resolved === "Boolean") return Value.boolean((raw as any).asBoolean?.() ?? false);
-          if (resolved === "Real") return Value.real((raw as any).asReal?.() ?? 0);
-          if (resolved === "Text") return Value.text((raw as any).asText?.() ?? "");
-          if (resolved === "Blob") return Value.blob((raw as any).asBlob?.() ?? new Uint8Array());
-          return new Value(resolved as ValueKind, value);
-        }
-      }
-    }
-    if (raw === null || raw === undefined) return Value.null();
-    if (typeof raw === "number") {
-      return Number.isInteger(raw) ? Value.integer(raw) : Value.real(raw);
-    }
-    if (typeof raw === "boolean") return Value.boolean(raw);
-    if (typeof raw === "string") return Value.text(raw);
-    if (raw instanceof Uint8Array) return Value.blob(raw);
-    if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
-    return Value.text(String(raw));
-  }
+	static from(raw: unknown): Value {
+		if (raw instanceof Value) return raw;
+		if (isLixValue(raw)) {
+			switch (raw.kind) {
+				case "null":
+					return Value.null();
+				case "bool":
+					return Value.boolean(raw.value);
+				case "int":
+					return Value.integer(raw.value);
+				case "float":
+					return Value.real(raw.value);
+				case "text":
+					return Value.text(raw.value);
+				case "blob":
+					return new Value("blob", undefined, raw.base64);
+			}
+		}
+		if (raw === null || raw === undefined) return Value.null();
+		if (typeof raw === "number") {
+			return Number.isInteger(raw) ? Value.integer(raw) : Value.real(raw);
+		}
+		if (typeof raw === "boolean") return Value.boolean(raw);
+		if (typeof raw === "string") return Value.text(raw);
+		if (raw instanceof Uint8Array) return Value.blob(raw);
+		if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
+		if (ArrayBuffer.isView(raw)) {
+			return Value.blob(
+				new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength),
+			);
+		}
+		throw new TypeError(
+			"Value.from() requires a canonical LixValue or scalar primitive",
+		);
+	}
 
-  kindValue(): ValueKind {
-    return this.kind;
-  }
+	kindValue(): ValueKind {
+		return this.kind;
+	}
 
-  asInteger(): number | undefined {
-    return this.kind === "Integer" ? (this.value as number) : undefined;
-  }
+	asInteger(): number | undefined {
+		return this.kind === "int" ? (this.value as number) : undefined;
+	}
 
-  asBoolean(): boolean | undefined {
-    return this.kind === "Boolean" ? (this.value as boolean) : undefined;
-  }
+	asBoolean(): boolean | undefined {
+		return this.kind === "bool" ? (this.value as boolean) : undefined;
+	}
 
-  asReal(): number | undefined {
-    return this.kind === "Real" ? (this.value as number) : undefined;
-  }
+	asReal(): number | undefined {
+		return this.kind === "float" ? (this.value as number) : undefined;
+	}
 
-  asText(): string | undefined {
-    return this.kind === "Text" ? (this.value as string) : undefined;
-  }
+	asText(): string | undefined {
+		return this.kind === "text" ? (this.value as string) : undefined;
+	}
 
-  asBlob(): Uint8Array | undefined {
-    return this.kind === "Blob" ? (this.value as Uint8Array) : undefined;
-  }
+	asBlob(): Uint8Array | undefined {
+		return this.kind === "blob" && this.base64 !== undefined
+			? base64ToBytes(this.base64)
+			: undefined;
+	}
 
-  toJSON(): { kind: ValueKind; value: unknown } {
-    return { kind: this.kind, value: this.value };
-  }
+	toJSON(): LixValue {
+		switch (this.kind) {
+			case "null":
+				return { kind: "null", value: null };
+			case "bool":
+				return { kind: "bool", value: this.asBoolean() ?? false };
+			case "int":
+				return { kind: "int", value: this.asInteger() ?? 0 };
+			case "float":
+				return { kind: "float", value: this.asReal() ?? 0 };
+			case "text":
+				return { kind: "text", value: this.asText() ?? "" };
+			case "blob":
+				return { kind: "blob", base64: this.base64 ?? "" };
+		}
+	}
 }
 
 export type QueryResult = {
-	rows: any[][];
+	rows: LixValue[][];
 	columns: string[];
 };
 
-const engineWasmUrl = new URL("./wasm/lix_engine_wasm_bindgen_bg.wasm", import.meta.url);
-
-function isNodeRuntime(): boolean {
-  const processLike = (globalThis as { process?: { versions?: { node?: string } } })
-    .process;
-  return (
-    !!processLike &&
-    typeof processLike.versions === "object" &&
-    !!processLike.versions?.node
-  );
+function isLixValue(value: unknown): value is LixValue {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const kind = (value as { kind?: unknown }).kind;
+	if (kind === "null") {
+		return (value as { value?: unknown }).value === null;
+	}
+	if (kind === "bool") {
+		return typeof (value as { value?: unknown }).value === "boolean";
+	}
+	if (kind === "int" || kind === "float") {
+		const raw = (value as { value?: unknown }).value;
+		if (typeof raw !== "number" || !Number.isFinite(raw)) {
+			return false;
+		}
+		if (kind === "int" && !Number.isInteger(raw)) {
+			return false;
+		}
+		return true;
+	}
+	if (kind === "text") {
+		return typeof (value as { value?: unknown }).value === "string";
+	}
+	if (kind === "blob") {
+		return typeof (value as { base64?: unknown }).base64 === "string";
+	}
+	return false;
 }
 
-async function tryReadNodeFileFromViteHttpUrl(url: URL): Promise<Uint8Array | undefined> {
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    return undefined;
-  }
+function bytesToBase64(bytes: Uint8Array): string {
+	const maybeBuffer = (
+		globalThis as {
+			Buffer?: {
+				from(value: Uint8Array): { toString(encoding: string): string };
+			};
+		}
+	).Buffer;
+	if (maybeBuffer) {
+		return maybeBuffer.from(bytes).toString("base64");
+	}
 
-  // Vitest/Vite in Node often rewrites module URLs to http://localhost with /@fs/.
-  const decodedPathname = decodeURIComponent(url.pathname);
-  let filePath: string | undefined;
-  if (decodedPathname.startsWith("/@fs/")) {
-    filePath = decodedPathname.slice("/@fs".length);
-  } else if (
-    url.hostname === "localhost" ||
-    url.hostname === "127.0.0.1" ||
-    url.hostname === "::1"
-  ) {
-    // Some setups expose absolute filesystem paths directly on localhost.
-    filePath = decodedPathname;
-  }
+	let binary = "";
+	const chunkSize = 0x8000;
+	for (let index = 0; index < bytes.length; index += chunkSize) {
+		const chunk = bytes.subarray(index, index + chunkSize);
+		binary += String.fromCharCode(...chunk);
+	}
+	return btoa(binary);
+}
 
-  if (!filePath) {
-    return undefined;
-  }
+function base64ToBytes(base64: string): Uint8Array {
+	const maybeBuffer = (
+		globalThis as {
+			Buffer?: {
+				from(value: string, encoding: string): Uint8Array;
+			};
+		}
+	).Buffer;
+	if (maybeBuffer) {
+		return new Uint8Array(maybeBuffer.from(base64, "base64"));
+	}
 
-  const fsModuleName = "node:fs/promises";
-  const { readFile } = await import(fsModuleName);
-  try {
-    return new Uint8Array(await readFile(filePath));
-  } catch {
-    return undefined;
-  }
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index += 1) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+	return bytes;
+}
+
+const engineWasmUrl = new URL(
+	"./wasm/lix_engine_wasm_bindgen_bg.wasm",
+	import.meta.url,
+);
+
+function isNodeRuntime(): boolean {
+	const processLike = (
+		globalThis as { process?: { versions?: { node?: string } } }
+	).process;
+	return (
+		!!processLike &&
+		typeof processLike.versions === "object" &&
+		!!processLike.versions?.node
+	);
+}
+
+async function tryReadNodeFileFromViteHttpUrl(
+	url: URL,
+): Promise<Uint8Array | undefined> {
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		return undefined;
+	}
+
+	// Vitest/Vite in Node often rewrites module URLs to http://localhost with /@fs/.
+	const decodedPathname = decodeURIComponent(url.pathname);
+	let filePath: string | undefined;
+	if (decodedPathname.startsWith("/@fs/")) {
+		filePath = decodedPathname.slice("/@fs".length);
+	} else if (
+		url.hostname === "localhost" ||
+		url.hostname === "127.0.0.1" ||
+		url.hostname === "::1"
+	) {
+		// Some setups expose absolute filesystem paths directly on localhost.
+		filePath = decodedPathname;
+	}
+
+	if (!filePath) {
+		return undefined;
+	}
+
+	const fsModuleName = "node:fs/promises";
+	const { readFile } = await import(fsModuleName);
+	try {
+		return new Uint8Array(await readFile(filePath));
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -154,34 +270,37 @@ async function tryReadNodeFileFromViteHttpUrl(url: URL): Promise<Uint8Array | un
  * - Node: read bytes from disk because `fetch(file://...)` is not supported.
  */
 export async function resolveEngineWasmModuleOrPath(): Promise<InitInput> {
-  if (!isNodeRuntime()) {
-    return engineWasmUrl;
-  }
+	if (!isNodeRuntime()) {
+		return engineWasmUrl;
+	}
 
-  if (engineWasmUrl.protocol === "file:") {
-    const fsModuleName = "node:fs/promises";
-    const urlModuleName = "node:url";
-    const [{ readFile }, { fileURLToPath }] = await Promise.all([
-      import(fsModuleName),
-      import(urlModuleName),
-    ]);
-    return readFile(fileURLToPath(engineWasmUrl));
-  }
+	if (engineWasmUrl.protocol === "file:") {
+		const fsModuleName = "node:fs/promises";
+		const urlModuleName = "node:url";
+		const [{ readFile }, { fileURLToPath }] = await Promise.all([
+			import(fsModuleName),
+			import(urlModuleName),
+		]);
+		return readFile(fileURLToPath(engineWasmUrl));
+	}
 
-  if (engineWasmUrl.protocol === "http:" || engineWasmUrl.protocol === "https:") {
-    const localBytes = await tryReadNodeFileFromViteHttpUrl(engineWasmUrl);
-    if (localBytes) {
-      return localBytes;
-    }
+	if (
+		engineWasmUrl.protocol === "http:" ||
+		engineWasmUrl.protocol === "https:"
+	) {
+		const localBytes = await tryReadNodeFileFromViteHttpUrl(engineWasmUrl);
+		if (localBytes) {
+			return localBytes;
+		}
 
-    const response = await fetch(engineWasmUrl);
-    if (!response.ok) {
-      throw new Error(
-        `failed to fetch wasm module from '${engineWasmUrl.toString()}': ${response.status} ${response.statusText}`,
-      );
-    }
-    return new Uint8Array(await response.arrayBuffer());
-  }
+		const response = await fetch(engineWasmUrl);
+		if (!response.ok) {
+			throw new Error(
+				`failed to fetch wasm module from '${engineWasmUrl.toString()}': ${response.status} ${response.statusText}`,
+			);
+		}
+		return new Uint8Array(await response.arrayBuffer());
+	}
 
-  return engineWasmUrl;
+	return engineWasmUrl;
 }

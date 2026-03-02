@@ -1,165 +1,170 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import type {
-  Database,
-  Sqlite3Static,
-  SqlValue,
+	Database,
+	Sqlite3Static,
+	SqlValue,
 } from "@sqlite.org/sqlite-wasm";
-import type { LixBackend, LixTransaction } from "../types.js";
-import { Value } from "../engine-wasm/index.js";
-import type { QueryResult } from "../engine-wasm/index.js";
+import type {
+	LixBackend,
+	LixRuntimeQueryResult,
+	LixRuntimeValue,
+	LixTransaction,
+} from "../types.js";
 
 type SqliteWasmDatabase = Database & {
-  sqlite3: Sqlite3Static;
+	sqlite3: Sqlite3Static;
 };
 
-const sqliteWasmAssetUrl = new URL("./sqlite3.wasm", import.meta.url).toString();
+const sqliteWasmAssetUrl = new URL(
+	"./sqlite3.wasm",
+	import.meta.url,
+).toString();
 
 // https://github.com/opral/lix-sdk/issues/231
 // @ts-expect-error - globalThis
 globalThis.sqlite3ApiConfig = {
-  warn: (message: string, details: unknown) => {
-    if (message === "Ignoring inability to install OPFS sqlite3_vfs:") {
-      return;
-    }
-    console.log(`${message} ${details}`);
-  },
+	warn: (message: string, details: unknown) => {
+		if (message === "Ignoring inability to install OPFS sqlite3_vfs:") {
+			return;
+		}
+		console.log(`${message} ${details}`);
+	},
 };
 
 let sqlite3: Sqlite3Static | undefined;
 
 async function createInMemoryDatabase(): Promise<SqliteWasmDatabase> {
-  if (!sqlite3) {
-    sqlite3 = await sqlite3InitModule({
-      locateFile: (path, prefix) =>
-        path === "sqlite3.wasm" ? sqliteWasmAssetUrl : `${prefix}${path}`,
-    });
-  }
+	if (!sqlite3) {
+		sqlite3 = await sqlite3InitModule({
+			locateFile: (path, prefix) =>
+				path === "sqlite3.wasm" ? sqliteWasmAssetUrl : `${prefix}${path}`,
+		});
+	}
 
-  const db = new sqlite3.oo1.DB(":memory:", "c");
-  // @ts-expect-error - attach module for consumers
-  db.sqlite3 = sqlite3;
-  return db as SqliteWasmDatabase;
+	const db = new sqlite3.oo1.DB(":memory:", "c");
+	// @ts-expect-error - attach module for consumers
+	db.sqlite3 = sqlite3;
+	return db as SqliteWasmDatabase;
 }
 
 export async function createWasmSqliteBackend(): Promise<LixBackend> {
-  const db = await createInMemoryDatabase();
-  let backendClosed = false;
+	const db = await createInMemoryDatabase();
+	let backendClosed = false;
 
-  const ensureBackendOpen = (): void => {
-    if (backendClosed) {
-      throw new Error("sqlite backend is closed");
-    }
-  };
+	const ensureBackendOpen = (): void => {
+		if (backendClosed) {
+			throw new Error("sqlite backend is closed");
+		}
+	};
 
-  const runQuery = (sql: string, params: ReadonlyArray<unknown>): QueryResult => {
-    ensureBackendOpen();
-    try {
-      const boundParams: SqlValue[] = params.map(toSqlParam);
-      const rows: SqlValue[][] = [];
-      const columns: string[] = [];
-      db.exec({
-        sql,
-        bind: boundParams,
-        rowMode: "array",
-        columnNames: columns,
-        resultRows: rows,
-      });
-      const normalizedRows = rows.map((row) =>
-        row.map((value) => fromSqlValue(value)),
-      );
-      return {
-        rows: normalizedRows,
-        columns,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`${message}\nwhile executing SQL:\n${sql}`);
-    }
-  };
+	const runQuery = (
+		sql: string,
+		params: ReadonlyArray<LixRuntimeValue>,
+	): LixRuntimeQueryResult => {
+		ensureBackendOpen();
+		try {
+			const boundParams: SqlValue[] = params.map(toSqlParam);
+			const rows: SqlValue[][] = [];
+			const columns: string[] = [];
+			db.exec({
+				sql,
+				bind: boundParams,
+				rowMode: "array",
+				columnNames: columns,
+				resultRows: rows,
+			});
+			const normalizedRows = rows.map((row) =>
+				row.map((value) => fromSqlValue(value)),
+			);
+			return {
+				rows: normalizedRows,
+				columns,
+			};
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`${message}\nwhile executing SQL:\n${sql}`);
+		}
+	};
 
-  const createTransaction = (): LixTransaction => {
-    let transactionClosed = false;
+	const createTransaction = (): LixTransaction => {
+		let transactionClosed = false;
 
-    return {
-      dialect: "sqlite",
-      async execute(sql: string, params: ReadonlyArray<unknown>): Promise<QueryResult> {
-        if (transactionClosed) {
-          throw new Error("transaction is already closed");
-        }
-        ensureBackendOpen();
-        return runQuery(sql, params);
-      },
-      async commit(): Promise<void> {
-        if (transactionClosed) {
-          return;
-        }
-        ensureBackendOpen();
-        runQuery("COMMIT", []);
-        transactionClosed = true;
-      },
-      async rollback(): Promise<void> {
-        if (transactionClosed) {
-          return;
-        }
-        ensureBackendOpen();
-        runQuery("ROLLBACK", []);
-        transactionClosed = true;
-      },
-    };
-  };
+		return {
+			dialect: "sqlite",
+			async execute(
+				sql: string,
+				params: ReadonlyArray<LixRuntimeValue>,
+			): Promise<LixRuntimeQueryResult> {
+				if (transactionClosed) {
+					throw new Error("transaction is already closed");
+				}
+				ensureBackendOpen();
+				return runQuery(sql, params);
+			},
+			async commit(): Promise<void> {
+				if (transactionClosed) {
+					return;
+				}
+				ensureBackendOpen();
+				runQuery("COMMIT", []);
+				transactionClosed = true;
+			},
+			async rollback(): Promise<void> {
+				if (transactionClosed) {
+					return;
+				}
+				ensureBackendOpen();
+				runQuery("ROLLBACK", []);
+				transactionClosed = true;
+			},
+		};
+	};
 
-  return {
-    dialect: "sqlite",
-    async execute(sql: string, params: ReadonlyArray<unknown>): Promise<QueryResult> {
-      return runQuery(sql, params);
-    },
-    async beginTransaction(): Promise<LixTransaction> {
-      ensureBackendOpen();
-      runQuery("BEGIN", []);
-      return createTransaction();
-    },
-    async exportSnapshot(): Promise<Uint8Array> {
-      ensureBackendOpen();
-      return db.sqlite3.capi.sqlite3_js_db_export(db, "main");
-    },
-    async close(): Promise<void> {
-      if (backendClosed) {
-        return;
-      }
-      backendClosed = true;
-      db.close();
-    },
-  };
+	return {
+		dialect: "sqlite",
+		async execute(
+			sql: string,
+			params: ReadonlyArray<LixRuntimeValue>,
+		): Promise<LixRuntimeQueryResult> {
+			return runQuery(sql, params);
+		},
+		async beginTransaction(): Promise<LixTransaction> {
+			ensureBackendOpen();
+			runQuery("BEGIN", []);
+			return createTransaction();
+		},
+		async exportSnapshot(): Promise<Uint8Array> {
+			ensureBackendOpen();
+			return db.sqlite3.capi.sqlite3_js_db_export(db, "main");
+		},
+		async close(): Promise<void> {
+			if (backendClosed) {
+				return;
+			}
+			backendClosed = true;
+			db.close();
+		},
+	};
 }
 
-function toSqlParam(raw: unknown): SqlValue {
-  const value = Value.from(raw);
-  switch (value.kind) {
-    case "Null":
-      return null;
-    case "Integer":
-      return value.asInteger() ?? null;
-    case "Real":
-      return value.asReal() ?? null;
-    case "Text":
-      return value.asText() ?? null;
-    case "Blob":
-      return value.asBlob() ?? null;
-    default:
-      return null;
-  }
+function toSqlParam(raw: LixRuntimeValue): SqlValue {
+	if (raw === null) return null;
+	if (typeof raw === "boolean") return raw ? 1 : 0;
+	if (typeof raw === "number") return raw;
+	if (typeof raw === "string") return raw;
+	if (raw instanceof Uint8Array) return raw;
+	return null;
 }
 
-function fromSqlValue(value: SqlValue): Value {
-  if (value === null || value === undefined) return Value.null();
-  if (typeof value === "number") {
-    if (Number.isInteger(value)) return Value.integer(value);
-    return Value.real(value);
-  }
-  if (typeof value === "string") return Value.text(value);
-  if (value instanceof Uint8Array) return Value.blob(value);
-  if (value instanceof ArrayBuffer) return Value.blob(new Uint8Array(value));
-  if (value instanceof Int8Array) return Value.blob(new Uint8Array(value));
-  if (typeof value === "bigint") return Value.integer(Number(value));
-  return Value.text(String(value));
+function fromSqlValue(value: SqlValue): LixRuntimeValue {
+	if (value === null || value === undefined) return null;
+	if (typeof value === "number") {
+		return value;
+	}
+	if (typeof value === "string") return value;
+	if (value instanceof Uint8Array) return value;
+	if (value instanceof ArrayBuffer) return new Uint8Array(value);
+	if (value instanceof Int8Array) return new Uint8Array(value);
+	if (typeof value === "bigint") return Number(value);
+	return String(value);
 }

@@ -2058,6 +2058,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "lix_cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "comfy-table",
  "lix_rs_sdk",
@@ -2101,6 +2102,7 @@ name = "lix_engine_wasm_bindgen"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures-util",
  "getrandom 0.3.4",
  "js-sys",
