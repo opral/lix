@@ -5,6 +5,7 @@ use crate::LixError;
 pub enum ErrorCode {
     AlreadyInitialized,
     TableNotFound,
+    SchemaNotRegistered,
     SqlUnknownTable,
     SqlUnknownColumn,
     InternalTableAccessDenied,
@@ -20,6 +21,7 @@ impl ErrorCode {
         match self {
             Self::AlreadyInitialized => "LIX_ERROR_ALREADY_INITIALIZED",
             Self::TableNotFound => "LIX_ERROR_TABLE_NOT_FOUND",
+            Self::SchemaNotRegistered => "LIX_ERROR_SCHEMA_NOT_REGISTERED",
             Self::SqlUnknownTable => "LIX_ERROR_SQL_UNKNOWN_TABLE",
             Self::SqlUnknownColumn => "LIX_ERROR_SQL_UNKNOWN_COLUMN",
             Self::InternalTableAccessDenied => "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
@@ -37,6 +39,7 @@ impl ErrorCode {
         &[
             Self::AlreadyInitialized,
             Self::TableNotFound,
+            Self::SchemaNotRegistered,
             Self::SqlUnknownTable,
             Self::SqlUnknownColumn,
             Self::InternalTableAccessDenied,
@@ -66,6 +69,23 @@ pub(crate) fn table_not_found_read_error() -> LixError {
         ErrorCode::TableNotFound,
         &format!(
             "Read queries must target Lix views (`lix_*`) only. Available tables: {available_tables}. Schemas are available via `lix_stored_schema`."
+        ),
+    )
+}
+
+pub(crate) fn schema_not_registered_error(
+    schema_key: &str,
+    available_schema_keys: &[&str],
+) -> LixError {
+    let available = if available_schema_keys.is_empty() {
+        "Available schemas: (none).".to_string()
+    } else {
+        format!("Available schemas: {}.", available_schema_keys.join(", "))
+    };
+    build_error(
+        ErrorCode::SchemaNotRegistered,
+        &format!(
+            "Schema `{schema_key}` is not registered. Register or install the schema before querying it. {available} Inspect registered schemas via `SELECT * FROM lix_stored_schema`."
         ),
     )
 }
@@ -165,10 +185,10 @@ pub(crate) fn file_data_expects_bytes_error() -> LixError {
 mod tests {
     use super::{
         already_initialized_error, file_data_expects_bytes_error,
-        internal_table_access_denied_error, read_only_view_write_error, sql_unknown_column_error,
-        sql_unknown_table_error, table_not_found_read_error,
-        transaction_control_statement_denied_error, transaction_handle_not_found_error,
-        vtable_schema_key_required_error, ErrorCode,
+        internal_table_access_denied_error, read_only_view_write_error,
+        schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
+        table_not_found_read_error, transaction_control_statement_denied_error,
+        transaction_handle_not_found_error, vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -188,6 +208,13 @@ mod tests {
 
         let table_not_found = table_not_found_read_error();
         assert_eq!(table_not_found.code, "LIX_ERROR_TABLE_NOT_FOUND");
+
+        let schema_not_registered =
+            schema_not_registered_error("markdown_v2_document", &["lix_key_value"]);
+        assert_eq!(
+            schema_not_registered.code,
+            "LIX_ERROR_SCHEMA_NOT_REGISTERED"
+        );
 
         let internal_access = internal_table_access_denied_error();
         assert_eq!(
