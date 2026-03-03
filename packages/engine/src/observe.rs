@@ -4,13 +4,14 @@ use crate::engine::sql::planning::dependency_spec::{
 };
 use crate::engine::{Engine, ExecuteOptions};
 use crate::state_commit_stream::StateCommitStream;
-use crate::{LixError, QueryResult, SqlDialect, Value};
+use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SQLITE_EXTERNAL_OBSERVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const OBSERVE_TICK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveQuery {
@@ -48,11 +49,22 @@ struct ObserveState {
     query: ObserveQuery,
     state_commits: StateCommitStream,
     last_result: Option<QueryResult>,
-    sqlite_external_polling: bool,
-    sqlite_last_data_version: Option<i64>,
+    writer_key_filter: ObserveWriterKeyFilter,
+    last_seen_tick_seq: Option<i64>,
     emitted_initial: bool,
     next_sequence: u64,
     closed: bool,
+}
+
+#[derive(Default)]
+struct ObserveWriterKeyFilter {
+    include: BTreeSet<String>,
+    exclude: BTreeSet<String>,
+}
+
+struct ObserveTickRow {
+    tick_seq: i64,
+    writer_key: Option<String>,
 }
 
 impl ObserveEvents<'_> {
@@ -100,38 +112,14 @@ impl ObserveState {
             self.emitted_initial = true;
             let rows = execute_observe_query(engine, &self.query).await?;
             self.last_result = Some(rows.clone());
-            if self.sqlite_external_polling {
-                self.sqlite_last_data_version = Some(sqlite_data_version(engine).await?);
-            }
+            self.last_seen_tick_seq = latest_observe_tick_seq(engine).await?;
             return Ok(Some(self.make_event(rows, None)));
         }
 
         loop {
-            if self.sqlite_external_polling {
-                if let Some(batch) = self.state_commits.try_next() {
-                    let rows = execute_observe_query(engine, &self.query).await?;
-
-                    if self
-                        .last_result
-                        .as_ref()
-                        .is_some_and(|previous| *previous == rows)
-                    {
-                        continue;
-                    }
-
-                    self.last_result = Some(rows.clone());
-                    return Ok(Some(self.make_event(rows, Some(batch.sequence))));
-                }
-
-                observe_poll_sleep(SQLITE_EXTERNAL_OBSERVE_POLL_INTERVAL).await;
-                if self.closed {
-                    return Ok(None);
-                }
-                if !self.sqlite_data_version_advanced(engine).await? {
-                    continue;
-                }
-
+            if let Some(batch) = self.state_commits.try_next() {
                 let rows = execute_observe_query(engine, &self.query).await?;
+
                 if self
                     .last_result
                     .as_ref()
@@ -141,16 +129,35 @@ impl ObserveState {
                 }
 
                 self.last_result = Some(rows.clone());
-                return Ok(Some(self.make_event(rows, None)));
+                return Ok(Some(self.make_event(rows, Some(batch.sequence))));
             }
 
-            let Some(batch) = self.state_commits.next().await else {
-                self.closed = true;
+            observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
+            if self.closed {
                 return Ok(None);
-            };
+            }
+
+            let observed_ticks = observe_ticks_since(engine, self.last_seen_tick_seq).await?;
+            if observed_ticks.is_empty() {
+                continue;
+            }
+
+            let mut should_reexecute = false;
+            for tick in observed_ticks {
+                self.last_seen_tick_seq = Some(tick.tick_seq);
+                if self
+                    .writer_key_filter
+                    .matches_external_tick(tick.writer_key.as_deref())
+                {
+                    should_reexecute = true;
+                }
+            }
+
+            if !should_reexecute {
+                continue;
+            }
 
             let rows = execute_observe_query(engine, &self.query).await?;
-
             if self
                 .last_result
                 .as_ref()
@@ -160,18 +167,7 @@ impl ObserveState {
             }
 
             self.last_result = Some(rows.clone());
-            return Ok(Some(self.make_event(rows, Some(batch.sequence))));
-        }
-    }
-
-    async fn sqlite_data_version_advanced(&mut self, engine: &Engine) -> Result<bool, LixError> {
-        let current = sqlite_data_version(engine).await?;
-        match self.sqlite_last_data_version {
-            Some(previous) if previous == current => Ok(false),
-            _ => {
-                self.sqlite_last_data_version = Some(current);
-                Ok(true)
-            }
+            return Ok(Some(self.make_event(rows, None)));
         }
     }
 
@@ -195,6 +191,27 @@ impl ObserveState {
         }
         self.closed = true;
         self.state_commits.close();
+    }
+}
+
+impl ObserveWriterKeyFilter {
+    fn matches_external_tick(&self, writer_key: Option<&str>) -> bool {
+        if !self.include.is_empty() {
+            let Some(writer_key) = writer_key else {
+                return false;
+            };
+            if !self.include.contains(writer_key) {
+                return false;
+            }
+        }
+
+        if let Some(writer_key) = writer_key {
+            if self.exclude.contains(writer_key) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -240,14 +257,18 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
 
     let dependency_spec = derive_dependency_spec_from_statements(&statements, &query.params)?;
     let filter = dependency_spec_to_state_commit_stream_filter(&dependency_spec);
+    let writer_key_filter = ObserveWriterKeyFilter {
+        include: filter.writer_keys.iter().cloned().collect(),
+        exclude: filter.exclude_writer_keys.iter().cloned().collect(),
+    };
     let state_commits = engine.state_commit_stream(filter);
 
     Ok(ObserveState {
         query,
         state_commits,
         last_result: None,
-        sqlite_external_polling: engine.sql_dialect() == SqlDialect::Sqlite,
-        sqlite_last_data_version: None,
+        writer_key_filter,
+        last_seen_tick_seq: None,
         emitted_initial: false,
         next_sequence: 0,
         closed: false,
@@ -265,28 +286,98 @@ async fn observe_poll_sleep(duration: Duration) {
     gloo_timers::future::TimeoutFuture::new(millis).await;
 }
 
-async fn sqlite_data_version(engine: &Engine) -> Result<i64, LixError> {
+async fn latest_observe_tick_seq(engine: &Engine) -> Result<Option<i64>, LixError> {
     let result = engine
-        .execute_backend_sql("PRAGMA data_version", &[])
+        .execute_backend_sql(
+            "SELECT tick_seq \
+             FROM lix_internal_observe_tick \
+             ORDER BY tick_seq DESC \
+             LIMIT 1",
+            &[],
+        )
         .await?;
-    let value = result
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .ok_or(LixError {
+    let Some(first_row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let Some(first_value) = first_row.first() else {
+        return Ok(None);
+    };
+    Ok(Some(parse_observe_tick_seq(first_value)?))
+}
+
+async fn observe_ticks_since(
+    engine: &Engine,
+    last_seen_tick_seq: Option<i64>,
+) -> Result<Vec<ObserveTickRow>, LixError> {
+    let result = if let Some(last_seen) = last_seen_tick_seq {
+        engine
+            .execute_backend_sql(
+                "SELECT tick_seq, writer_key \
+                 FROM lix_internal_observe_tick \
+                 WHERE tick_seq > $1 \
+                 ORDER BY tick_seq ASC",
+                &[Value::Integer(last_seen)],
+            )
+            .await?
+    } else {
+        engine
+            .execute_backend_sql(
+                "SELECT tick_seq, writer_key \
+                 FROM lix_internal_observe_tick \
+                 ORDER BY tick_seq ASC",
+                &[],
+            )
+            .await?
+    };
+
+    let mut ticks = Vec::with_capacity(result.rows.len());
+    for row in result.rows {
+        let tick_seq = parse_observe_tick_seq(row.first().ok_or(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "failed to read sqlite data_version: pragma returned no rows".to_string(),
-        })?;
+            description:
+                "failed to read observe tick sequence: row has no tick_seq column".to_string(),
+        })?)?;
+
+        let writer_key =
+            parse_observe_tick_writer_key(
+                row.get(1).ok_or(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description:
+                        "failed to read observe tick writer key: row has no writer_key column"
+                            .to_string(),
+                })?,
+            )?;
+
+        ticks.push(ObserveTickRow {
+            tick_seq,
+            writer_key,
+        });
+    }
+    Ok(ticks)
+}
+
+fn parse_observe_tick_seq(value: &Value) -> Result<i64, LixError> {
     match value {
         Value::Integer(value) => Ok(*value),
         Value::Real(value) => Ok(*value as i64),
         Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse sqlite data_version text: {error}"),
+            description: format!("failed to parse observe tick sequence text: {error}"),
         }),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse sqlite data_version value: {other:?}"),
+            description: format!("failed to parse observe tick sequence value: {other:?}"),
+        }),
+    }
+}
+
+fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(value) => Ok(Some(value.clone())),
+        other => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("failed to parse observe tick writer key value: {other:?}"),
         }),
     }
 }
