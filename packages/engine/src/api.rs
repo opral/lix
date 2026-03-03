@@ -151,11 +151,10 @@ impl Engine {
     ) -> Result<QueryResult, LixError> {
         let allow_internal_sql = allow_internal_tables || self.access_to_internal;
 
-        if !allow_internal_sql {
-            reject_internal_table_access(sql)?;
-        }
-
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        if !allow_internal_sql {
+            reject_internal_table_writes(&parsed_statements)?;
+        }
         if !allow_internal_sql && contains_transaction_control_statement(&parsed_statements) {
             return Err(errors::transaction_control_statement_denied_error());
         }
