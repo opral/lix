@@ -95,6 +95,17 @@ pub(crate) fn upsert_binary_file_version_ref_sql() -> String {
     )
 }
 
+pub(crate) fn select_binary_file_version_ref_sql() -> String {
+    format!(
+        "SELECT blob_hash, size_bytes \
+         FROM {} \
+         WHERE file_id = $1 \
+           AND version_id = $2 \
+         LIMIT 1",
+        tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+    )
+}
+
 pub(crate) fn delete_unreferenced_binary_chunk_store_sql() -> String {
     format!(
         "DELETE FROM {} \

@@ -12,7 +12,8 @@ pub(crate) async fn apply_sql_backed_effects(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     untracked_filesystem_update_domain_changes: &[DetectedFileDomainChange],
     plugin_changes_committed: bool,
-    file_cache_invalidation_targets: &BTreeSet<(String, String)>,
+    file_data_cache_invalidation_targets: &BTreeSet<(String, String)>,
+    file_path_cache_invalidation_targets: &BTreeSet<(String, String)>,
 ) -> Result<(), LixError> {
     let should_run_binary_gc =
         crate::engine::should_run_binary_cas_gc(mutations, detected_file_domain_changes);
@@ -34,16 +35,16 @@ pub(crate) async fn apply_sql_backed_effects(
         .persist_pending_file_path_updates(pending_file_writes)
         .await?;
     engine
-        .ensure_builtin_binary_blob_store_for_targets(file_cache_invalidation_targets)
+        .ensure_builtin_binary_blob_store_for_targets(file_data_cache_invalidation_targets)
         .await?;
     if should_run_binary_gc {
         engine.garbage_collect_unreachable_binary_cas().await?;
     }
     engine
-        .invalidate_file_data_cache_entries(file_cache_invalidation_targets)
+        .invalidate_file_data_cache_entries(file_data_cache_invalidation_targets)
         .await?;
     engine
-        .invalidate_file_path_cache_entries(file_cache_invalidation_targets)
+        .invalidate_file_path_cache_entries(file_path_cache_invalidation_targets)
         .await?;
     Ok(())
 }

@@ -96,6 +96,7 @@ pub struct Engine {
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
+    intent_pipeline_telemetry: IntentPipelineTelemetry,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
     active_transactions: Mutex<BTreeMap<u64, EngineTransaction<'static>>>,
     next_transaction_handle_id: AtomicU64,
@@ -216,7 +217,14 @@ pub(crate) struct DeferredTransactionSideEffects {
     pending_file_delete_targets: BTreeSet<(String, String)>,
     detected_file_domain_changes: Vec<DetectedFileDomainChange>,
     untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
-    file_cache_invalidation_targets: BTreeSet<(String, String)>,
+    file_data_cache_invalidation_targets: BTreeSet<(String, String)>,
+    file_path_cache_invalidation_targets: BTreeSet<(String, String)>,
+}
+
+#[derive(Default)]
+struct IntentPipelineTelemetry {
+    verification_checks: AtomicU64,
+    verification_failures: AtomicU64,
 }
 
 fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
@@ -301,10 +309,26 @@ impl Engine {
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
+            intent_pipeline_telemetry: IntentPipelineTelemetry::default(),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
             active_transactions: Mutex::new(BTreeMap::new()),
             next_transaction_handle_id: AtomicU64::new(1),
         }
+    }
+
+    pub(crate) fn record_intent_verification_checks(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.intent_pipeline_telemetry
+            .verification_checks
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_intent_verification_failure(&self) {
+        self.intent_pipeline_telemetry
+            .verification_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1108,7 +1132,6 @@ mod tests {
         advance_placeholder_state_for_statement(
             &statements.remove(0),
             &params,
-            SqlDialect::Sqlite,
             &mut placeholder_state,
         )
         .expect("advance placeholder state for first statement");
