@@ -1,3 +1,4 @@
+use super::exp::ExpCommand;
 use super::sql::SqlCommand;
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
@@ -16,6 +17,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Experimental commands for benchmarking and diagnostics.
+    Exp(ExpCommand),
+
     /// Execute raw SQL against a Lix database.
     Sql(SqlCommand),
 }
