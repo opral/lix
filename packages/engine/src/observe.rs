@@ -7,11 +7,12 @@ use crate::state_commit_stream::StateCommitStream;
 use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 const OBSERVE_TICK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const OBSERVE_FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveQuery {
@@ -46,25 +47,222 @@ pub struct ObserveEventsOwned {
 }
 
 struct ObserveState {
-    query: ObserveQuery,
-    state_commits: StateCommitStream,
-    last_result: Option<QueryResult>,
-    writer_key_filter: ObserveWriterKeyFilter,
-    last_seen_tick_seq: Option<i64>,
-    emitted_initial: bool,
+    source_key: String,
+    source: Arc<Mutex<SharedObserveSource>>,
+    subscriber_id: u64,
     next_sequence: u64,
     closed: bool,
 }
 
-#[derive(Default)]
+struct PollingGuard {
+    source: Arc<Mutex<SharedObserveSource>>,
+    armed: bool,
+}
+
+#[derive(Clone, Default)]
 struct ObserveWriterKeyFilter {
     include: BTreeSet<String>,
     exclude: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone)]
 struct ObserveTickRow {
     tick_seq: i64,
     writer_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SharedObserveEvent {
+    generation: u64,
+    rows: QueryResult,
+    state_commit_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedObserveSubscriberCursor {
+    last_seen_generation: Option<u64>,
+    initial_generation: Option<u64>,
+}
+
+pub(crate) struct SharedObserveSource {
+    query: ObserveQuery,
+    state_commits: StateCommitStream,
+    writer_key_filter: ObserveWriterKeyFilter,
+    last_seen_tick_seq: Option<i64>,
+    last_result: Option<QueryResult>,
+    latest_event: Option<SharedObserveEvent>,
+    events: VecDeque<SharedObserveEvent>,
+    next_generation: u64,
+    initialized: bool,
+    closed: bool,
+    polling: bool,
+    next_subscriber_id: u64,
+    subscribers: BTreeMap<u64, SharedObserveSubscriberCursor>,
+}
+
+enum PollWork {
+    Initial {
+        query: ObserveQuery,
+    },
+    StateCommit {
+        query: ObserveQuery,
+        state_commit_sequence: u64,
+    },
+    External {
+        query: ObserveQuery,
+        last_seen_tick_seq: Option<i64>,
+        writer_key_filter: ObserveWriterKeyFilter,
+    },
+}
+
+struct PollOutcome {
+    maybe_rows: Option<(QueryResult, Option<u64>)>,
+    update_last_seen_tick_seq: Option<Option<i64>>,
+    mark_initialized: bool,
+}
+
+impl SharedObserveSource {
+    fn new(
+        query: ObserveQuery,
+        state_commits: StateCommitStream,
+        writer_key_filter: ObserveWriterKeyFilter,
+    ) -> Self {
+        Self {
+            query,
+            state_commits,
+            writer_key_filter,
+            last_seen_tick_seq: None,
+            last_result: None,
+            latest_event: None,
+            events: VecDeque::new(),
+            next_generation: 0,
+            initialized: false,
+            closed: false,
+            polling: false,
+            next_subscriber_id: 1,
+            subscribers: BTreeMap::new(),
+        }
+    }
+
+    fn register_subscriber(&mut self) -> u64 {
+        let subscriber_id = self.next_subscriber_id;
+        self.next_subscriber_id = self.next_subscriber_id.saturating_add(1);
+        let initial_generation = if self.initialized {
+            self.latest_event.as_ref().map(|event| event.generation)
+        } else {
+            None
+        };
+        self.subscribers.insert(
+            subscriber_id,
+            SharedObserveSubscriberCursor {
+                last_seen_generation: None,
+                initial_generation,
+            },
+        );
+        subscriber_id
+    }
+
+    fn remove_subscriber(&mut self, subscriber_id: u64) {
+        self.subscribers.remove(&subscriber_id);
+        self.prune_events();
+    }
+
+    fn has_subscribers(&self) -> bool {
+        !self.subscribers.is_empty()
+    }
+
+    fn append_event(&mut self, rows: QueryResult, state_commit_sequence: Option<u64>) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let event = SharedObserveEvent {
+            generation,
+            rows,
+            state_commit_sequence,
+        };
+        self.latest_event = Some(event.clone());
+        self.events.push_back(event);
+    }
+
+    fn take_next_event_for_subscriber(&mut self, subscriber_id: u64) -> Option<SharedObserveEvent> {
+        let cursor = self.subscribers.get_mut(&subscriber_id)?;
+
+        if let Some(initial_generation) = cursor.initial_generation {
+            if let Some(initial_event) = self
+                .events
+                .iter()
+                .find(|event| event.generation == initial_generation)
+                .cloned()
+            {
+                cursor.initial_generation = None;
+                cursor.last_seen_generation = Some(initial_event.generation);
+                self.prune_events();
+                return Some(initial_event);
+            }
+            if let Some(initial_event) = self
+                .latest_event
+                .as_ref()
+                .filter(|event| event.generation == initial_generation)
+                .cloned()
+            {
+                cursor.initial_generation = None;
+                cursor.last_seen_generation = Some(initial_event.generation);
+                self.prune_events();
+                return Some(initial_event);
+            }
+            cursor.initial_generation = None;
+        }
+
+        let next_event = self
+            .events
+            .iter()
+            .find(|event| {
+                cursor
+                    .last_seen_generation
+                    .is_none_or(|last_seen| event.generation > last_seen)
+            })
+            .cloned();
+
+        if let Some(next_event) = &next_event {
+            cursor.last_seen_generation = Some(next_event.generation);
+            self.prune_events();
+        }
+
+        next_event
+    }
+
+    fn prune_events(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+
+        if self.subscribers.is_empty() {
+            self.events.clear();
+            return;
+        }
+
+        let mut min_seen_generation: Option<u64> = None;
+        for cursor in self.subscribers.values() {
+            let Some(last_seen_generation) = cursor.last_seen_generation else {
+                return;
+            };
+            min_seen_generation = Some(
+                min_seen_generation
+                    .map(|previous| previous.min(last_seen_generation))
+                    .unwrap_or(last_seen_generation),
+            );
+        }
+
+        let Some(min_seen_generation) = min_seen_generation else {
+            return;
+        };
+        while self
+            .events
+            .front()
+            .is_some_and(|event| event.generation <= min_seen_generation)
+        {
+            self.events.pop_front();
+        }
+    }
 }
 
 impl ObserveEvents<'_> {
@@ -73,7 +271,7 @@ impl ObserveEvents<'_> {
     }
 
     pub fn close(&mut self) {
-        self.state.close();
+        self.state.close_with_engine(self.engine);
     }
 }
 
@@ -89,7 +287,7 @@ impl ObserveEventsOwned {
     }
 
     pub fn close(&mut self) {
-        self.state.close();
+        self.state.close_with_engine(self.engine.as_ref());
     }
 }
 
@@ -108,89 +306,212 @@ impl ObserveState {
             return Ok(None);
         }
 
-        if !self.emitted_initial {
-            self.emitted_initial = true;
-            let rows = execute_observe_query(engine, &self.query).await?;
-            self.last_result = Some(rows.clone());
-            self.last_seen_tick_seq = latest_observe_tick_seq(engine).await?;
-            return Ok(Some(self.make_event(rows, None)));
-        }
-
         loop {
-            if let Some(batch) = self.state_commits.try_next() {
-                let rows = execute_observe_query(engine, &self.query).await?;
-
-                if self
-                    .last_result
-                    .as_ref()
-                    .is_some_and(|previous| *previous == rows)
-                {
-                    continue;
-                }
-
-                self.last_result = Some(rows.clone());
-                return Ok(Some(self.make_event(rows, Some(batch.sequence))));
-            }
-
-            observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
             if self.closed {
                 return Ok(None);
             }
 
-            let observed_ticks = observe_ticks_since(engine, self.last_seen_tick_seq).await?;
-            if observed_ticks.is_empty() {
-                continue;
+            if let Some(shared_event) = self.try_take_shared_event()? {
+                return Ok(Some(self.make_event(shared_event)));
             }
 
-            let mut should_reexecute = false;
-            for tick in observed_ticks {
-                self.last_seen_tick_seq = Some(tick.tick_seq);
-                if self
-                    .writer_key_filter
-                    .matches_external_tick(tick.writer_key.as_deref())
-                {
-                    should_reexecute = true;
+            let role = {
+                let mut source = lock_shared_source(&self.source)?;
+                if source.closed {
+                    return Ok(None);
                 }
-            }
+                if source.polling {
+                    false
+                } else {
+                    source.polling = true;
+                    true
+                }
+            };
 
-            if !should_reexecute {
-                continue;
+            if role {
+                let mut polling_guard = PollingGuard::new(Arc::clone(&self.source));
+                let poll_result = self.poll_shared_source_once(engine).await;
+                if let Ok(mut source) = lock_shared_source(&self.source) {
+                    source.polling = false;
+                }
+                polling_guard.disarm();
+                poll_result?;
+            } else {
+                observe_poll_sleep(OBSERVE_FOLLOWER_POLL_INTERVAL).await;
             }
-
-            let rows = execute_observe_query(engine, &self.query).await?;
-            if self
-                .last_result
-                .as_ref()
-                .is_some_and(|previous| *previous == rows)
-            {
-                continue;
-            }
-
-            self.last_result = Some(rows.clone());
-            return Ok(Some(self.make_event(rows, None)));
         }
     }
 
-    fn make_event(
-        &mut self,
-        rows: QueryResult,
-        state_commit_sequence: Option<u64>,
-    ) -> ObserveEvent {
+    fn try_take_shared_event(&mut self) -> Result<Option<SharedObserveEvent>, LixError> {
+        let mut source = lock_shared_source(&self.source)?;
+        if source.closed {
+            return Ok(None);
+        }
+        Ok(source.take_next_event_for_subscriber(self.subscriber_id))
+    }
+
+    async fn poll_shared_source_once(&mut self, engine: &Engine) -> Result<(), LixError> {
+        let work = {
+            let source = lock_shared_source(&self.source)?;
+            if source.closed {
+                return Ok(());
+            }
+
+            if !source.initialized {
+                PollWork::Initial {
+                    query: source.query.clone(),
+                }
+            } else if let Some(batch) = source.state_commits.try_next() {
+                PollWork::StateCommit {
+                    query: source.query.clone(),
+                    state_commit_sequence: batch.sequence,
+                }
+            } else {
+                PollWork::External {
+                    query: source.query.clone(),
+                    last_seen_tick_seq: source.last_seen_tick_seq,
+                    writer_key_filter: source.writer_key_filter.clone(),
+                }
+            }
+        };
+
+        let outcome = match work {
+            PollWork::Initial { query } => {
+                let rows = execute_observe_query(engine, &query).await?;
+                let latest_tick_seq = latest_observe_tick_seq(engine).await?;
+                PollOutcome {
+                    maybe_rows: Some((rows, None)),
+                    update_last_seen_tick_seq: Some(latest_tick_seq),
+                    mark_initialized: true,
+                }
+            }
+            PollWork::StateCommit {
+                query,
+                state_commit_sequence,
+            } => {
+                let rows = execute_observe_query(engine, &query).await?;
+                PollOutcome {
+                    maybe_rows: Some((rows, Some(state_commit_sequence))),
+                    update_last_seen_tick_seq: None,
+                    mark_initialized: true,
+                }
+            }
+            PollWork::External {
+                query,
+                last_seen_tick_seq,
+                writer_key_filter,
+            } => {
+                observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
+                let observed_ticks = observe_ticks_since(engine, last_seen_tick_seq).await?;
+                if observed_ticks.is_empty() {
+                    PollOutcome {
+                        maybe_rows: None,
+                        update_last_seen_tick_seq: None,
+                        mark_initialized: true,
+                    }
+                } else {
+                    let mut next_last_seen_tick_seq = last_seen_tick_seq;
+                    let mut should_reexecute = false;
+                    for tick in observed_ticks {
+                        next_last_seen_tick_seq = Some(tick.tick_seq);
+                        if writer_key_filter.matches_external_tick(tick.writer_key.as_deref()) {
+                            should_reexecute = true;
+                        }
+                    }
+
+                    if !should_reexecute {
+                        PollOutcome {
+                            maybe_rows: None,
+                            update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
+                            mark_initialized: true,
+                        }
+                    } else {
+                        let rows = execute_observe_query(engine, &query).await?;
+                        PollOutcome {
+                            maybe_rows: Some((rows, None)),
+                            update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
+                            mark_initialized: true,
+                        }
+                    }
+                }
+            }
+        };
+
+        self.apply_poll_outcome(outcome)
+    }
+
+    fn apply_poll_outcome(&self, outcome: PollOutcome) -> Result<(), LixError> {
+        let mut source = lock_shared_source(&self.source)?;
+        if source.closed {
+            return Ok(());
+        }
+
+        if outcome.mark_initialized {
+            source.initialized = true;
+        }
+        if let Some(last_seen_tick_seq) = outcome.update_last_seen_tick_seq {
+            source.last_seen_tick_seq = last_seen_tick_seq;
+        }
+
+        if let Some((rows, state_commit_sequence)) = outcome.maybe_rows {
+            let changed = source
+                .last_result
+                .as_ref()
+                .is_none_or(|previous| *previous != rows);
+            if changed {
+                source.last_result = Some(rows.clone());
+                source.append_event(rows, state_commit_sequence);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn make_event(&mut self, shared_event: SharedObserveEvent) -> ObserveEvent {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         ObserveEvent {
             sequence,
-            rows,
-            state_commit_sequence,
+            rows: shared_event.rows,
+            state_commit_sequence: shared_event.state_commit_sequence,
         }
     }
 
-    fn close(&mut self) {
+    fn close_with_engine(&mut self, engine: &Engine) {
         if self.closed {
             return;
         }
         self.closed = true;
-        self.state_commits.close();
+        let _ = unregister_observe_subscriber(
+            engine,
+            &self.source_key,
+            &self.source,
+            self.subscriber_id,
+        );
+    }
+}
+
+impl PollingGuard {
+    fn new(source: Arc<Mutex<SharedObserveSource>>) -> Self {
+        Self {
+            source,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PollingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut source) = self.source.lock() {
+            source.polling = false;
+        }
     }
 }
 
@@ -243,6 +564,75 @@ pub fn observe_owned(
 }
 
 fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveState, LixError> {
+    let source_key = observe_source_key(&query)?;
+    let source = acquire_or_create_shared_source(engine, &source_key, query)?;
+    let subscriber_id = {
+        let mut shared = lock_shared_source(&source)?;
+        if shared.closed {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "observe shared source is closed".to_string(),
+            });
+        }
+        shared.register_subscriber()
+    };
+
+    Ok(ObserveState {
+        source_key,
+        source,
+        subscriber_id,
+        next_sequence: 0,
+        closed: false,
+    })
+}
+
+fn observe_source_key(query: &ObserveQuery) -> Result<String, LixError> {
+    let params = serde_json::to_string(&query.params).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("failed to serialize observe params for dedup key: {error}"),
+    })?;
+    Ok(format!("{}\n--params:{params}", query.sql))
+}
+
+fn acquire_or_create_shared_source(
+    engine: &Engine,
+    source_key: &str,
+    query: ObserveQuery,
+) -> Result<Arc<Mutex<SharedObserveSource>>, LixError> {
+    loop {
+        if let Some(existing_source) = lock_observe_registry(engine)?.get(source_key).cloned() {
+            let is_closed = lock_shared_source(&existing_source)?.closed;
+            if is_closed {
+                let mut registry = lock_observe_registry(engine)?;
+                if registry
+                    .get(source_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &existing_source))
+                {
+                    registry.remove(source_key);
+                }
+                continue;
+            }
+            return Ok(existing_source);
+        }
+
+        let new_source = Arc::new(Mutex::new(build_shared_observe_source(
+            engine,
+            query.clone(),
+        )?));
+        let mut registry = lock_observe_registry(engine)?;
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            registry.entry(source_key.to_string())
+        {
+            entry.insert(Arc::clone(&new_source));
+            return Ok(new_source);
+        }
+    }
+}
+
+fn build_shared_observe_source(
+    engine: &Engine,
+    query: ObserveQuery,
+) -> Result<SharedObserveSource, LixError> {
     let statements = parse_sql_statements(&query.sql)?;
     if statements.is_empty()
         || !statements
@@ -263,15 +653,63 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
     };
     let state_commits = engine.state_commit_stream(filter);
 
-    Ok(ObserveState {
+    Ok(SharedObserveSource::new(
         query,
         state_commits,
-        last_result: None,
         writer_key_filter,
-        last_seen_tick_seq: None,
-        emitted_initial: false,
-        next_sequence: 0,
-        closed: false,
+    ))
+}
+
+fn unregister_observe_subscriber(
+    engine: &Engine,
+    source_key: &str,
+    source: &Arc<Mutex<SharedObserveSource>>,
+    subscriber_id: u64,
+) -> Result<(), LixError> {
+    let should_remove_registry_entry = {
+        let mut shared = lock_shared_source(source)?;
+        if shared.closed {
+            true
+        } else {
+            shared.remove_subscriber(subscriber_id);
+            if shared.has_subscribers() {
+                false
+            } else {
+                shared.closed = true;
+                shared.state_commits.close();
+                true
+            }
+        }
+    };
+
+    if should_remove_registry_entry {
+        let mut registry = lock_observe_registry(engine)?;
+        if registry
+            .get(source_key)
+            .is_some_and(|current| Arc::ptr_eq(current, source))
+        {
+            registry.remove(source_key);
+        }
+    }
+
+    Ok(())
+}
+
+fn lock_observe_registry<'a>(
+    engine: &'a Engine,
+) -> Result<MutexGuard<'a, BTreeMap<String, Arc<Mutex<SharedObserveSource>>>>, LixError> {
+    engine.observe_shared_sources.lock().map_err(|_| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "observe shared source registry lock poisoned".to_string(),
+    })
+}
+
+fn lock_shared_source<'a>(
+    source: &'a Arc<Mutex<SharedObserveSource>>,
+) -> Result<MutexGuard<'a, SharedObserveSource>, LixError> {
+    source.lock().map_err(|_| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "observe shared source lock poisoned".to_string(),
     })
 }
 
@@ -379,5 +817,187 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to parse observe tick writer key value: {other:?}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
+    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::{boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Value};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct CountingObserveBackend {
+        observe_query_hits: Arc<AtomicUsize>,
+    }
+
+    struct CountingObserveTransaction;
+
+    #[async_trait(?Send)]
+    impl LixBackend for CountingObserveBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("observe-shared-sentinel") {
+                self.observe_query_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Text("observe-shared-sentinel".to_string())]],
+                    columns: vec!["marker".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_observe_tick") {
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: vec!["tick_seq".to_string(), "writer_key".to_string()],
+                });
+            }
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(CountingObserveTransaction))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixTransaction for CountingObserveTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_dedups_initial_query_execution_across_identical_subscribers() {
+        let observe_query_hits = Arc::new(AtomicUsize::new(0));
+        let engine = boot(BootArgs::new(
+            Box::new(CountingObserveBackend {
+                observe_query_hits: Arc::clone(&observe_query_hits),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+        let mut observed_a = engine
+            .observe(query.clone())
+            .expect("observe should succeed");
+        let mut observed_b = engine.observe(query).expect("observe should succeed");
+
+        let event_a = tokio::time::timeout(Duration::from_secs(1), observed_a.next())
+            .await
+            .expect("observe_a next should not time out")
+            .expect("observe_a next should succeed")
+            .expect("observe_a event should exist");
+        let event_b = tokio::time::timeout(Duration::from_secs(1), observed_b.next())
+            .await
+            .expect("observe_b next should not time out")
+            .expect("observe_b next should succeed")
+            .expect("observe_b event should exist");
+
+        assert_eq!(
+            event_a.rows.rows,
+            vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
+        );
+        assert_eq!(
+            event_b.rows.rows,
+            vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
+        );
+        assert_eq!(
+            observe_query_hits.load(Ordering::SeqCst),
+            1,
+            "identical observe subscribers should share initial query execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_late_subscriber_reuses_cached_initial_snapshot() {
+        let observe_query_hits = Arc::new(AtomicUsize::new(0));
+        let engine = boot(BootArgs::new(
+            Box::new(CountingObserveBackend {
+                observe_query_hits: Arc::clone(&observe_query_hits),
+            }),
+            Arc::new(NoopWasmRuntime),
+        ));
+
+        let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+        let mut observed_a = engine
+            .observe(query.clone())
+            .expect("observe should succeed");
+
+        let _initial_a = tokio::time::timeout(Duration::from_secs(1), observed_a.next())
+            .await
+            .expect("observe_a next should not time out")
+            .expect("observe_a next should succeed")
+            .expect("observe_a event should exist");
+
+        let mut observed_b = engine.observe(query).expect("observe should succeed");
+        let event_b = tokio::time::timeout(Duration::from_secs(1), observed_b.next())
+            .await
+            .expect("observe_b next should not time out")
+            .expect("observe_b next should succeed")
+            .expect("observe_b event should exist");
+
+        assert_eq!(
+            event_b.rows.rows,
+            vec![vec![Value::Text("observe-shared-sentinel".to_string())]]
+        );
+        assert_eq!(
+            observe_query_hits.load(Ordering::SeqCst),
+            1,
+            "late identical subscriber should reuse shared cached initial snapshot"
+        );
+
+        observed_a.close();
+        observed_b.close();
+        tokio::time::sleep(OBSERVE_TICK_POLL_INTERVAL).await;
+
+        let mut observed_c = engine
+            .observe(ObserveQuery::new(
+                "SELECT 'observe-shared-sentinel' AS marker",
+                vec![],
+            ))
+            .expect("observe should succeed");
+        let _initial_c = tokio::time::timeout(Duration::from_secs(1), observed_c.next())
+            .await
+            .expect("observe_c next should not time out")
+            .expect("observe_c next should succeed")
+            .expect("observe_c event should exist");
+
+        assert_eq!(
+            observe_query_hits.load(Ordering::SeqCst),
+            2,
+            "new observer after all subscribers close should execute a fresh initial query"
+        );
+
+        let _ = engine
+            .execute("SELECT 1", &[], ExecuteOptions::default())
+            .await
+            .expect("sanity execute should succeed");
     }
 }

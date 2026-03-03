@@ -83,7 +83,7 @@ export function useQuery<TRow>(
 	const compiled = builder.compile();
 	const observeQuery = {
 		sql: compiled.sql,
-		params: [...compiled.parameters],
+		params: [...compiled.parameters] as any,
 	};
 	const cacheKey =
 		`${getLixInstanceId(lix)}:${subscribe ? "sub" : "once"}:` +
@@ -112,25 +112,21 @@ export function useQuery<TRow>(
 	// Subscribe for ongoing updates (only if subscribe is true)
 	useEffect(() => {
 		if (!subscribe) return;
-
-		let cancelled = false;
+		let closed = false;
 		const events = lix.observe(observeQuery);
 
-		const observeLoop = async () => {
+		void (async () => {
 			try {
-				while (!cancelled) {
+				while (!closed) {
 					const event = await events.next();
-					if (cancelled || event === undefined) {
+					if (closed || event === undefined) {
 						break;
 					}
-					const nextRows = (await query(lix).execute()) as TRow[];
-					if (cancelled) {
-						return;
-					}
+					const nextRows = queryResultToRows<TRow>(event.rows);
 					setRows(nextRows);
 				}
 			} catch (err) {
-				if (cancelled) {
+				if (closed) {
 					return;
 				}
 				// Clear promise to allow retry
@@ -140,11 +136,10 @@ export function useQuery<TRow>(
 					throw err instanceof Error ? err : new Error(String(err));
 				});
 			}
-		};
+		})();
 
-		void observeLoop();
 		return () => {
-			cancelled = true;
+			closed = true;
 			events.close();
 		};
 	}, [cacheKey, subscribe, lix]);
@@ -154,6 +149,25 @@ export function useQuery<TRow>(
 	}
 
 	return rows;
+}
+
+function queryResultToRows<TRow>(result: {
+	rows?: ReadonlyArray<ReadonlyArray<unknown>>;
+	columns?: ReadonlyArray<string>;
+}): TRow[] {
+	const columns = Array.isArray(result?.columns) ? result.columns : [];
+	const rows = Array.isArray(result?.rows) ? result.rows : [];
+	return rows.map((row) => {
+		const output: Record<string, unknown> = {};
+		for (let index = 0; index < columns.length; index += 1) {
+			const column = columns[index];
+			if (typeof column !== "string") {
+				continue;
+			}
+			output[column] = row[index];
+		}
+		return output as TRow;
+	});
 }
 
 function getLixInstanceId(lix: Lix): number {

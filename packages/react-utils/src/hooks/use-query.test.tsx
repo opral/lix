@@ -8,7 +8,7 @@ import {
 } from "./use-query.js";
 import { LixProvider } from "../provider.js";
 import { openLix } from "@lix-js/sdk";
-import { qb } from "@lix-js/kysely";
+import { qb, sql } from "@lix-js/kysely";
 
 type KeyValueRow = {
 	key: string;
@@ -305,7 +305,10 @@ test("useQueryTakeFirst (subscribe:false) does not reuse previous rows", async (
 			({ key = "no_subscribe_a" }: { key?: string } = {}) => {
 				const row = useQueryTakeFirst(
 					(lix) =>
-						qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", key),
+						qb(lix)
+							.selectFrom("lix_key_value")
+							.selectAll()
+							.where("key", "=", key),
 					{ subscribe: false },
 				);
 				emissions.push(row?.key);
@@ -414,7 +417,10 @@ test("akeFirst updates reference when underlying row changes", async () => {
 		const { result } = renderHook(
 			() =>
 				useQueryTakeFirst((lix) =>
-					qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", rowKey),
+					qb(lix)
+						.selectFrom("lix_key_value")
+						.selectAll()
+						.where("key", "=", rowKey),
 				),
 			{ wrapper },
 		);
@@ -519,7 +525,10 @@ test("akeFirst re-emits when aggregate result returns to the initial value", asy
 		const { result } = renderHook(
 			() =>
 				useQuery((lix) =>
-					qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", key),
+					qb(lix)
+						.selectFrom("lix_key_value")
+						.selectAll()
+						.where("key", "=", key),
 				),
 			{ wrapper },
 		);
@@ -531,7 +540,10 @@ test("akeFirst re-emits when aggregate result returns to the initial value", asy
 	});
 
 	await act(async () => {
-		await qb(lix).insertInto("lix_key_value").values({ key, value: "v1" }).execute();
+		await qb(lix)
+			.insertInto("lix_key_value")
+			.values({ key, value: "v1" })
+			.execute();
 	});
 
 	await waitFor(() => {
@@ -610,7 +622,9 @@ test("error handling with ErrorBoundary", async () => {
 			() =>
 				useQuery((lix) =>
 					// invalid table: will reject then throw
-					qb(lix).selectFrom("non_existent_table" as never).selectAll(),
+					qb(lix)
+						.selectFrom("non_existent_table" as never)
+						.selectAll(),
 				),
 			{ wrapper },
 		);
@@ -621,11 +635,7 @@ test("error handling with ErrorBoundary", async () => {
 	});
 
 	const caughtMessage =
-		caught instanceof Error
-			? caught.message
-			: caught
-				? String(caught)
-				: "";
+		caught instanceof Error ? caught.message : caught ? String(caught) : "";
 	expect(caughtMessage).toMatch(/no such table|non_existent_table/i);
 
 	// Restore console.error
@@ -950,6 +960,87 @@ test("useQuery subscription updates when query dependencies change", async () =>
 	await lix.close();
 });
 
+test("identical useQuery subscriptions share observe event payloads", async () => {
+	const lix = await openLix({});
+	const key = "shared_subscriptions_engine_key";
+
+	await qb(lix)
+		.insertInto("lix_key_value")
+		.values({ key, value: "before" })
+		.execute();
+
+	const wrapper = ({ children }: { children: React.ReactNode }) => (
+		<LixProvider lix={lix}>
+			<Suspense fallback={<div>Loading...</div>}>
+				<MockErrorBoundary>{children}</MockErrorBoundary>
+			</Suspense>
+		</LixProvider>
+	);
+
+	let hookResult:
+		| {
+				current: {
+					left: KeyValueRow[];
+					right: KeyValueRow[];
+				};
+		  }
+		| undefined;
+
+	await act(async () => {
+		const { result } = renderHook(
+			() => {
+				const left = useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
+						.select([
+							"key",
+							"value",
+							sql<string>`CAST(random() AS TEXT)`.as("nonce"),
+						])
+						.where("key", "=", key),
+				);
+				const right = useQuery((lix) =>
+					qb(lix)
+						.selectFrom("lix_key_value")
+						.select([
+							"key",
+							"value",
+							sql<string>`CAST(random() AS TEXT)`.as("nonce"),
+						])
+						.where("key", "=", key),
+				);
+				return { left, right };
+			},
+			{ wrapper },
+		);
+		hookResult = result;
+	});
+
+	await waitFor(() => {
+		expect(hookResult!.current.left).toHaveLength(1);
+		expect(hookResult!.current.right).toHaveLength(1);
+	});
+
+	await act(async () => {
+		await qb(lix)
+			.updateTable("lix_key_value")
+			.set({ value: "after" })
+			.where("key", "=", key)
+			.execute();
+	});
+
+	await waitFor(() => {
+		expect(hookResult!.current.left[0]?.value).toBe("after");
+		expect(hookResult!.current.right[0]?.value).toBe("after");
+	});
+
+	expect(String(hookResult!.current.left[0]?.nonce)).toBe(
+		String(hookResult!.current.right[0]?.nonce),
+	);
+
+	await lix.close();
+});
+
 test("useQuery refreshes when lix instance is switched", async () => {
 	const switchKey = "switch_instance_value";
 	// Create two separate lix instances
@@ -985,7 +1076,10 @@ test("useQuery refreshes when lix instance is switched", async () => {
 	// Wrapper function that uses the current lix
 	const TestComponent = () => {
 		const data = useQuery((lix) =>
-			qb(lix).selectFrom("lix_key_value").selectAll().where("key", "=", switchKey),
+			qb(lix)
+				.selectFrom("lix_key_value")
+				.selectAll()
+				.where("key", "=", switchKey),
 		);
 		return data;
 	};
