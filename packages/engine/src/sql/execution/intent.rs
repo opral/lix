@@ -15,7 +15,6 @@ pub(crate) struct IntentCollectionPolicy {
 
 pub(crate) struct ExecutionIntent {
     pub(crate) pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
-    pub(crate) pending_file_write_targets: BTreeSet<(String, String)>,
     pub(crate) pending_file_delete_targets: BTreeSet<(String, String)>,
     pub(crate) detected_file_domain_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
     pub(crate) detected_file_domain_changes: Vec<DetectedFileDomainChange>,
@@ -60,11 +59,8 @@ pub(crate) async fn collect_execution_intent_with_backend(
             .await?
     };
 
-    let pending_file_write_targets = pending_file_write_targets(&pending_file_writes);
-
     Ok(ExecutionIntent {
         pending_file_writes,
-        pending_file_write_targets,
         pending_file_delete_targets,
         detected_file_domain_changes_by_statement,
         detected_file_domain_changes,
@@ -72,7 +68,7 @@ pub(crate) async fn collect_execution_intent_with_backend(
     })
 }
 
-fn pending_file_write_targets(
+pub(crate) fn authoritative_pending_file_write_targets(
     writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
 ) -> BTreeSet<(String, String)> {
     writes

@@ -177,7 +177,6 @@ impl Engine {
         let cache_targets = shared_path::derive_cache_targets(
             &prepared.plan,
             execution.postprocess_file_cache_targets.clone(),
-            &prepared.intent,
         );
 
         apply_effects_tx::apply_sql_backed_effects(

@@ -451,6 +451,127 @@ simulation_test!(
 );
 
 simulation_test!(
+    observe_lix_state_mixed_tracked_and_untracked_changes_emit_only_on_visible_delta,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let branch = engine
+            .create_version(CreateVersionOptions {
+                inherits_from_version_id: Some("global".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("create_version should succeed");
+
+        let entity_id = "observe-mixed-active-untracked";
+        let insert_state_sql = "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
+        engine
+            .execute(
+                insert_state_sql,
+                &[
+                    Value::Text(entity_id.to_string()),
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("lix".to_string()),
+                    Value::Text("global".to_string()),
+                    Value::Text("lix_sdk".to_string()),
+                    Value::Text(format!(r#"{{"key":"{entity_id}","value":"global"}}"#)),
+                    Value::Text("1".to_string()),
+                ],
+            )
+            .await
+            .expect("global state insert should succeed");
+        engine
+            .execute(
+                insert_state_sql,
+                &[
+                    Value::Text(entity_id.to_string()),
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text("lix".to_string()),
+                    Value::Text(branch.id.clone()),
+                    Value::Text("lix_sdk".to_string()),
+                    Value::Text(format!(r#"{{"key":"{entity_id}","value":"branch-v1"}}"#)),
+                    Value::Text("1".to_string()),
+                ],
+            )
+            .await
+            .expect("branch state insert should succeed");
+
+        engine
+            .switch_version("global".to_string())
+            .await
+            .expect("switch to global should succeed");
+
+        let mut observed = engine
+            .observe(ObserveQuery::new(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
+                vec![Value::Text(entity_id.to_string())],
+            ))
+            .expect("observe should succeed");
+
+        let initial = observed.next().await.unwrap().unwrap();
+        assert_eq!(initial.sequence, 0);
+        assert_eq!(
+            initial.rows.rows,
+            vec![vec![Value::Text(format!(
+                r#"{{"key":"{entity_id}","value":"global"}}"#
+            ))]]
+        );
+
+        engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = $1 \
+                 WHERE entity_id = $2 \
+                   AND schema_key = $3 \
+                   AND version_id = $4",
+                &[
+                    Value::Text(format!(r#"{{"key":"{entity_id}","value":"branch-v2"}}"#)),
+                    Value::Text(entity_id.to_string()),
+                    Value::Text("lix_key_value".to_string()),
+                    Value::Text(branch.id.clone()),
+                ],
+            )
+            .await
+            .expect("branch state update should succeed");
+
+        let no_visible_change =
+            tokio::time::timeout(Duration::from_millis(300), observed.next()).await;
+        assert!(
+            no_visible_change.is_err(),
+            "tracked write in non-active version should not emit a visible observe update"
+        );
+
+        engine
+            .switch_version(branch.id.clone())
+            .await
+            .expect("switch to branch should succeed");
+
+        let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+            .await
+            .expect("observe next should not time out")
+            .expect("observe next should succeed")
+            .expect("observe update event should exist");
+        assert_eq!(update.sequence, 1);
+        assert_eq!(
+            update.rows.rows,
+            vec![vec![Value::Text(format!(
+                r#"{{"key":"{entity_id}","value":"branch-v2"}}"#
+            ))]]
+        );
+    }
+);
+
+simulation_test!(
     observe_rejects_non_query_sql,
     simulations = [sqlite, postgres],
     |sim| async move {

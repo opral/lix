@@ -2,6 +2,7 @@ use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixBackend;
 use crate::Value;
+use std::collections::BTreeSet;
 
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::planner_error::PlannerError;
@@ -9,6 +10,7 @@ use super::super::contracts::result_contract::ResultContract;
 use super::super::surfaces::registry::{
     preprocess_with_surfaces, DetectedFileDomainChangesByStatement,
 };
+use super::dependency_spec::derive_dependency_spec_from_statements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::invariants::validate_execution_plan;
@@ -21,6 +23,8 @@ pub(crate) async fn build_execution_plan<P>(
     params: &[Value],
     functions: SharedFunctionProvider<P>,
     detected_file_domain_changes_by_statement: &DetectedFileDomainChangesByStatement,
+    pending_file_delete_targets: &BTreeSet<(String, String)>,
+    authoritative_pending_file_write_targets: &BTreeSet<(String, String)>,
     writer_key: Option<&str>,
 ) -> Result<ExecutionPlan, PlannerError>
 where
@@ -40,12 +44,20 @@ where
     .map_err(PlannerError::preprocess)?;
 
     let requirements = derive_plan_requirements(&parsed_statements);
-    let effects = derive_plan_effects(&preprocess, writer_key)?;
+    let dependency_spec = derive_dependency_spec_from_statements(&parsed_statements, params)
+        .map_err(PlannerError::parse)?;
+    let effects = derive_plan_effects(
+        &preprocess,
+        writer_key,
+        pending_file_delete_targets,
+        authoritative_pending_file_write_targets,
+    )?;
 
     let plan = ExecutionPlan {
         preprocess,
         result_contract,
         requirements,
+        dependency_spec,
         effects,
     };
     validate_execution_plan(&plan)?;

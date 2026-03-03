@@ -1,3 +1,4 @@
+pub(crate) mod dependency_spec;
 pub(crate) mod effects;
 pub(crate) mod execution_plan;
 pub(crate) mod executor_error;
