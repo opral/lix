@@ -64,11 +64,14 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         active_account: None,
         access_to_internal: false,
     });
-    engine.init().await?;
     Ok(Lix { engine })
 }
 
 impl Lix {
+    pub async fn init(&self) -> Result<(), LixError> {
+        self.engine.init().await
+    }
+
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.engine
             .execute(sql, params, ExecuteOptions::default())

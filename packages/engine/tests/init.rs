@@ -63,6 +63,92 @@ fn cleanup_sqlite_path(path: &Path) {
 }
 
 #[test]
+fn init_parallel_open_same_sqlite_path_avoids_raw_unique_conflicts() {
+    const ATTEMPTS: usize = 30;
+    const THREADS_PER_ATTEMPT: usize = 2;
+
+    let mut failures = Vec::new();
+
+    for attempt in 0..ATTEMPTS {
+        let path = temp_sqlite_init_path(&format!("parallel-open-{attempt}"));
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS_PER_ATTEMPT + 1));
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(THREADS_PER_ATTEMPT);
+        let mut handles = Vec::new();
+
+        for worker in 0..THREADS_PER_ATTEMPT {
+            let path_for_thread = path.clone();
+            let barrier_for_thread = Arc::clone(&barrier);
+            let result_tx = result_tx.clone();
+            let handle = std::thread::Builder::new()
+                .name(format!(
+                    "init_parallel_open_same_sqlite_path_should_not_fail-{attempt}-{worker}"
+                ))
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build tokio runtime");
+
+                    barrier_for_thread.wait();
+
+                    let result = runtime.block_on(async move {
+                        let engine = boot_sqlite_engine_at_path(&path_for_thread);
+                        engine.init().await.map_err(|err| err.to_string())
+                    });
+
+                    let _ = result_tx.send(result);
+                })
+                .expect("failed to spawn parallel init worker");
+            handles.push(handle);
+        }
+
+        drop(result_tx);
+        barrier.wait();
+
+        let mut attempt_errors = Vec::new();
+        for _ in 0..THREADS_PER_ATTEMPT {
+            let received = result_rx
+                .recv_timeout(Duration::from_secs(120))
+                .expect("parallel init worker result should arrive");
+            if let Err(err) = received {
+                attempt_errors.push(err);
+            }
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("parallel init worker thread panicked");
+        }
+
+        cleanup_sqlite_path(&path);
+
+        for error in attempt_errors {
+            if error.contains("LIX_ERROR_ALREADY_INITIALIZED") {
+                continue;
+            }
+            let lower = error.to_ascii_lowercase();
+            if lower.contains("unique constraint failed")
+                || lower.contains("unique constraint violation")
+            {
+                failures.push(format!(
+                    "attempt {attempt}: raw unique conflict leaked instead of ALREADY_INITIALIZED: {error}"
+                ));
+                continue;
+            }
+            failures.push(format!("attempt {attempt}: unexpected init error: {error}"));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "parallel init on the same sqlite path produced invalid errors: {}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn init_reopen_preserves_working_changes_sqlite() {
     let path = temp_sqlite_init_path("working-changes");
     let path_for_thread = path.clone();
@@ -125,7 +211,11 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     drop(engine_a);
 
                     let engine_b = boot_sqlite_engine_at_path(&path_for_thread);
-                    engine_b.init().await.expect("reopen init should succeed");
+                    let reopen_init_err = engine_b
+                        .init()
+                        .await
+                        .expect_err("reopen init should report already initialized");
+                    assert_eq!(reopen_init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
 
                     let after = engine_b
                         .execute(
