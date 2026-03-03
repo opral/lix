@@ -9,6 +9,7 @@ pub fn run() -> Result<(), CliError> {
     let context = AppContext { lix_path: cli.path };
 
     match cli.command {
+        Command::Init(init_command) => commands::init::run(init_command),
         Command::Sql(sql_command) => commands::sql::run(&context, sql_command),
     }
 }

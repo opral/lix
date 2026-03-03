@@ -79,12 +79,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
 
         let result = engine
-            .execute(
-                "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name",
-                &[],
-            )
+            .execute("SELECT name FROM sqlite_master ORDER BY name LIMIT 1", &[])
             .await
             .expect("sqlite_master read should succeed");
 

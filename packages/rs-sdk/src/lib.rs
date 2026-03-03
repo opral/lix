@@ -1,7 +1,10 @@
 mod backend;
 mod wasmtime_runtime;
 
-use lix_engine::{boot, BootArgs, BootKeyValue, ExecuteOptions, WasmRuntime};
+use lix_engine::{
+    boot, init_lix as engine_init_lix, BootArgs, BootKeyValue, ExecuteOptions, InitLixArgs,
+    InitLixResult as EngineInitLixResult, WasmRuntime,
+};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
@@ -34,6 +37,52 @@ pub struct Lix {
 }
 
 pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
+    let resolved = resolve_open_config(config)?;
+    let engine = boot(BootArgs {
+        backend: resolved.backend,
+        wasm_runtime: resolved.wasm_runtime,
+        key_values: resolved.key_values,
+        active_account: None,
+        access_to_internal: false,
+    });
+    Ok(Lix { engine })
+}
+
+pub async fn init_lix(config: OpenLixConfig) -> Result<EngineInitLixResult, LixError> {
+    let resolved = resolve_open_config(config)?;
+    engine_init_lix(InitLixArgs {
+        backend: resolved.backend,
+        wasm_runtime: resolved.wasm_runtime,
+        key_values: resolved.key_values,
+    })
+    .await
+}
+
+impl Lix {
+    pub async fn init(&self) -> Result<(), LixError> {
+        self.engine.init_if_needed().await.map(|_| ())
+    }
+
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.engine
+            .execute(sql, params, ExecuteOptions::default())
+            .await
+    }
+}
+
+pub use backend::sqlite::SqliteBackend;
+pub use lix_engine::{
+    InitLixResult, LixBackend, LixError, QueryResult, Value, WasmComponentInstance, WasmLimits,
+};
+pub use wasmtime_runtime::WasmtimeRuntime;
+
+struct ResolvedOpenConfig {
+    backend: Box<dyn LixBackend + Send + Sync>,
+    wasm_runtime: Arc<dyn WasmRuntime>,
+    key_values: Vec<BootKeyValue>,
+}
+
+fn resolve_open_config(config: OpenLixConfig) -> Result<ResolvedOpenConfig, LixError> {
     let OpenLixConfig {
         backend,
         wasm_runtime,
@@ -57,28 +106,10 @@ pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
         Some(runtime) => runtime,
         None => Arc::new(wasmtime_runtime::WasmtimeRuntime::new()?),
     };
-    let engine = boot(BootArgs {
+
+    Ok(ResolvedOpenConfig {
         backend,
         wasm_runtime,
         key_values,
-        active_account: None,
-        access_to_internal: false,
-    });
-    Ok(Lix { engine })
+    })
 }
-
-impl Lix {
-    pub async fn init(&self) -> Result<(), LixError> {
-        self.engine.init().await
-    }
-
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.engine
-            .execute(sql, params, ExecuteOptions::default())
-            .await
-    }
-}
-
-pub use backend::sqlite::SqliteBackend;
-pub use lix_engine::{LixBackend, LixError, QueryResult, Value, WasmComponentInstance, WasmLimits};
-pub use wasmtime_runtime::WasmtimeRuntime;

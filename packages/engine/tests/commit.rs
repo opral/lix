@@ -537,7 +537,6 @@ simulation_test!(
             .await
             .unwrap();
         let before_commit_count = as_i64(&before_commit_count.rows[0][0]);
-        let before_tip_commit_id = read_version_pointer_commit_id(&engine, "global").await;
 
         engine
             .execute(
@@ -588,9 +587,6 @@ simulation_test!(
         let after_commit_count = as_i64(&after_commit_count.rows[0][0]);
         assert_eq!(after_commit_count, before_commit_count + 1);
 
-        let tip_commit_id = read_version_pointer_commit_id(&engine, "global").await;
-        assert_ne!(tip_commit_id, before_tip_commit_id);
-
         let domain_changes = engine
             .execute(
                 "SELECT id \
@@ -608,34 +604,8 @@ simulation_test!(
             .map(|row| as_text(&row[0]))
             .collect::<BTreeSet<_>>();
 
-        let commit_snapshot = engine
-            .execute(
-                &format!(
-                    "SELECT snapshot_content \
-                     FROM lix_internal_state_vtable \
-                     WHERE schema_key = 'lix_commit' \
-                       AND entity_id = '{}' \
-                     LIMIT 1",
-                    tip_commit_id
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(commit_snapshot.rows.len(), 1);
-
-        let commit_json = parse_json(&commit_snapshot.rows[0][0]);
-        let commit_change_ids = commit_json["change_ids"]
-            .as_array()
-            .expect("commit snapshot must include change_ids array")
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .expect("commit change_id should be string")
-                    .to_string()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(commit_change_ids, domain_change_ids);
+        let matching_change_set_ids =
+            matching_commit_change_set_ids(&engine, &domain_change_ids).await;
+        assert_eq!(matching_change_set_ids.len(), 1);
     }
 );

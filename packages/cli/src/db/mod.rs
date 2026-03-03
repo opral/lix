@@ -1,6 +1,6 @@
 use crate::app::AppContext;
 use crate::error::CliError;
-use lix_rs_sdk::{open_lix, Lix, OpenLixConfig, SqliteBackend};
+use lix_rs_sdk::{init_lix, open_lix, Lix, OpenLixConfig, SqliteBackend};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,8 @@ pub fn resolve_db_path(context: &AppContext) -> Result<PathBuf, CliError> {
 }
 
 pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
+    init_lix_at(path)?;
+
     let backend = SqliteBackend::from_path(path).map_err(|err| {
         CliError::msg(format!(
             "failed to open sqlite backend at {}: {}",
@@ -60,6 +62,36 @@ pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
             err
         ))
     })
+}
+
+pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|source| {
+                CliError::io("failed to create parent directory for lix file", source)
+            })?;
+        }
+    }
+
+    let init_backend = SqliteBackend::from_path(path).map_err(|err| {
+        CliError::msg(format!(
+            "failed to open sqlite backend at {}: {}",
+            path.display(),
+            err
+        ))
+    })?;
+    let init_config = OpenLixConfig {
+        backend: Some(Box::new(init_backend)),
+        ..Default::default()
+    };
+    let result = pollster::block_on(init_lix(init_config)).map_err(|err| {
+        CliError::msg(format!(
+            "failed to initialize lix database at {}: {}",
+            path.display(),
+            err
+        ))
+    })?;
+    Ok(result.created)
 }
 
 fn find_lix_files(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {
