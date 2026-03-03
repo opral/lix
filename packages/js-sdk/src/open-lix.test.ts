@@ -207,6 +207,24 @@ test("executeTransaction applies multiple statements in one call", async () => {
 	await lix.close();
 });
 
+test("execute accepts explicit BEGIN/COMMIT wrappers", async () => {
+	const lix = await openLix();
+
+	await lix.execute(
+		"BEGIN; INSERT INTO lix_key_value (key, value) VALUES (?1, ?2); COMMIT;",
+		["js-sdk-begin-commit", "ok"],
+	);
+
+	const value = await lix.execute(
+		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
+		["js-sdk-begin-commit"],
+	);
+	expect(value.rows.length).toBe(1);
+	expect(value.rows[0][0]).toBe("ok");
+
+	await lix.close();
+});
+
 test("beginTransaction commits and rollbacks explicitly", async () => {
 	const lix = await openLix();
 

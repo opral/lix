@@ -155,17 +155,15 @@ impl Engine {
         if !allow_internal_sql {
             reject_internal_table_writes(&parsed_statements)?;
         }
+        if let Some(statements) =
+            extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
+        {
+            return self
+                .execute_transaction_script_with_options(statements, params, options)
+                .await;
+        }
         if !allow_internal_sql && contains_transaction_control_statement(&parsed_statements) {
             return Err(errors::transaction_control_statement_denied_error());
-        }
-        if allow_internal_sql {
-            if let Some(statements) =
-                extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
-            {
-                return self
-                    .execute_transaction_script_with_options(statements, params, options)
-                    .await;
-            }
         }
         if parsed_statements.len() > 1 {
             return self
