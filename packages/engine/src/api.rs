@@ -5,6 +5,14 @@ use super::*;
 use crate::errors;
 
 impl Engine {
+    pub async fn open(&self) -> Result<(), LixError> {
+        if !self.is_initialized().await? {
+            return Err(errors::not_initialized_error());
+        }
+        self.load_and_cache_active_version().await?;
+        Ok(())
+    }
+
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
         self.wasm_runtime.clone()
     }

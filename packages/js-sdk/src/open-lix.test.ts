@@ -1,5 +1,22 @@
 import { expect, test } from "vitest";
-import { openLix } from "./open-lix.js";
+import { createWasmSqliteBackend } from "./backend/wasm-sqlite.js";
+import { initLix, openLix } from "./open-lix.js";
+
+async function createInitializedLix(args?: {
+	keyValues?: Parameters<typeof initLix>[0]["keyValues"];
+}) {
+	const backend = await createWasmSqliteBackend();
+	await initLix({
+		backend,
+		keyValues: args?.keyValues,
+	});
+	return await openLix({ backend });
+}
+
+test("openLix rejects when backend is not initialized", async () => {
+	const backend = await createWasmSqliteBackend();
+	await expect(openLix({ backend })).rejects.toThrow(/NOT_INITIALIZED/i);
+});
 
 function crc32(input: Uint8Array): number {
 	let crc = 0xffffffff;
@@ -103,7 +120,7 @@ test("openLix executes SQL against default in-memory sqlite backend", async () =
 });
 
 test("openLix disallows querying internal tables", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	await expect(
 		lix.execute("SELECT * FROM lix_internal_state_vtable", []),
 	).rejects.toThrow(
@@ -113,7 +130,7 @@ test("openLix disallows querying internal tables", async () => {
 });
 
 test("createVersion + switchVersion use the JS API surface", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	const created = await lix.createVersion({ name: "bench-branch" });
 	expect(created.id.length).toBeGreaterThan(0);
@@ -130,7 +147,7 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 });
 
 test("createVersion forwards inheritsFromVersionId and hidden options", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	const created = await lix.createVersion({
 		id: "branch-options",
@@ -161,7 +178,7 @@ test("createVersion forwards inheritsFromVersionId and hidden options", async ()
 });
 
 test("createCheckpoint returns checkpoint metadata and rotates working pointer", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
 		"js-create-checkpoint",
 		"v1",
@@ -185,7 +202,7 @@ test("createCheckpoint returns checkpoint metadata and rotates working pointer",
 });
 
 test("executeTransaction applies multiple statements in one call", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	await lix.executeTransaction([
 		{
@@ -208,7 +225,7 @@ test("executeTransaction applies multiple statements in one call", async () => {
 });
 
 test("execute accepts explicit BEGIN/COMMIT wrappers", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	await lix.execute(
 		"BEGIN; INSERT INTO lix_key_value (key, value) VALUES (?1, ?2); COMMIT;",
@@ -226,7 +243,7 @@ test("execute accepts explicit BEGIN/COMMIT wrappers", async () => {
 });
 
 test("beginTransaction commits and rollbacks explicitly", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	const tx = await lix.beginTransaction({ writerKey: "js-sdk-begin-tx" });
 	await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
@@ -258,7 +275,7 @@ test("beginTransaction commits and rollbacks explicitly", async () => {
 });
 
 test("beginTransaction calls are serialized per lix instance", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const tx1 = await lix.beginTransaction();
 
 	const tx2Promise = lix.beginTransaction();
@@ -278,7 +295,7 @@ test("beginTransaction calls are serialized per lix instance", async () => {
 });
 
 test("non-transaction execute waits while a transaction is open", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const tx = await lix.beginTransaction();
 	await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
 		"tx-open-visible-only-after-commit",
@@ -310,7 +327,7 @@ test("non-transaction execute waits while a transaction is open", async () => {
 });
 
 test("transaction helper commits on success and rolls back on error", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	await lix.transaction(async (tx) => {
 		await tx.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
@@ -345,7 +362,7 @@ test("transaction helper commits on success and rolls back on error", async () =
 });
 
 test("execute rejects object params that are not runtime values", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	await expect(
 		lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
@@ -360,7 +377,7 @@ test("execute rejects object params that are not runtime values", async () => {
 });
 
 test("execute persists raw scalar params", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
 		"open-lix-typed-param-value",
@@ -378,7 +395,7 @@ test("execute persists raw scalar params", async () => {
 });
 
 test("installPlugin stores plugin metadata", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 
 	const manifestJson = JSON.stringify({
 		key: "plugin_json",
@@ -414,7 +431,7 @@ test("installPlugin stores plugin metadata", async () => {
 });
 
 test("exportSnapshot returns sqlite bytes", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	await lix.execute(
 		"INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a.txt', x'01')",
 		[],
@@ -426,7 +443,7 @@ test("exportSnapshot returns sqlite bytes", async () => {
 });
 
 test("lix_file.data roundtrips as Uint8Array runtime value", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	await lix.execute(
 		"INSERT INTO lix_file (id, path, data) VALUES (?1, ?2, ?3)",
 		["blob-roundtrip", "/blob.bin", new Uint8Array([1, 2, 3])],
@@ -461,7 +478,7 @@ test("openLix seeds keyValues at startup", async () => {
 });
 
 test("close is idempotent and blocks further API calls", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	await lix.close();
 	await lix.close();
 
@@ -471,7 +488,7 @@ test("close is idempotent and blocks further API calls", async () => {
 });
 
 test("observe emits initial and follow-up query results", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const events = lix.observe({
 		sql: "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
 		params: ["observe-js"],
@@ -501,7 +518,7 @@ test("observe emits initial and follow-up query results", async () => {
 });
 
 test("observe on _by_version view emits follow-up results", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const events = lix.observe({
 		sql: "SELECT key FROM lix_key_value_by_version WHERE key = ?1",
 		params: ["observe-by-version"],
@@ -530,7 +547,7 @@ test("observe on _by_version view emits follow-up results", async () => {
 });
 
 test("observe on lix_state emits follow-up when switching active version", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const branch = await lix.createVersion({ name: "observe-switch-state" });
 	const entityId = "observe-switch-state-key";
 
@@ -590,7 +607,7 @@ test("observe on lix_state emits follow-up when switching active version", async
 });
 
 test("observe on lix_file emits follow-up when switching active version", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const branch = await lix.createVersion({ name: "observe-switch-file" });
 	const path = "/observe-switch-file.txt";
 
@@ -628,7 +645,7 @@ test("observe on lix_file emits follow-up when switching active version", async 
 });
 
 test("observe next resolves when closed while waiting", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const events = lix.observe({
 		sql: "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
 		params: ["observe-close"],
@@ -649,7 +666,7 @@ test("observe next resolves when closed while waiting", async () => {
 });
 
 test("observe stream remains usable after query error", async () => {
-	const lix = await openLix();
+	const lix = await createInitializedLix();
 	const key = "observe-recover-json";
 	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
 		key,

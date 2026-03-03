@@ -4,6 +4,7 @@ use crate::LixError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     AlreadyInitialized,
+    NotInitialized,
     TableNotFound,
     SchemaNotRegistered,
     SqlUnknownTable,
@@ -20,6 +21,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AlreadyInitialized => "LIX_ERROR_ALREADY_INITIALIZED",
+            Self::NotInitialized => "LIX_ERROR_NOT_INITIALIZED",
             Self::TableNotFound => "LIX_ERROR_TABLE_NOT_FOUND",
             Self::SchemaNotRegistered => "LIX_ERROR_SCHEMA_NOT_REGISTERED",
             Self::SqlUnknownTable => "LIX_ERROR_SQL_UNKNOWN_TABLE",
@@ -38,6 +40,7 @@ impl ErrorCode {
     pub const fn all() -> &'static [Self] {
         &[
             Self::AlreadyInitialized,
+            Self::NotInitialized,
             Self::TableNotFound,
             Self::SchemaNotRegistered,
             Self::SqlUnknownTable,
@@ -60,6 +63,13 @@ pub(crate) fn already_initialized_error() -> LixError {
     build_error(
         ErrorCode::AlreadyInitialized,
         "Engine is already initialized. Create a new Engine instance to initialize again.",
+    )
+}
+
+pub(crate) fn not_initialized_error() -> LixError {
+    build_error(
+        ErrorCode::NotInitialized,
+        "Engine is not initialized. Run initLix({ backend }) before openLix({ backend }).",
     )
 }
 
@@ -188,7 +198,7 @@ pub(crate) fn file_data_expects_bytes_error() -> LixError {
 mod tests {
     use super::{
         already_initialized_error, file_data_expects_bytes_error,
-        internal_table_access_denied_error, read_only_view_write_error,
+        internal_table_access_denied_error, not_initialized_error, read_only_view_write_error,
         schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
         table_not_found_read_error, transaction_control_statement_denied_error,
         transaction_handle_not_found_error, vtable_schema_key_required_error, ErrorCode,
@@ -211,6 +221,9 @@ mod tests {
 
         let table_not_found = table_not_found_read_error();
         assert_eq!(table_not_found.code, "LIX_ERROR_TABLE_NOT_FOUND");
+
+        let not_initialized = not_initialized_error();
+        assert_eq!(not_initialized.code, "LIX_ERROR_NOT_INITIALIZED");
 
         let schema_not_registered =
             schema_not_registered_error("markdown_v2_document", &["lix_key_value"]);

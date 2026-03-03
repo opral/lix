@@ -1,4 +1,5 @@
 import init, {
+	initLix as initLixWasm,
 	openLix as openLixWasm,
 	Value,
 	resolveEngineWasmModuleOrPath,
@@ -87,6 +88,10 @@ export type OpenLixKeyValue = {
 	lixcol_untracked?: boolean;
 };
 
+export type InitLixResult = {
+	created: boolean;
+};
+
 export type Lix = {
 	execute(
 		sql: string,
@@ -127,6 +132,20 @@ async function ensureWasmReady(): Promise<void> {
 	await wasmReady;
 }
 
+export async function initLix(args: {
+	backend: LixBackend;
+	keyValues?: ReadonlyArray<OpenLixKeyValue>;
+}): Promise<InitLixResult> {
+	await ensureWasmReady();
+	const wasmBackend = createCanonicalBackendAdapter(args.backend);
+	const result = await initLixWasm(
+		wasmBackend as any,
+		await getDefaultWasmRuntime(),
+		args.keyValues ? [...args.keyValues] : undefined,
+	);
+	return normalizeInitLixResult(result);
+}
+
 export async function openLix(
 	args: {
 		backend?: LixBackend;
@@ -135,11 +154,20 @@ export async function openLix(
 ): Promise<Lix> {
 	await ensureWasmReady();
 	const backend = args.backend ?? (await createWasmSqliteBackend());
+	if (!args.backend) {
+		await initLix({
+			backend,
+			keyValues: args.keyValues,
+		});
+	} else if (args.keyValues && args.keyValues.length > 0) {
+		throw new Error(
+			"openLix({ backend, keyValues }) is not supported; call initLix({ backend, keyValues }) before openLix({ backend })",
+		);
+	}
 	const wasmBackend = createCanonicalBackendAdapter(backend);
 	const wasmLix = await openLixWasm(
 		wasmBackend as any,
 		await getDefaultWasmRuntime(),
-		args.keyValues ? [...args.keyValues] : undefined,
 	);
 	let closed = false;
 	let closing = false;
@@ -671,6 +699,17 @@ function normalizeExecuteOptions(
 	return {
 		writerKey,
 	};
+}
+
+function normalizeInitLixResult(result: unknown): InitLixResult {
+	if (!result || typeof result !== "object") {
+		throw new Error("initLix() must return an object");
+	}
+	const created = (result as { created?: unknown }).created;
+	if (typeof created !== "boolean") {
+		throw new Error("initLix() result is missing boolean created");
+	}
+	return { created };
 }
 
 function encodeRuntimeSqlParam(

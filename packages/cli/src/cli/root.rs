@@ -1,3 +1,4 @@
+use super::init::InitCommand;
 use super::sql::SqlCommand;
 use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
@@ -16,6 +17,24 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Initialize a Lix database file at the provided path.
+    Init(InitCommand),
     /// Execute raw SQL against a Lix database.
     Sql(SqlCommand),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_init_command_path_argument() {
+        let cli = Cli::try_parse_from(["lix", "init", "tmp/new.lix"]).expect("parse succeeds");
+        match cli.command {
+            Command::Init(init) => assert_eq!(init.path, PathBuf::from("tmp/new.lix")),
+            _ => panic!("expected init command"),
+        }
+    }
 }

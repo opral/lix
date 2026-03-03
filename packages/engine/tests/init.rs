@@ -117,9 +117,7 @@ fn init_parallel_open_same_sqlite_path_avoids_raw_unique_conflicts() {
         }
 
         for handle in handles {
-            handle
-                .join()
-                .expect("parallel init worker thread panicked");
+            handle.join().expect("parallel init worker thread panicked");
         }
 
         cleanup_sqlite_path(&path);

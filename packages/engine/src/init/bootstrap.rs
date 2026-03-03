@@ -56,6 +56,21 @@ impl Engine {
         result
     }
 
+    pub async fn init_if_needed(&self) -> Result<bool, LixError> {
+        match self.init().await {
+            Ok(()) => Ok(true),
+            Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
+                self.load_and_cache_active_version().await?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn is_initialized(&self) -> Result<bool, LixError> {
+        self.backend_has_been_initialized().await
+    }
+
     async fn backend_has_been_initialized(&self) -> Result<bool, LixError> {
         let table_exists = match self.backend.dialect() {
             SqlDialect::Sqlite => {

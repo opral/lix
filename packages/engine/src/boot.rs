@@ -2,7 +2,7 @@ use crate::deterministic_mode::DeterministicSettings;
 use crate::engine::Engine;
 use crate::json_truthiness::{loosely_false, loosely_true};
 use crate::key_value::KEY_VALUE_GLOBAL_VERSION;
-use crate::{LixBackend, WasmRuntime};
+use crate::{LixBackend, LixError, WasmRuntime};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
@@ -30,6 +30,16 @@ pub struct BootArgs {
     pub access_to_internal: bool,
 }
 
+pub struct InitLixArgs {
+    pub backend: Box<dyn LixBackend + Send + Sync>,
+    pub wasm_runtime: Arc<dyn WasmRuntime>,
+    pub key_values: Vec<BootKeyValue>,
+}
+
+pub struct InitLixResult {
+    pub created: bool,
+}
+
 impl BootArgs {
     pub fn new(
         backend: Box<dyn LixBackend + Send + Sync>,
@@ -48,6 +58,18 @@ impl BootArgs {
 pub fn boot(args: BootArgs) -> Engine {
     let boot_deterministic_settings = infer_boot_deterministic_settings(&args.key_values);
     Engine::from_boot_args(args, boot_deterministic_settings)
+}
+
+pub async fn init_lix(args: InitLixArgs) -> Result<InitLixResult, LixError> {
+    let engine = boot(BootArgs {
+        backend: args.backend,
+        wasm_runtime: args.wasm_runtime,
+        key_values: args.key_values,
+        active_account: None,
+        access_to_internal: false,
+    });
+    let created = engine.init_if_needed().await?;
+    Ok(InitLixResult { created })
 }
 
 pub(crate) fn infer_boot_deterministic_settings(
