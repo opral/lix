@@ -2161,7 +2161,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "markdown_wc_core"
+name = "markdown_wc"
 version = "0.1.0"
 dependencies = [
  "markdown",
@@ -2632,7 +2632,7 @@ version = "0.1.0"
 dependencies = [
  "criterion 0.5.1",
  "markdown",
- "markdown_wc_core",
+ "markdown_wc",
  "serde",
  "serde_json",
  "strsim",
