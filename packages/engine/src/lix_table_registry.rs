@@ -51,16 +51,19 @@ const LIX_FILE_COLUMNS: &[&str] = &[
     "lixcol_metadata",
 ];
 
-const LIX_DIRECTORY_COLUMNS: &[&str] = &[
+const LIX_FILE_BY_VERSION_COLUMNS: &[&str] = &[
     "id",
-    "parent_id",
+    "directory_id",
     "name",
+    "extension",
     "path",
+    "data",
     "metadata",
     "hidden",
     "lixcol_entity_id",
     "lixcol_schema_key",
     "lixcol_file_id",
+    "lixcol_version_id",
     "lixcol_plugin_key",
     "lixcol_schema_version",
     "lixcol_inherited_from_version_id",
@@ -71,6 +74,81 @@ const LIX_DIRECTORY_COLUMNS: &[&str] = &[
     "lixcol_writer_key",
     "lixcol_untracked",
     "lixcol_metadata",
+];
+
+const LIX_FILE_HISTORY_COLUMNS: &[&str] = &[
+    "id",
+    "path",
+    "data",
+    "metadata",
+    "hidden",
+    "lixcol_entity_id",
+    "lixcol_schema_key",
+    "lixcol_file_id",
+    "lixcol_version_id",
+    "lixcol_plugin_key",
+    "lixcol_schema_version",
+    "lixcol_change_id",
+    "lixcol_metadata",
+    "lixcol_commit_id",
+    "lixcol_root_commit_id",
+    "lixcol_depth",
+];
+
+const LIX_DIRECTORY_COLUMNS: &[&str] = &[
+    "id",
+    "parent_id",
+    "name",
+    "path",
+    "hidden",
+    "lixcol_entity_id",
+    "lixcol_schema_key",
+    "lixcol_schema_version",
+    "lixcol_inherited_from_version_id",
+    "lixcol_change_id",
+    "lixcol_created_at",
+    "lixcol_updated_at",
+    "lixcol_commit_id",
+    "lixcol_untracked",
+    "lixcol_metadata",
+];
+
+const LIX_DIRECTORY_BY_VERSION_COLUMNS: &[&str] = &[
+    "id",
+    "parent_id",
+    "name",
+    "path",
+    "hidden",
+    "lixcol_entity_id",
+    "lixcol_schema_key",
+    "lixcol_schema_version",
+    "lixcol_version_id",
+    "lixcol_inherited_from_version_id",
+    "lixcol_change_id",
+    "lixcol_created_at",
+    "lixcol_updated_at",
+    "lixcol_commit_id",
+    "lixcol_untracked",
+    "lixcol_metadata",
+];
+
+const LIX_DIRECTORY_HISTORY_COLUMNS: &[&str] = &[
+    "id",
+    "parent_id",
+    "name",
+    "path",
+    "hidden",
+    "lixcol_entity_id",
+    "lixcol_schema_key",
+    "lixcol_file_id",
+    "lixcol_version_id",
+    "lixcol_plugin_key",
+    "lixcol_schema_version",
+    "lixcol_change_id",
+    "lixcol_metadata",
+    "lixcol_commit_id",
+    "lixcol_root_commit_id",
+    "lixcol_depth",
 ];
 
 const LIX_STORED_SCHEMA_COLUMNS: &[&str] = &[
@@ -115,11 +193,11 @@ const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     },
     LixTableSpec {
         name: "lix_file_by_version",
-        columns: LIX_FILE_COLUMNS,
+        columns: LIX_FILE_BY_VERSION_COLUMNS,
     },
     LixTableSpec {
         name: "lix_file_history",
-        columns: LIX_FILE_COLUMNS,
+        columns: LIX_FILE_HISTORY_COLUMNS,
     },
     LixTableSpec {
         name: "lix_directory",
@@ -127,11 +205,11 @@ const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     },
     LixTableSpec {
         name: "lix_directory_by_version",
-        columns: LIX_DIRECTORY_COLUMNS,
+        columns: LIX_DIRECTORY_BY_VERSION_COLUMNS,
     },
     LixTableSpec {
         name: "lix_directory_history",
-        columns: LIX_DIRECTORY_COLUMNS,
+        columns: LIX_DIRECTORY_HISTORY_COLUMNS,
     },
     LixTableSpec {
         name: "lix_version",
@@ -169,7 +247,11 @@ pub(crate) fn columns_for_public_lix_table(table_name: &str) -> Option<&'static 
 
 #[cfg(test)]
 mod tests {
-    use super::PUBLIC_LIX_TABLE_REGISTRY;
+    use super::{
+        columns_for_public_lix_table, LIX_DIRECTORY_BY_VERSION_COLUMNS, LIX_DIRECTORY_COLUMNS,
+        LIX_DIRECTORY_HISTORY_COLUMNS, LIX_FILE_BY_VERSION_COLUMNS, LIX_FILE_COLUMNS,
+        LIX_FILE_HISTORY_COLUMNS, PUBLIC_LIX_TABLE_REGISTRY,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -182,5 +264,30 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn filesystem_view_registry_columns_match_projection_contracts() {
+        assert_eq!(columns_for_public_lix_table("lix_file"), Some(LIX_FILE_COLUMNS));
+        assert_eq!(
+            columns_for_public_lix_table("lix_file_by_version"),
+            Some(LIX_FILE_BY_VERSION_COLUMNS)
+        );
+        assert_eq!(
+            columns_for_public_lix_table("lix_file_history"),
+            Some(LIX_FILE_HISTORY_COLUMNS)
+        );
+        assert_eq!(
+            columns_for_public_lix_table("lix_directory"),
+            Some(LIX_DIRECTORY_COLUMNS)
+        );
+        assert_eq!(
+            columns_for_public_lix_table("lix_directory_by_version"),
+            Some(LIX_DIRECTORY_BY_VERSION_COLUMNS)
+        );
+        assert_eq!(
+            columns_for_public_lix_table("lix_directory_history"),
+            Some(LIX_DIRECTORY_HISTORY_COLUMNS)
+        );
     }
 }

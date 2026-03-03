@@ -138,6 +138,26 @@ fn assert_not_null(value: &Value, label: &str) {
     );
 }
 
+fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<String> {
+    let marker = "Available columns: ";
+    let start = description
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing available columns marker in error: {description}"));
+    let tail = &description[start + marker.len()..];
+    let end = tail
+        .find('.')
+        .unwrap_or_else(|| panic!("missing available columns terminator in error: {description}"));
+    let raw = tail[..end].trim();
+    if raw == "(unknown)" {
+        return Vec::new();
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn value_as_i64(value: &Value) -> i64 {
     match value {
         Value::Integer(v) => *v,
@@ -1265,5 +1285,69 @@ simulation_test!(
 
         // Keep parity with legacy intent: the relevant lixcol surface should be selectable on both views.
         assert_eq!(file_history.rows[0].len(), key_value_history.rows[0].len());
+    }
+);
+
+simulation_test!(
+    file_history_view_unknown_column_diagnostic_matches_select_star_columns,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-diagnostic-columns', '/history-diagnostic-columns.json', lix_text_encode('{\"value\":\"v0\"}'))",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        let root_commit_id = active_version_commit_id(&engine).await;
+
+        let select_star = engine
+            .execute(
+                &format!(
+                    "SELECT * FROM lix_file_history \
+                     WHERE id = 'history-diagnostic-columns' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("SELECT * on lix_file_history should succeed");
+        assert_eq!(select_star.rows.len(), 1);
+        assert!(
+            !select_star.columns.is_empty(),
+            "SELECT * should expose columns for comparison"
+        );
+
+        let error = engine
+            .execute(
+                &format!(
+                    "SELECT bogus FROM lix_file_history \
+                     WHERE id = 'history-diagnostic-columns' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect_err("unknown column read should fail");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+
+        let available_columns =
+            parse_available_columns_from_unknown_column_error(&error.description);
+        assert_eq!(
+            available_columns, select_star.columns,
+            "unknown-column diagnostics should list the same columns as `SELECT *` on lix_file_history. error: {}",
+            error.description
+        );
     }
 );
