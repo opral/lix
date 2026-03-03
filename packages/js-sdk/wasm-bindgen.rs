@@ -1432,7 +1432,8 @@ export type LixObserveEvents = {
             });
         }
 
-        let rows_value = Reflect::get(&value, &JsValue::from_str("rows")).map_err(js_to_lix_error)?;
+        let rows_value =
+            Reflect::get(&value, &JsValue::from_str("rows")).map_err(js_to_lix_error)?;
         let rows_value = if let Ok(func) = rows_value.clone().dyn_into::<Function>() {
             func.call0(&value).map_err(js_to_lix_error)?
         } else {
@@ -1495,7 +1496,8 @@ export type LixObserveEvents = {
             });
         }
 
-        let kind_value = Reflect::get(&value, &JsValue::from_str("kind")).map_err(js_to_lix_error)?;
+        let kind_value =
+            Reflect::get(&value, &JsValue::from_str("kind")).map_err(js_to_lix_error)?;
         let kind = kind_value.as_string().ok_or_else(|| LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: "SQL value kind must be a string".to_string(),
@@ -1503,7 +1505,8 @@ export type LixObserveEvents = {
 
         match kind.as_str() {
             "null" => {
-                let raw = Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
                 if raw.is_null() {
                     Ok(EngineValue::Null)
                 } else {
@@ -1514,7 +1517,8 @@ export type LixObserveEvents = {
                 }
             }
             "bool" => {
-                let raw = Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
                 let parsed = raw.as_bool().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'bool' must contain a boolean 'value'".to_string(),
@@ -1522,7 +1526,8 @@ export type LixObserveEvents = {
                 Ok(EngineValue::Boolean(parsed))
             }
             "int" => {
-                let raw = Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
                 let parsed = raw.as_f64().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'int' must contain a numeric 'value'".to_string(),
@@ -1542,7 +1547,8 @@ export type LixObserveEvents = {
                 Ok(EngineValue::Integer(parsed as i64))
             }
             "float" => {
-                let raw = Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
                 let parsed = raw.as_f64().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'float' must contain a numeric 'value'".to_string(),
@@ -1556,7 +1562,8 @@ export type LixObserveEvents = {
                 Ok(EngineValue::Real(parsed))
             }
             "text" => {
-                let raw = Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
                 let parsed = raw.as_string().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'text' must contain a string 'value'".to_string(),
@@ -1564,7 +1571,8 @@ export type LixObserveEvents = {
                 Ok(EngineValue::Text(parsed))
             }
             "blob" => {
-                let raw = Reflect::get(&value, &JsValue::from_str("base64")).map_err(js_to_lix_error)?;
+                let raw =
+                    Reflect::get(&value, &JsValue::from_str("base64")).map_err(js_to_lix_error)?;
                 let base64 = raw.as_string().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'blob' must contain a string 'base64'".to_string(),
@@ -1611,11 +1619,7 @@ export type LixObserveEvents = {
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::NULL);
             }
             EngineValue::Boolean(value) => {
-                let _ = Reflect::set(
-                    &obj,
-                    &JsValue::from_str("kind"),
-                    &JsValue::from_str("bool"),
-                );
+                let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("bool"));
                 let _ = Reflect::set(
                     &obj,
                     &JsValue::from_str("value"),
@@ -1623,11 +1627,7 @@ export type LixObserveEvents = {
                 );
             }
             EngineValue::Integer(value) => {
-                let _ = Reflect::set(
-                    &obj,
-                    &JsValue::from_str("kind"),
-                    &JsValue::from_str("int"),
-                );
+                let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("int"));
                 let _ = Reflect::set(
                     &obj,
                     &JsValue::from_str("value"),
@@ -1635,7 +1635,11 @@ export type LixObserveEvents = {
                 );
             }
             EngineValue::Real(value) => {
-                let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("float"));
+                let _ = Reflect::set(
+                    &obj,
+                    &JsValue::from_str("kind"),
+                    &JsValue::from_str("float"),
+                );
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from_f64(value));
             }
             EngineValue::Text(value) => {
