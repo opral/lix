@@ -94,6 +94,7 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
             }
             "lix_state_by_version"
             | "lix_state_history"
+            | "lix_state_history_by_version"
             | "lix_internal_state_vtable"
             | "lix_internal_state_untracked" => {
                 uses_dynamic_state_relations = true;
@@ -102,7 +103,10 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
                 uses_dynamic_state_relations = true;
                 depends_on_active_version = true;
             }
-            "lix_file" | "lix_file_by_version" | "lix_file_history" => {
+            "lix_file"
+            | "lix_file_by_version"
+            | "lix_file_history"
+            | "lix_file_history_by_version" => {
                 compiled_schema_keys.insert("lix_file_descriptor".to_string());
                 if relation == "lix_file" {
                     depends_on_active_version = true;

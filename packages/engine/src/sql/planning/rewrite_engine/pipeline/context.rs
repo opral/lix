@@ -8,6 +8,7 @@ const FILESYSTEM_VIEW_NAMES: &[&str] = &[
     "lix_file",
     "lix_file_by_version",
     "lix_file_history",
+    "lix_file_history_by_version",
     "lix_directory",
     "lix_directory_by_version",
     "lix_directory_history",
@@ -79,6 +80,7 @@ impl AnalysisContext {
             || self.references_relation("lix_state")
             || self.references_relation("lix_state_by_version")
             || self.references_relation("lix_state_history")
+            || self.references_relation("lix_state_history_by_version")
             || self.references_relation("lix_working_changes")
     }
 
@@ -105,6 +107,7 @@ fn is_builtin_logical_relation(name: &str) -> bool {
         || name == "lix_state"
         || name == "lix_state_by_version"
         || name == "lix_state_history"
+        || name == "lix_state_history_by_version"
         || name == "lix_working_changes"
         || FILESYSTEM_VIEW_NAMES.contains(&name)
 }

@@ -215,6 +215,7 @@ fn preferred_lix_schema_key_alias(schema_key: &str) -> Option<&'static str> {
         "state" => Some("lix_state"),
         "state_by_version" => Some("lix_state_by_version"),
         "state_history" => Some("lix_state_history"),
+        "state_history_by_version" => Some("lix_state_history_by_version"),
         "label" => Some("lix_label"),
         "entity_label" => Some("lix_entity_label"),
         "conversation" => Some("lix_conversation"),

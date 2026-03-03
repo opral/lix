@@ -27,6 +27,22 @@ const LIX_CHANGE_COLUMNS: &[&str] = &[
     "snapshot_content",
 ];
 
+const LIX_STATE_HISTORY_COLUMNS: &[&str] = &[
+    "entity_id",
+    "schema_key",
+    "file_id",
+    "plugin_key",
+    "snapshot_content",
+    "metadata",
+    "schema_version",
+    "change_id",
+    "commit_id",
+    "commit_created_at",
+    "root_commit_id",
+    "depth",
+    "version_id",
+];
+
 const LIX_FILE_COLUMNS: &[&str] = &[
     "id",
     "directory_id",
@@ -177,7 +193,11 @@ const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     },
     LixTableSpec {
         name: "lix_state_history",
-        columns: &[],
+        columns: LIX_STATE_HISTORY_COLUMNS,
+    },
+    LixTableSpec {
+        name: "lix_state_history_by_version",
+        columns: LIX_STATE_HISTORY_COLUMNS,
     },
     LixTableSpec {
         name: "lix_change",
@@ -197,6 +217,10 @@ const PUBLIC_LIX_TABLE_REGISTRY: &[LixTableSpec] = &[
     },
     LixTableSpec {
         name: "lix_file_history",
+        columns: LIX_FILE_HISTORY_COLUMNS,
+    },
+    LixTableSpec {
+        name: "lix_file_history_by_version",
         columns: LIX_FILE_HISTORY_COLUMNS,
     },
     LixTableSpec {
@@ -268,7 +292,10 @@ mod tests {
 
     #[test]
     fn filesystem_view_registry_columns_match_projection_contracts() {
-        assert_eq!(columns_for_public_lix_table("lix_file"), Some(LIX_FILE_COLUMNS));
+        assert_eq!(
+            columns_for_public_lix_table("lix_file"),
+            Some(LIX_FILE_COLUMNS)
+        );
         assert_eq!(
             columns_for_public_lix_table("lix_file_by_version"),
             Some(LIX_FILE_BY_VERSION_COLUMNS)
