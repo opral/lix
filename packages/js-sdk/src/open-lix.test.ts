@@ -359,65 +359,6 @@ test("execute persists raw scalar params", async () => {
 	await lix.close();
 });
 
-test("execute options.writerKey is reflected in state commit stream changes", async () => {
-	const lix = await openLix();
-	const events = lix.stateCommitStream({
-		schemaKeys: ["lix_key_value"],
-		writerKeys: ["writer-js-sdk-execute"],
-	});
-
-	await lix.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
-		["writer-key-execute", "ok"],
-		{ writerKey: "writer-js-sdk-execute" },
-	);
-
-	const batch = await waitForBatch(events);
-	expect(batch).toBeDefined();
-	expect(batch!.changes.length).toBeGreaterThan(0);
-	expect(
-		batch!.changes.some(
-			(change: { writerKey: string | null; entityId: string }) =>
-				change.writerKey === "writer-js-sdk-execute" &&
-				change.entityId === "writer-key-execute",
-		),
-	).toBe(true);
-
-	events.close();
-	await lix.close();
-});
-
-test("executeTransaction options.writerKey is reflected in state commit stream changes", async () => {
-	const lix = await openLix();
-	const events = lix.stateCommitStream({
-		schemaKeys: ["lix_key_value"],
-		writerKeys: ["writer-js-sdk-tx"],
-	});
-
-	await lix.executeTransaction(
-		[
-			{
-				sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
-				params: ["writer-key-tx", "ok"],
-			},
-		],
-		{ writerKey: "writer-js-sdk-tx" },
-	);
-
-	const batch = await waitForBatch(events);
-	expect(batch).toBeDefined();
-	expect(
-		batch!.changes.some(
-			(change: { writerKey: string | null; entityId: string }) =>
-				change.writerKey === "writer-js-sdk-tx" &&
-				change.entityId === "writer-key-tx",
-		),
-	).toBe(true);
-
-	events.close();
-	await lix.close();
-});
-
 test("installPlugin stores plugin metadata", async () => {
 	const lix = await openLix();
 
@@ -509,36 +450,6 @@ test("close is idempotent and blocks further API calls", async () => {
 	await expect(lix.execute("SELECT 1", [])).rejects.toThrow("lix is closed");
 	await expect(lix.createVersion()).rejects.toThrow("lix is closed");
 	await expect(lix.switchVersion("v1")).rejects.toThrow("lix is closed");
-});
-
-test("stateCommitStream emits filtered commit batches", async () => {
-	const lix = await openLix();
-	const events = lix.stateCommitStream({ schemaKeys: ["lix_key_value"] });
-
-	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
-		"state-commit-events-js",
-		"ok",
-	]);
-
-	const secondBatchTrigger = await lix.execute(
-		"SELECT value FROM lix_key_value WHERE key = ?1",
-		["state-commit-events-js"],
-	);
-	expect(secondBatchTrigger.rows.length).toBe(1);
-
-	const batch = await waitForBatch(events);
-	expect(batch).toBeDefined();
-	expect(batch!.changes.length).toBeGreaterThan(0);
-	expect(
-		batch!.changes.some(
-			(change: { schemaKey: string; entityId: string }) =>
-				change.schemaKey === "lix_key_value" &&
-				change.entityId === "state-commit-events-js",
-		),
-	).toBe(true);
-
-	events.close();
-	await lix.close();
 });
 
 test("observe emits initial and follow-up query results", async () => {
@@ -764,19 +675,6 @@ test("observe stream remains usable after query error", async () => {
 });
 
 const TIMEOUT = Symbol("timeout");
-
-async function waitForBatch(events: {
-	tryNext(): unknown;
-}): Promise<any | undefined> {
-	const timeoutMs = 1000;
-	const started = Date.now();
-	while (Date.now() - started < timeoutMs) {
-		const next = events.tryNext();
-		if (next !== undefined) return next;
-		await new Promise((resolve) => setTimeout(resolve, 10));
-	}
-	return undefined;
-}
 
 async function withTimeout<T>(
 	promise: Promise<T>,

@@ -46,41 +46,6 @@ export type CreateCheckpointResult = {
 	changeSetId: string;
 };
 
-export type StateCommitStreamFilter = {
-	schemaKeys?: string[];
-	entityIds?: string[];
-	fileIds?: string[];
-	versionIds?: string[];
-	writerKeys?: string[];
-	excludeWriterKeys?: string[];
-	includeUntracked?: boolean;
-};
-
-export type StateCommitStreamOperation = "Insert" | "Update" | "Delete";
-
-export type StateCommitStreamChange = {
-	operation: StateCommitStreamOperation;
-	entityId: string;
-	schemaKey: string;
-	schemaVersion: string;
-	fileId: string;
-	versionId: string;
-	pluginKey: string;
-	snapshotContent: unknown | null;
-	untracked: boolean;
-	writerKey: string | null;
-};
-
-export type StateCommitStreamBatch = {
-	sequence: number;
-	changes: StateCommitStreamChange[];
-};
-
-export type StateCommitStream = {
-	tryNext(): StateCommitStreamBatch | undefined;
-	close(): void;
-};
-
 export type ObserveQuery = {
 	sql: string;
 	params?: ReadonlyArray<LixRuntimeValue>;
@@ -138,7 +103,6 @@ export type Lix = {
 		statements: ReadonlyArray<TransactionStatement>,
 		options?: ExecuteOptions,
 	): Promise<LixRuntimeQueryResult>;
-	stateCommitStream(filter?: StateCommitStreamFilter): StateCommitStream;
 	observe(query: ObserveQuery): ObserveEvents;
 	createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
 	createCheckpoint(): Promise<CreateCheckpointResult>;
@@ -179,9 +143,6 @@ export async function openLix(
 	);
 	let closed = false;
 	let closing = false;
-	const openStateCommitStreamHandles = new Set<{
-		close?: () => void;
-	}>();
 	const openObserveHandles = new Set<{
 		close?: () => void;
 	}>();
@@ -408,36 +369,6 @@ export async function openLix(
 		return decodeCanonicalQueryResult(result as LixCanonicalQueryResult);
 	};
 
-	const stateCommitStream = (
-		filter: StateCommitStreamFilter = {},
-	): StateCommitStream => {
-		ensureOpen("stateCommitStream");
-		const rawEvents = (wasmLix as any).stateCommitStream(filter ?? {});
-		if (!rawEvents || typeof rawEvents.tryNext !== "function") {
-			throw new Error("stateCommitStream is not available in this wasm build");
-		}
-		let localClosed = false;
-		const close = () => {
-			if (localClosed) return;
-			localClosed = true;
-			openStateCommitStreamHandles.delete(rawEvents);
-			if (typeof rawEvents.close === "function") {
-				rawEvents.close();
-			}
-		};
-		openStateCommitStreamHandles.add(rawEvents);
-
-		return {
-			tryNext(): StateCommitStreamBatch | undefined {
-				if (localClosed) return undefined;
-				const next = rawEvents.tryNext();
-				if (next === undefined || next === null) return undefined;
-				return next as StateCommitStreamBatch;
-			},
-			close,
-		};
-	};
-
 	const observe = (query: ObserveQuery): ObserveEvents => {
 		ensureOpen("observe");
 		if (
@@ -602,14 +533,6 @@ export async function openLix(
 			return;
 		}
 		closing = true;
-		for (const handle of openStateCommitStreamHandles) {
-			try {
-				handle.close?.();
-			} catch {
-				// ignore close errors from individual event handles
-			}
-		}
-		openStateCommitStreamHandles.clear();
 		for (const handle of openObserveHandles) {
 			try {
 				handle.close?.();
@@ -664,7 +587,6 @@ export async function openLix(
 		beginTransaction,
 		transaction,
 		executeTransaction,
-		stateCommitStream,
 		observe,
 		createVersion,
 		createCheckpoint,

@@ -30,7 +30,7 @@ pub struct BootKeyValueConfig {
 }
 
 pub struct Lix {
-    engine: Engine,
+    engine: lix_engine::Engine,
 }
 
 pub async fn open_lix(config: OpenLixConfig) -> Result<Lix, LixError> {
@@ -77,7 +77,5 @@ impl Lix {
 }
 
 pub use backend::sqlite::SqliteBackend;
-pub use lix_engine::{
-    Engine, LixBackend, LixError, QueryResult, Value, WasmComponentInstance, WasmLimits,
-};
+pub use lix_engine::{LixBackend, LixError, QueryResult, Value, WasmComponentInstance, WasmLimits};
 pub use wasmtime_runtime::WasmtimeRuntime;
