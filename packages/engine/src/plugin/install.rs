@@ -50,7 +50,13 @@ impl Engine {
         .await;
 
         match install_result {
-            Ok(()) => transaction.commit().await?,
+            Ok(()) => {
+                if !pending_state_commit_stream_changes.is_empty() {
+                    self.append_observe_tick_in_transaction(transaction.as_mut(), None)
+                        .await?;
+                }
+                transaction.commit().await?
+            }
             Err(error) => {
                 let _ = transaction.rollback().await;
                 return Err(error);

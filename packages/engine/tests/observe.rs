@@ -721,6 +721,424 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
     );
 }
 
+#[test]
+fn observe_postgres_detects_external_insert_without_local_commit_stream_event() {
+    run_local_observe_postgres_case(
+        "observe_postgres_detects_external_insert_without_local_commit_stream_event",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-external-insert")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a.init().await.expect("engine_a init should succeed");
+            engine_b.init().await.expect("engine_b init should succeed");
+
+            let mut observed = engine_a
+                .observe(ObserveQuery::new(
+                    "SELECT path FROM lix_file WHERE path = '/observe-external.md'",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
+
+            engine_b
+                .execute(
+                    "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))",
+                    &[],
+                    ExecuteOptions::default(),
+                )
+                .await
+                .expect("external insert should succeed");
+
+            let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+                .await
+                .expect("observe next should not time out")
+                .expect("observe next should succeed")
+                .expect("observe update event should exist");
+            assert_eq!(update.rows.rows.len(), 1);
+            assert_eq!(
+                update.rows.rows[0][0],
+                Value::Text("/observe-external.md".to_string())
+            );
+            assert_eq!(update.state_commit_sequence, None);
+        },
+    );
+}
+
+#[test]
+fn observe_postgres_detects_external_untracked_state_insert() {
+    run_local_observe_postgres_case(
+        "observe_postgres_detects_external_untracked_state_insert",
+        || async {
+            let connection_string = support::simulations::create_postgres_test_database_url(
+                "observe-external-untracked",
+            )
+            .await
+            .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a.init().await.expect("engine_a init should succeed");
+            engine_b.init().await.expect("engine_b init should succeed");
+
+            let mut observed = engine_a
+                .observe(ObserveQuery::new(
+                    "SELECT entity_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'observe-untracked-external' \
+                   AND untracked = true",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
+
+            engine_b
+                .execute(
+                    "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
+                 ) VALUES (\
+                 'observe-untracked-external', 'lix', 'lix_key_value', 'lix', '1', \
+                 lix_json('{\"key\":\"observe-untracked-external\",\"value\":\"u1\"}'), true\
+                 )",
+                    &[],
+                    ExecuteOptions::default(),
+                )
+                .await
+                .expect("external untracked insert should succeed");
+
+            let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+                .await
+                .expect("observe next should not time out")
+                .expect("observe next should succeed")
+                .expect("observe update event should exist");
+            assert_eq!(update.rows.rows.len(), 1);
+            assert_eq!(
+                update.rows.rows[0][0],
+                Value::Text("observe-untracked-external".to_string())
+            );
+            assert_eq!(update.state_commit_sequence, None);
+        },
+    );
+}
+
+#[test]
+fn observe_external_same_writer_key_is_suppressed() {
+    run_local_observe_postgres_case("observe_external_same_writer_key_is_suppressed", || async {
+        let writer = "observe-external-writer";
+        let connection_string =
+            support::simulations::create_postgres_test_database_url("observe-same-writer")
+                .await
+                .expect("postgres database url should be created");
+        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+        let engine_b = boot_postgres_engine_at_url(connection_string);
+
+        engine_a.init().await.expect("engine_a init should succeed");
+        engine_b.init().await.expect("engine_b init should succeed");
+
+        let mut observed = engine_a
+            .observe(ObserveQuery::new(
+                "SELECT path \
+                 FROM lix_file \
+                 WHERE path = '/observe-writer.md' \
+                   AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
+                vec![Value::Text(writer.to_string())],
+            ))
+            .expect("observe should succeed");
+        let initial = observed
+            .next()
+            .await
+            .expect("initial observe next should succeed")
+            .expect("initial observe event should exist");
+        assert!(initial.rows.rows.is_empty());
+
+        engine_b
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer.md', lix_text_encode('same-writer'))",
+                &[],
+                ExecuteOptions {
+                    writer_key: Some(writer.to_string()),
+                },
+            )
+            .await
+            .expect("external insert should succeed");
+
+        let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
+        assert!(
+            timed.is_err(),
+            "same writer key should suppress observe emission"
+        );
+    });
+}
+
+#[test]
+fn observe_external_different_writer_key_emits() {
+    run_local_observe_postgres_case("observe_external_different_writer_key_emits", || async {
+        let connection_string =
+            support::simulations::create_postgres_test_database_url("observe-different-writer")
+                .await
+                .expect("postgres database url should be created");
+        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+        let engine_b = boot_postgres_engine_at_url(connection_string);
+
+        engine_a.init().await.expect("engine_a init should succeed");
+        engine_b.init().await.expect("engine_b init should succeed");
+
+        let mut observed = engine_a
+            .observe(ObserveQuery::new(
+                "SELECT path \
+                 FROM lix_file \
+                 WHERE path = '/observe-writer-different.md' \
+                   AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
+                vec![Value::Text("observer-writer".to_string())],
+            ))
+            .expect("observe should succeed");
+        let initial = observed
+            .next()
+            .await
+            .expect("initial observe next should succeed")
+            .expect("initial observe event should exist");
+        assert!(initial.rows.rows.is_empty());
+
+        engine_b
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-different.md', lix_text_encode('different-writer'))",
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("different-writer".to_string()),
+                },
+            )
+            .await
+            .expect("external insert should succeed");
+
+        let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+            .await
+            .expect("observe next should not time out")
+            .expect("observe next should succeed")
+            .expect("observe update event should exist");
+        assert_eq!(update.rows.rows.len(), 1);
+        assert_eq!(update.state_commit_sequence, None);
+    });
+}
+
+#[test]
+fn observe_external_null_writer_key_emits() {
+    run_local_observe_postgres_case("observe_external_null_writer_key_emits", || async {
+        let connection_string =
+            support::simulations::create_postgres_test_database_url("observe-null-writer")
+                .await
+                .expect("postgres database url should be created");
+        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+        let engine_b = boot_postgres_engine_at_url(connection_string);
+
+        engine_a.init().await.expect("engine_a init should succeed");
+        engine_b.init().await.expect("engine_b init should succeed");
+
+        let mut observed = engine_a
+            .observe(ObserveQuery::new(
+                "SELECT path \
+                 FROM lix_file \
+                 WHERE path = '/observe-writer-null.md' \
+                   AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
+                vec![Value::Text("observer-writer".to_string())],
+            ))
+            .expect("observe should succeed");
+        let initial = observed
+            .next()
+            .await
+            .expect("initial observe next should succeed")
+            .expect("initial observe event should exist");
+        assert!(initial.rows.rows.is_empty());
+
+        engine_b
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-null.md', lix_text_encode('null-writer'))",
+                &[],
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("external insert should succeed");
+
+        let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+            .await
+            .expect("observe next should not time out")
+            .expect("observe next should succeed")
+            .expect("observe update event should exist");
+        assert_eq!(update.rows.rows.len(), 1);
+        assert_eq!(update.state_commit_sequence, None);
+    });
+}
+
+#[test]
+fn observe_external_read_only_transaction_does_not_emit() {
+    run_local_observe_postgres_case(
+        "observe_external_read_only_transaction_does_not_emit",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-read-only")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a.init().await.expect("engine_a init should succeed");
+            engine_b.init().await.expect("engine_b init should succeed");
+
+            let mut observed = engine_a
+                .observe(ObserveQuery::new(
+                    "SELECT path FROM lix_file WHERE path = '/observe-read-only-tx.md'",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
+
+            let mut tx = engine_b
+                .begin_transaction_with_options(ExecuteOptions::default())
+                .await
+                .expect("begin transaction should succeed");
+            tx.execute("SELECT 1", &[])
+                .await
+                .expect("read-only statement should succeed");
+            tx.commit().await.expect("commit should succeed");
+
+            let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
+            assert!(timed.is_err(), "read-only external tx should not emit");
+        },
+    );
+}
+
+#[test]
+fn observe_external_mutating_transaction_emits_once_for_result_delta() {
+    run_local_observe_postgres_case(
+        "observe_external_mutating_transaction_emits_once_for_result_delta",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-mutating")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a.init().await.expect("engine_a init should succeed");
+            engine_b.init().await.expect("engine_b init should succeed");
+
+            let mut observed = engine_a
+                .observe(ObserveQuery::new(
+                    "SELECT lix_text_decode(data) \
+                     FROM lix_file \
+                     WHERE path = '/observe-external-tx.md'",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
+
+            let mut tx = engine_b
+                .begin_transaction_with_options(ExecuteOptions::default())
+                .await
+                .expect("begin transaction should succeed");
+            tx.execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-external-tx.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+            tx.execute(
+                "UPDATE lix_file SET data = lix_text_encode('after') WHERE path = '/observe-external-tx.md'",
+                &[],
+            )
+            .await
+            .expect("update should succeed");
+            tx.commit().await.expect("commit should succeed");
+
+            let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+                .await
+                .expect("observe next should not time out")
+                .expect("observe next should succeed")
+                .expect("observe update event should exist");
+            assert_eq!(update.rows.rows.len(), 1);
+            assert_eq!(update.rows.rows[0][0], Value::Text("after".to_string()));
+            assert_eq!(update.state_commit_sequence, None);
+
+            let timed = tokio::time::timeout(Duration::from_millis(600), observed.next()).await;
+            assert!(
+                timed.is_err(),
+                "single external commit should not emit an extra duplicate event"
+            );
+        },
+    );
+}
+
+#[test]
+fn observe_external_unrelated_mutation_does_not_emit() {
+    run_local_observe_postgres_case(
+        "observe_external_unrelated_mutation_does_not_emit",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-unrelated")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a.init().await.expect("engine_a init should succeed");
+            engine_b.init().await.expect("engine_b init should succeed");
+
+            let mut observed = engine_a
+                .observe(ObserveQuery::new(
+                    "SELECT path FROM lix_file WHERE path = '/observe-unrelated-target.md'",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
+
+            engine_b
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-unrelated-other.md', lix_text_encode('other'))",
+                &[],
+                ExecuteOptions::default(),
+            )
+            .await
+            .expect("external insert should succeed");
+
+            let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
+            assert!(
+                timed.is_err(),
+                "unrelated external mutation should not emit when result stays identical"
+            );
+        },
+    );
+}
+
 fn boot_sqlite_engine_at_path(path: PathBuf) -> Engine {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
@@ -731,6 +1149,13 @@ fn boot_sqlite_engine_at_path(path: PathBuf) -> Engine {
             "sqlite://{}",
             path.to_string_lossy()
         )),
+        Arc::new(NoopWasmRuntime),
+    ))
+}
+
+fn boot_postgres_engine_at_url(connection_string: String) -> Engine {
+    boot(BootArgs::new(
+        support::simulations::postgres_backend_with_connection_string(connection_string),
         Arc::new(NoopWasmRuntime),
     ))
 }
@@ -793,6 +1218,49 @@ where
                 std::panic::resume_unwind(payload);
             }
             panic!("observe sqlite case disconnected without result: {name}");
+        }
+    }
+}
+
+fn run_local_observe_postgres_case<F, Fut>(name: &'static str, case: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime");
+                runtime.block_on(case());
+            }));
+            let _ = result_tx.send(run_result);
+        })
+        .expect("failed to spawn observe postgres test thread");
+
+    match result_rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(Ok(())) => {
+            thread
+                .join()
+                .expect("observe postgres test thread panicked");
+        }
+        Ok(Err(payload)) => {
+            let _ = thread.join();
+            std::panic::resume_unwind(payload);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("observe postgres case timed out after 120s: {name}");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(payload) = thread.join() {
+                std::panic::resume_unwind(payload);
+            }
+            panic!("observe postgres case disconnected without result: {name}");
         }
     }
 }

@@ -207,6 +207,37 @@ pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
         backend.execute(statement, &[]).await?;
     }
     ensure_binary_chunk_codec_columns(backend).await?;
+    ensure_observe_tick_table(backend).await?;
+    Ok(())
+}
+
+async fn ensure_observe_tick_table(backend: &dyn LixBackend) -> Result<(), LixError> {
+    match backend.dialect() {
+        SqlDialect::Sqlite => {
+            backend
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS lix_internal_observe_tick (\
+                     tick_seq INTEGER PRIMARY KEY AUTOINCREMENT,\
+                     created_at TEXT NOT NULL,\
+                     writer_key TEXT\
+                     )",
+                    &[],
+                )
+                .await?;
+        }
+        SqlDialect::Postgres => {
+            backend
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS lix_internal_observe_tick (\
+                     tick_seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\
+                     created_at TEXT NOT NULL,\
+                     writer_key TEXT\
+                     )",
+                    &[],
+                )
+                .await?;
+        }
+    }
     Ok(())
 }
 

@@ -13,16 +13,67 @@ impl Engine {
         self.state_commit_stream_bus.subscribe(filter)
     }
 
-    pub(crate) fn sql_dialect(&self) -> crate::SqlDialect {
-        self.backend.dialect()
-    }
-
     pub(crate) async fn execute_backend_sql(
         &self,
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, LixError> {
         self.backend.execute(sql, params).await
+    }
+
+    pub(crate) async fn append_observe_tick(
+        &self,
+        writer_key: Option<&str>,
+    ) -> Result<(), LixError> {
+        match writer_key {
+            Some(writer_key) => {
+                self.backend
+                    .execute(
+                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                         VALUES (CURRENT_TIMESTAMP, $1)",
+                        &[Value::Text(writer_key.to_string())],
+                    )
+                    .await?;
+            }
+            None => {
+                self.backend
+                    .execute(
+                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                         VALUES (CURRENT_TIMESTAMP, NULL)",
+                        &[],
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn append_observe_tick_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        writer_key: Option<&str>,
+    ) -> Result<(), LixError> {
+        match writer_key {
+            Some(writer_key) => {
+                transaction
+                    .execute(
+                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                         VALUES (CURRENT_TIMESTAMP, $1)",
+                        &[Value::Text(writer_key.to_string())],
+                    )
+                    .await?;
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+                         VALUES (CURRENT_TIMESTAMP, NULL)",
+                        &[],
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
@@ -193,6 +244,7 @@ impl Engine {
 
         let mut state_commit_stream_changes = prepared.plan.effects.state_commit_stream_changes;
         state_commit_stream_changes.extend(execution.state_commit_stream_changes);
+        let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
 
         apply_effects_post_commit::apply_runtime_post_commit_effects(
             self,
@@ -201,6 +253,8 @@ impl Engine {
                 .plan
                 .requirements
                 .should_invalidate_installed_plugins_cache,
+            should_emit_observe_tick,
+            options.writer_key.as_deref(),
             state_commit_stream_changes,
         )
         .await?;

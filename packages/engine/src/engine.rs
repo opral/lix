@@ -162,10 +162,19 @@ impl<'a> EngineTransaction<'a> {
     }
 
     pub async fn commit(mut self) -> Result<(), LixError> {
-        let transaction = self.transaction.take().ok_or_else(|| LixError {
+        let mut transaction = self.transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
+        let should_emit_observe_tick = !self.pending_state_commit_stream_changes.is_empty();
+        if should_emit_observe_tick {
+            self.engine
+                .append_observe_tick_in_transaction(
+                    transaction.as_mut(),
+                    self.options.writer_key.as_deref(),
+                )
+                .await?;
+        }
         transaction.commit().await?;
         if self.active_version_changed {
             self.engine

@@ -46,6 +46,13 @@ impl Engine {
             }
         };
 
+        if !pending_state_commit_stream_changes.is_empty() {
+            self.append_observe_tick_in_transaction(
+                transaction.as_mut(),
+                options.writer_key.as_deref(),
+            )
+            .await?;
+        }
         transaction.commit().await?;
         if active_version_id != starting_active_version_id {
             self.set_active_version_id(active_version_id);

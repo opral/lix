@@ -127,6 +127,37 @@ pub fn postgres_simulation() -> Simulation {
     }
 }
 
+pub fn postgres_backend_with_connection_string(
+    connection_string: String,
+) -> Box<dyn LixBackend + Send + Sync> {
+    Box::new(PostgresBackend::new(PostgresConfig { connection_string }))
+}
+
+pub async fn create_postgres_test_database_url(label: &str) -> Result<String, LixError> {
+    let instance = ensure_postgres().await?;
+    let db_index = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let normalized_label = label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let db_name = format!("lix_obs_{normalized_label}_{process_id}_{now_nanos}_{db_index}");
+
+    {
+        let pg = instance.postgresql.lock().await;
+        pg.create_database(&db_name).await.map_err(|err| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: err.to_string(),
+        })?;
+    }
+
+    Ok(instance.settings.url(&db_name))
+}
+
 struct PostgresBackend {
     config: PostgresConfig,
     pool: OnceCell<PgPool>,
