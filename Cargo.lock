@@ -2064,6 +2064,7 @@ dependencies = [
  "lix_rs_sdk",
  "pollster",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2163,12 +2164,6 @@ dependencies = [
 [[package]]
 name = "markdown_wc"
 version = "0.1.0"
-dependencies = [
- "markdown",
- "serde",
- "serde_json",
- "unicode-normalization",
-]
 
 [[package]]
 name = "matchit"
