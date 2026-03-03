@@ -68,7 +68,7 @@ pub(crate) fn table_not_found_read_error() -> LixError {
     build_error(
         ErrorCode::TableNotFound,
         &format!(
-            "Read queries must target Lix views (`lix_*`) only. Available tables: {available_tables}. Schemas are available via `lix_stored_schema`."
+            "Table not found. Known Lix tables: {available_tables}. If you are querying custom backend tables, ensure they exist in the connected database."
         ),
     )
 }
@@ -135,9 +135,12 @@ pub(crate) fn sql_unknown_column_error(
 }
 
 pub(crate) fn internal_table_access_denied_error() -> LixError {
+    let available_tables = public_lix_table_names().join(", ");
     build_error(
         ErrorCode::InternalTableAccessDenied,
-        "Queries against `lix_internal_*` are not allowed. Use public `lix_*` views.",
+        &format!(
+            "Direct writes to `lix_internal_*` tables can lead to data corruption. Public SQL tables: {available_tables}."
+        ),
     )
 }
 
@@ -265,9 +268,6 @@ mod tests {
     fn agent_entrypoints_use_error_catalog_constructors() {
         let engine_src = include_str!("../engine.rs");
         assert!(engine_src.contains("errors::internal_table_access_denied_error()"));
-
-        let preprocess_src = include_str!("../sql/planning/preprocess.rs");
-        assert!(preprocess_src.contains("errors::table_not_found_read_error()"));
 
         let classification_src = include_str!("../error_classification.rs");
         assert!(classification_src.contains("errors::sql_unknown_table_error("));
