@@ -350,22 +350,35 @@ fn derive_state_commit_stream_filter(
 fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommitStreamFilter {
     let mut schema_keys = BTreeSet::new();
     let mut uses_dynamic_state_relations = false;
+    let mut depends_on_active_version = false;
 
     for relation in &derived.relations {
         match relation.as_str() {
-            "lix_state"
-            | "lix_state_by_version"
+            "lix_state" => {
+                uses_dynamic_state_relations = true;
+                depends_on_active_version = true;
+            }
+            "lix_state_by_version"
             | "lix_state_history"
-            | "lix_working_changes"
             | "lix_internal_state_vtable"
             | "lix_internal_state_untracked" => {
                 uses_dynamic_state_relations = true;
             }
+            "lix_working_changes" => {
+                uses_dynamic_state_relations = true;
+                depends_on_active_version = true;
+            }
             "lix_file" | "lix_file_by_version" | "lix_file_history" => {
                 schema_keys.insert("lix_file_descriptor".to_string());
+                if relation == "lix_file" {
+                    depends_on_active_version = true;
+                }
             }
             "lix_directory" | "lix_directory_by_version" | "lix_directory_history" => {
                 schema_keys.insert("lix_directory_descriptor".to_string());
+                if relation == "lix_directory" {
+                    depends_on_active_version = true;
+                }
             }
             "lix_version" | "lix_version_by_version" => {
                 schema_keys.insert("lix_version_descriptor".to_string());
@@ -391,12 +404,36 @@ fn state_commit_filter_from_derived(derived: DerivedObserveFilter) -> StateCommi
     if uses_dynamic_state_relations {
         schema_keys.extend(derived.schema_keys);
     }
+    if depends_on_active_version {
+        schema_keys.insert("lix_active_version".to_string());
+    }
+
+    // A single commit-stream filter is conjunctive across dimensions.
+    // Active-version reactivity needs OR semantics:
+    //   (matching domain row changed) OR (lix_active_version changed).
+    // Keep schema-key precision, but drop entity/file/version literal filters so
+    // active-version commits are not accidentally filtered out.
+    let entity_ids = if depends_on_active_version {
+        Vec::new()
+    } else {
+        derived.entity_ids.into_iter().collect()
+    };
+    let file_ids = if depends_on_active_version {
+        Vec::new()
+    } else {
+        derived.file_ids.into_iter().collect()
+    };
+    let version_ids = if depends_on_active_version {
+        Vec::new()
+    } else {
+        derived.version_ids.into_iter().collect()
+    };
 
     StateCommitStreamFilter {
         schema_keys: schema_keys.into_iter().collect(),
-        entity_ids: derived.entity_ids.into_iter().collect(),
-        file_ids: derived.file_ids.into_iter().collect(),
-        version_ids: derived.version_ids.into_iter().collect(),
+        entity_ids,
+        file_ids,
+        version_ids,
         ..StateCommitStreamFilter::default()
     }
 }
@@ -661,12 +698,15 @@ mod tests {
         )
         .expect("derive filter");
 
-        assert_eq!(filter.schema_keys, vec!["lix_key_value".to_string()]);
         assert_eq!(
-            filter.entity_ids,
-            vec!["entity-a".to_string(), "entity-b".to_string()]
+            filter.schema_keys,
+            vec![
+                "lix_active_version".to_string(),
+                "lix_key_value".to_string()
+            ]
         );
-        assert_eq!(filter.version_ids, vec!["v-1".to_string()]);
+        assert!(filter.entity_ids.is_empty());
+        assert!(filter.version_ids.is_empty());
     }
 
     #[test]
@@ -676,7 +716,61 @@ mod tests {
                 .expect("parse sql");
 
         let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        assert_eq!(
+            filter.schema_keys,
+            vec![
+                "lix_active_version".to_string(),
+                "lix_file_descriptor".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_filter_maps_state_reads_to_state_schema_and_active_version() {
+        let statements = parse_sql_statements(
+            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
+        )
+        .expect("parse sql");
+
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        assert_eq!(
+            filter.schema_keys,
+            vec![
+                "lix_active_version".to_string(),
+                "lix_key_value".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_filter_does_not_add_active_version_for_file_by_version_reads() {
+        let statements = parse_sql_statements(
+            "SELECT id, path FROM lix_file_by_version WHERE lixcol_version_id = 'v-1'",
+        )
+        .expect("parse sql");
+
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
         assert_eq!(filter.schema_keys, vec!["lix_file_descriptor".to_string()]);
+    }
+
+    #[test]
+    fn derive_filter_drops_entity_literal_filters_for_active_state_queries() {
+        let statements = parse_sql_statements(
+            "SELECT snapshot_content \
+             FROM lix_state \
+             WHERE schema_key = 'lix_key_value' AND entity_id = 'entity-a'",
+        )
+        .expect("parse sql");
+
+        let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
+        assert_eq!(
+            filter.schema_keys,
+            vec![
+                "lix_active_version".to_string(),
+                "lix_key_value".to_string()
+            ]
+        );
+        assert!(filter.entity_ids.is_empty());
     }
 
     #[test]
@@ -709,7 +803,7 @@ mod tests {
         .expect("parse sql");
 
         let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
-        assert!(filter.schema_keys.is_empty());
+        assert_eq!(filter.schema_keys, vec!["lix_active_version".to_string()]);
         assert!(filter.entity_ids.is_empty());
         assert!(filter.file_ids.is_empty());
         assert!(filter.version_ids.is_empty());
@@ -724,7 +818,7 @@ mod tests {
         .expect("parse sql");
 
         let filter = derive_state_commit_stream_filter(&statements, &[]).expect("derive filter");
-        assert!(filter.schema_keys.is_empty());
+        assert_eq!(filter.schema_keys, vec!["lix_active_version".to_string()]);
         assert!(filter.entity_ids.is_empty());
         assert!(filter.file_ids.is_empty());
         assert!(filter.version_ids.is_empty());

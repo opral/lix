@@ -600,6 +600,104 @@ test("observe on _by_version view emits follow-up results", async () => {
 	await lix.close();
 });
 
+test("observe on lix_state emits follow-up when switching active version", async () => {
+	const lix = await openLix();
+	const branch = await lix.createVersion({ name: "observe-switch-state" });
+	const entityId = "observe-switch-state-key";
+
+	await lix.execute(
+		"INSERT INTO lix_state_by_version \
+		 (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+		[
+			entityId,
+			"lix_key_value",
+			"lix",
+			"global",
+			"lix_sdk",
+			JSON.stringify({ key: entityId, value: "global" }),
+			"1",
+		],
+	);
+	await lix.execute(
+		"INSERT INTO lix_state_by_version \
+		 (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+		[
+			entityId,
+			"lix_key_value",
+			"lix",
+			branch.id,
+			"lix_sdk",
+			JSON.stringify({ key: entityId, value: "branch" }),
+			"1",
+		],
+	);
+	await lix.switchVersion("global");
+
+	const events = lix.observe({
+		sql: "SELECT json_extract(snapshot_content, '$.value') \
+		      FROM lix_state \
+		      WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
+		params: [entityId],
+	});
+
+	const initial = await events.next();
+	expect(initial).toBeDefined();
+	expect(initial!.rows.rows).toEqual([["global"]]);
+
+	const nextPromise = events.next();
+	await lix.switchVersion(branch.id);
+
+	const followUp = await withTimeout(nextPromise, 1500);
+	expect(followUp).not.toBe(TIMEOUT);
+	if (followUp === TIMEOUT || followUp === undefined) {
+		throw new Error("observe follow-up did not arrive after switching version");
+	}
+	expect(followUp.rows.rows).toEqual([["branch"]]);
+
+	events.close();
+	await lix.close();
+});
+
+test("observe on lix_file emits follow-up when switching active version", async () => {
+	const lix = await openLix();
+	const branch = await lix.createVersion({ name: "observe-switch-file" });
+	const path = "/observe-switch-file.txt";
+
+	await lix.execute(
+		"INSERT INTO lix_file_by_version (path, data, lixcol_version_id) VALUES (?1, ?2, ?3)",
+		[path, new Uint8Array([1]), "global"],
+	);
+	await lix.execute(
+		"UPDATE lix_file_by_version SET data = ?1 WHERE path = ?2 AND lixcol_version_id = ?3",
+		[new Uint8Array([2]), path, branch.id],
+	);
+	await lix.switchVersion("global");
+
+	const events = lix.observe({
+		sql: "SELECT data FROM lix_file WHERE path = ?1",
+		params: [path],
+	});
+
+	const initial = await events.next();
+	expect(initial).toBeDefined();
+	expect(initial!.rows.rows).toEqual([[new Uint8Array([1])]]);
+
+	const nextPromise = events.next();
+	await lix.switchVersion(branch.id);
+
+	const followUp = await withTimeout(nextPromise, 1500);
+	expect(followUp).not.toBe(TIMEOUT);
+	if (followUp === TIMEOUT || followUp === undefined) {
+		throw new Error("observe follow-up did not arrive after switching version");
+	}
+	expect(followUp.rows.rows).toEqual([[new Uint8Array([2])]]);
+
+	events.close();
+	await lix.close();
+});
+
 test("observe next resolves when closed while waiting", async () => {
 	const lix = await openLix();
 	const events = lix.observe({
