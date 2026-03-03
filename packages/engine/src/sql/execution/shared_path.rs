@@ -1,9 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::engine::{
-    direct_state_file_cache_refresh_targets, file_descriptor_cache_eviction_targets, Engine,
-};
+use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
 use crate::validation::{validate_inserts, validate_updates};
 use crate::{LixBackend, LixError, Value};
@@ -12,7 +10,8 @@ use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::planning::derive_requirements::derive_plan_requirements;
 use super::super::planning::plan::build_execution_plan;
 use super::intent::{
-    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
+    authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
+    ExecutionIntent, IntentCollectionPolicy,
 };
 use sqlparser::ast::Statement;
 
@@ -88,6 +87,8 @@ pub(crate) async fn prepare_execution_with_backend(
         params,
         functions.clone(),
         &intent.detected_file_domain_changes_by_statement,
+        &intent.pending_file_delete_targets,
+        &authoritative_pending_file_write_targets(&intent.pending_file_writes),
         writer_key,
     )
     .await
@@ -118,22 +119,22 @@ pub(crate) async fn prepare_execution_with_backend(
 pub(crate) fn derive_cache_targets(
     plan: &ExecutionPlan,
     postprocess_file_cache_targets: BTreeSet<(String, String)>,
-    intent: &ExecutionIntent,
 ) -> CacheTargets {
     let file_cache_refresh_targets = if plan.requirements.should_refresh_file_cache {
-        let mut targets = direct_state_file_cache_refresh_targets(&plan.preprocess.mutations);
-        targets.extend(postprocess_file_cache_targets);
+        let mut targets = plan.effects.file_cache_refresh_targets.clone();
+        targets.extend(postprocess_file_cache_targets.clone());
         targets
     } else {
         BTreeSet::new()
     };
-    let descriptor_cache_eviction_targets =
-        file_descriptor_cache_eviction_targets(&plan.preprocess.mutations);
-    let mut file_path_cache_invalidation_targets = file_cache_refresh_targets.clone();
-    file_path_cache_invalidation_targets.extend(descriptor_cache_eviction_targets.clone());
-    file_path_cache_invalidation_targets.extend(intent.pending_file_delete_targets.iter().cloned());
-    let mut file_data_cache_invalidation_targets = file_path_cache_invalidation_targets.clone();
-    file_data_cache_invalidation_targets.extend(intent.pending_file_write_targets.iter().cloned());
+    let mut file_path_cache_invalidation_targets =
+        plan.effects.file_path_cache_invalidation_targets.clone();
+    let mut file_data_cache_invalidation_targets =
+        plan.effects.file_data_cache_invalidation_targets.clone();
+    if plan.requirements.should_refresh_file_cache {
+        file_path_cache_invalidation_targets.extend(file_cache_refresh_targets.iter().cloned());
+        file_data_cache_invalidation_targets.extend(file_cache_refresh_targets.iter().cloned());
+    }
 
     CacheTargets {
         file_cache_refresh_targets,

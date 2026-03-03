@@ -65,7 +65,6 @@ impl Engine {
         let cache_targets = shared_path::derive_cache_targets(
             &prepared.plan,
             execution.postprocess_file_cache_targets.clone(),
-            &prepared.intent,
         );
         let mut state_commit_stream_changes =
             prepared.plan.effects.state_commit_stream_changes.clone();

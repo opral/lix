@@ -1,3 +1,8 @@
+use std::collections::BTreeSet;
+
+use crate::engine::{
+    direct_state_file_cache_refresh_targets, file_descriptor_cache_eviction_targets,
+};
 use crate::state_commit_stream::state_commit_stream_changes_from_mutations;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -15,9 +20,20 @@ use super::super::super::contracts::planner_error::PlannerError;
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
     writer_key: Option<&str>,
+    pending_file_delete_targets: &BTreeSet<(String, String)>,
+    authoritative_pending_file_write_targets: &BTreeSet<(String, String)>,
 ) -> Result<PlanEffects, PlannerError> {
     let state_commit_stream_changes =
         state_commit_stream_changes_from_mutations(&preprocess.mutations, writer_key);
+    let file_cache_refresh_targets = direct_state_file_cache_refresh_targets(&preprocess.mutations);
+    let descriptor_cache_eviction_targets =
+        file_descriptor_cache_eviction_targets(&preprocess.mutations);
+    let mut file_path_cache_invalidation_targets = BTreeSet::new();
+    file_path_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
+    file_path_cache_invalidation_targets.extend(pending_file_delete_targets.iter().cloned());
+    let mut file_data_cache_invalidation_targets = file_path_cache_invalidation_targets.clone();
+    file_data_cache_invalidation_targets
+        .extend(authoritative_pending_file_write_targets.iter().cloned());
     let next_active_version_id = active_version_from_mutations(&preprocess.mutations)
         .map_err(PlannerError::preprocess)?
         .or(
@@ -28,6 +44,9 @@ pub(crate) fn derive_effects_from_state_resolution(
     Ok(PlanEffects {
         state_commit_stream_changes,
         next_active_version_id,
+        file_cache_refresh_targets,
+        file_data_cache_invalidation_targets,
+        file_path_cache_invalidation_targets,
     })
 }
 

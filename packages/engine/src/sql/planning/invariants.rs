@@ -37,5 +37,15 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
             "sql planner cannot expose postprocess internal rows as public DML RETURNING output",
         ));
     }
+    if plan.dependency_spec.depends_on_active_version
+        && !plan
+            .dependency_spec
+            .schema_keys
+            .contains("lix_active_version")
+    {
+        return Err(PlannerError::invariant(
+            "dependency spec marks active-version dependency but omits lix_active_version schema key",
+        ));
+    }
     Ok(())
 }
