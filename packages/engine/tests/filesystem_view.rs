@@ -279,6 +279,178 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
 });
 
 simulation_test!(
+    lix_file_update_data_with_qmark_params_persists_bytes,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ('/update-repro.md', lix_text_encode('before'))",
+            &[],
+        )
+        .await
+        .expect("seed insert should succeed");
+
+        let seeded = engine
+            .execute(
+                "SELECT id, data FROM lix_file WHERE path = '/update-repro.md' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("seed read should succeed");
+        assert_eq!(seeded.rows.len(), 1);
+        let file_id = match &seeded.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text id, got {other:?}"),
+        };
+        assert_blob_text(&seeded.rows[0][1], "before");
+
+        engine
+            .execute(
+                "UPDATE lix_file SET data = ? WHERE id = ?",
+                &[Value::Blob(b"after".to_vec()), Value::Text(file_id.clone())],
+            )
+            .await
+            .expect("file update should succeed");
+
+        let verify = engine
+            .execute(
+                &format!("SELECT data FROM lix_file WHERE id = '{}' LIMIT 1", file_id),
+                &[],
+            )
+            .await
+            .expect("verify read should succeed");
+        assert_eq!(verify.rows.len(), 1);
+        assert_blob_text(&verify.rows[0][0], "after");
+    }
+);
+
+simulation_test!(
+    lix_file_read_before_update_then_read_returns_updated_bytes,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/update-read-consistency.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let seeded = engine
+            .execute(
+                "SELECT id, data FROM lix_file WHERE path = '/update-read-consistency.md' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("seed read should succeed");
+        assert_eq!(seeded.rows.len(), 1);
+        let file_id = match &seeded.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text id, got {other:?}"),
+        };
+        assert_blob_text(&seeded.rows[0][1], "before");
+
+        engine
+            .execute(
+                "UPDATE lix_file SET data = ? WHERE id = ?",
+                &[Value::Blob(b"after".to_vec()), Value::Text(file_id.clone())],
+            )
+            .await
+            .expect("update should succeed");
+
+        let read_after = engine
+            .execute(
+                &format!("SELECT data FROM lix_file WHERE id = '{file_id}' LIMIT 1"),
+                &[],
+            )
+            .await
+            .expect("first read after update should succeed");
+        assert_eq!(read_after.rows.len(), 1);
+        assert_blob_text(&read_after.rows[0][0], "after");
+
+        let read_again = engine
+            .execute(
+                &format!("SELECT data FROM lix_file WHERE id = '{file_id}' LIMIT 1"),
+                &[],
+            )
+            .await
+            .expect("second read after update should succeed");
+        assert_eq!(read_again.rows.len(), 1);
+        assert_blob_text(&read_again.rows[0][0], "after");
+    }
+);
+
+simulation_test!(
+    lix_file_update_data_matched_row_is_not_silent_noop,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+        .execute(
+            "INSERT INTO lix_file (path, data) VALUES ('/update-change-id.md', lix_text_encode('before'))",
+            &[],
+        )
+        .await
+        .expect("seed insert should succeed");
+
+        let seeded = engine
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/update-change-id.md' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("seed read should succeed");
+        assert_eq!(seeded.rows.len(), 1);
+        let file_id = match &seeded.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text id, got {other:?}"),
+        };
+
+        let before = engine
+            .execute(
+                &format!("SELECT data FROM lix_file WHERE id = '{file_id}' LIMIT 1"),
+                &[],
+            )
+            .await
+            .expect("before read should succeed");
+        assert_eq!(before.rows.len(), 1);
+        assert_blob_text(&before.rows[0][0], "before");
+
+        engine
+            .execute(
+                "UPDATE lix_file SET data = ? WHERE id = ?",
+                &[Value::Blob(b"after".to_vec()), Value::Text(file_id.clone())],
+            )
+            .await
+            .expect("update should succeed");
+
+        let after = engine
+            .execute(
+                &format!("SELECT data FROM lix_file WHERE id = '{file_id}' LIMIT 1"),
+                &[],
+            )
+            .await
+            .expect("post-update read should succeed");
+        assert_eq!(after.rows.len(), 1);
+        assert_blob_text(&after.rows[0][0], "after");
+    }
+);
+
+simulation_test!(
     file_view_update_data_expression_fails_fast,
     |sim| async move {
         let engine = sim

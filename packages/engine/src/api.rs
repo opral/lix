@@ -143,7 +143,7 @@ impl Engine {
         let execution = match run::execute_plan_sql(
             self,
             &prepared.plan,
-            &prepared.detected_file_domain_changes,
+            &prepared.intent.detected_file_domain_changes,
             prepared.plan.requirements.should_refresh_file_cache,
             &prepared.functions,
             writer_key,
@@ -177,17 +177,18 @@ impl Engine {
         let cache_targets = shared_path::derive_cache_targets(
             &prepared.plan,
             execution.postprocess_file_cache_targets.clone(),
-            &prepared.pending_file_delete_targets,
+            &prepared.intent,
         );
 
         apply_effects_tx::apply_sql_backed_effects(
             self,
             &prepared.plan.preprocess.mutations,
-            &prepared.pending_file_writes,
-            &prepared.detected_file_domain_changes,
-            &prepared.untracked_filesystem_update_domain_changes,
+            &prepared.intent.pending_file_writes,
+            &prepared.intent.detected_file_domain_changes,
+            &prepared.intent.untracked_filesystem_update_domain_changes,
             execution.plugin_changes_committed,
-            &cache_targets.file_cache_invalidation_targets,
+            &cache_targets.file_data_cache_invalidation_targets,
+            &cache_targets.file_path_cache_invalidation_targets,
         )
         .await?;
 

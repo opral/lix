@@ -1,5 +1,5 @@
 use super::super::*;
-use super::ast::utils::{bind_sql_with_state, PlaceholderState};
+use super::ast::utils::{advance_placeholder_state_for_statement_ast, PlaceholderState};
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::history::plugin_inputs as history_plugin_inputs;
 use super::planning::preprocess::preprocess_sql_to_plan;
@@ -40,12 +40,7 @@ pub(crate) async fn collect_filesystem_update_detected_file_domain_changes_from_
             }
             other => {
                 tracked_changes_by_statement.push(Vec::new());
-                advance_placeholder_state_for_statement(
-                    &other,
-                    params,
-                    backend.dialect(),
-                    &mut placeholder_state,
-                )?;
+                advance_placeholder_state_for_statement(&other, params, &mut placeholder_state)?;
             }
         }
     }
@@ -59,21 +54,17 @@ pub(crate) async fn collect_filesystem_update_detected_file_domain_changes_from_
 pub(crate) fn advance_placeholder_state_for_statement(
     statement: &Statement,
     params: &[Value],
-    dialect: crate::backend::SqlDialect,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<(), LixError> {
-    let statement_sql = statement.to_string();
-    let bound = bind_sql_with_state(&statement_sql, params, dialect, *placeholder_state).map_err(
+    advance_placeholder_state_for_statement_ast(statement, params.len(), placeholder_state).map_err(
         |error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "filesystem side-effect placeholder binding failed for '{}': {}",
-                statement_sql, error.description
+                "filesystem side-effect placeholder advancement failed: {}",
+                error.description
             ),
         },
-    )?;
-    *placeholder_state = bound.state;
-    Ok(())
+    )
 }
 
 async fn resolve_pending_write_file_id_with_backend(
@@ -313,11 +304,14 @@ impl Engine {
         let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
             &std::mem::take(&mut side_effects.untracked_filesystem_update_domain_changes),
         );
+        let pending_file_delete_targets =
+            std::mem::take(&mut side_effects.pending_file_delete_targets);
         side_effects
-            .file_cache_invalidation_targets
-            .extend(std::mem::take(
-                &mut side_effects.pending_file_delete_targets,
-            ));
+            .file_data_cache_invalidation_targets
+            .extend(pending_file_delete_targets.iter().cloned());
+        side_effects
+            .file_path_cache_invalidation_targets
+            .extend(pending_file_delete_targets);
 
         if !detected_file_domain_changes.is_empty() {
             self.persist_detected_file_domain_changes_in_transaction(
@@ -345,7 +339,7 @@ impl Engine {
         .await?;
         self.ensure_builtin_binary_blob_store_for_targets_in_transaction(
             transaction,
-            &side_effects.file_cache_invalidation_targets,
+            &side_effects.file_data_cache_invalidation_targets,
         )
         .await?;
         if should_run_binary_gc {
@@ -354,12 +348,12 @@ impl Engine {
         }
         self.invalidate_file_data_cache_entries_in_transaction(
             transaction,
-            &side_effects.file_cache_invalidation_targets,
+            &side_effects.file_data_cache_invalidation_targets,
         )
         .await?;
         self.invalidate_file_path_cache_entries_in_transaction(
             transaction,
-            &side_effects.file_cache_invalidation_targets,
+            &side_effects.file_path_cache_invalidation_targets,
         )
         .await?;
 
@@ -539,25 +533,43 @@ impl Engine {
         &self,
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
     ) -> Result<(), LixError> {
-        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut latest_index_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
             if !write.data_is_authoritative {
                 continue;
             }
             let resolved_file_id =
                 resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
-            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
+            latest_index_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
-        for ((file_id, version_id), index) in latest_by_key {
-            let write = &writes[index];
+        for ((file_id, version_id), index) in &latest_index_by_key {
+            let write = writes.get(*index).ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write persistence failed: invalid write index {} for file '{}' version '{}'",
+                    index, file_id, version_id
+                ),
+            })?;
             persist_binary_blob_with_fastcdc_backend(
                 self.backend.as_ref(),
-                &file_id,
-                &version_id,
+                file_id,
+                version_id,
                 &write.after_data,
             )
             .await?;
+        }
+
+        self.record_intent_verification_checks(latest_index_by_key.len());
+        if let Err(error) = verify_binary_file_version_refs_with_backend(
+            self.backend.as_ref(),
+            writes,
+            &latest_index_by_key,
+        )
+        .await
+        {
+            self.record_intent_verification_failure();
+            return Err(error);
         }
 
         Ok(())
@@ -568,25 +580,43 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
     ) -> Result<(), LixError> {
-        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut latest_index_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
         for (index, write) in writes.iter().enumerate() {
             if !write.data_is_authoritative {
                 continue;
             }
             let resolved_file_id =
                 resolve_pending_write_file_id_in_transaction(transaction, write).await?;
-            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
+            latest_index_by_key.insert((resolved_file_id, write.version_id.clone()), index);
         }
 
-        for ((file_id, version_id), index) in latest_by_key {
-            let write = &writes[index];
+        for ((file_id, version_id), index) in &latest_index_by_key {
+            let write = writes.get(*index).ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write persistence failed (tx): invalid write index {} for file '{}' version '{}'",
+                    index, file_id, version_id
+                ),
+            })?;
             persist_binary_blob_with_fastcdc_in_transaction(
                 transaction,
-                &file_id,
-                &version_id,
+                file_id,
+                version_id,
                 &write.after_data,
             )
             .await?;
+        }
+
+        self.record_intent_verification_checks(latest_index_by_key.len());
+        if let Err(error) = verify_binary_file_version_refs_in_transaction(
+            transaction,
+            writes,
+            &latest_index_by_key,
+        )
+        .await
+        {
+            self.record_intent_verification_failure();
+            return Err(error);
         }
 
         Ok(())
@@ -1326,6 +1356,146 @@ async fn persist_binary_blob_with_fastcdc(
     Ok(())
 }
 
+async fn verify_binary_file_version_refs_with_backend(
+    backend: &dyn LixBackend,
+    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    expected_index_by_key: &BTreeMap<(String, String), usize>,
+) -> Result<(), LixError> {
+    if expected_index_by_key.is_empty() {
+        return Ok(());
+    }
+
+    let sql = filesystem_queries::select_binary_file_version_ref_sql();
+    for ((file_id, version_id), index) in expected_index_by_key {
+        let write = writes.get(*index).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "file data write verification failed: invalid write index {} for file '{}' version '{}'",
+                index, file_id, version_id
+            ),
+        })?;
+        let expected_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
+        let expected_size = i64::try_from(write.after_data.len()).map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "file data write verification failed: expected size overflow for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+
+        let result = backend
+            .execute(
+                &sql,
+                &[
+                    Value::Text(file_id.clone()),
+                    Value::Text(version_id.clone()),
+                ],
+            )
+            .await?;
+        let Some(row) = result.rows.first() else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write verification failed: missing binary ref for file '{}' version '{}'",
+                    file_id, version_id
+                ),
+            });
+        };
+        let actual_hash = text_value_required(row, 0, "blob_hash")?;
+        if actual_hash != expected_hash {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write verification failed: blob hash mismatch for file '{}' version '{}': expected '{}', got '{}'",
+                    file_id, version_id, expected_hash, actual_hash
+                ),
+            });
+        }
+        let actual_size = int_value_required(row, 1, "size_bytes")?;
+        if actual_size != expected_size {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write verification failed: size mismatch for file '{}' version '{}': expected {}, got {}",
+                    file_id, version_id, expected_size, actual_size
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn verify_binary_file_version_refs_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    expected_index_by_key: &BTreeMap<(String, String), usize>,
+) -> Result<(), LixError> {
+    if expected_index_by_key.is_empty() {
+        return Ok(());
+    }
+
+    let sql = filesystem_queries::select_binary_file_version_ref_sql();
+    for ((file_id, version_id), index) in expected_index_by_key {
+        let write = writes.get(*index).ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "file data write verification failed (tx): invalid write index {} for file '{}' version '{}'",
+                index, file_id, version_id
+            ),
+        })?;
+        let expected_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
+        let expected_size = i64::try_from(write.after_data.len()).map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "file data write verification failed (tx): expected size overflow for file '{}' version '{}'",
+                file_id, version_id
+            ),
+        })?;
+
+        let result = transaction
+            .execute(
+                &sql,
+                &[
+                    Value::Text(file_id.clone()),
+                    Value::Text(version_id.clone()),
+                ],
+            )
+            .await?;
+        let Some(row) = result.rows.first() else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write verification failed (tx): missing binary ref for file '{}' version '{}'",
+                    file_id, version_id
+                ),
+            });
+        };
+        let actual_hash = text_value_required(row, 0, "blob_hash")?;
+        if actual_hash != expected_hash {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write verification failed (tx): blob hash mismatch for file '{}' version '{}': expected '{}', got '{}'",
+                    file_id, version_id, expected_hash, actual_hash
+                ),
+            });
+        }
+        let actual_size = int_value_required(row, 1, "size_bytes")?;
+        if actual_size != expected_size {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "file data write verification failed (tx): size mismatch for file '{}' version '{}': expected {}, got {}",
+                    file_id, version_id, expected_size, actual_size
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn fastcdc_chunk_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     if data.is_empty() {
         return Vec::new();
@@ -1399,6 +1569,19 @@ fn blob_value_required(row: &[Value], index: usize, column: &str) -> Result<Vec<
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "builtin binary fallback: expected blob column '{}' at index {}",
+                column, index
+            ),
+        }),
+    }
+}
+
+fn int_value_required(row: &[Value], index: usize, column: &str) -> Result<i64, LixError> {
+    match row.get(index) {
+        Some(Value::Integer(value)) => Ok(*value),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "builtin binary fallback: expected integer column '{}' at index {}",
                 column, index
             ),
         }),

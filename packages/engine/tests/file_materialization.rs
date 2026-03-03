@@ -1900,6 +1900,83 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_update_path_only_preserves_existing_data_cache_row,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let (engine, main_version_id) =
+            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let plugin_wasm = plugin_txt_noop_wasm_bytes();
+        let plugin_archive = support::simulation_test::build_test_plugin_archive(
+            TEST_TXT_PLUGIN_MANIFEST,
+            &plugin_wasm,
+        )
+        .expect("build test plugin archive should succeed");
+        engine
+            .install_plugin(&plugin_archive)
+            .await
+            .expect("install txt plugin should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-json-path-only-cache-preserve', '/cache-preserve.json', lix_text_encode('{\"hello\":\"before\"}'))",
+                &[],
+            )
+            .await
+            .expect("initial file insert should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
+                 VALUES ('file-json-path-only-cache-preserve', ?, ?)",
+                &[
+                    Value::Text(main_version_id.clone()),
+                    Value::Blob(b"seed-cache".to_vec()),
+                ],
+            )
+            .await
+            .expect("seed file_data_cache row should succeed");
+
+        assert_eq!(
+            file_cache_row_count(
+                &engine,
+                "file-json-path-only-cache-preserve",
+                &main_version_id
+            )
+            .await,
+            1
+        );
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET path = '/cache-preserve.txt' \
+                 WHERE id = 'file-json-path-only-cache-preserve'",
+                &[],
+            )
+            .await
+            .expect("path-only file update should succeed");
+
+        let cache_row = engine
+            .execute(
+                &format!(
+                    "SELECT data \
+                     FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'file-json-path-only-cache-preserve' \
+                       AND version_id = '{}' \
+                     LIMIT 1",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("file_data_cache read should succeed");
+        assert_eq!(cache_row.rows.len(), 1);
+        assert_blob_bytes_eq(&cache_row.rows[0][0], b"seed-cache");
+    }
+);
+
+simulation_test!(
     file_update_cache_miss_uses_reconstructed_before_data_for_detect_stage,
     simulations = [sqlite, postgres],
     |sim| async move {

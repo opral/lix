@@ -3,14 +3,12 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectNamePart,
-    SetExpr, Value as SqlValue, VisitMut, VisitorMut,
+    SetExpr, Statement, Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::{LixError, SqlDialect, Value};
-
-use sqlparser::ast::Statement;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PlaceholderState {
@@ -97,6 +95,18 @@ pub(crate) fn bind_sql_with_state_and_appended_params(
     })
 }
 
+pub(crate) fn advance_placeholder_state_for_statement_ast(
+    statement: &Statement,
+    params_len: usize,
+    state: &mut PlaceholderState,
+) -> Result<(), LixError> {
+    let mut visitor = PlaceholderStateAdvancer { params_len, state };
+    if let ControlFlow::Break(error) = Visit::visit(statement, &mut visitor) {
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_values_rows(
     rows: &[Vec<Expr>],
     params: &[Value],
@@ -163,6 +173,25 @@ struct PlaceholderBinder<'a> {
     state: &'a mut PlaceholderState,
     source_to_dense: &'a mut HashMap<usize, usize>,
     used_source_indices: &'a mut Vec<usize>,
+}
+
+struct PlaceholderStateAdvancer<'a> {
+    params_len: usize,
+    state: &'a mut PlaceholderState,
+}
+
+impl Visitor for PlaceholderStateAdvancer<'_> {
+    type Break = LixError;
+
+    fn pre_visit_value(&mut self, value: &SqlValue) -> ControlFlow<Self::Break> {
+        let SqlValue::Placeholder(token) = value else {
+            return ControlFlow::Continue(());
+        };
+        match resolve_placeholder_index(token, self.params_len, self.state) {
+            Ok(_) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
 }
 
 impl VisitorMut for PlaceholderBinder<'_> {
