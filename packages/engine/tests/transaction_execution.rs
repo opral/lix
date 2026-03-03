@@ -262,6 +262,62 @@ simulation_test!(
 );
 
 simulation_test!(
+    execute_allows_begin_commit_script_without_internal_access,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                access_to_internal: false,
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "BEGIN; \
+                 INSERT INTO lix_key_value (key, value) VALUES ('tx-public-begin-commit', 'ok'); \
+                 COMMIT;",
+                &[],
+            )
+            .await
+            .expect("public execute should accept explicit BEGIN/COMMIT wrappers");
+
+        let result = engine
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'tx-public-begin-commit' LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("ok".to_string()));
+    }
+);
+
+simulation_test!(
+    execute_rejects_non_wrapped_transaction_control_without_internal_access,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                access_to_internal: false,
+                ..Default::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let error = engine
+            .execute("ROLLBACK;", &[])
+            .await
+            .expect_err("non-wrapped transaction control should remain denied");
+        assert_eq!(error.code, "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED");
+    }
+);
+
+simulation_test!(
     transaction_path_handles_large_vtable_insert_batch_without_sqlite_variable_overflow,
     simulations = [sqlite],
     |sim| async move {
