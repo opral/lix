@@ -98,6 +98,8 @@ pub struct Engine {
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
     intent_pipeline_telemetry: IntentPipelineTelemetry,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
+    pub(crate) observe_shared_sources:
+        Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
     active_transactions: Mutex<BTreeMap<u64, EngineTransaction<'static>>>,
     next_transaction_handle_id: AtomicU64,
 }
@@ -320,6 +322,7 @@ impl Engine {
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             intent_pipeline_telemetry: IntentPipelineTelemetry::default(),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
+            observe_shared_sources: Mutex::new(BTreeMap::new()),
             active_transactions: Mutex::new(BTreeMap::new()),
             next_transaction_handle_id: AtomicU64::new(1),
         }
