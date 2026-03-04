@@ -444,13 +444,13 @@ where
 
                 let mut current_insert = insert;
                 if let Some(rewritten) =
-                    lix_state_by_version_write::rewrite_insert(current_insert.clone())?
+                    lix_state_write::rewrite_insert_with_backend(backend, current_insert.clone())
+                        .await?
                 {
                     current_insert = rewritten;
                 }
                 if let Some(rewritten) =
-                    lix_state_write::rewrite_insert_with_backend(backend, current_insert.clone())
-                        .await?
+                    lix_state_by_version_write::rewrite_insert(current_insert.clone())?
                 {
                     current_insert = rewritten;
                 }
@@ -556,18 +556,18 @@ where
                     return Ok(StatementRuleOutcome::Emit(output));
                 }
 
-                if let Some(rewritten) = lix_state_by_version_write::rewrite_update(update.clone())?
-                {
-                    current = Statement::Update(rewritten);
-                    continue;
-                }
-
                 if let Some(rewritten) = lix_state_write::rewrite_update_with_backend(
                     backend,
                     update.clone(),
                     context.params,
                 )
                 .await?
+                {
+                    current = Statement::Update(rewritten);
+                    continue;
+                }
+
+                if let Some(rewritten) = lix_state_by_version_write::rewrite_update(update.clone())?
                 {
                     current = Statement::Update(rewritten);
                     continue;
@@ -624,6 +624,14 @@ where
                 };
 
                 let delete = if let Some(rewritten) =
+                    lix_state_write::rewrite_delete_with_backend(backend, delete.clone()).await?
+                {
+                    rewritten
+                } else {
+                    delete
+                };
+
+                let delete = if let Some(rewritten) =
                     lix_state_by_version_write::rewrite_delete(delete.clone())?
                 {
                     effective_scope_fallback = true;
@@ -642,18 +650,6 @@ where
                     current = rewritten;
                     continue;
                 }
-
-                let delete = if let Some(rewritten) =
-                    lix_state_write::rewrite_delete_with_backend(backend, delete.clone()).await?
-                {
-                    effective_scope_fallback =
-                        !vtable_write::selection_mentions_inherited_from_version_id(
-                            delete.selection.as_ref(),
-                        );
-                    rewritten
-                } else {
-                    delete
-                };
 
                 if let Some(version_rewrite) = lix_version_write::rewrite_delete_with_backend(
                     backend,
@@ -829,7 +825,8 @@ fn filesystem_noop_predicate(expr: &Expr) -> bool {
         left,
         op: BinaryOperator::Eq,
         right,
-    } = strip_nested_expr(expr) else {
+    } = strip_nested_expr(expr)
+    else {
         return false;
     };
 

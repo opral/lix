@@ -25,6 +25,7 @@ use super::super::history::commit_runtime::{
 use super::super::storage::sql_text::escape_sql_string;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
+const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
@@ -294,6 +295,10 @@ async fn build_delete_followup_statement_batch(
         });
     }
 
+    if let Some(selection_sql) = plan.effective_scope_untracked_selection_sql.as_deref() {
+        delete_effective_scope_untracked_rows(executor, selection_sql, params).await?;
+    }
+
     if plan.effective_scope_fallback {
         for fallback_row in load_effective_scope_delete_rows(executor, plan, params).await? {
             let key = (
@@ -390,6 +395,17 @@ async fn build_delete_followup_statement_batch(
         0,
         executor.dialect(),
     )
+}
+
+async fn delete_effective_scope_untracked_rows(
+    executor: &mut dyn SqlExecutor,
+    selection_sql: &str,
+    params: &[EngineValue],
+) -> Result<(), LixError> {
+    let sql = format!("DELETE FROM {UNTRACKED_TABLE} WHERE {selection_sql}");
+    let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
+    executor.execute(&bound.sql, &bound.params).await?;
+    Ok(())
 }
 
 async fn build_domain_change_followup_statement_batch(

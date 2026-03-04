@@ -293,6 +293,144 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_select_rejects_version_id_column,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        insert_state_row(
+            &engine,
+            "entity-version-col",
+            "version-a",
+            "{\"value\":\"A\"}",
+            false,
+        )
+        .await;
+
+        let error = engine
+            .execute(
+                "SELECT version_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-version-col'",
+                &[],
+            )
+            .await
+            .expect_err("lix_state should reject version_id column");
+
+        assert!(
+            error.description.contains("does not expose version_id"),
+            "unexpected error message: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_select_rejects_lixcol_version_id_column,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        insert_state_row(
+            &engine,
+            "entity-version-col-2",
+            "version-a",
+            "{\"value\":\"A\"}",
+            false,
+        )
+        .await;
+
+        let error = engine
+            .execute(
+                "SELECT lixcol_version_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-version-col-2'",
+                &[],
+            )
+            .await
+            .expect_err("lix_state should reject lixcol_version_id column");
+
+        assert!(
+            error.description.contains("does not expose version_id"),
+            "unexpected error message: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_select_rejects_version_id_from_wrapped_subquery,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        insert_state_row(
+            &engine,
+            "entity-subquery",
+            "version-a",
+            "{\"value\":\"A\"}",
+            false,
+        )
+        .await;
+
+        let error = engine
+            .execute(
+                "SELECT 1 \
+                 FROM (SELECT * FROM lix_state) s \
+                 WHERE s.version_id IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect_err("subquery access to version_id should fail");
+
+        let description = error.description.to_ascii_lowercase();
+        assert!(
+            description.contains("version_id"),
+            "unexpected error message: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
     lix_state_select_reflects_untracked_entity_after_vtable_update,
     |sim| async move {
         let engine = sim
@@ -843,6 +981,90 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_update_without_untracked_predicate_updates_effective_untracked_row,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        insert_state_row(
+            &engine,
+            "effective-entity-u",
+            "version-a",
+            "{\"value\":\"tracked-initial\"}",
+            false,
+        )
+        .await;
+        insert_state_row(
+            &engine,
+            "effective-entity-u",
+            "version-a",
+            "{\"value\":\"untracked-initial\"}",
+            true,
+        )
+        .await;
+
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"effective-updated\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'effective-entity-u' \
+                   AND file_id = 'test-file'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible = engine
+            .execute(
+                "SELECT snapshot_content, untracked \
+                 FROM lix_state \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'effective-entity-u' \
+                   AND file_id = 'test-file'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic_normalized(visible.rows.clone());
+        assert_eq!(visible.rows.len(), 1);
+        assert_text(&visible.rows[0][0], "{\"value\":\"effective-updated\"}");
+        assert_boolean_like(&visible.rows[0][1], true);
+
+        let tracked = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_materialized_v1_test_state_schema \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'effective-entity-u' \
+                   AND file_id = 'test-file' \
+                   AND version_id = 'version-a' \
+                   AND is_tombstone = 0",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tracked.rows.len(), 1);
+        assert_text(&tracked.rows[0][0], "{\"value\":\"tracked-initial\"}");
+    }
+);
+
+simulation_test!(
     lix_state_update_rejects_explicit_version_id_assignment,
     |sim| async move {
         let engine = sim
@@ -883,6 +1105,53 @@ simulation_test!(
             error
                 .description
                 .contains("lix_state update cannot set version_id"),
+            "unexpected error message: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_update_rejects_version_id_predicate,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-ver-pred",
+            "version-a",
+            "{\"value\":\"before\"}",
+            false,
+        )
+        .await;
+        engine
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let error = engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-ver-pred' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .expect_err("lix_state update with version_id predicate should fail");
+
+        assert!(
+            error.description.contains("does not expose version_id"),
             "unexpected error message: {}",
             error.description
         );
@@ -1079,7 +1348,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_delete_is_scoped_to_active_version_even_with_explicit_version_predicate,
+    lix_state_delete_rejects_version_id_predicate,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -1100,7 +1369,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        engine
+        let error = engine
             .execute(
                 "DELETE FROM lix_state \
                  WHERE schema_key = 'test_state_schema' \
@@ -1110,7 +1379,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .unwrap();
+            .expect_err("lix_state delete with version_id predicate should fail");
+
+        assert!(
+            error.description.contains("does not expose version_id"),
+            "unexpected error message: {}",
+            error.description
+        );
 
         let rows = engine
             .execute(

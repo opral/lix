@@ -38,6 +38,120 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
     }
 }
 
+async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulationEngine) {
+    engine
+        .execute(
+            "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
+             'lix_stored_schema',\
+             '{\"value\":{\"x-lix-key\":\"wk_writer_key_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+simulation_test!(
+    untracked_writer_key_matches_materialized_writer_key,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+        register_writer_key_test_schema(&engine).await;
+
+        let version_id = active_version_id(&engine).await;
+
+        engine
+            .execute_with_options(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) VALUES (\
+                     'wk-tracked', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"tracked\"}}', '1'\
+                     )"
+                ),
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:both".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_with_options(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                     ) VALUES (\
+                     'wk-untracked', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"untracked\"}}', '1', true\
+                     )"
+                ),
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:both".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let materialized = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key \
+                     FROM lix_internal_state_materialized_v1_wk_writer_key_schema \
+                     WHERE entity_id = 'wk-tracked' \
+                       AND version_id = '{version_id}' \
+                       AND is_tombstone = 0 \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(materialized.rows.len(), 1);
+        assert_text(&materialized.rows[0][0], "editor:both");
+
+        let untracked = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key \
+                     FROM lix_internal_state_untracked \
+                     WHERE entity_id = 'wk-untracked' \
+                       AND version_id = '{version_id}' \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(untracked.rows.len(), 1);
+        assert_text(&untracked.rows[0][0], "editor:both");
+
+        let view_rows = engine
+            .execute(
+                &format!(
+                    "SELECT entity_id, writer_key \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'wk_writer_key_schema' \
+                       AND version_id = '{version_id}' \
+                     ORDER BY entity_id"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(view_rows.rows.len(), 2);
+        assert_text(&view_rows.rows[0][0], "wk-tracked");
+        assert_text(&view_rows.rows[0][1], "editor:both");
+        assert_text(&view_rows.rows[1][0], "wk-untracked");
+        assert_text(&view_rows.rows[1][1], "editor:both");
+    }
+);
+
 simulation_test!(
     writer_key_visible_in_file_and_state_views_for_execute_options,
     simulations = [sqlite, postgres],

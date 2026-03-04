@@ -10,6 +10,7 @@ pub(crate) struct VtableDeletePlan {
     pub(crate) schema_key: String,
     pub(crate) effective_scope_fallback: bool,
     pub(crate) effective_scope_selection_sql: Option<String>,
+    pub(crate) effective_scope_untracked_selection_sql: Option<String>,
 }
 
 #[derive(Debug, Clone)]

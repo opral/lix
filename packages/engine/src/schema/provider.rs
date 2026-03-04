@@ -153,14 +153,12 @@ fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
             "properties": {
                 "entity_id": { "type": "string" },
                 "schema_key": { "type": "string" },
-                "file_id": { "type": "string" },
-                "version_id": { "type": "string" }
+                "file_id": { "type": "string" }
             },
             "required": [
                 "entity_id",
                 "schema_key",
-                "file_id",
-                "version_id"
+                "file_id"
             ],
             "additionalProperties": true
         })),

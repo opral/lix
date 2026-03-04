@@ -56,7 +56,9 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
             description: "statement rewrite produced no statements".to_string(),
         });
     }
-    if output.postprocess.is_some() && output.statements.len() != 1 {
+    if requires_single_statement_postprocess(output.postprocess.as_ref())
+        && output.statements.len() != 1
+    {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
@@ -68,12 +70,6 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
             description: "postprocess rewrites cannot emit mutation rows".to_string(),
         });
     }
-    if !output.update_validations.is_empty() && output.statements.len() != 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "update validation rewrites require a single statement".to_string(),
-        });
-    }
     if !output.mutations.is_empty() && !output.update_validations.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -81,7 +77,10 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
         });
     }
     if !output.update_validations.is_empty()
-        && !matches!(output.statements[0], sqlparser::ast::Statement::Update(_))
+        && !output
+            .statements
+            .iter()
+            .all(|statement| matches!(statement, sqlparser::ast::Statement::Update(_)))
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -91,7 +90,10 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
     if let Some(postprocess) = &output.postprocess {
         match postprocess {
             PostprocessPlan::VtableUpdate(_) => {
-                if !matches!(output.statements[0], sqlparser::ast::Statement::Update(_)) {
+                if !matches!(
+                    output.statements.last(),
+                    Some(sqlparser::ast::Statement::Update(_))
+                ) {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "vtable update postprocess requires an UPDATE statement"
@@ -116,6 +118,10 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
         }
     }
     Ok(())
+}
+
+fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
+    matches!(plan, Some(other) if !matches!(other, PostprocessPlan::VtableUpdate(_)))
 }
 
 pub(crate) fn validate_no_unresolved_logical_read_views(query: &Query) -> Result<(), LixError> {
@@ -185,6 +191,15 @@ mod tests {
         Statement::Query(Box::new(parse_query("SELECT 1")))
     }
 
+    fn empty_update_statement() -> Statement {
+        let mut statements = Parser::parse_sql(
+            &GenericDialect {},
+            "UPDATE lix_internal_state_vtable SET updated_at = updated_at WHERE schema_key = 'schema'",
+        )
+        .expect("parse SQL");
+        statements.remove(0)
+    }
+
     #[test]
     fn canonical_phase_rejects_unresolved_state_views() {
         let query = parse_query("SELECT * FROM lix_state_by_version");
@@ -213,6 +228,7 @@ mod tests {
                 schema_key: "schema".to_string(),
                 effective_scope_fallback: false,
                 effective_scope_selection_sql: None,
+                effective_scope_untracked_selection_sql: None,
             })),
             mutations: vec![crate::engine::sql::planning::rewrite_engine::types::MutationRow {
                 operation: crate::engine::sql::planning::rewrite_engine::types::MutationOperation::Insert,
@@ -234,9 +250,9 @@ mod tests {
     }
 
     #[test]
-    fn statement_validator_rejects_multi_statement_update_validation() {
+    fn statement_validator_rejects_update_validation_with_non_update_statement() {
         let output = RewriteOutput {
-            statements: vec![empty_statement(), empty_statement()],
+            statements: vec![empty_statement(), empty_update_statement()],
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
@@ -252,10 +268,10 @@ mod tests {
         };
 
         let err = validate_statement_output(&output)
-            .expect_err("update validations with multiple statements should be rejected");
+            .expect_err("update validations with non-update statement should be rejected");
         assert!(err
             .description
-            .contains("update validation rewrites require a single statement"));
+            .contains("update validations require an UPDATE statement output"));
     }
 
     #[test]
@@ -306,6 +322,25 @@ mod tests {
     }
 
     #[test]
+    fn statement_validator_allows_multi_statement_vtable_update_postprocess() {
+        let output = RewriteOutput {
+            statements: vec![empty_update_statement(), empty_update_statement()],
+            params: Vec::new(),
+            registrations: Vec::new(),
+            postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
+                schema_key: "schema".to_string(),
+                explicit_writer_key: None,
+                writer_key_assignment_present: false,
+            })),
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+        };
+
+        validate_statement_output(&output)
+            .expect("multi-statement vtable update postprocess should be valid");
+    }
+
+    #[test]
     fn statement_validator_rejects_vtable_delete_postprocess_on_non_delete_or_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
@@ -315,6 +350,7 @@ mod tests {
                 schema_key: "schema".to_string(),
                 effective_scope_fallback: false,
                 effective_scope_selection_sql: None,
+                effective_scope_untracked_selection_sql: None,
             })),
             mutations: Vec::new(),
             update_validations: Vec::new(),
