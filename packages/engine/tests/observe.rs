@@ -346,7 +346,7 @@ simulation_test!(
 
         let mut observed = engine
             .observe(ObserveQuery::new(
-                "SELECT version_id \
+                "SELECT lix_json_extract(snapshot_content, 'value') \
                  FROM lix_state \
                  WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
                 vec![Value::Text(entity_id.to_string())],
@@ -371,7 +371,7 @@ simulation_test!(
             .expect("observe next should succeed")
             .expect("observe update event should exist");
         assert_eq!(update.sequence, 1);
-        assert_eq!(update.rows.rows, vec![vec![Value::Text(branch.id.clone())]]);
+        assert_eq!(update.rows.rows, vec![vec![Value::Text("branch".to_string())]]);
     }
 );
 

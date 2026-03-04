@@ -1,13 +1,17 @@
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, TableFactor,
-    TableWithJoins,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Query, Select,
+    SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
 
 use crate::engine::sql::planning::param_context::{
     normalize_query_placeholders, PlaceholderOrdinalState,
 };
+use crate::engine::sql::planning::rewrite_engine::steps::column_usage::{
+    projected_lix_state_wrapper_columns, select_shape_is_complex,
+};
+use crate::engine::sql::planning::rewrite_engine::steps::state_columns::LIX_STATE_VISIBLE_COLUMNS;
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::{
-    take_pushdown_predicates, StatePushdown,
+    retarget_pushdown_predicates, take_pushdown_predicates, StatePushdown,
 };
 use crate::engine::sql::planning::rewrite_engine::{
     default_alias, escape_sql_string, object_name_matches, parse_single_query,
@@ -19,7 +23,6 @@ use crate::version::{
 use crate::LixError;
 
 const LIX_STATE_VIEW_NAME: &str = "lix_state";
-const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
 const ACTIVE_VERSION_TABLE: &str = "lix_internal_state_untracked";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
@@ -30,6 +33,7 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
+    let complex_shape = select_shape_is_complex(select);
     let projection = select.projection.clone();
     let mut selection = select.selection.clone();
     let prewhere = select.prewhere.clone();
@@ -44,6 +48,7 @@ fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixErro
             having.as_ref(),
             qualify.as_ref(),
             allow_unqualified,
+            complex_shape,
             changed,
         )?;
     }
@@ -59,6 +64,7 @@ fn rewrite_table_with_joins(
     having: Option<&Expr>,
     qualify: Option<&Expr>,
     allow_unqualified: bool,
+    complex_shape: bool,
     changed: &mut bool,
 ) -> Result<(), LixError> {
     rewrite_table_factor(
@@ -69,6 +75,7 @@ fn rewrite_table_with_joins(
         having,
         qualify,
         allow_unqualified,
+        complex_shape,
         changed,
     )?;
     for join in &mut table.joins {
@@ -80,6 +87,7 @@ fn rewrite_table_with_joins(
             having,
             qualify,
             false,
+            true,
             changed,
         )?;
     }
@@ -94,6 +102,7 @@ fn rewrite_table_factor(
     having: Option<&Expr>,
     qualify: Option<&Expr>,
     allow_unqualified: bool,
+    complex_shape: bool,
     changed: &mut bool,
 ) -> Result<(), LixError> {
     match relation {
@@ -120,7 +129,20 @@ fn rewrite_table_factor(
             } else {
                 Vec::new()
             };
-            let derived_query = build_lix_state_wrapper_query(&pushdown_predicates)?;
+            let projection_columns = if complex_shape {
+                LIX_STATE_VISIBLE_COLUMNS.to_vec()
+            } else {
+                projected_lix_state_wrapper_columns(
+                    projection,
+                    selection.as_ref(),
+                    prewhere,
+                    having,
+                    qualify,
+                    &relation_name,
+                    allow_unqualified,
+                )
+            };
+            let derived_query = build_lix_state_wrapper_query(&projection_columns, &pushdown_predicates)?;
             let derived_alias = alias.clone().or_else(|| Some(default_lix_state_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,
@@ -140,6 +162,7 @@ fn rewrite_table_factor(
                 having,
                 qualify,
                 allow_unqualified,
+                complex_shape,
                 changed,
             )?;
         }
@@ -299,59 +322,88 @@ fn version_column_read_error() -> LixError {
     }
 }
 
-fn build_lix_state_wrapper_query(extra_predicates: &[String]) -> Result<Query, LixError> {
-    let extra_where = if extra_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", extra_predicates.join(" AND "))
-    };
-    let sql = format!(
-        "SELECT \
-             s.entity_id AS entity_id, \
-             s.schema_key AS schema_key, \
-             s.file_id AS file_id, \
-             s.plugin_key AS plugin_key, \
-             s.snapshot_content AS snapshot_content, \
-             s.schema_version AS schema_version, \
-             s.created_at AS created_at, \
-             s.updated_at AS updated_at, \
-             s.inherited_from_version_id AS inherited_from_version_id, \
-             s.change_id AS change_id, \
-             s.commit_id AS commit_id, \
-             s.untracked AS untracked, \
-             s.writer_key AS writer_key, \
-             s.metadata AS metadata \
-         FROM {by_version_table} AS s \
-         WHERE s.version_id = ( \
-           SELECT lix_json_extract(snapshot_content, 'version_id') \
-           FROM {active_table} \
-           WHERE schema_key = '{active_schema_key}' \
-             AND file_id = '{active_file_id}' \
-             AND version_id = '{active_storage_version_id}' \
-             AND snapshot_content IS NOT NULL \
-           ORDER BY updated_at DESC \
-           LIMIT 1 \
-         ){extra_where}",
-        by_version_table = LIX_STATE_BY_VERSION_VIEW_NAME,
+fn build_lix_state_wrapper_query(
+    projected_columns: &[&str],
+    extra_predicates: &[Expr],
+) -> Result<Query, LixError> {
+    let mut query = parse_single_query("SELECT 1 FROM lix_state_by_version AS s")?;
+    let select = select_mut(&mut query)?;
+    select.projection = projected_columns
+        .iter()
+        .map(|column| SelectItem::ExprWithAlias {
+            expr: qualified_column_expr("s", column),
+            alias: Ident::new(*column),
+        })
+        .collect();
+
+    let mut predicates = vec![active_version_predicate_expr()?];
+    predicates.extend(extra_predicates.iter().cloned());
+    select.selection = join_with_and(predicates);
+
+    Ok(query)
+}
+
+fn wrapper_pushdown_predicates(pushdown: &StatePushdown) -> Vec<Expr> {
+    let mut out = Vec::new();
+    out.extend(pushdown.source_predicates.iter().cloned());
+    out.extend(retarget_pushdown_predicates(
+        &pushdown.ranked_predicates,
+        "ranked",
+        "s",
+    ));
+    out
+}
+
+fn active_version_predicate_expr() -> Result<Expr, LixError> {
+    let active_version_subquery = parse_single_query(&format!(
+        "SELECT lix_json_extract(snapshot_content, 'version_id') \
+         FROM {active_table} \
+         WHERE schema_key = '{active_schema_key}' \
+           AND file_id = '{active_file_id}' \
+           AND version_id = '{active_storage_version_id}' \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC \
+         LIMIT 1",
         active_table = ACTIVE_VERSION_TABLE,
         active_schema_key = escape_sql_string(active_version_schema_key()),
         active_file_id = escape_sql_string(active_version_file_id()),
         active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        extra_where = extra_where,
-    );
-    parse_single_query(&sql)
+    ))?;
+
+    Ok(Expr::BinaryOp {
+        left: Box::new(qualified_column_expr("s", "version_id")),
+        op: BinaryOperator::Eq,
+        right: Box::new(Expr::Subquery(Box::new(active_version_subquery))),
+    })
 }
 
-fn wrapper_pushdown_predicates(pushdown: &StatePushdown) -> Vec<String> {
-    let mut out = Vec::new();
-    out.extend(pushdown.source_predicates.iter().cloned());
-    out.extend(
-        pushdown
-            .ranked_predicates
-            .iter()
-            .map(|predicate| predicate.replacen("ranked.", "s.", 1)),
-    );
-    out
+fn join_with_and(mut predicates: Vec<Expr>) -> Option<Expr> {
+    if predicates.is_empty() {
+        return None;
+    }
+    let mut current = predicates.remove(0);
+    for predicate in predicates {
+        current = Expr::BinaryOp {
+            left: Box::new(current),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
+        };
+    }
+    Some(current)
+}
+
+fn qualified_column_expr(qualifier: &str, column: &str) -> Expr {
+    Expr::CompoundIdentifier(vec![Ident::new(qualifier), Ident::new(column)])
+}
+
+fn select_mut(query: &mut Query) -> Result<&mut Select, LixError> {
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected SELECT body when rewriting lix_state".to_string(),
+        });
+    };
+    Ok(select.as_mut())
 }
 
 fn default_lix_state_alias() -> sqlparser::ast::TableAlias {
@@ -394,6 +446,30 @@ mod tests {
         assert!(sql.contains("s.metadata AS metadata"));
         assert!(!sql.contains("s.version_id AS version_id"));
         assert!(!sql.contains("s.lixcol_version_id"));
+    }
+
+    #[test]
+    fn wrapper_projection_omits_commit_when_not_referenced() {
+        let query = parse_query("SELECT entity_id FROM lix_state");
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(!sql.contains("s.commit_id AS commit_id"));
+    }
+
+    #[test]
+    fn wrapper_projection_keeps_commit_when_referenced() {
+        let query = parse_query("SELECT commit_id FROM lix_state");
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.commit_id AS commit_id"));
     }
 
     #[test]

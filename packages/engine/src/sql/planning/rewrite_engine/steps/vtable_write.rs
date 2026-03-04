@@ -158,7 +158,13 @@ pub fn rewrite_insert_with_writer_key(
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations, functions)?;
+        let untracked = build_untracked_insert(
+            &insert,
+            untracked_rows,
+            &mut mutations,
+            writer_key,
+            functions,
+        )?;
         statements.push(untracked);
     }
 
@@ -219,7 +225,13 @@ pub async fn rewrite_insert_with_backend(
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations, functions)?;
+        let untracked = build_untracked_insert(
+            &insert,
+            untracked_rows,
+            &mut mutations,
+            writer_key,
+            functions,
+        )?;
         statements.push(untracked);
     }
 
@@ -541,6 +553,14 @@ pub fn rewrite_delete_with_options(
         } else {
             None
         };
+    let effective_scope_untracked_selection_sql = if effective_scope_without_untracked_predicate {
+        Some(
+            rewrite_inherited_from_version_id_to_null(&stripped_selection)
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     let tracked_selection = if effective_scope_without_untracked_predicate {
         let materialized_table_ref = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
@@ -592,8 +612,40 @@ pub fn rewrite_delete_with_options(
             schema_key,
             effective_scope_fallback,
             effective_scope_selection_sql,
+            effective_scope_untracked_selection_sql,
         },
     })))
+}
+
+fn rewrite_inherited_from_version_id_to_null(expr: &Expr) -> Expr {
+    struct InheritedFromVersionIdNullRewriter;
+
+    impl VisitorMut for InheritedFromVersionIdNullRewriter {
+        type Break = ();
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            let is_inherited_from_version_id = match expr {
+                Expr::Identifier(ident) => {
+                    ident.value.eq_ignore_ascii_case("inherited_from_version_id")
+                }
+                Expr::CompoundIdentifier(parts) => parts
+                    .last()
+                    .map(|ident| ident.value.eq_ignore_ascii_case("inherited_from_version_id"))
+                    .unwrap_or(false),
+                _ => false,
+            };
+
+            if is_inherited_from_version_id {
+                *expr = null_expr();
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut rewritten = expr.clone();
+    let mut visitor = InheritedFromVersionIdNullRewriter;
+    let _ = (&mut rewritten).visit(&mut visitor);
+    rewritten
 }
 
 fn build_untracked_on_conflict() -> OnInsert {
@@ -640,6 +692,15 @@ fn build_untracked_on_conflict() -> OnInsert {
                     value: Expr::CompoundIdentifier(vec![
                         Ident::new("excluded"),
                         Ident::new("metadata"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("writer_key")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("writer_key"),
                     ]),
                 },
                 Assignment {
@@ -1177,6 +1238,7 @@ fn build_untracked_insert(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     mutations: &mut Vec<MutationRow>,
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Statement, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
@@ -1187,6 +1249,7 @@ fn build_untracked_insert(
     let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
     let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
     let metadata_idx = find_column_index(&insert.columns, "metadata");
+    let writer_key_idx = find_column_index(&insert.columns, "writer_key");
 
     let mut mapped_rows = Vec::new();
     for (row, materialized) in rows {
@@ -1201,6 +1264,22 @@ fn build_untracked_insert(
             match metadata_idx {
                 Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
                 None => null_expr(),
+            },
+            match writer_key_idx {
+                Some(index) => {
+                    let explicit = resolved_optional_string(
+                        materialized.get(index),
+                        row.get(index),
+                        "writer_key",
+                    )?;
+                    explicit
+                        .or_else(|| writer_key.map(ToString::to_string))
+                        .map(|value| string_expr(&value))
+                        .unwrap_or_else(null_expr)
+                }
+                None => writer_key
+                    .map(string_expr)
+                    .unwrap_or_else(null_expr),
             },
             resolved_expr_or_original(
                 materialized.get(schema_version_idx),
@@ -1260,6 +1339,7 @@ fn build_untracked_insert(
             Ident::new("plugin_key"),
             Ident::new("snapshot_content"),
             Ident::new("metadata"),
+            Ident::new("writer_key"),
             Ident::new("schema_version"),
             Ident::new("created_at"),
             Ident::new("updated_at"),
@@ -3308,6 +3388,44 @@ mod tests {
         assert!(assignments.iter().any(|name| name == "is_tombstone"));
         assert!(!assignments.iter().any(|name| name == "snapshot_content"));
         assert!(assignments.iter().any(|name| name == "updated_at"));
+    }
+
+    #[test]
+    fn rewrite_delete_effective_scope_maps_inherited_from_version_predicate_for_untracked_cleanup()
+    {
+        let sql = r#"DELETE FROM lix_internal_state_vtable
+            WHERE schema_key = 'test_schema' AND inherited_from_version_id IS NULL"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let delete = match statement {
+            Statement::Delete(delete) => delete,
+            _ => panic!("expected delete"),
+        };
+
+        let rewrite = rewrite_delete(delete, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            DeleteRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        let effective_sql = planned
+            .plan
+            .effective_scope_selection_sql
+            .as_deref()
+            .expect("effective scope sql");
+        assert!(effective_sql.contains("inherited_from_version_id IS NULL"));
+
+        let untracked_sql = planned
+            .plan
+            .effective_scope_untracked_selection_sql
+            .as_deref()
+            .expect("untracked scope sql");
+        assert!(untracked_sql.contains("NULL IS NULL"));
+        assert!(!untracked_sql.contains("inherited_from_version_id"));
     }
 
     #[test]
