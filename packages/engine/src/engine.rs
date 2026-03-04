@@ -892,7 +892,7 @@ mod tests {
             "DELETE FROM lix_state_by_version WHERE file_id = 'f'"
         ));
         assert!(should_refresh_file_cache_for_sql(
-            "INSERT INTO lix_state (entity_id, schema_key, file_id, version_id, snapshot_content) VALUES ('/x', 'json_pointer', 'f', 'v', '{}')"
+            "INSERT INTO lix_state (entity_id, schema_key, file_id, snapshot_content) VALUES ('/x', 'json_pointer', 'f', '{}')"
         ));
     }
 

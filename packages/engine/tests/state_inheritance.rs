@@ -82,7 +82,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT entity_id, version_id, inherited_from_version_id, snapshot_content \
+                "SELECT entity_id, inherited_from_version_id, snapshot_content \
              FROM lix_state \
              WHERE schema_key = 'test_state_schema' \
                AND entity_id = 'entity-inherited'",
@@ -94,9 +94,8 @@ simulation_test!(
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "entity-inherited");
-        assert_text(&rows.statements[0].rows[0][1], "version-child");
-        assert_text(&rows.statements[0].rows[0][2], "global");
-        assert_text(&rows.statements[0].rows[0][3], "{\"value\":\"global\"}");
+        assert_text(&rows.statements[0].rows[0][1], "global");
+        assert_text(&rows.statements[0].rows[0][2], "{\"value\":\"global\"}");
     }
 );
 
@@ -136,7 +135,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT version_id, inherited_from_version_id, snapshot_content \
+                "SELECT inherited_from_version_id, snapshot_content \
              FROM lix_state \
              WHERE schema_key = 'test_state_schema' \
                AND entity_id = 'entity-override'",
@@ -147,9 +146,8 @@ simulation_test!(
 
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_text(&rows.statements[0].rows[0][0], "version-child");
-        assert_eq!(rows.statements[0].rows[0][1], Value::Null);
-        assert_text(&rows.statements[0].rows[0][2], "{\"value\":\"child\"}");
+        assert_eq!(rows.statements[0].rows[0][0], Value::Null);
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"child\"}");
     }
 );
 

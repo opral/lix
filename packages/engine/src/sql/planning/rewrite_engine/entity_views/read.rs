@@ -54,6 +54,7 @@ pub(crate) async fn rewrite_query_with_backend(
     if view_names.is_empty() {
         return Ok(None);
     }
+
     let resolved = resolve_targets_with_backend(backend, &view_names).await?;
     rewrite_query_with_resolver(query, &mut |name| {
         let Some(view_name) = object_name_terminal(name) else {
@@ -78,8 +79,9 @@ fn rewrite_select(
 ) -> Result<RewriteDecision, LixError> {
     let mut changed = RewriteDecision::Unchanged;
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
+    let selection = select.selection.clone();
     for table in &mut select.from {
-        if rewrite_table_with_joins(table, &select.selection, allow_unqualified, resolver)?
+        if rewrite_table_with_joins(table, &selection, allow_unqualified, resolver)?
             == RewriteDecision::Changed
         {
             changed = RewriteDecision::Changed;
@@ -117,6 +119,7 @@ fn rewrite_table_factor(
             let Some(target) = resolver(name)? else {
                 return Ok(RewriteDecision::Unchanged);
             };
+
             let relation_name = alias
                 .as_ref()
                 .map(|value| value.name.value.clone())
@@ -138,6 +141,9 @@ fn rewrite_table_factor(
             };
             Ok(RewriteDecision::Changed)
         }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => rewrite_table_with_joins(table_with_joins, selection, allow_unqualified, resolver),
         _ => Ok(RewriteDecision::Unchanged),
     }
 }
@@ -146,15 +152,14 @@ fn build_entity_view_query(
     target: &EntityViewTarget,
     pushdown: &HistoryPredicatePushdown,
 ) -> Result<Query, LixError> {
-    let (source_sql, extra_predicates) = match target.variant {
+    let (source, extra_predicates) = match target.variant {
         EntityViewVariant::Base => {
             base_effective_state_source(target.version_id_override.as_deref())
         }
-        EntityViewVariant::ByVersion => {
-            ("lix_state_by_version".to_string(), vec!["1=1".to_string()])
-        }
-        EntityViewVariant::History => ("lix_state_history".to_string(), vec!["1=1".to_string()]),
+        EntityViewVariant::ByVersion => ("lix_state_by_version".to_string(), Vec::new()),
+        EntityViewVariant::History => ("lix_state_history".to_string(), Vec::new()),
     };
+
     let mut select_parts = Vec::new();
     for property in &target.properties {
         select_parts.push(format!(
@@ -166,9 +171,10 @@ fn build_entity_view_query(
     for (column, alias) in projected_lixcol_aliases_for_variant(target.variant) {
         select_parts.push(format!("{column} AS {alias}"));
     }
+
     let mut predicates = vec![format!(
         "schema_key = '{schema_key}'",
-        schema_key = escape_sql_string(&target.schema_key)
+        schema_key = escape_sql_string(&target.schema_key),
     )];
     predicates.extend(extra_predicates);
     predicates.extend(render_history_pushdown_predicates(pushdown));
@@ -179,7 +185,7 @@ fn build_entity_view_query(
          FROM {source} \
          WHERE {predicate}",
         projection = select_parts.join(", "),
-        source = source_sql,
+        source = source,
         predicate = predicates.join(" AND "),
     );
     parse_single_query(&sql)
@@ -194,6 +200,7 @@ fn collect_history_pushdown_predicates(
     if variant != EntityViewVariant::History {
         return HistoryPredicatePushdown::default();
     }
+
     let mut pushdown = HistoryPredicatePushdown::default();
     let Some(expr) = selection.as_ref() else {
         return pushdown;
@@ -328,6 +335,7 @@ fn extract_history_source_column(
         Expr::Identifier(identifier) if allow_unqualified => identifier.value.as_str(),
         _ => return None,
     };
+
     match column {
         "lixcol_root_commit_id" | "root_commit_id" => Some("root_commit_id"),
         "lixcol_version_id" | "version_id" => Some("version_id"),
@@ -405,13 +413,14 @@ fn render_history_pushdown_predicates(pushdown: &HistoryPredicatePushdown) -> Ve
 
 fn base_effective_state_source(version_id_override: Option<&str>) -> (String, Vec<String>) {
     match version_id_override {
-        // Base views represent effective state. With an explicit version override, the
-        // effective-state source is still `lix_state_by_version`, scoped to that version.
+        // Base entity views are effective-state wrappers by default.
+        // If schema metadata pins a version, route through by-version with
+        // that explicit target-version filter.
         Some(version_id) => (
             "lix_state_by_version".to_string(),
             vec![format!("version_id = '{}'", escape_sql_string(version_id))],
         ),
-        None => ("lix_state".to_string(), vec!["1=1".to_string()]),
+        None => ("lix_state".to_string(), Vec::new()),
     }
 }
 
