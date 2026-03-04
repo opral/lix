@@ -29,6 +29,7 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command};
+    use crate::cli::sql::SqlSubcommand;
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -38,6 +39,31 @@ mod tests {
         match cli.command {
             Command::Init(init) => assert_eq!(init.path, PathBuf::from("tmp/new.lix")),
             _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn parses_sql_execute_repeated_param_flags() {
+        let cli = Cli::try_parse_from([
+            "lix",
+            "sql",
+            "execute",
+            "--param",
+            "first",
+            "--param",
+            "second",
+            "SELECT ?1, ?2",
+        ])
+        .expect("parse succeeds");
+
+        match cli.command {
+            Command::Sql(sql) => match sql.command {
+                SqlSubcommand::Execute(args) => {
+                    assert_eq!(args.params, vec!["first".to_string(), "second".to_string()]);
+                    assert_eq!(args.sql, "SELECT ?1, ?2");
+                }
+            },
+            _ => panic!("expected sql command"),
         }
     }
 }
