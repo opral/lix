@@ -228,6 +228,7 @@ mod tests {
                 schema_key: "schema".to_string(),
                 effective_scope_fallback: false,
                 effective_scope_selection_sql: None,
+                effective_scope_untracked_selection_sql: None,
             })),
             mutations: vec![crate::engine::sql::planning::rewrite_engine::types::MutationRow {
                 operation: crate::engine::sql::planning::rewrite_engine::types::MutationOperation::Insert,
@@ -349,6 +350,7 @@ mod tests {
                 schema_key: "schema".to_string(),
                 effective_scope_fallback: false,
                 effective_scope_selection_sql: None,
+                effective_scope_untracked_selection_sql: None,
             })),
             mutations: Vec::new(),
             update_validations: Vec::new(),

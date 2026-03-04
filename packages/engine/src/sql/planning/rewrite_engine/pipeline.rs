@@ -208,6 +208,11 @@ fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
                 Some(sql) => serialized.push_str(sql),
                 None => serialized.push_str("scope_sql:none"),
             }
+            serialized.push('\u{1e}');
+            match &plan.effective_scope_untracked_selection_sql {
+                Some(sql) => serialized.push_str(sql),
+                None => serialized.push_str("scope_untracked_sql:none"),
+            }
         }
         Some(PostprocessPlan::DomainChangesOnly) => {
             serialized.push_str("postprocess:domain_changes_only");

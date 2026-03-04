@@ -60,6 +60,7 @@ const INIT_STATEMENTS: &[&str] = &[
      plugin_key TEXT NOT NULL,\
      snapshot_content TEXT,\
      metadata TEXT,\
+     writer_key TEXT,\
      schema_version TEXT NOT NULL,\
      created_at TEXT NOT NULL,\
      updated_at TEXT NOT NULL,\
@@ -207,6 +208,7 @@ pub async fn init_backend(backend: &dyn LixBackend) -> Result<(), LixError> {
         backend.execute(statement, &[]).await?;
     }
     ensure_binary_chunk_codec_columns(backend).await?;
+    ensure_state_untracked_writer_key_column(backend).await?;
     ensure_observe_tick_table(backend).await?;
     Ok(())
 }
@@ -257,6 +259,16 @@ async fn ensure_binary_chunk_codec_columns(backend: &dyn LixBackend) -> Result<(
     )
     .await?;
     Ok(())
+}
+
+async fn ensure_state_untracked_writer_key_column(backend: &dyn LixBackend) -> Result<(), LixError> {
+    ensure_column_exists(
+        backend,
+        "lix_internal_state_untracked",
+        "writer_key",
+        "TEXT",
+    )
+    .await
 }
 
 async fn ensure_column_exists(

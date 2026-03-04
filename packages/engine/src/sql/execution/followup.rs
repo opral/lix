@@ -295,7 +295,7 @@ async fn build_delete_followup_statement_batch(
         });
     }
 
-    if let Some(selection_sql) = plan.effective_scope_selection_sql.as_deref() {
+    if let Some(selection_sql) = plan.effective_scope_untracked_selection_sql.as_deref() {
         delete_effective_scope_untracked_rows(executor, selection_sql, params).await?;
     }
 

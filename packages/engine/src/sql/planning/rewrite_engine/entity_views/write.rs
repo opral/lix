@@ -14,6 +14,7 @@ use sqlparser::parser::Parser;
 
 use crate::backend::SqlDialect;
 use crate::cel::CelEvaluator;
+use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
 use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::{
     rewrite_read_query, rewrite_read_query_with_backend,
 };
@@ -983,7 +984,10 @@ fn rewrite_subquery_expressions(expr: Expr) -> Result<Expr, LixError> {
             negated,
         } => Expr::InSubquery {
             expr: Box::new(rewrite_subquery_expressions(*expr)?),
-            subquery: Box::new(rewrite_read_query(*subquery)?),
+            subquery: Box::new(rewrite_and_lower_read_subquery(
+                *subquery,
+                SqlDialect::Sqlite,
+            )?),
             negated,
         },
         Expr::Between {
@@ -1053,10 +1057,16 @@ fn rewrite_subquery_expressions(expr: Expr) -> Result<Expr, LixError> {
             right: Box::new(rewrite_subquery_expressions(*right)?),
         },
         Expr::Exists { subquery, negated } => Expr::Exists {
-            subquery: Box::new(rewrite_read_query(*subquery)?),
+            subquery: Box::new(rewrite_and_lower_read_subquery(
+                *subquery,
+                SqlDialect::Sqlite,
+            )?),
             negated,
         },
-        Expr::Subquery(subquery) => Expr::Subquery(Box::new(rewrite_read_query(*subquery)?)),
+        Expr::Subquery(subquery) => Expr::Subquery(Box::new(rewrite_and_lower_read_subquery(
+            *subquery,
+            SqlDialect::Sqlite,
+        )?)),
         Expr::Function(function) => {
             let mut function = function;
             if let sqlparser::ast::FunctionArguments::List(list) = &mut function.args {
@@ -1161,7 +1171,9 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                 negated,
             } => Expr::InSubquery {
                 expr: Box::new(rewrite_subquery_expressions_with_backend(*expr, backend).await?),
-                subquery: Box::new(rewrite_read_query_with_backend(backend, *subquery).await?),
+                subquery: Box::new(
+                    rewrite_and_lower_read_subquery_with_backend(backend, *subquery).await?,
+                ),
                 negated,
             },
             Expr::Between {
@@ -1237,11 +1249,13 @@ fn rewrite_subquery_expressions_with_backend<'a>(
                 right: Box::new(rewrite_subquery_expressions_with_backend(*right, backend).await?),
             },
             Expr::Exists { subquery, negated } => Expr::Exists {
-                subquery: Box::new(rewrite_read_query_with_backend(backend, *subquery).await?),
+                subquery: Box::new(
+                    rewrite_and_lower_read_subquery_with_backend(backend, *subquery).await?,
+                ),
                 negated,
             },
             Expr::Subquery(subquery) => Expr::Subquery(Box::new(
-                rewrite_read_query_with_backend(backend, *subquery).await?,
+                rewrite_and_lower_read_subquery_with_backend(backend, *subquery).await?,
             )),
             Expr::Function(function) => {
                 let mut function = function;
@@ -1323,6 +1337,33 @@ fn rewrite_subquery_expressions_with_backend<'a>(
             other => other,
         })
     })
+}
+
+fn rewrite_and_lower_read_subquery(
+    subquery: Query,
+    dialect: SqlDialect,
+) -> Result<Query, LixError> {
+    let rewritten = rewrite_read_query(subquery)?;
+    lower_query(rewritten, dialect)
+}
+
+async fn rewrite_and_lower_read_subquery_with_backend(
+    backend: &dyn LixBackend,
+    subquery: Query,
+) -> Result<Query, LixError> {
+    let rewritten = rewrite_read_query_with_backend(backend, subquery).await?;
+    lower_query(rewritten, backend.dialect())
+}
+
+fn lower_query(query: Query, dialect: SqlDialect) -> Result<Query, LixError> {
+    let statement = Statement::Query(Box::new(query));
+    match lower_statement(statement, dialect)? {
+        Statement::Query(query) => Ok(*query),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected lowered subquery to remain a SELECT query".to_string(),
+        }),
+    }
 }
 
 fn rewrite_column_reference_expr(
