@@ -193,7 +193,7 @@ fn build_filesystem_projection_query(
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                fd.data AS data, \
+                COALESCE(fd.data, bbs.data) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -218,6 +218,11 @@ fn build_filesystem_projection_query(
              LEFT JOIN lix_internal_file_data_cache fd \
                ON fd.file_id = f.id \
               AND fd.version_id = f.lixcol_version_id \
+             LEFT JOIN lix_internal_binary_file_version_ref bfr \
+               ON bfr.file_id = f.id \
+              AND bfr.version_id = f.lixcol_version_id \
+             LEFT JOIN lix_internal_binary_blob_store bbs \
+               ON bbs.blob_hash = bfr.blob_hash \
              WHERE {active_version_scope}",
             active_version_scope = active_version_scope_predicate("f.lixcol_version_id"),
             active_version_scope_descriptor = active_version_scope_predicate("version_id")
@@ -292,7 +297,7 @@ fn build_filesystem_projection_query(
                             ELSE dp.path || f.name || '.' || f.extension \
                         END \
                 END AS path, \
-                fd.data AS data, \
+                COALESCE(fd.data, bbs.data) AS data, \
                 f.metadata, \
                 f.hidden, \
                 f.lixcol_entity_id, \
@@ -317,7 +322,12 @@ fn build_filesystem_projection_query(
                ON v.id = f.lixcol_version_id \
              LEFT JOIN lix_internal_file_data_cache fd \
                ON fd.file_id = f.id \
-              AND fd.version_id = f.lixcol_version_id"
+              AND fd.version_id = f.lixcol_version_id \
+             LEFT JOIN lix_internal_binary_file_version_ref bfr \
+               ON bfr.file_id = f.id \
+              AND bfr.version_id = f.lixcol_version_id \
+             LEFT JOIN lix_internal_binary_blob_store bbs \
+               ON bbs.blob_hash = bfr.blob_hash"
             .to_string(),
         FILE_HISTORY_VIEW | FILE_HISTORY_BY_VERSION_VIEW => {
             let state_history_view =
@@ -1146,7 +1156,9 @@ mod tests {
             .expect("query should be rewritten")
             .to_string();
 
-        assert!(rewritten.contains("fd.data AS data"));
+        assert!(rewritten.contains("COALESCE(fd.data, bbs.data) AS data"));
+        assert!(rewritten.contains("LEFT JOIN lix_internal_binary_file_version_ref bfr"));
+        assert!(rewritten.contains("LEFT JOIN lix_internal_binary_blob_store bbs"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("FROM lix_internal_state_untracked"));
@@ -1165,7 +1177,9 @@ mod tests {
             .expect("query should be rewritten")
             .to_string();
 
-        assert!(rewritten.contains("fd.data AS data"));
+        assert!(rewritten.contains("COALESCE(fd.data, bbs.data) AS data"));
+        assert!(rewritten.contains("LEFT JOIN lix_internal_binary_file_version_ref bfr"));
+        assert!(rewritten.contains("LEFT JOIN lix_internal_binary_blob_store bbs"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("LEFT JOIN lix_version v"));

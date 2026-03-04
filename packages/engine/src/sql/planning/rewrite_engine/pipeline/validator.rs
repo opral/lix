@@ -112,6 +112,7 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
                     });
                 }
             }
+            PostprocessPlan::DomainChangesOnly => {}
         }
     }
     Ok(())

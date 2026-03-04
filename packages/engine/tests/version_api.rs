@@ -19,6 +19,22 @@ fn value_as_bool(value: &Value) -> bool {
     }
 }
 
+async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let active = engine
+        .execute(
+            "SELECT v.commit_id \
+             FROM lix_active_version av \
+             JOIN lix_version v ON v.id = av.version_id \
+             ORDER BY av.id \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("active version commit query should succeed");
+    assert_eq!(active.rows.len(), 1);
+    value_as_text(&active.rows[0][0])
+}
+
 simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -133,6 +149,41 @@ simulation_test!(
         assert_eq!(active_after.rows.len(), 1);
         assert_eq!(value_as_text(&active_after.rows[0][0]), active_version_id);
         assert_ne!(value_as_text(&active_after.rows[0][1]), "global");
+    }
+);
+
+simulation_test!(
+    content_only_update_moves_active_commit_pointer,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('version-api-content-only', '/version-api-content-only.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let before_commit = active_version_commit_id(&engine).await;
+
+        engine
+            .execute(
+                "UPDATE lix_file SET data = lix_text_encode('after') \
+                 WHERE id = 'version-api-content-only'",
+                &[],
+            )
+            .await
+            .expect("content-only update should succeed");
+
+        let after_commit = active_version_commit_id(&engine).await;
+        assert_ne!(after_commit, before_commit);
     }
 );
 

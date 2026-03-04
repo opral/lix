@@ -209,6 +209,9 @@ fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
                 None => serialized.push_str("scope_sql:none"),
             }
         }
+        Some(PostprocessPlan::DomainChangesOnly) => {
+            serialized.push_str("postprocess:domain_changes_only");
+        }
     }
     serialized.push('\u{1f}');
 

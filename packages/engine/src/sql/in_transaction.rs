@@ -15,6 +15,14 @@ impl Engine {
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
     ) -> Result<QueryResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        if parsed_statements.len() != 1 {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
+                    "execute_with_options_in_transaction expects exactly one SQL statement"
+                        .to_string(),
+            });
+        }
         let writer_key = options.writer_key.as_deref();
         let defer_side_effects = deferred_side_effects.is_some();
         let prepared = {

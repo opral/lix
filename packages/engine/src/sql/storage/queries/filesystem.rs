@@ -41,6 +41,16 @@ pub(crate) fn select_file_data_cache_blob_sql() -> String {
     )
 }
 
+pub(crate) fn upsert_file_data_cache_sql() -> String {
+    format!(
+        "INSERT INTO {} (file_id, version_id, data) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (file_id, version_id) DO UPDATE SET \
+         data = EXCLUDED.data",
+        tables::filesystem::INTERNAL_FILE_DATA_CACHE,
+    )
+}
+
 pub(crate) fn binary_blob_exists_sql() -> String {
     format!(
         "SELECT 1 \
@@ -53,6 +63,17 @@ pub(crate) fn binary_blob_exists_sql() -> String {
          LIMIT 1",
         tables::filesystem::INTERNAL_BINARY_BLOB_STORE,
         tables::filesystem::INTERNAL_BINARY_BLOB_MANIFEST,
+    )
+}
+
+pub(crate) fn upsert_binary_blob_store_sql() -> String {
+    format!(
+        "INSERT INTO {} (blob_hash, data, size_bytes, created_at) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (blob_hash) DO UPDATE SET \
+         data = EXCLUDED.data, \
+         size_bytes = EXCLUDED.size_bytes",
+        tables::filesystem::INTERNAL_BINARY_BLOB_STORE,
     )
 }
 

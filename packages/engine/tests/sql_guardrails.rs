@@ -238,3 +238,32 @@ fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
         "side effects must not render statements to SQL text for placeholder advancement"
     );
 }
+
+#[test]
+fn guardrail_authoritative_writes_do_not_invalidate_file_data_cache_targets() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let effects_source =
+        fs::read_to_string(root.join("src/sql/semantics/state_resolution/effects.rs"))
+            .expect("effects.rs should be readable");
+
+    assert!(
+        !effects_source.contains(
+            "file_data_cache_invalidation_targets\n        .extend(authoritative_pending_file_write_targets.iter().cloned());"
+        ),
+        "authoritative file writes must be write-through, not file-data-cache invalidation targets"
+    );
+}
+
+#[test]
+fn guardrail_filesystem_data_only_updates_use_domain_changes_only_postprocess() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let canonical_source = fs::read_to_string(
+        root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"),
+    )
+    .expect("canonical statement rule source should be readable");
+
+    assert!(
+        canonical_source.contains("PostprocessPlan::DomainChangesOnly"),
+        "filesystem data-only updates must be able to emit DomainChangesOnly postprocess"
+    );
+}

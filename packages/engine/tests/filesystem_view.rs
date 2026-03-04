@@ -479,6 +479,274 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_data_insert_decode_never_null,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('qa-insert-decode', '/qa-insert-decode.md', lix_text_encode('insert-value'))",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT lix_text_decode(data) FROM lix_file WHERE id = 'qa-insert-decode' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("decode read should succeed");
+
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "insert-value");
+    }
+);
+
+simulation_test!(
+    file_data_update_decode_never_null,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('qa-update-decode', '/qa-update-decode.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+        engine
+            .execute(
+                "UPDATE lix_file SET data = lix_text_encode('after') \
+                 WHERE id = 'qa-update-decode'",
+                &[],
+            )
+            .await
+            .expect("update should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT lix_text_decode(data) FROM lix_file WHERE id = 'qa-update-decode' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("decode read should succeed");
+
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "after");
+    }
+);
+
+simulation_test!(
+    file_data_cache_miss_auto_materializes_from_cas,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('qa-cache-miss', '/qa-cache-miss.md', lix_text_encode('cache-miss'))",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+
+        let version_id = active_version_id(&engine).await;
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'qa-cache-miss' AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT lix_text_decode(data) FROM lix_file WHERE id = 'qa-cache-miss' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("decode read should succeed");
+
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "cache-miss");
+    }
+);
+
+simulation_test!(
+    file_data_manifest_only_auto_materializes,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('qa-manifest-only', '/qa-manifest-only.md', lix_text_encode('manifest-only'))",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+
+        let version_id = active_version_id(&engine).await;
+        let blob_hash_rows = engine
+            .execute(
+                &format!(
+                    "SELECT blob_hash FROM lix_internal_binary_file_version_ref \
+                     WHERE file_id = 'qa-manifest-only' AND version_id = '{}' LIMIT 1",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("blob hash query should succeed");
+        assert_eq!(blob_hash_rows.rows.len(), 1);
+        let blob_hash = match &blob_hash_rows.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text blob hash, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'qa-manifest-only' AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_blob_store WHERE blob_hash = '{}'",
+                    blob_hash
+                ),
+                &[],
+            )
+            .await
+            .expect("blob store delete should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT lix_text_decode(data) FROM lix_file WHERE id = 'qa-manifest-only' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("decode read should succeed");
+
+        assert_eq!(rows.rows.len(), 1);
+        assert_text(&rows.rows[0][0], "manifest-only");
+    }
+);
+
+simulation_test!(
+    file_data_unrecoverable_returns_explicit_error,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('qa-unrecoverable', '/qa-unrecoverable.md', lix_text_encode('missing'))",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+
+        let version_id = active_version_id(&engine).await;
+        let blob_hash_rows = engine
+            .execute(
+                &format!(
+                    "SELECT blob_hash FROM lix_internal_binary_file_version_ref \
+                     WHERE file_id = 'qa-unrecoverable' AND version_id = '{}' LIMIT 1",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("blob hash query should succeed");
+        assert_eq!(blob_hash_rows.rows.len(), 1);
+        let blob_hash = match &blob_hash_rows.rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text blob hash, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_file_data_cache \
+                     WHERE file_id = 'qa-unrecoverable' AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("cache delete should succeed");
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_blob_store WHERE blob_hash = '{}'",
+                    blob_hash
+                ),
+                &[],
+            )
+            .await
+            .expect("blob store delete should succeed");
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_internal_binary_blob_manifest_chunk WHERE blob_hash = '{}'",
+                    blob_hash
+                ),
+                &[],
+            )
+            .await
+            .expect("manifest chunk delete should succeed");
+        let error = engine
+            .execute(
+                "SELECT lix_text_decode(data) FROM lix_file WHERE id = 'qa-unrecoverable' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect_err("unrecoverable read should fail");
+        assert_eq!(error.code, "LIX_ERROR_FILE_DATA_UNAVAILABLE");
+    }
+);
+
+simulation_test!(
     directory_insert_by_path_autocreates_missing_ancestors,
     |sim| async move {
         let engine = sim

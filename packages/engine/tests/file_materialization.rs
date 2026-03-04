@@ -1857,12 +1857,6 @@ simulation_test!(
             .await
             .expect("initial file insert should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
-                .await,
-            0
-        );
-
         engine
             .execute(
                 &format!(
@@ -1928,7 +1922,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
-                 VALUES ('file-json-path-only-cache-preserve', ?, ?)",
+                 VALUES ('file-json-path-only-cache-preserve', ?, ?) \
+                 ON CONFLICT (file_id, version_id) DO UPDATE SET \
+                 data = EXCLUDED.data",
                 &[
                     Value::Text(main_version_id.clone()),
                     Value::Blob(b"seed-cache".to_vec()),
@@ -2463,11 +2459,6 @@ simulation_test!(
             .await
             .expect("file_by_version insert should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
-            0
-        );
-
         let before_rows = engine
             .execute(
                 &format!(
@@ -2621,11 +2612,6 @@ simulation_test!(
             .await
             .expect("file insert should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
-            0
-        );
-
         engine
             .execute(
                 &format!(
@@ -2770,11 +2756,6 @@ simulation_test!(
             .await
             .expect("file_by_version insert should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
-            0
-        );
-
         engine
             .execute(
                 &format!(
@@ -2830,11 +2811,6 @@ simulation_test!(
             )
             .await
             .expect("file insert should succeed");
-
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
-            0
-        );
 
         engine
             .execute(
@@ -2919,11 +2895,6 @@ simulation_test!(
             )
             .await
             .expect("file_by_version insert should succeed");
-
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
-            0
-        );
 
         engine
             .execute(

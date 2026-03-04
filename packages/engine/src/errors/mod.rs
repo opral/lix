@@ -15,6 +15,7 @@ pub enum ErrorCode {
     TransactionControlStatementDenied,
     TransactionHandleNotFound,
     FileDataExpectsBytes,
+    FileDataUnavailable,
 }
 
 impl ErrorCode {
@@ -34,6 +35,7 @@ impl ErrorCode {
             }
             Self::TransactionHandleNotFound => "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND",
             Self::FileDataExpectsBytes => "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
+            Self::FileDataUnavailable => "LIX_ERROR_FILE_DATA_UNAVAILABLE",
         }
     }
 
@@ -51,6 +53,7 @@ impl ErrorCode {
             Self::TransactionControlStatementDenied,
             Self::TransactionHandleNotFound,
             Self::FileDataExpectsBytes,
+            Self::FileDataUnavailable,
         ]
     }
 }
@@ -194,10 +197,26 @@ pub(crate) fn file_data_expects_bytes_error() -> LixError {
     )
 }
 
+pub(crate) fn file_data_unavailable_error(
+    file_id: &str,
+    version_id: &str,
+    blob_hash: Option<&str>,
+) -> LixError {
+    let blob_suffix = blob_hash
+        .map(|value| format!(" (blob_hash={value})"))
+        .unwrap_or_default();
+    build_error(
+        ErrorCode::FileDataUnavailable,
+        &format!(
+            "file data is unavailable for file_id='{file_id}' version_id='{version_id}'{blob_suffix}"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        already_initialized_error, file_data_expects_bytes_error,
+        already_initialized_error, file_data_expects_bytes_error, file_data_unavailable_error,
         internal_table_access_denied_error, not_initialized_error, read_only_view_write_error,
         schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
         table_not_found_read_error, transaction_control_statement_denied_error,
@@ -274,6 +293,13 @@ mod tests {
         assert_eq!(
             file_data_expects_bytes.code,
             "LIX_ERROR_FILE_DATA_EXPECTS_BYTES"
+        );
+
+        let file_data_unavailable =
+            file_data_unavailable_error("file-a", "version-a", Some("abc123"));
+        assert_eq!(
+            file_data_unavailable.code,
+            "LIX_ERROR_FILE_DATA_UNAVAILABLE"
         );
     }
 
