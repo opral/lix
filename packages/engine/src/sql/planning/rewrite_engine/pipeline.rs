@@ -121,7 +121,7 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
         }
     }
 
-    if postprocess.is_some() && rewritten.len() != 1 {
+    if requires_single_statement_postprocess(postprocess.as_ref()) && rewritten.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
@@ -259,6 +259,11 @@ fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
     }
 
     blake3::hash(serialized.as_bytes()).to_hex().to_string()
+}
+
+#[cfg(test)]
+fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
+    matches!(plan, Some(other) if !matches!(other, PostprocessPlan::VtableUpdate(_)))
 }
 
 #[cfg(test)]

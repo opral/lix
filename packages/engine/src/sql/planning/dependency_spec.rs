@@ -613,7 +613,7 @@ mod tests {
     fn derive_dependency_spec_resolves_placeholder_literals() {
         let statements = parse_sql_statements(
             "SELECT entity_id FROM lix_state \
-             WHERE schema_key = $1 AND entity_id IN ($2, 'entity-b') AND version_id = 'v-1'",
+             WHERE schema_key = $1 AND entity_id IN ($2, 'entity-b')",
         )
         .expect("parse sql");
 

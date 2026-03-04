@@ -533,6 +533,7 @@ fn cleanup_stale_embedded_postgres_processes() -> Result<(), LixError> {
     }
 
     cleanup_stale_embedded_postgres_artifacts();
+    cleanup_stale_sysv_ipc_objects();
 
     Ok(())
 }
@@ -572,4 +573,98 @@ fn embedded_postgres_owner_pid(file_name: &str) -> Option<u32> {
     let suffix = file_name.strip_prefix("lix-embedded-postgres-")?;
     let suffix = suffix.strip_suffix(".pgpass").unwrap_or(suffix);
     suffix.parse::<u32>().ok()
+}
+
+fn cleanup_stale_sysv_ipc_objects() {
+    cleanup_stale_sysv_shared_memory_segments();
+    cleanup_stale_sysv_semaphores();
+}
+
+fn cleanup_stale_sysv_shared_memory_segments() {
+    let Ok(current_user) = std::env::var("USER") else {
+        return;
+    };
+
+    let Ok(output) = std::process::Command::new("ipcs")
+        .args(["-m", "-a"])
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let mut segment_ids = Vec::new();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    for line in listing.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 9 || fields[0] != "m" {
+            continue;
+        }
+
+        let id = fields[1];
+        let owner = fields[4];
+        let nattch = fields[8];
+        if owner == current_user && nattch == "0" {
+            segment_ids.push(id.to_string());
+        }
+    }
+
+    for id in segment_ids {
+        let _ = std::process::Command::new("ipcrm")
+            .args(["-m", &id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn cleanup_stale_sysv_semaphores() {
+    let Ok(current_user) = std::env::var("USER") else {
+        return;
+    };
+
+    let Ok(output) = std::process::Command::new("ipcs")
+        .args(["-s", "-p"])
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    let mut semaphore_ids = Vec::new();
+    let listing = String::from_utf8_lossy(&output.stdout);
+    for line in listing.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || fields[0] != "s" {
+            continue;
+        }
+
+        let id = fields[1];
+        let owner = fields[4];
+        if owner != current_user {
+            continue;
+        }
+
+        let cpid = fields[6].parse::<u32>().ok();
+        let lpid = fields[7].parse::<u32>().ok();
+        let cpid_alive = cpid.is_some_and(is_pid_alive);
+        let lpid_alive = lpid.is_some_and(is_pid_alive);
+        if !cpid_alive && !lpid_alive {
+            semaphore_ids.push(id.to_string());
+        }
+    }
+
+    for id in semaphore_ids {
+        let _ = std::process::Command::new("ipcrm")
+            .args(["-s", &id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }

@@ -1,10 +1,9 @@
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Ident, Insert,
     ObjectName, ObjectNamePart, OnConflictAction, OnInsert, SetExpr, TableFactor, TableObject,
-    TableWithJoins, Update, Value,
+    TableWithJoins, Update, Value as SqlValue,
 };
 
-use crate::engine::sql::planning::rewrite_engine::bind_sql;
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -13,7 +12,7 @@ use crate::version::{
 use crate::{LixBackend, LixError, Value as EngineValue};
 
 const LIX_STATE_VIEW_NAME: &str = "lix_state";
-const VTABLE_NAME: &str = "lix_internal_state_vtable";
+const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 
 pub async fn rewrite_insert_with_backend(
@@ -30,11 +29,10 @@ pub async fn rewrite_insert_with_backend(
             description: "lix_state insert requires explicit columns".to_string(),
         });
     }
-    if insert
-        .columns
-        .iter()
-        .any(|column| column.value.eq_ignore_ascii_case("version_id"))
-    {
+    if insert.columns.iter().any(|column| {
+        column.value.eq_ignore_ascii_case("version_id")
+            || column.value.eq_ignore_ascii_case("lixcol_version_id")
+    }) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description:
@@ -70,7 +68,7 @@ pub async fn rewrite_insert_with_backend(
 
     insert.columns.push(Ident::new("version_id"));
     insert.table = TableObject::TableName(ObjectName(vec![ObjectNamePart::Identifier(
-        Ident::new(VTABLE_NAME),
+        Ident::new(LIX_STATE_BY_VERSION_VIEW_NAME),
     )]));
     Ok(Some(insert))
 }
@@ -126,17 +124,16 @@ fn validate_and_strip_insert_on_conflict(insert: &mut Insert) -> Result<(), LixE
 pub async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     mut update: Update,
-    params: &[EngineValue],
+    _params: &[EngineValue],
 ) -> Result<Option<Update>, LixError> {
     if !table_with_joins_is_lix_state(&update.table) {
         return Ok(None);
     }
     validate_update_assignments_known(&update)?;
-    if update
-        .assignments
-        .iter()
-        .any(|assignment| assignment_target_is_column(&assignment.target, "version_id"))
-    {
+    if update.assignments.iter().any(|assignment| {
+        assignment_target_is_column(&assignment.target, "version_id")
+            || assignment_target_is_column(&assignment.target, "lixcol_version_id")
+    }) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description:
@@ -145,55 +142,25 @@ pub async fn rewrite_update_with_backend(
         });
     }
 
-    let active_version_id = load_active_version_id(backend).await?;
-    let stripped_selection = update
+    if update
         .selection
-        .take()
-        .map(strip_inherited_from_version_predicate)
-        .transpose()?
-        .flatten();
-    let has_untracked_predicate = stripped_selection
         .as_ref()
-        .map(|selection| contains_column_reference(selection, "untracked"))
-        .unwrap_or(false);
-    replace_table_with_vtable(&mut update.table)?;
-    let mut selection = match stripped_selection {
+        .is_some_and(contains_forbidden_version_id_reference)
+    {
+        return Err(version_id_reference_error());
+    }
+
+    let active_version_id = load_active_version_id(backend).await?;
+    replace_table_with_state_by_version(&mut update.table)?;
+    update.selection = Some(match update.selection.take() {
         Some(existing) => Expr::BinaryOp {
             left: Box::new(existing),
             op: BinaryOperator::And,
             right: Box::new(version_predicate_expr(&active_version_id)),
         },
         None => version_predicate_expr(&active_version_id),
-    };
-
-    if !has_untracked_predicate && matches_untracked_rows(backend, &selection, params).await? {
-        selection = Expr::BinaryOp {
-            left: Box::new(selection),
-            op: BinaryOperator::And,
-            right: Box::new(untracked_true_predicate_expr()),
-        };
-    }
-
-    update.selection = Some(selection);
+    });
     Ok(Some(update))
-}
-
-async fn matches_untracked_rows(
-    backend: &dyn LixBackend,
-    selection: &Expr,
-    params: &[EngineValue],
-) -> Result<bool, LixError> {
-    let sql = format!(
-        "SELECT 1 \
-         FROM {untracked_table} \
-         WHERE ({selection}) \
-         LIMIT 1",
-        untracked_table = UNTRACKED_TABLE,
-        selection = selection,
-    );
-    let bound = bind_sql(&sql, params, backend.dialect())?;
-    let result = backend.execute(&bound.sql, &bound.params).await?;
-    Ok(!result.rows.is_empty())
 }
 
 fn contains_column_reference(expr: &Expr, column: &str) -> bool {
@@ -231,14 +198,6 @@ fn contains_column_reference(expr: &Expr, column: &str) -> bool {
     }
 }
 
-fn untracked_true_predicate_expr() -> Expr {
-    Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(Ident::new("untracked"))),
-        op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(Value::Boolean(true).into())),
-    }
-}
-
 pub async fn rewrite_delete_with_backend(
     backend: &dyn LixBackend,
     mut delete: Delete,
@@ -247,15 +206,17 @@ pub async fn rewrite_delete_with_backend(
         return Ok(None);
     }
 
-    let active_version_id = load_active_version_id(backend).await?;
-    replace_delete_from_vtable(&mut delete)?;
-    let stripped_selection = delete
+    if delete
         .selection
-        .take()
-        .map(strip_inherited_from_version_predicate)
-        .transpose()?
-        .flatten();
-    delete.selection = Some(match stripped_selection {
+        .as_ref()
+        .is_some_and(contains_forbidden_version_id_reference)
+    {
+        return Err(version_id_reference_error());
+    }
+
+    let active_version_id = load_active_version_id(backend).await?;
+    replace_delete_from_state_by_version(&mut delete)?;
+    delete.selection = Some(match delete.selection.take() {
         Some(existing) => Expr::BinaryOp {
             left: Box::new(existing),
             op: BinaryOperator::And,
@@ -332,7 +293,7 @@ fn delete_from_is_lix_state(delete: &Delete) -> bool {
     }
 }
 
-fn replace_table_with_vtable(table: &mut TableWithJoins) -> Result<(), LixError> {
+fn replace_table_with_state_by_version(table: &mut TableWithJoins) -> Result<(), LixError> {
     if !table.joins.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -341,7 +302,9 @@ fn replace_table_with_vtable(table: &mut TableWithJoins) -> Result<(), LixError>
     }
     match &mut table.relation {
         TableFactor::Table { name, .. } => {
-            *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(VTABLE_NAME))]);
+            *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                LIX_STATE_BY_VERSION_VIEW_NAME,
+            ))]);
             Ok(())
         }
         _ => Err(LixError {
@@ -351,7 +314,7 @@ fn replace_table_with_vtable(table: &mut TableWithJoins) -> Result<(), LixError>
     }
 }
 
-fn replace_delete_from_vtable(delete: &mut Delete) -> Result<(), LixError> {
+fn replace_delete_from_state_by_version(delete: &mut Delete) -> Result<(), LixError> {
     let tables = match &mut delete.from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
     };
@@ -361,7 +324,7 @@ fn replace_delete_from_vtable(delete: &mut Delete) -> Result<(), LixError> {
             description: "lix_state delete requires table target".to_string(),
         });
     };
-    replace_table_with_vtable(table)
+    replace_table_with_state_by_version(table)
 }
 
 fn version_predicate_expr(version_id: &str) -> Expr {
@@ -369,64 +332,22 @@ fn version_predicate_expr(version_id: &str) -> Expr {
         left: Box::new(Expr::Identifier(Ident::new("version_id"))),
         op: BinaryOperator::Eq,
         right: Box::new(Expr::Value(
-            Value::SingleQuotedString(version_id.to_string()).into(),
+            SqlValue::SingleQuotedString(version_id.to_string()).into(),
         )),
     }
 }
 
-fn strip_inherited_from_version_predicate(expr: Expr) -> Result<Option<Expr>, LixError> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            let left = strip_inherited_from_version_predicate(*left)?;
-            let right = strip_inherited_from_version_predicate(*right)?;
-            match (left, right) {
-                (Some(left), Some(right)) => Ok(Some(Expr::BinaryOp {
-                    left: Box::new(left),
-                    op: BinaryOperator::And,
-                    right: Box::new(right),
-                })),
-                (Some(expr), None) | (None, Some(expr)) => Ok(Some(expr)),
-                (None, None) => Ok(None),
-            }
-        }
-        Expr::IsNull(inner) if expr_is_inherited_from_version_column(&inner) => Ok(None),
-        Expr::IsNotNull(inner) if expr_is_inherited_from_version_column(&inner) => {
-            Ok(Some(false_predicate_expr()))
-        }
-        other if contains_column_reference(&other, "inherited_from_version_id") => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description:
-                "lix_state mutation only supports inherited_from_version_id filters via IS NULL/IS NOT NULL"
-                    .to_string(),
-        }),
-        other => Ok(Some(other)),
-    }
+fn contains_forbidden_version_id_reference(expr: &Expr) -> bool {
+    contains_column_reference(expr, "version_id")
+        || contains_column_reference(expr, "lixcol_version_id")
 }
 
-fn expr_is_inherited_from_version_column(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identifier(ident) => ident
-            .value
-            .eq_ignore_ascii_case("inherited_from_version_id"),
-        Expr::CompoundIdentifier(idents) => idents
-            .last()
-            .map(|ident| {
-                ident
-                    .value
-                    .eq_ignore_ascii_case("inherited_from_version_id")
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn false_predicate_expr() -> Expr {
-    Expr::BinaryOp {
-        left: Box::new(Expr::Value(Value::Number("1".to_string(), false).into())),
-        op: BinaryOperator::Eq,
-        right: Box::new(Expr::Value(Value::Number("0".to_string(), false).into())),
+fn version_id_reference_error() -> LixError {
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description:
+            "lix_state does not expose version_id; use lix_state_by_version for explicit version filters"
+                .to_string(),
     }
 }
 
@@ -459,6 +380,7 @@ fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
         "schema_key",
         "file_id",
         "version_id",
+        "lixcol_version_id",
         "plugin_key",
         "schema_version",
         "snapshot_content",
