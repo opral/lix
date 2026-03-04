@@ -24,11 +24,12 @@ pub struct SqlExecuteArgs {
     #[arg(long, value_enum, default_value_t = SqlOutputFormat::Table)]
     pub format: SqlOutputFormat,
 
-    /// Bind positional SQL parameters as text values. Repeat for ?1, ?2, ...
+    /// Bind positional SQL parameters from a JSON array.
     ///
-    /// Example: --param hello --param world
-    #[arg(long = "param")]
-    pub params: Vec<String>,
+    /// Use inline JSON (`--params '[1,true,null,\"text\"]'`) or `-` to read JSON from stdin.
+    /// Supported values: null, booleans, numbers, strings, and blobs via {"$blob":"<base64>"}.
+    #[arg(long = "params")]
+    pub params: Option<String>,
 
     /// SQL query text to execute. Use '-' to read from stdin.
     pub sql: String,
