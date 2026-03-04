@@ -268,7 +268,10 @@ mod tests {
 
     #[test]
     fn filesystem_view_registry_columns_match_projection_contracts() {
-        assert_eq!(columns_for_public_lix_table("lix_file"), Some(LIX_FILE_COLUMNS));
+        assert_eq!(
+            columns_for_public_lix_table("lix_file"),
+            Some(LIX_FILE_COLUMNS)
+        );
         assert_eq!(
             columns_for_public_lix_table("lix_file_by_version"),
             Some(LIX_FILE_BY_VERSION_COLUMNS)

@@ -109,9 +109,11 @@ fn query_selects_wildcard(query: &Query) -> bool {
         return true;
     }
 
-    query.with
-        .as_ref()
-        .is_some_and(|with| with.cte_tables.iter().any(|cte| query_selects_wildcard(&cte.query)))
+    query.with.as_ref().is_some_and(|with| {
+        with.cte_tables
+            .iter()
+            .any(|cte| query_selects_wildcard(&cte.query))
+    })
 }
 
 fn query_set_expr_selects_wildcard(expr: &SetExpr) -> bool {
@@ -133,7 +135,8 @@ fn query_set_expr_selects_wildcard(expr: &SetExpr) -> bool {
 fn select_item_is_wildcard(item: &sqlparser::ast::SelectItem) -> bool {
     matches!(
         item,
-        sqlparser::ast::SelectItem::Wildcard(_) | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+        sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
     )
 }
 
@@ -780,10 +783,7 @@ mod tests {
 
     #[test]
     fn metadata_only_lix_file_reads_do_not_materialize() {
-        assert_eq!(
-            materialization_scope("SELECT COUNT(*) FROM lix_file"),
-            None
-        );
+        assert_eq!(materialization_scope("SELECT COUNT(*) FROM lix_file"), None);
         assert_eq!(
             materialization_scope("SELECT path FROM lix_file WHERE path LIKE '/docs/%'"),
             None
