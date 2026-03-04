@@ -4,7 +4,7 @@ Replay the first 100 commits from `microsoft/vscode-docs` into a `.lix` SQLite a
 
 - `js-sdk`
 - `@lix-js/better-sqlite3-backend`
-- installed plugins: `text_plugin`, `plugin_md_v2`
+- no plugins required for `bench`
 
 ## CLI
 
@@ -12,6 +12,7 @@ Replay the first 100 commits from `microsoft/vscode-docs` into a `.lix` SQLite a
 pnpm --filter vscode-docs-replay run cli -- replay --commits 100
 pnpm --filter vscode-docs-replay run cli -- analyze
 pnpm --filter vscode-docs-replay run cli -- analyze-file-types
+pnpm --filter vscode-docs-replay run cli -- bench --commits 100 --query-runs 10 --query-warmup 2 --verify-state
 pnpm --filter vscode-docs-replay run cli -- reset
 ```
 
@@ -21,6 +22,7 @@ Shorthand scripts:
 pnpm --filter vscode-docs-replay run replay -- --commits 100
 pnpm --filter vscode-docs-replay run analyze
 pnpm --filter vscode-docs-replay run analyze-file-types
+pnpm --filter vscode-docs-replay run bench -- --commits 100 --query-runs 10 --query-warmup 2 --verify-state
 pnpm --filter vscode-docs-replay run reset
 ```
 
@@ -55,6 +57,8 @@ automatically.
 
 - `VSCODE_REPLAY_RESOLVE_LFS_POINTERS=0` disables pointer resolution.
 - `VSCODE_REPLAY_FETCH_MISSING_LFS_OBJECTS=0` disables automatic missing-object fetch.
+- `VSCODE_REPLAY_INSTALL_TEXT_PLUGIN=0` disables text plugin install.
+- `VSCODE_REPLAY_INSTALL_MD_PLUGIN=0` disables markdown plugin install.
 
 ## Output
 
@@ -62,4 +66,31 @@ Default replay output:
 
 - `packages/vscode-docs-replay/results/vscode-docs-first-100.lix`
 
+Default bench output:
+
+- `packages/vscode-docs-replay/results/vscode-docs.bench.json`
+- `packages/vscode-docs-replay/results/vscode-docs.git-replay/` (git replay baseline repo)
+
 Override with `VSCODE_REPLAY_OUTPUT_PATH`.
+Override report path with `VSCODE_BENCH_REPORT_PATH`.
+Override git baseline path with `VSCODE_BENCH_GIT_REPLAY_PATH`.
+
+## Bench Metrics
+
+`bench` runs:
+
+1. replay into `.lix`
+2. build a git replay baseline from the same commit slice
+3. compare storage size (`lix` vs git replay, plus source clone context)
+4. run paired query timings (`lix` SQL vs git commands) with warmup + measured runs
+
+`bench` replays commits into Lix without installing plugins.
+
+Useful env vars:
+
+- `VSCODE_BENCH_QUERY_RUNS` measured iterations per query (default `10`)
+- `VSCODE_BENCH_QUERY_WARMUP` warmup iterations per query (default `2`)
+- `VSCODE_BENCH_INSERT_BATCH_ROWS` insert rows per replay statement (default `100`)
+- `VSCODE_BENCH_VERIFY_STATE=1` verify git and lix file-path state after each replayed commit
+- `VSCODE_BENCH_INCLUDE_COUNT_QUERY=1` include heavy `SELECT COUNT(*) FROM lix_file` paired query
+- `VSCODE_BENCH_SKIP_REPLAY=1` currently ignored (replay is required for ingestion/query metrics)

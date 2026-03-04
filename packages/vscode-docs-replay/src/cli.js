@@ -42,6 +42,12 @@ async function main() {
       return;
     }
 
+    case "bench": {
+      const forwarded = args[0] === "--" ? args.slice(1) : args;
+      await run("pnpm", ["run", "bench:raw", "--", ...forwarded]);
+      return;
+    }
+
     case "reset": {
       await run("pnpm", ["run", "reset:raw"]);
       return;
@@ -58,6 +64,7 @@ function printHelp() {
   console.log("  replay --commits 100");
   console.log("  analyze");
   console.log("  analyze-file-types");
+  console.log("  bench --commits 100 --query-runs 10 --query-warmup 2 [--verify-state]");
   console.log("  reset");
 }
 

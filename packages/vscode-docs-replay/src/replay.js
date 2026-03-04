@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { openLix } from "@lix-js/sdk";
 import { createBetterSqlite3Backend } from "@lix-js/better-sqlite3-backend";
 import {
@@ -22,6 +23,7 @@ const REPO_ROOT = join(__dirname, "..", "..", "..");
 const CONFIG = {
   repoUrl: process.env.VSCODE_REPLAY_REPO_URL ?? "https://github.com/microsoft/vscode-docs.git",
   repoPath: process.env.VSCODE_REPLAY_REPO_PATH ?? join(REPO_ROOT, "artifact", "vscode-docs"),
+  replayRef: process.env.VSCODE_REPLAY_REF?.trim() || null,
   anchorPath:
     process.env.VSCODE_REPLAY_ANCHOR_PATH ??
     join(__dirname, "..", ".cache", "vscode-docs.anchor"),
@@ -30,11 +32,14 @@ const CONFIG = {
     join(__dirname, "..", "results", "vscode-docs-first-100.lix"),
   commitLimit: parseEnvInt("VSCODE_REPLAY_COMMITS", 100),
   progressEvery: parseEnvInt("VSCODE_REPLAY_PROGRESS_EVERY", 10),
+  installTextPlugin: parseEnvBool("VSCODE_REPLAY_INSTALL_TEXT_PLUGIN", true),
+  installMdPlugin: parseEnvBool("VSCODE_REPLAY_INSTALL_MD_PLUGIN", true),
+  verifyState: parseEnvBool("VSCODE_REPLAY_VERIFY_STATE", false),
 };
 
 async function main() {
   const started = performance.now();
-  const anchorSha = await readAnchorSha(CONFIG.anchorPath);
+  const replayRef = await resolveReplayRef();
 
   const repo = await ensureGitRepo({
     repoPath: CONFIG.repoPath,
@@ -42,17 +47,17 @@ async function main() {
     cacheDir: join(__dirname, "..", ".cache"),
     defaultDirName: "vscode-docs",
     syncRemote: false,
-    ref: anchorSha,
+    ref: replayRef,
   });
 
   const commits = await listLinearCommits(repo.repoPath, {
-    ref: anchorSha,
+    ref: replayRef,
     maxCount: CONFIG.commitLimit,
     firstParent: true,
   });
 
   if (commits.length === 0) {
-    throw new Error(`no commits found at ${repo.repoPath} (${anchorSha})`);
+    throw new Error(`no commits found at ${repo.repoPath} (${replayRef})`);
   }
 
   await mkdir(dirname(CONFIG.outputPath), { recursive: true });
@@ -74,19 +79,31 @@ async function main() {
   });
 
   try {
-    await installPluginFromWorkspace(lix, {
-      packageDirName: "text-plugin",
-      wasmFileName: "text_plugin.wasm",
-    });
-    await installPluginFromWorkspace(lix, {
-      packageDirName: "plugin-md-v2",
-      wasmFileName: "plugin_md_v2.wasm",
-    });
+    if (CONFIG.installTextPlugin) {
+      await installPluginFromWorkspace(lix, {
+        packageDirName: "text-plugin",
+        wasmFileName: "text_plugin.wasm",
+      });
+    } else {
+      console.log("[replay] skipping text plugin install");
+    }
+
+    if (CONFIG.installMdPlugin) {
+      await installPluginFromWorkspace(lix, {
+        packageDirName: "plugin-md-v2",
+        wasmFileName: "plugin_md_v2.wasm",
+      });
+    } else {
+      console.log("[replay] skipping markdown plugin install");
+    }
 
     const state = createReplayState();
+    const expectedStateById = new Map();
     let applied = 0;
     let noop = 0;
     let changedPaths = 0;
+    let verifiedCommits = 0;
+    let verificationMs = 0;
 
     for (let index = 0; index < commits.length; index++) {
       const commitSha = commits[index];
@@ -129,6 +146,18 @@ async function main() {
         }
       }
 
+      if (CONFIG.verifyState) {
+        const verifyStarted = performance.now();
+        applyPreparedBatchToExpectedState(expectedStateById, prepared);
+        await verifyCommitStateHashes({
+          lix,
+          commitSha,
+          expectedStateById,
+        });
+        verificationMs += performance.now() - verifyStarted;
+        verifiedCommits += 1;
+      }
+
       if (
         index === 0 ||
         (index + 1) % CONFIG.progressEvery === 0 ||
@@ -143,15 +172,28 @@ async function main() {
     const elapsedMs = performance.now() - started;
 
     console.log(`[replay] done in ${(elapsedMs / 1000).toFixed(2)}s`);
-    console.log(`[replay] anchor commit: ${anchorSha}`);
+    console.log(`[replay] replay ref: ${replayRef}`);
     console.log(`[replay] output: ${CONFIG.outputPath}`);
     console.log(`[replay] commits replayed: ${commits.length}`);
     console.log(`[replay] commits applied: ${applied}`);
     console.log(`[replay] commits noop: ${noop}`);
     console.log(`[replay] changed paths total: ${changedPaths}`);
+    if (CONFIG.verifyState) {
+      console.log(
+        `[replay] verified commits: ${verifiedCommits}/${commits.length} (${verificationMs.toFixed(2)}ms)`,
+      );
+    }
   } finally {
     await lix.close();
   }
+}
+
+async function resolveReplayRef() {
+  if (CONFIG.replayRef) {
+    return CONFIG.replayRef;
+  }
+
+  return await readAnchorSha(CONFIG.anchorPath);
 }
 
 async function installPluginFromWorkspace(lix, options) {
@@ -197,6 +239,122 @@ async function loadPluginWasmBytes(options) {
   throw new Error(
     `failed to locate built wasm artifact '${wasmFileName}' for plugin at ${packageDir}`,
   );
+}
+
+function applyPreparedBatchToExpectedState(expectedStateById, prepared) {
+  for (const id of prepared.deletes) {
+    expectedStateById.delete(String(id));
+  }
+
+  for (const row of prepared.inserts) {
+    expectedStateById.set(String(row.id), {
+      path: String(row.path),
+      hash: hashBytes(row.data),
+    });
+  }
+
+  for (const row of prepared.updates) {
+    expectedStateById.set(String(row.id), {
+      path: String(row.path),
+      hash: hashBytes(row.data),
+    });
+  }
+}
+
+async function verifyCommitStateHashes(args) {
+  const { lix, commitSha, expectedStateById } = args;
+  const result = await lix.execute("SELECT id, path, data FROM lix_file", []);
+  const rows = result.rows ?? [];
+  if (rows.length !== expectedStateById.size) {
+    throw new Error(
+      `state mismatch at ${commitSha}: row count differs (lix=${rows.length}, expected=${expectedStateById.size})`,
+    );
+  }
+
+  const seen = new Set();
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const id = scalarToString(row?.[0], `verify.id[${index}]`);
+    const path = scalarToString(row?.[1], `verify.path[${index}]`);
+    const data = scalarToBlob(row?.[2], `verify.data[${index}]`);
+    const hash = hashBytes(data);
+
+    const expected = expectedStateById.get(id);
+    if (!expected) {
+      throw new Error(`state mismatch at ${commitSha}: unexpected id ${id}`);
+    }
+    if (path !== expected.path) {
+      throw new Error(
+        `state mismatch at ${commitSha}: path differs for id ${id} (lix=${path}, expected=${expected.path})`,
+      );
+    }
+    if (hash !== expected.hash) {
+      throw new Error(`state mismatch at ${commitSha}: hash differs for id ${id}`);
+    }
+    seen.add(id);
+  }
+
+  if (seen.size !== expectedStateById.size) {
+    throw new Error(
+      `state mismatch at ${commitSha}: missing rows (lix=${seen.size}, expected=${expectedStateById.size})`,
+    );
+  }
+}
+
+function hashBytes(bytes) {
+  return createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+}
+
+function scalarToString(value, context) {
+  if (value === null || value === undefined) {
+    throw new Error(`missing scalar for ${context}`);
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "bigint") {
+    return String(value);
+  }
+  if (typeof value === "object" && value !== null) {
+    if (
+      value.kind === "Text" ||
+      value.kind === "text" ||
+      value.kind === "Integer" ||
+      value.kind === "integer" ||
+      value.kind === "Real" ||
+      value.kind === "real"
+    ) {
+      return String(value.value);
+    }
+  }
+  throw new Error(`unsupported scalar value for ${context}: ${JSON.stringify(value)}`);
+}
+
+function scalarToBlob(value, context) {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  if (Buffer.isBuffer(value)) {
+    return Uint8Array.from(value);
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (typeof value === "object" && value !== null) {
+    if (Array.isArray(value.value)) {
+      return Uint8Array.from(value.value);
+    }
+    if (typeof value.base64 === "string") {
+      return Uint8Array.from(Buffer.from(value.base64, "base64"));
+    }
+    if (
+      (value.kind === "Blob" || value.kind === "blob") &&
+      typeof value.value === "string"
+    ) {
+      return Uint8Array.from(Buffer.from(value.value, "base64"));
+    }
+  }
+  throw new Error(`unsupported blob value for ${context}: ${JSON.stringify(value)}`);
 }
 
 async function ensurePluginWasmBuilt(packageDir) {
@@ -264,6 +422,20 @@ function parseEnvInt(name, fallback) {
     throw new Error(`${name} must be a positive integer, got '${raw}'`);
   }
   return parsed;
+}
+
+function parseEnvBool(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(raw.toLowerCase())) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(raw.toLowerCase())) {
+    return false;
+  }
+  throw new Error(`${name} must be boolean-like (0/1/true/false), got '${raw}'`);
 }
 
 async function runCommand(command, args) {

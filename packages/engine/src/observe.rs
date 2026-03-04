@@ -4,7 +4,7 @@ use crate::engine::sql::planning::dependency_spec::{
 };
 use crate::engine::{Engine, ExecuteOptions};
 use crate::state_commit_stream::StateCommitStream;
-use crate::{LixError, QueryResult, Value};
+use crate::{LixError, QueryResult, Value, WireValue};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -587,9 +587,14 @@ fn build_observe_state(engine: &Engine, query: ObserveQuery) -> Result<ObserveSt
 }
 
 fn observe_source_key(query: &ObserveQuery) -> Result<String, LixError> {
-    let params = serde_json::to_string(&query.params).map_err(|error| LixError {
+    let wire_params = query
+        .params
+        .iter()
+        .map(WireValue::try_from_engine)
+        .collect::<Result<Vec<_>, _>>()?;
+    let params = serde_json::to_string(&wire_params).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("failed to serialize observe params for dedup key: {error}"),
+        description: format!("failed to serialize observe wire params for dedup key: {error}"),
     })?;
     Ok(format!("{}\n--params:{params}", query.sql))
 }
@@ -822,7 +827,7 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
 
 #[cfg(test)]
 mod tests {
-    use super::{ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
+    use super::{observe_source_key, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::{boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;
@@ -999,5 +1004,50 @@ mod tests {
             .execute("SELECT 1", &[], ExecuteOptions::default())
             .await
             .expect("sanity execute should succeed");
+    }
+
+    #[test]
+    fn observe_source_key_serializes_params_with_canonical_wire_kinds() {
+        let query = ObserveQuery::new(
+            "SELECT ?1, ?2, ?3, ?4, ?5, ?6",
+            vec![
+                Value::Null,
+                Value::Boolean(true),
+                Value::Integer(7),
+                Value::Real(1.25),
+                Value::Text("hello".to_string()),
+                Value::Blob(vec![1, 2, 3]),
+            ],
+        );
+
+        let key = observe_source_key(&query).expect("observe source key should be generated");
+        assert!(key.contains("\"kind\":\"null\""));
+        assert!(key.contains("\"kind\":\"bool\""));
+        assert!(key.contains("\"kind\":\"int\""));
+        assert!(key.contains("\"kind\":\"float\""));
+        assert!(key.contains("\"kind\":\"text\""));
+        assert!(key.contains("\"kind\":\"blob\""));
+        assert!(!key.contains("\"kind\":\"Null\""));
+        assert!(!key.contains("\"kind\":\"Bool\""));
+        assert!(!key.contains("\"kind\":\"Integer\""));
+        assert!(!key.contains("\"kind\":\"Real\""));
+        assert!(!key.contains("\"kind\":\"Text\""));
+        assert!(!key.contains("\"kind\":\"Blob\""));
+    }
+
+    #[test]
+    fn observe_source_key_is_stable_for_identical_query_and_params() {
+        let query_a = ObserveQuery::new(
+            "SELECT ?1, ?2",
+            vec![Value::Text("same".to_string()), Value::Integer(1)],
+        );
+        let query_b = ObserveQuery::new(
+            "SELECT ?1, ?2",
+            vec![Value::Text("same".to_string()), Value::Integer(1)],
+        );
+
+        let key_a = observe_source_key(&query_a).expect("first key should be generated");
+        let key_b = observe_source_key(&query_b).expect("second key should be generated");
+        assert_eq!(key_a, key_b);
     }
 }

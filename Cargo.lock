@@ -2072,6 +2072,7 @@ name = "lix_engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "cel",
  "chrono",

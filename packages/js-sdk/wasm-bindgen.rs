@@ -1,7 +1,6 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use async_trait::async_trait;
-    use base64::Engine as _;
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
@@ -10,6 +9,7 @@ mod wasm {
         ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
         ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
         SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
+        WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -169,7 +169,7 @@ export type LixObserveEvents = {
                 .execute(&sql, &values, execute_options)
                 .await
                 .map_err(js_error)?;
-            Ok(query_result_to_js(result))
+            query_result_to_js(result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = executeTransaction)]
@@ -202,7 +202,7 @@ export type LixObserveEvents = {
             }
 
             transaction.commit().await.map_err(js_error)?;
-            Ok(query_result_to_js(last_result))
+            query_result_to_js(last_result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = beginTransaction)]
@@ -366,7 +366,9 @@ export type LixObserveEvents = {
                 *guard = Some(events);
             }
 
-            Ok(observe_event_to_js(next.expect("checked is_some")).into())
+            Ok(observe_event_to_js(next.expect("checked is_some"))
+                .map_err(js_error)?
+                .into())
         }
 
         #[wasm_bindgen(js_name = close)]
@@ -418,7 +420,7 @@ export type LixObserveEvents = {
                 .execute_in_transaction_handle(self.handle, &sql, &values)
                 .await
                 .map_err(js_error)?;
-            Ok(query_result_to_js(result))
+            query_result_to_js(result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = commit)]
@@ -748,7 +750,7 @@ export type LixObserveEvents = {
         object
     }
 
-    fn observe_event_to_js(event: EngineObserveEvent) -> Object {
+    fn observe_event_to_js(event: EngineObserveEvent) -> Result<Object, LixError> {
         let object = Object::new();
         let _ = Reflect::set(
             &object,
@@ -758,7 +760,7 @@ export type LixObserveEvents = {
         let _ = Reflect::set(
             &object,
             &JsValue::from_str("rows"),
-            &query_result_to_js(event.rows),
+            &query_result_to_js(event.rows)?,
         );
         let state_commit_sequence = match event.state_commit_sequence {
             Some(value) => JsValue::from_f64(value as f64),
@@ -769,7 +771,7 @@ export type LixObserveEvents = {
             &JsValue::from_str("stateCommitSequence"),
             &state_commit_sequence,
         );
-        object
+        Ok(object)
     }
 
     fn read_required_string_property(
@@ -1017,8 +1019,9 @@ export type LixObserveEvents = {
                 description: "backend.execute is required".to_string(),
             })?;
             let js_params = Array::new();
-            for param in params.iter().cloned() {
-                let value: JsValue = value_to_js(param);
+            for param in params {
+                let wire = WireValue::try_from_engine(param)?;
+                let value = wire_value_to_js(wire);
                 js_params.push(&value);
             }
             let result = func
@@ -1249,6 +1252,10 @@ export type LixObserveEvents = {
     }
 
     fn value_from_js(value: JsValue) -> Result<EngineValue, LixError> {
+        wire_value_from_js(value)?.try_into_engine()
+    }
+
+    fn wire_value_from_js(value: JsValue) -> Result<WireValue, LixError> {
         if !value.is_object() {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
@@ -1268,7 +1275,7 @@ export type LixObserveEvents = {
                 let raw =
                     Reflect::get(&value, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
                 if raw.is_null() {
-                    Ok(EngineValue::Null)
+                    Ok(WireValue::Null { value: () })
                 } else {
                     Err(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
@@ -1283,7 +1290,7 @@ export type LixObserveEvents = {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'bool' must contain a boolean 'value'".to_string(),
                 })?;
-                Ok(EngineValue::Boolean(parsed))
+                Ok(WireValue::Bool { value: parsed })
             }
             "int" => {
                 let raw =
@@ -1304,7 +1311,9 @@ export type LixObserveEvents = {
                         description: "LixValue 'int' is outside i64 range".to_string(),
                     });
                 }
-                Ok(EngineValue::Integer(parsed as i64))
+                Ok(WireValue::Int {
+                    value: parsed as i64,
+                })
             }
             "float" => {
                 let raw =
@@ -1319,7 +1328,7 @@ export type LixObserveEvents = {
                         description: "LixValue 'float' must be a finite number".to_string(),
                     });
                 }
-                Ok(EngineValue::Real(parsed))
+                Ok(WireValue::Float { value: parsed })
             }
             "text" => {
                 let raw =
@@ -1328,7 +1337,7 @@ export type LixObserveEvents = {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'text' must contain a string 'value'".to_string(),
                 })?;
-                Ok(EngineValue::Text(parsed))
+                Ok(WireValue::Text { value: parsed })
             }
             "blob" => {
                 let raw =
@@ -1337,13 +1346,7 @@ export type LixObserveEvents = {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'blob' must contain a string 'base64'".to_string(),
                 })?;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(base64.as_bytes())
-                    .map_err(|error| LixError {
-                        code: "LIX_ERROR_JS_SDK".to_string(),
-                        description: format!("LixValue 'blob' base64 decode failed: {error}"),
-                    })?;
-                Ok(EngineValue::Blob(bytes))
+                Ok(WireValue::Blob { base64 })
             }
             _ => Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
@@ -1352,33 +1355,34 @@ export type LixObserveEvents = {
         }
     }
 
-    fn query_result_to_js(result: EngineQueryResult) -> JsValue {
+    fn query_result_to_js(result: EngineQueryResult) -> Result<JsValue, LixError> {
+        let wire = WireQueryResult::try_from_engine(&result)?;
         let rows = Array::new();
-        for row in result.rows {
+        for row in wire.rows {
             let js_row = Array::new();
             for value in row {
-                js_row.push(&value_to_js(value));
+                js_row.push(&wire_value_to_js(value));
             }
             rows.push(&js_row);
         }
         let columns = Array::new();
-        for column in result.columns {
+        for column in wire.columns {
             columns.push(&JsValue::from_str(&column));
         }
         let obj = Object::new();
         let _ = Reflect::set(&obj, &JsValue::from_str("rows"), &rows);
         let _ = Reflect::set(&obj, &JsValue::from_str("columns"), &columns);
-        obj.into()
+        Ok(obj.into())
     }
 
-    fn value_to_js(value: EngineValue) -> JsValue {
+    fn wire_value_to_js(value: WireValue) -> JsValue {
         let obj = Object::new();
         match value {
-            EngineValue::Null => {
+            WireValue::Null { value: _ } => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("null"));
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::NULL);
             }
-            EngineValue::Boolean(value) => {
+            WireValue::Bool { value } => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("bool"));
                 let _ = Reflect::set(
                     &obj,
@@ -1386,7 +1390,7 @@ export type LixObserveEvents = {
                     &JsValue::from_bool(value),
                 );
             }
-            EngineValue::Integer(value) => {
+            WireValue::Int { value } => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("int"));
                 let _ = Reflect::set(
                     &obj,
@@ -1394,7 +1398,7 @@ export type LixObserveEvents = {
                     &JsValue::from_f64(value as f64),
                 );
             }
-            EngineValue::Real(value) => {
+            WireValue::Float { value } => {
                 let _ = Reflect::set(
                     &obj,
                     &JsValue::from_str("kind"),
@@ -1402,7 +1406,7 @@ export type LixObserveEvents = {
                 );
                 let _ = Reflect::set(&obj, &JsValue::from_str("value"), &JsValue::from_f64(value));
             }
-            EngineValue::Text(value) => {
+            WireValue::Text { value } => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("text"));
                 let _ = Reflect::set(
                     &obj,
@@ -1410,13 +1414,12 @@ export type LixObserveEvents = {
                     &JsValue::from_str(&value),
                 );
             }
-            EngineValue::Blob(value) => {
+            WireValue::Blob { base64 } => {
                 let _ = Reflect::set(&obj, &JsValue::from_str("kind"), &JsValue::from_str("blob"));
-                let encoded = base64::engine::general_purpose::STANDARD.encode(value);
                 let _ = Reflect::set(
                     &obj,
                     &JsValue::from_str("base64"),
-                    &JsValue::from_str(&encoded),
+                    &JsValue::from_str(&base64),
                 );
             }
         }
