@@ -1,4 +1,4 @@
-use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, QueryResult, Value};
+use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct CreateVersionOptions {
@@ -41,7 +41,19 @@ async fn create_version_in_transaction(
             &[],
         )
         .await?;
-    let row = first_row(&active_version, "active version row")?;
+    let [statement] = active_version.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "active version query",
+            1,
+            active_version.statements.len(),
+        ));
+    };
+    let [row] = statement.rows.as_slice() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "missing active version row".to_string(),
+        });
+    };
     let active_version_id = text_at(row, 0, "active_version.version_id")?;
     let active_commit_id = text_at(row, 1, "lix_version.commit_id")?;
 
@@ -78,19 +90,20 @@ async fn create_version_in_transaction(
 
 async fn generate_uuid(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
     let generated = tx.execute("SELECT lix_uuid_v7()", &[]).await?;
-    let row = first_row(&generated, "generated uuid")?;
-    text_at(row, 0, "lix_uuid_v7()")
-}
-
-fn first_row<'a>(result: &'a QueryResult, context: &str) -> Result<&'a [Value], LixError> {
-    result
-        .rows
-        .first()
-        .map(std::vec::Vec::as_slice)
-        .ok_or_else(|| LixError {
+    let [statement] = generated.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "generated uuid query",
+            1,
+            generated.statements.len(),
+        ));
+    };
+    let [row] = statement.rows.as_slice() else {
+        return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("missing {context}"),
-        })
+            description: "missing generated uuid row".to_string(),
+        });
+    };
+    text_at(row, 0, "lix_uuid_v7()")
 }
 
 fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {

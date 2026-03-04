@@ -63,7 +63,7 @@ pub use state_commit_stream::{
     StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange, StateCommitStreamFilter,
     StateCommitStreamOperation,
 };
-pub use types::{QueryResult, Value};
+pub use types::{ExecuteResult, QueryResult, Value};
 pub use version::{CreateVersionOptions, CreateVersionResult};
 pub use wasm_runtime::{NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime};
 pub use wire::{WireQueryResult, WireValue};

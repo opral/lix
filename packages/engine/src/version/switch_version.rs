@@ -1,4 +1,4 @@
-use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
+use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 pub async fn switch_version(engine: &Engine, version_id: String) -> Result<(), LixError> {
     if version_id.trim().is_empty() {
@@ -42,7 +42,14 @@ async fn ensure_version_exists(
             &[Value::Text(version_id.to_string())],
         )
         .await?;
-    if result.rows.is_empty() {
+    let [statement] = result.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "version existence query",
+            1,
+            result.statements.len(),
+        ));
+    };
+    if statement.rows.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("version '{version_id}' does not exist"),

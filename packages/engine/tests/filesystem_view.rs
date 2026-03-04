@@ -43,8 +43,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected active version id as text, got {other:?}"),
     }
@@ -62,8 +62,8 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected active version commit id as text, got {other:?}"),
     }
@@ -95,9 +95,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/src/index.ts', X'69676E6F726564')",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-1', '/src/index.ts', X'69676E6F726564')", &[])
         .await
         .unwrap();
 
@@ -109,12 +107,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(result.rows.clone());
-        assert_eq!(result.rows.len(), 1);
-        assert_text(&result.rows[0][0], "file-1");
-        assert_text(&result.rows[0][1], "/src/index.ts");
-        assert_blob_text(&result.rows[0][2], "ignored");
-        assert_text(&result.rows[0][3], "lix_file_descriptor");
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_text(&result.statements[0].rows[0][0], "file-1");
+        assert_text(&result.statements[0].rows[0][1], "/src/index.ts");
+        assert_blob_text(&result.statements[0].rows[0][2], "ignored");
+        assert_text(&result.statements[0].rows[0][3], "lix_file_descriptor");
     }
 );
 
@@ -147,11 +145,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(directories.rows.len(), 1);
-        assert_text(&directories.rows[0][0], "/docs/");
-        assert_text(&directories.rows[0][1], "docs");
-        assert!(matches!(directories.rows[0][2], Value::Null));
-        assert_boolean_like(&directories.rows[0][3], false);
+        assert_eq!(directories.statements[0].rows.len(), 1);
+        assert_text(&directories.statements[0].rows[0][0], "/docs/");
+        assert_text(&directories.statements[0].rows[0][1], "docs");
+        assert!(matches!(directories.statements[0].rows[0][2], Value::Null));
+        assert_boolean_like(&directories.statements[0].rows[0][3], false);
     }
 );
 
@@ -183,25 +181,25 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(directories.rows.len(), 2);
+        assert_eq!(directories.statements[0].rows.len(), 2);
 
-        assert_text(&directories.rows[0][1], "/docs/");
-        assert_text(&directories.rows[0][2], "docs");
-        assert!(matches!(directories.rows[0][3], Value::Null));
-        assert_boolean_like(&directories.rows[0][4], false);
+        assert_text(&directories.statements[0].rows[0][1], "/docs/");
+        assert_text(&directories.statements[0].rows[0][2], "docs");
+        assert!(matches!(directories.statements[0].rows[0][3], Value::Null));
+        assert_boolean_like(&directories.statements[0].rows[0][4], false);
 
-        assert_text(&directories.rows[1][1], "/docs/guides/");
-        assert_text(&directories.rows[1][2], "guides");
-        let parent_id = match &directories.rows[1][3] {
+        assert_text(&directories.statements[0].rows[1][1], "/docs/guides/");
+        assert_text(&directories.statements[0].rows[1][2], "guides");
+        let parent_id = match &directories.statements[0].rows[1][3] {
             Value::Text(value) => value.clone(),
             other => panic!("expected guides parent_id as text, got {other:?}"),
         };
-        let docs_id = match &directories.rows[0][0] {
+        let docs_id = match &directories.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected docs id as text, got {other:?}"),
         };
         assert_eq!(parent_id, docs_id);
-        assert_boolean_like(&directories.rows[1][4], false);
+        assert_boolean_like(&directories.statements[0].rows[1][4], false);
     }
 );
 
@@ -214,9 +212,7 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-2', '/src/readme.md', X'69676E6F726564')",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-2', '/src/readme.md', X'69676E6F726564')", &[])
         .await
         .unwrap();
 
@@ -230,7 +226,7 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(before.rows.len(), 1);
+    assert_eq!(before.statements[0].rows.len(), 1);
     let version_id = active_version_id(&engine).await;
 
     engine
@@ -252,15 +248,15 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(after.rows.clone());
-    assert_eq!(before.rows, after.rows);
+    sim.assert_deterministic(after.statements[0].rows.clone());
+    assert_eq!(before.statements[0].rows, after.statements[0].rows);
 
     let file_row = engine
         .execute("SELECT data FROM lix_file WHERE id = 'file-2'", &[])
         .await
         .unwrap();
-    assert_eq!(file_row.rows.len(), 1);
-    assert_blob_text(&file_row.rows[0][0], "ignored-again");
+    assert_eq!(file_row.statements[0].rows.len(), 1);
+    assert_blob_text(&file_row.statements[0].rows[0][0], "ignored-again");
 
     let cache_row = engine
         .execute(
@@ -274,8 +270,8 @@ simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(cache_row.rows.len(), 1);
-    assert_blob_text(&cache_row.rows[0][0], "ignored-again");
+    assert_eq!(cache_row.statements[0].rows.len(), 1);
+    assert_blob_text(&cache_row.statements[0].rows[0][0], "ignored-again");
 });
 
 simulation_test!(
@@ -289,9 +285,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (path, data) VALUES ('/update-repro.md', lix_text_encode('before'))",
-            &[],
-        )
+            "INSERT INTO lix_file (path, data) VALUES ('/update-repro.md', lix_text_encode('before'))", &[])
         .await
         .expect("seed insert should succeed");
 
@@ -302,12 +296,12 @@ simulation_test!(
             )
             .await
             .expect("seed read should succeed");
-        assert_eq!(seeded.rows.len(), 1);
-        let file_id = match &seeded.rows[0][0] {
+        assert_eq!(seeded.statements[0].rows.len(), 1);
+        let file_id = match &seeded.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text id, got {other:?}"),
         };
-        assert_blob_text(&seeded.rows[0][1], "before");
+        assert_blob_text(&seeded.statements[0].rows[0][1], "before");
 
         engine
             .execute(
@@ -324,8 +318,8 @@ simulation_test!(
             )
             .await
             .expect("verify read should succeed");
-        assert_eq!(verify.rows.len(), 1);
-        assert_blob_text(&verify.rows[0][0], "after");
+        assert_eq!(verify.statements[0].rows.len(), 1);
+        assert_blob_text(&verify.statements[0].rows[0][0], "after");
     }
 );
 
@@ -340,9 +334,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/update-read-consistency.md', lix_text_encode('before'))",
-                &[],
-            )
+                "INSERT INTO lix_file (path, data) VALUES ('/update-read-consistency.md', lix_text_encode('before'))", &[])
             .await
             .expect("seed insert should succeed");
 
@@ -353,12 +345,12 @@ simulation_test!(
             )
             .await
             .expect("seed read should succeed");
-        assert_eq!(seeded.rows.len(), 1);
-        let file_id = match &seeded.rows[0][0] {
+        assert_eq!(seeded.statements[0].rows.len(), 1);
+        let file_id = match &seeded.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text id, got {other:?}"),
         };
-        assert_blob_text(&seeded.rows[0][1], "before");
+        assert_blob_text(&seeded.statements[0].rows[0][1], "before");
 
         engine
             .execute(
@@ -375,8 +367,8 @@ simulation_test!(
             )
             .await
             .expect("first read after update should succeed");
-        assert_eq!(read_after.rows.len(), 1);
-        assert_blob_text(&read_after.rows[0][0], "after");
+        assert_eq!(read_after.statements[0].rows.len(), 1);
+        assert_blob_text(&read_after.statements[0].rows[0][0], "after");
 
         let read_again = engine
             .execute(
@@ -385,8 +377,8 @@ simulation_test!(
             )
             .await
             .expect("second read after update should succeed");
-        assert_eq!(read_again.rows.len(), 1);
-        assert_blob_text(&read_again.rows[0][0], "after");
+        assert_eq!(read_again.statements[0].rows.len(), 1);
+        assert_blob_text(&read_again.statements[0].rows[0][0], "after");
     }
 );
 
@@ -401,9 +393,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (path, data) VALUES ('/update-change-id.md', lix_text_encode('before'))",
-            &[],
-        )
+            "INSERT INTO lix_file (path, data) VALUES ('/update-change-id.md', lix_text_encode('before'))", &[])
         .await
         .expect("seed insert should succeed");
 
@@ -414,8 +404,8 @@ simulation_test!(
             )
             .await
             .expect("seed read should succeed");
-        assert_eq!(seeded.rows.len(), 1);
-        let file_id = match &seeded.rows[0][0] {
+        assert_eq!(seeded.statements[0].rows.len(), 1);
+        let file_id = match &seeded.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text id, got {other:?}"),
         };
@@ -427,8 +417,8 @@ simulation_test!(
             )
             .await
             .expect("before read should succeed");
-        assert_eq!(before.rows.len(), 1);
-        assert_blob_text(&before.rows[0][0], "before");
+        assert_eq!(before.statements[0].rows.len(), 1);
+        assert_blob_text(&before.statements[0].rows[0][0], "before");
 
         engine
             .execute(
@@ -445,8 +435,8 @@ simulation_test!(
             )
             .await
             .expect("post-update read should succeed");
-        assert_eq!(after.rows.len(), 1);
-        assert_blob_text(&after.rows[0][0], "after");
+        assert_eq!(after.statements[0].rows.len(), 1);
+        assert_blob_text(&after.statements[0].rows[0][0], "after");
     }
 );
 
@@ -461,9 +451,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('file-2-expr', '/src/readme.md', lix_text_encode('ignored'))",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-2-expr', '/src/readme.md', lix_text_encode('ignored'))", &[])
             .await
             .expect("seed insert should succeed");
 
@@ -773,10 +761,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(directories.rows.clone());
-        assert_eq!(directories.rows.len(), 2);
-        assert_text(&directories.rows[0][0], "/guides/");
-        assert_text(&directories.rows[1][0], "/guides/api/");
+        sim.assert_deterministic(directories.statements[0].rows.clone());
+        assert_eq!(directories.statements[0].rows.len(), 2);
+        assert_text(&directories.statements[0].rows[0][0], "/guides/");
+        assert_text(&directories.statements[0].rows[1][0], "/guides/api/");
     }
 );
 
@@ -838,10 +826,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(directories.rows.clone());
-        sim.assert_deterministic(files.rows.clone());
-        assert!(directories.rows.is_empty());
-        assert!(files.rows.is_empty());
+        sim.assert_deterministic(directories.statements[0].rows.clone());
+        sim.assert_deterministic(files.statements[0].rows.clone());
+        assert!(directories.statements[0].rows.is_empty());
+        assert!(files.statements[0].rows.is_empty());
     }
 );
 
@@ -873,9 +861,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-cascade-param', '/docs/guides/intro.md', lix_text_encode('ignored'))",
-                &[],
-            )
+                 VALUES ('file-cascade-param', '/docs/guides/intro.md', lix_text_encode('ignored'))", &[])
             .await
             .unwrap();
 
@@ -906,10 +892,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(directories.rows.clone());
-        sim.assert_deterministic(files.rows.clone());
-        assert!(directories.rows.is_empty());
-        assert!(files.rows.is_empty());
+        sim.assert_deterministic(directories.statements[0].rows.clone());
+        sim.assert_deterministic(files.statements[0].rows.clone());
+        assert!(directories.statements[0].rows.is_empty());
+        assert!(files.statements[0].rows.is_empty());
     }
 );
 
@@ -938,11 +924,14 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(inserted.rows.len(), 1);
-        assert_text(&inserted.rows[0][0], "dir-1");
-        assert_text(&inserted.rows[0][1], "/docs/");
-        assert_text(&inserted.rows[0][2], "docs");
-        assert_text(&inserted.rows[0][3], "lix_directory_descriptor");
+        assert_eq!(inserted.statements[0].rows.len(), 1);
+        assert_text(&inserted.statements[0].rows[0][0], "dir-1");
+        assert_text(&inserted.statements[0].rows[0][1], "/docs/");
+        assert_text(&inserted.statements[0].rows[0][2], "docs");
+        assert_text(
+            &inserted.statements[0].rows[0][3],
+            "lix_directory_descriptor",
+        );
 
         engine
             .execute(
@@ -956,9 +945,9 @@ simulation_test!(
             .execute("SELECT name FROM lix_directory WHERE id = 'dir-1'", &[])
             .await
             .unwrap();
-        sim.assert_deterministic(updated.rows.clone());
-        assert_eq!(updated.rows.len(), 1);
-        assert_text(&updated.rows[0][0], "guides");
+        sim.assert_deterministic(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "guides");
 
         engine
             .execute("DELETE FROM lix_directory WHERE id = 'dir-1'", &[])
@@ -969,7 +958,7 @@ simulation_test!(
             .execute("SELECT id FROM lix_directory WHERE id = 'dir-1'", &[])
             .await
             .unwrap();
-        assert!(deleted.rows.is_empty());
+        assert!(deleted.statements[0].rows.is_empty());
     }
 );
 
@@ -982,9 +971,7 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-id-immutable', '/immutable.json', lix_text_encode('ignored'))",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-id-immutable', '/immutable.json', lix_text_encode('ignored'))", &[])
         .await
         .unwrap();
 
@@ -1005,9 +992,7 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-             VALUES ('file-id-immutable-by-version', '/immutable-by-version.json', lix_text_encode('ignored'), $1)",
-            &[Value::Text(version_id.clone())],
-        )
+             VALUES ('file-id-immutable-by-version', '/immutable-by-version.json', lix_text_encode('ignored'), $1)", &[Value::Text(version_id.clone())])
         .await
         .unwrap();
 
@@ -1064,9 +1049,7 @@ simulation_test!(
         engine
         .execute(
             "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
-             VALUES ('dir-id-immutable-by-version', '/immutable-dir-by-version/', NULL, 'immutable-dir-by-version', $1)",
-            &[Value::Text(version_id.clone())],
-        )
+             VALUES ('dir-id-immutable-by-version', '/immutable-dir-by-version/', NULL, 'immutable-dir-by-version', $1)", &[Value::Text(version_id.clone())])
         .await
         .unwrap();
 
@@ -1203,9 +1186,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
                 "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                  VALUES ('file-shared', '/shared/config.json', lix_text_encode('ignored'), '{version_a}')",
                 version_a = version_a_sql
-            ),
-            &[],
-        )
+            ), &[])
         .await
         .unwrap();
 
@@ -1215,9 +1196,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
                 "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                  VALUES ('file-shared', '/shared/config.json', lix_text_encode('ignored'), '{version_b}')",
                 version_b = version_b_sql
-            ),
-            &[],
-        )
+            ), &[])
         .await
         .unwrap();
 
@@ -1245,9 +1224,9 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(row_a.rows.len(), 1);
-    assert_text(&row_a.rows[0][0], "/shared/config.json");
-    assert_blob_text(&row_a.rows[0][1], "ignored");
+    assert_eq!(row_a.statements[0].rows.len(), 1);
+    assert_text(&row_a.statements[0].rows[0][0], "/shared/config.json");
+    assert_blob_text(&row_a.statements[0].rows[0][1], "ignored");
 
     let row_b = engine
         .execute(
@@ -1260,9 +1239,12 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(row_b.rows.len(), 1);
-    assert_text(&row_b.rows[0][0], "/shared/config-renamed.json");
-    assert_blob_text(&row_b.rows[0][1], "ignored-again");
+    assert_eq!(row_b.statements[0].rows.len(), 1);
+    assert_text(
+        &row_b.statements[0].rows[0][0],
+        "/shared/config-renamed.json",
+    );
+    assert_blob_text(&row_b.statements[0].rows[0][1], "ignored-again");
 
     engine
         .execute(
@@ -1287,7 +1269,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(after_delete_a.rows.len(), 1);
+    assert_eq!(after_delete_a.statements[0].rows.len(), 1);
 
     let after_delete_b = engine
         .execute(
@@ -1300,7 +1282,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         )
         .await
         .unwrap();
-    assert!(after_delete_b.rows.is_empty());
+    assert!(after_delete_b.statements[0].rows.is_empty());
 });
 
 simulation_test!(file_by_version_requires_version_id, |sim| async move {
@@ -1331,9 +1313,7 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
-             VALUES ('needs-version-predicate', '/needs-version.json', lix_text_encode('ignored'), $1)",
-            &[Value::Text(version_id.clone())],
-        )
+             VALUES ('needs-version-predicate', '/needs-version.json', lix_text_encode('ignored'), $1)", &[Value::Text(version_id.clone())])
         .await
         .unwrap();
 
@@ -1395,8 +1375,8 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         )
         .await
         .expect("parameterized version predicate select should succeed");
-    assert_eq!(after_update.rows.len(), 1);
-    assert_text(&after_update.rows[0][0], "/changed.json");
+    assert_eq!(after_update.statements[0].rows.len(), 1);
+    assert_text(&after_update.statements[0].rows[0][0], "/changed.json");
 
     engine
         .execute(
@@ -1415,7 +1395,7 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         )
         .await
         .expect("post-delete parameterized select should succeed");
-    assert!(after_delete.rows.is_empty());
+    assert!(after_delete.statements[0].rows.is_empty());
 });
 
 simulation_test!(
@@ -1439,9 +1419,7 @@ simulation_test!(
                     "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
                      VALUES ('dir-shared', '/docs/', NULL, 'docs', '{version_a}')",
                     version_a = version_a_sql
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
 
@@ -1451,9 +1429,7 @@ simulation_test!(
                     "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
                      VALUES ('dir-shared', '/docs/', NULL, 'docs', '{version_b}')",
                     version_b = version_b_sql
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
 
@@ -1481,9 +1457,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(row_a.rows.len(), 1);
-        assert_text(&row_a.rows[0][0], "/docs/");
-        assert_text(&row_a.rows[0][1], "docs");
+        assert_eq!(row_a.statements[0].rows.len(), 1);
+        assert_text(&row_a.statements[0].rows[0][0], "/docs/");
+        assert_text(&row_a.statements[0].rows[0][1], "docs");
 
         let row_b = engine
             .execute(
@@ -1496,9 +1472,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(row_b.rows.len(), 1);
-        assert_text(&row_b.rows[0][0], "/guides/");
-        assert_text(&row_b.rows[0][1], "guides");
+        assert_eq!(row_b.statements[0].rows.len(), 1);
+        assert_text(&row_b.statements[0].rows[0][0], "/guides/");
+        assert_text(&row_b.statements[0].rows[0][1], "guides");
 
         engine
             .execute(
@@ -1523,7 +1499,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(after_delete_a.rows.len(), 1);
+        assert_eq!(after_delete_a.statements[0].rows.len(), 1);
 
         let after_delete_b = engine
             .execute(
@@ -1536,7 +1512,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert!(after_delete_b.rows.is_empty());
+        assert!(after_delete_b.statements[0].rows.is_empty());
     }
 );
 
@@ -1632,9 +1608,9 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         )
         .await
         .expect("parameterized directory select should succeed");
-    assert_eq!(after_update.rows.len(), 1);
-    assert_text(&after_update.rows[0][0], "/changed/");
-    assert_text(&after_update.rows[0][1], "changed");
+    assert_eq!(after_update.statements[0].rows.len(), 1);
+    assert_text(&after_update.statements[0].rows[0][0], "/changed/");
+    assert_text(&after_update.statements[0].rows[0][1], "changed");
 
     engine
         .execute(
@@ -1653,7 +1629,7 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         )
         .await
         .expect("post-delete parameterized directory select should succeed");
-    assert!(after_delete.rows.is_empty());
+    assert!(after_delete.statements[0].rows.is_empty());
 });
 
 simulation_test!(
@@ -1667,9 +1643,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('file-mixed', '/mixed.json', lix_text_encode('ignored'))",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('file-mixed', '/mixed.json', lix_text_encode('ignored'))", &[])
         .await
         .unwrap();
 
@@ -1682,7 +1656,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(before.rows.len(), 1);
+        assert_eq!(before.statements[0].rows.len(), 1);
 
         engine
             .execute(
@@ -1703,8 +1677,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(after.rows.len(), 1);
-        assert_integer(&after.rows[0][0], 2);
+        assert_eq!(after.statements[0].rows.len(), 1);
+        assert_integer(&after.statements[0].rows[0][0], 2);
 
         let file_row = engine
             .execute(
@@ -1713,12 +1687,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_row.rows.len(), 1);
-        assert_blob_text(&file_row.rows[0][0], "ignored-again");
+        assert_eq!(file_row.statements[0].rows.len(), 1);
+        assert_blob_text(&file_row.statements[0].rows[0][0], "ignored-again");
         assert!(
-            matches!(&file_row.rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"sam\"")),
+            matches!(&file_row.statements[0].rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"sam\"")),
             "expected metadata containing owner key, got {:?}",
-            file_row.rows[0][1]
+            file_row.statements[0].rows[0][1]
         );
     }
 );
@@ -1754,9 +1728,7 @@ simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
 
     let err = engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-insert', '/bytes-text-insert.bin', 'HELLO WORLD')",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-insert', '/bytes-text-insert.bin', 'HELLO WORLD')", &[])
             .await
             .expect_err("text data insert should fail");
     assert_eq!(err.code, "LIX_ERROR_FILE_DATA_EXPECTS_BYTES");
@@ -1771,9 +1743,7 @@ simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-insert', '/bytes-hex-insert.bin', X'48454C4C4F20574F524C44')",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-insert', '/bytes-hex-insert.bin', X'48454C4C4F20574F524C44')", &[])
             .await
             .expect("hex data insert should succeed");
 
@@ -1784,8 +1754,8 @@ simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
         )
         .await
         .expect("read inserted hex data should succeed");
-    assert_eq!(row.rows.len(), 1);
-    assert_blob_text(&row.rows[0][0], "HELLO WORLD");
+    assert_eq!(row.statements[0].rows.len(), 1);
+    assert_blob_text(&row.statements[0].rows[0][0], "HELLO WORLD");
 });
 
 simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
@@ -1797,9 +1767,7 @@ simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-update', '/bytes-text-update.bin', X'00')",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-text-update', '/bytes-text-update.bin', X'00')", &[])
             .await
             .expect("seed insert should succeed");
 
@@ -1822,9 +1790,7 @@ simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {
 
     engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-update', '/bytes-hex-update.bin', X'00')",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('bytes-hex-update', '/bytes-hex-update.bin', X'00')", &[])
             .await
             .expect("seed insert should succeed");
 
@@ -1843,8 +1809,8 @@ simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {
         )
         .await
         .expect("read updated hex data should succeed");
-    assert_eq!(row.rows.len(), 1);
-    assert_blob_text(&row.rows[0][0], "HELLO WORLD");
+    assert_eq!(row.statements[0].rows.len(), 1);
+    assert_blob_text(&row.statements[0].rows[0][0], "HELLO WORLD");
 });
 
 simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
@@ -1865,14 +1831,12 @@ simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
         .execute("SELECT id FROM lix_file WHERE path = '/auto-id.txt'", &[])
         .await
         .unwrap();
-    assert_eq!(file.rows.len(), 1);
-    assert_non_empty_text(&file.rows[0][0]);
+    assert_eq!(file.statements[0].rows.len(), 1);
+    assert_non_empty_text(&file.statements[0].rows[0][0]);
 
     engine
         .execute(
-            "INSERT INTO lix_directory (path, parent_id, name) VALUES ('/auto-dir/', NULL, 'auto-dir')",
-            &[],
-        )
+            "INSERT INTO lix_directory (path, parent_id, name) VALUES ('/auto-dir/', NULL, 'auto-dir')", &[])
         .await
         .unwrap();
     let directory = engine
@@ -1882,8 +1846,8 @@ simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(directory.rows.len(), 1);
-    assert_non_empty_text(&directory.rows[0][0]);
+    assert_eq!(directory.statements[0].rows.len(), 1);
+    assert_non_empty_text(&directory.statements[0].rows[0][0]);
 });
 
 simulation_test!(
@@ -1897,9 +1861,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/auto-id-data.txt', X'48454C4C4F20574F524C44')",
-                &[],
-            )
+                "INSERT INTO lix_file (path, data) VALUES ('/auto-id-data.txt', X'48454C4C4F20574F524C44')", &[])
             .await
             .expect("insert with auto id should succeed");
 
@@ -1910,9 +1872,9 @@ simulation_test!(
             )
             .await
             .expect("read auto-id file should succeed");
-        assert_eq!(row.rows.len(), 1);
-        assert_non_empty_text(&row.rows[0][0]);
-        assert_blob_text(&row.rows[0][1], "HELLO WORLD");
+        assert_eq!(row.statements[0].rows.len(), 1);
+        assert_non_empty_text(&row.statements[0].rows[0][0]);
+        assert_blob_text(&row.statements[0].rows[0][1], "HELLO WORLD");
     }
 );
 
@@ -1927,9 +1889,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('hidden-file-default', '/hidden-default.json', X'69676E6F726564')",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('hidden-file-default', '/hidden-default.json', X'69676E6F726564')", &[])
         .await
         .unwrap();
         let file_default = engine
@@ -1939,8 +1899,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_default.rows.len(), 1);
-        assert_boolean_like(&file_default.rows[0][0], false);
+        assert_eq!(file_default.statements[0].rows.len(), 1);
+        assert_boolean_like(&file_default.statements[0].rows[0][0], false);
 
         engine
             .execute(
@@ -1957,8 +1917,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_true.rows.len(), 1);
-        assert_boolean_like(&file_true.rows[0][0], true);
+        assert_eq!(file_true.statements[0].rows.len(), 1);
+        assert_boolean_like(&file_true.statements[0].rows[0][0], true);
 
         engine
             .execute(
@@ -1975,8 +1935,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(dir_default.rows.len(), 1);
-        assert_boolean_like(&dir_default.rows[0][0], false);
+        assert_eq!(dir_default.statements[0].rows.len(), 1);
+        assert_boolean_like(&dir_default.statements[0].rows[0][0], false);
 
         engine
             .execute(
@@ -1993,8 +1953,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(dir_true.rows.len(), 1);
-        assert_boolean_like(&dir_true.rows[0][0], true);
+        assert_eq!(dir_true.statements[0].rows.len(), 1);
+        assert_boolean_like(&dir_true.statements[0].rows[0][0], true);
     }
 );
 
@@ -2258,7 +2218,7 @@ simulation_test!(
             .await
             .expect("post-delete query should succeed");
         assert!(
-            deleted_rows.rows.is_empty(),
+            deleted_rows.statements[0].rows.is_empty(),
             "deleted inherited file should not be visible in child version",
         );
 
@@ -2278,9 +2238,12 @@ simulation_test!(
             )
             .await
             .expect("query should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "file-child-readme-tombstone");
-        assert_text(&rows.rows[0][1], "/readme.md");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(
+            &rows.statements[0].rows[0][0],
+            "file-child-readme-tombstone",
+        );
+        assert_text(&rows.statements[0].rows[0][1], "/readme.md");
     }
 );
 
@@ -2318,8 +2281,8 @@ simulation_test!(
             )
             .await
             .expect("count query should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_integer(&rows.rows[0][0], 0);
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_integer(&rows.statements[0].rows[0][0], 0);
     }
 );
 
@@ -2383,8 +2346,8 @@ simulation_test!(
             )
             .await
             .expect("old path count query should succeed");
-        assert_eq!(old_rows.rows.len(), 1);
-        assert_integer(&old_rows.rows[0][0], 0);
+        assert_eq!(old_rows.statements[0].rows.len(), 1);
+        assert_integer(&old_rows.statements[0].rows[0][0], 0);
 
         let new_rows = engine
             .execute(
@@ -2393,8 +2356,8 @@ simulation_test!(
             )
             .await
             .expect("new path count query should succeed");
-        assert_eq!(new_rows.rows.len(), 1);
-        assert_integer(&new_rows.rows[0][0], 1);
+        assert_eq!(new_rows.statements[0].rows.len(), 1);
+        assert_integer(&new_rows.statements[0].rows[0][0], 1);
     }
 );
 
@@ -2528,9 +2491,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('nested-readme', '/docs/readme.md', lix_text_encode('nested'))",
-                &[],
-            )
+                 VALUES ('nested-readme', '/docs/readme.md', lix_text_encode('nested'))", &[])
             .await
             .expect(
                 "nested file insert should succeed even when parent directory is auto-created and root filename matches",
@@ -2540,11 +2501,11 @@ simulation_test!(
             .execute("SELECT id, path FROM lix_file ORDER BY path", &[])
             .await
             .expect("file query should succeed");
-        assert_eq!(files.rows.len(), 2);
-        assert_text(&files.rows[0][0], "nested-readme");
-        assert_text(&files.rows[0][1], "/docs/readme.md");
-        assert_text(&files.rows[1][0], "root-readme");
-        assert_text(&files.rows[1][1], "/readme.md");
+        assert_eq!(files.statements[0].rows.len(), 2);
+        assert_text(&files.statements[0].rows[0][0], "nested-readme");
+        assert_text(&files.statements[0].rows[0][1], "/docs/readme.md");
+        assert_text(&files.statements[0].rows[1][0], "root-readme");
+        assert_text(&files.statements[0].rows[1][1], "/readme.md");
     }
 );
 
@@ -2622,9 +2583,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_row.rows.len(), 1);
-        assert_text(&file_row.rows[0][0], "/docs/guides/a.md");
-        let file_commit_id = match &file_row.rows[0][1] {
+        assert_eq!(file_row.statements[0].rows.len(), 1);
+        assert_text(&file_row.statements[0].rows[0][0], "/docs/guides/a.md");
+        let file_commit_id = match &file_row.statements[0].rows[0][1] {
             Value::Text(value) => value.clone(),
             other => panic!("expected file commit_id as text, got {other:?}"),
         };
@@ -2641,8 +2602,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_descriptor_row.rows.len(), 1);
-        let file_directory_id = match &file_descriptor_row.rows[0][0] {
+        assert_eq!(file_descriptor_row.statements[0].rows.len(), 1);
+        let file_directory_id = match &file_descriptor_row.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected file directory_id as text, got {other:?}"),
         };
@@ -2657,23 +2618,23 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(directory_rows.rows.len(), 2);
+        assert_eq!(directory_rows.statements[0].rows.len(), 2);
 
-        assert_text(&directory_rows.rows[0][1], "/docs/");
-        let docs_directory_id = match &directory_rows.rows[0][0] {
+        assert_text(&directory_rows.statements[0].rows[0][1], "/docs/");
+        let docs_directory_id = match &directory_rows.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected docs directory id as text, got {other:?}"),
         };
-        match &directory_rows.rows[0][2] {
+        match &directory_rows.statements[0].rows[0][2] {
             Value::Null => {}
             other => panic!("expected /docs/ parent_id to be NULL, got {other:?}"),
         }
-        assert_text(&directory_rows.rows[0][3], &file_commit_id);
+        assert_text(&directory_rows.statements[0].rows[0][3], &file_commit_id);
 
-        assert_text(&directory_rows.rows[1][1], "/docs/guides/");
-        assert_text(&directory_rows.rows[1][2], &docs_directory_id);
-        assert_text(&directory_rows.rows[1][3], &file_commit_id);
-        let guides_directory_id = match &directory_rows.rows[1][0] {
+        assert_text(&directory_rows.statements[0].rows[1][1], "/docs/guides/");
+        assert_text(&directory_rows.statements[0].rows[1][2], &docs_directory_id);
+        assert_text(&directory_rows.statements[0].rows[1][3], &file_commit_id);
+        let guides_directory_id = match &directory_rows.statements[0].rows[1][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected guides directory id as text, got {other:?}"),
         };
@@ -2711,9 +2672,7 @@ simulation_test!(
                      )",
                     version_id = version_id_sql,
                     snapshot_content = snapshot_content
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("seed untracked file descriptor should succeed");
 
@@ -2736,8 +2695,8 @@ simulation_test!(
             )
             .await
             .expect("updated untracked file row should be readable");
-        assert_eq!(file_row.rows.len(), 1);
-        assert_text(&file_row.rows[0][0], "/docs/guides/a.md");
+        assert_eq!(file_row.statements[0].rows.len(), 1);
+        assert_text(&file_row.statements[0].rows[0][0], "/docs/guides/a.md");
 
         let directory_rows = engine
             .execute(
@@ -2749,11 +2708,11 @@ simulation_test!(
             )
             .await
             .expect("auto-created parent directories should be readable");
-        assert_eq!(directory_rows.rows.len(), 2);
-        assert_text(&directory_rows.rows[0][0], "/docs/");
-        assert_text(&directory_rows.rows[1][0], "/docs/guides/");
-        assert_boolean_like(&directory_rows.rows[0][1], true);
-        assert_boolean_like(&directory_rows.rows[1][1], true);
+        assert_eq!(directory_rows.statements[0].rows.len(), 2);
+        assert_text(&directory_rows.statements[0].rows[0][0], "/docs/");
+        assert_text(&directory_rows.statements[0].rows[1][0], "/docs/guides/");
+        assert_boolean_like(&directory_rows.statements[0].rows[0][1], true);
+        assert_boolean_like(&directory_rows.statements[0].rows[1][1], true);
     }
 );
 
@@ -2780,7 +2739,7 @@ simulation_test!(
             .execute("SELECT id FROM lix_directory WHERE path = '/docs/'", &[])
             .await
             .expect("directory lookup should succeed");
-        assert!(directories.rows.is_empty());
+        assert!(directories.statements[0].rows.is_empty());
     }
 );
 
@@ -2811,9 +2770,7 @@ simulation_test!(
                      ) VALUES (\
                         'file-tombstone-fast-path', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', NULL, '1', true\
                      )"
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("seed untracked tombstone should succeed");
 
@@ -2835,7 +2792,7 @@ simulation_test!(
             .await
             .expect("file read should succeed");
         assert!(
-            file_rows.rows.is_empty(),
+            file_rows.statements[0].rows.is_empty(),
             "tombstoned file must stay hidden after no-op update"
         );
 
@@ -2844,7 +2801,7 @@ simulation_test!(
             .await
             .expect("directory read should succeed");
         assert!(
-            directory_rows.rows.is_empty(),
+            directory_rows.statements[0].rows.is_empty(),
             "no-op update should not create parent directories for tombstoned rows"
         );
     }
@@ -2878,8 +2835,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows.len(), 1);
-        let actual_commit_id = match &rows.rows[0][0] {
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        let actual_commit_id = match &rows.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text lixcol_commit_id, got {other:?}"),
         };
@@ -2908,9 +2865,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('switch-file', '/switch-a.json', lix_text_encode('ignored'), '{version_a}')",
                     version_a = version_a_sql,
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
         engine
@@ -2919,9 +2874,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('switch-file', '/switch-b.json', lix_text_encode('ignored'), '{version_b}')",
                     version_b = version_b_sql,
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
 
@@ -2931,9 +2884,7 @@ simulation_test!(
                     "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
                      VALUES ('switch-dir', '/a/', NULL, 'a', '{version_a}')",
                     version_a = version_a_sql,
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
         engine
@@ -2942,9 +2893,7 @@ simulation_test!(
                     "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
                      VALUES ('switch-dir', '/b/', NULL, 'b', '{version_b}')",
                     version_b = version_b_sql,
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
 
@@ -2952,8 +2901,8 @@ simulation_test!(
             .execute("SELECT path FROM lix_file WHERE id = 'switch-file'", &[])
             .await
             .unwrap();
-        assert_eq!(before_file.rows.len(), 1);
-        assert_text(&before_file.rows[0][0], "/switch-a.json");
+        assert_eq!(before_file.statements[0].rows.len(), 1);
+        assert_text(&before_file.statements[0].rows[0][0], "/switch-a.json");
 
         let before_dir = engine
             .execute(
@@ -2962,8 +2911,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(before_dir.rows.len(), 1);
-        assert_text(&before_dir.rows[0][0], "/a/");
+        assert_eq!(before_dir.statements[0].rows.len(), 1);
+        assert_text(&before_dir.statements[0].rows[0][0], "/a/");
 
         engine
             .execute(
@@ -2980,8 +2929,8 @@ simulation_test!(
             .execute("SELECT path FROM lix_file WHERE id = 'switch-file'", &[])
             .await
             .unwrap();
-        assert_eq!(after_file.rows.len(), 1);
-        assert_text(&after_file.rows[0][0], "/switch-b.json");
+        assert_eq!(after_file.statements[0].rows.len(), 1);
+        assert_text(&after_file.statements[0].rows[0][0], "/switch-b.json");
 
         let after_dir = engine
             .execute(
@@ -2990,8 +2939,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(after_dir.rows.len(), 1);
-        assert_text(&after_dir.rows[0][0], "/b/");
+        assert_eq!(after_dir.statements[0].rows.len(), 1);
+        assert_text(&after_dir.statements[0].rows[0][0], "/b/");
     }
 );
 
@@ -3004,9 +2953,7 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
 
     let file_err = engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('invalid-file', 'invalid-path', lix_text_encode('ignored'))",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('invalid-file', 'invalid-path', lix_text_encode('ignored'))", &[])
         .await
         .expect_err("invalid file path should fail");
     assert!(
@@ -3046,9 +2993,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('lixcol-file', '/lixcol.json', lix_text_encode('ignored'), '{\"tag\":\"file\"}')",
-                &[],
-            )
+             VALUES ('lixcol-file', '/lixcol.json', lix_text_encode('ignored'), '{\"tag\":\"file\"}')", &[])
             .await
             .unwrap();
         engine
@@ -3066,15 +3011,13 @@ simulation_test!(
                 lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
                 lixcol_schema_version, lixcol_inherited_from_version_id, lixcol_change_id, \
                 lixcol_created_at, lixcol_updated_at, lixcol_writer_key, lixcol_untracked, lixcol_metadata \
-             FROM lix_file WHERE id = 'lixcol-file'",
-                &[],
-            )
+             FROM lix_file WHERE id = 'lixcol-file'", &[])
             .await
             .unwrap();
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_text(&file_rows.rows[0][1], "lix_file_descriptor");
-        assert_text(&file_rows.rows[0][3], "lix");
-        match &file_rows.rows[0][9] {
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_text(&file_rows.statements[0].rows[0][1], "lix_file_descriptor");
+        assert_text(&file_rows.statements[0].rows[0][3], "lix");
+        match &file_rows.statements[0].rows[0][9] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected lixcol_writer_key as text/null, got {other:?}"),
         }
@@ -3088,13 +3031,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_shape_rows.rows.len(), 1);
-        match &file_shape_rows.rows[0][0] {
+        assert_eq!(file_shape_rows.statements[0].rows.len(), 1);
+        match &file_shape_rows.statements[0].rows[0][0] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected directory_id as text/null, got {other:?}"),
         }
-        assert_text(&file_shape_rows.rows[0][1], "lixcol");
-        assert_text(&file_shape_rows.rows[0][2], "json");
+        assert_text(&file_shape_rows.statements[0].rows[0][1], "lixcol");
+        assert_text(&file_shape_rows.statements[0].rows[0][2], "json");
 
         let active_version = active_version_id(&engine).await.replace('\'', "''");
         let file_by_version_shape_rows = engine
@@ -3109,14 +3052,17 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_by_version_shape_rows.rows.len(), 1);
-        match &file_by_version_shape_rows.rows[0][0] {
+        assert_eq!(file_by_version_shape_rows.statements[0].rows.len(), 1);
+        match &file_by_version_shape_rows.statements[0].rows[0][0] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected file_by_version directory_id as text/null, got {other:?}"),
         }
-        assert_text(&file_by_version_shape_rows.rows[0][1], "lixcol");
-        assert_text(&file_by_version_shape_rows.rows[0][2], "json");
-        match &file_by_version_shape_rows.rows[0][3] {
+        assert_text(
+            &file_by_version_shape_rows.statements[0].rows[0][1],
+            "lixcol",
+        );
+        assert_text(&file_by_version_shape_rows.statements[0].rows[0][2], "json");
+        match &file_by_version_shape_rows.statements[0].rows[0][3] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected file_by_version writer key as text/null, got {other:?}"),
         }
@@ -3127,18 +3073,19 @@ simulation_test!(
                 lixcol_entity_id, lixcol_schema_key, lixcol_schema_version, lixcol_inherited_from_version_id, \
                 lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
                 lixcol_untracked, lixcol_metadata \
-             FROM lix_directory WHERE id = 'lixcol-dir'",
-                &[],
-            )
+             FROM lix_directory WHERE id = 'lixcol-dir'", &[])
             .await
             .unwrap();
-        assert_eq!(directory_rows.rows.len(), 1);
-        assert_text(&directory_rows.rows[0][1], "lix_directory_descriptor");
-        match &directory_rows.rows[0][2] {
+        assert_eq!(directory_rows.statements[0].rows.len(), 1);
+        assert_text(
+            &directory_rows.statements[0].rows[0][1],
+            "lix_directory_descriptor",
+        );
+        match &directory_rows.statements[0].rows[0][2] {
             Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
             other => panic!("expected lixcol_schema_version as text, got {other:?}"),
         }
-        match &directory_rows.rows[0][9] {
+        match &directory_rows.statements[0].rows[0][9] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected lixcol_metadata as text/null, got {other:?}"),
         }
@@ -3156,12 +3103,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(directory_by_version_rows.rows.len(), 1);
-        match &directory_by_version_rows.rows[0][0] {
+        assert_eq!(directory_by_version_rows.statements[0].rows.len(), 1);
+        match &directory_by_version_rows.statements[0].rows[0][0] {
             Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
             other => panic!("expected by-version schema version as text, got {other:?}"),
         }
-        match &directory_by_version_rows.rows[0][1] {
+        match &directory_by_version_rows.statements[0].rows[0][1] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected by-version metadata as text/null, got {other:?}"),
         }
@@ -3179,9 +3126,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_file (id, path, data) VALUES ('change-id-file', '/change-id.json', lix_text_encode('ignored'))",
-            &[],
-        )
+            "INSERT INTO lix_file (id, path, data) VALUES ('change-id-file', '/change-id.json', lix_text_encode('ignored'))", &[])
         .await
         .unwrap();
 
@@ -3193,8 +3138,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_row.rows.len(), 1);
-        let file_change_id = match &file_row.rows[0][0] {
+        assert_eq!(file_row.statements[0].rows.len(), 1);
+        let file_change_id = match &file_row.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text lixcol_change_id, got {other:?}"),
         };
@@ -3208,8 +3153,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(by_version_row.rows.len(), 1);
-        let by_version_change_id = match &by_version_row.rows[0][0] {
+        assert_eq!(by_version_row.statements[0].rows.len(), 1);
+        let by_version_change_id = match &by_version_row.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text lixcol_change_id, got {other:?}"),
         };
@@ -3227,9 +3172,7 @@ simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('metadata-change-file', '/metadata-change.json', lix_text_encode('ignored'), '{\"owner\":\"a\"}')",
-            &[],
-        )
+             VALUES ('metadata-change-file', '/metadata-change.json', lix_text_encode('ignored'), '{\"owner\":\"a\"}')", &[])
         .await
         .unwrap();
 
@@ -3240,8 +3183,8 @@ simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(before.rows.len(), 1);
-    let before_change_id = match &before.rows[0][0] {
+    assert_eq!(before.statements[0].rows.len(), 1);
+    let before_change_id = match &before.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text change id, got {other:?}"),
     };
@@ -3263,16 +3206,16 @@ simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(after.rows.len(), 1);
-    let after_change_id = match &after.rows[0][0] {
+    assert_eq!(after.statements[0].rows.len(), 1);
+    let after_change_id = match &after.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text change id, got {other:?}"),
     };
     assert_ne!(before_change_id, after_change_id);
     assert!(
-        matches!(&after.rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"b\"")),
+        matches!(&after.statements[0].rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"b\"")),
         "expected updated metadata payload, got {:?}",
-        after.rows[0][1]
+        after.statements[0].rows[0][1]
     );
 });
 
@@ -3327,11 +3270,20 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert!(!file_history.rows.is_empty());
-        assert_text(&file_history.rows[0][0], "history-file");
-        assert!(matches!(file_history.rows[0][1], Value::Text(_)));
-        assert!(matches!(file_history.rows[0][2], Value::Text(_)));
-        assert!(matches!(file_history.rows[0][3], Value::Integer(_)));
+        assert!(!file_history.statements[0].rows.is_empty());
+        assert_text(&file_history.statements[0].rows[0][0], "history-file");
+        assert!(matches!(
+            file_history.statements[0].rows[0][1],
+            Value::Text(_)
+        ));
+        assert!(matches!(
+            file_history.statements[0].rows[0][2],
+            Value::Text(_)
+        ));
+        assert!(matches!(
+            file_history.statements[0].rows[0][3],
+            Value::Integer(_)
+        ));
 
         let directory_history = engine
             .execute(
@@ -3343,11 +3295,20 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert!(!directory_history.rows.is_empty());
-        assert_text(&directory_history.rows[0][0], "history-dir");
-        assert!(matches!(directory_history.rows[0][1], Value::Text(_)));
-        assert!(matches!(directory_history.rows[0][2], Value::Text(_)));
-        assert!(matches!(directory_history.rows[0][3], Value::Integer(_)));
+        assert!(!directory_history.statements[0].rows.is_empty());
+        assert_text(&directory_history.statements[0].rows[0][0], "history-dir");
+        assert!(matches!(
+            directory_history.statements[0].rows[0][1],
+            Value::Text(_)
+        ));
+        assert!(matches!(
+            directory_history.statements[0].rows[0][2],
+            Value::Text(_)
+        ));
+        assert!(matches!(
+            directory_history.statements[0].rows[0][3],
+            Value::Integer(_)
+        ));
     }
 );
 

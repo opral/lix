@@ -47,8 +47,8 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine
         .await
         .unwrap();
 
-    assert_eq!(sequence.rows.len(), 1);
-    let snapshot_content = match &sequence.rows[0][0] {
+    assert_eq!(sequence.statements[0].rows.len(), 1);
+    let snapshot_content = match &sequence.statements[0].rows[0][0] {
         Value::Text(value) => value,
         other => panic!("expected text snapshot_content, got {other:?}"),
     };
@@ -80,12 +80,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(mode_metadata.rows.len(), 1);
-        let created_at = match &mode_metadata.rows[0][0] {
+        assert_eq!(mode_metadata.statements[0].rows.len(), 1);
+        let created_at = match &mode_metadata.statements[0].rows[0][0] {
             Value::Text(value) => value,
             other => panic!("expected text created_at, got {other:?}"),
         };
-        let updated_at = match &mode_metadata.rows[0][1] {
+        let updated_at = match &mode_metadata.statements[0].rows[0][1] {
             Value::Text(value) => value,
             other => panic!("expected text updated_at, got {other:?}"),
         };
@@ -107,9 +107,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(mode_row.rows.len(), 1);
+        assert_eq!(mode_row.statements[0].rows.len(), 1);
 
-        let mode_snapshot = match &mode_row.rows[0][0] {
+        let mode_snapshot = match &mode_row.statements[0].rows[0][0] {
             Value::Text(value) => value,
             other => panic!("expected text snapshot_content, got {other:?}"),
         };
@@ -140,26 +140,38 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(first.rows.len(), 1);
-        assert_eq!(first.rows[0][0], Value::Text(deterministic_uuid(0)));
+        assert_eq!(first.statements[0].rows.len(), 1);
         assert_eq!(
-            first.rows[0][1],
+            first.statements[0].rows[0][0],
+            Value::Text(deterministic_uuid(0))
+        );
+        assert_eq!(
+            first.statements[0].rows[0][1],
             Value::Text("1970-01-01T00:00:00.001Z".to_string())
         );
-        assert_eq!(first.rows[0][2], Value::Text(deterministic_uuid(2)));
+        assert_eq!(
+            first.statements[0].rows[0][2],
+            Value::Text(deterministic_uuid(2))
+        );
 
         let second = engine
             .execute("SELECT lix_uuid_v7(), lix_timestamp(), lix_uuid_v7()", &[])
             .await
             .unwrap();
 
-        assert_eq!(second.rows.len(), 1);
-        assert_eq!(second.rows[0][0], Value::Text(deterministic_uuid(3)));
+        assert_eq!(second.statements[0].rows.len(), 1);
         assert_eq!(
-            second.rows[0][1],
+            second.statements[0].rows[0][0],
+            Value::Text(deterministic_uuid(3))
+        );
+        assert_eq!(
+            second.statements[0].rows[0][1],
             Value::Text("1970-01-01T00:00:00.004Z".to_string())
         );
-        assert_eq!(second.rows[0][2], Value::Text(deterministic_uuid(5)));
+        assert_eq!(
+            second.statements[0].rows[0][2],
+            Value::Text(deterministic_uuid(5))
+        );
 
         assert_eq!(read_sequence_value(&engine).await, 5);
     }
@@ -192,9 +204,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -209,11 +219,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(changes.rows.len(), 1);
-        assert_eq!(changes.rows[0][0], Value::Text(deterministic_uuid(1)));
-        assert_eq!(changes.rows[0][1], Value::Text(deterministic_uuid(9)));
+        assert_eq!(changes.statements[0].rows.len(), 1);
         assert_eq!(
-            changes.rows[0][2],
+            changes.statements[0].rows[0][0],
+            Value::Text(deterministic_uuid(1))
+        );
+        assert_eq!(
+            changes.statements[0].rows[0][1],
+            Value::Text(deterministic_uuid(9))
+        );
+        assert_eq!(
+            changes.statements[0].rows[0][2],
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
@@ -229,14 +245,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(materialized.rows.len(), 1);
-        assert_eq!(materialized.rows[0][0], Value::Text(deterministic_uuid(1)));
+        assert_eq!(materialized.statements[0].rows.len(), 1);
         assert_eq!(
-            materialized.rows[0][1],
+            materialized.statements[0].rows[0][0],
+            Value::Text(deterministic_uuid(1))
+        );
+        assert_eq!(
+            materialized.statements[0].rows[0][1],
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
         assert_eq!(
-            materialized.rows[0][2],
+            materialized.statements[0].rows[0][2],
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
@@ -269,11 +288,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Value::Text(deterministic_uuid(0)));
-        assert_eq!(result.rows[0][2], Value::Text(deterministic_uuid(1)));
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(
+            result.statements[0].rows[0][0],
+            Value::Text(deterministic_uuid(0))
+        );
+        assert_eq!(
+            result.statements[0].rows[0][2],
+            Value::Text(deterministic_uuid(1))
+        );
 
-        let timestamp = match &result.rows[0][1] {
+        let timestamp = match &result.statements[0].rows[0][1] {
             Value::Text(value) => value,
             other => panic!("expected text timestamp, got {other:?}"),
         };
@@ -310,9 +335,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-defaults', 'defaults_schema', 'file-1', 'version-1', 'lix', '{}', '1'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
@@ -330,8 +353,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(row.rows.len(), 1);
-        let snapshot_content = match &row.rows[0][0] {
+        assert_eq!(row.statements[0].rows.len(), 1);
+        let snapshot_content = match &row.statements[0].rows[0][0] {
             Value::Text(value) => value,
             other => panic!("expected text snapshot_content, got {other:?}"),
         };
@@ -375,8 +398,8 @@ simulation_test!(
 
         let result = engine.execute("SELECT lix_uuid_v7()", &[]).await.unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        let uuid = match &result.rows[0][0] {
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let uuid = match &result.statements[0].rows[0][0] {
             Value::Text(value) => value,
             other => panic!("expected text uuid, got {other:?}"),
         };
@@ -402,8 +425,8 @@ simulation_test!(
         let mut millis = Vec::new();
         for _ in 0..12 {
             let result = engine.execute("SELECT lix_timestamp()", &[]).await.unwrap();
-            assert_eq!(result.rows.len(), 1);
-            let timestamp = match &result.rows[0][0] {
+            assert_eq!(result.statements[0].rows.len(), 1);
+            let timestamp = match &result.statements[0].rows[0][0] {
                 Value::Text(value) => value,
                 other => panic!("expected text timestamp, got {other:?}"),
             };

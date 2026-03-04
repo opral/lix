@@ -33,7 +33,7 @@ use crate::version::{
     version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
 };
 use crate::WasmRuntime;
-use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
+use crate::{ExecuteResult, LixBackend, LixError, LixTransaction, QueryResult, Value};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
@@ -118,7 +118,11 @@ pub struct EngineTransaction<'a> {
 }
 
 impl<'a> EngineTransaction<'a> {
-    pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
         if !self.engine.access_to_internal {
             let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
             reject_internal_table_writes(&parsed_statements)?;
@@ -130,7 +134,7 @@ impl<'a> EngineTransaction<'a> {
         &mut self,
         sql: &str,
         params: &[Value],
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         self.execute_with_access(sql, params).await
     }
 
@@ -138,7 +142,7 @@ impl<'a> EngineTransaction<'a> {
         &mut self,
         sql: &str,
         params: &[Value],
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         let previous_active_version_id = self.active_version_id.clone();
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
@@ -157,7 +161,8 @@ impl<'a> EngineTransaction<'a> {
                 )
                 .await?
         } else {
-            self.engine
+            let single_statement_result = self
+                .engine
                 .execute_with_options_in_transaction(
                     transaction.as_mut(),
                     sql,
@@ -168,7 +173,10 @@ impl<'a> EngineTransaction<'a> {
                     false,
                     &mut self.pending_state_commit_stream_changes,
                 )
-                .await?
+                .await?;
+            ExecuteResult {
+                statements: vec![single_statement_result],
+            }
         };
         if self.active_version_id != previous_active_version_id {
             self.active_version_changed = true;
@@ -684,7 +692,8 @@ mod tests {
     use crate::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::version::active_version_schema_key;
     use crate::{
-        LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value, WasmComponentInstance,
+        ExecuteResult, LixError, NoopWasmRuntime, QueryResult, SnapshotChunkReader, Value,
+        WasmComponentInstance,
     };
     use async_trait::async_trait;
     use serde_json::json;
@@ -713,7 +722,7 @@ mod tests {
         sql: &str,
         params: &[Value],
         options: &ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         let statements = parse_sql_statements(sql)?;
         engine
             .execute_statement_script_with_options(statements, params, options)
@@ -935,11 +944,7 @@ mod tests {
         ));
 
         let error = engine
-            .execute(
-                "SELECT * FROM unknown_table",
-                &[],
-                ExecuteOptions::default(),
-            )
+            .execute("SELECT * FROM unknown_table", &[])
             .await
             .expect_err("unknown relation query should fail");
 

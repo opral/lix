@@ -36,8 +36,8 @@ async fn read_active_version_value(engine: &support::simulation_test::Simulation
         .await
         .unwrap();
 
-    assert_eq!(row.rows.len(), 1);
-    let snapshot = parse_snapshot(&row.rows[0][0]);
+    assert_eq!(row.statements[0].rows.len(), 1);
+    let snapshot = parse_snapshot(&row.statements[0].rows[0][0]);
     snapshot["version_id"]
         .as_str()
         .expect("active version value should be a string")
@@ -51,12 +51,12 @@ async fn read_active_version_view_row(
         .execute("SELECT id, version_id FROM lix_active_version", &[])
         .await
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let id = match &result.rows[0][0] {
+    assert_eq!(result.statements[0].rows.len(), 1);
+    let id = match &result.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text id, got {other:?}"),
     };
-    let version_id = match &result.rows[0][1] {
+    let version_id = match &result.statements[0].rows[0][1] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text version_id, got {other:?}"),
     };
@@ -86,18 +86,18 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
         .await
         .unwrap();
 
-    assert_eq!(row.rows.len(), 1);
-    let entity_id = match &row.rows[0][0] {
+    assert_eq!(row.statements[0].rows.len(), 1);
+    let entity_id = match &row.statements[0].rows[0][0] {
         Value::Text(value) => value,
         other => panic!("expected text entity_id, got {other:?}"),
     };
-    let snapshot = parse_snapshot(&row.rows[0][1]);
+    let snapshot = parse_snapshot(&row.statements[0].rows[0][1]);
     assert_eq!(snapshot["id"], entity_id.as_str());
     let active_version_id = snapshot["version_id"]
         .as_str()
         .expect("active version snapshot should include string version_id");
     assert!(!active_version_id.is_empty());
-    assert_true_like(&row.rows[0][2]);
+    assert_true_like(&row.statements[0].rows[0][2]);
 
     sim.assert_deterministic(entity_id.to_string());
     sim.assert_deterministic(active_version_id.to_string());
@@ -109,8 +109,11 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
         )
         .await
         .unwrap();
-    assert_eq!(version.rows.len(), 1);
-    assert_eq!(version.rows[0][0], Value::Text("main".to_string()));
+    assert_eq!(version.statements[0].rows.len(), 1);
+    assert_eq!(
+        version.statements[0].rows[0][0],
+        Value::Text("main".to_string())
+    );
 }
 
 simulation_test!(
@@ -144,18 +147,18 @@ simulation_test!(init_seeds_default_active_version, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(row.rows.len(), 1);
-    let entity_id = match &row.rows[0][0] {
+    assert_eq!(row.statements[0].rows.len(), 1);
+    let entity_id = match &row.statements[0].rows[0][0] {
         Value::Text(value) => value,
         other => panic!("expected text entity_id, got {other:?}"),
     };
-    let snapshot = parse_snapshot(&row.rows[0][1]);
+    let snapshot = parse_snapshot(&row.statements[0].rows[0][1]);
     assert_eq!(snapshot["id"], entity_id.as_str());
     let active_version_id = snapshot["version_id"]
         .as_str()
         .expect("active version snapshot should include string version_id");
     assert!(!active_version_id.is_empty());
-    assert_true_like(&row.rows[0][2]);
+    assert_true_like(&row.statements[0].rows[0][2]);
 
     let version = engine
         .execute(
@@ -164,8 +167,11 @@ simulation_test!(init_seeds_default_active_version, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(version.rows.len(), 1);
-    assert_eq!(version.rows[0][0], Value::Text("main".to_string()));
+    assert_eq!(version.statements[0].rows.len(), 1);
+    assert_eq!(
+        version.statements[0].rows[0][0],
+        Value::Text("main".to_string())
+    );
 });
 
 simulation_test!(

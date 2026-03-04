@@ -37,13 +37,13 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(vec![vec![after_insert.rows[0][0].clone()]]);
-    assert_eq!(after_insert.rows.len(), 1);
+    sim.assert_deterministic(vec![vec![after_insert.statements[0].rows[0][0].clone()]]);
+    assert_eq!(after_insert.statements[0].rows.len(), 1);
     assert_eq!(
-        after_insert.rows[0][0],
+        after_insert.statements[0].rows[0][0],
         Value::Text("{\"key\":\"key0\",\"value\":\"value0\"}".to_string())
     );
-    match &after_insert.rows[0][1] {
+    match &after_insert.statements[0].rows[0][1] {
         Value::Boolean(value) => assert!(!value),
         Value::Integer(value) => assert_eq!(*value, 0),
         other => panic!("expected false-like untracked marker, got {other:?}"),
@@ -69,10 +69,10 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(after_update.rows.clone());
-    assert_eq!(after_update.rows.len(), 1);
+    sim.assert_deterministic(after_update.statements[0].rows.clone());
+    assert_eq!(after_update.statements[0].rows.len(), 1);
     assert_eq!(
-        after_update.rows[0][0],
+        after_update.statements[0].rows[0][0],
         Value::Text("{\"key\":\"key0\",\"value\":\"value1\"}".to_string())
     );
 
@@ -97,8 +97,8 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(after_delete.rows.clone());
-    assert_eq!(after_delete.rows.len(), 0);
+    sim.assert_deterministic(after_delete.statements[0].rows.clone());
+    assert_eq!(after_delete.statements[0].rows.len(), 0);
 });
 
 simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
@@ -137,10 +137,10 @@ simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(rows.rows.clone());
-    assert_eq!(rows.rows.len(), 6);
+    sim.assert_deterministic(rows.statements[0].rows.clone());
+    assert_eq!(rows.statements[0].rows.len(), 6);
 
-    let actual_by_id: HashMap<String, String> = rows
+    let actual_by_id: HashMap<String, String> = rows.statements[0]
         .rows
         .iter()
         .map(|row| {
@@ -213,11 +213,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 2);
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
 
-        let number_row = &rows.rows[0];
-        let string_row = &rows.rows[1];
+        let number_row = &rows.statements[0].rows[0];
+        let string_row = &rows.statements[0].rows[1];
 
         assert_eq!(number_row[0], Value::Text("type_test_number".to_string()));
         assert_eq!(
@@ -259,8 +259,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(result.rows.clone());
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Value::Text("20".to_string()));
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(
+            result.statements[0].rows[0][0],
+            Value::Text("20".to_string())
+        );
     }
 );

@@ -1,4 +1,5 @@
 use super::*;
+use crate::errors;
 
 impl Engine {
     pub(crate) async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {
@@ -60,10 +61,15 @@ impl Engine {
     }
 
     pub(crate) async fn generate_runtime_uuid(&self) -> Result<String, LixError> {
-        let result = self
-            .execute("SELECT lix_uuid_v7()", &[], ExecuteOptions::default())
-            .await?;
-        let row = result.rows.first().ok_or_else(|| LixError {
+        let result = self.execute("SELECT lix_uuid_v7()", &[]).await?;
+        let [statement] = result.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "lix_uuid_v7 query",
+                1,
+                result.statements.len(),
+            ));
+        };
+        let row = statement.rows.first().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "lix_uuid_v7 query returned no rows".to_string(),
         })?;

@@ -17,8 +17,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text active version id, got {other:?}"),
     }
@@ -30,9 +30,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -82,9 +80,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "value-b");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "value-b");
     }
 );
 
@@ -126,9 +124,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "value-b");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "value-b");
     }
 );
 
@@ -186,9 +184,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "{\"value\":\"B\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"B\"}");
     }
 );
 
@@ -210,9 +208,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'oc-state-bv', 'test_state_schema', 'test-file', 'version-a', 'lix', '1', '{\"value\":\"A\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -224,9 +220,7 @@ simulation_test!(
                  'oc-state-bv', 'test_state_schema', 'test-file', 'version-a', 'lix', '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE \
-                 SET snapshot_content = '{\"value\":\"B\"}'",
-                &[],
-            )
+                 SET snapshot_content = '{\"value\":\"B\"}'", &[])
             .await
             .unwrap();
 
@@ -241,9 +235,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "{\"value\":\"B\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"B\"}");
     }
 );
 
@@ -289,8 +283,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0][0], Value::Integer(1));
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_eq!(rows.statements[0].rows[0][0], Value::Integer(1));
     }
 );

@@ -30,8 +30,11 @@ async fn active_version_pointer(
         )
         .await
         .expect("active version query should succeed");
-    assert_eq!(result.rows.len(), 1);
-    (as_text(&result.rows[0][0]), as_text(&result.rows[0][1]))
+    assert_eq!(result.statements[0].rows.len(), 1);
+    (
+        as_text(&result.statements[0].rows[0][0]),
+        as_text(&result.statements[0].rows[0][1]),
+    )
 }
 
 simulation_test!(
@@ -91,8 +94,11 @@ simulation_test!(
             )
             .await
             .expect("baseline query should succeed");
-        assert_eq!(baseline.rows.len(), 1);
-        assert_eq!(as_text(&baseline.rows[0][0]), before_commit_id);
+        assert_eq!(baseline.statements[0].rows.len(), 1);
+        assert_eq!(
+            as_text(&baseline.statements[0].rows[0][0]),
+            before_commit_id
+        );
     }
 );
 
@@ -130,8 +136,8 @@ simulation_test!(checkpoint_labels_current_commit, |sim| async move {
         )
         .await
         .expect("checkpoint label query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    assert_eq!(as_i64(&rows.rows[0][0]), 1);
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    assert_eq!(as_i64(&rows.statements[0].rows[0][0]), 1);
 });
 
 simulation_test!(
@@ -166,8 +172,8 @@ simulation_test!(
             )
             .await
             .expect("baseline query should succeed");
-        assert_eq!(baseline.rows.len(), 1);
-        assert_eq!(as_text(&baseline.rows[0][0]), tip_commit_id);
+        assert_eq!(baseline.statements[0].rows.len(), 1);
+        assert_eq!(as_text(&baseline.statements[0].rows[0][0]), tip_commit_id);
     }
 );
 
@@ -191,7 +197,7 @@ simulation_test!(checkpoint_clears_working_changes, |sim| async move {
         .execute("SELECT COUNT(*) FROM lix_working_changes", &[])
         .await
         .expect("working changes query should succeed");
-    assert!(as_i64(&before.rows[0][0]) > 0);
+    assert!(as_i64(&before.statements[0].rows[0][0]) > 0);
 
     engine
         .create_checkpoint()
@@ -202,7 +208,7 @@ simulation_test!(checkpoint_clears_working_changes, |sim| async move {
         .execute("SELECT COUNT(*) FROM lix_working_changes", &[])
         .await
         .expect("working changes query should succeed");
-    assert_eq!(as_i64(&after.rows[0][0]), 0);
+    assert_eq!(as_i64(&after.statements[0].rows[0][0]), 0);
 });
 
 simulation_test!(
@@ -242,12 +248,12 @@ simulation_test!(
         assert_eq!(checkpoint.id, commit_before);
         assert_eq!(commit_after, commit_before);
         assert_eq!(
-            as_i64(&commits_after.rows[0][0]),
-            as_i64(&commits_before.rows[0][0])
+            as_i64(&commits_after.statements[0].rows[0][0]),
+            as_i64(&commits_before.statements[0].rows[0][0])
         );
         assert_eq!(
-            as_i64(&edges_after.rows[0][0]),
-            as_i64(&edges_before.rows[0][0])
+            as_i64(&edges_after.statements[0].rows[0][0]),
+            as_i64(&edges_before.statements[0].rows[0][0])
         );
     }
 );

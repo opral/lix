@@ -396,13 +396,11 @@ simulation_test!(
         let path = "/observe-switch-file.txt";
         engine
             .execute(
-                "INSERT INTO lix_file_by_version (path, data, lixcol_version_id) VALUES ($1, $2, $3)",
-                &[
+                "INSERT INTO lix_file_by_version (path, data, lixcol_version_id) VALUES ($1, $2, $3)", &[
                     Value::Text(path.to_string()),
                     Value::Blob(vec![1]),
                     Value::Text("global".to_string()),
-                ],
-            )
+                ])
             .await
             .expect("global file insert should succeed");
         engine
@@ -635,10 +633,7 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
 
             engine_b
                 .execute(
-                    "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))",
-                    &[],
-                    ExecuteOptions::default(),
-                )
+                    "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))", &[])
                 .await
                 .expect("external insert should succeed");
 
@@ -706,10 +701,7 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
                  ) VALUES (\
                  'observe-untracked-external', 'lix', 'lix_key_value', 'lix', '1', \
                  lix_json('{\"key\":\"observe-untracked-external\",\"value\":\"u1\"}'), true\
-                 )",
-                    &[],
-                    ExecuteOptions::default(),
-                )
+                 )", &[])
                 .await
                 .expect("external untracked insert should succeed");
 
@@ -770,10 +762,7 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
 
             engine_b
                 .execute(
-                    "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))",
-                    &[],
-                    ExecuteOptions::default(),
-                )
+                    "INSERT INTO lix_file (path, data) VALUES ('/observe-external.md', lix_text_encode('hello'))", &[])
                 .await
                 .expect("external insert should succeed");
 
@@ -839,10 +828,7 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                  ) VALUES (\
                  'observe-untracked-external', 'lix', 'lix_key_value', 'lix', '1', \
                  lix_json('{\"key\":\"observe-untracked-external\",\"value\":\"u1\"}'), true\
-                 )",
-                    &[],
-                    ExecuteOptions::default(),
-                )
+                 )", &[])
                 .await
                 .expect("external untracked insert should succeed");
 
@@ -898,7 +884,7 @@ fn observe_external_same_writer_key_is_suppressed() {
         assert!(initial.rows.rows.is_empty());
 
         engine_b
-            .execute(
+            .execute_with_options(
                 "INSERT INTO lix_file (path, data) VALUES ('/observe-writer.md', lix_text_encode('same-writer'))",
                 &[],
                 ExecuteOptions {
@@ -952,7 +938,7 @@ fn observe_external_different_writer_key_emits() {
         assert!(initial.rows.rows.is_empty());
 
         engine_b
-            .execute(
+            .execute_with_options(
                 "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-different.md', lix_text_encode('different-writer'))",
                 &[],
                 ExecuteOptions {
@@ -1009,10 +995,7 @@ fn observe_external_null_writer_key_emits() {
 
         engine_b
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-null.md', lix_text_encode('null-writer'))",
-                &[],
-                ExecuteOptions::default(),
-            )
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-null.md', lix_text_encode('null-writer'))", &[])
             .await
             .expect("external insert should succeed");
 
@@ -1183,10 +1166,7 @@ fn observe_external_unrelated_mutation_does_not_emit() {
 
             engine_b
             .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/observe-unrelated-other.md', lix_text_encode('other'))",
-                &[],
-                ExecuteOptions::default(),
-            )
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-unrelated-other.md', lix_text_encode('other'))", &[])
             .await
             .expect("external insert should succeed");
 

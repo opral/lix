@@ -348,9 +348,7 @@ async fn register_plugin_schema(engine: &support::simulation_test::SimulationEng
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"json_pointer\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"value\":{}},\"required\":[\"path\",\"value\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .expect("register plugin schema should succeed");
 }
@@ -363,8 +361,8 @@ async fn main_version_id(engine: &support::simulation_test::SimulationEngine) ->
         )
         .await
         .expect("main version query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected main version id text, got {other:?}"),
     }
@@ -382,8 +380,8 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
         )
         .await
         .expect("active version commit query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected active version commit id text, got {other:?}"),
     }
@@ -397,8 +395,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .expect("active version query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected active version id text, got {other:?}"),
     }
@@ -511,7 +509,8 @@ async fn detected_json_pointer_entities(
         )
         .await
         .expect("detected json_pointer query should succeed");
-    rows.rows
+    rows.statements[0]
+        .rows
         .iter()
         .map(|row| match &row[0] {
             Value::Text(value) => value.clone(),
@@ -537,8 +536,8 @@ async fn json_pointer_change_count(
         )
         .await
         .expect("json_pointer change count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 fn assert_blob_json_eq(value: &Value, expected: JsonValue) {
@@ -589,8 +588,8 @@ async fn file_cache_row_count(
         )
         .await
         .expect("file_data_cache count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn file_descriptor_tombstone_count(
@@ -612,8 +611,8 @@ async fn file_descriptor_tombstone_count(
         )
         .await
         .expect("file descriptor tombstone count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn total_file_cache_row_count_for_prefix(
@@ -632,8 +631,8 @@ async fn total_file_cache_row_count_for_prefix(
         )
         .await
         .expect("total file_data_cache count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn orphan_file_cache_row_count_for_prefix(
@@ -658,8 +657,8 @@ async fn orphan_file_cache_row_count_for_prefix(
         )
         .await
         .expect("orphan file_data_cache count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn binary_blob_hash_for_file_version(
@@ -680,7 +679,10 @@ async fn binary_blob_hash_for_file_version(
         )
         .await
         .expect("binary file_version_ref lookup should succeed");
-    rows.rows.first().map(|row| value_as_text(&row[0]))
+    rows.statements[0]
+        .rows
+        .first()
+        .map(|row| value_as_text(&row[0]))
 }
 
 async fn binary_chunk_hash_for_blob(
@@ -701,7 +703,10 @@ async fn binary_chunk_hash_for_blob(
         )
         .await
         .expect("binary manifest chunk lookup should succeed");
-    rows.rows.first().map(|row| value_as_text(&row[0]))
+    rows.statements[0]
+        .rows
+        .first()
+        .map(|row| value_as_text(&row[0]))
 }
 
 async fn binary_manifest_row_count_by_hash(
@@ -720,8 +725,8 @@ async fn binary_manifest_row_count_by_hash(
         )
         .await
         .expect("binary manifest row count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
@@ -736,8 +741,8 @@ async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::Simula
         )
         .await
         .expect("orphan binary chunk count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn orphan_binary_manifest_chunk_row_count(
@@ -754,8 +759,8 @@ async fn orphan_binary_manifest_chunk_row_count(
         )
         .await
         .expect("orphan binary manifest chunk count query should succeed");
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn binary_codec_counts_for_blob(
@@ -773,16 +778,14 @@ async fn binary_codec_counts_for_blob(
                  JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
                  WHERE mc.blob_hash = '{}'",
                 blob_hash
-            ),
-            &[],
-        )
+            ), &[])
         .await
         .expect("binary codec counts query should succeed");
-    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.statements[0].rows.len(), 1);
     (
-        value_as_i64(&rows.rows[0][0]),
-        value_as_i64(&rows.rows[0][1]),
-        value_as_i64(&rows.rows[0][2]),
+        value_as_i64(&rows.statements[0].rows[0][0]),
+        value_as_i64(&rows.statements[0].rows[0][1]),
+        value_as_i64(&rows.statements[0].rows[0][2]),
     )
 }
 
@@ -814,8 +817,8 @@ async fn binary_prefixed_chunk_payload_count_for_blob(
             .await
             .expect("prefixed binary chunk payload count query should succeed"),
     };
-    assert_eq!(rows.rows.len(), 1);
-    value_as_i64(&rows.rows[0][0])
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    value_as_i64(&rows.statements[0].rows[0][0])
 }
 
 async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
@@ -884,8 +887,8 @@ simulation_test!(
             )
             .await
             .expect("builtin fallback state row query should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        let snapshot = match &rows.rows[0][0] {
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        let snapshot = match &rows.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected snapshot text, got {other:?}"),
         };
@@ -949,9 +952,7 @@ simulation_test!(
                      'file-1', 'lix_file_descriptor', 'lix', '{}', 'lix', '{{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"config\",\"extension\":\"json\",\"metadata\":null,\"hidden\":false}}', '1'\
                      )",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("insert file descriptor should succeed");
 
@@ -964,9 +965,7 @@ simulation_test!(
                      ('', 'json_pointer', 'file-1', '{}', 'json', '{{\"path\":\"\",\"value\":{{}}}}', '1'), \
                      ('/value', 'json_pointer', 'file-1', '{}', 'json', '{{\"path\":\"/value\",\"value\":\"A\"}}', '1')",
                     main_version_id, main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("insert plugin state should succeed");
 
@@ -991,8 +990,11 @@ simulation_test!(
             )
             .await
             .expect("file_data_cache query should succeed");
-        assert_eq!(cache_rows.rows.len(), 1);
-        assert_blob_json_eq(&cache_rows.rows[0][0], serde_json::json!({"value":"A"}));
+        assert_eq!(cache_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &cache_rows.statements[0].rows[0][0],
+            serde_json::json!({"value":"A"}),
+        );
 
         let file_rows = engine
             .execute(
@@ -1006,8 +1008,11 @@ simulation_test!(
             )
             .await
             .expect("lix_file_by_version query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_blob_json_eq(&file_rows.rows[0][0], serde_json::json!({"value":"A"}));
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &file_rows.statements[0].rows[0][0],
+            serde_json::json!({"value":"A"}),
+        );
     }
 );
 
@@ -1045,9 +1050,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json', '/config.json', lix_text_encode('{\"hello\":\"from-write\"}'))",
-                &[],
-            )
+                 VALUES ('file-json', '/config.json', lix_text_encode('{\"hello\":\"from-write\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
@@ -1066,22 +1069,31 @@ simulation_test!(
             )
             .await
             .expect("detected plugin changes query should succeed");
-        assert_eq!(detected_changes.rows.len(), 2);
-        assert_eq!(detected_changes.rows[0][0], Value::Text("".to_string()));
+        assert_eq!(detected_changes.statements[0].rows.len(), 2);
         assert_eq!(
-            detected_changes.rows[0][1],
+            detected_changes.statements[0].rows[0][0],
+            Value::Text("".to_string())
+        );
+        assert_eq!(
+            detected_changes.statements[0].rows[0][1],
             Value::Text("json_pointer".to_string())
         );
-        assert_eq!(detected_changes.rows[0][2], Value::Text("json".to_string()));
         assert_eq!(
-            detected_changes.rows[1][0],
+            detected_changes.statements[0].rows[0][2],
+            Value::Text("json".to_string())
+        );
+        assert_eq!(
+            detected_changes.statements[0].rows[1][0],
             Value::Text("/hello".to_string())
         );
         assert_eq!(
-            detected_changes.rows[1][1],
+            detected_changes.statements[0].rows[1][1],
             Value::Text("json_pointer".to_string())
         );
-        assert_eq!(detected_changes.rows[1][2], Value::Text("json".to_string()));
+        assert_eq!(
+            detected_changes.statements[0].rows[1][2],
+            Value::Text("json".to_string())
+        );
 
         let file_rows = engine
             .execute(
@@ -1090,9 +1102,9 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &file_rows.rows[0][0],
+            &file_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"from-write"}),
         );
     }
@@ -1132,9 +1144,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-update', '/config.json', lix_text_encode('{\"hello\":\"before\",\"remove\":\"soon-gone\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-update', '/config.json', lix_text_encode('{\"hello\":\"before\",\"remove\":\"soon-gone\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1163,7 +1173,7 @@ simulation_test!(
             )
             .await
             .expect("detected plugin changes query should succeed");
-        let detected_entities = detected_changes
+        let detected_entities = detected_changes.statements[0]
             .rows
             .iter()
             .map(|row| match &row[0] {
@@ -1183,9 +1193,9 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &file_rows.rows[0][0],
+            &file_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"after","add":"new-value"}),
         );
     }
@@ -1200,9 +1210,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-param', '/config.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"gone\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-param', '/config.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"gone\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1231,9 +1239,9 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &file_rows.rows[0][0],
+            &file_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"after-param","new":1}),
         );
     }
@@ -1248,9 +1256,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-combined', '/combined.json', lix_text_encode('{\"hello\":\"before\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-combined', '/combined.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1285,8 +1291,8 @@ simulation_test!(
             )
             .await
             .expect("commit edge query should succeed");
-        assert_eq!(edge_rows.rows.len(), 1);
-        assert_eq!(value_as_i64(&edge_rows.rows[0][0]), 1);
+        assert_eq!(edge_rows.statements[0].rows.len(), 1);
+        assert_eq!(value_as_i64(&edge_rows.statements[0].rows[0][0]), 1);
 
         let detected =
             detected_json_pointer_entities(&engine, "file-json-combined", &main_version_id).await;
@@ -1305,13 +1311,13 @@ simulation_test!(
             )
             .await
             .expect("combined file read should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
-        match &file_rows.rows[0][0] {
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        match &file_rows.statements[0].rows[0][0] {
             Value::Text(value) => assert_eq!(value, "/combined-renamed.json"),
             other => panic!("expected path text, got {other:?}"),
         }
         assert_blob_json_eq(
-            &file_rows.rows[0][1],
+            &file_rows.statements[0].rows[0][1],
             serde_json::json!({"hello":"after","added":true}),
         );
     }
@@ -1326,9 +1332,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-insert-cache', '/state-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-state-insert-cache', '/state-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1339,9 +1343,9 @@ simulation_test!(
             )
             .await
             .expect("file read before state insert should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start"}),
         );
 
@@ -1351,9 +1355,7 @@ simulation_test!(
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  '/extra', 'file-json-state-insert-cache', 'json_pointer', 'json', '1', '{\"path\":\"/extra\",\"value\":\"Add\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .expect("direct state insert should succeed");
 
@@ -1364,9 +1366,9 @@ simulation_test!(
             )
             .await
             .expect("file read after state insert should succeed");
-        assert_eq!(after_rows.rows.len(), 1);
+        assert_eq!(after_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &after_rows.rows[0][0],
+            &after_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start","extra":"Add"}),
         );
     }
@@ -1381,9 +1383,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-cache', '/state-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-state-cache', '/state-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1394,9 +1394,9 @@ simulation_test!(
             )
             .await
             .expect("file read before state update should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start"}),
         );
 
@@ -1419,8 +1419,11 @@ simulation_test!(
             )
             .await
             .expect("file read after state update should succeed");
-        assert_eq!(after_rows.rows.len(), 1);
-        assert_blob_json_eq(&after_rows.rows[0][0], serde_json::json!({"content":"New"}));
+        assert_eq!(after_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &after_rows.statements[0].rows[0][0],
+            serde_json::json!({"content":"New"}),
+        );
     }
 );
 
@@ -1433,9 +1436,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-delete-cache', '/state-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-state-delete-cache', '/state-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1446,9 +1447,9 @@ simulation_test!(
             )
             .await
             .expect("file read before state delete should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start"}),
         );
 
@@ -1470,8 +1471,8 @@ simulation_test!(
             )
             .await
             .expect("file read after state delete should succeed");
-        assert_eq!(after_rows.rows.len(), 1);
-        assert_blob_json_eq(&after_rows.rows[0][0], serde_json::json!({}));
+        assert_eq!(after_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(&after_rows.statements[0].rows[0][0], serde_json::json!({}));
     }
 );
 
@@ -1484,9 +1485,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-by-version-insert-cache', '/state-by-version-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-state-by-version-insert-cache', '/state-by-version-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1503,9 +1502,9 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read before state insert should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start"}),
         );
 
@@ -1518,9 +1517,7 @@ simulation_test!(
                      '/extra', 'file-json-state-by-version-insert-cache', '{}', 'json_pointer', 'json', '1', '{{\"path\":\"/extra\",\"value\":\"Add\"}}'\
                      )",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("direct state_by_version insert should succeed");
 
@@ -1537,9 +1534,9 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read after state insert should succeed");
-        assert_eq!(after_rows.rows.len(), 1);
+        assert_eq!(after_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &after_rows.rows[0][0],
+            &after_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start","extra":"Add"}),
         );
     }
@@ -1554,9 +1551,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-by-version-cache', '/state-by-version-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-state-by-version-cache', '/state-by-version-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1573,9 +1568,9 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read before state update should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start"}),
         );
 
@@ -1608,8 +1603,11 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read after state update should succeed");
-        assert_eq!(after_rows.rows.len(), 1);
-        assert_blob_json_eq(&after_rows.rows[0][0], serde_json::json!({"content":"New"}));
+        assert_eq!(after_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &after_rows.statements[0].rows[0][0],
+            serde_json::json!({"content":"New"}),
+        );
     }
 );
 
@@ -1622,9 +1620,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-state-by-version-delete-cache', '/state-by-version-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-state-by-version-delete-cache', '/state-by-version-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1641,9 +1637,9 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read before state delete should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"content":"Start"}),
         );
 
@@ -1675,8 +1671,8 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read after state delete should succeed");
-        assert_eq!(after_rows.rows.len(), 1);
-        assert_blob_json_eq(&after_rows.rows[0][0], serde_json::json!({}));
+        assert_eq!(after_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(&after_rows.statements[0].rows[0][0], serde_json::json!({}));
     }
 );
 
@@ -1689,9 +1685,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path', '/before.json', lix_text_encode('{\"hello\":\"before\",\"remove\":true}'))",
-                &[],
-            )
+                 VALUES ('file-json-path', '/before.json', lix_text_encode('{\"hello\":\"before\",\"remove\":true}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1716,8 +1710,11 @@ simulation_test!(
             )
             .await
             .expect("file path query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_eq!(file_rows.rows[0][0], Value::Text("/after.json".to_string()));
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            file_rows.statements[0].rows[0][0],
+            Value::Text("/after.json".to_string())
+        );
 
         let file_rows = engine
             .execute(
@@ -1726,9 +1723,9 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &file_rows.rows[0][0],
+            &file_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"after-path"}),
         );
     }
@@ -1754,9 +1751,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path-only-switch', '/switch.json', lix_text_encode('{\"hello\":\"before\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-path-only-switch', '/switch.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1793,7 +1788,7 @@ simulation_test!(
             .await
             .expect("post-switch json plugin entities query should succeed");
         assert!(
-            after_json_entities.rows.is_empty(),
+            after_json_entities.statements[0].rows.is_empty(),
             "json plugin should have no live entities after switch"
         );
 
@@ -1813,8 +1808,8 @@ simulation_test!(
             )
             .await
             .expect("json_pointer tombstone count query should succeed");
-        assert_eq!(tombstone_rows.rows.len(), 1);
-        assert_eq!(value_as_i64(&tombstone_rows.rows[0][0]), 2);
+        assert_eq!(tombstone_rows.statements[0].rows.len(), 1);
+        assert_eq!(value_as_i64(&tombstone_rows.statements[0].rows[0][0]), 2);
 
         let file_rows = engine
             .execute(
@@ -1826,8 +1821,11 @@ simulation_test!(
             )
             .await
             .expect("path-only updated file read should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_eq!(file_rows.rows[0][0], Value::Text("/switch.txt".to_string()));
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            file_rows.statements[0].rows[0][0],
+            Value::Text("/switch.txt".to_string())
+        );
     }
 );
 
@@ -1851,9 +1849,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path-only-cache-guard', '/cache-guard.json', lix_text_encode('{\"hello\":\"before\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-path-only-cache-guard', '/cache-guard.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1913,9 +1909,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-path-only-cache-preserve', '/cache-preserve.json', lix_text_encode('{\"hello\":\"before\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-path-only-cache-preserve', '/cache-preserve.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -1967,8 +1961,8 @@ simulation_test!(
             )
             .await
             .expect("file_data_cache read should succeed");
-        assert_eq!(cache_row.rows.len(), 1);
-        assert_blob_bytes_eq(&cache_row.rows[0][0], b"seed-cache");
+        assert_eq!(cache_row.statements[0].rows.len(), 1);
+        assert_blob_bytes_eq(&cache_row.statements[0].rows[0][0], b"seed-cache");
     }
 );
 
@@ -1982,9 +1976,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-before-aware', '/before-aware.json', lix_text_encode('{\"hello\":\"before\"}'))",
-                &[],
-            )
+                 VALUES ('file-before-aware', '/before-aware.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -2030,8 +2022,8 @@ simulation_test!(
             )
             .await
             .expect("before marker query should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        let snapshot = match &rows.rows[0][0] {
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        let snapshot = match &rows.statements[0].rows[0][0] {
             Value::Text(value) => value,
             other => panic!("expected snapshot_content text, got {other:?}"),
         };
@@ -2055,9 +2047,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('file-json-by-version', '/config.json', lix_text_encode('{{\"hello\":\"before\",\"remove\":\"gone\"}}'), '{}')",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("initial by-version file insert should succeed");
 
@@ -2069,9 +2059,7 @@ simulation_test!(
                      WHERE id = 'file-json-by-version' \
                        AND lixcol_version_id = '{}'",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("by-version file update should succeed");
 
@@ -2095,9 +2083,9 @@ simulation_test!(
             )
             .await
             .expect("lix_file_by_version query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &file_rows.rows[0][0],
+            &file_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"after-by-version","add":"v"}),
         );
     }
@@ -2150,14 +2138,14 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_one.rows.len(), 1);
-        assert_eq!(file_two.rows.len(), 1);
+        assert_eq!(file_one.statements[0].rows.len(), 1);
+        assert_eq!(file_two.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &file_one.rows[0][0],
+            &file_one.statements[0].rows[0][0],
             serde_json::json!({"common":"updated"}),
         );
         assert_blob_json_eq(
-            &file_two.rows[0][0],
+            &file_two.statements[0].rows[0][0],
             serde_json::json!({"common":"updated"}),
         );
     }
@@ -2174,9 +2162,7 @@ simulation_test!(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-multi-insert-1', '/multi-insert-1.json', lix_text_encode('{\"first\":1}')); \
                  INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-multi-insert-2', '/multi-insert-2.json', lix_text_encode('{\"second\":2}'))",
-                &[],
-            )
+                 VALUES ('file-json-multi-insert-2', '/multi-insert-2.json', lix_text_encode('{\"second\":2}'))", &[])
             .await
             .expect("multi-statement insert should succeed");
 
@@ -2218,9 +2204,7 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file SET data = lix_text_encode('{\"a\":2,\"b\":true}') WHERE id = 'file-json-seq'; \
-                 UPDATE lix_file SET data = lix_text_encode('{\"a\":4}') WHERE id = 'file-json-seq'",
-                &[],
-            )
+                 UPDATE lix_file SET data = lix_text_encode('{\"a\":4}') WHERE id = 'file-json-seq'", &[])
             .await
             .expect("multi-statement update should succeed");
 
@@ -2235,8 +2219,11 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_blob_json_eq(&file_rows.rows[0][0], serde_json::json!({"a":4}));
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &file_rows.statements[0].rows[0][0],
+            serde_json::json!({"a":4}),
+        );
     }
 );
 
@@ -2249,9 +2236,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-seq-param', '/seq-param.json', lix_text_encode('{\"seed\":0}'))",
-                &[],
-            )
+                 VALUES ('file-json-seq-param', '/seq-param.json', lix_text_encode('{\"seed\":0}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -2278,8 +2263,11 @@ simulation_test!(
             )
             .await
             .expect("lix_file query should succeed");
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_blob_json_eq(&file_rows.rows[0][0], serde_json::json!({"final":2}));
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &file_rows.statements[0].rows[0][0],
+            serde_json::json!({"final":2}),
+        );
     }
 );
 
@@ -2312,9 +2300,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('file-active-switch', '/active-switch.json', lix_text_encode('{{\"hello\":\"before\"}}'), '{}')",
                     version_b
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("file_by_version insert should succeed");
 
@@ -2324,9 +2310,7 @@ simulation_test!(
                     "UPDATE lix_active_version SET version_id = '{}'; \
                      UPDATE lix_file SET data = lix_text_encode('{{\"hello\":\"after\"}}') WHERE id = 'file-active-switch'",
                     version_b
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("active-version switch + file update should succeed");
 
@@ -2339,8 +2323,11 @@ simulation_test!(
             )
             .await
             .expect("lix_file read after active switch update should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"hello":"after"}));
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &rows.statements[0].rows[0][0],
+            serde_json::json!({"hello":"after"}),
+        );
 
         let pointer_rows = engine
             .execute(
@@ -2358,8 +2345,8 @@ simulation_test!(
             )
             .await
             .expect("json pointer row read should succeed");
-        assert_eq!(pointer_rows.rows.len(), 1);
-        let snapshot = match &pointer_rows.rows[0][0] {
+        assert_eq!(pointer_rows.statements[0].rows.len(), 1);
+        let snapshot = match &pointer_rows.statements[0].rows[0][0] {
             Value::Text(text) => serde_json::from_str::<JsonValue>(text)
                 .expect("json pointer snapshot_content should be valid JSON"),
             other => panic!("expected snapshot_content text, got {other:?}"),
@@ -2377,9 +2364,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-delete', '/delete.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"x\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-delete', '/delete.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"x\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -2390,9 +2375,9 @@ simulation_test!(
             )
             .await
             .expect("file read before delete should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"before","drop":"x"}),
         );
         assert_eq!(
@@ -2416,7 +2401,7 @@ simulation_test!(
             )
             .await
             .expect("file read after delete should succeed");
-        assert_eq!(after_rows.rows.len(), 0);
+        assert_eq!(after_rows.statements[0].rows.len(), 0);
         assert_eq!(
             file_cache_row_count(&engine, "file-json-delete", &main_version_id).await,
             0
@@ -2453,9 +2438,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('file-delete-by-version', '/delete-by-version.json', lix_text_encode('{{\"hello\":\"by-version\"}}'), '{}')",
                     version_b
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("file_by_version insert should succeed");
 
@@ -2472,9 +2455,9 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read before delete should succeed");
-        assert_eq!(before_rows.rows.len(), 1);
+        assert_eq!(before_rows.statements[0].rows.len(), 1);
         assert_blob_json_eq(
-            &before_rows.rows[0][0],
+            &before_rows.statements[0].rows[0][0],
             serde_json::json!({"hello":"by-version"}),
         );
         assert_eq!(
@@ -2508,7 +2491,7 @@ simulation_test!(
             )
             .await
             .expect("file_by_version read after delete should succeed");
-        assert_eq!(after_rows.rows.len(), 0);
+        assert_eq!(after_rows.statements[0].rows.len(), 0);
         assert_eq!(
             file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
             0
@@ -2531,9 +2514,7 @@ simulation_test!(
                  WHERE id = 'file-json-mixed-drop'; \
                  DELETE FROM lix_file WHERE id = 'file-json-mixed-drop'; \
                  INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-mixed-keep', '/keep.json', lix_text_encode('{\"keep\":\"yes\"}'))",
-                &[],
-            )
+                 VALUES ('file-json-mixed-keep', '/keep.json', lix_text_encode('{\"keep\":\"yes\"}'))", &[])
             .await
             .expect("mixed insert/update/delete execute should succeed");
 
@@ -2553,8 +2534,11 @@ simulation_test!(
             )
             .await
             .expect("kept file query should succeed");
-        assert_eq!(kept_rows.rows.len(), 1);
-        assert_blob_json_eq(&kept_rows.rows[0][0], serde_json::json!({"keep":"yes"}));
+        assert_eq!(kept_rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &kept_rows.statements[0].rows[0][0],
+            serde_json::json!({"keep":"yes"}),
+        );
         assert_eq!(
             file_cache_row_count(&engine, "file-json-mixed-drop", &main_version_id).await,
             0
@@ -2574,9 +2558,7 @@ simulation_test!(
                  VALUES ('file-json-overlay-meta-delete', '/overlay-meta-delete.json', lix_text_encode('{\"v\":1}'), '{\"tag\":\"x\"}'); \
                  DELETE FROM lix_file \
                  WHERE metadata IS NOT NULL \
-                   AND id = 'file-json-overlay-meta-delete'",
-                &[],
-            )
+                   AND id = 'file-json-overlay-meta-delete'", &[])
             .await
             .expect("metadata-predicate delete should succeed");
 
@@ -2589,7 +2571,7 @@ simulation_test!(
             )
             .await
             .expect("post-delete read should succeed");
-        assert!(rows.rows.is_empty());
+        assert!(rows.statements[0].rows.is_empty());
         assert_eq!(
             file_cache_row_count(&engine, "file-json-overlay-meta-delete", &main_version_id).await,
             0
@@ -2606,9 +2588,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-read-miss', '/read-miss.json', lix_text_encode('{\"hello\":\"from-read\"}'))",
-                &[],
-            )
+                 VALUES ('file-read-miss', '/read-miss.json', lix_text_encode('{\"hello\":\"from-read\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
@@ -2636,8 +2616,11 @@ simulation_test!(
             )
             .await
             .expect("lix_file read should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"hello":"from-read"}));
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &rows.statements[0].rows[0][0],
+            serde_json::json!({"hello":"from-read"}),
+        );
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
@@ -2655,9 +2638,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-empty-read-regression', '/empty-read-regression.json', lix_text_encode('{\"hello\":\"from-read\"}'))",
-                &[],
-            )
+                 VALUES ('file-empty-read-regression', '/empty-read-regression.json', lix_text_encode('{\"hello\":\"from-read\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
@@ -2671,9 +2652,9 @@ simulation_test!(
             )
             .await
             .expect("blob ref query should succeed");
-        assert_eq!(blob_ref_rows.rows.len(), 1);
+        assert_eq!(blob_ref_rows.statements[0].rows.len(), 1);
         assert!(
-            value_as_i64(&blob_ref_rows.rows[0][0]) > 0,
+            value_as_i64(&blob_ref_rows.statements[0].rows[0][0]) > 0,
             "expected non-empty blob ref before read cache miss"
         );
 
@@ -2695,8 +2676,8 @@ simulation_test!(
             )
             .await
             .expect("cache count query should succeed");
-        assert_eq!(cache_rows.rows.len(), 1);
-        assert_eq!(value_as_i64(&cache_rows.rows[0][0]), 0);
+        assert_eq!(cache_rows.statements[0].rows.len(), 1);
+        assert_eq!(value_as_i64(&cache_rows.statements[0].rows[0][0]), 0);
 
         let rows = engine
             .execute(
@@ -2714,10 +2695,16 @@ simulation_test!(
             )
             .await
             .expect("cache count after read should succeed");
-        assert_eq!(cache_rows_after_read.rows.len(), 1);
-        assert_eq!(value_as_i64(&cache_rows_after_read.rows[0][0]), 1);
-        assert_eq!(rows.rows.len(), 1);
-        assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"hello":"from-read"}));
+        assert_eq!(cache_rows_after_read.statements[0].rows.len(), 1);
+        assert_eq!(
+            value_as_i64(&cache_rows_after_read.statements[0].rows[0][0]),
+            1
+        );
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &rows.statements[0].rows[0][0],
+            serde_json::json!({"hello":"from-read"}),
+        );
     }
 );
 
@@ -2750,9 +2737,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('file-read-miss-by-version', '/read-miss-by-version.json', lix_text_encode('{{\"hello\":\"by-version\"}}'), '{}')",
                     version_b
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("file_by_version insert should succeed");
 
@@ -2787,8 +2772,11 @@ simulation_test!(
             )
             .await
             .expect("lix_file_by_version read should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_blob_json_eq(&rows.rows[0][0], serde_json::json!({"hello":"by-version"}));
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_blob_json_eq(
+            &rows.statements[0].rows[0][0],
+            serde_json::json!({"hello":"by-version"}),
+        );
 
         assert_eq!(
             file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
@@ -2806,9 +2794,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-read-insert-select', '/insert-select.json', lix_text_encode('{\"hello\":\"from-insert-select\"}'))",
-                &[],
-            )
+                 VALUES ('file-read-insert-select', '/insert-select.json', lix_text_encode('{\"hello\":\"from-insert-select\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
@@ -2848,9 +2834,7 @@ simulation_test!(
                      WHERE id = 'file-read-insert-select' \
                      LIMIT 1",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("insert-select from lix_file should succeed");
 
@@ -2890,9 +2874,7 @@ simulation_test!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                      VALUES ('file-read-insert-select-by-version', '/insert-select-by-version.json', lix_text_encode('{{\"hello\":\"from-version-b\"}}'), '{}')",
                     version_b
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("file_by_version insert should succeed");
 
@@ -2933,9 +2915,7 @@ simulation_test!(
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
                     main_version_id, version_b
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("insert-select from lix_file_by_version should succeed");
 
@@ -2955,9 +2935,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-path-echo', '/docs/readme.json', lix_text_encode('{\"hello\":\"world\"}'))",
-                &[],
-            )
+                 VALUES ('file-path-echo', '/docs/readme.json', lix_text_encode('{\"hello\":\"world\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
@@ -2984,8 +2962,8 @@ simulation_test!(
             )
             .await
             .expect("lix_file read should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_blob_bytes_eq(&rows.rows[0][0], b"/docs/readme.json");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_blob_bytes_eq(&rows.statements[0].rows[0][0], b"/docs/readme.json");
 
         assert_eq!(
             file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
@@ -3018,7 +2996,7 @@ simulation_test!(
                 .execute(&read_sql, &[])
                 .await
                 .expect("churn read should succeed");
-            assert_eq!(read_rows.rows.len(), 1);
+            assert_eq!(read_rows.statements[0].rows.len(), 1);
 
             let delete_sql = format!("DELETE FROM lix_file WHERE id = '{}'", file_id);
             engine
@@ -3044,9 +3022,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
                  ('cache-orphan-keep', '/cache-orphan-keep.json', lix_text_encode('{\"keep\":true}')), \
-                 ('cache-orphan-drop', '/cache-orphan-drop.json', lix_text_encode('{\"drop\":true}'))",
-                &[],
-            )
+                 ('cache-orphan-drop', '/cache-orphan-drop.json', lix_text_encode('{\"drop\":true}'))", &[])
             .await
             .expect("mixed lifecycle insert should succeed");
 
@@ -3057,7 +3033,7 @@ simulation_test!(
             )
             .await
             .expect("keep read should succeed");
-        assert_eq!(keep_rows.rows.len(), 1);
+        assert_eq!(keep_rows.statements[0].rows.len(), 1);
         let drop_rows = engine
             .execute(
                 "SELECT data FROM lix_file WHERE id = 'cache-orphan-drop' LIMIT 1",
@@ -3065,7 +3041,7 @@ simulation_test!(
             )
             .await
             .expect("drop read should succeed");
-        assert_eq!(drop_rows.rows.len(), 1);
+        assert_eq!(drop_rows.statements[0].rows.len(), 1);
 
         engine
             .execute("DELETE FROM lix_file WHERE id = 'cache-orphan-drop'", &[])
@@ -3103,9 +3079,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', lix_text_encode('AAAA-AAAA-AAAA-AAAA'))",
-                &[],
-            )
+                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', lix_text_encode('AAAA-AAAA-AAAA-AAAA'))", &[])
             .await
             .expect("initial binary write should succeed");
         let old_blob_hash =
@@ -3149,8 +3123,11 @@ simulation_test!(
             )
             .await
             .expect("history read should succeed");
-        assert_eq!(history_rows.rows.len(), 1);
-        assert_blob_bytes_eq(&history_rows.rows[0][0], b"AAAA-AAAA-AAAA-AAAA");
+        assert_eq!(history_rows.statements[0].rows.len(), 1);
+        assert_blob_bytes_eq(
+            &history_rows.statements[0].rows[0][0],
+            b"AAAA-AAAA-AAAA-AAAA",
+        );
 
         assert_eq!(orphan_binary_manifest_chunk_row_count(&engine).await, 0);
         assert_eq!(orphan_binary_chunk_row_count(&engine).await, 0);
@@ -3177,9 +3154,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-fk-guard', '/assets/blob.mp4', lix_text_encode('FK-GUARD-DATA-123456'))",
-                &[],
-            )
+                 VALUES ('binary-fk-guard', '/assets/blob.mp4', lix_text_encode('FK-GUARD-DATA-123456'))", &[])
             .await
             .expect("binary write should succeed");
 
@@ -3275,7 +3250,7 @@ simulation_test!(
             )
             .await
             .expect("binary file read should succeed");
-        assert_eq!(rows.rows.len(), 1);
-        assert_blob_bytes_eq(&rows.rows[0][0], &payload);
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_blob_bytes_eq(&rows.statements[0].rows[0][0], &payload);
     }
 );

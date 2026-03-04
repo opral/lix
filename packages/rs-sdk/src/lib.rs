@@ -68,7 +68,7 @@ impl Lix {
         self.engine.init_if_needed().await.map(|_| ())
     }
 
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.execute_with_options(sql, params, ExecuteOptionsConfig::default())
             .await
     }
@@ -78,9 +78,9 @@ impl Lix {
         sql: &str,
         params: &[Value],
         options: ExecuteOptionsConfig,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         self.engine
-            .execute(sql, params, to_engine_execute_options(options))
+            .execute_with_options(sql, params, to_engine_execute_options(options))
             .await
     }
 
@@ -102,7 +102,11 @@ impl Lix {
 }
 
 impl<'a> LixTransaction<'a> {
-    pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
         let tx = self.inner.as_mut().ok_or_else(inactive_transaction_error)?;
         tx.execute(sql, params).await
     }
@@ -176,6 +180,7 @@ fn inactive_transaction_error() -> LixError {
 
 pub use backend::sqlite::SqliteBackend;
 pub use lix_engine::{
-    InitLixResult, LixBackend, LixError, QueryResult, Value, WasmComponentInstance, WasmLimits,
+    ExecuteResult, InitLixResult, LixBackend, LixError, QueryResult, Value, WasmComponentInstance,
+    WasmLimits,
 };
 pub use wasmtime_runtime::WasmtimeRuntime;

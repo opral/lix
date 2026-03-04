@@ -58,7 +58,7 @@ fn run_count_bench(
     c.bench_function(bench_name, |b| {
         b.iter(|| {
             let result = runtime
-                .block_on(engine.execute(sql, &params, ExecuteOptions::default()))
+                .block_on(engine.execute(sql, &params))
                 .expect("count query should succeed");
 
             let value = result
@@ -102,13 +102,10 @@ async fn seed_engine(
         .execute(
             "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-             ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')",
-            &[
+             ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')", &[
                 Value::Text(format!("{SCHEMA_KEY}~1")),
                 Value::Text(schema_snapshot),
-            ],
-            ExecuteOptions::default(),
-        )
+            ])
         .await?;
 
     for idx in 0..ROW_COUNT {
@@ -118,16 +115,13 @@ async fn seed_engine(
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (?, ?, ?, 'global', ?, ?, '1')",
-                &[
+                 ) VALUES (?, ?, ?, 'global', ?, ?, '1')", &[
                     Value::Text(entity_id),
                     Value::Text(SCHEMA_KEY.to_string()),
                     Value::Text(FILE_ID.to_string()),
                     Value::Text(PLUGIN_KEY.to_string()),
                     Value::Text(snapshot),
-                ],
-                ExecuteOptions::default(),
-            )
+                ])
             .await?;
     }
 
@@ -140,14 +134,12 @@ async fn seed_engine(
                  'bench-child', 'bench-child', 'global', 0, 'commit-bench-child'\
                  )",
                 &[],
-                ExecuteOptions::default(),
             )
             .await?;
         engine
             .execute(
                 "UPDATE lix_active_version SET version_id = 'bench-child'",
                 &[],
-                ExecuteOptions::default(),
             )
             .await?;
     }

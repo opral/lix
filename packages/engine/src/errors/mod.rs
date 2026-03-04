@@ -16,6 +16,7 @@ pub enum ErrorCode {
     TransactionHandleNotFound,
     FileDataExpectsBytes,
     FileDataUnavailable,
+    UnexpectedStatementCount,
 }
 
 impl ErrorCode {
@@ -36,6 +37,7 @@ impl ErrorCode {
             Self::TransactionHandleNotFound => "LIX_ERROR_TRANSACTION_HANDLE_NOT_FOUND",
             Self::FileDataExpectsBytes => "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
             Self::FileDataUnavailable => "LIX_ERROR_FILE_DATA_UNAVAILABLE",
+            Self::UnexpectedStatementCount => "LIX_ERROR_UNEXPECTED_STATEMENT_COUNT",
         }
     }
 
@@ -54,6 +56,7 @@ impl ErrorCode {
             Self::TransactionHandleNotFound,
             Self::FileDataExpectsBytes,
             Self::FileDataUnavailable,
+            Self::UnexpectedStatementCount,
         ]
     }
 }
@@ -179,7 +182,7 @@ pub(crate) fn vtable_schema_key_required_error() -> LixError {
 pub(crate) fn transaction_control_statement_denied_error() -> LixError {
     build_error(
         ErrorCode::TransactionControlStatementDenied,
-        "Use transaction APIs instead: beginTransaction(), transaction(), or executeTransaction().",
+        "Use transaction APIs instead: beginTransaction() or transaction().",
     )
 }
 
@@ -213,6 +216,17 @@ pub(crate) fn file_data_unavailable_error(
     )
 }
 
+pub(crate) fn unexpected_statement_count_error(
+    context: &str,
+    expected: usize,
+    actual: usize,
+) -> LixError {
+    build_error(
+        ErrorCode::UnexpectedStatementCount,
+        &format!("{context}: expected {expected} statement result(s), got {actual}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -220,7 +234,8 @@ mod tests {
         internal_table_access_denied_error, not_initialized_error, read_only_view_write_error,
         schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
         table_not_found_read_error, transaction_control_statement_denied_error,
-        transaction_handle_not_found_error, vtable_schema_key_required_error, ErrorCode,
+        transaction_handle_not_found_error, unexpected_statement_count_error,
+        vtable_schema_key_required_error, ErrorCode,
     };
     use std::collections::HashSet;
 
@@ -300,6 +315,12 @@ mod tests {
         assert_eq!(
             file_data_unavailable.code,
             "LIX_ERROR_FILE_DATA_UNAVAILABLE"
+        );
+
+        let unexpected_statement_count = unexpected_statement_count_error("unit test", 1, 2);
+        assert_eq!(
+            unexpected_statement_count.code,
+            "LIX_ERROR_UNEXPECTED_STATEMENT_COUNT"
         );
     }
 

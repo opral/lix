@@ -51,7 +51,6 @@ fn bench_lix_file_exact_delete_missing_ids(c: &mut Criterion) {
                     "DELETE FROM lix_file \
                      WHERE id IN ('bench-missing-delete-a', 'bench-missing-delete-b')",
                     &[],
-                    ExecuteOptions::default(),
                 ))
                 .expect("delete should succeed");
             black_box(result.rows.len());
@@ -73,7 +72,6 @@ fn bench_lix_file_exact_update_missing_id(c: &mut Criterion) {
                      SET path = '/bench/missing-update.txt', data = x'01' \
                      WHERE id = 'bench-missing-update-id'",
                     &[],
-                    ExecuteOptions::default(),
                 ))
                 .expect("update should succeed");
             black_box(result.rows.len());
@@ -107,7 +105,6 @@ fn bench_lix_file_update_fast_id_repro(c: &mut Criterion) {
                         Value::Blob(data),
                         Value::Text(FAST_ID_REPRO_FILE_ID.to_string()),
                     ],
-                    ExecuteOptions::default(),
                 ))
                 .expect("fast-id repro update should succeed");
             black_box(result.rows.len());
@@ -125,22 +122,14 @@ fn bench_lix_file_read_scan_no_plugin(c: &mut Criterion) {
         .expect("failed to seed engine for read-scan no-plugin bench");
 
     let warmup = runtime
-        .block_on(engine.execute(
-            "SELECT path, data FROM lix_file ORDER BY path",
-            &[],
-            ExecuteOptions::default(),
-        ))
+        .block_on(engine.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))
         .expect("warmup read scan should succeed");
     let expected_rows = warmup.rows.len();
 
     c.bench_function("lix_file_read_scan_path_data_no_plugin", |b| {
         b.iter(|| {
             let result = runtime
-                .block_on(engine.execute(
-                    "SELECT path, data FROM lix_file ORDER BY path",
-                    &[],
-                    ExecuteOptions::default(),
-                ))
+                .block_on(engine.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))
                 .expect("read scan should succeed");
             black_box(result.rows.len());
             debug_assert_eq!(result.rows.len(), expected_rows);
@@ -158,22 +147,14 @@ fn bench_lix_file_read_scan_plugin_json(c: &mut Criterion) {
         .expect("failed to seed engine for read-scan plugin bench");
 
     let warmup = runtime
-        .block_on(engine.execute(
-            "SELECT path, data FROM lix_file ORDER BY path",
-            &[],
-            ExecuteOptions::default(),
-        ))
+        .block_on(engine.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))
         .expect("warmup read scan should succeed");
     let expected_rows = warmup.rows.len();
 
     c.bench_function("lix_file_read_scan_path_data_plugin_json", |b| {
         b.iter(|| {
             let result = runtime
-                .block_on(engine.execute(
-                    "SELECT path, data FROM lix_file ORDER BY path",
-                    &[],
-                    ExecuteOptions::default(),
-                ))
+                .block_on(engine.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))
                 .expect("read scan should succeed");
             black_box(result.rows.len());
             debug_assert_eq!(result.rows.len(), expected_rows);
@@ -195,7 +176,6 @@ fn bench_lix_file_read_point_path_plugin_json(c: &mut Criterion) {
         .block_on(engine.execute(
             "SELECT path, data FROM lix_file WHERE path = ?",
             &[Value::Text(target_path.clone())],
-            ExecuteOptions::default(),
         ))
         .expect("warmup point read should succeed");
     let expected_rows = warmup.rows.len();
@@ -206,7 +186,6 @@ fn bench_lix_file_read_point_path_plugin_json(c: &mut Criterion) {
                 .block_on(engine.execute(
                     "SELECT path, data FROM lix_file WHERE path = ?",
                     &[Value::Text(target_path.clone())],
-                    ExecuteOptions::default(),
                 ))
                 .expect("point read should succeed");
             black_box(result.rows.len());
@@ -229,7 +208,6 @@ fn bench_lix_file_read_point_path_no_plugin(c: &mut Criterion) {
         .block_on(engine.execute(
             "SELECT path, data FROM lix_file WHERE path = ?",
             &[Value::Text(target_path.clone())],
-            ExecuteOptions::default(),
         ))
         .expect("warmup point read should succeed");
     let expected_rows = warmup.rows.len();
@@ -240,7 +218,6 @@ fn bench_lix_file_read_point_path_no_plugin(c: &mut Criterion) {
                 .block_on(engine.execute(
                     "SELECT path, data FROM lix_file WHERE path = ?",
                     &[Value::Text(target_path.clone())],
-                    ExecuteOptions::default(),
                 ))
                 .expect("point read should succeed");
             black_box(result.rows.len());
@@ -269,7 +246,6 @@ fn run_file_insert_bench(
                 .block_on(engine.execute(
                     "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
                     &[Value::Text(file_id), Value::Text(path), Value::Blob(data)],
-                    ExecuteOptions::default(),
                 ))
                 .expect("file insert should succeed");
 
@@ -293,10 +269,7 @@ async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> 
             .execute(
             "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES ('test_json_pointer~1', 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')",
-                &[Value::Text(TEST_JSON_POINTER_SCHEMA_DEFINITION.to_string())],
-                ExecuteOptions::default(),
-            )
+                 ) VALUES ('test_json_pointer~1', 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')", &[Value::Text(TEST_JSON_POINTER_SCHEMA_DEFINITION.to_string())])
             .await?;
 
         let plugin_archive = build_test_plugin_archive()?;
@@ -313,16 +286,12 @@ async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> 
                     Value::Text(warmup_path),
                     Value::Blob(warmup_data),
                 ],
-                ExecuteOptions::default(),
             )
             .await?;
 
         let detected = engine
             .execute(
-                "SELECT COUNT(*) FROM lix_state WHERE file_id = ? AND plugin_key = 'test_json_plugin'",
-                &[Value::Text(warmup_file_id.to_string())],
-                ExecuteOptions::default(),
-            )
+                "SELECT COUNT(*) FROM lix_state WHERE file_id = ? AND plugin_key = 'test_json_plugin'", &[Value::Text(warmup_file_id.to_string())])
             .await?;
         let count = scalar_count(&detected)?;
         if count <= 0 {
@@ -347,7 +316,6 @@ async fn seed_engine_with_fast_id_repro() -> Result<lix_engine::Engine, LixError
                 Value::Text("/bench/fast-id-repro/seed-000000.txt".to_string()),
                 Value::Blob(vec![0]),
             ],
-            ExecuteOptions::default(),
         )
         .await?;
 
@@ -366,7 +334,6 @@ async fn seed_engine_with_fast_id_repro() -> Result<lix_engine::Engine, LixError
                     Value::Blob(data),
                     Value::Text(FAST_ID_REPRO_FILE_ID.to_string()),
                 ],
-                ExecuteOptions::default(),
             )
             .await?;
     }
@@ -397,7 +364,6 @@ async fn seed_engine_with_read_dataset(
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
                 &[Value::Text(file_id), Value::Text(path), Value::Blob(data)],
-                ExecuteOptions::default(),
             )
             .await?;
     }

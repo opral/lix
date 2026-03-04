@@ -342,7 +342,6 @@ fn run_ingest_workload(
                     Value::Text(spec.path.clone()),
                     Value::Blob(spec.data.clone()),
                 ],
-                ExecuteOptions::default(),
             ))?;
             Ok(spec.data.len() as u64)
         },
@@ -378,7 +377,6 @@ fn run_update_workload(
             runtime.block_on(engine.execute(
                 "UPDATE lix_file SET data = ? WHERE id = ?",
                 &[Value::Blob(next.clone()), Value::Text(spec.id.clone())],
-                ExecuteOptions::default(),
             ))?;
 
             spec.data = next;
@@ -424,7 +422,6 @@ fn run_history_validation_workload(
                  WHERE id = ? \
                  ORDER BY lixcol_root_commit_id ASC, lixcol_depth ASC",
                 &[Value::Text(file_id.to_string())],
-                ExecuteOptions::default(),
             ))?;
 
             if result.rows.is_empty() {

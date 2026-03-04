@@ -132,12 +132,17 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn execute(
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+            .await
+    }
+
+    pub async fn execute_with_options(
         &self,
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         self.execute_impl_sql(sql, params, options, false).await
     }
 
@@ -146,7 +151,7 @@ impl Engine {
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         self.execute_impl_sql(sql, params, options, true).await
     }
 
@@ -156,7 +161,7 @@ impl Engine {
         params: &[Value],
         options: ExecuteOptions,
         allow_internal_tables: bool,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         let allow_internal_sql = allow_internal_tables || self.access_to_internal;
 
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
@@ -264,7 +269,9 @@ impl Engine {
         )
         .await?;
 
-        Ok(execution.public_result)
+        Ok(ExecuteResult {
+            statements: vec![execution.public_result],
+        })
     }
 
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {

@@ -167,10 +167,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     engine_a
                         .execute(
                             "INSERT INTO lix_file (path, data, metadata) \
-                             VALUES ('/wc-reopen.md', lix_text_encode('hello'), NULL)",
-                            &[],
-                            ExecuteOptions::default(),
-                        )
+                             VALUES ('/wc-reopen.md', lix_text_encode('hello'), NULL)", &[])
                         .await
                         .expect("file insert should succeed");
 
@@ -179,12 +176,15 @@ fn init_reopen_preserves_working_changes_sqlite() {
                             "SELECT id \
                              FROM lix_file \
                              WHERE path = '/wc-reopen.md' \
-                             LIMIT 1",
-                            &[],
-                            ExecuteOptions::default(),
-                        )
+                             LIMIT 1", &[])
                         .await
                         .expect("file lookup should succeed");
+                    let [file_result] = file_result.statements.as_slice() else {
+                        panic!(
+                            "file lookup query: expected 1 statement result(s), got {}",
+                            file_result.statements.len()
+                        );
+                    };
                     assert_eq!(file_result.rows.len(), 1);
                     let file_id = text_value(&file_result.rows[0][0], "file_id");
 
@@ -194,12 +194,15 @@ fn init_reopen_preserves_working_changes_sqlite() {
                              FROM lix_working_changes \
                              WHERE schema_key = 'lix_file_descriptor' \
                                AND file_id = 'lix' \
-                               AND entity_id = $1",
-                            &[lix_engine::Value::Text(file_id.clone())],
-                            ExecuteOptions::default(),
-                        )
+                               AND entity_id = $1", &[lix_engine::Value::Text(file_id.clone())])
                         .await
                         .expect("working changes query before reopen should succeed");
+                    let [before] = before.statements.as_slice() else {
+                        panic!(
+                            "working changes query before reopen: expected 1 statement result(s), got {}",
+                            before.statements.len()
+                        );
+                    };
                     let before_count = i64_value(&before.rows[0][0], "working_changes_before");
                     assert!(
                         before_count > 0,
@@ -221,12 +224,15 @@ fn init_reopen_preserves_working_changes_sqlite() {
                              FROM lix_working_changes \
                              WHERE schema_key = 'lix_file_descriptor' \
                                AND file_id = 'lix' \
-                               AND entity_id = $1",
-                            &[lix_engine::Value::Text(file_id.clone())],
-                            ExecuteOptions::default(),
-                        )
+                               AND entity_id = $1", &[lix_engine::Value::Text(file_id.clone())])
                         .await
                         .expect("working changes query after reopen should succeed");
+                    let [after] = after.statements.as_slice() else {
+                        panic!(
+                            "working changes query after reopen: expected 1 statement result(s), got {}",
+                            after.statements.len()
+                        );
+                    };
                     let after_count = i64_value(&after.rows[0][0], "working_changes_after");
 
                     let tip_result = engine_b
@@ -235,12 +241,15 @@ fn init_reopen_preserves_working_changes_sqlite() {
                              FROM lix_active_version av \
                              JOIN lix_version v ON v.id = av.version_id \
                              ORDER BY av.id \
-                             LIMIT 1",
-                            &[],
-                            ExecuteOptions::default(),
-                        )
+                             LIMIT 1", &[])
                         .await
                         .expect("tip query should succeed");
+                    let [tip_result] = tip_result.statements.as_slice() else {
+                        panic!(
+                            "tip query: expected 1 statement result(s), got {}",
+                            tip_result.statements.len()
+                        );
+                    };
                     assert_eq!(tip_result.rows.len(), 1);
                     let tip_commit_id = text_value(&tip_result.rows[0][0], "commit_id");
 
@@ -250,12 +259,15 @@ fn init_reopen_preserves_working_changes_sqlite() {
                              FROM lix_working_changes \
                              WHERE schema_key = 'lix_file_descriptor' \
                                AND file_id = 'lix' \
-                               AND entity_id = $1",
-                            &[lix_engine::Value::Text(file_id)],
-                            ExecuteOptions::default(),
-                        )
+                               AND entity_id = $1", &[lix_engine::Value::Text(file_id)])
                         .await
                         .expect("working row query after reopen should succeed");
+                    let [after_rows] = after_rows.statements.as_slice() else {
+                        panic!(
+                            "working row query after reopen: expected 1 statement result(s), got {}",
+                            after_rows.statements.len()
+                        );
+                    };
                     assert_eq!(after_rows.rows.len(), 1, "expected one working row after reopen");
                     assert_eq!(text_value(&after_rows.rows[0][0], "status"), "added");
                     assert_eq!(after_rows.rows[0][1], lix_engine::Value::Null);
@@ -311,7 +323,7 @@ simulation_test!(init_creates_untracked_table, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.statements[0].rows.clone());
 });
 
 simulation_test!(init_creates_snapshot_table, |sim| async move {
@@ -327,7 +339,7 @@ simulation_test!(init_creates_snapshot_table, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.statements[0].rows.clone());
 });
 
 simulation_test!(init_creates_change_table, |sim| async move {
@@ -343,7 +355,7 @@ simulation_test!(init_creates_change_table, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
+    sim.assert_deterministic(result.statements[0].rows.clone());
 });
 
 simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
@@ -362,9 +374,9 @@ simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0][0], lix_engine::Value::Null);
+    sim.assert_deterministic(result.statements[0].rows.clone());
+    assert_eq!(result.statements[0].rows.len(), 1);
+    assert_eq!(result.statements[0].rows[0][0], lix_engine::Value::Null);
 });
 
 simulation_test!(
@@ -387,7 +399,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(result.rows.clone());
+        sim.assert_deterministic(result.statements[0].rows.clone());
     }
 );
 
@@ -413,14 +425,14 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 1);
+    sim.assert_deterministic(result.statements[0].rows.clone());
+    assert_eq!(result.statements[0].rows.len(), 1);
     assert_eq!(
-        result.rows[0][0],
+        result.statements[0].rows[0][0],
         lix_engine::Value::Text("lix_key_value~1".to_string())
     );
 
-    let snapshot_content = match &result.rows[0][1] {
+    let snapshot_content = match &result.statements[0].rows[0][1] {
         lix_engine::Value::Text(value) => value,
         other => panic!("expected text snapshot_content, got {other:?}"),
     };
@@ -461,11 +473,11 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 9);
+    sim.assert_deterministic(result.statements[0].rows.clone());
+    assert_eq!(result.statements[0].rows.len(), 9);
 
     let mut seen_schema_keys = BTreeSet::new();
-    for row in result.rows {
+    for row in &result.statements[0].rows {
         let entity_id = match &row[0] {
             lix_engine::Value::Text(value) => value.clone(),
             other => panic!("expected text entity_id, got {other:?}"),
@@ -535,9 +547,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(version_result.rows.clone());
-        assert_eq!(version_result.rows.len(), 1);
-        let commit_id = match &version_result.rows[0][0] {
+        sim.assert_deterministic(version_result.statements[0].rows.clone());
+        assert_eq!(version_result.statements[0].rows.len(), 1);
+        let commit_id = match &version_result.statements[0].rows[0][0] {
             lix_engine::Value::Text(value) => value.clone(),
             other => panic!("expected text commit_id for global version, got {other:?}"),
         };
@@ -552,9 +564,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(change_set_result.rows.clone());
-        assert_eq!(change_set_result.rows.len(), 1);
-        let change_set_id = match &change_set_result.rows[0][0] {
+        sim.assert_deterministic(change_set_result.statements[0].rows.clone());
+        assert_eq!(change_set_result.statements[0].rows.len(), 1);
+        let change_set_id = match &change_set_result.statements[0].rows[0][0] {
             lix_engine::Value::Text(value) => value.clone(),
             other => panic!("expected text change_set_id for commit, got {other:?}"),
         };
@@ -569,8 +581,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(change_set_exists.rows.clone());
-        assert_eq!(change_set_exists.rows.len(), 1);
+        sim.assert_deterministic(change_set_exists.statements[0].rows.clone());
+        assert_eq!(change_set_exists.statements[0].rows.len(), 1);
     }
 );
 
@@ -594,8 +606,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(active_version.rows.len(), 1);
-        let main_version_id = text_value(&active_version.rows[0][0], "version_id");
+        assert_eq!(active_version.statements[0].rows.len(), 1);
+        let main_version_id = text_value(&active_version.statements[0].rows[0][0], "version_id");
         assert_ne!(main_version_id, "global");
 
         let versions = engine
@@ -608,9 +620,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(versions.rows.clone());
+        sim.assert_deterministic(versions.statements[0].rows.clone());
         assert_eq!(
-            versions.rows.len(),
+            versions.statements[0].rows.len(),
             2,
             "expected global + main version rows"
         );
@@ -624,14 +636,14 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(baselines.rows.clone());
+        sim.assert_deterministic(baselines.statements[0].rows.clone());
         assert_eq!(
-            baselines.rows.len(),
+            baselines.statements[0].rows.len(),
             2,
             "expected baseline pointer rows for global + main"
         );
 
-        for version_row in &versions.rows {
+        for version_row in &versions.statements[0].rows {
             let version_id = text_value(&version_row[0], "id");
             let commit_id = text_value(&version_row[1], "commit_id");
             assert!(
@@ -639,7 +651,7 @@ simulation_test!(
                 "version '{version_id}' must have commit_id"
             );
 
-            let baseline_commit_id = baselines
+            let baseline_commit_id = baselines.statements[0]
                 .rows
                 .iter()
                 .find_map(|row| {
@@ -666,7 +678,7 @@ simulation_test!(
                 .await
                 .unwrap();
             assert_eq!(
-                i64_value(&commit_exists.rows[0][0], "commit_count"),
+                i64_value(&commit_exists.statements[0].rows[0][0], "commit_count"),
                 1,
                 "commit '{commit_id}' must exist exactly once"
             );
@@ -722,7 +734,7 @@ simulation_test!(
 
         let mut has_checkpoint = false;
         let mut checkpoint_label_id: Option<String> = None;
-        for row in result.rows {
+        for row in &result.statements[0].rows {
             let row_entity_id = match &row[0] {
                 lix_engine::Value::Text(value) => value.clone(),
                 other => panic!("expected text entity_id for lix_label, got {other:?}"),
@@ -761,8 +773,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(global_version.rows.len(), 1);
-        let global_commit_id = text_value(&global_version.rows[0][0], "global.commit_id");
+        assert_eq!(global_version.statements[0].rows.len(), 1);
+        let global_commit_id =
+            text_value(&global_version.statements[0].rows[0][0], "global.commit_id");
 
         let checkpoint_links = engine
             .execute(
@@ -780,7 +793,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(
-            checkpoint_links.rows.len(),
+            checkpoint_links.statements[0].rows.len(),
             1,
             "expected exactly one checkpoint label link for bootstrap commit"
         );
@@ -807,13 +820,13 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(result.rows.clone());
-    assert_eq!(result.rows.len(), 3);
+    sim.assert_deterministic(result.statements[0].rows.clone());
+    assert_eq!(result.statements[0].rows.len(), 3);
     assert_eq!(
-        result.rows[0][0],
+        result.statements[0].rows[0][0],
         lix_engine::Value::Text("/.lix/".to_string())
     );
-    let root_hidden = match &result.rows[0][1] {
+    let root_hidden = match &result.statements[0].rows[0][1] {
         lix_engine::Value::Boolean(value) => *value,
         lix_engine::Value::Text(value) => value == "true",
         _ => false,
@@ -821,13 +834,13 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
     assert!(
         root_hidden,
         "expected hidden=true for /.lix/, got {:?}",
-        result.rows[0][1]
+        result.statements[0].rows[0][1]
     );
     assert_eq!(
-        result.rows[1][0],
+        result.statements[0].rows[1][0],
         lix_engine::Value::Text("/.lix/app_data/".to_string())
     );
-    let app_data_hidden = match &result.rows[1][1] {
+    let app_data_hidden = match &result.statements[0].rows[1][1] {
         lix_engine::Value::Boolean(value) => *value,
         lix_engine::Value::Text(value) => value == "true",
         _ => false,
@@ -835,13 +848,13 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
     assert!(
         app_data_hidden,
         "expected hidden=true for /.lix/app_data/, got {:?}",
-        result.rows[1][1]
+        result.statements[0].rows[1][1]
     );
     assert_eq!(
-        result.rows[2][0],
+        result.statements[0].rows[2][0],
         lix_engine::Value::Text("/.lix/plugins/".to_string())
     );
-    let plugins_hidden = match &result.rows[2][1] {
+    let plugins_hidden = match &result.statements[0].rows[2][1] {
         lix_engine::Value::Boolean(value) => *value,
         lix_engine::Value::Text(value) => value == "true",
         _ => false,
@@ -849,7 +862,7 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
     assert!(
         plugins_hidden,
         "expected hidden=true for /.lix/plugins/, got {:?}",
-        result.rows[2][1]
+        result.statements[0].rows[2][1]
     );
 
     let active_result = engine
@@ -863,13 +876,13 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(active_result.rows.clone());
-    assert_eq!(active_result.rows.len(), 3);
+    sim.assert_deterministic(active_result.statements[0].rows.clone());
+    assert_eq!(active_result.statements[0].rows.len(), 3);
     assert_eq!(
-        active_result.rows[0][0],
+        active_result.statements[0].rows[0][0],
         lix_engine::Value::Text("/.lix/".to_string())
     );
-    let active_root_hidden = match &active_result.rows[0][1] {
+    let active_root_hidden = match &active_result.statements[0].rows[0][1] {
         lix_engine::Value::Boolean(value) => *value,
         lix_engine::Value::Text(value) => value == "true",
         _ => false,
@@ -877,13 +890,13 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
     assert!(
         active_root_hidden,
         "expected hidden=true for /.lix/ in lix_directory, got {:?}",
-        active_result.rows[0][1]
+        active_result.statements[0].rows[0][1]
     );
     assert_eq!(
-        active_result.rows[1][0],
+        active_result.statements[0].rows[1][0],
         lix_engine::Value::Text("/.lix/app_data/".to_string())
     );
-    let active_app_data_hidden = match &active_result.rows[1][1] {
+    let active_app_data_hidden = match &active_result.statements[0].rows[1][1] {
         lix_engine::Value::Boolean(value) => *value,
         lix_engine::Value::Text(value) => value == "true",
         _ => false,
@@ -891,13 +904,13 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
     assert!(
         active_app_data_hidden,
         "expected hidden=true for /.lix/app_data/ in lix_directory, got {:?}",
-        active_result.rows[1][1]
+        active_result.statements[0].rows[1][1]
     );
     assert_eq!(
-        active_result.rows[2][0],
+        active_result.statements[0].rows[2][0],
         lix_engine::Value::Text("/.lix/plugins/".to_string())
     );
-    let active_plugins_hidden = match &active_result.rows[2][1] {
+    let active_plugins_hidden = match &active_result.statements[0].rows[2][1] {
         lix_engine::Value::Boolean(value) => *value,
         lix_engine::Value::Text(value) => value == "true",
         _ => false,
@@ -905,6 +918,6 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
     assert!(
         active_plugins_hidden,
         "expected hidden=true for /.lix/plugins/ in lix_directory, got {:?}",
-        active_result.rows[2][1]
+        active_result.statements[0].rows[2][1]
     );
 });

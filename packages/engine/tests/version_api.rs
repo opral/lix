@@ -53,8 +53,8 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
         )
         .await
         .expect("active version query should succeed");
-    let active_version_id = value_as_text(&active_before.rows[0][0]);
-    let active_commit_id = value_as_text(&active_before.rows[0][1]);
+    let active_version_id = value_as_text(&active_before.statements[0].rows[0][0]);
+    let active_commit_id = value_as_text(&active_before.statements[0].rows[0][1]);
 
     let created = engine
         .create_version(CreateVersionOptions::default())
@@ -74,8 +74,8 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
         )
         .await
         .expect("created version query should succeed");
-    assert_eq!(created_row.rows.len(), 1);
-    let row = &created_row.rows[0];
+    assert_eq!(created_row.statements[0].rows.len(), 1);
+    let row = &created_row.statements[0].rows[0];
     assert_eq!(value_as_text(&row[0]), created.id);
     assert_eq!(value_as_text(&row[1]), created.name);
     assert_eq!(value_as_text(&row[2]), created.inherits_from_version_id);
@@ -90,8 +90,11 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
         )
         .await
         .expect("baseline pointer query should succeed");
-    assert_eq!(baseline_row.rows.len(), 1);
-    assert_eq!(value_as_text(&baseline_row.rows[0][0]), active_commit_id);
+    assert_eq!(baseline_row.statements[0].rows.len(), 1);
+    assert_eq!(
+        value_as_text(&baseline_row.statements[0].rows[0][0]),
+        active_commit_id
+    );
 
     let active_after = engine
         .execute(
@@ -100,7 +103,10 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
         )
         .await
         .expect("active version query after create should succeed");
-    assert_eq!(value_as_text(&active_after.rows[0][0]), active_version_id);
+    assert_eq!(
+        value_as_text(&active_after.statements[0].rows[0][0]),
+        active_version_id
+    );
 });
 
 simulation_test!(
@@ -123,8 +129,8 @@ simulation_test!(
             )
             .await
             .expect("active version query should succeed");
-        assert_eq!(active_before.rows.len(), 1);
-        let active_version_id = value_as_text(&active_before.rows[0][0]);
+        assert_eq!(active_before.statements[0].rows.len(), 1);
+        let active_version_id = value_as_text(&active_before.statements[0].rows[0][0]);
         assert_ne!(active_version_id, "global");
 
         engine
@@ -146,9 +152,15 @@ simulation_test!(
             )
             .await
             .expect("active version query should succeed");
-        assert_eq!(active_after.rows.len(), 1);
-        assert_eq!(value_as_text(&active_after.rows[0][0]), active_version_id);
-        assert_ne!(value_as_text(&active_after.rows[0][1]), "global");
+        assert_eq!(active_after.statements[0].rows.len(), 1);
+        assert_eq!(
+            value_as_text(&active_after.statements[0].rows[0][0]),
+            active_version_id
+        );
+        assert_ne!(
+            value_as_text(&active_after.statements[0].rows[0][1]),
+            "global"
+        );
     }
 );
 
@@ -218,8 +230,8 @@ simulation_test!(
             )
             .await
             .expect("created version query should succeed");
-        assert_eq!(created_row.rows.len(), 1);
-        let row = &created_row.rows[0];
+        assert_eq!(created_row.statements[0].rows.len(), 1);
+        let row = &created_row.statements[0].rows[0];
         assert_eq!(value_as_text(&row[0]), "branch-alpha");
         assert_eq!(value_as_text(&row[1]), "Branch Alpha");
         assert_eq!(value_as_text(&row[2]), "global");
@@ -236,7 +248,10 @@ simulation_test!(
             )
             .await
             .expect("active version query should succeed");
-        assert_eq!(value_as_text(&active.rows[0][0]), "branch-alpha");
+        assert_eq!(
+            value_as_text(&active.statements[0].rows[0][0]),
+            "branch-alpha"
+        );
     }
 );
 

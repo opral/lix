@@ -25,9 +25,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_state_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -43,8 +41,8 @@ async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -
         )
         .await
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    match &result.rows[0][0] {
+    assert_eq!(result.statements[0].rows.len(), 1);
+    match &result.statements[0].rows[0][0] {
         Value::Text(text) => text.clone(),
         other => panic!("expected commit_id text, got {other:?}"),
     }
@@ -66,9 +64,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'paragraph0', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -81,22 +77,20 @@ simulation_test!(
                      WHERE entity_id = 'paragraph0' \
                        AND schema_key = 'test_state_history_schema' \
                        AND root_commit_id = '{commit_id}'"
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "paragraph0");
-        assert_text(&rows.rows[0][1], &commit_id);
-        assert_text(&rows.rows[0][2], &commit_id);
-        assert_eq!(rows.rows[0][3], Value::Integer(0));
-        assert_text(&rows.rows[0][4], "{\"value\":\"initial\"}");
-        assert_eq!(rows.rows[0][5], Value::Null);
-        assert_non_empty_text(&rows.rows[0][6]);
-        assert_text(&rows.rows[0][7], "global");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "paragraph0");
+        assert_text(&rows.statements[0].rows[0][1], &commit_id);
+        assert_text(&rows.statements[0].rows[0][2], &commit_id);
+        assert_eq!(rows.statements[0].rows[0][3], Value::Integer(0));
+        assert_text(&rows.statements[0].rows[0][4], "{\"value\":\"initial\"}");
+        assert_eq!(rows.statements[0].rows[0][5], Value::Null);
+        assert_non_empty_text(&rows.statements[0].rows[0][6]);
+        assert_text(&rows.statements[0].rows[0][7], "global");
     }
 );
 
@@ -116,9 +110,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'paragraph0', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
         engine
@@ -159,14 +151,14 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 3);
-        assert_eq!(rows.rows[0][0], Value::Integer(0));
-        assert_text(&rows.rows[0][1], "{\"value\":\"value2\"}");
-        assert_eq!(rows.rows[1][0], Value::Integer(1));
-        assert_text(&rows.rows[1][1], "{\"value\":\"value1\"}");
-        assert_eq!(rows.rows[2][0], Value::Integer(2));
-        assert_text(&rows.rows[2][1], "{\"value\":\"value0\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 3);
+        assert_eq!(rows.statements[0].rows[0][0], Value::Integer(0));
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"value2\"}");
+        assert_eq!(rows.statements[0].rows[1][0], Value::Integer(1));
+        assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"value1\"}");
+        assert_eq!(rows.statements[0].rows[2][0], Value::Integer(2));
+        assert_text(&rows.statements[0].rows[2][1], "{\"value\":\"value0\"}");
     }
 );
 
@@ -186,9 +178,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'history-created-at', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
         engine
@@ -219,14 +209,14 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 2);
-        assert_eq!(rows.rows[0][0], Value::Integer(0));
-        assert_non_empty_text(&rows.rows[0][1]);
-        assert_non_empty_text(&rows.rows[0][2]);
-        assert_eq!(rows.rows[1][0], Value::Integer(1));
-        assert_non_empty_text(&rows.rows[1][1]);
-        assert_non_empty_text(&rows.rows[1][2]);
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_eq!(rows.statements[0].rows[0][0], Value::Integer(0));
+        assert_non_empty_text(&rows.statements[0].rows[0][1]);
+        assert_non_empty_text(&rows.statements[0].rows[0][2]);
+        assert_eq!(rows.statements[0].rows[1][0], Value::Integer(1));
+        assert_non_empty_text(&rows.statements[0].rows[1][1]);
+        assert_non_empty_text(&rows.statements[0].rows[1][2]);
     }
 );
 
@@ -246,9 +236,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'entity1', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
         let insert_commit_id = active_commit_id(&engine).await;
@@ -279,11 +267,14 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(at_insert.rows.clone());
-        assert_eq!(at_insert.rows.len(), 1);
-        assert_text(&at_insert.rows[0][0], "{\"value\":\"initial\"}");
-        assert_text(&at_insert.rows[0][1], &insert_commit_id);
-        assert_eq!(at_insert.rows[0][2], Value::Integer(0));
+        sim.assert_deterministic(at_insert.statements[0].rows.clone());
+        assert_eq!(at_insert.statements[0].rows.len(), 1);
+        assert_text(
+            &at_insert.statements[0].rows[0][0],
+            "{\"value\":\"initial\"}",
+        );
+        assert_text(&at_insert.statements[0].rows[0][1], &insert_commit_id);
+        assert_eq!(at_insert.statements[0].rows[0][2], Value::Integer(0));
 
         let at_update = engine
             .execute(
@@ -298,14 +289,20 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(at_update.rows.clone());
-        assert_eq!(at_update.rows.len(), 2);
-        assert_text(&at_update.rows[0][0], "{\"value\":\"updated\"}");
-        assert_text(&at_update.rows[0][1], &update_commit_id);
-        assert_eq!(at_update.rows[0][2], Value::Integer(0));
-        assert_text(&at_update.rows[1][0], "{\"value\":\"initial\"}");
-        assert_text(&at_update.rows[1][1], &update_commit_id);
-        assert_eq!(at_update.rows[1][2], Value::Integer(1));
+        sim.assert_deterministic(at_update.statements[0].rows.clone());
+        assert_eq!(at_update.statements[0].rows.len(), 2);
+        assert_text(
+            &at_update.statements[0].rows[0][0],
+            "{\"value\":\"updated\"}",
+        );
+        assert_text(&at_update.statements[0].rows[0][1], &update_commit_id);
+        assert_eq!(at_update.statements[0].rows[0][2], Value::Integer(0));
+        assert_text(
+            &at_update.statements[0].rows[1][0],
+            "{\"value\":\"initial\"}",
+        );
+        assert_text(&at_update.statements[0].rows[1][1], &update_commit_id);
+        assert_eq!(at_update.statements[0].rows[1][2], Value::Integer(1));
     }
 );
 
@@ -403,12 +400,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], &entity_a_commit_id);
-        assert_text(&rows.rows[0][1], &latest_root_commit_id);
-        assert_eq!(rows.rows[0][2], Value::Integer(2));
-        assert_text(&rows.rows[0][3], "{\"value\":\"a0\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], &entity_a_commit_id);
+        assert_text(&rows.statements[0].rows[0][1], &latest_root_commit_id);
+        assert_eq!(rows.statements[0].rows[0][2], Value::Integer(2));
+        assert_text(&rows.statements[0].rows[0][3], "{\"value\":\"a0\"}");
     }
 );
 
@@ -471,7 +468,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(entity_a_depth_zero.rows.len(), 0);
+        assert_eq!(entity_a_depth_zero.statements[0].rows.len(), 0);
 
         let entity_b_depth_zero = engine
             .execute(
@@ -487,12 +484,24 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(entity_b_depth_zero.rows.clone());
-        assert_eq!(entity_b_depth_zero.rows.len(), 1);
-        assert_text(&entity_b_depth_zero.rows[0][0], &latest_root_commit_id);
-        assert_text(&entity_b_depth_zero.rows[0][1], &latest_root_commit_id);
-        assert_eq!(entity_b_depth_zero.rows[0][2], Value::Integer(0));
-        assert_text(&entity_b_depth_zero.rows[0][3], "{\"value\":\"b1\"}");
+        sim.assert_deterministic(entity_b_depth_zero.statements[0].rows.clone());
+        assert_eq!(entity_b_depth_zero.statements[0].rows.len(), 1);
+        assert_text(
+            &entity_b_depth_zero.statements[0].rows[0][0],
+            &latest_root_commit_id,
+        );
+        assert_text(
+            &entity_b_depth_zero.statements[0].rows[0][1],
+            &latest_root_commit_id,
+        );
+        assert_eq!(
+            entity_b_depth_zero.statements[0].rows[0][2],
+            Value::Integer(0)
+        );
+        assert_text(
+            &entity_b_depth_zero.statements[0].rows[0][3],
+            "{\"value\":\"b1\"}",
+        );
     }
 );
 
@@ -555,8 +564,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(duplicates.rows.clone());
-        assert_eq!(duplicates.rows.len(), 0);
+        sim.assert_deterministic(duplicates.statements[0].rows.clone());
+        assert_eq!(duplicates.statements[0].rows.len(), 0);
     }
 );
 

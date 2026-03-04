@@ -73,8 +73,8 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine
         .await
         .unwrap();
 
-    assert_eq!(sequence.rows.len(), 1);
-    let snapshot_content = match &sequence.rows[0][0] {
+    assert_eq!(sequence.statements[0].rows.len(), 1);
+    let snapshot_content = match &sequence.statements[0].rows[0][0] {
         Value::Text(value) => value,
         other => panic!("expected text snapshot_content, got {other:?}"),
     };
@@ -156,6 +156,12 @@ simulation_test!(
                     let first = tx
                         .execute("SELECT lix_uuid_v7(), lix_timestamp(), lix_uuid_v7()", &[])
                         .await?;
+                    let [first] = first.statements.as_slice() else {
+                        panic!(
+                            "deterministic first query: expected 1 statement result(s), got {}",
+                            first.statements.len()
+                        );
+                    };
                     assert_eq!(first.rows.len(), 1);
                     assert_eq!(first.rows[0][0], Value::Text(deterministic_uuid(0)));
                     assert_eq!(
@@ -167,6 +173,12 @@ simulation_test!(
                     let second = tx
                         .execute("SELECT lix_uuid_v7(), lix_timestamp(), lix_uuid_v7()", &[])
                         .await?;
+                    let [second] = second.statements.as_slice() else {
+                        panic!(
+                            "deterministic second query: expected 1 statement result(s), got {}",
+                            second.statements.len()
+                        );
+                    };
                     assert_eq!(second.rows.len(), 1);
                     assert_eq!(second.rows[0][0], Value::Text(deterministic_uuid(3)));
                     assert_eq!(
@@ -196,9 +208,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-sequential-fallback', '/tx-sequential-fallback.json', lix_text_encode('before'))",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-sequential-fallback', '/tx-sequential-fallback.json', lix_text_encode('before'))", &[])
             .await
             .unwrap();
 
@@ -224,8 +234,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(result.rows.len(), 1);
-        assert_blob_text(&result.rows[0][0], "after");
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_blob_text(&result.statements[0].rows[0][0], "after");
     }
 );
 
@@ -347,9 +357,7 @@ simulation_test!(
             .execute(
                 "BEGIN; \
                  INSERT INTO lix_file (id, path, data) VALUES ('tx-script-preprocess', '/tx-script-preprocess.json', lix_text_encode('before')); \
-                 COMMIT;",
-                &[],
-            )
+                 COMMIT;", &[])
             .await
             .expect("BEGIN/COMMIT script should preprocess lix_file view writes");
 
@@ -360,8 +368,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(result.rows.len(), 1);
-        assert_blob_text(&result.rows[0][0], "before");
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_blob_text(&result.statements[0].rows[0][0], "before");
     }
 );
 
@@ -395,8 +403,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Value::Text("ok".to_string()));
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(
+            result.statements[0].rows[0][0],
+            Value::Text("ok".to_string())
+        );
     }
 );
 
@@ -474,9 +485,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-param-update', '/before.md', lix_text_encode('before'))",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-param-update', '/before.md', lix_text_encode('before'))", &[])
             .await
             .unwrap();
 
@@ -486,8 +495,7 @@ simulation_test!(
                  DELETE FROM lix_file WHERE id IN (?); \
                  INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?); \
                  UPDATE lix_file SET path = ?, data = ? WHERE id = ?; \
-                 COMMIT;",
-                &[
+                 COMMIT;", &[
                     Value::Text("tx-script-delete-miss".to_string()),
                     Value::Text("tx-script-insert".to_string()),
                     Value::Text("/inserted.md".to_string()),
@@ -495,8 +503,7 @@ simulation_test!(
                     Value::Text("/after.md".to_string()),
                     Value::Blob(b"after".to_vec()),
                     Value::Text("tx-script-param-update".to_string()),
-                ],
-            )
+                ])
             .await
             .expect(
                 "BEGIN/COMMIT transaction script with parameterized update should execute successfully",
@@ -509,9 +516,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(updated.rows.len(), 1);
-        assert_eq!(updated.rows[0][0], Value::Text("/after.md".to_string()));
-        assert_blob_text(&updated.rows[0][1], "after");
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_eq!(
+            updated.statements[0].rows[0][0],
+            Value::Text("/after.md".to_string())
+        );
+        assert_blob_text(&updated.statements[0].rows[0][1], "after");
     }
 );
 
@@ -527,9 +537,7 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-single-update', '/before.md', lix_text_encode('before'))",
-                &[],
-            )
+                "INSERT INTO lix_file (id, path, data) VALUES ('tx-script-single-update', '/before.md', lix_text_encode('before'))", &[])
             .await
             .unwrap();
 
@@ -554,9 +562,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(updated.rows.len(), 1);
-        assert_eq!(updated.rows[0][0], Value::Text("/after.md".to_string()));
-        assert_blob_text(&updated.rows[0][1], "after");
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_eq!(
+            updated.statements[0].rows[0][0],
+            Value::Text("/after.md".to_string())
+        );
+        assert_blob_text(&updated.statements[0].rows[0][1], "after");
     }
 );
 
@@ -587,8 +598,13 @@ simulation_test!(
             .await
             .expect("mixed placeholder transaction script should execute");
 
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0], vec![Value::Integer(22), Value::Integer(44)]);
+        assert_eq!(result.statements.len(), 3);
+        assert_eq!(result.statements[0].rows, vec![vec![Value::Integer(11)]]);
+        assert_eq!(result.statements[1].rows, vec![vec![Value::Integer(33)]]);
+        assert_eq!(
+            result.statements[2].rows,
+            vec![vec![Value::Integer(22), Value::Integer(44)]]
+        );
     }
 );
 
@@ -631,6 +647,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert!(rows.rows.is_empty(), "panic path should roll back writes");
+        assert!(
+            rows.statements[0].rows.is_empty(),
+            "panic path should roll back writes"
+        );
     }
 );

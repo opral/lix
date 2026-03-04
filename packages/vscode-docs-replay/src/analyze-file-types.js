@@ -77,7 +77,7 @@ async function main() {
       [],
     );
 
-    const rows = (result.rows ?? []).map((row, index) => ({
+    const rows = statementRows(result).map((row, index) => ({
       pluginKey: scalarToString(row?.[0], `rows[${index}].plugin_key`),
       extension: scalarToString(row?.[1], `rows[${index}].extension`),
       fileCount: scalarToNumber(row?.[2], `rows[${index}].file_count`),
@@ -177,6 +177,10 @@ function scalarToString(value, context) {
     }
   }
   throw new Error(`unsupported text scalar for ${context}: ${JSON.stringify(value)}`);
+}
+
+function statementRows(result, statementIndex = 0) {
+  return result?.statements?.[statementIndex]?.rows ?? [];
 }
 
 function formatNumber(value) {

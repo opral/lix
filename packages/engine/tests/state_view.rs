@@ -16,9 +16,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -92,9 +90,9 @@ simulation_test!(lix_state_select_exposes_commit_id, |sim| async move {
         .await
         .unwrap();
 
-    sim.assert_deterministic(rows.rows.clone());
-    assert_eq!(rows.rows.len(), 1);
-    let commit_id = match &rows.rows[0][0] {
+    sim.assert_deterministic(rows.statements[0].rows.clone());
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    let commit_id = match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value,
         other => panic!("expected text commit_id in lix_state, got {other:?}"),
     };
@@ -136,10 +134,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "entity-a");
-        assert_text(&rows.rows[0][1], "{\"value\":\"A\"}");
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "entity-a");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"A\"}");
     }
 );
 
@@ -174,9 +172,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(first.rows.clone());
-        assert_eq!(first.rows.len(), 1);
-        assert_text(&first.rows[0][0], "entity-a");
+        sim.assert_deterministic(first.statements[0].rows.clone());
+        assert_eq!(first.statements[0].rows.len(), 1);
+        assert_text(&first.statements[0].rows[0][0], "entity-a");
 
         engine
             .execute(
@@ -194,9 +192,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(second.rows.clone());
-        assert_eq!(second.rows.len(), 1);
-        assert_text(&second.rows[0][0], "entity-b");
+        sim.assert_deterministic(second.statements[0].rows.clone());
+        assert_eq!(second.statements[0].rows.len(), 1);
+        assert_text(&second.statements[0].rows[0][0], "entity-b");
     }
 );
 
@@ -246,10 +244,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "{\"value\":\"untracked\"}");
-        assert_boolean_like(&rows.rows[0][1], true);
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"untracked\"}");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
     }
 );
 
@@ -287,10 +285,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "entity-a");
-        assert_text(&rows.rows[0][1], "test_state_schema");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "entity-a");
+        assert_text(&rows.statements[0].rows[0][1], "test_state_schema");
     }
 );
 
@@ -346,10 +344,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(updated.rows.clone());
-        assert_eq!(updated.rows.len(), 1);
-        assert_text(&updated.rows[0][0], "{\"value\":\"updated\"}");
-        assert_boolean_like(&updated.rows[0][1], true);
+        sim.assert_deterministic_normalized(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "{\"value\":\"updated\"}");
+        assert_boolean_like(&updated.statements[0].rows[0][1], true);
     }
 );
 
@@ -398,10 +396,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(first.rows.clone());
-        assert_eq!(first.rows.len(), 1);
-        assert_text(&first.rows[0][0], "version-a");
-        assert_text(&first.rows[0][1], "{\"value\":\"A\"}");
+        sim.assert_deterministic(first.statements[0].rows.clone());
+        assert_eq!(first.statements[0].rows.len(), 1);
+        assert_text(&first.statements[0].rows[0][0], "version-a");
+        assert_text(&first.statements[0].rows[0][1], "{\"value\":\"A\"}");
 
         engine
             .execute(
@@ -435,12 +433,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(second.rows.clone());
-        assert_eq!(second.rows.len(), 2);
-        assert_text(&second.rows[0][0], "version-a");
-        assert_text(&second.rows[0][1], "{\"value\":\"A\"}");
-        assert_text(&second.rows[1][0], "version-b");
-        assert_text(&second.rows[1][1], "{\"value\":\"B\"}");
+        sim.assert_deterministic(second.statements[0].rows.clone());
+        assert_eq!(second.statements[0].rows.len(), 2);
+        assert_text(&second.statements[0].rows[0][0], "version-a");
+        assert_text(&second.statements[0].rows[0][1], "{\"value\":\"A\"}");
+        assert_text(&second.statements[0].rows[1][0], "version-b");
+        assert_text(&second.statements[0].rows[1][1], "{\"value\":\"B\"}");
     }
 );
 
@@ -492,10 +490,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "version-a");
-        assert_text(&rows.rows[0][1], "{\"value\":\"P\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "version-a");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"P\"}");
     }
 );
 
@@ -524,9 +522,7 @@ simulation_test!(
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -538,9 +534,7 @@ simulation_test!(
                  'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id) DO UPDATE \
-                 SET snapshot_content = '{\"value\":\"B\"}'",
-                &[],
-            )
+                 SET snapshot_content = '{\"value\":\"B\"}'", &[])
             .await
             .unwrap();
 
@@ -556,9 +550,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(visible.rows.clone());
-        assert_eq!(visible.rows.len(), 1);
-        assert_text(&visible.rows[0][0], "{\"value\":\"B\"}");
+        sim.assert_deterministic(visible.statements[0].rows.clone());
+        assert_eq!(visible.statements[0].rows.len(), 1);
+        assert_text(&visible.statements[0].rows[0][0], "{\"value\":\"B\"}");
 
         let materialized = engine
             .execute(
@@ -573,9 +567,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(materialized.rows.clone());
-        assert_eq!(materialized.rows.len(), 1);
-        assert_text(&materialized.rows[0][0], "{\"value\":\"B\"}");
+        sim.assert_deterministic(materialized.statements[0].rows.clone());
+        assert_eq!(materialized.statements[0].rows.len(), 1);
+        assert_text(&materialized.statements[0].rows[0][0], "{\"value\":\"B\"}");
     }
 );
 
@@ -605,9 +599,7 @@ simulation_test!(
                  ) VALUES (\
                  'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
                  ) \
-                 ON CONFLICT (entity_id, schema_key, file_id) DO NOTHING",
-                &[],
-            )
+                 ON CONFLICT (entity_id, schema_key, file_id) DO NOTHING", &[])
             .await
             .expect_err("DO NOTHING should be rejected");
 
@@ -645,9 +637,7 @@ simulation_test!(
                  entity_id, file_id, schema_key, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
                  'entity-x', 'file-x', 'test_state_schema', 'version-b', 'lix', '1', '{\"value\":\"x\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .expect_err("lix_state insert with version_id should fail");
 
@@ -723,12 +713,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 2);
-        assert_text(&rows.rows[0][0], "version-a");
-        assert_text(&rows.rows[0][1], "{\"value\":\"A-updated\"}");
-        assert_text(&rows.rows[1][0], "version-b");
-        assert_text(&rows.rows[1][1], "{\"value\":\"B-initial\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "version-a");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"A-updated\"}");
+        assert_text(&rows.statements[0].rows[1][0], "version-b");
+        assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"B-initial\"}");
     }
 );
 
@@ -789,9 +779,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "{\"value\":\"after\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"after\"}");
     }
 );
 
@@ -845,10 +835,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "{\"value\":\"updated\"}");
-        assert_boolean_like(&rows.rows[0][1], true);
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "{\"value\":\"updated\"}");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
     }
 );
 
@@ -1006,12 +996,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 2);
-        assert_text(&rows.rows[0][0], "version-a");
-        assert_eq!(rows.rows[0][1], Value::Null);
-        assert_text(&rows.rows[1][0], "version-b");
-        assert_text(&rows.rows[1][1], "{\"value\":\"B-initial\"}");
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "version-a");
+        assert_eq!(rows.statements[0].rows[0][1], Value::Null);
+        assert_text(&rows.statements[0].rows[1][0], "version-b");
+        assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"B-initial\"}");
     }
 );
 
@@ -1077,11 +1067,14 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "version-b");
-        assert_text(&rows.rows[0][1], "{\"value\":\"B-untracked\"}");
-        assert_boolean_like(&rows.rows[0][2], true);
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "version-b");
+        assert_text(
+            &rows.statements[0].rows[0][1],
+            "{\"value\":\"B-untracked\"}",
+        );
+        assert_boolean_like(&rows.statements[0].rows[0][2], true);
     }
 );
 
@@ -1132,11 +1125,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 2);
-        assert_text(&rows.rows[0][0], "version-a");
-        assert_text(&rows.rows[0][1], "{\"value\":\"A\"}");
-        assert_text(&rows.rows[1][0], "version-b");
-        assert_text(&rows.rows[1][1], "{\"value\":\"B\"}");
+        sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "version-a");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"A\"}");
+        assert_text(&rows.statements[0].rows[1][0], "version-b");
+        assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"B\"}");
     }
 );

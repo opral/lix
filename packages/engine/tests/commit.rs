@@ -31,9 +31,7 @@ async fn register_test_schema(engine: &SimulationEngine) {
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -74,8 +72,8 @@ async fn read_version_pointer_commit_id(engine: &SimulationEngine, version_id: &
         )
         .await
         .unwrap();
-    assert_eq!(result.rows.len(), 1);
-    let snapshot = parse_json(&result.rows[0][0]);
+    assert_eq!(result.statements[0].rows.len(), 1);
+    let snapshot = parse_json(&result.statements[0].rows[0][0]);
     snapshot["commit_id"]
         .as_str()
         .expect("version tip snapshot should include string commit_id")
@@ -97,7 +95,7 @@ async fn matching_commit_change_set_ids(
         .unwrap();
 
     let mut matching_change_set_ids = Vec::new();
-    for row in commit_snapshot_ids.rows {
+    for row in &commit_snapshot_ids.statements[0].rows {
         let snapshot_id = as_text(&row[0]);
         let snapshot = engine
             .execute(
@@ -109,10 +107,10 @@ async fn matching_commit_change_set_ids(
             )
             .await
             .unwrap();
-        if snapshot.rows.is_empty() {
+        if snapshot.statements[0].rows.is_empty() {
             continue;
         }
-        let commit_json = parse_json(&snapshot.rows[0][0]);
+        let commit_json = parse_json(&snapshot.statements[0].rows[0][0]);
         let Some(change_ids) = commit_json.get("change_ids").and_then(|v| v.as_array()) else {
             continue;
         };
@@ -182,9 +180,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'para-0', 'test_schema', 'file-1', 'global', 'lix', '{\"key\":\"v0\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -196,9 +192,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'para-1', 'test_schema', 'file-1', 'global', 'lix', '{\"key\":\"v1\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -216,9 +210,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_change.rows.len(), 1);
+        assert_eq!(domain_change.statements[0].rows.len(), 1);
 
-        let snapshot_id = as_text(&domain_change.rows[0][1]);
+        let snapshot_id = as_text(&domain_change.statements[0].rows[0][1]);
         let snapshot = engine
             .execute(
                 &format!(
@@ -229,9 +223,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.statements[0].rows.len(), 1);
         assert_eq!(
-            snapshot.rows[0][0],
+            snapshot.statements[0].rows[0][0],
             Value::Text("{\"key\":\"v1\"}".to_string())
         );
 
@@ -251,7 +245,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(edge_change_count.rows[0][0], Value::Integer(0));
+        assert_eq!(
+            edge_change_count.statements[0].rows[0][0],
+            Value::Integer(0)
+        );
 
         // The derived edge must still exist in current vtable state.
         let derived_edge = engine
@@ -268,8 +265,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(derived_edge.rows.len(), 1);
-        let edge_snapshot = parse_json(&derived_edge.rows[0][0]);
+        assert_eq!(derived_edge.statements[0].rows.len(), 1);
+        let edge_snapshot = parse_json(&derived_edge.statements[0].rows[0][0]);
         assert_eq!(
             edge_snapshot["parent_id"].as_str(),
             Some(previous_commit_id.as_str())
@@ -289,8 +286,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert!(snapshot_fks.rows.len() >= 3);
-        for row in snapshot_fks.rows {
+        assert!(snapshot_fks.statements[0].rows.len() >= 3);
+        for row in &snapshot_fks.statements[0].rows {
             let id = as_text(&row[0]);
             let exists = engine
                 .execute(
@@ -302,7 +299,7 @@ simulation_test!(
                 )
                 .await
                 .unwrap();
-            assert_eq!(exists.rows[0][0], Value::Integer(1));
+            assert_eq!(exists.statements[0].rows[0][0], Value::Integer(1));
         }
     }
 );
@@ -322,12 +319,10 @@ simulation_test!(
             .execute(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')",
-                &[],
-            )
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
-        let before_count = as_i64(&before.rows[0][0]);
+        let before_count = as_i64(&before.statements[0].rows[0][0]);
 
         engine
             .execute(
@@ -335,9 +330,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES (\
                  'entity-untracked', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"local\"}', '1', true\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -345,12 +338,10 @@ simulation_test!(
             .execute(
                 "SELECT COUNT(*) \
                  FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')",
-                &[],
-            )
+                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_pointer', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
-        assert_eq!(as_i64(&after.rows[0][0]), before_count);
+        assert_eq!(as_i64(&after.statements[0].rows[0][0]), before_count);
 
         let row = engine
             .execute(
@@ -362,12 +353,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(row.rows.len(), 1);
+        assert_eq!(row.statements[0].rows.len(), 1);
         assert_eq!(
-            row.rows[0][0],
+            row.statements[0].rows[0][0],
             Value::Text("{\"key\":\"local\"}".to_string())
         );
-        match &row.rows[0][1] {
+        match &row.statements[0].rows[0][1] {
             Value::Boolean(value) => assert!(*value),
             Value::Integer(value) => assert_eq!(*value, 1),
             other => panic!("expected true-like untracked marker, got {other:?}"),
@@ -394,9 +385,7 @@ simulation_test!(
                  'entity-a', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"a\"}', '1'\
                  ), (\
                  'entity-b', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"b\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -410,8 +399,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.rows.len(), 2);
-        let domain_change_ids: BTreeSet<String> = domain_changes
+        assert_eq!(domain_changes.statements[0].rows.len(), 2);
+        let domain_change_ids: BTreeSet<String> = domain_changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))
@@ -428,13 +417,11 @@ simulation_test!(
                  FROM lix_internal_state_vtable cse \
                  JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
                  WHERE cse.schema_key = 'lix_change_set_element' \
-                   AND ch.schema_key = 'test_schema'",
-                &[],
-            )
+                   AND ch.schema_key = 'test_schema'", &[])
             .await
             .unwrap();
 
-        let cse_for_change_set = cse_rows
+        let cse_for_change_set = cse_rows.statements[0]
             .rows
             .iter()
             .map(|row| parse_json(&row[0]))
@@ -483,9 +470,7 @@ simulation_test!(
                  ) VALUES (\
                  'entity-d', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"d\"}', '1'\
                  ); \
-                 COMMIT;",
-                &[],
-            )
+                 COMMIT;", &[])
             .await
             .unwrap();
 
@@ -499,8 +484,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.rows.len(), 2);
-        let domain_change_ids: BTreeSet<String> = domain_changes
+        assert_eq!(domain_changes.statements[0].rows.len(), 2);
+        let domain_change_ids: BTreeSet<String> = domain_changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))
@@ -517,13 +502,11 @@ simulation_test!(
                  FROM lix_internal_state_vtable cse \
                  JOIN lix_internal_change ch ON ch.id = lix_json_extract(cse.snapshot_content, 'change_id') \
                  WHERE cse.schema_key = 'lix_change_set_element' \
-                   AND ch.schema_key = 'test_schema'",
-                &[],
-            )
+                   AND ch.schema_key = 'test_schema'", &[])
             .await
             .unwrap();
 
-        let cse_for_change_set = cse_rows
+        let cse_for_change_set = cse_rows.statements[0]
             .rows
             .iter()
             .map(|row| parse_json(&row[0]))
@@ -567,7 +550,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        let before_commit_count = as_i64(&before_commit_count.rows[0][0]);
+        let before_commit_count = as_i64(&before_commit_count.statements[0].rows[0][0]);
 
         engine
             .execute(
@@ -590,16 +573,16 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(values.rows.len(), 2);
+        assert_eq!(values.statements[0].rows.len(), 2);
         assert_eq!(
-            values.rows[0],
+            values.statements[0].rows[0],
             vec![
                 Value::Text("tx-kv-a".to_string()),
                 Value::Text("value-a".to_string())
             ]
         );
         assert_eq!(
-            values.rows[1],
+            values.statements[0].rows[1],
             vec![
                 Value::Text("tx-kv-b".to_string()),
                 Value::Text("value-b".to_string())
@@ -615,7 +598,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        let after_commit_count = as_i64(&after_commit_count.rows[0][0]);
+        let after_commit_count = as_i64(&after_commit_count.statements[0].rows[0][0]);
         assert_eq!(after_commit_count, before_commit_count + 1);
 
         let domain_changes = engine
@@ -628,8 +611,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.rows.len(), 2);
-        let domain_change_ids = domain_changes
+        assert_eq!(domain_changes.statements[0].rows.len(), 2);
+        let domain_change_ids = domain_changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))

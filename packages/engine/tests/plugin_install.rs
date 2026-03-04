@@ -127,9 +127,9 @@ simulation_test!(
             .await
             .expect("plugin archive lookup should succeed");
 
-        sim.assert_deterministic(result.rows.clone());
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_eq!(
             row[0],
             Value::Text("lix_plugin_archive::plugin_json".to_string())
@@ -355,7 +355,7 @@ simulation_test!(
             )
             .await
             .expect("plugin count query should succeed");
-        assert_eq!(value_as_i64(&plugin_count.rows[0][0]), 0);
+        assert_eq!(value_as_i64(&plugin_count.statements[0].rows[0][0]), 0);
 
         let schema_count = engine
             .execute(
@@ -366,7 +366,7 @@ simulation_test!(
             )
             .await
             .expect("schema count query should succeed");
-        assert_eq!(value_as_i64(&schema_count.rows[0][0]), 0);
+        assert_eq!(value_as_i64(&schema_count.statements[0].rows[0][0]), 0);
     }
 );
 
@@ -425,8 +425,8 @@ simulation_test!(
             .await
             .expect("plugin archive lookup should succeed");
 
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_eq!(
             row[0],
             Value::Text("lix_plugin_archive::plugin_json".to_string())

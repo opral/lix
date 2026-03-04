@@ -120,7 +120,7 @@ async function createCanonicalBoundaryLix() {
 		},
 	};
 
-	const lix = await openLixWasm(backend as any, createNodeWasmRuntime(), undefined);
+	const lix = await openLixWasm(backend as any, createNodeWasmRuntime());
 	return { lix, runtimeBackend };
 }
 
