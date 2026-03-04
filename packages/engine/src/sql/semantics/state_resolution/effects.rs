@@ -31,9 +31,8 @@ pub(crate) fn derive_effects_from_state_resolution(
     let mut file_path_cache_invalidation_targets = BTreeSet::new();
     file_path_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
     file_path_cache_invalidation_targets.extend(pending_file_delete_targets.iter().cloned());
-    let mut file_data_cache_invalidation_targets = file_path_cache_invalidation_targets.clone();
-    file_data_cache_invalidation_targets
-        .extend(authoritative_pending_file_write_targets.iter().cloned());
+    let file_data_cache_invalidation_targets = file_path_cache_invalidation_targets.clone();
+    let _ = authoritative_pending_file_write_targets;
     let next_active_version_id = active_version_from_mutations(&preprocess.mutations)
         .map_err(PlannerError::preprocess)?
         .or(

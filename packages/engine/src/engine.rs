@@ -140,27 +140,40 @@ impl<'a> EngineTransaction<'a> {
         params: &[Value],
     ) -> Result<QueryResult, LixError> {
         let previous_active_version_id = self.active_version_id.clone();
+        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let transaction = self.transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        let result = self
-            .engine
-            .execute_with_options_in_transaction(
-                transaction.as_mut(),
-                sql,
-                params,
-                &self.options,
-                &mut self.active_version_id,
-                None,
-                false,
-                &mut self.pending_state_commit_stream_changes,
-            )
-            .await?;
+        let result = if parsed_statements.len() > 1 {
+            self.engine
+                .execute_statement_script_with_options_in_transaction(
+                    transaction.as_mut(),
+                    parsed_statements.clone(),
+                    params,
+                    &self.options,
+                    &mut self.active_version_id,
+                    &mut self.pending_state_commit_stream_changes,
+                )
+                .await?
+        } else {
+            self.engine
+                .execute_with_options_in_transaction(
+                    transaction.as_mut(),
+                    sql,
+                    params,
+                    &self.options,
+                    &mut self.active_version_id,
+                    None,
+                    false,
+                    &mut self.pending_state_commit_stream_changes,
+                )
+                .await?
+        };
         if self.active_version_id != previous_active_version_id {
             self.active_version_changed = true;
         }
-        if should_invalidate_installed_plugins_cache_for_sql(sql) {
+        if should_invalidate_installed_plugins_cache_for_statements(&parsed_statements) {
             self.installed_plugins_cache_invalidation_pending = true;
         }
         Ok(result)
@@ -295,6 +308,7 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
     crate::error_classification::normalize_sql_error_with_backend(backend, error, statements).await
 }
 
+#[cfg(test)]
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
     let Ok(statements) = parse_sql(sql) else {
         return false;

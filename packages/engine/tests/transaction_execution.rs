@@ -230,6 +230,110 @@ simulation_test!(
 );
 
 simulation_test!(
+    tx_execute_multistmt_has_statement_barriers_for_file_bytes,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('tx-byte-barrier', '/tx-byte-barrier.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    let rows = tx
+                        .execute(
+                            "UPDATE lix_file SET data = lix_text_encode('after') \
+                             WHERE id = 'tx-byte-barrier'; \
+                             SELECT data FROM lix_file WHERE id = 'tx-byte-barrier' LIMIT 1",
+                            &[],
+                        )
+                        .await?;
+                    assert_eq!(rows.rows.len(), 1);
+                    assert_blob_text(&rows.rows[0][0], "after");
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+);
+
+simulation_test!(
+    tx_execute_multistmt_commit_pointer_visible_after_content_stmt,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('tx-commit-barrier', '/tx-commit-barrier.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    let before = tx
+                        .execute(
+                            "SELECT v.commit_id \
+                             FROM lix_active_version av \
+                             JOIN lix_version v ON v.id = av.version_id \
+                             ORDER BY av.id \
+                             LIMIT 1",
+                            &[],
+                        )
+                        .await?;
+                    assert_eq!(before.rows.len(), 1);
+                    let before_commit = match &before.rows[0][0] {
+                        Value::Text(value) => value.clone(),
+                        other => panic!("expected commit id text, got {other:?}"),
+                    };
+
+                    let after = tx
+                        .execute(
+                            "UPDATE lix_file SET data = lix_text_encode('after') \
+                             WHERE id = 'tx-commit-barrier'; \
+                             SELECT v.commit_id \
+                             FROM lix_active_version av \
+                             JOIN lix_version v ON v.id = av.version_id \
+                             ORDER BY av.id \
+                             LIMIT 1",
+                            &[],
+                        )
+                        .await?;
+                    assert_eq!(after.rows.len(), 1);
+                    let after_commit = match &after.rows[0][0] {
+                        Value::Text(value) => value.clone(),
+                        other => panic!("expected commit id text, got {other:?}"),
+                    };
+                    assert_ne!(after_commit, before_commit);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+);
+
+simulation_test!(
     transaction_script_path_preprocesses_lix_file_statements,
     simulations = [sqlite, postgres],
     |sim| async move {

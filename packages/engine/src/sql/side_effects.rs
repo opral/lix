@@ -138,12 +138,41 @@ impl Engine {
                 }
                 history_plugin_inputs::FileReadMaterializationScope::AllVersions => None,
             };
-            crate::plugin::runtime::materialize_missing_file_data_with_plugins(
+            if let Err(error) = crate::plugin::runtime::materialize_missing_file_data_with_plugins(
                 backend,
                 self.wasm_runtime.as_ref(),
                 versions.as_ref(),
             )
-            .await?;
+            .await
+            {
+                if let Some(unavailable) = first_unavailable_file_data_target_with_binary_ref(
+                    backend,
+                    scope,
+                    active_version_id,
+                )
+                .await?
+                {
+                    return Err(crate::errors::file_data_unavailable_error(
+                        &unavailable.file_id,
+                        &unavailable.version_id,
+                        unavailable.blob_hash.as_deref(),
+                    ));
+                }
+                return Err(error);
+            }
+            if let Some(unavailable) = first_unavailable_file_data_target_with_binary_ref(
+                backend,
+                scope,
+                active_version_id,
+            )
+            .await?
+            {
+                return Err(crate::errors::file_data_unavailable_error(
+                    &unavailable.file_id,
+                    &unavailable.version_id,
+                    unavailable.blob_hash.as_deref(),
+                ));
+            }
         }
         if history_plugin_inputs::file_history_read_materialization_required_for_statements(
             statements,
@@ -983,6 +1012,52 @@ impl Engine {
     }
 }
 
+struct FileDataUnavailableTarget {
+    file_id: String,
+    version_id: String,
+    blob_hash: Option<String>,
+}
+
+async fn first_unavailable_file_data_target_with_binary_ref(
+    backend: &dyn LixBackend,
+    scope: history_plugin_inputs::FileReadMaterializationScope,
+    active_version_id: &str,
+) -> Result<Option<FileDataUnavailableTarget>, LixError> {
+    let mut params = Vec::new();
+    let scope_sql = match scope {
+        history_plugin_inputs::FileReadMaterializationScope::ActiveVersionOnly => {
+            params.push(Value::Text(active_version_id.to_string()));
+            "AND bfr.version_id = $1"
+        }
+        history_plugin_inputs::FileReadMaterializationScope::AllVersions => "",
+    };
+    let sql = format!(
+        "SELECT bfr.file_id, bfr.version_id, bfr.blob_hash \
+         FROM lix_internal_binary_file_version_ref bfr \
+         JOIN lix_internal_file_path_cache fp \
+           ON fp.file_id = bfr.file_id \
+          AND fp.version_id = bfr.version_id \
+         LEFT JOIN lix_internal_file_data_cache fd \
+           ON fd.file_id = bfr.file_id \
+          AND fd.version_id = bfr.version_id \
+         LEFT JOIN lix_internal_binary_blob_store bbs \
+           ON bbs.blob_hash = bfr.blob_hash \
+         WHERE fd.data IS NULL \
+           AND bbs.data IS NULL \
+           {scope_sql} \
+         LIMIT 1"
+    );
+    let result = backend.execute(&sql, &params).await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(FileDataUnavailableTarget {
+        file_id: text_value_required(row, 0, "file_id")?,
+        version_id: text_value_required(row, 1, "version_id")?,
+        blob_hash: Some(text_value_required(row, 2, "blob_hash")?),
+    }))
+}
+
 fn build_detected_file_domain_changes_insert(
     changes: &[DetectedFileDomainChange],
     untracked: bool,
@@ -1250,10 +1325,12 @@ async fn persist_binary_blob_with_fastcdc(
     version_id: &str,
     data: &[u8],
 ) -> Result<(), LixError> {
+    let upsert_blob_store_sql = filesystem_queries::upsert_binary_blob_store_sql();
     let insert_manifest_sql = filesystem_queries::insert_binary_blob_manifest_sql();
     let insert_chunk_store_sql = filesystem_queries::insert_binary_chunk_store_sql();
     let insert_manifest_chunk_sql = filesystem_queries::insert_binary_blob_manifest_chunk_sql();
     let upsert_file_version_ref_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
+    let upsert_file_data_cache_sql = filesystem_queries::upsert_file_data_cache_sql();
 
     let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
     let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
@@ -1280,6 +1357,17 @@ async fn persist_binary_blob_with_fastcdc(
                 Value::Text(blob_hash.clone()),
                 Value::Integer(size_bytes),
                 Value::Integer(chunk_count),
+                Value::Text(now.clone()),
+            ],
+        )
+        .await?;
+    executor
+        .execute_sql(
+            &upsert_blob_store_sql,
+            &[
+                Value::Text(blob_hash.clone()),
+                Value::Blob(data.to_vec()),
+                Value::Integer(size_bytes),
                 Value::Text(now.clone()),
             ],
         )
@@ -1349,6 +1437,16 @@ async fn persist_binary_blob_with_fastcdc(
                 Value::Text(blob_hash),
                 Value::Integer(size_bytes),
                 Value::Text(now),
+            ],
+        )
+        .await?;
+    executor
+        .execute_sql(
+            &upsert_file_data_cache_sql,
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Blob(data.to_vec()),
             ],
         )
         .await?;

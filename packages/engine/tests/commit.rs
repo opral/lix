@@ -133,6 +133,37 @@ async fn matching_commit_change_set_ids(
     matching_change_set_ids
 }
 
+async fn count_version_pointer_changes(engine: &SimulationEngine, version_id: &str) -> i64 {
+    let result = engine
+        .execute(
+            &format!(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_change \
+                 WHERE schema_key = 'lix_version_pointer' \
+                   AND entity_id = '{}'",
+                version_id
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    as_i64(&result.rows[0][0])
+}
+
+async fn active_version_id(engine: &SimulationEngine) -> String {
+    let result = engine
+        .execute(
+            "SELECT version_id \
+             FROM lix_active_version \
+             ORDER BY id \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    as_text(&result.rows[0][0])
+}
+
 simulation_test!(
     commit_writes_business_rows_to_change_and_snapshot_tables,
     |sim| async move {
@@ -607,5 +638,42 @@ simulation_test!(
         let matching_change_set_ids =
             matching_commit_change_set_ids(&engine, &domain_change_ids).await;
         assert_eq!(matching_change_set_ids.len(), 1);
+    }
+);
+
+simulation_test!(
+    content_only_update_emits_version_pointer_change,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('commit-content-only', '/commit-content-only.md', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let before = count_version_pointer_changes(&engine, &version_id).await;
+
+        engine
+            .execute(
+                "UPDATE lix_file SET data = lix_text_encode('after') \
+                 WHERE id = 'commit-content-only'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let after = count_version_pointer_changes(&engine, &version_id).await;
+        assert_eq!(after, before + 1);
     }
 );
