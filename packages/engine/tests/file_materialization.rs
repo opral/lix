@@ -2861,7 +2861,7 @@ simulation_test!(
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) \
                      SELECT \
-                     'insert-select-probe-main', \
+                     CASE WHEN data IS NOT NULL THEN 'insert-select-probe-main' ELSE 'insert-select-probe-main' END, \
                      'json_pointer', \
                      'file-read-insert-select', \
                      '{}', \
