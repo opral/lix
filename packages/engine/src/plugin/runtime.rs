@@ -1346,8 +1346,16 @@ async fn load_missing_file_history_descriptors(
                  lixcol_depth AS depth, \
                  lixcol_commit_id AS commit_id, \
                  path \
-               FROM lix_file_history \
+               FROM lix_file_history_by_version \
                WHERE path IS NOT NULL \
+                 AND lixcol_root_commit_id IN (\
+                   SELECT entity_id \
+                   FROM lix_internal_state_materialized_v1_lix_commit \
+                   WHERE schema_key = 'lix_commit' \
+                     AND version_id = 'global' \
+                     AND is_tombstone = 0 \
+                     AND snapshot_content IS NOT NULL\
+                 ) \
                  AND NOT EXISTS (\
                    SELECT 1 \
                    FROM lix_internal_file_history_data_cache cache \

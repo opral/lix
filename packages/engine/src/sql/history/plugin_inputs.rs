@@ -53,14 +53,15 @@ pub(crate) fn file_history_read_materialization_required_for_statements(
 
 fn file_history_read_materialization_required_for_statement(statement: &Statement) -> bool {
     statement_reads_table_name(statement, "lix_file_history")
+        || statement_reads_table_name(statement, "lix_file_history_by_version")
 }
 
 fn file_read_materialization_scope_for_statement(
     statement: &Statement,
 ) -> Option<FileReadMaterializationScope> {
-    let by_version_requires_data =
-        statement_requires_file_data_materialization(statement, "lix_file_by_version");
-    if by_version_requires_data {
+    let mentions_by_version = statement_reads_table_name(statement, "lix_file_by_version")
+        || statement_reads_table_name(statement, "lix_file_history_by_version");
+    if mentions_by_version {
         return Some(FileReadMaterializationScope::AllVersions);
     }
     let active_version_requires_data =

@@ -5,6 +5,14 @@ use super::*;
 use crate::errors;
 
 impl Engine {
+    pub async fn open(&self) -> Result<(), LixError> {
+        if !self.is_initialized().await? {
+            return Err(errors::not_initialized_error());
+        }
+        self.load_and_cache_active_version().await?;
+        Ok(())
+    }
+
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
         self.wasm_runtime.clone()
     }
@@ -151,22 +159,19 @@ impl Engine {
     ) -> Result<QueryResult, LixError> {
         let allow_internal_sql = allow_internal_tables || self.access_to_internal;
 
-        if !allow_internal_sql {
-            reject_internal_table_access(sql)?;
-        }
-
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+        if !allow_internal_sql {
+            reject_internal_table_writes(&parsed_statements)?;
+        }
+        if let Some(statements) =
+            extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
+        {
+            return self
+                .execute_transaction_script_with_options(statements, params, options)
+                .await;
+        }
         if !allow_internal_sql && contains_transaction_control_statement(&parsed_statements) {
             return Err(errors::transaction_control_statement_denied_error());
-        }
-        if allow_internal_sql {
-            if let Some(statements) =
-                extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
-            {
-                return self
-                    .execute_transaction_script_with_options(statements, params, options)
-                    .await;
-            }
         }
         if parsed_statements.len() > 1 {
             return self

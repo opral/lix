@@ -10,6 +10,7 @@ pub fn run() -> Result<(), CliError> {
 
     match cli.command {
         Command::Exp(exp_command) => commands::exp::run(&context, exp_command),
+        Command::Init(init_command) => commands::init::run(init_command),
         Command::Sql(sql_command) => commands::sql::run(&context, sql_command),
     }
 }

@@ -185,7 +185,7 @@ pub(crate) fn coalesce_vtable_inserts_in_statement_list(
         match statement {
             Statement::Insert(insert) => {
                 if let Some(existing) = pending_insert.as_mut() {
-                    if can_merge_vtable_insert(existing, &insert) {
+                    if can_merge_coalescable_insert(existing, &insert) {
                         append_insert_rows(existing, &insert)?;
                     } else {
                         flush_pending_insert(&mut result, &mut pending_insert);
@@ -227,7 +227,7 @@ pub(crate) fn coalesce_vtable_inserts_in_transactions(
             }
             Statement::Insert(insert) if in_transaction => {
                 if let Some(existing) = pending_insert.as_mut() {
-                    if can_merge_vtable_insert(existing, &insert) {
+                    if can_merge_coalescable_insert(existing, &insert) {
                         append_insert_rows(existing, &insert)?;
                     } else {
                         flush_pending_insert(&mut result, &mut pending_insert);
@@ -254,8 +254,8 @@ fn flush_pending_insert(result: &mut Vec<Statement>, pending_insert: &mut Option
     }
 }
 
-fn can_merge_vtable_insert(left: &Insert, right: &Insert) -> bool {
-    if !insert_targets_vtable(left) || !insert_targets_vtable(right) {
+fn can_merge_coalescable_insert(left: &Insert, right: &Insert) -> bool {
+    if !insert_targets_coalescable_table(left) || !insert_targets_coalescable_table(right) {
         return false;
     }
     if insert_targets_stored_schema(left) || insert_targets_stored_schema(right) {
@@ -324,9 +324,13 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
     Ok(())
 }
 
-fn insert_targets_vtable(insert: &Insert) -> bool {
+fn insert_targets_coalescable_table(insert: &Insert) -> bool {
     match &insert.table {
-        TableObject::TableName(name) => object_name_matches(name, "lix_internal_state_vtable"),
+        TableObject::TableName(name) => {
+            object_name_matches(name, "lix_internal_state_vtable")
+                || object_name_matches(name, "lix_key_value")
+                || object_name_matches(name, "lix_key_value_by_version")
+        }
         _ => false,
     }
 }

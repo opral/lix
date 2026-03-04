@@ -44,8 +44,8 @@ pub use commit::{
     MaterializedStateRow, VersionInfo, VersionSnapshot,
 };
 pub use engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction, EngineTransactionFuture,
-    ExecuteOptions,
+    boot, init_lix, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction,
+    EngineTransactionFuture, ExecuteOptions, InitLixArgs, InitLixResult,
 };
 pub use error::LixError;
 pub use errors::ErrorCode;

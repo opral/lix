@@ -4,12 +4,12 @@ mod wasm {
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, observe_owned, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
-        CreateVersionResult, ExecuteOptions, LixBackend, LixError, LixTransaction,
-        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
-        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
-        SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
-        WireQueryResult, WireValue,
+        boot, init_lix as engine_init_lix, observe_owned, BootArgs, BootKeyValue,
+        CreateCheckpointResult, CreateVersionOptions, CreateVersionResult, ExecuteOptions,
+        InitLixArgs, LixBackend, LixError, LixTransaction, ObserveEvent as EngineObserveEvent,
+        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
+        WasmComponentInstance, WasmLimits, WasmRuntime, WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -81,6 +81,10 @@ export type LixBootKeyValue = {
   value: unknown;
   lixcol_version_id?: string;
   lixcol_untracked?: boolean;
+};
+
+export type InitLixResult = {
+  created: boolean;
 };
 
 export type CreateVersionOptions = {
@@ -465,25 +469,53 @@ export type LixObserveEvents = {
     pub async fn open_lix(
         backend: JsLixBackend,
         wasm_runtime: JsLixWasmRuntime,
-        boot_key_values: Option<JsValue>,
     ) -> Result<Lix, JsValue> {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
         });
-        let mut boot_args = BootArgs::new(
+        let boot_args = BootArgs::new(
             backend,
             Arc::new(JsHostWasmRuntime {
                 runtime: wasm_runtime.into(),
             }) as Arc<dyn WasmRuntime>,
         );
-        if let Some(raw_key_values) = boot_key_values {
-            boot_args.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
-        }
         let engine = boot(boot_args);
-        engine.init().await.map_err(js_error)?;
+        engine.open().await.map_err(js_error)?;
         Ok(Lix {
             engine: Arc::new(engine),
         })
+    }
+
+    #[wasm_bindgen(js_name = initLix)]
+    pub async fn init_lix(
+        backend: JsLixBackend,
+        wasm_runtime: JsLixWasmRuntime,
+        boot_key_values: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let backend = Box::new(JsBackend {
+            backend: backend.into(),
+        });
+        let mut init_args = InitLixArgs {
+            backend,
+            wasm_runtime: Arc::new(JsHostWasmRuntime {
+                runtime: wasm_runtime.into(),
+            }) as Arc<dyn WasmRuntime>,
+            key_values: Vec::new(),
+        };
+        if let Some(raw_key_values) = boot_key_values {
+            init_args.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
+        }
+        let created = engine_init_lix(init_args).await.map_err(js_error)?.created;
+
+        let object = Object::new();
+        Reflect::set(
+            &object,
+            &JsValue::from_str("created"),
+            &JsValue::from_bool(created),
+        )
+        .map_err(js_to_lix_error)
+        .map_err(js_error)?;
+        Ok(object.into())
     }
 
     fn parse_boot_key_values(input: JsValue) -> Result<Vec<BootKeyValue>, LixError> {
@@ -493,7 +525,7 @@ export type LixObserveEvents = {
         if !Array::is_array(&input) {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
-                description: "openLix keyValues must be an array".to_string(),
+                description: "initLix keyValues must be an array".to_string(),
             });
         }
 
@@ -503,20 +535,20 @@ export type LixObserveEvents = {
             if !entry.is_object() {
                 return Err(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
-                    description: "openLix keyValues entries must be objects".to_string(),
+                    description: "initLix keyValues entries must be objects".to_string(),
                 });
             }
 
-            let key = read_required_string_property(&entry, "key", "openLix keyValues entry")?;
+            let key = read_required_string_property(&entry, "key", "initLix keyValues entry")?;
             let value =
                 Reflect::get(&entry, &JsValue::from_str("value")).map_err(js_to_lix_error)?;
-            let value = js_to_json_value(value, &format!("openLix keyValues[{key}].value"))?;
+            let value = js_to_json_value(value, &format!("initLix keyValues[{key}].value"))?;
 
             if Reflect::has(&entry, &JsValue::from_str("versionId")).map_err(js_to_lix_error)? {
                 return Err(LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
                     description:
-                        "openLix keyValues entries must use 'lixcol_version_id' instead of 'versionId'"
+                        "initLix keyValues entries must use 'lixcol_version_id' instead of 'versionId'"
                             .to_string(),
                 });
             }
@@ -524,7 +556,7 @@ export type LixObserveEvents = {
                 return Err(LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
                     description:
-                        "openLix keyValues entries must use 'lixcol_version_id' instead of 'version_id'"
+                        "initLix keyValues entries must use 'lixcol_version_id' instead of 'version_id'"
                             .to_string(),
                 });
             }
@@ -532,12 +564,12 @@ export type LixObserveEvents = {
             let version_id = read_optional_string_property_with_context(
                 &entry,
                 "lixcol_version_id",
-                "openLix keyValues entry",
+                "initLix keyValues entry",
             )?;
             let untracked = read_optional_bool_property_with_context(
                 &entry,
                 "lixcol_untracked",
-                "openLix keyValues entry",
+                "initLix keyValues entry",
             )?;
 
             parsed.push(BootKeyValue {
@@ -1462,7 +1494,11 @@ export type LixObserveEvents = {
 mod wasm {
     pub struct Lix;
 
-    pub fn open_lix(_: (), _: Option<()>, _: Option<()>) -> Result<Lix, String> {
+    pub fn open_lix(_: (), _: Option<()>) -> Result<Lix, String> {
+        Err("engine-wasm is only available for wasm32 targets".to_string())
+    }
+
+    pub fn init_lix(_: (), _: Option<()>, _: Option<()>) -> Result<(), String> {
         Err("engine-wasm is only available for wasm32 targets".to_string())
     }
 }

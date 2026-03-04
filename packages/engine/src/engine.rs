@@ -36,7 +36,7 @@ use crate::WasmRuntime;
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 use futures_util::FutureExt;
 use serde_json::Value as JsonValue;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -67,7 +67,9 @@ use self::sql::planning::parse::parse_sql;
 use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use self::sql::storage::sql_text::escape_sql_string;
 
-pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
+pub use crate::boot::{
+    boot, init_lix, BootAccount, BootArgs, BootKeyValue, InitLixArgs, InitLixResult,
+};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -118,7 +120,8 @@ pub struct EngineTransaction<'a> {
 impl<'a> EngineTransaction<'a> {
     pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         if !self.engine.access_to_internal {
-            reject_internal_table_access(sql)?;
+            let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
+            reject_internal_table_writes(&parsed_statements)?;
         }
         self.execute_with_access(sql, params).await
     }
@@ -238,11 +241,50 @@ struct IntentPipelineTelemetry {
     verification_failures: AtomicU64,
 }
 
-fn reject_internal_table_access(sql: &str) -> Result<(), LixError> {
-    if sql.to_ascii_lowercase().contains("lix_internal_") {
-        return Err(crate::errors::internal_table_access_denied_error());
+fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
+    for statement in statements {
+        if statement_writes_to_lix_internal_table(statement) {
+            return Err(crate::errors::internal_table_access_denied_error());
+        }
     }
     Ok(())
+}
+
+fn statement_writes_to_lix_internal_table(statement: &Statement) -> bool {
+    match statement {
+        Statement::Insert(insert) => match &insert.table {
+            TableObject::TableName(name) => object_name_is_lix_internal(name),
+            _ => false,
+        },
+        Statement::Update(update) => match &update.table.relation {
+            TableFactor::Table { name, .. } => object_name_is_lix_internal(name),
+            _ => false,
+        },
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                sqlparser::ast::FromTable::WithFromKeyword(tables)
+                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+            };
+            tables.iter().any(|table| match &table.relation {
+                TableFactor::Table { name, .. } => object_name_is_lix_internal(name),
+                _ => false,
+            })
+        }
+        _ => false,
+    }
+}
+
+fn object_name_is_lix_internal(name: &sqlparser::ast::ObjectName) -> bool {
+    name.0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| {
+            ident
+                .value
+                .to_ascii_lowercase()
+                .starts_with("lix_internal_")
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) async fn normalize_sql_execution_error_with_backend(
@@ -1186,35 +1228,36 @@ mod tests {
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_select_where_exists_subquery_lix_file() {
+    fn file_read_materialization_scope_ignores_select_where_exists_subquery_lix_file_metadata_only()
+    {
         let scope = file_read_materialization_scope_for_sql(
             "SELECT 1 \
              WHERE EXISTS (\
                 SELECT 1 FROM lix_file WHERE id = 'file-a'\
              )",
         );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+        assert_eq!(scope, None);
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_select_join_on_subquery_lix_file() {
+    fn file_read_materialization_scope_ignores_select_join_on_subquery_lix_file_metadata_only() {
         let scope = file_read_materialization_scope_for_sql(
             "SELECT t.id \
              FROM some_table t \
              LEFT JOIN other_table o \
                ON EXISTS (SELECT 1 FROM lix_file WHERE id = 'file-a')",
         );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+        assert_eq!(scope, None);
     }
 
     #[test]
-    fn file_read_materialization_scope_detects_update_where_subquery_lix_file() {
+    fn file_read_materialization_scope_ignores_update_where_subquery_lix_file_metadata_only() {
         let scope = file_read_materialization_scope_for_sql(
             "UPDATE some_table \
              SET payload = 'x' \
              WHERE id IN (SELECT id FROM lix_file WHERE id = 'file-a')",
         );
-        assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
+        assert_eq!(scope, None);
     }
 
     #[test]
