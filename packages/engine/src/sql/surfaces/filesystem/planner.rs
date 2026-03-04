@@ -5,6 +5,7 @@ const TABLE_PATTERNS: &[&str] = &[
     "lix_file",
     "lix_file_by_version",
     "lix_file_history",
+    "lix_file_history_by_version",
     "lix_directory",
     "lix_directory_by_version",
     "lix_directory_history",

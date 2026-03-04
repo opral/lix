@@ -610,8 +610,14 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
             let engine_a = boot_sqlite_engine_at_path(path.clone());
             let engine_b = boot_sqlite_engine_at_path(path.clone());
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(
@@ -666,8 +672,14 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
             let engine_a = boot_sqlite_engine_at_path(path.clone());
             let engine_b = boot_sqlite_engine_at_path(path.clone());
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(
@@ -733,8 +745,14 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
             let engine_a = boot_postgres_engine_at_url(connection_string.clone());
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(
@@ -787,8 +805,14 @@ fn observe_postgres_detects_external_untracked_state_insert() {
             let engine_a = boot_postgres_engine_at_url(connection_string.clone());
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(
@@ -848,8 +872,14 @@ fn observe_external_same_writer_key_is_suppressed() {
         let engine_a = boot_postgres_engine_at_url(connection_string.clone());
         let engine_b = boot_postgres_engine_at_url(connection_string);
 
-        engine_a.init().await.expect("engine_a init should succeed");
-        engine_b.init().await.expect("engine_b init should succeed");
+        engine_a
+            .init_if_needed()
+            .await
+            .expect("engine_a init should succeed");
+        engine_b
+            .init_if_needed()
+            .await
+            .expect("engine_b init should succeed");
 
         let mut observed = engine_a
             .observe(ObserveQuery::new(
@@ -896,8 +926,14 @@ fn observe_external_different_writer_key_emits() {
         let engine_a = boot_postgres_engine_at_url(connection_string.clone());
         let engine_b = boot_postgres_engine_at_url(connection_string);
 
-        engine_a.init().await.expect("engine_a init should succeed");
-        engine_b.init().await.expect("engine_b init should succeed");
+        engine_a
+            .init_if_needed()
+            .await
+            .expect("engine_a init should succeed");
+        engine_b
+            .init_if_needed()
+            .await
+            .expect("engine_b init should succeed");
 
         let mut observed = engine_a
             .observe(ObserveQuery::new(
@@ -946,8 +982,14 @@ fn observe_external_null_writer_key_emits() {
         let engine_a = boot_postgres_engine_at_url(connection_string.clone());
         let engine_b = boot_postgres_engine_at_url(connection_string);
 
-        engine_a.init().await.expect("engine_a init should succeed");
-        engine_b.init().await.expect("engine_b init should succeed");
+        engine_a
+            .init_if_needed()
+            .await
+            .expect("engine_a init should succeed");
+        engine_b
+            .init_if_needed()
+            .await
+            .expect("engine_b init should succeed");
 
         let mut observed = engine_a
             .observe(ObserveQuery::new(
@@ -996,8 +1038,14 @@ fn observe_external_read_only_transaction_does_not_emit() {
             let engine_a = boot_postgres_engine_at_url(connection_string.clone());
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(
@@ -1039,8 +1087,14 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
             let engine_a = boot_postgres_engine_at_url(connection_string.clone());
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(
@@ -1105,8 +1159,14 @@ fn observe_external_unrelated_mutation_does_not_emit() {
             let engine_a = boot_postgres_engine_at_url(connection_string.clone());
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
-            engine_a.init().await.expect("engine_a init should succeed");
-            engine_b.init().await.expect("engine_b init should succeed");
+            engine_a
+                .init_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_b
+                .init_if_needed()
+                .await
+                .expect("engine_b init should succeed");
 
             let mut observed = engine_a
                 .observe(ObserveQuery::new(

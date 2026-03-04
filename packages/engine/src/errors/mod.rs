@@ -4,6 +4,7 @@ use crate::LixError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     AlreadyInitialized,
+    NotInitialized,
     TableNotFound,
     SchemaNotRegistered,
     SqlUnknownTable,
@@ -20,6 +21,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AlreadyInitialized => "LIX_ERROR_ALREADY_INITIALIZED",
+            Self::NotInitialized => "LIX_ERROR_NOT_INITIALIZED",
             Self::TableNotFound => "LIX_ERROR_TABLE_NOT_FOUND",
             Self::SchemaNotRegistered => "LIX_ERROR_SCHEMA_NOT_REGISTERED",
             Self::SqlUnknownTable => "LIX_ERROR_SQL_UNKNOWN_TABLE",
@@ -38,6 +40,7 @@ impl ErrorCode {
     pub const fn all() -> &'static [Self] {
         &[
             Self::AlreadyInitialized,
+            Self::NotInitialized,
             Self::TableNotFound,
             Self::SchemaNotRegistered,
             Self::SqlUnknownTable,
@@ -63,12 +66,19 @@ pub(crate) fn already_initialized_error() -> LixError {
     )
 }
 
+pub(crate) fn not_initialized_error() -> LixError {
+    build_error(
+        ErrorCode::NotInitialized,
+        "Engine is not initialized. Run initLix({ backend }) before openLix({ backend }).",
+    )
+}
+
 pub(crate) fn table_not_found_read_error() -> LixError {
     let available_tables = public_lix_table_names().join(", ");
     build_error(
         ErrorCode::TableNotFound,
         &format!(
-            "Read queries must target Lix views (`lix_*`) only. Available tables: {available_tables}. Schemas are available via `lix_stored_schema`."
+            "Table not found. Known Lix tables: {available_tables}. If you are querying custom backend tables, ensure they exist in the connected database."
         ),
     )
 }
@@ -135,9 +145,12 @@ pub(crate) fn sql_unknown_column_error(
 }
 
 pub(crate) fn internal_table_access_denied_error() -> LixError {
+    let available_tables = public_lix_table_names().join(", ");
     build_error(
         ErrorCode::InternalTableAccessDenied,
-        "Queries against `lix_internal_*` are not allowed. Use public `lix_*` views.",
+        &format!(
+            "Direct writes to `lix_internal_*` tables can lead to data corruption. Public SQL tables: {available_tables}."
+        ),
     )
 }
 
@@ -185,7 +198,7 @@ pub(crate) fn file_data_expects_bytes_error() -> LixError {
 mod tests {
     use super::{
         already_initialized_error, file_data_expects_bytes_error,
-        internal_table_access_denied_error, read_only_view_write_error,
+        internal_table_access_denied_error, not_initialized_error, read_only_view_write_error,
         schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
         table_not_found_read_error, transaction_control_statement_denied_error,
         transaction_handle_not_found_error, vtable_schema_key_required_error, ErrorCode,
@@ -208,6 +221,9 @@ mod tests {
 
         let table_not_found = table_not_found_read_error();
         assert_eq!(table_not_found.code, "LIX_ERROR_TABLE_NOT_FOUND");
+
+        let not_initialized = not_initialized_error();
+        assert_eq!(not_initialized.code, "LIX_ERROR_NOT_INITIALIZED");
 
         let schema_not_registered =
             schema_not_registered_error("markdown_v2_document", &["lix_key_value"]);
@@ -265,9 +281,6 @@ mod tests {
     fn agent_entrypoints_use_error_catalog_constructors() {
         let engine_src = include_str!("../engine.rs");
         assert!(engine_src.contains("errors::internal_table_access_denied_error()"));
-
-        let preprocess_src = include_str!("../sql/planning/preprocess.rs");
-        assert!(preprocess_src.contains("errors::table_not_found_read_error()"));
 
         let classification_src = include_str!("../error_classification.rs");
         assert!(classification_src.contains("errors::sql_unknown_table_error("));

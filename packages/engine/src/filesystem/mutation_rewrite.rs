@@ -34,6 +34,7 @@ use crate::{LixBackend, LixError, Value as EngineValue};
 const FILE_VIEW: &str = "lix_file";
 const FILE_BY_VERSION_VIEW: &str = "lix_file_by_version";
 const FILE_HISTORY_VIEW: &str = "lix_file_history";
+const FILE_HISTORY_BY_VERSION_VIEW: &str = "lix_file_history_by_version";
 const DIRECTORY_VIEW: &str = "lix_directory";
 const DIRECTORY_BY_VERSION_VIEW: &str = "lix_directory_by_version";
 const DIRECTORY_HISTORY_VIEW: &str = "lix_directory_history";
@@ -739,6 +740,12 @@ fn target_from_view_name(view_name: &str) -> Option<FilesystemTarget> {
         FILE_HISTORY_VIEW => Some(FilesystemTarget {
             view_name: FILE_HISTORY_VIEW,
             rewrite_view_name: FILE_DESCRIPTOR_VIEW,
+            read_only: true,
+            is_file: true,
+        }),
+        FILE_HISTORY_BY_VERSION_VIEW => Some(FilesystemTarget {
+            view_name: FILE_HISTORY_BY_VERSION_VIEW,
+            rewrite_view_name: FILE_DESCRIPTOR_BY_VERSION_VIEW,
             read_only: true,
             is_file: true,
         }),

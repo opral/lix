@@ -8,15 +8,21 @@ use crate::backend::SqlDialect;
 use crate::engine::sql::planning::param_context::{
     normalize_query_placeholders, PlaceholderOrdinalState,
 };
+use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
 use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::select_supports_count_fast_path;
 use crate::engine::sql::planning::rewrite_engine::{
     bind_sql, default_alias, escape_sql_string, object_name_matches, parse_single_query,
     parse_sql_statements, rewrite_query_with_select_rewriter,
 };
-use crate::version::GLOBAL_VERSION_ID;
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
+    GLOBAL_VERSION_ID,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
+const LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME: &str = "lix_state_history_by_version";
 const TIMELINE_BREAKPOINT_TABLE: &str = "lix_internal_entity_state_timeline_breakpoint";
 const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
 const MAX_HISTORY_DEPTH: i64 = 512;
@@ -31,7 +37,8 @@ pub async fn rewrite_query_with_backend(
     query: Query,
     params: &[Value],
 ) -> Result<Option<Query>, LixError> {
-    let (rewritten, requests) = rewrite_query_collect_requests(query)?;
+    let (rewritten, requests) =
+        rewrite_query_collect_requests_with_dialect(query, backend.dialect())?;
     let mut seen_requests = BTreeSet::new();
     for request in requests {
         if should_fallback_to_phase1_query(&request) {
@@ -52,13 +59,20 @@ pub async fn rewrite_query_with_backend(
 }
 
 fn rewrite_query_collect_requests(
+    query: Query,
+) -> Result<(Option<Query>, Vec<HistoryPushdown>), LixError> {
+    rewrite_query_collect_requests_with_dialect(query, SqlDialect::Sqlite)
+}
+
+fn rewrite_query_collect_requests_with_dialect(
     mut query: Query,
+    dialect: SqlDialect,
 ) -> Result<(Option<Query>, Vec<HistoryPushdown>), LixError> {
     normalize_query_placeholders(&mut query, &mut PlaceholderOrdinalState::new())?;
 
     let mut requests = Vec::new();
     let rewritten = rewrite_query_with_select_rewriter(query, &mut |select, changed| {
-        rewrite_select(select, changed, &mut requests)
+        rewrite_select(select, changed, &mut requests, dialect)
     })?;
     Ok((rewritten, requests))
 }
@@ -67,6 +81,7 @@ fn rewrite_select(
     select: &mut Select,
     changed: &mut bool,
     requests: &mut Vec<HistoryPushdown>,
+    dialect: SqlDialect,
 ) -> Result<(), LixError> {
     let count_fast_path = select_supports_count_fast_path(select);
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
@@ -78,6 +93,7 @@ fn rewrite_select(
             count_fast_path,
             changed,
             requests,
+            dialect,
         )?;
     }
     Ok(())
@@ -90,6 +106,7 @@ fn rewrite_table_with_joins(
     count_fast_path: bool,
     changed: &mut bool,
     requests: &mut Vec<HistoryPushdown>,
+    dialect: SqlDialect,
 ) -> Result<(), LixError> {
     rewrite_table_factor(
         &mut table.relation,
@@ -98,6 +115,7 @@ fn rewrite_table_with_joins(
         count_fast_path,
         changed,
         requests,
+        dialect,
     )?;
     for join in &mut table.joins {
         rewrite_table_factor(
@@ -107,6 +125,7 @@ fn rewrite_table_with_joins(
             false,
             changed,
             requests,
+            dialect,
         )?;
     }
     Ok(())
@@ -119,17 +138,32 @@ fn rewrite_table_factor(
     count_fast_path: bool,
     changed: &mut bool,
     requests: &mut Vec<HistoryPushdown>,
+    dialect: SqlDialect,
 ) -> Result<(), LixError> {
     match relation {
-        TableFactor::Table { name, alias, .. }
-            if object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME) =>
-        {
+        TableFactor::Table { name, alias, .. } => {
+            let view_variant = if object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME) {
+                Some(HistoryViewVariant::Active)
+            } else if object_name_matches(name, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME) {
+                Some(HistoryViewVariant::ByVersion)
+            } else {
+                None
+            };
+            let Some(view_variant) = view_variant else {
+                return Ok(());
+            };
             let relation_name = alias
                 .as_ref()
                 .map(|value| value.name.value.clone())
-                .unwrap_or_else(|| LIX_STATE_HISTORY_VIEW_NAME.to_string());
-            let pushdown =
+                .unwrap_or_else(|| match view_variant {
+                    HistoryViewVariant::Active => LIX_STATE_HISTORY_VIEW_NAME.to_string(),
+                    HistoryViewVariant::ByVersion => {
+                        LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME.to_string()
+                    }
+                });
+            let mut pushdown =
                 take_history_pushdown_predicates(selection, &relation_name, allow_unqualified);
+            pushdown.view_variant = view_variant;
             let derived_query = build_lix_state_history_view_query(
                 &pushdown,
                 count_fast_path && selection.is_none(),
@@ -137,7 +171,7 @@ fn rewrite_table_factor(
             requests.push(pushdown.clone());
             let derived_alias = alias
                 .clone()
-                .or_else(|| Some(default_lix_state_history_alias()));
+                .or_else(|| Some(default_lix_state_history_alias(view_variant)));
             *relation = TableFactor::Derived {
                 lateral: false,
                 subquery: Box::new(derived_query),
@@ -155,6 +189,7 @@ fn rewrite_table_factor(
                 count_fast_path,
                 changed,
                 requests,
+                dialect,
             )?;
         }
         _ => {}
@@ -167,6 +202,16 @@ struct HistoryPushdown {
     change_predicates: Vec<String>,
     requested_predicates: Vec<String>,
     cse_predicates: Vec<String>,
+    has_root_predicate: bool,
+    has_version_predicate: bool,
+    view_variant: HistoryViewVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HistoryViewVariant {
+    #[default]
+    Active,
+    ByVersion,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -177,7 +222,11 @@ enum HistoryPushdownBucket {
 }
 
 enum ExtractedPredicate {
-    Push(HistoryPushdownBucket, String),
+    Push {
+        bucket: HistoryPushdownBucket,
+        sql: String,
+        source_column: &'static str,
+    },
     Drop,
 }
 
@@ -209,11 +258,22 @@ fn take_history_pushdown_predicates(
     let mut remaining = Vec::new();
     for part in parts {
         match part.extracted {
-            Some(ExtractedPredicate::Push(bucket, sql)) => match bucket {
-                HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
-                HistoryPushdownBucket::Requested => pushdown.requested_predicates.push(sql),
-                HistoryPushdownBucket::Cse => pushdown.cse_predicates.push(sql),
-            },
+            Some(ExtractedPredicate::Push {
+                bucket,
+                sql,
+                source_column,
+            }) => {
+                if source_column == "root_commit_id" {
+                    pushdown.has_root_predicate = true;
+                } else if source_column == "version_id" {
+                    pushdown.has_version_predicate = true;
+                }
+                match bucket {
+                    HistoryPushdownBucket::Change => pushdown.change_predicates.push(sql),
+                    HistoryPushdownBucket::Requested => pushdown.requested_predicates.push(sql),
+                    HistoryPushdownBucket::Cse => pushdown.cse_predicates.push(sql),
+                }
+            }
             Some(ExtractedPredicate::Drop) => {}
             _ => remaining.push(part.predicate),
         }
@@ -280,38 +340,51 @@ fn extract_binary_pushdown(
 ) -> Option<ExtractedPredicate> {
     let op_sql = operator.to_string();
     match column {
-        "schema_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.schema_key {op_sql} {rhs}"),
-        )),
-        "entity_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.entity_id {op_sql} {rhs}"),
-        )),
-        "file_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.file_id {op_sql} {rhs}"),
-        )),
-        "plugin_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.plugin_key {op_sql} {rhs}"),
-        )),
-        "change_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.change_id {op_sql} {rhs}"),
-        )),
-        "root_commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Requested,
-            format!("c.id {op_sql} {rhs}"),
-        )),
-        "commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_id {op_sql} {rhs}"),
-        )),
-        "depth" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_depth {op_sql} {rhs}"),
-        )),
+        "schema_key" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.schema_key {op_sql} {rhs}"),
+            source_column: "schema_key",
+        }),
+        "entity_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.entity_id {op_sql} {rhs}"),
+            source_column: "entity_id",
+        }),
+        "file_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.file_id {op_sql} {rhs}"),
+            source_column: "file_id",
+        }),
+        "plugin_key" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.plugin_key {op_sql} {rhs}"),
+            source_column: "plugin_key",
+        }),
+        "change_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.change_id {op_sql} {rhs}"),
+            source_column: "change_id",
+        }),
+        "version_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Requested,
+            sql: format!("d.root_version_id {op_sql} {rhs}"),
+            source_column: "version_id",
+        }),
+        "root_commit_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Requested,
+            sql: format!("c.id {op_sql} {rhs}"),
+            source_column: "root_commit_id",
+        }),
+        "commit_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Cse,
+            sql: format!("rc.commit_id {op_sql} {rhs}"),
+            source_column: "commit_id",
+        }),
+        "depth" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Cse,
+            sql: format!("rc.commit_depth {op_sql} {rhs}"),
+            source_column: "depth",
+        }),
         _ => None,
     }
 }
@@ -319,76 +392,102 @@ fn extract_binary_pushdown(
 fn extract_in_list_pushdown(column: &str, list: &[Expr]) -> Option<ExtractedPredicate> {
     let list_sql = render_in_list_sql(list);
     match column {
-        "schema_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.schema_key IN ({list_sql})"),
-        )),
-        "entity_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.entity_id IN ({list_sql})"),
-        )),
-        "file_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.file_id IN ({list_sql})"),
-        )),
-        "plugin_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.plugin_key IN ({list_sql})"),
-        )),
-        "change_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.change_id IN ({list_sql})"),
-        )),
-        "root_commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Requested,
-            format!("c.id IN ({list_sql})"),
-        )),
-        "commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_id IN ({list_sql})"),
-        )),
-        "depth" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_depth IN ({list_sql})"),
-        )),
+        "schema_key" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.schema_key IN ({list_sql})"),
+            source_column: "schema_key",
+        }),
+        "entity_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.entity_id IN ({list_sql})"),
+            source_column: "entity_id",
+        }),
+        "file_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.file_id IN ({list_sql})"),
+            source_column: "file_id",
+        }),
+        "plugin_key" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.plugin_key IN ({list_sql})"),
+            source_column: "plugin_key",
+        }),
+        "change_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.change_id IN ({list_sql})"),
+            source_column: "change_id",
+        }),
+        "version_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Requested,
+            sql: format!("d.root_version_id IN ({list_sql})"),
+            source_column: "version_id",
+        }),
+        "root_commit_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Requested,
+            sql: format!("c.id IN ({list_sql})"),
+            source_column: "root_commit_id",
+        }),
+        "commit_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Cse,
+            sql: format!("rc.commit_id IN ({list_sql})"),
+            source_column: "commit_id",
+        }),
+        "depth" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Cse,
+            sql: format!("rc.commit_depth IN ({list_sql})"),
+            source_column: "depth",
+        }),
         _ => None,
     }
 }
 
 fn extract_in_subquery_pushdown(column: &str, subquery: &Query) -> Option<ExtractedPredicate> {
     match column {
-        "schema_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.schema_key IN ({subquery})"),
-        )),
-        "entity_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.entity_id IN ({subquery})"),
-        )),
-        "file_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.file_id IN ({subquery})"),
-        )),
-        "plugin_key" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.plugin_key IN ({subquery})"),
-        )),
-        "change_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Change,
-            format!("bp.change_id IN ({subquery})"),
-        )),
-        "root_commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Requested,
-            format!("c.id IN ({subquery})"),
-        )),
-        "commit_id" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_id IN ({subquery})"),
-        )),
-        "depth" => Some(ExtractedPredicate::Push(
-            HistoryPushdownBucket::Cse,
-            format!("rc.commit_depth IN ({subquery})"),
-        )),
+        "schema_key" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.schema_key IN ({subquery})"),
+            source_column: "schema_key",
+        }),
+        "entity_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.entity_id IN ({subquery})"),
+            source_column: "entity_id",
+        }),
+        "file_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.file_id IN ({subquery})"),
+            source_column: "file_id",
+        }),
+        "plugin_key" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.plugin_key IN ({subquery})"),
+            source_column: "plugin_key",
+        }),
+        "change_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Change,
+            sql: format!("bp.change_id IN ({subquery})"),
+            source_column: "change_id",
+        }),
+        "version_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Requested,
+            sql: format!("d.root_version_id IN ({subquery})"),
+            source_column: "version_id",
+        }),
+        "root_commit_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Requested,
+            sql: format!("c.id IN ({subquery})"),
+            source_column: "root_commit_id",
+        }),
+        "commit_id" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Cse,
+            sql: format!("rc.commit_id IN ({subquery})"),
+            source_column: "commit_id",
+        }),
+        "depth" => Some(ExtractedPredicate::Push {
+            bucket: HistoryPushdownBucket::Cse,
+            sql: format!("rc.commit_depth IN ({subquery})"),
+            source_column: "depth",
+        }),
         _ => None,
     }
 }
@@ -460,6 +559,7 @@ fn normalize_history_column(raw: &str) -> Option<String> {
         "schema_key" | "lixcol_schema_key" => Some("schema_key".to_string()),
         "file_id" | "lixcol_file_id" => Some("file_id".to_string()),
         "plugin_key" | "lixcol_plugin_key" => Some("plugin_key".to_string()),
+        "version_id" | "lixcol_version_id" => Some("version_id".to_string()),
         "change_id" | "lixcol_change_id" => Some("change_id".to_string()),
         "commit_id" | "lixcol_commit_id" => Some("commit_id".to_string()),
         "commit_created_at" => Some("commit_created_at".to_string()),
@@ -493,11 +593,18 @@ fn build_lix_state_history_view_query(
         return build_lix_state_history_view_query_phase1(pushdown, count_fast_path);
     }
 
-    let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
-    requested_predicates.extend(pushdown.requested_predicates.clone());
+    let mut requested_predicates = build_requested_predicates(pushdown);
     let reachable_where_sql = render_where_clause(&pushdown.cse_predicates);
     let breakpoint_where_sql = render_where_clause(&pushdown.change_predicates);
+    if !pushdown.has_root_predicate {
+        requested_predicates
+            .push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
+    }
     let requested_where_sql = render_where_clause(&requested_predicates);
+
+    let active_version_rows_cte_sql = active_version_rows_cte_sql(pushdown.view_variant);
+    let default_root_commits_cte_sql = default_root_commits_cte_sql(pushdown.view_variant);
+    let commit_by_version_scope_where = commit_by_version_scope_where_sql(pushdown.view_variant);
 
     let final_select_sql = if count_fast_path {
         "SELECT COUNT(*) AS count \
@@ -519,17 +626,18 @@ fn build_lix_state_history_view_query(
                h.commit_created_at AS commit_created_at, \
                h.root_commit_id AS root_commit_id, \
                h.depth AS depth, \
-               '{global_version}' AS version_id \
+               h.root_version_id AS version_id \
              FROM history_rows h \
              LEFT JOIN lix_internal_snapshot s \
                ON s.id = h.snapshot_id \
-             WHERE h.snapshot_id != 'no-content'",
-            global_version = GLOBAL_VERSION_ID
+             WHERE h.snapshot_id != 'no-content'"
         )
     };
 
     let sql = format!(
         "WITH \
+           {active_version_rows_cte_sql}\
+           {default_root_commits_cte_sql}\
            commit_by_version AS ( \
              SELECT \
                entity_id AS id, \
@@ -539,18 +647,24 @@ fn build_lix_state_history_view_query(
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
+               {commit_by_version_scope_where} \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
            requested_commits AS ( \
-             SELECT DISTINCT c.id AS commit_id \
+             SELECT DISTINCT \
+               c.id AS commit_id, \
+               COALESCE(d.root_version_id, c.lixcol_version_id) AS root_version_id \
              FROM commit_by_version c \
+             LEFT JOIN default_root_commits d \
+               ON d.root_commit_id = c.id \
              {requested_where_sql} \
            ), \
            reachable_commits AS ( \
              SELECT \
                ancestry.ancestor_id AS commit_id, \
                requested.commit_id AS root_commit_id, \
+               requested.root_version_id AS root_version_id, \
                ancestry.depth AS commit_depth \
              FROM requested_commits requested \
              JOIN lix_internal_commit_ancestry ancestry \
@@ -561,6 +675,7 @@ fn build_lix_state_history_view_query(
              SELECT \
                rc.commit_id, \
                rc.root_commit_id, \
+               rc.root_version_id, \
                rc.commit_depth, \
                c.created_at AS commit_created_at \
              FROM reachable_commits rc \
@@ -598,6 +713,7 @@ fn build_lix_state_history_view_query(
                rc.commit_id AS commit_id, \
                rc.commit_created_at AS commit_created_at, \
                rc.root_commit_id AS root_commit_id, \
+               rc.root_version_id AS root_version_id, \
                rc.commit_depth AS depth \
              FROM filtered_reachable_commits rc \
              JOIN breakpoint_rows bp \
@@ -611,8 +727,81 @@ fn build_lix_state_history_view_query(
         reachable_where_sql = reachable_where_sql,
         breakpoint_where_sql = breakpoint_where_sql,
         final_select_sql = final_select_sql,
+        active_version_rows_cte_sql = active_version_rows_cte_sql,
+        default_root_commits_cte_sql = default_root_commits_cte_sql,
+        commit_by_version_scope_where = commit_by_version_scope_where,
     );
     parse_single_query(&sql)
+}
+
+fn build_requested_predicates(pushdown: &HistoryPushdown) -> Vec<String> {
+    let mut requested_predicates = Vec::new();
+    requested_predicates.extend(pushdown.requested_predicates.clone());
+    requested_predicates
+}
+
+fn active_version_rows_cte_sql(view_variant: HistoryViewVariant) -> String {
+    match view_variant {
+        HistoryViewVariant::Active => format!(
+            "active_version_rows AS ( \
+               SELECT DISTINCT \
+                 lix_json_extract(snapshot_content, 'version_id') AS version_id \
+               FROM lix_internal_state_untracked \
+               WHERE schema_key = '{schema_key}' \
+                 AND file_id = '{file_id}' \
+                 AND version_id = '{storage_version_id}' \
+                 AND snapshot_content IS NOT NULL \
+             ), ",
+            schema_key = escape_sql_string(active_version_schema_key()),
+            file_id = escape_sql_string(active_version_file_id()),
+            storage_version_id = escape_sql_string(active_version_storage_version_id()),
+        ),
+        HistoryViewVariant::ByVersion => String::new(),
+    }
+}
+
+fn default_root_commits_cte_sql(view_variant: HistoryViewVariant) -> String {
+    match view_variant {
+        HistoryViewVariant::Active => format!(
+            "default_root_commits AS ( \
+               SELECT DISTINCT \
+                 lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+                 vp.version_id AS root_version_id \
+               FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+               JOIN active_version_rows av \
+                 ON av.version_id = vp.entity_id \
+               WHERE vp.schema_key = '{schema_key}' \
+                 AND vp.file_id = '{file_id}' \
+                 AND vp.version_id = '{storage_version_id}' \
+                 AND vp.is_tombstone = 0 \
+                 AND vp.snapshot_content IS NOT NULL \
+             ), ",
+            schema_key = escape_sql_string(version_pointer_schema_key()),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            storage_version_id = escape_sql_string(version_pointer_storage_version_id()),
+        ),
+        HistoryViewVariant::ByVersion => format!(
+            "default_root_commits AS ( \
+               SELECT DISTINCT \
+                 lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+                 vp.entity_id AS root_version_id \
+               FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+               WHERE vp.schema_key = '{schema_key}' \
+                 AND vp.file_id = '{file_id}' \
+                 AND vp.version_id = '{storage_version_id}' \
+                 AND vp.is_tombstone = 0 \
+                 AND vp.snapshot_content IS NOT NULL \
+             ), ",
+            schema_key = escape_sql_string(version_pointer_schema_key()),
+            file_id = escape_sql_string(version_pointer_file_id()),
+            storage_version_id = escape_sql_string(version_pointer_storage_version_id()),
+        ),
+    }
+}
+
+fn commit_by_version_scope_where_sql(view_variant: HistoryViewVariant) -> String {
+    let _ = view_variant;
+    String::new()
 }
 
 fn should_fallback_to_phase1_query(pushdown: &HistoryPushdown) -> bool {
@@ -638,8 +827,11 @@ fn build_lix_state_history_view_query_phase1(
             .collect::<Result<Vec<_>, _>>()?,
     );
 
-    let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
-    requested_predicates.extend(pushdown.requested_predicates.clone());
+    let mut requested_predicates = build_requested_predicates(pushdown);
+    if !pushdown.has_root_predicate {
+        requested_predicates
+            .push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
+    }
 
     let mut cse_predicates = vec![format!("cse_raw.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
     cse_predicates.extend(pushdown.cse_predicates.iter().map(|predicate| {
@@ -692,6 +884,7 @@ fn build_lix_state_history_view_query_phase1(
            r.origin_commit_id, \
            r.commit_created_at, \
            r.root_commit_id, \
+           r.root_version_id, \
            r.commit_depth, \
            ROW_NUMBER() OVER ( \
              PARTITION BY \
@@ -721,6 +914,7 @@ fn build_lix_state_history_view_query_phase1(
            r.origin_commit_id AS origin_commit_id, \
            r.commit_created_at AS commit_created_at, \
            r.root_commit_id AS root_commit_id, \
+           r.root_version_id AS root_version_id, \
            r.commit_depth AS commit_depth, \
            ROW_NUMBER() OVER ( \
              PARTITION BY \
@@ -759,16 +953,21 @@ fn build_lix_state_history_view_query_phase1(
                ranked.commit_created_at AS commit_created_at, \
                ranked.root_commit_id AS root_commit_id, \
                ranked.commit_depth AS depth, \
-               '{global_version}' AS version_id \
+               ranked.root_version_id AS version_id \
              FROM ranked_cse ranked \
              WHERE ranked.rn = 1 \
-               AND ranked.snapshot_content IS NOT NULL",
-            global_version = GLOBAL_VERSION_ID
+               AND ranked.snapshot_content IS NOT NULL"
         )
     };
 
+    let active_version_rows_cte_sql = active_version_rows_cte_sql(pushdown.view_variant);
+    let default_root_commits_cte_sql = default_root_commits_cte_sql(pushdown.view_variant);
+    let commit_by_version_scope_where = commit_by_version_scope_where_sql(pushdown.view_variant);
+
     let sql = format!(
         "WITH \
+           {active_version_rows_cte_sql}\
+           {default_root_commits_cte_sql}\
            commit_by_version AS ( \
              SELECT \
                entity_id AS id, \
@@ -778,6 +977,7 @@ fn build_lix_state_history_view_query_phase1(
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
+               {commit_by_version_scope_where} \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
@@ -799,14 +999,19 @@ fn build_lix_state_history_view_query_phase1(
              {all_changes_sql} \
            ), \
            requested_commits AS ( \
-             SELECT DISTINCT c.id AS commit_id \
+             SELECT DISTINCT \
+               c.id AS commit_id, \
+               COALESCE(d.root_version_id, c.lixcol_version_id) AS root_version_id \
              FROM commit_by_version c \
+             LEFT JOIN default_root_commits d \
+               ON d.root_commit_id = c.id \
              {requested_where_sql} \
            ), \
-           reachable_commits_from_requested(id, root_commit_id, depth) AS ( \
+           reachable_commits_from_requested(id, root_commit_id, root_version_id, depth) AS ( \
              SELECT \
                ancestry.ancestor_id AS id, \
                requested.commit_id AS root_commit_id, \
+               requested.root_version_id AS root_version_id, \
                ancestry.depth AS depth \
              FROM requested_commits requested \
              JOIN lix_internal_commit_ancestry ancestry \
@@ -819,10 +1024,10 @@ fn build_lix_state_history_view_query_phase1(
                c.change_set_id AS change_set_id, \
                c.commit_created_at AS commit_created_at, \
                rc.root_commit_id, \
+               rc.root_version_id, \
                rc.depth AS commit_depth \
              FROM commit_by_version c \
              JOIN reachable_commits_from_requested rc ON c.id = rc.id \
-             WHERE c.lixcol_version_id = '{global_version}' \
            ), \
            cse_in_reachable_commits AS ( \
              SELECT \
@@ -833,6 +1038,7 @@ fn build_lix_state_history_view_query_phase1(
                cc_raw.commit_id AS origin_commit_id, \
                cc_raw.commit_created_at AS commit_created_at, \
                cc_raw.root_commit_id AS root_commit_id, \
+               cc_raw.root_version_id AS root_version_id, \
                cc_raw.commit_depth AS commit_depth \
              FROM change_set_element_by_version cse_raw \
              JOIN commit_changesets cc_raw \
@@ -850,6 +1056,9 @@ fn build_lix_state_history_view_query_phase1(
         cse_where_sql = cse_where_sql,
         ranked_select_sql = ranked_select_sql,
         final_select_sql = final_select_sql,
+        active_version_rows_cte_sql = active_version_rows_cte_sql,
+        default_root_commits_cte_sql = default_root_commits_cte_sql,
+        commit_by_version_scope_where = commit_by_version_scope_where,
     );
     parse_single_query(&sql)
 }
@@ -930,27 +1139,43 @@ async fn resolve_requested_root_commits(
     pushdown: &HistoryPushdown,
     params: &[Value],
 ) -> Result<Vec<String>, LixError> {
-    let mut requested_predicates = vec![format!("c.lixcol_version_id = '{GLOBAL_VERSION_ID}'",)];
-    requested_predicates.extend(pushdown.requested_predicates.clone());
+    let mut requested_predicates = build_requested_predicates(pushdown);
+    if !pushdown.has_root_predicate {
+        requested_predicates
+            .push("c.id IN (SELECT root_commit_id FROM default_root_commits)".to_string());
+    }
     let requested_where_sql = render_where_clause(&requested_predicates);
+    let active_version_rows_cte_sql = active_version_rows_cte_sql(pushdown.view_variant);
+    let default_root_commits_cte_sql = default_root_commits_cte_sql(pushdown.view_variant);
+    let commit_by_version_scope_where = commit_by_version_scope_where_sql(pushdown.view_variant);
     let sql = format!(
-        "WITH commit_by_version AS ( \
-           SELECT \
-             entity_id AS id, \
-             version_id AS lixcol_version_id \
-           FROM lix_internal_state_materialized_v1_lix_commit \
-           WHERE schema_key = 'lix_commit' \
-             AND version_id = '{global_version}' \
-             AND is_tombstone = 0 \
-             AND snapshot_content IS NOT NULL \
-         ) \
+        "WITH \
+           {active_version_rows_cte_sql}\
+           {default_root_commits_cte_sql}\
+           commit_by_version AS ( \
+             SELECT \
+               entity_id AS id, \
+               version_id AS lixcol_version_id \
+             FROM lix_internal_state_materialized_v1_lix_commit \
+             WHERE schema_key = 'lix_commit' \
+               AND version_id = '{global_version}' \
+               {commit_by_version_scope_where} \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ) \
          SELECT DISTINCT c.id \
          FROM commit_by_version c \
+         LEFT JOIN default_root_commits d \
+           ON d.root_commit_id = c.id \
          {requested_where}",
         global_version = GLOBAL_VERSION_ID,
+        active_version_rows_cte_sql = active_version_rows_cte_sql,
+        default_root_commits_cte_sql = default_root_commits_cte_sql,
+        commit_by_version_scope_where = commit_by_version_scope_where,
         requested_where = requested_where_sql,
     );
-    let bound = bind_sql(&sql, params, backend.dialect())?;
+    let lowered_sql = lower_single_statement_sql(&sql, backend.dialect())?;
+    let bound = bind_sql(&lowered_sql, params, backend.dialect())?;
     let rows = backend.execute(&bound.sql, &bound.params).await?;
     let mut roots = BTreeSet::new();
     for row in &rows.rows {
@@ -959,6 +1184,21 @@ async fn resolve_requested_root_commits(
         }
     }
     Ok(roots.into_iter().collect())
+}
+
+fn lower_single_statement_sql(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
+    let mut statements = parse_sql_statements(sql)?;
+    if statements.len() != 1 {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "expected exactly one statement for lowering, got {}",
+                statements.len()
+            ),
+        });
+    }
+    let lowered = lower_statement(statements.remove(0), dialect)?;
+    Ok(lowered.to_string())
 }
 
 async fn ensure_history_timeline_materialized_for_root(
@@ -1399,8 +1639,12 @@ fn integer_from_value(value: &Value) -> Option<i64> {
     }
 }
 
-fn default_lix_state_history_alias() -> sqlparser::ast::TableAlias {
-    default_alias(LIX_STATE_HISTORY_VIEW_NAME)
+fn default_lix_state_history_alias(view_variant: HistoryViewVariant) -> sqlparser::ast::TableAlias {
+    let view_name = match view_variant {
+        HistoryViewVariant::Active => LIX_STATE_HISTORY_VIEW_NAME,
+        HistoryViewVariant::ByVersion => LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME,
+    };
+    default_alias(view_name)
 }
 
 #[cfg(test)]

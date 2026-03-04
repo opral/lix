@@ -4,6 +4,7 @@ use crate::engine::sql::planning::rewrite_engine::object_name_matches;
 use crate::{errors, LixError};
 
 const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
+const LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME: &str = "lix_state_history_by_version";
 
 pub fn reject_insert(insert: &Insert) -> Result<(), LixError> {
     if table_object_is_lix_state_history(&insert.table) {
@@ -32,7 +33,10 @@ fn read_only_error(operation: &str) -> LixError {
 
 fn table_object_is_lix_state_history(table: &TableObject) -> bool {
     match table {
-        TableObject::TableName(name) => object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME),
+        TableObject::TableName(name) => {
+            object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME)
+                || object_name_matches(name, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME)
+        }
         _ => false,
     }
 }
@@ -42,6 +46,7 @@ fn table_with_joins_is_lix_state_history(table: &sqlparser::ast::TableWithJoins)
         && matches!(
             &table.relation,
             TableFactor::Table { name, .. } if object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME)
+                || object_name_matches(name, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME)
         )
 }
 

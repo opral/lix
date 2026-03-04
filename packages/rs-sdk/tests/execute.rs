@@ -35,16 +35,33 @@ fn select_works_with_default_in_memory_sqlite() {
 }
 
 #[test]
-fn open_lix_initializes_core_tables() {
+fn open_lix_does_not_initialize_core_tables() {
     run_async_with_large_stack(|| async {
         let lix = open_lix(OpenLixConfig::default())
             .await
             .expect("open_lix should succeed");
 
+        let error = lix
+            .execute("SELECT COUNT(*) FROM lix_active_version", &[])
+            .await
+            .expect_err("open_lix should not auto-initialize core tables");
+        assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
+    });
+}
+
+#[test]
+fn explicit_init_initializes_core_tables() {
+    run_async_with_large_stack(|| async {
+        let lix = open_lix(OpenLixConfig::default())
+            .await
+            .expect("open_lix should succeed");
+
+        lix.init().await.expect("explicit init should succeed");
+
         let result = lix
             .execute("SELECT COUNT(*) FROM lix_active_version", &[])
             .await
-            .expect("init should create and expose active version");
+            .expect("explicit init should create and expose active version");
 
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], Value::Integer(1));

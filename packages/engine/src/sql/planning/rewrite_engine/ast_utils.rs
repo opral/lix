@@ -286,7 +286,7 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use crate::engine::sql::planning::rewrite_engine::{
+    use super::{
         default_alias, object_name_matches, parse_single_query, rewrite_query_selects,
         rewrite_table_factors_in_select_decision, visit_query_selects,
         visit_table_factors_in_select, RewriteDecision,

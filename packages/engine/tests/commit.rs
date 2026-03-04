@@ -516,3 +516,96 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    explicit_begin_commit_with_multiple_key_value_inserts_creates_single_commit_with_both_changes,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+
+        let before_commit_count = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_commit'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let before_commit_count = as_i64(&before_commit_count.rows[0][0]);
+
+        engine
+            .execute(
+                "BEGIN; \
+                 INSERT INTO lix_key_value (key, value) VALUES ('tx-kv-a', 'value-a'); \
+                 INSERT INTO lix_key_value (key, value) VALUES ('tx-kv-b', 'value-b'); \
+                 COMMIT;",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let values = engine
+            .execute(
+                "SELECT key, value \
+                 FROM lix_key_value \
+                 WHERE key IN ('tx-kv-a', 'tx-kv-b') \
+                 ORDER BY key",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(values.rows.len(), 2);
+        assert_eq!(
+            values.rows[0],
+            vec![
+                Value::Text("tx-kv-a".to_string()),
+                Value::Text("value-a".to_string())
+            ]
+        );
+        assert_eq!(
+            values.rows[1],
+            vec![
+                Value::Text("tx-kv-b".to_string()),
+                Value::Text("value-b".to_string())
+            ]
+        );
+
+        let after_commit_count = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'lix_commit'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let after_commit_count = as_i64(&after_commit_count.rows[0][0]);
+        assert_eq!(after_commit_count, before_commit_count + 1);
+
+        let domain_changes = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_internal_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id IN ('tx-kv-a', 'tx-kv-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(domain_changes.rows.len(), 2);
+        let domain_change_ids = domain_changes
+            .rows
+            .iter()
+            .map(|row| as_text(&row[0]))
+            .collect::<BTreeSet<_>>();
+
+        let matching_change_set_ids =
+            matching_commit_change_set_ids(&engine, &domain_change_ids).await;
+        assert_eq!(matching_change_set_ids.len(), 1);
+    }
+);

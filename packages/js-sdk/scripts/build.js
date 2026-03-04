@@ -86,9 +86,9 @@ async function copySqliteWasmAsset() {
 
 async function main() {
 	await syncBuiltinSchemas();
+	await buildEngineWasm();
 	await buildTypescriptDist();
 	await copySqliteWasmAsset();
-	await buildEngineWasm();
 }
 
 main().catch((error) => {

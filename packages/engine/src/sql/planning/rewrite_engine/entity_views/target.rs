@@ -14,6 +14,7 @@ const RESERVED_VIEW_NAMES: &[&str] = &[
     "lix_state",
     "lix_state_by_version",
     "lix_state_history",
+    "lix_state_history_by_version",
     "lix_version",
     "lix_active_version",
     "lix_active_account",

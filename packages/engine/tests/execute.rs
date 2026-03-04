@@ -1,6 +1,6 @@
 mod support;
 
-use lix_engine::Value;
+use lix_engine::{ExecuteOptions, Value};
 use support::simulation_test::SimulationBootArgs;
 
 simulation_test!(select_works, |sim| async move {
@@ -72,28 +72,44 @@ simulation_test!(
 );
 
 simulation_test!(
-    sqlite_master_query_returns_table_not_found,
+    sqlite_master_query_is_allowed,
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
 
-        let error = engine
-            .execute(
-                "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name",
-                &[],
-            )
+        let result = engine
+            .execute("SELECT name FROM sqlite_master ORDER BY name LIMIT 1", &[])
             .await
-            .expect_err("sqlite_master read should be rejected");
+            .expect("sqlite_master read should succeed");
 
-        assert_eq!(error.code, "LIX_ERROR_TABLE_NOT_FOUND");
+        assert!(
+            result.columns.iter().any(|column| column == "name"),
+            "sqlite_master query should return the name column"
+        );
     }
 );
 
+simulation_test!(internal_table_read_is_allowed, |sim| async move {
+    let mut boot_args = SimulationBootArgs::default();
+    boot_args.access_to_internal = false;
+    let engine = sim
+        .boot_simulated_engine(Some(boot_args))
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.expect("init should succeed");
+
+    engine
+        .execute("SELECT COUNT(*) FROM lix_internal_state_untracked", &[])
+        .await
+        .expect("internal table read should be allowed");
+});
+
 simulation_test!(
-    internal_table_read_returns_access_denied,
+    internal_table_write_returns_access_denied,
     |sim| async move {
         let mut boot_args = SimulationBootArgs::default();
         boot_args.access_to_internal = false;
@@ -101,12 +117,46 @@ simulation_test!(
             .boot_simulated_engine(Some(boot_args))
             .await
             .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
 
         let error = engine
-            .execute("SELECT * FROM lix_internal_state_vtable", &[])
+            .execute(
+                "UPDATE lix_internal_state_untracked SET snapshot_content = '{}' WHERE 1 = 0",
+                &[],
+            )
             .await
-            .expect_err("internal table read should be rejected");
+            .expect_err("internal table write should be rejected");
 
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
+        assert!(error
+            .description
+            .contains("Direct writes to `lix_internal_*` tables can lead to data corruption."));
+    }
+);
+
+simulation_test!(
+    internal_table_write_in_transaction_returns_access_denied,
+    |sim| async move {
+        let mut boot_args = SimulationBootArgs::default();
+        boot_args.access_to_internal = false;
+        let engine = sim
+            .boot_simulated_engine(Some(boot_args))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("init should succeed");
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin transaction should succeed");
+        let error = tx
+            .execute(
+                "UPDATE lix_internal_state_untracked SET snapshot_content = '{}' WHERE 1 = 0",
+                &[],
+            )
+            .await
+            .expect_err("internal table write in transaction should be rejected");
+        assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
+        tx.rollback().await.expect("rollback should succeed");
     }
 );
