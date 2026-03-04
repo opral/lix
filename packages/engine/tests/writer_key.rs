@@ -31,8 +31,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected active version id as text, got {other:?}"),
     }
@@ -49,9 +49,7 @@ simulation_test!(
         engine.init().await.unwrap();
         engine
             .execute(
-                "SELECT writer_key FROM lix_internal_state_materialized_v1_lix_file_descriptor LIMIT 0",
-                &[],
-            )
+                "SELECT writer_key FROM lix_internal_state_materialized_v1_lix_file_descriptor LIMIT 0", &[])
             .await
             .unwrap();
 
@@ -73,8 +71,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(file_row.rows.len(), 1);
-        assert_text(&file_row.rows[0][0], "editor:single");
+        assert_eq!(file_row.statements[0].rows.len(), 1);
+        assert_text(&file_row.statements[0].rows[0][0], "editor:single");
 
         let version_id = active_version_id(&engine).await;
         let state_row = engine
@@ -90,8 +88,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(state_row.rows.len(), 1);
-        assert_text(&state_row.rows[0][0], "editor:single");
+        assert_eq!(state_row.statements[0].rows.len(), 1);
+        assert_text(&state_row.statements[0].rows[0][0], "editor:single");
     }
 );
 
@@ -145,11 +143,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows.len(), 2);
-        assert_text(&rows.rows[0][0], "wk-tx-1");
-        assert_text(&rows.rows[0][1], "editor:tx");
-        assert_text(&rows.rows[1][0], "wk-tx-2");
-        assert_text(&rows.rows[1][1], "editor:tx");
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(&rows.statements[0].rows[0][0], "wk-tx-1");
+        assert_text(&rows.statements[0].rows[0][1], "editor:tx");
+        assert_text(&rows.statements[0].rows[1][0], "wk-tx-2");
+        assert_text(&rows.statements[0].rows[1][1], "editor:tx");
     }
 );
 
@@ -199,8 +197,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(state_row.rows.len(), 1);
-        assert_null(&state_row.rows[0][0]);
+        assert_eq!(state_row.statements[0].rows.len(), 1);
+        assert_null(&state_row.statements[0].rows[0][0]);
     }
 );
 
@@ -244,9 +242,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tombstone.rows.len(), 1);
-        assert_null(&tombstone.rows[0][0]);
-        assert_eq!(tombstone.rows[0][1], Value::Integer(1));
+        assert_eq!(tombstone.statements[0].rows.len(), 1);
+        assert_null(&tombstone.statements[0].rows[0][0]);
+        assert_eq!(tombstone.statements[0].rows[0][1], Value::Integer(1));
     }
 );
 
@@ -290,7 +288,7 @@ simulation_test!(
             .execute("SELECT id FROM lix_file WHERE id = 'wk-rolled-back'", &[])
             .await
             .unwrap();
-        assert!(file_rows.rows.is_empty());
+        assert!(file_rows.statements[0].rows.is_empty());
     }
 );
 
@@ -337,8 +335,8 @@ simulation_test!(
             .execute("SELECT data FROM lix_file WHERE id = 'wk-tx-cache'", &[])
             .await
             .unwrap();
-        assert_eq!(file_rows.rows.len(), 1);
-        assert_blob_text(&file_rows.rows[0][0], "after");
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_blob_text(&file_rows.statements[0].rows[0][0], "after");
 
         let version_id = active_version_id(&engine).await;
         let cache_rows = engine
@@ -351,8 +349,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(cache_rows.rows.len(), 1);
-        assert_blob_text(&cache_rows.rows[0][0], "after");
+        assert_eq!(cache_rows.statements[0].rows.len(), 1);
+        assert_blob_text(&cache_rows.statements[0].rows[0][0], "after");
     }
 );
 
@@ -402,7 +400,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(state_row.rows.len(), 1);
-        assert_text(&state_row.rows[0][0], "editor:explicit-update");
+        assert_eq!(state_row.statements[0].rows.len(), 1);
+        assert_text(
+            &state_row.statements[0].rows[0][0],
+            "editor:explicit-update",
+        );
     }
 );

@@ -2,7 +2,8 @@ use crate::engine::sql::ast::utils::parse_sql_statements;
 use crate::engine::sql::planning::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
-use crate::engine::{Engine, ExecuteOptions};
+use crate::engine::Engine;
+use crate::errors;
 use crate::state_commit_stream::StateCommitStream;
 use crate::{LixError, QueryResult, Value, WireValue};
 use serde::{Deserialize, Serialize};
@@ -540,9 +541,15 @@ async fn execute_observe_query(
     engine: &Engine,
     query: &ObserveQuery,
 ) -> Result<QueryResult, LixError> {
-    engine
-        .execute(&query.sql, &query.params, ExecuteOptions::default())
-        .await
+    let result = engine.execute(&query.sql, &query.params).await?;
+    let [statement] = result.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "observe query",
+            1,
+            result.statements.len(),
+        ));
+    };
+    Ok(statement.clone())
 }
 
 impl Engine {
@@ -1001,7 +1008,7 @@ mod tests {
         );
 
         let _ = engine
-            .execute("SELECT 1", &[], ExecuteOptions::default())
+            .execute("SELECT 1", &[])
             .await
             .expect("sanity execute should succeed");
     }

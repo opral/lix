@@ -142,6 +142,10 @@ export type QueryResult = {
 	columns: string[];
 };
 
+export type ExecuteResult = {
+	statements: QueryResult[];
+};
+
 function isLixValue(value: unknown): value is LixValue {
 	if (!value || typeof value !== "object") {
 		return false;

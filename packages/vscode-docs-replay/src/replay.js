@@ -124,7 +124,7 @@ async function main() {
 
       if (statements.length > 0) {
         try {
-          await lix.executeTransaction(statements);
+          await executeStatementsInTransaction(lix, statements);
         } catch (error) {
           const payload = error && typeof error === "object" ? error.payload : undefined;
           const payloadJson =
@@ -264,7 +264,7 @@ function applyPreparedBatchToExpectedState(expectedStateById, prepared) {
 async function verifyCommitStateHashes(args) {
   const { lix, commitSha, expectedStateById } = args;
   const result = await lix.execute("SELECT id, path, data FROM lix_file", []);
-  const rows = result.rows ?? [];
+  const rows = statementRows(result);
   if (rows.length !== expectedStateById.size) {
     throw new Error(
       `state mismatch at ${commitSha}: row count differs (lix=${rows.length}, expected=${expectedStateById.size})`,
@@ -299,6 +299,18 @@ async function verifyCommitStateHashes(args) {
       `state mismatch at ${commitSha}: missing rows (lix=${seen.size}, expected=${expectedStateById.size})`,
     );
   }
+}
+
+function statementRows(result, statementIndex = 0) {
+  return result?.statements?.[statementIndex]?.rows ?? [];
+}
+
+async function executeStatementsInTransaction(lix, statements) {
+  await lix.transaction(async (tx) => {
+    for (const statement of statements) {
+      await tx.execute(statement.sql, statement.params ?? []);
+    }
+  });
 }
 
 function hashBytes(bytes) {

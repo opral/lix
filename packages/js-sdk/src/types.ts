@@ -1,15 +1,24 @@
 import type {
+	ExecuteResult as LixCanonicalExecuteResult,
 	LixValue as LixCanonicalValue,
 	QueryResult as LixCanonicalQueryResult,
 } from "./engine-wasm/index.js";
 
-export type { LixCanonicalValue, LixCanonicalQueryResult };
+export type {
+	LixCanonicalExecuteResult,
+	LixCanonicalValue,
+	LixCanonicalQueryResult,
+};
 
 export type LixRuntimeValue = null | boolean | number | string | Uint8Array;
 
 export type LixRuntimeQueryResult = {
 	rows: LixRuntimeValue[][];
 	columns: string[];
+};
+
+export type LixRuntimeExecuteResult = {
+	statements: LixRuntimeQueryResult[];
 };
 
 export type LixSqlDialect = "sqlite" | "postgres";

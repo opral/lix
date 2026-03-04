@@ -17,8 +17,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text active version id, got {other:?}"),
     }
@@ -71,12 +71,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert!(!rows.rows.is_empty());
-        assert_text(&rows.rows[0][0], "key-history");
-        assert_text(&rows.rows[0][1], "value-history");
-        assert!(matches!(rows.rows[0][2], Value::Text(_)));
-        assert!(matches!(rows.rows[0][3], Value::Integer(_)));
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert!(!rows.statements[0].rows.is_empty());
+        assert_text(&rows.statements[0].rows[0][0], "key-history");
+        assert_text(&rows.statements[0].rows[0][1], "value-history");
+        assert!(matches!(rows.statements[0].rows[0][2], Value::Text(_)));
+        assert!(matches!(rows.statements[0].rows[0][3], Value::Integer(_)));
     }
 );
 

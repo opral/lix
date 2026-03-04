@@ -34,7 +34,6 @@ fn bench_lix_state_by_version_count_eq_version(c: &mut Criterion) {
                        AND version_id = ? \
                        AND snapshot_content IS NOT NULL",
                     &params,
-                    ExecuteOptions::default(),
                 ))
                 .expect("eq version count should succeed");
             black_box(result.rows.len());
@@ -63,7 +62,6 @@ fn bench_lix_state_by_version_count_in_version_list(c: &mut Criterion) {
                        AND version_id IN (?, ?) \
                        AND snapshot_content IS NOT NULL",
                     &params,
-                    ExecuteOptions::default(),
                 ))
                 .expect("IN list version count should succeed");
             black_box(result.rows.len());
@@ -95,7 +93,6 @@ fn bench_lix_state_by_version_count_active_scope_subquery(c: &mut Criterion) {
                        ) \
                        AND snapshot_content IS NOT NULL",
                     &params,
-                    ExecuteOptions::default(),
                 ))
                 .expect("active-scope version count should succeed");
             black_box(result.rows.len());
@@ -117,7 +114,6 @@ async fn seed_engine_with_versions() -> Result<lix_engine::Engine, LixError> {
         .execute(
             "UPDATE lix_active_version SET version_id = ?",
             &[Value::Text(target_version)],
-            ExecuteOptions::default(),
         )
         .await?;
 
@@ -144,13 +140,10 @@ async fn insert_stored_schema(engine: &lix_engine::Engine) -> Result<(), LixErro
         .execute(
             "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-             ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')",
-            &[
+             ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')", &[
                 Value::Text(format!("{SCHEMA_KEY}~1")),
                 Value::Text(schema_snapshot),
-            ],
-            ExecuteOptions::default(),
-        )
+            ])
         .await?;
     Ok(())
 }
@@ -175,7 +168,6 @@ async fn insert_versions(engine: &lix_engine::Engine) -> Result<(), LixError> {
                     Value::Text(parent),
                     Value::Text(format!("commit-{version_id}")),
                 ],
-                ExecuteOptions::default(),
             )
             .await?;
     }
@@ -197,16 +189,13 @@ async fn insert_versioned_state_rows(engine: &lix_engine::Engine) -> Result<(), 
                 .execute(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                     ) VALUES (?, ?, ?, ?, 'lix', ?, '1')",
-                    &[
+                     ) VALUES (?, ?, ?, ?, 'lix', ?, '1')", &[
                         Value::Text(entity_id),
                         Value::Text(SCHEMA_KEY.to_string()),
                         Value::Text(FILE_ID.to_string()),
                         Value::Text(version_id.clone()),
                         Value::Text(snapshot),
-                    ],
-                    ExecuteOptions::default(),
-                )
+                    ])
                 .await?;
         }
     }

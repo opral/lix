@@ -300,7 +300,7 @@ async function replayCommitsToLix(args) {
     if (statements.length === 0) {
       noopCommits += 1;
     } else {
-      await lix.executeTransaction(statements);
+      await executeStatementsInTransaction(lix, statements);
       appliedCommits += 1;
     }
 
@@ -570,7 +570,7 @@ async function verifyCommitStatePaths(args) {
     "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_file_descriptor'",
     [],
   );
-  const lixPaths = (lixRows.rows ?? [])
+  const lixPaths = statementRows(lixRows)
     .map((row, index) => fromLixPath(scalarToString(row?.[0], `verify.entity_id[${index}]`)))
     .sort();
 
@@ -655,7 +655,7 @@ async function benchmarkQueries(args) {
         "SELECT path FROM lix_file WHERE path LIKE ? ORDER BY path LIMIT 100",
         [samples.prefixLixLike],
       );
-      return (result.rows ?? []).length;
+      return statementRows(result).length;
     },
     gitCommand: ["git", "-C", gitRepoPath, ...prefixGitArgs],
     gitRun: async () => {
@@ -733,7 +733,7 @@ async function benchmarkQueries(args) {
     query: "SELECT * FROM lix_file LIMIT 100",
     run: async () => {
       const result = await lix.execute("SELECT * FROM lix_file LIMIT 100", []);
-      return (result.rows ?? []).length;
+      return statementRows(result).length;
     },
   });
 
@@ -747,7 +747,7 @@ async function benchmarkQueries(args) {
       const result = await lix.execute("SELECT * FROM lix_file WHERE path = ? LIMIT 1", [
         samples.exactLixPath,
       ]);
-      return (result.rows ?? []).length;
+      return statementRows(result).length;
     },
   });
 
@@ -1068,12 +1068,24 @@ async function directorySize(path, options = {}) {
 
 async function queryScalarNumber(lix, sql, context, params = []) {
   const result = await lix.execute(sql, params);
-  return scalarToNumber(result.rows?.[0]?.[0], context);
+  return scalarToNumber(statementRows(result)?.[0]?.[0], context);
 }
 
 async function queryScalarText(lix, sql, context, params = []) {
   const result = await lix.execute(sql, params);
-  return scalarToString(result.rows?.[0]?.[0], context);
+  return scalarToString(statementRows(result)?.[0]?.[0], context);
+}
+
+function statementRows(result, statementIndex = 0) {
+  return result?.statements?.[statementIndex]?.rows ?? [];
+}
+
+async function executeStatementsInTransaction(lix, statements) {
+  await lix.transaction(async (tx) => {
+    for (const statement of statements) {
+      await tx.execute(statement.sql, statement.params ?? []);
+    }
+  });
 }
 
 function scalarToNumber(value, context) {

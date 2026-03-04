@@ -33,9 +33,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"materialization_test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -48,8 +46,8 @@ async fn main_version_id(engine: &support::simulation_test::SimulationEngine) ->
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected main version id text, got {other:?}"),
     }
@@ -77,9 +75,7 @@ simulation_test!(
                      'entity-1', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"A\"}}', '1'\
                      )",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
         engine
@@ -91,9 +87,7 @@ simulation_test!(
                      'entity-1b', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
                      )",
                     main_version_id
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .unwrap();
 
@@ -153,9 +147,7 @@ simulation_test!(
                          'entity-2', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
                          )",
                         main_version_id
-                    ),
-                    &[],
-                )
+                    ), &[])
                 .await
                 .unwrap();
 
@@ -204,17 +196,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(rows.rows.len(), 1);
-        match &rows.rows[0][0] {
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        match &rows.statements[0].rows[0][0] {
             Value::Text(text) => assert_eq!(text, "{\"value\":\"B\"}"),
             other => panic!("expected text snapshot_content, got {other:?}"),
         }
-        match &rows.rows[0][1] {
+        match &rows.statements[0].rows[0][1] {
             Value::Text(text) => assert!(!text.is_empty()),
             other => panic!("expected text change_id, got {other:?}"),
         }
 
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic(rows.statements[0].rows.clone());
     }
 );
 
@@ -293,12 +285,15 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0][0], Value::Text("entity-new".to_string()));
+        assert_eq!(rows.statements[0].rows.len(), 1);
         assert_eq!(
-            rows.rows[0][1],
+            rows.statements[0].rows[0][0],
+            Value::Text("entity-new".to_string())
+        );
+        assert_eq!(
+            rows.statements[0].rows[0][1],
             Value::Text("{\"value\":\"new\"}".to_string())
         );
-        sim.assert_deterministic(rows.rows.clone());
+        sim.assert_deterministic(rows.statements[0].rows.clone());
     }
 );

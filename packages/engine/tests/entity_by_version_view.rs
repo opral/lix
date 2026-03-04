@@ -17,8 +17,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text active version id, got {other:?}"),
     }
@@ -41,9 +41,7 @@ simulation_test!(
                  key, value, lixcol_file_id, lixcol_version_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
                  'key-bv', 'value-insert', 'lix', $1, 'lix', '1'\
-                 )",
-                &[Value::Text(version_id.clone())],
-            )
+                 )", &[Value::Text(version_id.clone())])
             .await
             .unwrap();
 
@@ -56,11 +54,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(inserted.rows.clone());
-        assert_eq!(inserted.rows.len(), 1);
-        assert_text(&inserted.rows[0][0], "key-bv");
-        assert_text(&inserted.rows[0][1], "value-insert");
-        assert_text(&inserted.rows[0][2], &version_id);
+        sim.assert_deterministic(inserted.statements[0].rows.clone());
+        assert_eq!(inserted.statements[0].rows.len(), 1);
+        assert_text(&inserted.statements[0].rows[0][0], "key-bv");
+        assert_text(&inserted.statements[0].rows[0][1], "value-insert");
+        assert_text(&inserted.statements[0].rows[0][2], &version_id);
 
         engine
             .execute(
@@ -87,9 +85,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(updated.rows.clone());
-        assert_eq!(updated.rows.len(), 1);
-        assert_text(&updated.rows[0][0], "value-update");
+        sim.assert_deterministic(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "value-update");
 
         engine
             .execute(
@@ -115,8 +113,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(deleted.rows.clone());
-        assert!(deleted.rows.is_empty());
+        sim.assert_deterministic(deleted.statements[0].rows.clone());
+        assert!(deleted.statements[0].rows.is_empty());
     }
 );
 
@@ -195,13 +193,16 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(updated.rows.clone());
-        assert_eq!(updated.rows.len(), 1);
-        assert_text(&updated.rows[0][0], "value-b");
+        sim.assert_deterministic_normalized(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "value-b");
         assert!(
-            matches!(updated.rows[0][1], Value::Boolean(true) | Value::Integer(1)),
+            matches!(
+                updated.statements[0].rows[0][1],
+                Value::Boolean(true) | Value::Integer(1)
+            ),
             "expected true-like untracked marker, got {:?}",
-            updated.rows[0][1]
+            updated.statements[0].rows[0][1]
         );
     }
 );

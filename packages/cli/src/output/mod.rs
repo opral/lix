@@ -1,9 +1,35 @@
 use base64::Engine as _;
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, ContentArrangement, Row, Table};
-use lix_rs_sdk::{QueryResult, Value};
+use lix_rs_sdk::{ExecuteResult, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
-pub fn print_query_result_table(result: &QueryResult) {
+pub fn print_execute_result_table(result: &ExecuteResult) {
+    if result.statements.is_empty() {
+        println!("OK");
+        return;
+    }
+
+    let total = result.statements.len();
+    for (index, statement) in result.statements.iter().enumerate() {
+        println!("Statement {}/{}:", index + 1, total);
+        print_query_result_table(statement);
+        if index + 1 < total {
+            println!();
+        }
+    }
+}
+
+pub fn print_execute_result_json(result: &ExecuteResult) {
+    let payload = serde_json::json!({
+        "statements": result.statements.iter().map(query_result_to_json).collect::<Vec<_>>(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+fn print_query_result_table(result: &QueryResult) {
     if result.columns.is_empty() && result.rows.is_empty() {
         println!("OK");
         return;
@@ -32,15 +58,11 @@ pub fn print_query_result_table(result: &QueryResult) {
     println!("({} rows)", result.rows.len());
 }
 
-pub fn print_query_result_json(result: &QueryResult) {
-    let payload = serde_json::json!({
+fn query_result_to_json(result: &QueryResult) -> JsonValue {
+    serde_json::json!({
         "columns": result.columns,
         "rows": result.rows.iter().map(|row| row.iter().map(value_to_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
-    });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
-    );
+    })
 }
 
 fn value_to_text(value: &Value) -> String {

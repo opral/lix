@@ -19,9 +19,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -32,9 +30,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
@@ -45,9 +41,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -60,13 +54,13 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(read.rows.clone());
-        assert_eq!(read.rows.len(), 1);
+        sim.assert_deterministic_normalized(read.statements[0].rows.clone());
+        assert_eq!(read.statements[0].rows.len(), 1);
         assert_eq!(
-            read.rows[0][0],
+            read.statements[0].rows[0][0],
             Value::Text("{\"key\":\"untracked\"}".to_string())
         );
-        assert_boolean_like(&read.rows[0][1], true);
+        assert_boolean_like(&read.statements[0].rows[0][1], true);
     }
 );
 
@@ -86,9 +80,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -99,9 +91,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -114,13 +104,13 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(read.rows.clone());
-        assert_eq!(read.rows.len(), 1);
+        sim.assert_deterministic_normalized(read.statements[0].rows.clone());
+        assert_eq!(read.statements[0].rows.len(), 1);
         assert_eq!(
-            read.rows[0][0],
+            read.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
-        assert_boolean_like(&read.rows[0][1], false);
+        assert_boolean_like(&read.statements[0].rows[0][1], false);
     }
 );
 
@@ -140,9 +130,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -150,9 +138,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -165,9 +151,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -176,9 +160,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -192,17 +174,44 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(read.rows.clone());
-        assert_eq!(read.rows.len(), 3);
-        assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
-        assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
-        assert_eq!(read.rows[0][2], Value::Text("file-1".to_string()));
-        assert_eq!(read.rows[1][0], Value::Text("entity-2".to_string()));
-        assert_eq!(read.rows[1][1], Value::Text("schema_b".to_string()));
-        assert_eq!(read.rows[1][2], Value::Text("file-2".to_string()));
-        assert_eq!(read.rows[2][0], Value::Text("entity-3".to_string()));
-        assert_eq!(read.rows[2][1], Value::Text("schema_a".to_string()));
-        assert_eq!(read.rows[2][2], Value::Text("file-3".to_string()));
+        sim.assert_deterministic_normalized(read.statements[0].rows.clone());
+        assert_eq!(read.statements[0].rows.len(), 3);
+        assert_eq!(
+            read.statements[0].rows[0][0],
+            Value::Text("entity-1".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[0][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[0][2],
+            Value::Text("file-1".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[1][0],
+            Value::Text("entity-2".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[1][1],
+            Value::Text("schema_b".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[1][2],
+            Value::Text("file-2".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[2][0],
+            Value::Text("entity-3".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[2][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[2][2],
+            Value::Text("file-3".to_string())
+        );
     }
 );
 
@@ -222,9 +231,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -232,9 +239,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -246,9 +251,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -257,9 +260,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -273,17 +274,44 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(read.rows.clone());
-        assert_eq!(read.rows.len(), 3);
-        assert_eq!(read.rows[0][0], Value::Text("entity-1".to_string()));
-        assert_eq!(read.rows[0][1], Value::Text("schema_a".to_string()));
-        assert_eq!(read.rows[0][2], Value::Text("file-1".to_string()));
-        assert_eq!(read.rows[1][0], Value::Text("entity-2".to_string()));
-        assert_eq!(read.rows[1][1], Value::Text("schema_b".to_string()));
-        assert_eq!(read.rows[1][2], Value::Text("file-2".to_string()));
-        assert_eq!(read.rows[2][0], Value::Text("entity-3".to_string()));
-        assert_eq!(read.rows[2][1], Value::Text("schema_a".to_string()));
-        assert_eq!(read.rows[2][2], Value::Text("file-3".to_string()));
+        sim.assert_deterministic_normalized(read.statements[0].rows.clone());
+        assert_eq!(read.statements[0].rows.len(), 3);
+        assert_eq!(
+            read.statements[0].rows[0][0],
+            Value::Text("entity-1".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[0][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[0][2],
+            Value::Text("file-1".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[1][0],
+            Value::Text("entity-2".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[1][1],
+            Value::Text("schema_b".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[1][2],
+            Value::Text("file-2".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[2][0],
+            Value::Text("entity-3".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[2][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            read.statements[0].rows[2][2],
+            Value::Text("file-3".to_string())
+        );
     }
 );
 
@@ -302,9 +330,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -312,9 +338,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -326,9 +350,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -337,9 +359,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -353,22 +373,22 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(schema_a_only.rows.clone());
-        assert_eq!(schema_a_only.rows.len(), 2);
+        sim.assert_deterministic(schema_a_only.statements[0].rows.clone());
+        assert_eq!(schema_a_only.statements[0].rows.len(), 2);
         assert_eq!(
-            schema_a_only.rows[0][0],
+            schema_a_only.statements[0].rows[0][0],
             Value::Text("entity-1".to_string())
         );
         assert_eq!(
-            schema_a_only.rows[0][1],
+            schema_a_only.statements[0].rows[0][1],
             Value::Text("schema_a".to_string())
         );
         assert_eq!(
-            schema_a_only.rows[1][0],
+            schema_a_only.statements[0].rows[1][0],
             Value::Text("entity-3".to_string())
         );
         assert_eq!(
-            schema_a_only.rows[1][1],
+            schema_a_only.statements[0].rows[1][1],
             Value::Text("schema_a".to_string())
         );
     }
@@ -389,9 +409,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -399,9 +417,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -413,9 +429,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -424,9 +438,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -440,12 +452,24 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(schema_a_eq.rows.clone());
-        assert_eq!(schema_a_eq.rows.len(), 2);
-        assert_eq!(schema_a_eq.rows[0][0], Value::Text("entity-1".to_string()));
-        assert_eq!(schema_a_eq.rows[0][1], Value::Text("schema_a".to_string()));
-        assert_eq!(schema_a_eq.rows[1][0], Value::Text("entity-3".to_string()));
-        assert_eq!(schema_a_eq.rows[1][1], Value::Text("schema_a".to_string()));
+        sim.assert_deterministic(schema_a_eq.statements[0].rows.clone());
+        assert_eq!(schema_a_eq.statements[0].rows.len(), 2);
+        assert_eq!(
+            schema_a_eq.statements[0].rows[0][0],
+            Value::Text("entity-1".to_string())
+        );
+        assert_eq!(
+            schema_a_eq.statements[0].rows[0][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            schema_a_eq.statements[0].rows[1][0],
+            Value::Text("entity-3".to_string())
+        );
+        assert_eq!(
+            schema_a_eq.statements[0].rows[1][1],
+            Value::Text("schema_a".to_string())
+        );
     }
 );
 
@@ -464,9 +488,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -474,9 +496,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -488,9 +508,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -499,9 +517,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -514,17 +530,20 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(entity_filter.rows.clone());
-        assert_eq!(entity_filter.rows.len(), 1);
+        sim.assert_deterministic(entity_filter.statements[0].rows.clone());
+        assert_eq!(entity_filter.statements[0].rows.len(), 1);
         assert_eq!(
-            entity_filter.rows[0][0],
+            entity_filter.statements[0].rows[0][0],
             Value::Text("entity-2".to_string())
         );
         assert_eq!(
-            entity_filter.rows[0][1],
+            entity_filter.statements[0].rows[0][1],
             Value::Text("schema_b".to_string())
         );
-        assert_eq!(entity_filter.rows[0][2], Value::Text("file-2".to_string()));
+        assert_eq!(
+            entity_filter.statements[0].rows[0][2],
+            Value::Text("file-2".to_string())
+        );
     }
 );
 
@@ -543,9 +562,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -553,9 +570,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -567,9 +582,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -578,9 +591,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -593,11 +604,20 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(file_filter.rows.clone());
-        assert_eq!(file_filter.rows.len(), 1);
-        assert_eq!(file_filter.rows[0][0], Value::Text("entity-3".to_string()));
-        assert_eq!(file_filter.rows[0][1], Value::Text("schema_a".to_string()));
-        assert_eq!(file_filter.rows[0][2], Value::Text("file-3".to_string()));
+        sim.assert_deterministic(file_filter.statements[0].rows.clone());
+        assert_eq!(file_filter.statements[0].rows.len(), 1);
+        assert_eq!(
+            file_filter.statements[0].rows[0][0],
+            Value::Text("entity-3".to_string())
+        );
+        assert_eq!(
+            file_filter.statements[0].rows[0][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            file_filter.statements[0].rows[0][2],
+            Value::Text("file-3".to_string())
+        );
     }
 );
 
@@ -616,9 +636,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_a\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -626,9 +644,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"schema_b\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -640,9 +656,7 @@ simulation_test!(
              'entity-1', 'schema_a', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"a1\"}'\
              ), (\
              'entity-3', 'schema_a', '1', 'file-3', 'version-1', 'lix', '{\"key\":\"a2\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
         engine
@@ -651,9 +665,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-2', 'schema_b', '1', 'file-2', 'version-1', 'lix', '{\"key\":\"b1\"}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -666,11 +678,20 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(multi_filter.rows.clone());
-        assert_eq!(multi_filter.rows.len(), 1);
-        assert_eq!(multi_filter.rows[0][0], Value::Text("entity-3".to_string()));
-        assert_eq!(multi_filter.rows[0][1], Value::Text("schema_a".to_string()));
-        assert_eq!(multi_filter.rows[0][2], Value::Text("file-3".to_string()));
+        sim.assert_deterministic(multi_filter.statements[0].rows.clone());
+        assert_eq!(multi_filter.statements[0].rows.len(), 1);
+        assert_eq!(
+            multi_filter.statements[0].rows[0][0],
+            Value::Text("entity-3".to_string())
+        );
+        assert_eq!(
+            multi_filter.statements[0].rows[0][1],
+            Value::Text("schema_a".to_string())
+        );
+        assert_eq!(
+            multi_filter.statements[0].rows[0][2],
+            Value::Text("file-3".to_string())
+        );
     }
 );
 
@@ -690,9 +711,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -703,9 +722,7 @@ simulation_test!(
              entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
              ) VALUES (\
              'entity-1', 'test_schema', '1', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
@@ -716,18 +733,14 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
         // Delete untracked row.
         engine
         .execute(
-            "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = true",
-            &[],
-        )
+            "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = true", &[])
         .await
         .unwrap();
 
@@ -740,12 +753,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(read.rows.clone());
-        assert_eq!(read.rows.len(), 1);
+        sim.assert_deterministic_normalized(read.statements[0].rows.clone());
+        assert_eq!(read.statements[0].rows.len(), 1);
         assert_eq!(
-            read.rows[0][0],
+            read.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
-        assert_boolean_like(&read.rows[0][1], false);
+        assert_boolean_like(&read.statements[0].rows[0][1], false);
     }
 );

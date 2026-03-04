@@ -18,8 +18,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    match &rows.rows[0][0] {
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text active version id, got {other:?}"),
     }
@@ -104,9 +104,7 @@ async fn install_select_override_schema(engine: &support::simulation_test::Simul
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -117,9 +115,7 @@ async fn install_inherited_override_schema(engine: &support::simulation_test::Si
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_inherited_from_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -130,9 +126,7 @@ async fn install_default_values_schema(engine: &support::simulation_test::Simula
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -143,9 +137,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
@@ -154,9 +146,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
              '{\"value\":{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -197,11 +187,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(result.rows.clone());
-        assert_eq!(result.rows.len(), 1);
-        assert_text(&result.rows[0][0], "key-sel");
-        assert_text(&result.rows[0][1], "value-sel");
-        assert_text(&result.rows[0][2], "lix_key_value");
+        sim.assert_deterministic(result.statements[0].rows.clone());
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_text(&result.statements[0].rows[0][0], "key-sel");
+        assert_text(&result.statements[0].rows[0][1], "value-sel");
+        assert_text(&result.statements[0].rows[0][2], "lix_key_value");
     }
 );
 
@@ -243,9 +233,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(updated.rows.clone());
-        assert_eq!(updated.rows.len(), 1);
-        assert_text(&updated.rows[0][0], "value-update");
+        sim.assert_deterministic(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "value-update");
 
         engine
             .execute("DELETE FROM lix_key_value WHERE key = 'key-write'", &[])
@@ -256,8 +246,8 @@ simulation_test!(
             .execute("SELECT key FROM lix_key_value WHERE key = 'key-write'", &[])
             .await
             .unwrap();
-        sim.assert_deterministic(deleted.rows.clone());
-        assert!(deleted.rows.is_empty());
+        sim.assert_deterministic(deleted.statements[0].rows.clone());
+        assert!(deleted.statements[0].rows.is_empty());
     }
 );
 
@@ -295,9 +285,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(updated.rows.clone());
-        assert_eq!(updated.rows.len(), 1);
-        assert_text(&updated.rows[0][0], "value-b");
+        sim.assert_deterministic(updated.statements[0].rows.clone());
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "value-b");
     }
 );
 
@@ -351,9 +341,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(selected.rows.clone());
-        assert_eq!(selected.rows.len(), 1);
-        assert_text(&selected.rows[0][0], "default-id-value");
+        sim.assert_deterministic(selected.statements[0].rows.clone());
+        assert_eq!(selected.statements[0].rows.len(), 1);
+        assert_text(&selected.statements[0].rows[0][0], "default-id-value");
 
         let stored = engine
             .execute(
@@ -366,10 +356,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(stored.rows.len(), 1);
-        assert_text(&stored.rows[0][0], "default-id-value");
+        assert_eq!(stored.statements[0].rows.len(), 1);
+        assert_text(&stored.statements[0].rows[0][0], "default-id-value");
         assert_eq!(
-            snapshot_field(&stored.rows[0][1], "id"),
+            snapshot_field(&stored.statements[0].rows[0][1], "id"),
             "default-id-value".to_string()
         );
     }
@@ -424,10 +414,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "variant-2");
-        assert_text(&rows.rows[0][1], "msg-2");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "variant-2");
+        assert_text(&rows.statements[0].rows[0][1], "msg-2");
     }
 );
 
@@ -465,12 +455,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "inherit-key");
-        assert_text(&rows.rows[0][1], "from-global");
-        assert_text(&rows.rows[0][2], "version-child");
-        assert_text(&rows.rows[0][3], "global");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "inherit-key");
+        assert_text(&rows.statements[0].rows[0][1], "from-global");
+        assert_text(&rows.statements[0].rows[0][2], "version-child");
+        assert_text(&rows.statements[0].rows[0][3], "global");
     }
 );
 
@@ -488,9 +478,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema', \
                  '{\"value\":{\"x-lix-key\":\"lix_patch_validation\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -577,9 +565,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(stored.rows.len(), 1);
-        assert_text(&stored.rows[0][0], "global");
-        assert_eq!(snapshot_field(&stored.rows[0][1], "name"), "Original");
+        assert_eq!(stored.statements[0].rows.len(), 1);
+        assert_text(&stored.statements[0].rows[0][0], "global");
+        assert_eq!(
+            snapshot_field(&stored.statements[0].rows[0][1], "name"),
+            "Original"
+        );
 
         let selected = engine
             .execute(
@@ -590,10 +581,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(selected.rows.clone());
-        assert_eq!(selected.rows.len(), 1);
-        assert_text(&selected.rows[0][0], "ovr-1");
-        assert_text(&selected.rows[0][1], "Original");
+        sim.assert_deterministic(selected.statements[0].rows.clone());
+        assert_eq!(selected.statements[0].rows.len(), 1);
+        assert_text(&selected.statements[0].rows[0][0], "ovr-1");
+        assert_text(&selected.statements[0].rows[0][1], "Original");
     }
 );
 
@@ -613,9 +604,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'ovr-2', 'lix_version_override_schema', 'lix', 'global', 'lix', '{\"id\":\"ovr-2\",\"name\":\"Global\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
         engine
@@ -624,9 +613,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'ovr-2', 'lix_version_override_schema', 'lix', 'main', 'lix', '{\"id\":\"ovr-2\",\"name\":\"Main\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -652,7 +639,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        let versioned_names = rows
+        let versioned_names = rows.statements[0]
             .rows
             .iter()
             .map(|row| {
@@ -716,9 +703,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'ovr-inherit-1', 'lix_version_override_child_schema', 'lix', 'global', 'lix', '{\"id\":\"ovr-inherit-1\",\"name\":\"Global\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -732,11 +717,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "ovr-inherit-1");
-        assert_text(&rows.rows[0][1], "Global");
-        assert_text(&rows.rows[0][2], "global");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "ovr-inherit-1");
+        assert_text(&rows.statements[0].rows[0][1], "Global");
+        assert_text(&rows.statements[0].rows[0][2], "global");
     }
 );
 
@@ -760,9 +745,7 @@ simulation_test!(
                  ('mismatch-plugin', 'lix_select_override_schema', 'inlang', 'global', 'other_plugin', '{\"id\":\"mismatch-plugin\"}', NULL, '1', true), \
                  ('mismatch-untracked', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-untracked\"}', NULL, '1', false), \
                  ('mismatch-metadata', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-metadata\"}', '{\"k\":1}', '1', true), \
-                 ('match-main', 'lix_select_override_schema', 'inlang', 'main', 'inlang_sdk', '{\"id\":\"match-main\"}', NULL, '1', true)",
-                &[],
-            )
+                 ('match-main', 'lix_select_override_schema', 'inlang', 'main', 'inlang_sdk', '{\"id\":\"match-main\"}', NULL, '1', true)", &[])
             .await
             .unwrap();
 
@@ -775,9 +758,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(base_rows.rows.clone());
-        assert_eq!(base_rows.rows.len(), 1);
-        assert_text(&base_rows.rows[0][0], "match-global");
+        sim.assert_deterministic(base_rows.statements[0].rows.clone());
+        assert_eq!(base_rows.statements[0].rows.len(), 1);
+        assert_text(&base_rows.statements[0].rows[0][0], "match-global");
 
         let by_version_rows = engine
             .execute(
@@ -788,11 +771,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(by_version_rows.rows.clone());
-        assert_eq!(by_version_rows.rows.len(), 3);
+        sim.assert_deterministic(by_version_rows.statements[0].rows.clone());
+        assert_eq!(by_version_rows.statements[0].rows.len(), 3);
         let mut match_global_rows = Vec::new();
         let mut match_main_rows = Vec::new();
-        for row in &by_version_rows.rows {
+        for row in &by_version_rows.statements[0].rows {
             let id = match &row[0] {
                 Value::Text(value) => value.clone(),
                 other => panic!("expected id text, got {other:?}"),
@@ -856,9 +839,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES \
                  ('inherited-match', 'lix_inherited_override_schema', 'lix', 'global', 'lix', '{\"id\":\"inherited-match\"}', '1', false), \
-                 ('inherited-mismatch', 'lix_inherited_override_schema', 'lix', 'active-inherited', 'lix', '{\"id\":\"inherited-mismatch\"}', '1', false)",
-                &[],
-            )
+                 ('inherited-mismatch', 'lix_inherited_override_schema', 'lix', 'active-inherited', 'lix', '{\"id\":\"inherited-mismatch\"}', '1', false)", &[])
             .await
             .unwrap();
 
@@ -871,10 +852,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "inherited-match");
-        assert_text(&rows.rows[0][1], "global");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "inherited-match");
+        assert_text(&rows.statements[0].rows[0][1], "global");
     }
 );
 
@@ -889,9 +870,7 @@ simulation_test!(
 
         let err = engine
             .execute(
-                "INSERT INTO lix_key_value (key, value, bogus) VALUES ('k-unknown', 'v-unknown', 'x')",
-                &[],
-            )
+                "INSERT INTO lix_key_value (key, value, bogus) VALUES ('k-unknown', 'v-unknown', 'x')", &[])
             .await
             .expect_err("insert with unknown column should fail");
         assert!(
@@ -1002,9 +981,7 @@ simulation_test!(
                 "INSERT INTO lix_stored_schema_by_version (value, lixcol_version_id) VALUES (\
                  lix_json('{\"x-lix-key\":\"lix_custom_error_columns\",\"x-lix-version\":\"1\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"]}'),\
                  'global'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .expect("schema insert should succeed");
 

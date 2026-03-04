@@ -43,9 +43,7 @@ async fn register_test_state_schema(engine: &support::simulation_test::Simulatio
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -67,8 +65,8 @@ async fn run_lix_version_seeded_main_id_deterministic(sim: SimulationArgs) {
         .await
         .unwrap();
 
-    assert_eq!(result.rows.len(), 1);
-    let row = &result.rows[0];
+    assert_eq!(result.statements[0].rows.len(), 1);
+    let row = &result.statements[0].rows[0];
     let id = match &row[0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected text id, got {other:?}"),
@@ -108,8 +106,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_text(&row[0], "global");
         assert_text(&row[1], "global");
         assert_eq!(row[2], Value::Null);
@@ -143,8 +141,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_non_empty_text(&row[0]);
         assert_ne!(row[0], Value::Text("main".to_string()));
         assert_text(&row[1], "main");
@@ -184,8 +182,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_text(&row[0], "version-a");
         assert_text(&row[1], "Version A");
         assert_eq!(row[2], Value::Null);
@@ -204,9 +202,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(vtable_rows.rows.len(), 2);
-        assert_text(&vtable_rows.rows[0][0], "lix_version_descriptor");
-        assert_text(&vtable_rows.rows[1][0], "lix_version_pointer");
+        assert_eq!(vtable_rows.statements[0].rows.len(), 2);
+        assert_text(
+            &vtable_rows.statements[0].rows[0][0],
+            "lix_version_descriptor",
+        );
+        assert_text(&vtable_rows.statements[0].rows[1][0], "lix_version_pointer");
     }
 );
 
@@ -280,8 +281,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_text(&row[0], "version-b");
         assert_text(&row[1], "Version B2");
         assert_bool(&row[2], true);
@@ -325,8 +326,8 @@ simulation_test!(lix_version_update_allows_commit_id_only, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(rows.rows.len(), 1);
-    assert_text(&rows.rows[0][0], "commit-tip-1");
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    assert_text(&rows.statements[0].rows[0][0], "commit-tip-1");
 });
 
 simulation_test!(lix_version_update_supports_placeholders, |sim| async move {
@@ -372,8 +373,8 @@ simulation_test!(lix_version_update_supports_placeholders, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(result.rows.len(), 1);
-    let row = &result.rows[0];
+    assert_eq!(result.statements[0].rows.len(), 1);
+    let row = &result.statements[0].rows[0];
     assert_text(&row[0], "version-ph");
     assert_text(&row[1], "Version PH2");
     assert_text(&row[2], "commit-ph2");
@@ -407,7 +408,7 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         .execute("SELECT id FROM lix_version WHERE id = 'version-c'", &[])
         .await
         .unwrap();
-    assert_eq!(version_rows.rows.len(), 0);
+    assert_eq!(version_rows.statements[0].rows.len(), 0);
 
     let deleted_rows = engine
         .execute(
@@ -421,11 +422,17 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(deleted_rows.rows.len(), 2);
-    assert_text(&deleted_rows.rows[0][0], "lix_version_descriptor");
-    assert_eq!(deleted_rows.rows[0][1], Value::Null);
-    assert_text(&deleted_rows.rows[1][0], "lix_version_pointer");
-    assert_eq!(deleted_rows.rows[1][1], Value::Null);
+    assert_eq!(deleted_rows.statements[0].rows.len(), 2);
+    assert_text(
+        &deleted_rows.statements[0].rows[0][0],
+        "lix_version_descriptor",
+    );
+    assert_eq!(deleted_rows.statements[0].rows[0][1], Value::Null);
+    assert_text(
+        &deleted_rows.statements[0].rows[1][0],
+        "lix_version_pointer",
+    );
+    assert_eq!(deleted_rows.statements[0].rows[1][1], Value::Null);
 });
 
 simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {
@@ -460,7 +467,7 @@ simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(result.rows.len(), 0);
+    assert_eq!(result.statements[0].rows.len(), 0);
 });
 
 simulation_test!(
@@ -493,23 +500,21 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(before_version.rows.len(), 1);
+        assert_eq!(before_version.statements[0].rows.len(), 1);
 
         let global_before = engine
             .execute("SELECT commit_id FROM lix_version WHERE id = 'global'", &[])
             .await
             .unwrap();
-        assert_eq!(global_before.rows.len(), 1);
-        let global_before_commit = match &global_before.rows[0][0] {
+        assert_eq!(global_before.statements[0].rows.len(), 1);
+        let global_before_commit = match &global_before.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text commit_id, got {other:?}"),
         };
 
         engine
             .execute(
-                "UPDATE lix_version SET name = 'version-direct-renamed' WHERE id = 'version-direct'",
-                &[],
-            )
+                "UPDATE lix_version SET name = 'version-direct-renamed' WHERE id = 'version-direct'", &[])
             .await
             .unwrap();
 
@@ -522,17 +527,23 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(after_version.rows.len(), 1);
-        assert_text(&after_version.rows[0][0], "version-direct");
-        assert_text(&after_version.rows[0][1], "version-direct-renamed");
-        assert_eq!(after_version.rows[0][2], before_version.rows[0][2]);
+        assert_eq!(after_version.statements[0].rows.len(), 1);
+        assert_text(&after_version.statements[0].rows[0][0], "version-direct");
+        assert_text(
+            &after_version.statements[0].rows[0][1],
+            "version-direct-renamed",
+        );
+        assert_eq!(
+            after_version.statements[0].rows[0][2],
+            before_version.statements[0].rows[0][2]
+        );
 
         let global_after = engine
             .execute("SELECT commit_id FROM lix_version WHERE id = 'global'", &[])
             .await
             .unwrap();
-        assert_eq!(global_after.rows.len(), 1);
-        let global_after_commit = match &global_after.rows[0][0] {
+        assert_eq!(global_after.statements[0].rows.len(), 1);
+        let global_after_commit = match &global_after.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text commit_id, got {other:?}"),
         };
@@ -571,7 +582,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(before_version.rows.len(), 1);
+        assert_eq!(before_version.statements[0].rows.len(), 1);
 
         engine
             .execute(
@@ -579,9 +590,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'state-entity-1', 'test_schema', 'file-state', 'version-state', 'lix', '{\"key\":\"value\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -594,10 +603,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(after_version.rows.len(), 1);
-        assert_text(&after_version.rows[0][0], "version-state");
-        assert_text(&after_version.rows[0][1], "version-state");
-        assert_ne!(after_version.rows[0][2], before_version.rows[0][2]);
+        assert_eq!(after_version.statements[0].rows.len(), 1);
+        assert_text(&after_version.statements[0].rows[0][0], "version-state");
+        assert_text(&after_version.statements[0].rows[0][1], "version-state");
+        assert_ne!(
+            after_version.statements[0].rows[0][2],
+            before_version.statements[0].rows[0][2]
+        );
     }
 );
 
@@ -656,11 +668,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(versions.rows.len(), 2);
-        assert_text(&versions.rows[0][0], "v-unique-1");
-        assert_text(&versions.rows[0][1], "v-unique-2");
-        assert_text(&versions.rows[0][2], "commit-unique-2");
-        assert_text(&versions.rows[1][0], "v-unique-3");
+        assert_eq!(versions.statements[0].rows.len(), 2);
+        assert_text(&versions.statements[0].rows[0][0], "v-unique-1");
+        assert_text(&versions.statements[0].rows[0][1], "v-unique-2");
+        assert_text(&versions.statements[0].rows[0][2], "commit-unique-2");
+        assert_text(&versions.statements[0].rows[1][0], "v-unique-3");
     }
 );
 
@@ -694,9 +706,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(inserted.rows.len(), 1);
-        assert_text(&inserted.rows[0][0], "v-lenient");
-        assert_text(&inserted.rows[0][1], "does_not_exist");
+        assert_eq!(inserted.statements[0].rows.len(), 1);
+        assert_text(&inserted.statements[0].rows[0][0], "v-lenient");
+        assert_text(&inserted.statements[0].rows[0][1], "does_not_exist");
     }
 );
 
@@ -715,9 +727,7 @@ simulation_test!(
                  id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
                  'version-baseline-insert', 'version-baseline-insert', 'global', false, 'commit-baseline-insert'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -730,8 +740,12 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(baseline.rows.len(), 1, "missing baseline pointer row");
-        assert_text(&baseline.rows[0][0], "commit-baseline-insert");
+        assert_eq!(
+            baseline.statements[0].rows.len(),
+            1,
+            "missing baseline pointer row"
+        );
+        assert_text(&baseline.statements[0].rows[0][0], "commit-baseline-insert");
     }
 );
 
@@ -764,7 +778,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(
-            baseline_before_delete.rows.len(),
+            baseline_before_delete.statements[0].rows.len(),
             1,
             "expected baseline row before SQL delete"
         );
@@ -786,8 +800,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(baseline_after_delete.rows.len(), 1);
-        let remaining = match &baseline_after_delete.rows[0][0] {
+        assert_eq!(baseline_after_delete.statements[0].rows.len(), 1);
+        let remaining = match &baseline_after_delete.statements[0].rows[0][0] {
             Value::Integer(value) => *value,
             Value::Text(value) => value
                 .parse::<i64>()
@@ -813,9 +827,7 @@ simulation_test!(
                  id, name, inherits_from_version_id, hidden, commit_id\
                  ) VALUES (\
                  'version-baseline-frozen', 'version-baseline-frozen', 'global', false, 'commit-baseline-frozen-0'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -828,8 +840,15 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(baseline_before.rows.len(), 1, "missing baseline row");
-        assert_text(&baseline_before.rows[0][0], "commit-baseline-frozen-0");
+        assert_eq!(
+            baseline_before.statements[0].rows.len(),
+            1,
+            "missing baseline row"
+        );
+        assert_text(
+            &baseline_before.statements[0].rows[0][0],
+            "commit-baseline-frozen-0",
+        );
 
         engine
             .execute(
@@ -850,8 +869,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(version_tip.rows.len(), 1);
-        assert_text(&version_tip.rows[0][0], "commit-baseline-frozen-1");
+        assert_eq!(version_tip.statements[0].rows.len(), 1);
+        assert_text(
+            &version_tip.statements[0].rows[0][0],
+            "commit-baseline-frozen-1",
+        );
 
         let baseline_after = engine
             .execute(
@@ -862,7 +884,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(baseline_after.rows.len(), 1);
-        assert_text(&baseline_after.rows[0][0], "commit-baseline-frozen-0");
+        assert_eq!(baseline_after.statements[0].rows.len(), 1);
+        assert_text(
+            &baseline_after.statements[0].rows[0][0],
+            "commit-baseline-frozen-0",
+        );
     }
 );

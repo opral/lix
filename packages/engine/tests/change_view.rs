@@ -40,8 +40,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(change_id_result.rows.len(), 1);
-        let change_id = match &change_id_result.rows[0][0] {
+        assert_eq!(change_id_result.statements[0].rows.len(), 1);
+        let change_id = match &change_id_result.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected change_id as text, got {other:?}"),
         };
@@ -57,8 +57,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(result.rows.len(), 1);
-        let row = &result.rows[0];
+        assert_eq!(result.statements[0].rows.len(), 1);
+        let row = &result.statements[0].rows[0];
         assert_text(&row[0], &change_id);
         assert_text(&row[1], "change-view-file-1");
         assert_text(&row[2], "lix_file_descriptor");
@@ -81,9 +81,7 @@ simulation_test!(lix_change_rejects_insert_update_delete, |sim| async move {
     let insert_err = engine
         .execute(
             "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
-             VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')",
-                &[],
-            )
+             VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')", &[])
             .await
         .expect_err("INSERT on lix_change should fail");
     assert_eq!(insert_err.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");

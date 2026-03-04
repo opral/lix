@@ -11,7 +11,7 @@ impl Engine {
         statements: Vec<Statement>,
         params: &[Value],
         options: ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         self.execute_statement_script_with_options(statements, params, &options)
             .await
     }
@@ -21,7 +21,7 @@ impl Engine {
         statements: Vec<Statement>,
         params: &[Value],
         options: &ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.active_version_id.read().unwrap().clone();
         let starting_active_version_id = active_version_id.clone();
@@ -72,7 +72,7 @@ impl Engine {
         options: &ExecuteOptions,
         active_version_id: &mut String,
         pending_state_commit_stream_changes: &mut Vec<StateCommitStreamChange>,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         let coalesced_statements = if params.is_empty() {
             coalesce_lix_file_transaction_statements(
                 &original_statements,
@@ -129,10 +129,7 @@ impl Engine {
         };
         let skip_statement_side_effect_collection = deferred_side_effects.is_some();
 
-        let mut last_result = QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        };
+        let mut statement_results = Vec::with_capacity(sql_statements.len());
         for (sql, statement_params) in sql_statements {
             let result = if skip_statement_side_effect_collection {
                 self.execute_with_options_in_transaction(
@@ -162,7 +159,7 @@ impl Engine {
 
             match result {
                 Ok(query_result) => {
-                    last_result = query_result;
+                    statement_results.push(query_result);
                 }
                 Err(error) => {
                     return Err(error);
@@ -178,6 +175,8 @@ impl Engine {
             )
             .await?;
         }
-        Ok(last_result)
+        Ok(ExecuteResult {
+            statements: statement_results,
+        })
     }
 }

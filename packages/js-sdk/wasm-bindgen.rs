@@ -6,10 +6,11 @@ mod wasm {
     use lix_engine::{
         boot, init_lix as engine_init_lix, observe_owned, BootArgs, BootKeyValue,
         CreateCheckpointResult, CreateVersionOptions, CreateVersionResult, ExecuteOptions,
-        InitLixArgs, LixBackend, LixError, LixTransaction, ObserveEvent as EngineObserveEvent,
-        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
-        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
-        WasmComponentInstance, WasmLimits, WasmRuntime, WireQueryResult, WireValue,
+        ExecuteResult as EngineExecuteResult, InitLixArgs, LixBackend, LixError, LixTransaction,
+        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
+        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
+        SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
+        WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -32,6 +33,10 @@ export type LixValue =
 export type LixQueryResult = {
   rows: LixValue[][];
   columns: string[];
+};
+
+export type LixExecuteResult = {
+  statements: LixQueryResult[];
 };
 
 export type LixTransaction = {
@@ -105,11 +110,6 @@ export type ObserveQuery = {
   params?: LixValue[];
 };
 
-export type LixTransactionStatement = {
-  sql: string;
-  params?: LixValue[];
-};
-
 export type ExecuteOptions = {
   writerKey?: string | null;
 };
@@ -170,43 +170,10 @@ export type LixObserveEvents = {
             let execute_options = parse_execute_options(options, "execute").map_err(js_error)?;
             let result = self
                 .engine
-                .execute(&sql, &values, execute_options)
+                .execute_with_options(&sql, &values, execute_options)
                 .await
                 .map_err(js_error)?;
-            query_result_to_js(result).map_err(js_error)
-        }
-
-        #[wasm_bindgen(js_name = executeTransaction)]
-        pub async fn execute_transaction(
-            &self,
-            statements: JsValue,
-            options: Option<JsValue>,
-        ) -> Result<JsValue, JsValue> {
-            let statements = parse_transaction_statements(statements).map_err(js_error)?;
-            let execute_options =
-                parse_execute_options(options, "executeTransaction").map_err(js_error)?;
-            let mut transaction = self
-                .engine
-                .begin_transaction_with_options(execute_options)
-                .await
-                .map_err(js_error)?;
-            let mut last_result = EngineQueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            };
-
-            for statement in statements {
-                match transaction.execute(&statement.sql, &statement.params).await {
-                    Ok(result) => last_result = result,
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        return Err(js_error(error));
-                    }
-                }
-            }
-
-            transaction.commit().await.map_err(js_error)?;
-            query_result_to_js(last_result).map_err(js_error)
+            execute_result_to_js(result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = beginTransaction)]
@@ -424,7 +391,7 @@ export type LixObserveEvents = {
                 .execute_in_transaction_handle(self.handle, &sql, &values)
                 .await
                 .map_err(js_error)?;
-            query_result_to_js(result).map_err(js_error)
+            execute_result_to_js(result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = commit)]
@@ -671,62 +638,6 @@ export type LixObserveEvents = {
 
         let writer_key = read_optional_string_property_with_context(&input, "writerKey", context)?;
         Ok(ExecuteOptions { writer_key })
-    }
-
-    struct TransactionStatement {
-        sql: String,
-        params: Vec<EngineValue>,
-    }
-
-    fn parse_transaction_statements(input: JsValue) -> Result<Vec<TransactionStatement>, LixError> {
-        if !Array::is_array(&input) {
-            return Err(LixError {
-                code: "LIX_ERROR_JS_SDK".to_string(),
-                description: "executeTransaction statements must be an array".to_string(),
-            });
-        }
-
-        let values = Array::from(&input);
-        let mut parsed = Vec::with_capacity(values.length() as usize);
-
-        for (index, entry) in values.iter().enumerate() {
-            if !entry.is_object() {
-                return Err(LixError {
-                    code: "LIX_ERROR_JS_SDK".to_string(),
-                    description: format!(
-                        "executeTransaction statements[{index}] must be an object"
-                    ),
-                });
-            }
-
-            let sql = read_required_string_property(
-                &entry,
-                "sql",
-                &format!("executeTransaction statements[{index}]"),
-            )?;
-            let params =
-                Reflect::get(&entry, &JsValue::from_str("params")).map_err(js_to_lix_error)?;
-            let params = if params.is_null() || params.is_undefined() {
-                Vec::new()
-            } else if Array::is_array(&params) {
-                let mut values = Vec::new();
-                for value in Array::from(&params).iter() {
-                    values.push(value_from_js(value)?);
-                }
-                values
-            } else {
-                return Err(LixError {
-                    code: "LIX_ERROR_JS_SDK".to_string(),
-                    description: format!(
-                        "executeTransaction statements[{index}].params must be an array"
-                    ),
-                });
-            };
-
-            parsed.push(TransactionStatement { sql, params });
-        }
-
-        Ok(parsed)
     }
 
     fn read_optional_bool_property_with_context(
@@ -1404,6 +1315,16 @@ export type LixObserveEvents = {
         let obj = Object::new();
         let _ = Reflect::set(&obj, &JsValue::from_str("rows"), &rows);
         let _ = Reflect::set(&obj, &JsValue::from_str("columns"), &columns);
+        Ok(obj.into())
+    }
+
+    fn execute_result_to_js(result: EngineExecuteResult) -> Result<JsValue, LixError> {
+        let statements = Array::new();
+        for statement in result.statements {
+            statements.push(&query_result_to_js(statement)?);
+        }
+        let obj = Object::new();
+        let _ = Reflect::set(&obj, &JsValue::from_str("statements"), &statements);
         Ok(obj.into())
     }
 

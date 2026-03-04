@@ -727,17 +727,26 @@ fn verify_commit_state_hashes(
                     "failed to query replay state for verification: {err}"
                 ))
             })?;
+    let row_result = result.statements.first().ok_or_else(|| {
+        CliError::msg("failed to query replay state for verification: no statement result returned")
+    })?;
+    if result.statements.len() != 1 {
+        return Err(CliError::msg(format!(
+            "failed to query replay state for verification: expected exactly 1 statement result, got {}",
+            result.statements.len()
+        )));
+    }
 
-    if result.rows.len() != expected_state_by_id.len() {
+    if row_result.rows.len() != expected_state_by_id.len() {
         return Err(CliError::msg(format!(
             "state mismatch at {commit_sha}: row count differs (lix={}, expected={})",
-            result.rows.len(),
+            row_result.rows.len(),
             expected_state_by_id.len()
         )));
     }
 
     let mut seen = HashSet::<String>::new();
-    for (index, row) in result.rows.iter().enumerate() {
+    for (index, row) in row_result.rows.iter().enumerate() {
         if row.len() < 3 {
             return Err(CliError::msg(format!(
                 "state mismatch at {commit_sha}: row {index} has fewer than 3 columns"

@@ -1,4 +1,5 @@
 use super::*;
+use crate::errors;
 
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
 const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
@@ -27,7 +28,14 @@ impl Engine {
                     ExecuteOptions::default(),
                 )
                 .await?;
-            if !existing.rows.is_empty() {
+            let [statement] = existing.statements.as_slice() else {
+                return Err(errors::unexpected_statement_count_error(
+                    "builtin schema existence query",
+                    1,
+                    existing.statements.len(),
+                ));
+            };
+            if !statement.rows.is_empty() {
                 continue;
             }
 
@@ -105,7 +113,14 @@ impl Engine {
                     ExecuteOptions::default(),
                 )
                 .await?;
-            if !existing.rows.is_empty() {
+            let [statement] = existing.statements.as_slice() else {
+                return Err(errors::unexpected_statement_count_error(
+                    "global system directory existence query",
+                    1,
+                    existing.statements.len(),
+                ));
+            };
+            if !statement.rows.is_empty() {
                 continue;
             }
 
@@ -136,7 +151,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        for row in &existing.rows {
+        let [statement] = existing.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "default checkpoint label query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        for row in &statement.rows {
             let Some(Value::Text(row_entity_id)) = row.first() else {
                 continue;
             };
@@ -190,7 +212,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        let Some(first) = rows.rows.first() else {
+        let [statement] = rows.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "global version commit_id query",
+                1,
+                rows.statements.len(),
+            ));
+        };
+        let Some(first) = statement.rows.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "init invariant violation: global version pointer is missing"
@@ -220,7 +249,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        if !existing.rows.is_empty() {
+        let [statement] = existing.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "checkpoint label bootstrap link existence query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if !statement.rows.is_empty() {
             return Ok(());
         }
 
@@ -389,7 +425,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        if exists.rows.is_empty() {
+        let [statement] = exists.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "seed_boot_account existence query",
+                1,
+                exists.statements.len(),
+            ));
+        };
+        if statement.rows.is_empty() {
             self.execute_internal(
                 "INSERT INTO lix_internal_state_vtable (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
@@ -642,12 +685,19 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
+        let [statement] = versions.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "rebuild_internal_last_checkpoint query",
+                1,
+                versions.statements.len(),
+            ));
+        };
 
         self.backend
             .execute("DELETE FROM lix_internal_last_checkpoint", &[])
             .await?;
 
-        for row in &versions.rows {
+        for row in &statement.rows {
             let version_id = text_value(row.get(0), "lix_version.id")?;
             let commit_id = text_value(row.get(1), "lix_version.commit_id")?;
             let checkpoint_commit_id = self
@@ -712,7 +762,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        let Some(first) = rows.rows.first() else {
+        let [statement] = rows.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "resolve checkpoint ancestor query",
+                1,
+                rows.statements.len(),
+            ));
+        };
+        let Some(first) = statement.rows.first() else {
             return Ok(None);
         };
         Ok(Some(text_value(first.get(0), "checkpoint ancestor id")?))
@@ -737,7 +794,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        if !existing.rows.is_empty() {
+        let [statement] = existing.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "seed_bootstrap_commit existence query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if !statement.rows.is_empty() {
             return Ok(());
         }
 
@@ -780,7 +844,14 @@ impl Engine {
                 ExecuteOptions::default(),
             )
             .await?;
-        if !existing.rows.is_empty() {
+        let [statement] = existing.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "seed_bootstrap_change_set existence query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if !statement.rows.is_empty() {
             return Ok(());
         }
 
@@ -813,10 +884,16 @@ impl Engine {
                  WHERE id = $1 \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
-                ExecuteOptions::default(),
             )
             .await?;
-        let Some(row) = commit_row.rows.first() else {
+        let [statement] = commit_row.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "commit integrity commit query",
+                1,
+                commit_row.statements.len(),
+            ));
+        };
+        let Some(row) = statement.rows.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
@@ -848,10 +925,16 @@ impl Engine {
                  WHERE id = $1 \
                  LIMIT 1",
                 &[Value::Text(change_set_id.clone())],
-                ExecuteOptions::default(),
             )
             .await?;
-        if existing.rows.is_empty() {
+        let [statement] = existing.statements.as_slice() else {
+            return Err(errors::unexpected_statement_count_error(
+                "commit integrity change_set query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if statement.rows.is_empty() {
             return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                     "init invariant violation: commit '{commit_id}' references missing change_set '{change_set_id}'"
                 ),

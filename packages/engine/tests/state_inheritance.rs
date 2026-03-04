@@ -15,9 +15,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -93,12 +91,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "entity-inherited");
-        assert_text(&rows.rows[0][1], "version-child");
-        assert_text(&rows.rows[0][2], "global");
-        assert_text(&rows.rows[0][3], "{\"value\":\"global\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "entity-inherited");
+        assert_text(&rows.statements[0].rows[0][1], "version-child");
+        assert_text(&rows.statements[0].rows[0][2], "global");
+        assert_text(&rows.statements[0].rows[0][3], "{\"value\":\"global\"}");
     }
 );
 
@@ -147,11 +145,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "version-child");
-        assert_eq!(rows.rows[0][1], Value::Null);
-        assert_text(&rows.rows[0][2], "{\"value\":\"child\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "version-child");
+        assert_eq!(rows.statements[0].rows[0][1], Value::Null);
+        assert_text(&rows.statements[0].rows[0][2], "{\"value\":\"child\"}");
     }
 );
 
@@ -206,8 +204,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert!(rows.rows.is_empty());
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert!(rows.statements[0].rows.is_empty());
     }
 );
 
@@ -261,10 +259,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.rows.clone());
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "entity-global");
-        assert_text(&rows.rows[0][1], "global");
-        assert_text(&rows.rows[0][2], "{\"value\":\"global\"}");
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "entity-global");
+        assert_text(&rows.statements[0].rows[0][1], "global");
+        assert_text(&rows.statements[0].rows[0][2], "{\"value\":\"global\"}");
     }
 );

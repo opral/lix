@@ -62,7 +62,7 @@ impl Engine {
         handle: u64,
         sql: &str,
         params: &[Value],
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         let mut transaction = self.take_transaction_handle(handle)?;
         let result = transaction.execute(sql, params).await;
         self.put_transaction_handle(handle, transaction)?;

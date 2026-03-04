@@ -58,8 +58,8 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         )
         .await
         .expect("active version id query should succeed");
-    assert_eq!(result.rows.len(), 1);
-    as_text(&result.rows[0][0])
+    assert_eq!(result.statements[0].rows.len(), 1);
+    as_text(&result.statements[0].rows[0][0])
 }
 
 async fn rotate_working_commit(engine: &support::simulation_test::SimulationEngine) {
@@ -88,8 +88,8 @@ async fn active_version_pointer(engine: &support::simulation_test::SimulationEng
         )
         .await
         .expect("active version pointer query should succeed");
-    assert_eq!(result.rows.len(), 1);
-    as_text(&result.rows[0][0])
+    assert_eq!(result.statements[0].rows.len(), 1);
+    as_text(&result.statements[0].rows[0][0])
 }
 
 simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
@@ -122,13 +122,13 @@ simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
         .expect("working changes query should succeed");
     let tip_commit_id = active_version_pointer(&engine).await;
 
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(as_text(&result.rows[0][0]), "added");
-    assert_null(&result.rows[0][1]);
-    assert_non_empty_text(&result.rows[0][2]);
-    assert_not_working_projection_change_id(&result.rows[0][2]);
-    assert_null(&result.rows[0][3]);
-    assert_eq!(as_text(&result.rows[0][4]), tip_commit_id);
+    assert_eq!(result.statements[0].rows.len(), 1);
+    assert_eq!(as_text(&result.statements[0].rows[0][0]), "added");
+    assert_null(&result.statements[0].rows[0][1]);
+    assert_non_empty_text(&result.statements[0].rows[0][2]);
+    assert_not_working_projection_change_id(&result.statements[0].rows[0][2]);
+    assert_null(&result.statements[0].rows[0][3]);
+    assert_eq!(as_text(&result.statements[0].rows[0][4]), tip_commit_id);
 });
 
 simulation_test!(
@@ -169,21 +169,25 @@ simulation_test!(
              WHERE schema_key = 'lix_key_value' \
                AND file_id = 'lix' \
                AND entity_id = $1 \
-             LIMIT 1",
-                &[Value::Text(key)],
-            )
+             LIMIT 1", &[Value::Text(key)])
             .await
             .expect("working changes query should succeed");
         let tip_commit_id = active_version_pointer(&engine).await;
 
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(as_text(&result.rows[0][0]), "modified");
-        assert_non_empty_text(&result.rows[0][1]);
-        assert_non_empty_text(&result.rows[0][2]);
-        assert_not_working_projection_change_id(&result.rows[0][2]);
-        assert_ne!(as_text(&result.rows[0][1]), as_text(&result.rows[0][2]));
-        assert_eq!(as_text(&result.rows[0][3]), baseline_commit_id);
-        assert_eq!(as_text(&result.rows[0][4]), tip_commit_id);
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(as_text(&result.statements[0].rows[0][0]), "modified");
+        assert_non_empty_text(&result.statements[0].rows[0][1]);
+        assert_non_empty_text(&result.statements[0].rows[0][2]);
+        assert_not_working_projection_change_id(&result.statements[0].rows[0][2]);
+        assert_ne!(
+            as_text(&result.statements[0].rows[0][1]),
+            as_text(&result.statements[0].rows[0][2])
+        );
+        assert_eq!(
+            as_text(&result.statements[0].rows[0][3]),
+            baseline_commit_id
+        );
+        assert_eq!(as_text(&result.statements[0].rows[0][4]), tip_commit_id);
     }
 );
 
@@ -224,17 +228,15 @@ simulation_test!(
              WHERE schema_key = 'lix_key_value' \
                AND file_id = 'lix' \
                AND entity_id = $1 \
-             LIMIT 1",
-            &[Value::Text(key)],
-        )
+             LIMIT 1", &[Value::Text(key)])
         .await
         .expect("working changes query should succeed");
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(as_text(&result.rows[0][0]), "removed");
-        assert_non_empty_text(&result.rows[0][1]);
-        assert_null(&result.rows[0][2]);
-        assert_non_empty_text(&result.rows[0][3]);
-        assert_null(&result.rows[0][4]);
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(as_text(&result.statements[0].rows[0][0]), "removed");
+        assert_non_empty_text(&result.statements[0].rows[0][1]);
+        assert_null(&result.statements[0].rows[0][2]);
+        assert_non_empty_text(&result.statements[0].rows[0][3]);
+        assert_null(&result.statements[0].rows[0][4]);
     }
 );
 
@@ -273,7 +275,7 @@ simulation_test!(
             .await
             .expect("working changes query should succeed");
 
-        assert_eq!(result.rows.len(), 0);
+        assert_eq!(result.statements[0].rows.len(), 0);
     }
 );
 
@@ -306,9 +308,7 @@ simulation_test!(
                      ), (\
                      '{key_sql}', 'lix_key_value', 'lix', '{active_version_id_sql}', 'lix', '{{\"key\":\"{key_sql}\",\"value\":\"v3\"}}', '1'\
                      )"
-                ),
-                &[],
-            )
+                ), &[])
             .await
             .expect("duplicate internal writes should succeed");
 
@@ -324,8 +324,8 @@ simulation_test!(
             )
             .await
             .expect("tip change set query should succeed");
-        assert_eq!(tip_change_set.rows.len(), 1);
-        let tip_change_set_id = as_text(&tip_change_set.rows[0][0]);
+        assert_eq!(tip_change_set.statements[0].rows.len(), 1);
+        let tip_change_set_id = as_text(&tip_change_set.statements[0].rows[0][0]);
 
         let tip_entry_count = engine
             .execute(
@@ -340,7 +340,7 @@ simulation_test!(
             .await
             .expect("tip entry count query should succeed");
         assert_eq!(
-            as_i64(&tip_entry_count.rows[0][0]),
+            as_i64(&tip_entry_count.statements[0].rows[0][0]),
             1,
             "tip change set should collapse duplicate entries for one entity"
         );
@@ -358,13 +358,13 @@ simulation_test!(
             .expect("working changes query should succeed");
 
         assert_eq!(
-            result.rows.len(),
+            result.statements[0].rows.len(),
             1,
             "working changes should collapse multiple tip entries for one entity"
         );
-        assert_eq!(as_text(&result.rows[0][0]), "added");
-        assert_null(&result.rows[0][1]);
-        assert_non_empty_text(&result.rows[0][2]);
+        assert_eq!(as_text(&result.statements[0].rows[0][0]), "added");
+        assert_null(&result.statements[0].rows[0][1]);
+        assert_non_empty_text(&result.statements[0].rows[0][2]);
     }
 );
 
@@ -397,7 +397,7 @@ simulation_test!(
             )
             .await
             .expect("pre-checkpoint working changes query should succeed");
-        assert_eq!(as_i64(&before_count.rows[0][0]), 1);
+        assert_eq!(as_i64(&before_count.statements[0].rows[0][0]), 1);
 
         let checkpoint = engine
             .create_checkpoint()
@@ -415,7 +415,7 @@ simulation_test!(
             )
             .await
             .expect("post-checkpoint working changes query should succeed");
-        assert_eq!(as_i64(&after_count.rows[0][0]), 0);
+        assert_eq!(as_i64(&after_count.statements[0].rows[0][0]), 0);
 
         let checkpoint_count = engine
             .execute(
@@ -429,7 +429,7 @@ simulation_test!(
             )
             .await
             .expect("checkpoint change_set query should succeed");
-        assert_eq!(as_i64(&checkpoint_count.rows[0][0]), 1);
+        assert_eq!(as_i64(&checkpoint_count.statements[0].rows[0][0]), 1);
     }
 );
 
@@ -479,7 +479,7 @@ simulation_test!(
             .expect("working changes query should succeed");
 
         let mut status_by_entity = BTreeMap::new();
-        for row in &rows.rows {
+        for row in &rows.statements[0].rows {
             status_by_entity.insert(as_text(&row[0]), as_text(&row[1]));
         }
 
@@ -539,12 +539,12 @@ simulation_test!(
             .expect("working changes query should succeed");
 
         assert_eq!(
-            rows.rows.len(),
+            rows.statements[0].rows.len(),
             1,
             "earlier changed entity should remain visible after unrelated later commit"
         );
-        assert_eq!(as_text(&rows.rows[0][0]), target_key);
-        assert_eq!(as_text(&rows.rows[0][1]), "added");
+        assert_eq!(as_text(&rows.statements[0].rows[0][0]), target_key);
+        assert_eq!(as_text(&rows.statements[0].rows[0][1]), "added");
     }
 );
 
@@ -624,7 +624,7 @@ simulation_test!(
             .expect("branch working changes query should succeed");
 
         let mut branch_status_by_entity = BTreeMap::new();
-        for row in &branch_rows.rows {
+        for row in &branch_rows.statements[0].rows {
             branch_status_by_entity.insert(as_text(&row[0]), as_text(&row[1]));
         }
         assert_eq!(
@@ -676,7 +676,7 @@ simulation_test!(
             .expect("main working changes query should succeed");
 
         let mut main_status_by_entity = BTreeMap::new();
-        for row in &main_rows.rows {
+        for row in &main_rows.statements[0].rows {
             main_status_by_entity.insert(as_text(&row[0]), as_text(&row[1]));
         }
         assert_eq!(
@@ -729,8 +729,8 @@ simulation_test!(
             )
             .await
             .expect("file lookup should succeed");
-        assert_eq!(file.rows.len(), 1);
-        let file_id = as_text(&file.rows[0][0]);
+        assert_eq!(file.statements[0].rows.len(), 1);
+        let file_id = as_text(&file.statements[0].rows[0][0]);
 
         let before = engine
             .execute(
@@ -743,7 +743,7 @@ simulation_test!(
             )
             .await
             .expect("working changes query before reinit should succeed");
-        let before_count = as_i64(&before.rows[0][0]);
+        let before_count = as_i64(&before.statements[0].rows[0][0]);
         assert!(
             before_count > 0,
             "expected file insert to produce working changes before reinit"
@@ -766,7 +766,7 @@ simulation_test!(
             )
             .await
             .expect("working changes query after reinit should succeed");
-        let after_count = as_i64(&after.rows[0][0]);
+        let after_count = as_i64(&after.statements[0].rows[0][0]);
 
         assert!(
             after_count > 0,
@@ -787,9 +787,7 @@ simulation_test!(
         let file_path = format!("/{}.txt", unique_key("wc-view-nested-subquery"));
         engine
             .execute(
-                "INSERT INTO lix_file (path, data, metadata) VALUES ($1, lix_text_encode('hello'), NULL)",
-                &[Value::Text(file_path.clone())],
-            )
+                "INSERT INTO lix_file (path, data, metadata) VALUES ($1, lix_text_encode('hello'), NULL)", &[Value::Text(file_path.clone())])
             .await
             .expect("file insert should succeed");
 
@@ -803,8 +801,8 @@ simulation_test!(
             .await
             .expect("nested subquery filter over lix_file should succeed");
 
-        assert_eq!(rows.rows.len(), 1);
-        let count = as_i64(&rows.rows[0][0]);
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        let count = as_i64(&rows.statements[0].rows[0][0]);
         assert!(count >= 0, "count should be non-negative");
     }
 );

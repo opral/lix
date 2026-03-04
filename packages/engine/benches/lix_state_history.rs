@@ -130,11 +130,7 @@ fn bench_lix_state_history_count_by_root_commit(c: &mut Criterion) {
     c.bench_function("lix_state_history_count_by_root_commit", |b| {
         b.iter(|| {
             let result = runtime
-                .block_on(seed.engine.execute(
-                    HISTORY_COUNT_BY_ROOT_QUERY,
-                    &params,
-                    ExecuteOptions::default(),
-                ))
+                .block_on(seed.engine.execute(HISTORY_COUNT_BY_ROOT_QUERY, &params))
                 .expect("history count should succeed");
             let scalar = result
                 .rows
@@ -171,11 +167,10 @@ fn bench_lix_state_history_entity_timeline_scan(c: &mut Criterion) {
     c.bench_function("lix_state_history_entity_timeline_scan", |b| {
         b.iter(|| {
             let result = runtime
-                .block_on(seed.engine.execute(
-                    HISTORY_ENTITY_TIMELINE_SCAN_QUERY,
-                    &params,
-                    ExecuteOptions::default(),
-                ))
+                .block_on(
+                    seed.engine
+                        .execute(HISTORY_ENTITY_TIMELINE_SCAN_QUERY, &params),
+                )
                 .expect("history timeline scan should succeed");
             black_box(result.rows.len());
         });
@@ -202,11 +197,7 @@ fn bench_lix_state_history_plugin_runtime_query_exact(c: &mut Criterion) {
     c.bench_function("lix_state_history_plugin_runtime_query_exact", |b| {
         b.iter(|| {
             let result = runtime
-                .block_on(seed.engine.execute(
-                    PLUGIN_RUNTIME_HISTORY_QUERY,
-                    &params,
-                    ExecuteOptions::default(),
-                ))
+                .block_on(seed.engine.execute(PLUGIN_RUNTIME_HISTORY_QUERY, &params))
                 .expect("plugin runtime history query should succeed");
             black_box(result.rows.len());
         });
@@ -235,11 +226,10 @@ fn bench_lix_state_history_file_plugin_root_depth_range_timeline(c: &mut Criteri
         |b| {
             b.iter(|| {
                 let result = runtime
-                    .block_on(seed.engine.execute(
-                        HISTORY_FILE_PLUGIN_ROOT_DEPTH_RANGE_TIMELINE_QUERY,
-                        &params,
-                        ExecuteOptions::default(),
-                    ))
+                    .block_on(
+                        seed.engine
+                            .execute(HISTORY_FILE_PLUGIN_ROOT_DEPTH_RANGE_TIMELINE_QUERY, &params),
+                    )
                     .expect("file/plugin/root/depth timeline query should succeed");
                 black_box(result.rows.len());
             });
@@ -269,11 +259,10 @@ fn bench_lix_state_history_file_plugin_root_depth_between_0_and_10(c: &mut Crite
         |b| {
             b.iter(|| {
                 let result = runtime
-                    .block_on(seed.engine.execute(
-                        HISTORY_FILE_PLUGIN_ROOT_DEPTH_BETWEEN_0_10_QUERY,
-                        &params,
-                        ExecuteOptions::default(),
-                    ))
+                    .block_on(
+                        seed.engine
+                            .execute(HISTORY_FILE_PLUGIN_ROOT_DEPTH_BETWEEN_0_10_QUERY, &params),
+                    )
                     .expect("file/plugin/root/depth BETWEEN 0 AND 10 query should succeed");
                 black_box(result.rows.len());
             });
@@ -306,7 +295,6 @@ fn bench_lix_state_history_file_plugin_root_all_entities_at_depth(c: &mut Criter
                     .block_on(seed.engine.execute(
                         HISTORY_FILE_PLUGIN_ROOT_ALL_ENTITIES_AT_DEPTH_QUERY,
                         &params,
-                        ExecuteOptions::default(),
                     ))
                     .expect("file/plugin/root/all-entities-at-depth query should succeed");
                 black_box(result.rows.len());
@@ -337,11 +325,7 @@ fn bench_lix_state_history_plugin_runtime_query_exact_branchy_graph(c: &mut Crit
         |b| {
             b.iter(|| {
                 let result = runtime
-                    .block_on(seed.engine.execute(
-                        PLUGIN_RUNTIME_HISTORY_QUERY,
-                        &params,
-                        ExecuteOptions::default(),
-                    ))
+                    .block_on(seed.engine.execute(PLUGIN_RUNTIME_HISTORY_QUERY, &params))
                     .expect("plugin runtime branchy history query should succeed");
                 black_box(result.rows.len());
             });
@@ -376,11 +360,7 @@ fn bench_lix_state_history_plugin_runtime_scale_matrix(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("plugin_runtime_exact", label), |b| {
             b.iter(|| {
                 let result = runtime
-                    .block_on(seed.engine.execute(
-                        PLUGIN_RUNTIME_HISTORY_QUERY,
-                        &params,
-                        ExecuteOptions::default(),
-                    ))
+                    .block_on(seed.engine.execute(PLUGIN_RUNTIME_HISTORY_QUERY, &params))
                     .expect("plugin runtime history scale query should succeed");
                 black_box(result.rows.len());
             });
@@ -417,11 +397,7 @@ fn bench_lix_state_history_phase0_scale_tiers(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("plugin_runtime_exact", label), |b| {
             b.iter(|| {
                 let result = runtime
-                    .block_on(seed.engine.execute(
-                        PLUGIN_RUNTIME_HISTORY_QUERY,
-                        &params,
-                        ExecuteOptions::default(),
-                    ))
+                    .block_on(seed.engine.execute(PLUGIN_RUNTIME_HISTORY_QUERY, &params))
                     .expect("plugin runtime history phase0 tier query should succeed");
                 black_box(result.rows.len());
             });
@@ -528,13 +504,10 @@ async fn insert_stored_schema(engine: &lix_engine::Engine) -> Result<(), LixErro
         .execute(
             "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-             ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')",
-            &[
+             ) VALUES (?, 'lix_stored_schema', 'lix', 'global', 'lix', ?, '1')", &[
                 Value::Text(format!("{SCHEMA_KEY}~1")),
                 Value::Text(schema_snapshot),
-            ],
-            ExecuteOptions::default(),
-        )
+            ])
         .await?;
     Ok(())
 }
@@ -557,7 +530,6 @@ async fn insert_initial_rows(
                     Value::Text(FILE_ID.to_string()),
                     Value::Text(snapshot),
                 ],
-                ExecuteOptions::default(),
             )
             .await?;
     }
@@ -610,7 +582,7 @@ async fn apply_single_history_update(
         escape_sql_literal(SCHEMA_KEY),
         escape_sql_literal(FILE_ID),
     );
-    engine.execute(&sql, &[], ExecuteOptions::default()).await?;
+    engine.execute(&sql, &[]).await?;
     Ok(())
 }
 
@@ -665,7 +637,6 @@ async fn load_active_commit_tip(engine: &lix_engine::Engine) -> Result<CommitTip
              JOIN lix_version v ON v.id = av.version_id \
              LIMIT 1",
             &[],
-            ExecuteOptions::default(),
         )
         .await?;
     let row = result.rows.first().ok_or_else(|| LixError {
@@ -689,7 +660,6 @@ async fn load_active_version_id(engine: &lix_engine::Engine) -> Result<String, L
              FROM lix_active_version \
              LIMIT 1",
             &[],
-            ExecuteOptions::default(),
         )
         .await?;
     let value = result
@@ -717,7 +687,6 @@ async fn rewind_active_version_tip(
                 Value::Text(tip.commit_id.clone()),
                 Value::Text(active_version_id.to_string()),
             ],
-            ExecuteOptions::default(),
         )
         .await?;
     Ok(())
@@ -734,7 +703,6 @@ async fn ensure_commit_graph_is_branchy(engine: &lix_engine::Engine) -> Result<(
                HAVING COUNT(*) > 1\
              ) AS branch_parents",
             &[],
-            ExecuteOptions::default(),
         )
         .await?;
     let count = result
@@ -771,7 +739,6 @@ async fn load_depth_range_for_file_root(
                 Value::Text(PLUGIN_KEY.to_string()),
                 Value::Text(root_commit_id.to_string()),
             ],
-            ExecuteOptions::default(),
         )
         .await?;
     let max_depth = result
@@ -812,7 +779,6 @@ async fn load_commit_id_at_or_after_depth(
                 Value::Text(root_commit_id.to_string()),
                 Value::Integer(depth_floor),
             ],
-            ExecuteOptions::default(),
         )
         .await?;
     if let Some(value) = result.rows.first().and_then(|row| row.first()) {
@@ -896,7 +862,7 @@ fn emit_explain_query_plan(
 ) {
     let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
     let result = runtime
-        .block_on(engine.execute(&explain_sql, params, ExecuteOptions::default()))
+        .block_on(engine.execute(&explain_sql, params))
         .unwrap_or_else(|error| panic!("EXPLAIN QUERY PLAN failed for '{label}': {error:?}"));
     println!("[bench-explain] {label}");
     for row in &result.rows {

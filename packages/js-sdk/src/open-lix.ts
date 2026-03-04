@@ -8,18 +8,22 @@ import { createWasmSqliteBackend } from "./backend/wasm-sqlite.js";
 import type { LixWasmRuntime } from "./engine-wasm/index.js";
 import type {
 	LixBackend,
+	LixCanonicalExecuteResult,
 	LixCanonicalQueryResult,
 	LixCanonicalValue,
+	LixRuntimeExecuteResult,
 	LixRuntimeQueryResult,
 	LixRuntimeValue,
 } from "./types.js";
 
 export type {
 	LixBackend,
+	LixCanonicalExecuteResult,
 	LixCanonicalQueryResult,
 	LixCanonicalValue,
 	LixSqlDialect,
 	LixTransaction,
+	LixRuntimeExecuteResult,
 	LixRuntimeQueryResult,
 	LixRuntimeValue,
 } from "./types.js";
@@ -52,11 +56,6 @@ export type ObserveQuery = {
 	params?: ReadonlyArray<LixRuntimeValue>;
 };
 
-export type TransactionStatement = {
-	sql: string;
-	params?: ReadonlyArray<LixRuntimeValue>;
-};
-
 export type ExecuteOptions = {
 	writerKey?: string | null;
 };
@@ -65,7 +64,7 @@ export type SqlTransaction = {
 	execute(
 		sql: string,
 		params?: ReadonlyArray<LixRuntimeValue>,
-	): Promise<LixRuntimeQueryResult>;
+	): Promise<LixRuntimeExecuteResult>;
 	commit(): Promise<void>;
 	rollback(): Promise<void>;
 };
@@ -97,17 +96,13 @@ export type Lix = {
 		sql: string,
 		params?: ReadonlyArray<LixRuntimeValue>,
 		options?: ExecuteOptions,
-	): Promise<LixRuntimeQueryResult>;
+	): Promise<LixRuntimeExecuteResult>;
 	beginTransaction(options?: ExecuteOptions): Promise<SqlTransaction>;
 	transaction<T>(
 		options: ExecuteOptions,
 		f: (tx: SqlTransaction) => Promise<T>,
 	): Promise<T>;
 	transaction<T>(f: (tx: SqlTransaction) => Promise<T>): Promise<T>;
-	executeTransaction(
-		statements: ReadonlyArray<TransactionStatement>,
-		options?: ExecuteOptions,
-	): Promise<LixRuntimeQueryResult>;
 	observe(query: ObserveQuery): ObserveEvents;
 	createVersion(args?: CreateVersionOptions): Promise<CreateVersionResult>;
 	createCheckpoint(): Promise<CreateCheckpointResult>;
@@ -189,7 +184,7 @@ export async function openLix(
 		sql: string,
 		params: ReadonlyArray<LixRuntimeValue> = [],
 		options?: ExecuteOptions,
-	): Promise<LixCanonicalQueryResult> =>
+	): Promise<LixCanonicalExecuteResult> =>
 		(wasmLix as any).execute(
 			sql,
 			params.map((param) => encodeRuntimeSqlParam(param, "execute")),
@@ -222,10 +217,10 @@ export async function openLix(
 		sql: string,
 		params: ReadonlyArray<LixRuntimeValue> = [],
 		options?: ExecuteOptions,
-	): Promise<LixRuntimeQueryResult> => {
+	): Promise<LixRuntimeExecuteResult> => {
 		ensureOpen("execute");
 		const result = await runQueued(() => runExecute(sql, params, options));
-		return decodeCanonicalQueryResult(result);
+		return decodeCanonicalExecuteResult(result);
 	};
 
 	const beginTransaction = async (
@@ -263,7 +258,7 @@ export async function openLix(
 			execute: async (
 				sql: string,
 				params: ReadonlyArray<LixRuntimeValue> = [],
-			): Promise<LixRuntimeQueryResult> => {
+			): Promise<LixRuntimeExecuteResult> => {
 				if (transactionClosed) {
 					throw new Error("transaction is closed; execute() is unavailable");
 				}
@@ -278,7 +273,9 @@ export async function openLix(
 						encodeRuntimeSqlParam(param, "transaction.execute"),
 					),
 				);
-				return decodeCanonicalQueryResult(result as LixCanonicalQueryResult);
+				return decodeCanonicalExecuteResult(
+					result as LixCanonicalExecuteResult,
+				);
 			},
 			commit: async (): Promise<void> => {
 				if (transactionClosed) {
@@ -356,46 +353,6 @@ export async function openLix(
 			throw error;
 		}
 	}
-
-	const executeTransaction = async (
-		statements: ReadonlyArray<TransactionStatement>,
-		options?: ExecuteOptions,
-	): Promise<LixRuntimeQueryResult> => {
-		ensureOpen("executeTransaction");
-		if (!Array.isArray(statements)) {
-			throw new Error("executeTransaction requires an array of statements");
-		}
-		if (typeof (wasmLix as any).executeTransaction !== "function") {
-			throw new Error("executeTransaction is not available in this wasm build");
-		}
-
-		const encoded = statements.map((statement, index) => {
-			const sql = String(statement?.sql ?? "").trim();
-			if (sql.length === 0) {
-				throw new Error(`executeTransaction statement ${index} has empty sql`);
-			}
-			const params = statement?.params ?? [];
-			if (!Array.isArray(params)) {
-				throw new Error(
-					`executeTransaction statement ${index}.params must be an array`,
-				);
-			}
-			return {
-				sql,
-				params: params.map((param) =>
-					encodeRuntimeSqlParam(param, "executeTransaction"),
-				),
-			};
-		});
-
-		const result = await runQueued(() =>
-			(wasmLix as any).executeTransaction(
-				encoded,
-				normalizeExecuteOptions(options, "executeTransaction"),
-			),
-		);
-		return decodeCanonicalQueryResult(result as LixCanonicalQueryResult);
-	};
 
 	const observe = (query: ObserveQuery): ObserveEvents => {
 		ensureOpen("observe");
@@ -614,7 +571,6 @@ export async function openLix(
 		execute,
 		beginTransaction,
 		transaction,
-		executeTransaction,
 		observe,
 		createVersion,
 		createCheckpoint,
@@ -677,7 +633,7 @@ function isNodeRuntime(): boolean {
 
 function normalizeExecuteOptions(
 	options: ExecuteOptions | undefined,
-	methodName: "execute" | "executeTransaction" | "beginTransaction",
+	methodName: "execute" | "beginTransaction",
 ): ExecuteOptions | undefined {
 	if (options === undefined) {
 		return undefined;
@@ -714,7 +670,7 @@ function normalizeInitLixResult(result: unknown): InitLixResult {
 
 function encodeRuntimeSqlParam(
 	param: LixRuntimeValue,
-	context: "execute" | "executeTransaction" | "transaction.execute" | "observe",
+	context: "execute" | "transaction.execute" | "observe",
 ): Value {
 	if (param === null || param === undefined) {
 		return Value.null();
@@ -753,6 +709,17 @@ function decodeCanonicalQueryResult(
 				: [],
 		),
 		columns,
+	};
+}
+
+function decodeCanonicalExecuteResult(
+	result: LixCanonicalExecuteResult,
+): LixRuntimeExecuteResult {
+	const statements = Array.isArray(result?.statements) ? result.statements : [];
+	return {
+		statements: statements.map((statement) =>
+			decodeCanonicalQueryResult(statement),
+		),
 	};
 }
 

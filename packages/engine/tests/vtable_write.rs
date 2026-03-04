@@ -9,9 +9,7 @@ async fn register_test_schema(engine: &SimulationEngine) {
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 }
@@ -31,9 +29,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema',\
                  '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -43,24 +39,20 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
         let initial = engine
             .execute(
-                "SELECT snapshot_content FROM lix_internal_state_untracked WHERE entity_id = 'entity-1'",
-                &[],
-            )
+                "SELECT snapshot_content FROM lix_internal_state_untracked WHERE entity_id = 'entity-1'", &[])
             .await
             .unwrap();
 
-        sim.assert_deterministic(initial.rows.clone());
-        assert_eq!(initial.rows.len(), 1);
+        sim.assert_deterministic(initial.statements[0].rows.clone());
+        assert_eq!(initial.statements[0].rows.len(), 1);
         assert_eq!(
-            initial.rows[0][0],
+            initial.statements[0].rows[0][0],
             Value::Text("{\"key\":\"untracked\"}".to_string())
         );
 
@@ -75,14 +67,12 @@ simulation_test!(
 
         let updated = engine
         .execute(
-            "SELECT snapshot_content FROM lix_internal_state_untracked WHERE entity_id = 'entity-1'",
-            &[],
-        )
+            "SELECT snapshot_content FROM lix_internal_state_untracked WHERE entity_id = 'entity-1'", &[])
         .await
         .unwrap();
 
         assert_eq!(
-            updated.rows[0][0],
+            updated.statements[0].rows[0][0],
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
 
@@ -92,9 +82,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -107,19 +95,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(read.rows.clone());
-        assert_eq!(read.rows.len(), 1);
+        sim.assert_deterministic_normalized(read.statements[0].rows.clone());
+        assert_eq!(read.statements[0].rows.len(), 1);
         assert_eq!(
-            read.rows[0][0],
+            read.statements[0].rows[0][0],
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
-        assert_boolean_like(&read.rows[0][1], true);
+        assert_boolean_like(&read.statements[0].rows[0][1], true);
 
         engine
             .execute(
-                "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = true",
-                &[],
-            )
+                "DELETE FROM lix_internal_state_vtable WHERE entity_id = 'entity-1' AND untracked = true", &[])
             .await
             .unwrap();
 
@@ -131,7 +117,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(remaining.rows[0][0], Value::Integer(0));
+        assert_eq!(remaining.statements[0].rows[0][0], Value::Integer(0));
     }
 );
 
@@ -148,9 +134,7 @@ simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema',\
                  '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-                 )",
-            &[],
-        )
+                 )", &[])
         .await
         .unwrap();
 
@@ -160,9 +144,7 @@ simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -175,8 +157,11 @@ simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(vtable.rows.len(), 1);
-    assert_eq!(vtable.rows[0][0], Value::Text("untracked".to_string()));
+    assert_eq!(vtable.statements[0].rows.len(), 1);
+    assert_eq!(
+        vtable.statements[0].rows[0][0],
+        Value::Text("untracked".to_string())
+    );
 });
 
 simulation_test!(
@@ -196,9 +181,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, untracked\
                  ) VALUES (\
                  'entity-meta-untracked', 'test_schema', 'file-1', 'main', 'lix', '{\"key\":\"untracked-meta\"}', '1', '{\"source\":\"local\"}', true\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -212,9 +195,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(vtable_before.rows.len(), 1);
+        assert_eq!(vtable_before.statements[0].rows.len(), 1);
         assert_eq!(
-            vtable_before.rows[0][0],
+            vtable_before.statements[0].rows[0][0],
             Value::Text("{\"source\":\"local\"}".to_string())
         );
 
@@ -229,9 +212,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(by_version_before.rows.len(), 1);
+        assert_eq!(by_version_before.statements[0].rows.len(), 1);
         assert_eq!(
-            by_version_before.rows[0][0],
+            by_version_before.statements[0].rows[0][0],
             Value::Text("{\"source\":\"local\"}".to_string())
         );
 
@@ -257,9 +240,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(vtable_after.rows.len(), 1);
+        assert_eq!(vtable_after.statements[0].rows.len(), 1);
         assert_eq!(
-            vtable_after.rows[0][0],
+            vtable_after.statements[0].rows[0][0],
             Value::Text("{\"source\":\"updated\",\"retries\":1}".to_string())
         );
 
@@ -274,9 +257,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(by_version_after.rows.len(), 1);
+        assert_eq!(by_version_after.statements[0].rows.len(), 1);
         assert_eq!(
-            by_version_after.rows[0][0],
+            by_version_after.statements[0].rows[0][0],
             Value::Text("{\"source\":\"updated\",\"retries\":1}".to_string())
         );
     }
@@ -300,9 +283,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -314,9 +295,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(changes.rows.len(), 1);
+        assert_eq!(changes.statements[0].rows.len(), 1);
 
-        let snapshot_id = match &changes.rows[0][0] {
+        let snapshot_id = match &changes.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected snapshot id"),
         };
@@ -332,9 +313,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(snapshots.rows.len(), 1);
+        assert_eq!(snapshots.statements[0].rows.len(), 1);
         assert_eq!(
-            snapshots.rows[0][0],
+            snapshots.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
 
@@ -348,9 +329,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(materialized.rows.len(), 1);
+        assert_eq!(materialized.statements[0].rows.len(), 1);
         assert_eq!(
-            materialized.rows[0][0],
+            materialized.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
     }
@@ -373,9 +354,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata\
                  ) VALUES (\
                  'entity-meta', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1', '{\"source\":\"import\"}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -388,9 +367,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(vtable.rows.len(), 1);
+        assert_eq!(vtable.statements[0].rows.len(), 1);
         assert_eq!(
-            vtable.rows[0][0],
+            vtable.statements[0].rows[0][0],
             Value::Text("{\"source\":\"import\"}".to_string())
         );
 
@@ -403,9 +382,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(changes.rows.len(), 1);
+        assert_eq!(changes.statements[0].rows.len(), 1);
         assert_eq!(
-            changes.rows[0][0],
+            changes.statements[0].rows[0][0],
             Value::Text("{\"source\":\"import\"}".to_string())
         );
     }
@@ -426,8 +405,7 @@ simulation_test!(
         .execute(
             "INSERT INTO lix_internal_state_vtable (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)", &[
                 Value::Text("entity-1".to_string()),
                 Value::Text("test_schema".to_string()),
                 Value::Text("file-1".to_string()),
@@ -435,8 +413,7 @@ simulation_test!(
                 Value::Text("lix".to_string()),
                 Value::Text("{\"key\":\"tracked-param\"}".to_string()),
                 Value::Text("1".to_string()),
-            ],
-        )
+            ])
         .await
         .unwrap();
 
@@ -450,9 +427,9 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(materialized.rows.len(), 1);
+        assert_eq!(materialized.statements[0].rows.len(), 1);
         assert_eq!(
-            materialized.rows[0][0],
+            materialized.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked-param\"}".to_string())
         );
     }
@@ -473,9 +450,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -484,9 +459,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"2\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -496,9 +469,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"initial\"}', '1'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -508,9 +479,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'other', '{\"key\":\"updated\"}', '2'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -520,20 +489,21 @@ simulation_test!(
              WHERE schema_key = 'test_schema' \
                AND entity_id = 'entity-1' \
                AND file_id = 'file-1' \
-               AND version_id = 'version-1'",
-                &[],
-            )
+               AND version_id = 'version-1'", &[])
             .await
             .unwrap();
 
-        assert_eq!(stored.rows.len(), 1);
-        assert_eq!(stored.rows[0][0], Value::Text("2".to_string()));
+        assert_eq!(stored.statements[0].rows.len(), 1);
         assert_eq!(
-            stored.rows[0][1],
+            stored.statements[0].rows[0][0],
+            Value::Text("2".to_string())
+        );
+        assert_eq!(
+            stored.statements[0].rows[0][1],
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
 
-        let change_id = match &stored.rows[0][2] {
+        let change_id = match &stored.statements[0].rows[0][2] {
             Value::Text(value) => value.clone(),
             other => panic!("expected change_id text, got {other:?}"),
         };
@@ -547,8 +517,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(change.rows.len(), 1);
-        assert_eq!(change.rows[0][0], Value::Text("other".to_string()));
+        assert_eq!(change.statements[0].rows.len(), 1);
+        assert_eq!(
+            change.statements[0].rows[0][0],
+            Value::Text("other".to_string())
+        );
     }
 );
 
@@ -568,9 +541,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema',\
                  '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -579,9 +550,7 @@ simulation_test!(
                 "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
                  'lix_stored_schema',\
                  '{\"value\":{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"2\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}}'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -591,9 +560,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
                  ) VALUES (\
                  'entity-all-cols', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"initial\"}', '1', '{\"source\":\"old\"}', 'writer:old'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -621,10 +588,10 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tombstone.rows.len(), 1);
-        assert_eq!(tombstone.rows[0][0], Value::Integer(1));
-        assert_eq!(tombstone.rows[0][1], Value::Null);
-        let tombstone_updated_at = match &tombstone.rows[0][2] {
+        assert_eq!(tombstone.statements[0].rows.len(), 1);
+        assert_eq!(tombstone.statements[0].rows[0][0], Value::Integer(1));
+        assert_eq!(tombstone.statements[0].rows[0][1], Value::Null);
+        let tombstone_updated_at = match &tombstone.statements[0].rows[0][2] {
             Value::Text(value) => value.clone(),
             other => panic!("expected tombstone updated_at text, got {other:?}"),
         };
@@ -635,9 +602,7 @@ simulation_test!(
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
                  ) VALUES (\
                  'entity-all-cols', 'test_schema', 'file-1', 'version-1', 'other', '{\"key\":\"updated\"}', '2', '{\"source\":\"new\"}', 'writer:new'\
-                 )",
-                &[],
-            )
+                 )", &[])
             .await
             .unwrap();
 
@@ -648,30 +613,37 @@ simulation_test!(
                  WHERE entity_id = 'entity-all-cols' \
                    AND file_id = 'file-1' \
                    AND version_id = 'version-1' \
-                 LIMIT 1",
-                &[],
-            )
+                 LIMIT 1", &[])
             .await
             .unwrap();
 
-        assert_eq!(stored.rows.len(), 1);
-        assert_eq!(stored.rows[0][0], Value::Text("2".to_string()));
-        assert_eq!(stored.rows[0][1], Value::Text("other".to_string()));
+        assert_eq!(stored.statements[0].rows.len(), 1);
         assert_eq!(
-            stored.rows[0][2],
+            stored.statements[0].rows[0][0],
+            Value::Text("2".to_string())
+        );
+        assert_eq!(
+            stored.statements[0].rows[0][1],
+            Value::Text("other".to_string())
+        );
+        assert_eq!(
+            stored.statements[0].rows[0][2],
             Value::Text("{\"key\":\"updated\"}".to_string())
         );
         assert_eq!(
-            stored.rows[0][3],
+            stored.statements[0].rows[0][3],
             Value::Text("{\"source\":\"new\"}".to_string())
         );
-        assert_eq!(stored.rows[0][4], Value::Text("writer:new".to_string()));
-        assert_eq!(stored.rows[0][5], Value::Integer(0));
-        let change_id = match &stored.rows[0][6] {
+        assert_eq!(
+            stored.statements[0].rows[0][4],
+            Value::Text("writer:new".to_string())
+        );
+        assert_eq!(stored.statements[0].rows[0][5], Value::Integer(0));
+        let change_id = match &stored.statements[0].rows[0][6] {
             Value::Text(value) => value.clone(),
             other => panic!("expected change_id text, got {other:?}"),
         };
-        let updated_at = match &stored.rows[0][7] {
+        let updated_at = match &stored.statements[0].rows[0][7] {
             Value::Text(value) => value.clone(),
             other => panic!("expected updated_at text, got {other:?}"),
         };
@@ -687,10 +659,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(change.rows.len(), 1);
-        assert_eq!(change.rows[0][0], Value::Text("other".to_string()));
+        assert_eq!(change.statements[0].rows.len(), 1);
         assert_eq!(
-            change.rows[0][1],
+            change.statements[0].rows[0][0],
+            Value::Text("other".to_string())
+        );
+        assert_eq!(
+            change.statements[0].rows[0][1],
             Value::Text("{\"source\":\"new\"}".to_string())
         );
     }
@@ -709,15 +684,13 @@ simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
         .execute(
             "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              SELECT entity_id, $1, $2, $3, $4, payload, $5 \
-             FROM (SELECT 'entity-1' AS entity_id, '{\"key\":\"from-select\"}' AS payload) source_rows",
-            &[
+             FROM (SELECT 'entity-1' AS entity_id, '{\"key\":\"from-select\"}' AS payload) source_rows", &[
                 Value::Text("test_schema".to_string()),
                 Value::Text("file-1".to_string()),
                 Value::Text("version-1".to_string()),
                 Value::Text("lix".to_string()),
                 Value::Text("1".to_string()),
-            ],
-        )
+            ])
         .await
         .unwrap();
 
@@ -731,9 +704,9 @@ simulation_test!(tracked_insert_select_uses_resolved_rows, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(materialized.rows.len(), 1);
+    assert_eq!(materialized.statements[0].rows.len(), 1);
     assert_eq!(
-        materialized.rows[0][0],
+        materialized.statements[0].rows[0][0],
         Value::Text("{\"key\":\"from-select\"}".to_string())
     );
 });
@@ -751,15 +724,13 @@ simulation_test!(tracked_insert_select_zero_rows_is_noop, |sim| async move {
         .execute(
             "INSERT INTO lix_internal_state_vtable (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              SELECT entity_id, $1, $2, $3, $4, payload, $5 \
-             FROM (SELECT 'entity-1' AS entity_id, '{\"key\":\"from-select\"}' AS payload WHERE 0 = 1) source_rows",
-            &[
+             FROM (SELECT 'entity-1' AS entity_id, '{\"key\":\"from-select\"}' AS payload WHERE 0 = 1) source_rows", &[
                 Value::Text("test_schema".to_string()),
                 Value::Text("file-1".to_string()),
                 Value::Text("version-1".to_string()),
                 Value::Text("lix".to_string()),
                 Value::Text("1".to_string()),
-            ],
-        )
+            ])
         .await;
 
     assert!(result.is_ok(), "{result:?}");
@@ -772,7 +743,7 @@ simulation_test!(tracked_insert_select_zero_rows_is_noop, |sim| async move {
         )
         .await
         .unwrap();
-    assert_eq!(count.rows[0][0], Value::Integer(0));
+    assert_eq!(count.statements[0].rows[0][0], Value::Integer(0));
 });
 
 simulation_test!(
@@ -793,9 +764,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-2', 'test_schema', 'file-1', 'version-1', 'lix', NULL, '1'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -807,8 +776,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(changes.rows.len(), 1);
-        assert_eq!(changes.rows[0][0], Value::Text("no-content".to_string()));
+        assert_eq!(changes.statements[0].rows.len(), 1);
+        assert_eq!(
+            changes.statements[0].rows[0][0],
+            Value::Text("no-content".to_string())
+        );
     }
 );
 
@@ -828,9 +800,7 @@ simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-             )",
-                &[],
-            )
+             )", &[])
             .await
             .unwrap();
 
@@ -842,8 +812,8 @@ simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(change.rows.len(), 1);
-    let change_id = match &change.rows[0][0] {
+    assert_eq!(change.statements[0].rows.len(), 1);
+    let change_id = match &change.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         _ => panic!("expected change id"),
     };
@@ -857,8 +827,8 @@ simulation_test!(tracked_state_change_id_matches_vtable, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(vtable.rows.len(), 1);
-    assert_eq!(vtable.rows[0][0], Value::Text(change_id));
+    assert_eq!(vtable.statements[0].rows.len(), 1);
+    assert_eq!(vtable.statements[0].rows[0][0], Value::Text(change_id));
 });
 
 simulation_test!(tracked_update_creates_change_row, |sim| async move {
@@ -877,18 +847,14 @@ simulation_test!(tracked_update_creates_change_row, |sim| async move {
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
     engine
         .execute(
             "UPDATE lix_internal_state_vtable SET snapshot_content = '{\"key\":\"updated\"}' \
-             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'",
-            &[],
-        )
+             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
         .await
         .unwrap();
 
@@ -901,13 +867,13 @@ simulation_test!(tracked_update_creates_change_row, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(vtable.rows.len(), 1);
+    assert_eq!(vtable.statements[0].rows.len(), 1);
     assert_eq!(
-        vtable.rows[0][1],
+        vtable.statements[0].rows[0][1],
         Value::Text("{\"key\":\"updated\"}".to_string())
     );
 
-    let change_id = match &vtable.rows[0][0] {
+    let change_id = match &vtable.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         _ => panic!("expected change id"),
     };
@@ -923,8 +889,8 @@ simulation_test!(tracked_update_creates_change_row, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(change.rows.len(), 1);
-    let snapshot_id = match &change.rows[0][0] {
+    assert_eq!(change.statements[0].rows.len(), 1);
+    let snapshot_id = match &change.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         _ => panic!("expected snapshot id"),
     };
@@ -940,9 +906,9 @@ simulation_test!(tracked_update_creates_change_row, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.statements[0].rows.len(), 1);
     assert_eq!(
-        snapshot.rows[0][0],
+        snapshot.statements[0].rows[0][0],
         Value::Text("{\"key\":\"updated\"}".to_string())
     );
 });
@@ -965,18 +931,14 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
         engine
         .execute(
             "DELETE FROM lix_internal_state_vtable \
-             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'",
-            &[],
-        )
+             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
         .await
         .unwrap();
 
@@ -991,10 +953,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(materialized.rows.len(), 1);
-        assert_eq!(materialized.rows[0][0], Value::Null);
+        assert_eq!(materialized.statements[0].rows.len(), 1);
+        assert_eq!(materialized.statements[0].rows[0][0], Value::Null);
 
-        let change_id = match &materialized.rows[0][1] {
+        let change_id = match &materialized.statements[0].rows[0][1] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected change id"),
         };
@@ -1010,8 +972,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(change.rows.len(), 1);
-        assert_eq!(change.rows[0][0], Value::Text("no-content".to_string()));
+        assert_eq!(change.statements[0].rows.len(), 1);
+        assert_eq!(
+            change.statements[0].rows[0][0],
+            Value::Text("no-content".to_string())
+        );
     }
 );
 
@@ -1033,9 +998,7 @@ simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"one\"}', '1'\
              ), (\
              'entity-2', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"two\"}', '1'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
@@ -1048,11 +1011,11 @@ simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(changes.rows.len(), 2);
+    assert_eq!(changes.statements[0].rows.len(), 2);
 
     let mut change_map: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
-    for row in changes.rows {
+    for row in &changes.statements[0].rows {
         let change_id = match &row[0] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected change id"),
@@ -1085,8 +1048,11 @@ simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
             )
             .await
             .unwrap();
-        assert_eq!(snapshot.rows.len(), 1);
-        assert_eq!(snapshot.rows[0][0], Value::Text(content.to_string()));
+        assert_eq!(snapshot.statements[0].rows.len(), 1);
+        assert_eq!(
+            snapshot.statements[0].rows[0][0],
+            Value::Text(content.to_string())
+        );
     }
 
     let materialized = engine
@@ -1100,8 +1066,8 @@ simulation_test!(tracked_multi_row_insert_creates_changes, |sim| async move {
         .await
         .unwrap();
 
-    assert_eq!(materialized.rows.len(), 2);
-    for row in materialized.rows {
+    assert_eq!(materialized.statements[0].rows.len(), 2);
+    for row in &materialized.statements[0].rows {
         let entity_id = match &row[0] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected entity id"),
@@ -1143,18 +1109,14 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1'\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
         engine
         .execute(
             "UPDATE lix_internal_state_vtable SET snapshot_content = NULL \
-             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'",
-            &[],
-        )
+             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = 'version-1'", &[])
         .await
         .unwrap();
 
@@ -1167,10 +1129,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(vtable.rows.len(), 1);
-        assert_eq!(vtable.rows[0][1], Value::Null);
+        assert_eq!(vtable.statements[0].rows.len(), 1);
+        assert_eq!(vtable.statements[0].rows[0][1], Value::Null);
 
-        let change_id = match &vtable.rows[0][0] {
+        let change_id = match &vtable.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected change id"),
         };
@@ -1186,8 +1148,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(change.rows.len(), 1);
-        assert_eq!(change.rows[0][0], Value::Text("no-content".to_string()));
+        assert_eq!(change.statements[0].rows.len(), 1);
+        assert_eq!(
+            change.statements[0].rows[0][0],
+            Value::Text("no-content".to_string())
+        );
     }
 );
 
@@ -1211,20 +1176,16 @@ simulation_test!(
              'entity-1', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked\"}', '1', false\
              ), (\
              'entity-2', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked\"}', '1', true\
-             )",
-            &[],
-        )
+             )", &[])
         .await
         .unwrap();
 
         let change_count = engine
         .execute(
-            "SELECT COUNT(*) FROM lix_internal_change WHERE entity_id IN ('entity-1', 'entity-2')",
-            &[],
-        )
+            "SELECT COUNT(*) FROM lix_internal_change WHERE entity_id IN ('entity-1', 'entity-2')", &[])
         .await
         .unwrap();
-        assert_eq!(change_count.rows[0][0], Value::Integer(1));
+        assert_eq!(change_count.statements[0].rows[0][0], Value::Integer(1));
 
         let tracked_change = engine
             .execute(
@@ -1233,8 +1194,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tracked_change.rows.len(), 1);
-        let snapshot_id = match &tracked_change.rows[0][0] {
+        assert_eq!(tracked_change.statements[0].rows.len(), 1);
+        let snapshot_id = match &tracked_change.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             _ => panic!("expected snapshot id"),
         };
@@ -1249,9 +1210,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.statements[0].rows.len(), 1);
         assert_eq!(
-            snapshot.rows[0][0],
+            snapshot.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
 
@@ -1264,9 +1225,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tracked_materialized.rows.len(), 1);
+        assert_eq!(tracked_materialized.statements[0].rows.len(), 1);
         assert_eq!(
-            tracked_materialized.rows[0][0],
+            tracked_materialized.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked\"}".to_string())
         );
 
@@ -1278,9 +1239,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(untracked.rows.len(), 1);
+        assert_eq!(untracked.statements[0].rows.len(), 1);
         assert_eq!(
-            untracked.rows[0][0],
+            untracked.statements[0].rows[0][0],
             Value::Text("{\"key\":\"untracked\"}".to_string())
         );
     }

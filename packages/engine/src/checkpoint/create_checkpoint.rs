@@ -1,4 +1,4 @@
-use crate::{Engine, EngineTransaction, ExecuteOptions, LixError, Value};
+use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateCheckpointResult {
@@ -27,7 +27,19 @@ async fn create_checkpoint_in_transaction(
             &[],
         )
         .await?;
-    let row = first_row(&version_row, "active version row")?;
+    let [statement] = version_row.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "active version query",
+            1,
+            version_row.statements.len(),
+        ));
+    };
+    let [row] = statement.rows.as_slice() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "missing active version row".to_string(),
+        });
+    };
     let version_id = text_at(row, 0, "version_id")?;
     let commit_id = text_at(row, 1, "commit_id")?;
 
@@ -76,7 +88,14 @@ async fn load_commit(
             &[Value::Text(commit_id.to_string())],
         )
         .await?;
-    let Some(row) = result.rows.first() else {
+    let [statement] = result.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "load commit query",
+            1,
+            result.statements.len(),
+        ));
+    };
+    let Some(row) = statement.rows.first() else {
         return Ok(None);
     };
     Ok(Some(CommitRow {
@@ -105,7 +124,14 @@ async fn ensure_checkpoint_label_on_commit(
             ],
         )
         .await?;
-    if !exists.rows.is_empty() {
+    let [statement] = exists.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "entity label existence query",
+            1,
+            exists.statements.len(),
+        ));
+    };
+    if !statement.rows.is_empty() {
         return Ok(());
     }
 
@@ -151,7 +177,14 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
             &[],
         )
         .await?;
-    for row in &result.rows {
+    let [statement] = result.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "checkpoint label lookup query",
+            1,
+            result.statements.len(),
+        ));
+    };
+    for row in &statement.rows {
         let snapshot_content = text_at(row, 0, "snapshot_content")?;
         let parsed: serde_json::Value =
             serde_json::from_str(&snapshot_content).map_err(|error| LixError {
@@ -173,17 +206,6 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "checkpoint label row is missing in global version".to_string(),
     })
-}
-
-fn first_row<'a>(result: &'a crate::QueryResult, context: &str) -> Result<&'a [Value], LixError> {
-    result
-        .rows
-        .first()
-        .map(std::vec::Vec::as_slice)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("missing {context}"),
-        })
 }
 
 fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {

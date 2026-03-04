@@ -61,7 +61,7 @@ async function main() {
         "SELECT name, SUM(pgsize) AS bytes, COUNT(*) AS pages FROM dbstat GROUP BY name ORDER BY bytes DESC LIMIT 20",
         [],
       );
-      dbstatByObject = (dbstatResult.rows ?? []).map((row) => ({
+      dbstatByObject = statementRows(dbstatResult).map((row) => ({
         name: scalarToString(row?.[0], "dbstat.name"),
         bytes: scalarToNumber(row?.[1], "dbstat.bytes"),
         pages: scalarToNumber(row?.[2], "dbstat.pages"),
@@ -76,7 +76,7 @@ async function main() {
         "SELECT schema_key, COUNT(*) AS row_count FROM lix_internal_change GROUP BY schema_key ORDER BY row_count DESC LIMIT 20",
         [],
       );
-      topChangeSchemas = (changeSchemaResult.rows ?? []).map((row) => ({
+      topChangeSchemas = statementRows(changeSchemaResult).map((row) => ({
         schemaKey: scalarToString(row?.[0], "schema_key"),
         rowCount: scalarToNumber(row?.[1], "row_count"),
       }));
@@ -123,14 +123,18 @@ async function main() {
 
 async function queryColumnText(lix, sql, context) {
   const result = await lix.execute(sql, []);
-  return (result.rows ?? []).map((row, index) =>
+  return statementRows(result).map((row, index) =>
     scalarToString(row?.[0], `${context}[${index}]`),
   );
 }
 
 async function queryScalarNumber(lix, sql, context) {
   const result = await lix.execute(sql, []);
-  return scalarToNumber(result.rows?.[0]?.[0], context);
+  return scalarToNumber(statementRows(result)?.[0]?.[0], context);
+}
+
+function statementRows(result, statementIndex = 0) {
+  return result?.statements?.[statementIndex]?.rows ?? [];
 }
 
 function scalarToNumber(value, context) {

@@ -13,6 +13,13 @@ async function createInitializedLix(args?: {
 	return await openLix({ backend });
 }
 
+function statementRows(
+	result: { statements: Array<{ rows: unknown[][] }> },
+	statementIndex = 0,
+): unknown[][] {
+	return result.statements[statementIndex]?.rows ?? [];
+}
+
 test("openLix rejects when backend is not initialized", async () => {
 	const backend = await createWasmSqliteBackend();
 	await expect(openLix({ backend })).rejects.toThrow(/NOT_INITIALIZED/i);
@@ -113,9 +120,10 @@ function createStoredZip(
 test("openLix executes SQL against default in-memory sqlite backend", async () => {
 	const lix = await openLix();
 	const result = await lix.execute("SELECT 1 + 1", []);
+	const rows = statementRows(result);
 
-	expect(result.rows.length).toBe(1);
-	expect(result.rows[0][0]).toBe(2);
+	expect(rows.length).toBe(1);
+	expect(rows[0]?.[0]).toBe(2);
 	await lix.close();
 });
 
@@ -141,8 +149,9 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 	const active = await lix.execute(
 		"SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
 	);
-	expect(active.rows.length).toBe(1);
-	expect(active.rows[0][0]).toBe(created.id);
+	const activeRows = statementRows(active);
+	expect(activeRows.length).toBe(1);
+	expect(activeRows[0]?.[0]).toBe(created.id);
 	await lix.close();
 });
 
@@ -168,11 +177,12 @@ test("createVersion forwards inheritsFromVersionId and hidden options", async ()
      LIMIT 1",
 		["branch-options"],
 	);
-	expect(row.rows.length).toBe(1);
-	expect(row.rows[0][0]).toBe("branch-options");
-	expect(row.rows[0][1]).toBe("Branch Options");
-	expect(row.rows[0][2]).toBe("global");
-	expect(row.rows[0][3]).toBe("true");
+	const rowValues = statementRows(row);
+	expect(rowValues.length).toBe(1);
+	expect(rowValues[0]?.[0]).toBe("branch-options");
+	expect(rowValues[0]?.[1]).toBe("Branch Options");
+	expect(rowValues[0]?.[2]).toBe("global");
+	expect(rowValues[0]?.[3]).toBe("true");
 
 	await lix.close();
 });
@@ -195,31 +205,26 @@ test("createCheckpoint returns checkpoint metadata and rotates working pointer",
      ORDER BY av.id LIMIT 1",
 		[],
 	);
-	expect(version.rows.length).toBe(1);
-	expect(version.rows[0][1]).toBe(checkpoint.id);
+	const versionRows = statementRows(version);
+	expect(versionRows.length).toBe(1);
+	expect(versionRows[0]?.[1]).toBe(checkpoint.id);
 
 	await lix.close();
 });
 
-test("executeTransaction applies multiple statements in one call", async () => {
+test("execute applies multiple statements in one call", async () => {
 	const lix = await createInitializedLix();
 
-	await lix.executeTransaction([
-		{
-			sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
-			params: ["tx-batch-a", "value-a"],
-		},
-		{
-			sql: "INSERT INTO lix_key_value (key, value) VALUES (?, ?)",
-			params: ["tx-batch-b", "value-b"],
-		},
-	]);
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ('tx-batch-a', 'value-a'); \
+	 INSERT INTO lix_key_value (key, value) VALUES ('tx-batch-b', 'value-b');",
+	);
 
 	const values = await lix.execute(
 		"SELECT key, value FROM lix_key_value WHERE key IN (?1, ?2) ORDER BY key",
 		["tx-batch-a", "tx-batch-b"],
 	);
-	expect(values.rows.length).toBe(2);
+	expect(statementRows(values).length).toBe(2);
 
 	await lix.close();
 });
@@ -236,8 +241,9 @@ test("execute accepts explicit BEGIN/COMMIT wrappers", async () => {
 		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
 		["js-sdk-begin-commit"],
 	);
-	expect(value.rows.length).toBe(1);
-	expect(value.rows[0][0]).toBe("ok");
+	const valueRows = statementRows(value);
+	expect(valueRows.length).toBe(1);
+	expect(valueRows[0]?.[0]).toBe("ok");
 
 	await lix.close();
 });
@@ -256,7 +262,7 @@ test("beginTransaction commits and rollbacks explicitly", async () => {
 		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
 		["tx-explicit-commit"],
 	);
-	expect(committed.rows.length).toBe(1);
+	expect(statementRows(committed).length).toBe(1);
 
 	const tx2 = await lix.beginTransaction();
 	await tx2.execute("INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)", [
@@ -269,7 +275,7 @@ test("beginTransaction commits and rollbacks explicitly", async () => {
 		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
 		["tx-explicit-rollback"],
 	);
-	expect(rolledBack.rows.length).toBe(0);
+	expect(statementRows(rolledBack).length).toBe(0);
 
 	await lix.close();
 });
@@ -321,7 +327,7 @@ test("non-transaction execute waits while a transaction is open", async () => {
 		"SELECT key FROM lix_key_value WHERE key IN (?1, ?2) ORDER BY key",
 		["outside-execute-waits", "tx-open-visible-only-after-commit"],
 	);
-	expect(rows.rows.length).toBe(2);
+	expect(statementRows(rows).length).toBe(2);
 
 	await lix.close();
 });
@@ -350,13 +356,13 @@ test("transaction helper commits on success and rolls back on error", async () =
 		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
 		["tx-helper-commit"],
 	);
-	expect(committed.rows.length).toBe(1);
+	expect(statementRows(committed).length).toBe(1);
 
 	const rolledBack = await lix.execute(
 		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
 		["tx-helper-rollback"],
 	);
-	expect(rolledBack.rows.length).toBe(0);
+	expect(statementRows(rolledBack).length).toBe(0);
 
 	await lix.close();
 });
@@ -388,8 +394,9 @@ test("execute persists raw scalar params", async () => {
 		"SELECT value FROM lix_key_value WHERE key = ?1 LIMIT 1",
 		["open-lix-typed-param-value"],
 	);
-	expect(inserted.rows.length).toBe(1);
-	expect(inserted.rows[0][0]).toBe("typed-text-value");
+	const insertedRows = statementRows(inserted);
+	expect(insertedRows.length).toBe(1);
+	expect(insertedRows[0]?.[0]).toBe("typed-text-value");
 
 	await lix.close();
 });
@@ -452,8 +459,9 @@ test("lix_file.data roundtrips as Uint8Array runtime value", async () => {
 		"SELECT data FROM lix_file WHERE id = ?1 LIMIT 1",
 		["blob-roundtrip"],
 	);
-	expect(result.rows.length).toBe(1);
-	expect(result.rows[0][0]).toEqual(new Uint8Array([1, 2, 3]));
+	const resultRows = statementRows(result);
+	expect(resultRows.length).toBe(1);
+	expect(resultRows[0]?.[0]).toEqual(new Uint8Array([1, 2, 3]));
 	await lix.close();
 });
 
@@ -472,8 +480,9 @@ test("openLix seeds keyValues at startup", async () => {
      WHERE key = 'lix_deterministic_mode' LIMIT 1",
 		[],
 	);
-	expect(result.rows.length).toBe(1);
-	expect(result.rows[0][0]).toBe(JSON.stringify({ enabled: true }));
+	const resultRows = statementRows(result);
+	expect(resultRows.length).toBe(1);
+	expect(resultRows[0]?.[0]).toBe(JSON.stringify({ enabled: true }));
 	await lix.close();
 });
 

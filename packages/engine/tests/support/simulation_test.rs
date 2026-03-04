@@ -11,10 +11,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, Engine, ExecuteOptions, LixBackend, LixError,
-    MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
-    MaterializationReport, MaterializationRequest, MaterializationScope, QueryResult, Value,
-    WasmRuntime,
+    boot, BootAccount, BootArgs, BootKeyValue, Engine, ExecuteOptions, ExecuteResult, LixBackend,
+    LixError, MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
+    MaterializationReport, MaterializationRequest, MaterializationScope, Value, WasmRuntime,
 };
 use tokio::sync::Mutex as TokioMutex;
 use zip::write::SimpleFileOptions;
@@ -79,30 +78,9 @@ impl SimulationEngine {
         result
     }
 
-    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        match classify_statement(sql) {
-            StatementKind::Read => {
-                self.rematerialize_before_read_if_needed().await?;
-                self.engine
-                    .execute(sql, params, ExecuteOptions::default())
-                    .await
-            }
-            StatementKind::Write => {
-                let result = self
-                    .engine
-                    .execute(sql, params, ExecuteOptions::default())
-                    .await;
-                if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
-                    self.rematerialization_pending.store(true, Ordering::SeqCst);
-                }
-                result
-            }
-            StatementKind::Other => {
-                self.engine
-                    .execute(sql, params, ExecuteOptions::default())
-                    .await
-            }
-        }
+    pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        self.execute_with_options(sql, params, ExecuteOptions::default())
+            .await
     }
 
     pub async fn execute_with_options(
@@ -110,20 +88,20 @@ impl SimulationEngine {
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<ExecuteResult, LixError> {
         match classify_statement(sql) {
             StatementKind::Read => {
                 self.rematerialize_before_read_if_needed().await?;
-                self.engine.execute(sql, params, options).await
+                self.engine.execute_with_options(sql, params, options).await
             }
             StatementKind::Write => {
-                let result = self.engine.execute(sql, params, options).await;
+                let result = self.engine.execute_with_options(sql, params, options).await;
                 if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
                     self.rematerialization_pending.store(true, Ordering::SeqCst);
                 }
                 result
             }
-            StatementKind::Other => self.engine.execute(sql, params, options).await,
+            StatementKind::Other => self.engine.execute_with_options(sql, params, options).await,
         }
     }
 

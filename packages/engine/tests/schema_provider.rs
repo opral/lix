@@ -30,9 +30,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'same_request_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Ada\"}', '1'\
-             )",
-                &[],
-            )
+             )", &[])
             .await;
 
         assert!(result.is_ok(), "{result:?}");
@@ -46,7 +44,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let snapshot = text_to_json(&stored.rows[0][0]);
+        let snapshot = text_to_json(&stored.statements[0].rows[0][0]);
         assert_eq!(snapshot["name"], JsonValue::String("Ada".to_string()));
     }
 );
@@ -70,9 +68,7 @@ simulation_test!(
              INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema',\
              '{\"value\":{\"x-lix-key\":\"same_request_child\",\"x-lix-version\":\"1\",\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"same_request_parent\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"parent_id\":{\"type\":\"string\"}},\"required\":[\"parent_id\"],\"additionalProperties\":false}}'\
-             )",
-                &[],
-            )
+             )", &[])
             .await;
 
         assert!(result.is_ok(), "{result:?}");
@@ -87,7 +83,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(count.rows[0][0], Value::Integer(2));
+        assert_eq!(count.statements[0].rows[0][0], Value::Integer(2));
     }
 );
 
@@ -111,9 +107,7 @@ simulation_test!(
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
              'entity-1', 'same_request_default_schema', 'file-1', 'version-1', 'lix', '{\"name\":\"Sample\"}', '1'\
-             )",
-            &[],
-        )
+             )", &[])
         .await;
 
         assert!(result.is_ok(), "{result:?}");
@@ -127,7 +121,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let snapshot = text_to_json(&row.rows[0][0]);
+        let snapshot = text_to_json(&row.statements[0].rows[0][0]);
         assert_eq!(
             snapshot["slug"],
             JsonValue::String("Sample-slug".to_string())

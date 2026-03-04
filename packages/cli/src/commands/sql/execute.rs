@@ -15,8 +15,8 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<(), CliError> {
         .map_err(|err| CliError::msg(format!("sql execution failed: {err}")))?;
 
     match args.format {
-        SqlOutputFormat::Json => output::print_query_result_json(&result),
-        SqlOutputFormat::Table => output::print_query_result_table(&result),
+        SqlOutputFormat::Json => output::print_execute_result_json(&result),
+        SqlOutputFormat::Table => output::print_execute_result_table(&result),
     }
 
     Ok(())
@@ -88,7 +88,10 @@ mod tests {
 
                 let result = run(&context, args);
                 let _ = std::fs::remove_file(&path);
-                assert!(result.is_ok(), "expected sql execute to succeed: {result:?}");
+                assert!(
+                    result.is_ok(),
+                    "expected sql execute to succeed: {result:?}"
+                );
             })
             .expect("spawn test thread");
 
