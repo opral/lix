@@ -26,6 +26,9 @@ pub(crate) fn rewrite_query(query: Query, params: &[Value]) -> Result<QueryRuleO
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_active_version::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
+    // Keep `lix_state` before `lix_state_by_version`: the `lix_state` rule
+    // rewrites to a wrapper query that intentionally references
+    // `lix_state_by_version`, and the next rule lowers that inner relation.
     let rewritten = lix_state::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_state_by_version::rewrite_query(current.clone())?;
@@ -62,6 +65,9 @@ pub(crate) async fn rewrite_query_with_backend(
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_active_version::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
+    // Keep `lix_state` before `lix_state_by_version`: the `lix_state` rule
+    // rewrites to a wrapper query that intentionally references
+    // `lix_state_by_version`, and the next rule lowers that inner relation.
     let rewritten = lix_state::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_state_by_version::rewrite_query(current.clone())?;

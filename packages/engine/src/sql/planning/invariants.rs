@@ -9,7 +9,9 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
             "sql planner produced an execution plan without statements",
         ));
     }
-    if plan.preprocess.postprocess.is_some() && plan.preprocess.prepared_statements.len() != 1 {
+    if requires_single_statement_postprocess(plan.preprocess.postprocess.as_ref())
+        && plan.preprocess.prepared_statements.len() != 1
+    {
         return Err(PlannerError::invariant(
             "sql planner produced invalid postprocess plan with multiple statements",
         ));
@@ -48,4 +50,19 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
         ));
     }
     Ok(())
+}
+
+fn requires_single_statement_postprocess(
+    plan: Option<&crate::engine::sql::contracts::postprocess_actions::PostprocessPlan>,
+) -> bool {
+    matches!(
+        plan,
+        Some(other)
+            if !matches!(
+                other,
+                crate::engine::sql::contracts::postprocess_actions::PostprocessPlan::VtableUpdate(
+                    _
+                )
+            )
+    )
 }

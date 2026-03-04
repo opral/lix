@@ -4,9 +4,10 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Delete, DoUpdate, Expr, Function,
     FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, OnConflict,
     OnConflictAction, OnInsert, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, Visitor,
+    TableWithJoins, Update, Value, ValueWithSpan, Values, Visit, VisitMut, Visitor, VisitorMut,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 
 use crate::commit::{generate_commit, DomainChangeInput, GenerateCommitArgs};
 #[cfg(test)]
@@ -23,8 +24,8 @@ use crate::engine::sql::planning::rewrite_engine::types::{
 };
 use crate::engine::sql::planning::rewrite_engine::SchemaRegistration;
 use crate::engine::sql::planning::rewrite_engine::{
-    object_name_matches, resolve_expr_cell_with_state, PlaceholderState, ResolvedCell,
-    RowSourceResolver,
+    object_name_matches, parse_single_query, quote_ident, resolve_expr_cell_with_state,
+    PlaceholderState, ResolvedCell, RowSourceResolver,
 };
 use crate::errors;
 use crate::functions::LixFunctionProvider;
@@ -86,9 +87,10 @@ pub struct VtableUpdateStatement {
 
 #[derive(Debug)]
 pub struct VtableUpdateRewrite {
+    pub pre_statements: Vec<Statement>,
     pub statement: Statement,
     pub plan: VtableUpdatePlan,
-    pub validation: Option<UpdateValidationPlan>,
+    pub validations: Vec<UpdateValidationPlan>,
 }
 
 #[derive(Debug)]
@@ -156,7 +158,13 @@ pub fn rewrite_insert_with_writer_key(
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations, functions)?;
+        let untracked = build_untracked_insert(
+            &insert,
+            untracked_rows,
+            &mut mutations,
+            writer_key,
+            functions,
+        )?;
         statements.push(untracked);
     }
 
@@ -217,7 +225,13 @@ pub async fn rewrite_insert_with_backend(
     }
 
     if !untracked_rows.is_empty() {
-        let untracked = build_untracked_insert(&insert, untracked_rows, &mut mutations, functions)?;
+        let untracked = build_untracked_insert(
+            &insert,
+            untracked_rows,
+            &mut mutations,
+            writer_key,
+            functions,
+        )?;
         statements.push(untracked);
     }
 
@@ -280,12 +294,13 @@ fn validate_and_strip_insert_on_conflict(
 }
 
 pub fn rewrite_update(
-    update: Update,
+    mut update: Update,
     params: &[EngineValue],
 ) -> Result<Option<UpdateRewrite>, LixError> {
     if !table_with_joins_is_vtable(&update.table) {
         return Ok(None);
     }
+    strip_update_target_alias_qualifiers(&mut update);
 
     if update
         .assignments
@@ -304,6 +319,7 @@ pub fn rewrite_update(
         description: "vtable update requires a WHERE clause".to_string(),
     })?;
 
+    let original_assignments = update.assignments.clone();
     let has_untracked_true = contains_untracked_true(selection, params);
     let has_untracked_false = contains_untracked_false(selection, params);
     if has_untracked_true && has_untracked_false {
@@ -322,7 +338,7 @@ pub fn rewrite_update(
         }
         let mut new_update = update.clone();
         replace_table_with_untracked(&mut new_update.table);
-        new_update.assignments = filter_update_assignments(update.assignments);
+        new_update.assignments = filter_update_assignments(original_assignments.clone());
         ensure_updated_at_assignment(&mut new_update.assignments);
         new_update.selection = try_strip_untracked_predicate(selection, params).unwrap_or(None);
         let validation =
@@ -364,6 +380,7 @@ pub fn rewrite_update(
         description: "vtable update requires a WHERE clause after stripping untracked".to_string(),
     })?;
 
+    let effective_scope_without_untracked_predicate = !has_untracked_false;
     let schema_key = extract_single_schema_key(&stripped_selection, params)?;
     let writer_key_assignment_present = update
         .assignments
@@ -371,27 +388,78 @@ pub fn rewrite_update(
         .any(|assignment| assignment_target_is_column(&assignment.target, "writer_key"));
     let explicit_writer_key = extract_explicit_writer_key_assignment(&update.assignments, params)?;
 
+    let mut pre_statements = Vec::new();
+    let mut validations = Vec::new();
+    if effective_scope_without_untracked_predicate {
+        let mut untracked_update = update.clone();
+        replace_table_with_untracked(&mut untracked_update.table);
+        untracked_update.assignments = filter_update_assignments(original_assignments.clone());
+        ensure_updated_at_assignment(&mut untracked_update.assignments);
+        untracked_update.selection = Some(stripped_selection.clone());
+        if let Some(validation) =
+            build_update_validation_plan(&untracked_update, Some(UNTRACKED_TABLE.to_string()), params)?
+        {
+            validations.push(validation);
+        }
+        pre_statements.push(Statement::Update(untracked_update));
+    }
+
     let mut new_update = update.clone();
     replace_table_with_materialized(&mut new_update.table, &schema_key);
-    new_update.assignments = filter_update_assignments(update.assignments);
+    new_update.assignments = filter_update_assignments(original_assignments);
     ensure_updated_at_assignment(&mut new_update.assignments);
-    new_update.selection = Some(stripped_selection);
+    let tracked_selection = if effective_scope_without_untracked_predicate {
+        let materialized_table_ref = update_target_table_reference(&new_update.table)?;
+        let entity_id_expr_sql = assignment_or_materialized_key_sql(
+            &new_update.assignments,
+            "entity_id",
+            &materialized_table_ref,
+        );
+        let file_id_expr_sql = assignment_or_materialized_key_sql(
+            &new_update.assignments,
+            "file_id",
+            &materialized_table_ref,
+        );
+        let version_id_expr_sql = assignment_or_materialized_key_sql(
+            &new_update.assignments,
+            "version_id",
+            &materialized_table_ref,
+        );
+        let effective_scope_predicate =
+            build_not_exists_untracked_shadow_predicate(
+                &materialized_table_ref,
+                &entity_id_expr_sql,
+                &file_id_expr_sql,
+                &version_id_expr_sql,
+            )?;
+        Expr::BinaryOp {
+            left: Box::new(stripped_selection),
+            op: BinaryOperator::And,
+            right: Box::new(effective_scope_predicate),
+        }
+    } else {
+        stripped_selection
+    };
+    new_update.selection = Some(tracked_selection);
     new_update.returning = Some(build_update_returning());
 
-    let validation = build_update_validation_plan(
+    if let Some(validation) = build_update_validation_plan(
         &new_update,
         Some(format!("{}{}", MATERIALIZED_PREFIX, schema_key)),
         params,
-    )?;
+    )? {
+        validations.push(validation);
+    }
 
     Ok(Some(UpdateRewrite::Planned(VtableUpdateRewrite {
+        pre_statements,
         statement: Statement::Update(new_update),
         plan: VtableUpdatePlan {
             schema_key,
             explicit_writer_key,
             writer_key_assignment_present,
         },
-        validation,
+        validations,
     })))
 }
 
@@ -403,10 +471,11 @@ pub fn rewrite_delete(
 }
 
 pub fn rewrite_delete_with_options(
-    delete: Delete,
+    mut delete: Delete,
     effective_scope_fallback: bool,
     params: &[EngineValue],
 ) -> Result<Option<DeleteRewrite>, LixError> {
+    strip_delete_target_alias_qualifiers(&mut delete);
     if !delete_from_is_vtable(&delete) {
         return Ok(None);
     }
@@ -476,11 +545,41 @@ pub fn rewrite_delete_with_options(
         description: "vtable delete requires a WHERE clause after stripping untracked".to_string(),
     })?;
 
+    let effective_scope_without_untracked_predicate = !has_untracked_false;
     let schema_key = extract_single_schema_key(&stripped_selection, params)?;
-    let effective_scope_selection_sql = if effective_scope_fallback {
-        Some(stripped_selection.to_string())
+    let effective_scope_selection_sql =
+        if effective_scope_fallback || effective_scope_without_untracked_predicate {
+            Some(stripped_selection.to_string())
+        } else {
+            None
+        };
+    let effective_scope_untracked_selection_sql = if effective_scope_without_untracked_predicate {
+        Some(
+            rewrite_inherited_from_version_id_to_null(&stripped_selection)
+                .to_string(),
+        )
     } else {
         None
+    };
+
+    let tracked_selection = if effective_scope_without_untracked_predicate {
+        let materialized_table_ref = format!("{}{}", MATERIALIZED_PREFIX, schema_key);
+        let default_entity_sql = materialized_column_sql(&materialized_table_ref, "entity_id");
+        let default_file_sql = materialized_column_sql(&materialized_table_ref, "file_id");
+        let default_version_sql = materialized_column_sql(&materialized_table_ref, "version_id");
+        let effective_scope_predicate = build_not_exists_untracked_shadow_predicate(
+            &materialized_table_ref,
+            &default_entity_sql,
+            &default_file_sql,
+            &default_version_sql,
+        )?;
+        Expr::BinaryOp {
+            left: Box::new(stripped_selection.clone()),
+            op: BinaryOperator::And,
+            right: Box::new(effective_scope_predicate),
+        }
+    } else {
+        stripped_selection.clone()
     };
 
     let update = Update {
@@ -501,7 +600,7 @@ pub fn rewrite_delete_with_options(
             },
         ],
         from: None,
-        selection: Some(stripped_selection),
+        selection: Some(tracked_selection),
         returning: Some(build_update_returning()),
         or: None,
         limit: None,
@@ -513,8 +612,40 @@ pub fn rewrite_delete_with_options(
             schema_key,
             effective_scope_fallback,
             effective_scope_selection_sql,
+            effective_scope_untracked_selection_sql,
         },
     })))
+}
+
+fn rewrite_inherited_from_version_id_to_null(expr: &Expr) -> Expr {
+    struct InheritedFromVersionIdNullRewriter;
+
+    impl VisitorMut for InheritedFromVersionIdNullRewriter {
+        type Break = ();
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            let is_inherited_from_version_id = match expr {
+                Expr::Identifier(ident) => {
+                    ident.value.eq_ignore_ascii_case("inherited_from_version_id")
+                }
+                Expr::CompoundIdentifier(parts) => parts
+                    .last()
+                    .map(|ident| ident.value.eq_ignore_ascii_case("inherited_from_version_id"))
+                    .unwrap_or(false),
+                _ => false,
+            };
+
+            if is_inherited_from_version_id {
+                *expr = null_expr();
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut rewritten = expr.clone();
+    let mut visitor = InheritedFromVersionIdNullRewriter;
+    let _ = (&mut rewritten).visit(&mut visitor);
+    rewritten
 }
 
 fn build_untracked_on_conflict() -> OnInsert {
@@ -561,6 +692,15 @@ fn build_untracked_on_conflict() -> OnInsert {
                     value: Expr::CompoundIdentifier(vec![
                         Ident::new("excluded"),
                         Ident::new("metadata"),
+                    ]),
+                },
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("writer_key")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("writer_key"),
                     ]),
                 },
                 Assignment {
@@ -1098,6 +1238,7 @@ fn build_untracked_insert(
     insert: &sqlparser::ast::Insert,
     rows: Vec<(Vec<Expr>, Vec<ResolvedCell>)>,
     mutations: &mut Vec<MutationRow>,
+    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<Statement, LixError> {
     let entity_idx = required_column_index(&insert.columns, "entity_id")?;
@@ -1108,6 +1249,7 @@ fn build_untracked_insert(
     let snapshot_idx = required_column_index(&insert.columns, "snapshot_content")?;
     let schema_version_idx = required_column_index(&insert.columns, "schema_version")?;
     let metadata_idx = find_column_index(&insert.columns, "metadata");
+    let writer_key_idx = find_column_index(&insert.columns, "writer_key");
 
     let mut mapped_rows = Vec::new();
     for (row, materialized) in rows {
@@ -1122,6 +1264,22 @@ fn build_untracked_insert(
             match metadata_idx {
                 Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
                 None => null_expr(),
+            },
+            match writer_key_idx {
+                Some(index) => {
+                    let explicit = resolved_optional_string(
+                        materialized.get(index),
+                        row.get(index),
+                        "writer_key",
+                    )?;
+                    explicit
+                        .or_else(|| writer_key.map(ToString::to_string))
+                        .map(|value| string_expr(&value))
+                        .unwrap_or_else(null_expr)
+                }
+                None => writer_key
+                    .map(string_expr)
+                    .unwrap_or_else(null_expr),
             },
             resolved_expr_or_original(
                 materialized.get(schema_version_idx),
@@ -1181,6 +1339,7 @@ fn build_untracked_insert(
             Ident::new("plugin_key"),
             Ident::new("snapshot_content"),
             Ident::new("metadata"),
+            Ident::new("writer_key"),
             Ident::new("schema_version"),
             Ident::new("created_at"),
             Ident::new("updated_at"),
@@ -1734,6 +1893,61 @@ fn replace_table_with_materialized(table: &mut TableWithJoins, schema_key: &str)
     }
 }
 
+fn update_target_table_reference(table: &TableWithJoins) -> Result<String, LixError> {
+    match &table.relation {
+        TableFactor::Table { name, alias, .. } => {
+            if let Some(alias) = alias {
+                return Ok(quote_ident(&alias.name.value));
+            }
+            Ok(name.to_string())
+        }
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "vtable update requires a table target".to_string(),
+        }),
+    }
+}
+
+fn build_not_exists_untracked_shadow_predicate(
+    materialized_table_ref: &str,
+    entity_id_expr_sql: &str,
+    file_id_expr_sql: &str,
+    version_id_expr_sql: &str,
+) -> Result<Expr, LixError> {
+    let untracked_alias = "__lix_untracked";
+    let untracked_table = quote_ident(UNTRACKED_TABLE);
+    let untracked_alias_quoted = quote_ident(untracked_alias);
+    let schema_key_expr_sql = materialized_column_sql(materialized_table_ref, "schema_key");
+
+    let not_exists_sql = format!(
+        "SELECT 1 WHERE NOT EXISTS (\
+         SELECT 1 FROM {untracked_table} AS {untracked_alias} \
+         WHERE {untracked_alias}.schema_key = {schema_key_expr} \
+           AND {untracked_alias}.entity_id = {entity_id_expr} \
+           AND {untracked_alias}.file_id = {file_id_expr} \
+           AND {untracked_alias}.version_id = {version_id_expr}\
+         )",
+        untracked_table = untracked_table,
+        untracked_alias = untracked_alias_quoted,
+        schema_key_expr = schema_key_expr_sql,
+        entity_id_expr = entity_id_expr_sql,
+        file_id_expr = file_id_expr_sql,
+        version_id_expr = version_id_expr_sql,
+    );
+
+    let query = parse_single_query(&not_exists_sql)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "vtable update effective scope predicate requires SELECT body".to_string(),
+        });
+    };
+    select.selection.clone().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "vtable update effective scope predicate missing WHERE clause".to_string(),
+    })
+}
+
 fn replace_delete_from_untracked(delete: &mut Delete) {
     let tables = match &mut delete.from {
         sqlparser::ast::FromTable::WithFromKeyword(tables)
@@ -1753,6 +1967,23 @@ fn find_column_index(columns: &[Ident], column: &str) -> Option<usize> {
 
 fn assignment_target_is_untracked(target: &AssignmentTarget) -> bool {
     assignment_target_is_column(target, "untracked")
+}
+
+fn materialized_column_sql(materialized_table_ref: &str, column: &str) -> String {
+    format!("{materialized_table_ref}.{}", quote_ident(column))
+}
+
+fn assignment_or_materialized_key_sql(
+    assignments: &[Assignment],
+    column: &str,
+    materialized_table_ref: &str,
+) -> String {
+    assignments
+        .iter()
+        .rev()
+        .find(|assignment| assignment_target_is_column(&assignment.target, column))
+        .map(|assignment| assignment.value.to_string())
+        .unwrap_or_else(|| materialized_column_sql(materialized_table_ref, column))
 }
 
 fn assignment_target_column_name(target: &AssignmentTarget) -> Option<String> {
@@ -1840,7 +2071,13 @@ fn try_strip_untracked_predicate(expr: &Expr, params: &[EngineValue]) -> Option<
             let stripped = try_strip_untracked_predicate(inner, params)?;
             Some(stripped.map(|expr| Expr::Nested(Box::new(expr))))
         }
-        _ => Some(Some(expr.clone())),
+        _ => {
+            if contains_untracked_true(expr, params) {
+                None
+            } else {
+                Some(Some(expr.clone()))
+            }
+        }
     }
 }
 
@@ -1871,8 +2108,74 @@ fn try_strip_untracked_false_predicate(
             let stripped = try_strip_untracked_false_predicate(inner, params)?;
             Some(stripped.map(|expr| Expr::Nested(Box::new(expr))))
         }
-        _ => Some(Some(expr.clone())),
+        _ => {
+            if contains_untracked_false(expr, params) {
+                None
+            } else {
+                Some(Some(expr.clone()))
+            }
+        }
     }
+}
+
+fn strip_update_target_alias_qualifiers(update: &mut Update) {
+    let alias = take_table_factor_alias(&mut update.table.relation);
+    let Some(alias) = alias else {
+        return;
+    };
+
+    if let Some(selection) = update.selection.as_mut() {
+        strip_alias_qualifiers_in_expr(selection, &alias);
+    }
+    for assignment in &mut update.assignments {
+        strip_alias_qualifiers_in_expr(&mut assignment.value, &alias);
+    }
+}
+
+fn strip_delete_target_alias_qualifiers(delete: &mut Delete) {
+    let tables = match &mut delete.from {
+        sqlparser::ast::FromTable::WithFromKeyword(tables)
+        | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    let alias = tables
+        .first_mut()
+        .and_then(|table| take_table_factor_alias(&mut table.relation));
+    let Some(alias) = alias else {
+        return;
+    };
+
+    if let Some(selection) = delete.selection.as_mut() {
+        strip_alias_qualifiers_in_expr(selection, &alias);
+    }
+}
+
+fn take_table_factor_alias(relation: &mut TableFactor) -> Option<String> {
+    match relation {
+        TableFactor::Table { alias, .. } => alias.take().map(|alias| alias.name.value),
+        _ => None,
+    }
+}
+
+fn strip_alias_qualifiers_in_expr(expr: &mut Expr, alias: &str) {
+    struct AliasQualifierStripper<'a> {
+        alias: &'a str,
+    }
+
+    impl VisitorMut for AliasQualifierStripper<'_> {
+        type Break = ();
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            if let Expr::CompoundIdentifier(parts) = expr {
+                if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(self.alias) {
+                    *expr = Expr::Identifier(parts[1].clone());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut stripper = AliasQualifierStripper { alias };
+    let _ = expr.visit(&mut stripper);
 }
 
 fn is_untracked_equals_true(expr: &Expr, params: &[EngineValue]) -> bool {
@@ -2781,6 +3084,55 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_effective_update_adds_untracked_pre_statement_and_shadow_filter() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET snapshot_content = '{"key":"value"}'
+            WHERE schema_key = 'test_schema' AND entity_id = 'entity-1'"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let rewrite = rewrite_update(update, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            UpdateRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        assert_eq!(planned.pre_statements.len(), 1);
+        let pre_statement = match &planned.pre_statements[0] {
+            Statement::Update(update) => update,
+            _ => panic!("expected update pre-statement"),
+        };
+        assert!(
+            pre_statement
+                .table
+                .to_string()
+                .contains("lix_internal_state_untracked")
+        );
+        assert!(pre_statement.returning.is_none());
+
+        let statement = match planned.statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let selection_sql = statement
+            .selection
+            .expect("selection")
+            .to_string()
+            .to_ascii_lowercase();
+        assert!(selection_sql.contains("not exists"));
+        assert!(selection_sql.contains("lix_internal_state_untracked"));
+    }
+
+    #[test]
     fn rewrite_tracked_update_materializes_parameterized_snapshot_for_validation() {
         let sql = r#"UPDATE lix_internal_state_vtable
             SET snapshot_content = $1
@@ -2805,7 +3157,11 @@ mod tests {
             _ => panic!("expected planned rewrite"),
         };
 
-        let validation = planned.validation.expect("validation plan");
+        let validation = planned
+            .validations
+            .first()
+            .cloned()
+            .expect("validation plan");
         assert_eq!(validation.snapshot_content, Some(json!({ "key": "value" })));
     }
 
@@ -2834,7 +3190,11 @@ mod tests {
             _ => panic!("expected planned rewrite"),
         };
 
-        let validation = planned.validation.expect("validation plan");
+        let validation = planned
+            .validations
+            .first()
+            .cloned()
+            .expect("validation plan");
         assert_eq!(validation.snapshot_content, Some(json!({ "key": "value" })));
     }
 
@@ -3031,6 +3391,44 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_delete_effective_scope_maps_inherited_from_version_predicate_for_untracked_cleanup()
+    {
+        let sql = r#"DELETE FROM lix_internal_state_vtable
+            WHERE schema_key = 'test_schema' AND inherited_from_version_id IS NULL"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let delete = match statement {
+            Statement::Delete(delete) => delete,
+            _ => panic!("expected delete"),
+        };
+
+        let rewrite = rewrite_delete(delete, &[])
+            .expect("rewrite ok")
+            .expect("rewrite applied");
+
+        let planned = match rewrite {
+            DeleteRewrite::Planned(planned) => planned,
+            _ => panic!("expected planned rewrite"),
+        };
+
+        let effective_sql = planned
+            .plan
+            .effective_scope_selection_sql
+            .as_deref()
+            .expect("effective scope sql");
+        assert!(effective_sql.contains("inherited_from_version_id IS NULL"));
+
+        let untracked_sql = planned
+            .plan
+            .effective_scope_untracked_selection_sql
+            .as_deref()
+            .expect("untracked scope sql");
+        assert!(untracked_sql.contains("NULL IS NULL"));
+        assert!(!untracked_sql.contains("inherited_from_version_id"));
+    }
+
+    #[test]
     fn rewrite_update_requires_schema_key_predicate() {
         let sql = r#"UPDATE lix_internal_state_vtable
             SET snapshot_content = '{"key":"value"}'
@@ -3130,6 +3528,28 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_update_rejects_untracked_or_predicate() {
+        let sql = r#"UPDATE lix_internal_state_vtable
+            SET snapshot_content = '{"key":"value"}'
+            WHERE schema_key = 'a' AND (untracked = true OR entity_id = 'entity-1')"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let update = match statement {
+            Statement::Update(update) => update,
+            _ => panic!("expected update"),
+        };
+
+        let err = rewrite_update(update, &[]).expect_err("expected error");
+        assert!(
+            err.description
+                .contains("vtable update could not strip untracked predicate"),
+            "{:#?}",
+            err
+        );
+    }
+
+    #[test]
     fn rewrite_delete_requires_schema_key_predicate() {
         let sql = r#"DELETE FROM lix_internal_state_vtable
             WHERE entity_id = 'entity-1'"#;
@@ -3159,6 +3579,27 @@ mod tests {
 
         let err = rewrite_delete(delete, &[]).expect_err("expected error");
         assert!(err.description.contains("single schema_key"), "{:#?}", err);
+    }
+
+    #[test]
+    fn rewrite_delete_rejects_untracked_or_predicate() {
+        let sql = r#"DELETE FROM lix_internal_state_vtable
+            WHERE schema_key = 'a' AND (untracked = true OR entity_id = 'entity-1')"#;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
+        let statement = statements.remove(0);
+
+        let delete = match statement {
+            Statement::Delete(delete) => delete,
+            _ => panic!("expected delete"),
+        };
+
+        let err = rewrite_delete(delete, &[]).expect_err("expected error");
+        assert!(
+            err.description
+                .contains("vtable delete could not strip untracked predicate"),
+            "{:#?}",
+            err
+        );
     }
 
     fn find_insert<'a>(statements: &'a [Statement], table: &str) -> &'a Statement {

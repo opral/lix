@@ -1,11 +1,12 @@
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, ObjectNamePart, Query, Select, TableFactor, TableWithJoins,
+    BinaryOperator, Expr, Ident, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr,
+    TableFactor, TableWithJoins, Value,
 };
 
 use crate::engine::sql::planning::rewrite_engine::{
-    default_alias, escape_sql_string, parse_single_query, quote_ident, rewrite_query_selects,
-    visit_query_selects, visit_table_factors_in_select, RewriteDecision,
+    default_alias, parse_single_query, rewrite_query_selects, visit_query_selects,
+    visit_table_factors_in_select, RewriteDecision,
 };
 use crate::{LixBackend, LixError};
 
@@ -24,16 +25,16 @@ enum HistoryPredicate {
     Binary {
         source_column: &'static str,
         operator: BinaryOperator,
-        rhs_sql: String,
+        rhs: Expr,
     },
     InSubquery {
         source_column: &'static str,
-        subquery_sql: String,
+        subquery: Query,
         negated: bool,
     },
     InList {
         source_column: &'static str,
-        list_sql: Vec<String>,
+        list: Vec<Expr>,
         negated: bool,
     },
     IsNull {
@@ -54,6 +55,7 @@ pub(crate) async fn rewrite_query_with_backend(
     if view_names.is_empty() {
         return Ok(None);
     }
+
     let resolved = resolve_targets_with_backend(backend, &view_names).await?;
     rewrite_query_with_resolver(query, &mut |name| {
         let Some(view_name) = object_name_terminal(name) else {
@@ -78,8 +80,9 @@ fn rewrite_select(
 ) -> Result<RewriteDecision, LixError> {
     let mut changed = RewriteDecision::Unchanged;
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
+    let selection = select.selection.clone();
     for table in &mut select.from {
-        if rewrite_table_with_joins(table, &select.selection, allow_unqualified, resolver)?
+        if rewrite_table_with_joins(table, &selection, allow_unqualified, resolver)?
             == RewriteDecision::Changed
         {
             changed = RewriteDecision::Changed;
@@ -117,6 +120,7 @@ fn rewrite_table_factor(
             let Some(target) = resolver(name)? else {
                 return Ok(RewriteDecision::Unchanged);
             };
+
             let relation_name = alias
                 .as_ref()
                 .map(|value| value.name.value.clone())
@@ -138,6 +142,9 @@ fn rewrite_table_factor(
             };
             Ok(RewriteDecision::Changed)
         }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => rewrite_table_with_joins(table_with_joins, selection, allow_unqualified, resolver),
         _ => Ok(RewriteDecision::Unchanged),
     }
 }
@@ -146,43 +153,93 @@ fn build_entity_view_query(
     target: &EntityViewTarget,
     pushdown: &HistoryPredicatePushdown,
 ) -> Result<Query, LixError> {
-    let (source_sql, extra_predicates) = match target.variant {
+    let (source, extra_predicates) = match target.variant {
         EntityViewVariant::Base => {
             base_effective_state_source(target.version_id_override.as_deref())
         }
-        EntityViewVariant::ByVersion => {
-            ("lix_state_by_version".to_string(), vec!["1=1".to_string()])
-        }
-        EntityViewVariant::History => ("lix_state_history".to_string(), vec!["1=1".to_string()]),
+        EntityViewVariant::ByVersion => ("lix_state_by_version".to_string(), Vec::new()),
+        EntityViewVariant::History => ("lix_state_history".to_string(), Vec::new()),
     };
-    let mut select_parts = Vec::new();
+
+    let mut query = parse_single_query("SELECT 1 FROM lix_state")?;
+    let select = select_mut(&mut query)?;
+    select.from = vec![TableWithJoins {
+        relation: table_factor(&source),
+        joins: Vec::new(),
+    }];
+
+    let mut projection = Vec::new();
     for property in &target.properties {
-        select_parts.push(format!(
-            "lix_json_extract(snapshot_content, '{property}') AS {alias}",
-            property = escape_sql_string(property),
-            alias = quote_ident(property),
-        ));
+        projection.push(SelectItem::ExprWithAlias {
+            expr: json_extract_expr("snapshot_content", property)?,
+            alias: Ident::new(property),
+        });
     }
     for (column, alias) in projected_lixcol_aliases_for_variant(target.variant) {
-        select_parts.push(format!("{column} AS {alias}"));
+        projection.push(SelectItem::ExprWithAlias {
+            expr: Expr::Identifier(Ident::new(*column)),
+            alias: Ident::new(*alias),
+        });
     }
-    let mut predicates = vec![format!(
-        "schema_key = '{schema_key}'",
-        schema_key = escape_sql_string(&target.schema_key)
-    )];
+    select.projection = projection;
+
+    let mut predicates = vec![Expr::BinaryOp {
+        left: Box::new(Expr::Identifier(Ident::new("schema_key"))),
+        op: BinaryOperator::Eq,
+        right: Box::new(string_literal_expr(&target.schema_key)),
+    }];
     predicates.extend(extra_predicates);
     predicates.extend(render_history_pushdown_predicates(pushdown));
     predicates.extend(override_predicates(target));
+    select.selection = join_with_and(predicates);
 
-    let sql = format!(
-        "SELECT {projection} \
-         FROM {source} \
-         WHERE {predicate}",
-        projection = select_parts.join(", "),
-        source = source_sql,
-        predicate = predicates.join(" AND "),
-    );
-    parse_single_query(&sql)
+    Ok(query)
+}
+
+fn table_factor(table: &str) -> TableFactor {
+    TableFactor::Table {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(table))]),
+        alias: None,
+        args: None,
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    }
+}
+
+fn json_extract_expr(column: &str, key: &str) -> Result<Expr, LixError> {
+    let query = parse_single_query(&format!(
+        "SELECT lix_json_extract({column}, '{key}')",
+        column = column,
+        key = key.replace('\'', "''"),
+    ))?;
+    let SetExpr::Select(select) = *query.body else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected SELECT when parsing lix_json_extract expression".to_string(),
+        });
+    };
+    let Some(item) = select.projection.first() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected projection when parsing lix_json_extract expression".to_string(),
+        });
+    };
+    match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Ok(expr.clone()),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "unexpected projection shape for lix_json_extract expression".to_string(),
+        }),
+    }
+}
+
+fn string_literal_expr(value: &str) -> Expr {
+    Expr::Value(Value::SingleQuotedString(value.to_string()).into())
 }
 
 fn collect_history_pushdown_predicates(
@@ -194,6 +251,7 @@ fn collect_history_pushdown_predicates(
     if variant != EntityViewVariant::History {
         return HistoryPredicatePushdown::default();
     }
+
     let mut pushdown = HistoryPredicatePushdown::default();
     let Some(expr) = selection.as_ref() else {
         return pushdown;
@@ -239,7 +297,7 @@ fn collect_history_pushdown_predicates_from_expr(
                 predicates.push(HistoryPredicate::Binary {
                     source_column,
                     operator: op.clone(),
-                    rhs_sql: right.to_string(),
+                    rhs: (*right.clone()),
                 });
             } else if let Some(source_column) =
                 extract_history_source_column(right, relation_name, allow_unqualified)
@@ -248,7 +306,7 @@ fn collect_history_pushdown_predicates_from_expr(
                     predicates.push(HistoryPredicate::Binary {
                         source_column,
                         operator: inverted,
-                        rhs_sql: left.to_string(),
+                        rhs: (*left.clone()),
                     });
                 }
             }
@@ -263,7 +321,7 @@ fn collect_history_pushdown_predicates_from_expr(
             {
                 predicates.push(HistoryPredicate::InSubquery {
                     source_column,
-                    subquery_sql: subquery.to_string(),
+                    subquery: (*subquery.clone()),
                     negated: *negated,
                 });
             }
@@ -278,7 +336,7 @@ fn collect_history_pushdown_predicates_from_expr(
             {
                 predicates.push(HistoryPredicate::InList {
                     source_column,
-                    list_sql: list.iter().map(ToString::to_string).collect(),
+                    list: list.clone(),
                     negated: *negated,
                 });
             }
@@ -328,6 +386,7 @@ fn extract_history_source_column(
         Expr::Identifier(identifier) if allow_unqualified => identifier.value.as_str(),
         _ => return None,
     };
+
     match column {
         "lixcol_root_commit_id" | "root_commit_id" => Some("root_commit_id"),
         "lixcol_version_id" | "version_id" => Some("version_id"),
@@ -347,7 +406,7 @@ fn invert_binary_operator(op: BinaryOperator) -> Option<BinaryOperator> {
     }
 }
 
-fn render_history_pushdown_predicates(pushdown: &HistoryPredicatePushdown) -> Vec<String> {
+fn render_history_pushdown_predicates(pushdown: &HistoryPredicatePushdown) -> Vec<Expr> {
     pushdown
         .predicates
         .iter()
@@ -355,95 +414,86 @@ fn render_history_pushdown_predicates(pushdown: &HistoryPredicatePushdown) -> Ve
             HistoryPredicate::Binary {
                 source_column,
                 operator,
-                rhs_sql,
-            } => format!(
-                "{column} {op} {rhs}",
-                column = source_column,
-                op = operator,
-                rhs = rhs_sql
-            ),
+                rhs,
+            } => Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new(*source_column))),
+                op: operator.clone(),
+                right: Box::new(rhs.clone()),
+            },
             HistoryPredicate::InSubquery {
                 source_column,
-                subquery_sql,
+                subquery,
                 negated,
-            } => {
-                let not_sql = if *negated { " NOT" } else { "" };
-                format!(
-                    "{column}{not_sql} IN ({subquery})",
-                    column = source_column,
-                    not_sql = not_sql,
-                    subquery = subquery_sql
-                )
-            }
+            } => Expr::InSubquery {
+                expr: Box::new(Expr::Identifier(Ident::new(*source_column))),
+                subquery: Box::new(subquery.clone()),
+                negated: *negated,
+            },
             HistoryPredicate::InList {
                 source_column,
-                list_sql,
+                list,
                 negated,
-            } => {
-                let not_sql = if *negated { " NOT" } else { "" };
-                format!(
-                    "{column}{not_sql} IN ({list})",
-                    column = source_column,
-                    not_sql = not_sql,
-                    list = list_sql.join(", ")
-                )
-            }
+            } => Expr::InList {
+                expr: Box::new(Expr::Identifier(Ident::new(*source_column))),
+                list: list.clone(),
+                negated: *negated,
+            },
             HistoryPredicate::IsNull {
                 source_column,
                 negated,
             } => {
-                let is_not = if *negated { " NOT" } else { "" };
-                format!(
-                    "{column} IS{is_not} NULL",
-                    column = source_column,
-                    is_not = is_not
-                )
+                if *negated {
+                    Expr::IsNotNull(Box::new(Expr::Identifier(Ident::new(*source_column))))
+                } else {
+                    Expr::IsNull(Box::new(Expr::Identifier(Ident::new(*source_column))))
+                }
             }
         })
         .collect()
 }
 
-fn base_effective_state_source(version_id_override: Option<&str>) -> (String, Vec<String>) {
+fn base_effective_state_source(version_id_override: Option<&str>) -> (String, Vec<Expr>) {
     match version_id_override {
-        // Base views represent effective state. With an explicit version override, the
-        // effective-state source is still `lix_state_by_version`, scoped to that version.
+        // Base entity views are effective-state wrappers by default.
+        // If schema metadata pins a version, route through by-version with
+        // that explicit target-version filter.
         Some(version_id) => (
             "lix_state_by_version".to_string(),
-            vec![format!("version_id = '{}'", escape_sql_string(version_id))],
+            vec![Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("version_id"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(string_literal_expr(version_id)),
+            }],
         ),
-        None => ("lix_state".to_string(), vec!["1=1".to_string()]),
+        None => ("lix_state".to_string(), Vec::new()),
     }
 }
 
-fn override_predicates(target: &EntityViewTarget) -> Vec<String> {
+fn override_predicates(target: &EntityViewTarget) -> Vec<Expr> {
     target
         .override_predicates
         .iter()
         .map(|predicate| match &predicate.value {
-            JsonValue::Null => format!("{column} IS NULL", column = predicate.column),
-            value => format!(
-                "{column} = {literal}",
-                column = predicate.column,
-                literal = render_literal(value)
-            ),
+            JsonValue::Null => Expr::IsNull(Box::new(Expr::Identifier(Ident::new(
+                &predicate.column,
+            )))),
+            value => Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new(&predicate.column))),
+                op: BinaryOperator::Eq,
+                right: Box::new(render_literal_expr(value)),
+            },
         })
         .collect()
 }
 
-fn render_literal(value: &JsonValue) -> String {
+fn render_literal_expr(value: &JsonValue) -> Expr {
     match value {
-        JsonValue::Null => "NULL".to_string(),
-        JsonValue::Bool(value) => {
-            if *value {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }
-        JsonValue::Number(value) => value.to_string(),
-        JsonValue::String(value) => format!("'{}'", escape_sql_string(value)),
+        JsonValue::Null => Expr::Value(Value::Null.into()),
+        JsonValue::Bool(value) => Expr::Value(Value::Boolean(*value).into()),
+        JsonValue::Number(value) => Expr::Value(Value::Number(value.to_string(), false).into()),
+        JsonValue::String(value) => Expr::Value(Value::SingleQuotedString(value.clone()).into()),
         JsonValue::Array(_) | JsonValue::Object(_) => {
-            format!("'{}'", escape_sql_string(&value.to_string()))
+            Expr::Value(Value::SingleQuotedString(value.to_string()).into())
         }
     }
 }
@@ -469,4 +519,29 @@ fn object_name_terminal(name: &ObjectName) -> Option<String> {
         .last()
         .and_then(ObjectNamePart::as_ident)
         .map(|ident| ident.value.clone())
+}
+
+fn join_with_and(mut predicates: Vec<Expr>) -> Option<Expr> {
+    if predicates.is_empty() {
+        return None;
+    }
+    let mut current = predicates.remove(0);
+    for predicate in predicates {
+        current = Expr::BinaryOp {
+            left: Box::new(current),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
+        };
+    }
+    Some(current)
+}
+
+fn select_mut(query: &mut Query) -> Result<&mut Select, LixError> {
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected SELECT body when rewriting entity view".to_string(),
+        });
+    };
+    Ok(select.as_mut())
 }

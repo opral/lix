@@ -1,19 +1,29 @@
-use sqlparser::ast::{Expr, GroupByExpr, Query, Select, SelectItem, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Query, Select,
+    SelectItem, SetExpr, TableFactor, TableWithJoins,
+};
 
 use crate::engine::sql::planning::param_context::{
     normalize_query_placeholders, PlaceholderOrdinalState,
 };
-use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::{
-    select_supports_count_fast_path, take_pushdown_predicates,
+use crate::engine::sql::planning::rewrite_engine::steps::column_usage::{
+    projected_lix_state_wrapper_columns, select_shape_is_complex,
 };
-use crate::engine::sql::planning::rewrite_engine::steps::vtable_read::build_effective_state_active_query;
+use crate::engine::sql::planning::rewrite_engine::steps::state_columns::LIX_STATE_VISIBLE_COLUMNS;
+use crate::engine::sql::planning::rewrite_engine::steps::state_pushdown::{
+    retarget_pushdown_predicates, take_pushdown_predicates, StatePushdown,
+};
 use crate::engine::sql::planning::rewrite_engine::{
-    default_alias, expr_references_column_name, object_name_matches,
-    rewrite_query_with_select_rewriter, ColumnReferenceOptions,
+    default_alias, escape_sql_string, object_name_matches, parse_single_query,
+    rewrite_query_with_select_rewriter,
+};
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
 };
 use crate::LixError;
 
 const LIX_STATE_VIEW_NAME: &str = "lix_state";
+const ACTIVE_VERSION_TABLE: &str = "lix_internal_state_untracked";
 
 pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
     let mut query = query;
@@ -22,45 +32,62 @@ pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
 }
 
 fn rewrite_select(select: &mut Select, changed: &mut bool) -> Result<(), LixError> {
-    let count_fast_path = select_supports_count_fast_path(select);
-    let include_commit_mapping = select_requires_commit_mapping(select);
     let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
+    let complex_shape = select_shape_is_complex(select);
+    let projection = select.projection.clone();
+    let mut selection = select.selection.clone();
+    let prewhere = select.prewhere.clone();
+    let having = select.having.clone();
+    let qualify = select.qualify.clone();
     for table in &mut select.from {
         rewrite_table_with_joins(
             table,
-            &mut select.selection,
+            &projection,
+            &mut selection,
+            prewhere.as_ref(),
+            having.as_ref(),
+            qualify.as_ref(),
             allow_unqualified,
-            count_fast_path,
-            include_commit_mapping,
+            complex_shape,
             changed,
         )?;
     }
+    select.selection = selection;
     Ok(())
 }
 
 fn rewrite_table_with_joins(
     table: &mut TableWithJoins,
+    projection: &[SelectItem],
     selection: &mut Option<Expr>,
+    prewhere: Option<&Expr>,
+    having: Option<&Expr>,
+    qualify: Option<&Expr>,
     allow_unqualified: bool,
-    count_fast_path: bool,
-    include_commit_mapping: bool,
+    complex_shape: bool,
     changed: &mut bool,
 ) -> Result<(), LixError> {
     rewrite_table_factor(
         &mut table.relation,
+        projection,
         selection,
+        prewhere,
+        having,
+        qualify,
         allow_unqualified,
-        count_fast_path,
-        include_commit_mapping,
+        complex_shape,
         changed,
     )?;
     for join in &mut table.joins {
         rewrite_table_factor(
             &mut join.relation,
+            projection,
             selection,
+            prewhere,
+            having,
+            qualify,
             false,
-            false,
-            include_commit_mapping,
+            true,
             changed,
         )?;
     }
@@ -69,10 +96,13 @@ fn rewrite_table_with_joins(
 
 fn rewrite_table_factor(
     relation: &mut TableFactor,
+    projection: &[SelectItem],
     selection: &mut Option<Expr>,
+    prewhere: Option<&Expr>,
+    having: Option<&Expr>,
+    qualify: Option<&Expr>,
     allow_unqualified: bool,
-    count_fast_path: bool,
-    include_commit_mapping: bool,
+    complex_shape: bool,
     changed: &mut bool,
 ) -> Result<(), LixError> {
     match relation {
@@ -83,12 +113,36 @@ fn rewrite_table_factor(
                 .as_ref()
                 .map(|value| value.name.value.clone())
                 .unwrap_or_else(|| LIX_STATE_VIEW_NAME.to_string());
-            let pushdown = take_pushdown_predicates(selection, &relation_name, allow_unqualified);
-            let derived_query = build_effective_state_active_query(
-                &pushdown,
-                count_fast_path && selection.is_none(),
-                include_commit_mapping,
+            validate_no_version_column_references(
+                projection,
+                selection.as_ref(),
+                prewhere,
+                having,
+                qualify,
+                &relation_name,
+                allow_unqualified,
             )?;
+            let pushdown_predicates = if allow_unqualified {
+                let pushdown =
+                    take_pushdown_predicates(selection, &relation_name, allow_unqualified);
+                wrapper_pushdown_predicates(&pushdown)
+            } else {
+                Vec::new()
+            };
+            let projection_columns = if complex_shape {
+                LIX_STATE_VISIBLE_COLUMNS.to_vec()
+            } else {
+                projected_lix_state_wrapper_columns(
+                    projection,
+                    selection.as_ref(),
+                    prewhere,
+                    having,
+                    qualify,
+                    &relation_name,
+                    allow_unqualified,
+                )
+            };
+            let derived_query = build_lix_state_wrapper_query(&projection_columns, &pushdown_predicates)?;
             let derived_alias = alias.clone().or_else(|| Some(default_lix_state_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,
@@ -102,10 +156,13 @@ fn rewrite_table_factor(
         } => {
             rewrite_table_with_joins(
                 table_with_joins,
+                projection,
                 selection,
+                prewhere,
+                having,
+                qualify,
                 allow_unqualified,
-                count_fast_path,
-                include_commit_mapping,
+                complex_shape,
                 changed,
             )?;
         }
@@ -114,62 +171,239 @@ fn rewrite_table_factor(
     Ok(())
 }
 
-fn select_requires_commit_mapping(select: &Select) -> bool {
-    // Keep commit mapping enabled for complex query shapes where
-    // projection/column inference is less predictable.
-    if select.distinct.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || select.having.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-    {
-        return true;
-    }
-    match &select.group_by {
-        GroupByExpr::Expressions(exprs, modifiers) => {
-            if !exprs.is_empty() || !modifiers.is_empty() {
-                return true;
+fn validate_no_version_column_references(
+    projection: &[SelectItem],
+    selection: Option<&Expr>,
+    prewhere: Option<&Expr>,
+    having: Option<&Expr>,
+    qualify: Option<&Expr>,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> Result<(), LixError> {
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+                {
+                    return Err(version_column_read_error());
+                }
             }
+            SelectItem::QualifiedWildcard(
+                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
+                _,
+            ) => {
+                if expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+                {
+                    return Err(version_column_read_error());
+                }
+            }
+            _ => {}
         }
-        GroupByExpr::All(_) => return true,
     }
 
-    if select
-        .projection
+    for expr in [selection, prewhere, having, qualify].into_iter().flatten() {
+        if expr_references_lix_state_version_column(expr, relation_name, allow_unqualified) {
+            return Err(version_column_read_error());
+        }
+    }
+
+    Ok(())
+}
+
+fn expr_references_lix_state_version_column(
+    expr: &Expr,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> bool {
+    match expr {
+        Expr::Identifier(ident) => {
+            allow_unqualified
+                && (ident.value.eq_ignore_ascii_case("version_id")
+                    || ident.value.eq_ignore_ascii_case("lixcol_version_id"))
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let qualifier = &parts[parts.len() - 2].value;
+            let column = &parts[parts.len() - 1].value;
+            qualifier.eq_ignore_ascii_case(relation_name)
+                && (column.eq_ignore_ascii_case("version_id")
+                    || column.eq_ignore_ascii_case("lixcol_version_id"))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_lix_state_version_column(left, relation_name, allow_unqualified)
+                || expr_references_lix_state_version_column(right, relation_name, allow_unqualified)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr) => {
+            expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+                || expr_references_lix_state_version_column(low, relation_name, allow_unqualified)
+                || expr_references_lix_state_version_column(high, relation_name, allow_unqualified)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+                || expr_references_lix_state_version_column(
+                    pattern,
+                    relation_name,
+                    allow_unqualified,
+                )
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+                || list.iter().any(|item| {
+                    expr_references_lix_state_version_column(item, relation_name, allow_unqualified)
+                })
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|value| {
+                expr_references_lix_state_version_column(value, relation_name, allow_unqualified)
+            }) || conditions.iter().any(|condition| {
+                expr_references_lix_state_version_column(
+                    &condition.condition,
+                    relation_name,
+                    allow_unqualified,
+                ) || expr_references_lix_state_version_column(
+                    &condition.result,
+                    relation_name,
+                    allow_unqualified,
+                )
+            }) || else_result.as_ref().is_some_and(|value| {
+                expr_references_lix_state_version_column(value, relation_name, allow_unqualified)
+            })
+        }
+        Expr::Tuple(items) => items.iter().any(|item| {
+            expr_references_lix_state_version_column(item, relation_name, allow_unqualified)
+        }),
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
+                    expr_references_lix_state_version_column(
+                        inner,
+                        relation_name,
+                        allow_unqualified,
+                    )
+                }
+                FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => match arg {
+                    FunctionArgExpr::Expr(inner) => expr_references_lix_state_version_column(
+                        inner,
+                        relation_name,
+                        allow_unqualified,
+                    ),
+                    _ => false,
+                },
+                _ => false,
+            }),
+            _ => false,
+        },
+        Expr::InSubquery { expr, .. } => {
+            expr_references_lix_state_version_column(expr, relation_name, allow_unqualified)
+        }
+        _ => false,
+    }
+}
+
+fn version_column_read_error() -> LixError {
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description:
+            "lix_state does not expose version_id; use lix_state_by_version for explicit version reads"
+                .to_string(),
+    }
+}
+
+fn build_lix_state_wrapper_query(
+    projected_columns: &[&str],
+    extra_predicates: &[Expr],
+) -> Result<Query, LixError> {
+    let mut query = parse_single_query("SELECT 1 FROM lix_state_by_version AS s")?;
+    let select = select_mut(&mut query)?;
+    select.projection = projected_columns
         .iter()
-        .any(select_item_requires_commit_mapping)
-    {
-        return true;
-    }
+        .map(|column| SelectItem::ExprWithAlias {
+            expr: qualified_column_expr("s", column),
+            alias: Ident::new(*column),
+        })
+        .collect();
 
-    select
-        .selection
-        .as_ref()
-        .is_some_and(expr_requires_commit_mapping)
+    let mut predicates = vec![active_version_predicate_expr()?];
+    predicates.extend(extra_predicates.iter().cloned());
+    select.selection = join_with_and(predicates);
+
+    Ok(query)
 }
 
-fn select_item_requires_commit_mapping(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
-        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-            expr_requires_commit_mapping(expr)
-        }
-    }
+fn wrapper_pushdown_predicates(pushdown: &StatePushdown) -> Vec<Expr> {
+    let mut out = Vec::new();
+    out.extend(pushdown.source_predicates.iter().cloned());
+    out.extend(retarget_pushdown_predicates(
+        &pushdown.ranked_predicates,
+        "ranked",
+        "s",
+    ));
+    out
 }
 
-fn expr_requires_commit_mapping(expr: &Expr) -> bool {
-    let options = ColumnReferenceOptions::default();
-    expr_references_column_name(expr, "commit_id", options)
-        || expr_references_column_name(expr, "lixcol_commit_id", options)
+fn active_version_predicate_expr() -> Result<Expr, LixError> {
+    let active_version_subquery = parse_single_query(&format!(
+        "SELECT lix_json_extract(snapshot_content, 'version_id') \
+         FROM {active_table} \
+         WHERE schema_key = '{active_schema_key}' \
+           AND file_id = '{active_file_id}' \
+           AND version_id = '{active_storage_version_id}' \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC \
+         LIMIT 1",
+        active_table = ACTIVE_VERSION_TABLE,
+        active_schema_key = escape_sql_string(active_version_schema_key()),
+        active_file_id = escape_sql_string(active_version_file_id()),
+        active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
+    ))?;
+
+    Ok(Expr::BinaryOp {
+        left: Box::new(qualified_column_expr("s", "version_id")),
+        op: BinaryOperator::Eq,
+        right: Box::new(Expr::Subquery(Box::new(active_version_subquery))),
+    })
+}
+
+fn join_with_and(mut predicates: Vec<Expr>) -> Option<Expr> {
+    if predicates.is_empty() {
+        return None;
+    }
+    let mut current = predicates.remove(0);
+    for predicate in predicates {
+        current = Expr::BinaryOp {
+            left: Box::new(current),
+            op: BinaryOperator::And,
+            right: Box::new(predicate),
+        };
+    }
+    Some(current)
+}
+
+fn qualified_column_expr(qualifier: &str, column: &str) -> Expr {
+    Expr::CompoundIdentifier(vec![Ident::new(qualifier), Ident::new(column)])
+}
+
+fn select_mut(query: &mut Query) -> Result<&mut Select, LixError> {
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected SELECT body when rewriting lix_state".to_string(),
+        });
+    };
+    Ok(select.as_mut())
 }
 
 fn default_lix_state_alias() -> sqlparser::ast::TableAlias {
@@ -184,46 +418,89 @@ mod tests {
     use sqlparser::parser::Parser;
 
     #[test]
-    fn pushes_file_id_and_plugin_key_filters_into_lix_state_derived_query() {
-        let query = parse_query(
-            "SELECT COUNT(*) FROM lix_state WHERE file_id = ? AND plugin_key = 'plugin_json'",
-        );
+    fn rewrites_lix_state_to_by_version_wrapper_query() {
+        let query = parse_query("SELECT entity_id, schema_key FROM lix_state");
 
         let rewritten = rewrite_query(query)
             .expect("rewrite should succeed")
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("s.file_id = ?1"));
-        assert!(sql.contains("ranked.plugin_key = 'plugin_json'"));
-        assert!(!sql.contains("WHERE file_id = ? AND plugin_key = 'plugin_json'"));
-        assert!(!sql.contains("commit_by_version"));
-        assert!(!sql.contains("change_set_element_by_version"));
-        assert!(!sql.contains("change_commit_by_change_id"));
+        assert!(sql.contains("FROM lix_state_by_version AS s"));
+        assert!(sql.contains(
+            "WHERE s.version_id = (SELECT lix_json_extract(snapshot_content, 'version_id')"
+        ));
+        assert!(!sql.contains("FROM lix_state "));
     }
 
     #[test]
-    fn canonicalizes_bare_placeholders_and_pushes_down_predicates() {
-        let query =
-            parse_query("SELECT COUNT(*) FROM lix_state WHERE plugin_key = ? AND file_id = ?");
+    fn wrapper_projection_excludes_version_id_columns() {
+        let query = parse_query("SELECT * FROM lix_state");
 
         let rewritten = rewrite_query(query)
             .expect("rewrite should succeed")
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("ranked.plugin_key = ?1"));
-        assert!(sql.contains("s.file_id = ?2"));
-        assert!(!sql.contains("plugin_key = ? AND file_id = ?"));
+        assert!(sql.contains("s.entity_id AS entity_id"));
+        assert!(sql.contains("s.metadata AS metadata"));
+        assert!(!sql.contains("s.version_id AS version_id"));
+        assert!(!sql.contains("s.lixcol_version_id"));
     }
 
     #[test]
-    fn non_count_query_without_commit_id_omits_commit_mapping_ctes() {
+    fn wrapper_projection_omits_commit_when_not_referenced() {
+        let query = parse_query("SELECT entity_id FROM lix_state");
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(!sql.contains("s.commit_id AS commit_id"));
+    }
+
+    #[test]
+    fn wrapper_projection_keeps_commit_when_referenced() {
+        let query = parse_query("SELECT commit_id FROM lix_state");
+
+        let rewritten = rewrite_query(query)
+            .expect("rewrite should succeed")
+            .expect("query should be rewritten");
+        let sql = rewritten.to_string();
+
+        assert!(sql.contains("s.commit_id AS commit_id"));
+    }
+
+    #[test]
+    fn rejects_version_id_projection_for_lix_state() {
+        let query = parse_query("SELECT version_id FROM lix_state");
+        let error = rewrite_query(query).expect_err("version_id projection should be rejected");
+        assert!(error.description.contains("does not expose version_id"));
+    }
+
+    #[test]
+    fn rejects_lixcol_version_id_projection_for_lix_state() {
+        let query = parse_query("SELECT lixcol_version_id FROM lix_state");
+        let error =
+            rewrite_query(query).expect_err("lixcol_version_id projection should be rejected");
+        assert!(error.description.contains("does not expose version_id"));
+    }
+
+    #[test]
+    fn rejects_version_id_predicate_for_lix_state() {
+        let query = parse_query("SELECT entity_id FROM lix_state WHERE version_id = 'v-1'");
+        let error = rewrite_query(query).expect_err("version predicate should be rejected");
+        assert!(error.description.contains("does not expose version_id"));
+    }
+
+    #[test]
+    fn pushes_schema_and_file_predicates_into_wrapper_query() {
         let query = parse_query(
-            "SELECT entity_id, untracked \
+            "SELECT entity_id \
              FROM lix_state \
-             WHERE schema_key = 'lix_file_descriptor' \
-               AND entity_id = 'bench-file-1'",
+             WHERE schema_key = 'lix_entity_label' \
+               AND file_id = 'lix'",
         );
 
         let rewritten = rewrite_query(query)
@@ -231,28 +508,9 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(!sql.contains("commit_by_version"));
-        assert!(!sql.contains("change_set_element_by_version"));
-        assert!(!sql.contains("change_commit_by_change_id"));
-    }
-
-    #[test]
-    fn non_count_query_with_commit_id_keeps_commit_mapping_ctes() {
-        let query = parse_query(
-            "SELECT commit_id \
-             FROM lix_state \
-             WHERE schema_key = 'lix_file_descriptor' \
-               AND entity_id = 'bench-file-1'",
-        );
-
-        let rewritten = rewrite_query(query)
-            .expect("rewrite should succeed")
-            .expect("query should be rewritten");
-        let sql = rewritten.to_string();
-
-        assert!(sql.contains("commit_by_version"));
-        assert!(sql.contains("change_set_element_by_version"));
-        assert!(sql.contains("change_commit_by_change_id"));
+        assert!(sql.contains("s.schema_key = 'lix_entity_label'"));
+        assert!(sql.contains("s.file_id = 'lix'"));
+        assert!(!sql.contains("WHERE schema_key = 'lix_entity_label'"));
     }
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {

@@ -16,9 +16,8 @@ use crate::engine::sql::planning::rewrite_engine::{
     escape_sql_string, object_name_matches, parse_single_query, quote_ident,
 };
 use crate::version::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    version_descriptor_file_id, version_descriptor_schema_key,
-    version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
+    version_descriptor_file_id, version_descriptor_schema_key, version_descriptor_storage_version_id,
+    GLOBAL_VERSION_ID,
 };
 use crate::{errors, LixBackend, LixError, Value as LixValue};
 
@@ -38,34 +37,14 @@ pub(crate) fn build_effective_state_by_version_query(
     }
 }
 
-pub(crate) fn build_effective_state_active_query(
-    pushdown: &StatePushdown,
-    count_only: bool,
-    include_commit_mapping: bool,
-) -> Result<Query, LixError> {
-    if count_only {
-        build_effective_state_active_count_query(pushdown)
-    } else {
-        build_effective_state_active_view_query(pushdown, include_commit_mapping)
-    }
-}
-
 fn build_effective_state_by_version_view_query(
     pushdown: &StatePushdown,
     include_commit_mapping: bool,
 ) -> Result<Query, LixError> {
     let (target_version_pushdown, ranked_predicates) =
         split_effective_by_version_ranked_pushdown(pushdown);
-    let source_pushdown = if pushdown.source_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
-    };
-    let ranked_pushdown = if ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", ranked_predicates.join(" AND "))
-    };
+    let source_pushdown = render_where_clause(&pushdown.source_predicates, " WHERE ");
+    let ranked_pushdown = render_where_clause(&ranked_predicates, " AND ");
     let target_versions_cte =
         build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
     let descriptor_table = quote_ident(&format!(
@@ -225,16 +204,8 @@ fn build_effective_state_by_version_count_query(
 ) -> Result<Query, LixError> {
     let (target_version_pushdown, ranked_predicates) =
         split_effective_by_version_ranked_pushdown(pushdown);
-    let source_pushdown = if pushdown.source_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
-    };
-    let ranked_pushdown = if ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", ranked_predicates.join(" AND "))
-    };
+    let source_pushdown = render_where_clause(&pushdown.source_predicates, " WHERE ");
+    let ranked_pushdown = render_where_clause(&ranked_predicates, " AND ");
     let target_versions_cte =
         build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
     let descriptor_table = quote_ident(&format!(
@@ -307,7 +278,7 @@ fn build_effective_state_by_version_count_query(
 }
 
 fn build_effective_state_target_versions_cte(
-    target_version_pushdown: &[String],
+    target_version_pushdown: &[Expr],
     vtable_name: &str,
 ) -> String {
     if target_version_pushdown.is_empty() {
@@ -325,10 +296,11 @@ fn build_effective_state_target_versions_cte(
         );
     }
 
-    let target_version_filter = target_version_pushdown.join(" AND ");
-    if target_version_pushdown.iter().any(|predicate| {
-        predicate.contains('?') || predicate.to_ascii_lowercase().contains("select")
-    }) {
+    let target_version_filter = join_predicates(target_version_pushdown);
+    if target_version_pushdown
+        .iter()
+        .any(predicate_contains_placeholder_or_subquery)
+    {
         return format!(
             "all_target_versions AS ( \
                SELECT version_id FROM version_descriptor \
@@ -362,12 +334,12 @@ fn build_effective_state_target_versions_cte(
 
 fn split_effective_by_version_ranked_pushdown(
     pushdown: &StatePushdown,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<Expr>, Vec<Expr>) {
     let mut target_version = Vec::new();
     let mut ranked = Vec::new();
     for predicate in &pushdown.ranked_predicates {
-        if let Some(stripped) = predicate.strip_prefix("ranked.version_id ") {
-            target_version.push(format!("version_id {stripped}"));
+        if let Some(rewritten) = extract_target_version_pushdown_predicate(predicate) {
+            target_version.push(rewritten);
             continue;
         }
         ranked.push(predicate.clone());
@@ -375,250 +347,157 @@ fn split_effective_by_version_ranked_pushdown(
     (target_version, ranked)
 }
 
-fn build_effective_state_active_view_query(
-    pushdown: &StatePushdown,
-    include_commit_mapping: bool,
-) -> Result<Query, LixError> {
-    let source_pushdown = if pushdown.source_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
-    };
-    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
-    };
-    let descriptor_table = quote_ident(&format!(
-        "lix_internal_state_materialized_v1_{}",
-        version_descriptor_schema_key()
-    ));
-    let commit_ctes = if include_commit_mapping {
-        format!(
-            ", \
-           commit_by_version AS ( \
-             SELECT \
-               COALESCE(lix_json_extract(snapshot_content, 'id'), entity_id) AS commit_id, \
-               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
-             FROM {vtable_name} \
-             WHERE schema_key = 'lix_commit' \
-               AND version_id = '{global_version}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           change_set_element_by_version AS ( \
-             SELECT \
-               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
-               lix_json_extract(snapshot_content, 'change_id') AS change_id \
-             FROM {vtable_name} \
-             WHERE schema_key = 'lix_change_set_element' \
-               AND version_id = '{global_version}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           change_commit_by_change_id AS ( \
-             SELECT \
-               cse.change_id AS change_id, \
-               MAX(cbv.commit_id) AS commit_id \
-             FROM change_set_element_by_version cse \
-             JOIN commit_by_version cbv \
-               ON cbv.change_set_id = cse.change_set_id \
-             WHERE cse.change_id IS NOT NULL \
-             GROUP BY cse.change_id \
-           )",
-            vtable_name = VTABLE_NAME,
-            global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        )
-    } else {
-        String::new()
-    };
-    let commit_join = if include_commit_mapping {
-        "LEFT JOIN change_commit_by_change_id cc \
-             ON cc.change_id = s.change_id"
-            .to_string()
-    } else {
-        String::new()
-    };
-    let commit_expr = if include_commit_mapping {
-        "COALESCE(cc.commit_id, CASE WHEN s.untracked = true THEN 'untracked' ELSE NULL END) \
-             AS commit_id"
-            .to_string()
-    } else {
-        "CASE WHEN s.untracked = true THEN 'untracked' ELSE NULL END AS commit_id".to_string()
-    };
-    let sql = format!(
-        "SELECT \
-             ranked.entity_id AS entity_id, \
-             ranked.schema_key AS schema_key, \
-             ranked.file_id AS file_id, \
-             ranked.version_id AS version_id, \
-             ranked.plugin_key AS plugin_key, \
-             ranked.snapshot_content AS snapshot_content, \
-             ranked.schema_version AS schema_version, \
-             ranked.created_at AS created_at, \
-             ranked.updated_at AS updated_at, \
-             ranked.inherited_from_version_id AS inherited_from_version_id, \
-             ranked.change_id AS change_id, \
-             ranked.commit_id AS commit_id, \
-             ranked.untracked AS untracked, \
-             ranked.writer_key AS writer_key, \
-             ranked.metadata AS metadata \
-         FROM ( \
-           WITH RECURSIVE active_version AS ( \
-             SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = '{active_schema_key}' \
-               AND file_id = '{active_file_id}' \
-               AND version_id = '{active_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1 \
-           ), \
-           version_chain(version_id, depth) AS ( \
-             SELECT version_id, 0 AS depth \
-             FROM active_version \
-             UNION ALL \
-             SELECT \
-               lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
-               vc.depth + 1 AS depth \
-             FROM version_chain vc \
-             JOIN {descriptor_table} vd \
-               ON lix_json_extract(vd.snapshot_content, 'id') = vc.version_id \
-             WHERE vd.schema_key = '{descriptor_schema_key}' \
-               AND vd.file_id = '{descriptor_file_id}' \
-               AND vd.version_id = '{descriptor_storage_version_id}' \
-               AND vd.is_tombstone = 0 \
-               AND vd.snapshot_content IS NOT NULL \
-               AND lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
-               AND vc.depth < 64 \
-           ) \
-           {commit_ctes} \
-           SELECT \
-             s.entity_id AS entity_id, \
-             s.schema_key AS schema_key, \
-             s.file_id AS file_id, \
-             av.version_id AS version_id, \
-             s.plugin_key AS plugin_key, \
-             s.snapshot_content AS snapshot_content, \
-             s.schema_version AS schema_version, \
-             s.created_at AS created_at, \
-             s.updated_at AS updated_at, \
-             CASE \
-               WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
-               WHEN vc.depth = 0 THEN NULL \
-               ELSE s.version_id \
-             END AS inherited_from_version_id, \
-             s.change_id AS change_id, \
-             {commit_expr}, \
-             s.untracked AS untracked, \
-             s.writer_key AS writer_key, \
-             s.metadata AS metadata, \
-             ROW_NUMBER() OVER ( \
-               PARTITION BY s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
-             ) AS rn \
-           FROM {vtable_name} s \
-           JOIN version_chain vc \
-             ON vc.version_id = s.version_id \
-           {commit_join} \
-           CROSS JOIN active_version av \
-           {source_pushdown} \
-         ) AS ranked \
-         WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL\
-           {ranked_pushdown}",
-        active_schema_key = escape_sql_string(active_version_schema_key()),
-        active_file_id = escape_sql_string(active_version_file_id()),
-        active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
-        vtable_name = VTABLE_NAME,
-        source_pushdown = source_pushdown,
-        ranked_pushdown = ranked_pushdown,
-        commit_ctes = commit_ctes,
-        commit_expr = commit_expr,
-        commit_join = commit_join,
-    );
-    parse_single_query(&sql)
+fn extract_target_version_pushdown_predicate(predicate: &Expr) -> Option<Expr> {
+    match predicate {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if is_ranked_version_expr(left) {
+                return Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("version_id"))),
+                    op: BinaryOperator::Eq,
+                    right: right.clone(),
+                });
+            }
+            if is_ranked_version_expr(right) {
+                return Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("version_id"))),
+                    op: BinaryOperator::Eq,
+                    right: left.clone(),
+                });
+            }
+            None
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if !is_ranked_version_expr(expr) {
+                return None;
+            }
+            Some(Expr::InList {
+                expr: Box::new(Expr::Identifier(Ident::new("version_id"))),
+                list: list.clone(),
+                negated: false,
+            })
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated: false,
+        } => {
+            if !is_ranked_version_expr(expr) {
+                return None;
+            }
+            Some(Expr::InSubquery {
+                expr: Box::new(Expr::Identifier(Ident::new("version_id"))),
+                subquery: subquery.clone(),
+                negated: false,
+            })
+        }
+        Expr::IsNull(expr) => {
+            if !is_ranked_version_expr(expr) {
+                return None;
+            }
+            Some(Expr::IsNull(Box::new(Expr::Identifier(Ident::new(
+                "version_id",
+            )))))
+        }
+        Expr::IsNotNull(expr) => {
+            if !is_ranked_version_expr(expr) {
+                return None;
+            }
+            Some(Expr::IsNotNull(Box::new(Expr::Identifier(Ident::new(
+                "version_id",
+            )))))
+        }
+        _ => None,
+    }
 }
 
-fn build_effective_state_active_count_query(pushdown: &StatePushdown) -> Result<Query, LixError> {
-    let source_pushdown = if pushdown.source_predicates.is_empty() {
+fn is_ranked_version_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let qualifier = &parts[parts.len() - 2].value;
+            let column = &parts[parts.len() - 1].value;
+            qualifier.eq_ignore_ascii_case("ranked") && column.eq_ignore_ascii_case("version_id")
+        }
+        Expr::Nested(inner) => is_ranked_version_expr(inner),
+        _ => false,
+    }
+}
+
+fn render_where_clause(predicates: &[Expr], prefix: &str) -> String {
+    if predicates.is_empty() {
         String::new()
     } else {
-        format!(" WHERE {}", pushdown.source_predicates.join(" AND "))
-    };
-    let ranked_pushdown = if pushdown.ranked_predicates.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", pushdown.ranked_predicates.join(" AND "))
-    };
-    let descriptor_table = quote_ident(&format!(
-        "lix_internal_state_materialized_v1_{}",
-        version_descriptor_schema_key()
-    ));
-    let sql = format!(
-        "SELECT \
-             ranked.entity_id AS entity_id \
-         FROM ( \
-           WITH RECURSIVE active_version AS ( \
-             SELECT lix_json_extract(snapshot_content, 'version_id') AS version_id \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = '{active_schema_key}' \
-               AND file_id = '{active_file_id}' \
-               AND version_id = '{active_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY updated_at DESC \
-             LIMIT 1 \
-           ), \
-           version_chain(version_id, depth) AS ( \
-             SELECT version_id, 0 AS depth \
-             FROM active_version \
-             UNION ALL \
-             SELECT \
-               lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') AS version_id, \
-               vc.depth + 1 AS depth \
-             FROM version_chain vc \
-             JOIN {descriptor_table} vd \
-               ON lix_json_extract(vd.snapshot_content, 'id') = vc.version_id \
-             WHERE vd.schema_key = '{descriptor_schema_key}' \
-               AND vd.file_id = '{descriptor_file_id}' \
-               AND vd.version_id = '{descriptor_storage_version_id}' \
-               AND vd.is_tombstone = 0 \
-               AND vd.snapshot_content IS NOT NULL \
-               AND lix_json_extract(vd.snapshot_content, 'inherits_from_version_id') IS NOT NULL \
-               AND vc.depth < 64 \
-           ) \
-           SELECT \
-             s.entity_id AS entity_id, \
-             s.schema_key AS schema_key, \
-             s.file_id AS file_id, \
-             av.version_id AS version_id, \
-             s.plugin_key AS plugin_key, \
-             s.snapshot_content AS snapshot_content, \
-             ROW_NUMBER() OVER ( \
-               PARTITION BY s.entity_id, s.schema_key, s.file_id \
-               ORDER BY vc.depth ASC \
-             ) AS rn \
-           FROM {vtable_name} s \
-           JOIN version_chain vc \
-             ON vc.version_id = s.version_id \
-           CROSS JOIN active_version av \
-           {source_pushdown} \
-         ) AS ranked \
-         WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL\
-           {ranked_pushdown}",
-        active_schema_key = escape_sql_string(active_version_schema_key()),
-        active_file_id = escape_sql_string(active_version_file_id()),
-        active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
-        vtable_name = VTABLE_NAME,
-        source_pushdown = source_pushdown,
-        ranked_pushdown = ranked_pushdown,
-    );
-    parse_single_query(&sql)
+        format!("{prefix}{}", join_predicates(predicates))
+    }
+}
+
+fn join_predicates(predicates: &[Expr]) -> String {
+    predicates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn predicate_contains_placeholder_or_subquery(predicate: &Expr) -> bool {
+    if predicate.to_string().contains('?') {
+        return true;
+    }
+    predicate_contains_subquery(predicate)
+}
+
+fn predicate_contains_subquery(predicate: &Expr) -> bool {
+    match predicate {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            predicate_contains_subquery(left) || predicate_contains_subquery(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr) => predicate_contains_subquery(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            predicate_contains_subquery(expr)
+                || predicate_contains_subquery(low)
+                || predicate_contains_subquery(high)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            predicate_contains_subquery(expr) || predicate_contains_subquery(pattern)
+        }
+        Expr::InList { expr, list, .. } => {
+            predicate_contains_subquery(expr)
+                || list.iter().any(predicate_contains_subquery)
+        }
+        Expr::Tuple(items) => items.iter().any(predicate_contains_subquery),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|value| predicate_contains_subquery(value))
+                || conditions.iter().any(|condition| {
+                    predicate_contains_subquery(&condition.condition)
+                        || predicate_contains_subquery(&condition.result)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|value| predicate_contains_subquery(value))
+        }
+        _ => false,
+    }
 }
 
 pub fn rewrite_query(query: Query, params: &[LixValue]) -> Result<Option<Query>, LixError> {
@@ -944,7 +823,7 @@ fn build_untracked_union_query(
     let mut union_parts = Vec::new();
     union_parts.push(format!(
         "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, NULL AS writer_key, true AS untracked, 1 AS priority \
+                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, writer_key, true AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
         untracked = UNTRACKED_TABLE

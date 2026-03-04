@@ -121,6 +121,352 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    vtable_update_without_untracked_predicate_updates_effective_untracked_row,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-effective-update', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked-initial\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES (\
+                 'entity-effective-update', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked-initial\"}', '1', true\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_internal_state_vtable \
+                 SET snapshot_content = '{\"key\":\"effective-updated\"}' \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-update' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible = engine
+            .execute(
+                "SELECT snapshot_content, untracked \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-update' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic_normalized(visible.rows.clone());
+        assert_eq!(visible.rows.len(), 1);
+        assert_eq!(
+            visible.rows[0][0],
+            Value::Text("{\"key\":\"effective-updated\"}".to_string())
+        );
+        assert_boolean_like(&visible.rows[0][1], true);
+
+        let tracked = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_materialized_v1_test_schema \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-update' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1' \
+                   AND is_tombstone = 0",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tracked.rows.len(), 1);
+        assert_eq!(
+            tracked.rows[0][0],
+            Value::Text("{\"key\":\"tracked-initial\"}".to_string())
+        );
+    }
+);
+
+simulation_test!(
+    vtable_update_without_untracked_predicate_with_alias_updates_effective_untracked_row,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-effective-alias', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked-initial\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES (\
+                 'entity-effective-alias', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked-initial\"}', '1', true\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_internal_state_vtable AS s \
+                 SET snapshot_content = '{\"key\":\"alias-updated\"}' \
+                 WHERE s.schema_key = 'test_schema' \
+                   AND s.entity_id = 'entity-effective-alias' \
+                   AND s.file_id = 'file-1' \
+                   AND s.version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible = engine
+            .execute(
+                "SELECT snapshot_content, untracked \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-alias' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic_normalized(visible.rows.clone());
+        assert_eq!(visible.rows.len(), 1);
+        assert_eq!(
+            visible.rows[0][0],
+            Value::Text("{\"key\":\"alias-updated\"}".to_string())
+        );
+        assert_boolean_like(&visible.rows[0][1], true);
+    }
+);
+
+simulation_test!(
+    vtable_update_without_untracked_predicate_key_mutation_keeps_tracked_shadowed,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-effective-key-move', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked-initial\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES (\
+                 'entity-effective-key-move', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked-initial\"}', '1', true\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "UPDATE lix_internal_state_vtable \
+                 SET file_id = 'file-2', snapshot_content = '{\"key\":\"effective-moved\"}' \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-key-move' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible_new = engine
+            .execute(
+                "SELECT snapshot_content, untracked \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-key-move' \
+                   AND file_id = 'file-2' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic_normalized(visible_new.rows.clone());
+        assert_eq!(visible_new.rows.len(), 1);
+        assert_eq!(
+            visible_new.rows[0][0],
+            Value::Text("{\"key\":\"effective-moved\"}".to_string())
+        );
+        assert_boolean_like(&visible_new.rows[0][1], true);
+
+        let tracked_old = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_materialized_v1_test_schema \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-key-move' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1' \
+                   AND is_tombstone = 0",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tracked_old.rows.len(), 1);
+        assert_eq!(
+            tracked_old.rows[0][0],
+            Value::Text("{\"key\":\"tracked-initial\"}".to_string())
+        );
+
+        let tracked_new = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_internal_state_materialized_v1_test_schema \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-key-move' \
+                   AND file_id = 'file-2' \
+                   AND version_id = 'version-1' \
+                   AND is_tombstone = 0",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(tracked_new.rows.len(), 0);
+    }
+);
+
+simulation_test!(
+    vtable_delete_without_untracked_predicate_deletes_effective_untracked_row,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-effective-delete', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"tracked-initial\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_state_vtable (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
+                 ) VALUES (\
+                 'entity-effective-delete', 'test_schema', 'file-1', 'version-1', 'lix', '{\"key\":\"untracked-initial\"}', '1', true\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-delete' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible = engine
+            .execute(
+                "SELECT snapshot_content, untracked \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-delete' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        sim.assert_deterministic_normalized(visible.rows.clone());
+        assert_eq!(visible.rows.len(), 1);
+        assert_eq!(
+            visible.rows[0][0],
+            Value::Text("{\"key\":\"tracked-initial\"}".to_string())
+        );
+        assert_boolean_like(&visible.rows[0][1], false);
+
+        let untracked = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-effective-delete' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(untracked.rows[0][0], Value::Integer(0));
+    }
+);
+
 simulation_test!(untracked_state_change_id_is_untracked, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)

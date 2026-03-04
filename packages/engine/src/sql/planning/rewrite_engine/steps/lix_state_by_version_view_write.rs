@@ -5,6 +5,7 @@ use sqlparser::ast::{
 };
 
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
+use crate::engine::sql::planning::rewrite_engine::steps::state_columns::LIX_STATE_BY_VERSION_MUTABLE_COLUMNS;
 use crate::LixError;
 
 const LIX_STATE_BY_VERSION_VIEW_NAME: &str = "lix_state_by_version";
@@ -251,23 +252,10 @@ fn assignment_target_column_name(target: &AssignmentTarget) -> Option<String> {
 }
 
 fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
-    const ALLOWED: &[&str] = &[
-        "entity_id",
-        "schema_key",
-        "file_id",
-        "version_id",
-        "plugin_key",
-        "schema_version",
-        "snapshot_content",
-        "metadata",
-        "writer_key",
-        "untracked",
-        "inherited_from_version_id",
-    ];
     for assignment in &update.assignments {
         let column = assignment_target_column_name(&assignment.target).ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: "strict rewrite violation: lix_state_by_version update assignment must target a named column".to_string(),
         })?;
-        if ALLOWED
+        if LIX_STATE_BY_VERSION_MUTABLE_COLUMNS
             .iter()
             .any(|candidate| column.eq_ignore_ascii_case(candidate))
         {
@@ -276,7 +264,7 @@ fn validate_update_assignments_known(update: &Update) -> Result<(), LixError> {
         return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "strict rewrite violation: lix_state_by_version update assignment references unknown column '{}'; allowed columns: {}",
                 column,
-                ALLOWED.join(", ")
+                LIX_STATE_BY_VERSION_MUTABLE_COLUMNS.join(", ")
             ),
         });
     }
