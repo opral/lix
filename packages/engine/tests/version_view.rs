@@ -84,26 +84,23 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_version_hides_internal_global_lane,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+simulation_test!(lix_version_hides_internal_global_lane, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
 
-        let result = engine
-            .execute(
-                "SELECT id, name FROM lix_version WHERE id = 'global' OR name = 'global'",
-                &[],
-            )
-            .await
-            .unwrap();
+    let result = engine
+        .execute(
+            "SELECT id, name FROM lix_version WHERE id = 'global' OR name = 'global'",
+            &[],
+        )
+        .await
+        .unwrap();
 
-        assert!(result.statements[0].rows.is_empty());
-    }
-);
+    assert!(result.statements[0].rows.is_empty());
+});
 
 simulation_test!(
     lix_version_select_reads_seeded_main_version,
@@ -395,8 +392,8 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         .unwrap();
     assert_eq!(version_rows.statements[0].rows.len(), 0);
 
-        let deleted_rows = engine
-            .execute(
+    let deleted_rows = engine
+        .execute(
             "SELECT DISTINCT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-c' \
@@ -408,15 +405,15 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         .await
         .unwrap();
 
-        assert_eq!(deleted_rows.statements[0].rows.len(), 2);
-        assert_text(
-            &deleted_rows.statements[0].rows[0][0],
-            "lix_version_descriptor",
-        );
-        assert_text(
-            &deleted_rows.statements[0].rows[1][0],
-            "lix_version_pointer",
-        );
+    assert_eq!(deleted_rows.statements[0].rows.len(), 2);
+    assert_text(
+        &deleted_rows.statements[0].rows[0][0],
+        "lix_version_descriptor",
+    );
+    assert_text(
+        &deleted_rows.statements[0].rows[1][0],
+        "lix_version_pointer",
+    );
 });
 
 simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {

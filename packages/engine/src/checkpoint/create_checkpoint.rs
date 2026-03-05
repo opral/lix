@@ -137,6 +137,7 @@ async fn load_global_pointer_commit_id(tx: &mut EngineTransaction<'_>) -> Result
                AND entity_id = 'global' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
+               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              ORDER BY updated_at DESC, created_at DESC, change_id DESC \

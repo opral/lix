@@ -3,11 +3,29 @@ mod support;
 use lix_engine::{ExecuteOptions, Value};
 use support::simulation_test::SimulationBootArgs;
 
-simulation_test!(select_works, |sim| async move {
+simulation_test!(
+    execute_before_init_returns_not_initialized,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        let err = engine
+            .execute("SELECT 1 + 1", &[])
+            .await
+            .expect_err("execute before init should fail");
+        assert_eq!(err.code, "LIX_ERROR_NOT_INITIALIZED");
+    }
+);
+
+simulation_test!(select_works_after_init, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
+
     let result = engine.execute("SELECT 1 + 1", &[]).await.unwrap();
     sim.assert_deterministic(result.statements[0].rows.clone());
     assert_eq!(result.statements[0].rows.len(), 1);

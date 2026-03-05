@@ -63,10 +63,7 @@ async fn read_active_version_view_row(
     (id, version_id)
 }
 
-async fn insert_version(
-    engine: &support::simulation_test::SimulationEngine,
-    version_id: &str,
-) {
+async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
     let sql = format!(
         "INSERT INTO lix_version (\
          id, name, hidden, commit_id\
@@ -266,7 +263,10 @@ simulation_test!(
         insert_version(&engine, "version-existing-fk").await;
 
         engine
-            .execute("UPDATE lix_active_version SET version_id = 'version-existing-fk'", &[])
+            .execute(
+                "UPDATE lix_active_version SET version_id = 'version-existing-fk'",
+                &[],
+            )
             .await
             .unwrap();
 

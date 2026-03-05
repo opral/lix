@@ -33,7 +33,7 @@ impl Engine {
         ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
 
         let mut transaction = self.backend.begin_transaction().await?;
-        let mut active_version_id = self.active_version_id.read().unwrap().clone();
+        let mut active_version_id = self.require_active_version_id()?;
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
         let options = ExecuteOptions::default();
