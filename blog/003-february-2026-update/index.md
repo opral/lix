@@ -3,6 +3,8 @@ date: "2026-03-04"
 og:description: "The Rust rewrite is complete. 33x faster file writes, lix was trending on HackerNews, and what's next in March."
 ---
 
+# February 2026 Update: Rust Rewrite Complete
+
 **TL;DR**
 
 - 33x faster file writes
