@@ -177,6 +177,7 @@ async fn ensure_version_descriptor_exists(
                 "SELECT 1 \
                  FROM {table} \
                  WHERE entity_id = $1 \
+                   AND global = true \
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",

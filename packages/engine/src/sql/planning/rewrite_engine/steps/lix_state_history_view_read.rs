@@ -773,6 +773,7 @@ fn default_root_commits_cte_sql(view_variant: HistoryViewVariant) -> String {
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
+                 AND vp.global = true \
                  AND vp.is_tombstone = 0 \
                  AND vp.snapshot_content IS NOT NULL \
              ), ",
@@ -789,6 +790,7 @@ fn default_root_commits_cte_sql(view_variant: HistoryViewVariant) -> String {
                WHERE vp.schema_key = '{schema_key}' \
                  AND vp.file_id = '{file_id}' \
                  AND vp.version_id = '{storage_version_id}' \
+                 AND vp.global = true \
                  AND vp.is_tombstone = 0 \
                  AND vp.snapshot_content IS NOT NULL \
              ), ",

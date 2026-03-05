@@ -498,6 +498,7 @@ async fn load_effective_scope_delete_rows(
              WHERE schema_key = '{descriptor_schema_key}' \
                AND file_id = '{descriptor_file_id}' \
                AND version_id = '{descriptor_storage_version_id}' \
+               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
