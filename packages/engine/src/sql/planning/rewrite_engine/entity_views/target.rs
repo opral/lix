@@ -7,6 +7,7 @@ use sqlparser::ast::{ObjectName, ObjectNamePart};
 use crate::builtin_schema::builtin_schema_definition;
 use crate::cel::CelEvaluator;
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError};
 
 const RESERVED_VIEW_NAMES: &[&str] = &[
@@ -52,6 +53,7 @@ pub(crate) struct EntityViewTarget {
     pub file_id_override: Option<String>,
     pub plugin_key_override: Option<String>,
     pub version_id_override: Option<String>,
+    pub write_version_id_override: Option<String>,
     pub override_predicates: Vec<EntityViewOverridePredicate>,
 }
 
@@ -149,10 +151,7 @@ pub(crate) fn projected_lixcol_aliases_for_variant(
             ("schema_version", "lixcol_schema_version"),
             ("created_at", "lixcol_created_at"),
             ("updated_at", "lixcol_updated_at"),
-            (
-                "inherited_from_version_id",
-                "lixcol_inherited_from_version_id",
-            ),
+            ("global", "lixcol_global"),
             ("change_id", "lixcol_change_id"),
             ("untracked", "lixcol_untracked"),
             ("metadata", "lixcol_metadata"),
@@ -166,10 +165,7 @@ pub(crate) fn projected_lixcol_aliases_for_variant(
             ("schema_version", "lixcol_schema_version"),
             ("created_at", "lixcol_created_at"),
             ("updated_at", "lixcol_updated_at"),
-            (
-                "inherited_from_version_id",
-                "lixcol_inherited_from_version_id",
-            ),
+            ("global", "lixcol_global"),
             ("change_id", "lixcol_change_id"),
             ("untracked", "lixcol_untracked"),
             ("metadata", "lixcol_metadata"),
@@ -229,6 +225,8 @@ fn build_target_from_schema(
         extract_lixcol_string_override(schema, schema_key, "lixcol_plugin_key", &evaluator)?;
     let version_id_override =
         extract_lixcol_string_override(schema, schema_key, "lixcol_version_id", &evaluator)?;
+    let write_version_id_override =
+        extract_write_version_id_override(schema, schema_key, &version_id_override, &evaluator)?;
     let override_predicates = collect_override_predicates(schema, schema_key, variant, &evaluator)?;
 
     Ok(Some(EntityViewTarget {
@@ -243,6 +241,7 @@ fn build_target_from_schema(
         file_id_override,
         plugin_key_override,
         version_id_override,
+        write_version_id_override,
         override_predicates,
     }))
 }
@@ -438,6 +437,46 @@ fn extract_lixcol_string_override(
     }
 }
 
+fn extract_lixcol_boolean_override(
+    schema: &JsonValue,
+    schema_key: &str,
+    key: &str,
+    evaluator: &CelEvaluator,
+) -> Result<Option<bool>, LixError> {
+    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Bool(value) => Ok(Some(value)),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "x-lix-override-lixcols '{}.{}' must evaluate to a boolean",
+                schema_key, key
+            ),
+        }),
+    }
+}
+
+fn extract_write_version_id_override(
+    schema: &JsonValue,
+    schema_key: &str,
+    version_id_override: &Option<String>,
+    evaluator: &CelEvaluator,
+) -> Result<Option<String>, LixError> {
+    if let Some(version_id) = version_id_override {
+        return Ok(Some(version_id.clone()));
+    }
+
+    if extract_lixcol_boolean_override(schema, schema_key, "lixcol_global", evaluator)?
+        == Some(true)
+    {
+        return Ok(Some(GLOBAL_VERSION_ID.to_string()));
+    }
+
+    Ok(None)
+}
+
 fn extract_lixcol_scalar_override(
     schema: &JsonValue,
     schema_key: &str,
@@ -471,7 +510,7 @@ fn collect_override_predicates(
         "lixcol_entity_id",
         "lixcol_file_id",
         "lixcol_plugin_key",
-        "lixcol_inherited_from_version_id",
+        "lixcol_global",
         "lixcol_metadata",
         "lixcol_untracked",
     ];
@@ -500,7 +539,7 @@ fn override_column_name(key: &str) -> Option<&'static str> {
         "lixcol_entity_id" => "entity_id",
         "lixcol_file_id" => "file_id",
         "lixcol_plugin_key" => "plugin_key",
-        "lixcol_inherited_from_version_id" => "inherited_from_version_id",
+        "lixcol_global" => "global",
         "lixcol_metadata" => "metadata",
         "lixcol_untracked" => "untracked",
         _ => return None,
@@ -509,7 +548,7 @@ fn override_column_name(key: &str) -> Option<&'static str> {
 
 fn override_allowed_for_variant(key: &str, variant: EntityViewVariant) -> bool {
     match key {
-        "lixcol_inherited_from_version_id" | "lixcol_untracked" => {
+        "lixcol_global" | "lixcol_untracked" => {
             variant == EntityViewVariant::Base || variant == EntityViewVariant::ByVersion
         }
         _ => true,
@@ -583,11 +622,50 @@ mod tests {
             target.version_id_override.as_deref(),
             Some("version-custom")
         );
+        assert_eq!(
+            target.write_version_id_override.as_deref(),
+            Some("version-custom")
+        );
         assert_eq!(target.override_predicates.len(), 3);
         assert!(target
             .override_predicates
             .iter()
             .any(|predicate| predicate.column == "untracked" && predicate.value == json!(true)));
+    }
+
+    #[test]
+    fn derives_global_version_override_from_lixcol_global() {
+        let schema = json!({
+            "x-lix-key": "lix_custom_entity",
+            "x-lix-version": "1",
+            "x-lix-override-lixcols": {
+                "lixcol_file_id": "'file-custom'",
+                "lixcol_plugin_key": "'plugin-custom'",
+                "lixcol_global": "true"
+            },
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        });
+
+        let target = build_target_from_schema(
+            "lix_custom_entity",
+            "lix_custom_entity",
+            EntityViewVariant::Base,
+            &schema,
+        )
+        .expect("target resolution should succeed")
+        .expect("target should resolve");
+
+        assert_eq!(target.version_id_override, None);
+        assert_eq!(target.write_version_id_override.as_deref(), Some("global"));
+        assert!(target
+            .override_predicates
+            .iter()
+            .any(|predicate| predicate.column == "global" && predicate.value == json!(true)));
     }
 
     #[test]

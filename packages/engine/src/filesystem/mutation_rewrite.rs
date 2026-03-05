@@ -26,8 +26,7 @@ use crate::filesystem::path::{
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
+    parse_active_version_snapshot, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, Value as EngineValue};
 
@@ -1960,7 +1959,7 @@ fn placeholder_range(start: usize, len: usize) -> String {
 }
 
 async fn load_version_chain_ids(
-    backend: &dyn LixBackend,
+    _backend: &dyn LixBackend,
     version_id: &str,
     read_rewrite_session: &mut ReadRewriteSession,
 ) -> Result<Vec<String>, LixError> {
@@ -1968,62 +1967,9 @@ async fn load_version_chain_ids(
         return Ok(cached.to_vec());
     }
 
-    let inherits_expr = json_text_expr_sql(backend.dialect(), "inherits_from_version_id");
-    let sql = format!(
-        "WITH RECURSIVE version_chain(version_id, depth) AS ( \
-           SELECT $1 AS version_id, 0 AS depth \
-           UNION ALL \
-           SELECT \
-             COALESCE( \
-               (SELECT {inherits_expr} \
-                FROM lix_internal_state_untracked \
-                WHERE schema_key = '{schema_key}' \
-                  AND file_id = '{file_id}' \
-                  AND version_id = '{storage_version_id}' \
-                  AND entity_id = vc.version_id \
-                  AND snapshot_content IS NOT NULL \
-                LIMIT 1), \
-               (SELECT {inherits_expr} \
-                FROM lix_internal_state_materialized_v1_lix_version_descriptor \
-                WHERE schema_key = '{schema_key}' \
-                  AND version_id = '{storage_version_id}' \
-                  AND entity_id = vc.version_id \
-                  AND is_tombstone = 0 \
-                  AND snapshot_content IS NOT NULL \
-                LIMIT 1) \
-             ) AS version_id, \
-             vc.depth + 1 AS depth \
-           FROM version_chain vc \
-           WHERE vc.version_id IS NOT NULL \
-             AND vc.depth < 64 \
-         ) \
-         SELECT version_id \
-         FROM version_chain \
-         WHERE version_id IS NOT NULL",
-        inherits_expr = inherits_expr,
-        schema_key = escape_sql_string(version_descriptor_schema_key()),
-        file_id = escape_sql_string(version_descriptor_file_id()),
-        storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
-    );
-    let result = backend
-        .execute(&sql, &[EngineValue::Text(version_id.to_string())])
-        .await?;
-
-    let mut chain = Vec::new();
-    for row in &result.rows {
-        let Some(value) = row.first() else {
-            continue;
-        };
-        let EngineValue::Text(version_id) = value else {
-            continue;
-        };
-        if chain.iter().any(|existing| existing == version_id) {
-            continue;
-        }
-        chain.push(version_id.clone());
-    }
-    if chain.is_empty() {
-        chain.push(version_id.to_string());
+    let mut chain = vec![version_id.to_string()];
+    if version_id != GLOBAL_VERSION_ID {
+        chain.push(GLOBAL_VERSION_ID.to_string());
     }
 
     read_rewrite_session.cache_version_chain(version_id, &chain);
@@ -3928,8 +3874,8 @@ fn allowed_filesystem_selection_columns(target: FilesystemTarget) -> Vec<&'stati
         "lixcol_root_commit_id",
         "depth",
         "lixcol_depth",
-        "inherited_from_version_id",
-        "lixcol_inherited_from_version_id",
+        "global",
+        "lixcol_global",
         "untracked",
         "lixcol_untracked",
         "created_at",
@@ -3998,17 +3944,15 @@ mod tests {
     };
     use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
-    use std::sync::Mutex;
-
     #[test]
     fn json_text_expr_sql_uses_backend_specific_expression() {
         assert_eq!(
-            json_text_expr_sql(SqlDialect::Sqlite, "inherits_from_version_id"),
-            "json_extract(snapshot_content, '$.\"inherits_from_version_id\"')"
+            json_text_expr_sql(SqlDialect::Sqlite, "parent_id"),
+            "json_extract(snapshot_content, '$.\"parent_id\"')"
         );
         assert_eq!(
-            json_text_expr_sql(SqlDialect::Postgres, "inherits_from_version_id"),
-            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'inherits_from_version_id')"
+            json_text_expr_sql(SqlDialect::Postgres, "parent_id"),
+            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'parent_id')"
         );
     }
 
@@ -4276,18 +4220,7 @@ mod tests {
         assert_eq!(tombstone, Some(true));
     }
 
-    struct VersionChainBackendMock {
-        execute_calls: Mutex<usize>,
-    }
-
-    impl VersionChainBackendMock {
-        fn execute_calls(&self) -> usize {
-            *self
-                .execute_calls
-                .lock()
-                .expect("version chain execute_calls mutex poisoned")
-        }
-    }
+    struct VersionChainBackendMock;
 
     #[async_trait::async_trait(?Send)]
     impl LixBackend for VersionChainBackendMock {
@@ -4295,26 +4228,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(&self, _sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-            let mut calls = self
-                .execute_calls
-                .lock()
-                .expect("version chain execute_calls mutex poisoned");
-            *calls += 1;
-
-            let requested_version = match params.first() {
-                Some(Value::Text(version_id)) => version_id.clone(),
-                _ => "unknown".to_string(),
-            };
-            let parent_version = format!("{requested_version}-parent");
-
-            Ok(QueryResult {
-                rows: vec![
-                    vec![Value::Text(requested_version)],
-                    vec![Value::Text(parent_version)],
-                ],
-                columns: vec!["version_id".to_string()],
-            })
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            panic!("version chain lookup should not query the backend");
         }
 
         async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
@@ -4327,9 +4242,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_chain_lookup_uses_session_cache_for_repeated_version() {
-        let backend = VersionChainBackendMock {
-            execute_calls: Mutex::new(0),
-        };
+        let backend = VersionChainBackendMock;
         let mut session = ReadRewriteSession::default();
 
         let first = load_version_chain_ids(&backend, "v-main", &mut session)
@@ -4340,10 +4253,6 @@ mod tests {
             .expect("cached lookup should succeed");
 
         assert_eq!(first, second);
-        assert_eq!(
-            backend.execute_calls(),
-            1,
-            "repeated lookup should reuse session cache"
-        );
+        assert_eq!(first, vec!["v-main".to_string(), "global".to_string()]);
     }
 }

@@ -47,10 +47,6 @@ fn build_effective_state_by_version_view_query(
     let ranked_pushdown = render_where_clause(&ranked_predicates, " AND ");
     let target_versions_cte =
         build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
-    let descriptor_table = quote_ident(&format!(
-        "lix_internal_state_materialized_v1_{}",
-        version_descriptor_schema_key()
-    ));
     let commit_ctes = if include_commit_mapping {
         format!(
             ", \
@@ -113,25 +109,14 @@ fn build_effective_state_by_version_view_query(
              ranked.schema_version AS schema_version, \
              ranked.created_at AS created_at, \
              ranked.updated_at AS updated_at, \
-             ranked.inherited_from_version_id AS inherited_from_version_id, \
+             ranked.global AS global, \
              ranked.change_id AS change_id, \
              ranked.commit_id AS commit_id, \
              ranked.untracked AS untracked, \
              ranked.writer_key AS writer_key, \
              ranked.metadata AS metadata \
          FROM ( \
-           WITH RECURSIVE \
-             version_descriptor AS ( \
-               SELECT \
-                 lix_json_extract(snapshot_content, 'id') AS version_id, \
-                 lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
-               FROM {descriptor_table} \
-               WHERE schema_key = '{descriptor_schema_key}' \
-                 AND file_id = '{descriptor_file_id}' \
-                 AND version_id = '{descriptor_storage_version_id}' \
-                 AND is_tombstone = 0 \
-                 AND snapshot_content IS NOT NULL \
-             ), \
+           WITH \
              {target_versions_cte}, \
              version_chain(target_version_id, ancestor_version_id, depth) AS ( \
                SELECT \
@@ -141,14 +126,11 @@ fn build_effective_state_by_version_view_query(
                FROM target_versions \
                UNION ALL \
                SELECT \
-                 vc.target_version_id, \
-                 vd.inherits_from_version_id AS ancestor_version_id, \
-                 vc.depth + 1 AS depth \
-               FROM version_chain vc \
-               JOIN version_descriptor vd \
-                 ON vd.version_id = vc.ancestor_version_id \
-               WHERE vd.inherits_from_version_id IS NOT NULL \
-                 AND vc.depth < 64 \
+                 version_id AS target_version_id, \
+                 '{global_version}' AS ancestor_version_id, \
+                 1 AS depth \
+               FROM target_versions \
+               WHERE version_id <> '{global_version}' \
              ) \
              {commit_ctes} \
            SELECT \
@@ -161,11 +143,7 @@ fn build_effective_state_by_version_view_query(
              s.schema_version AS schema_version, \
              s.created_at AS created_at, \
              s.updated_at AS updated_at, \
-             CASE \
-               WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
-               WHEN vc.depth = 0 THEN NULL \
-               ELSE s.version_id \
-             END AS inherited_from_version_id, \
+             s.global AS global, \
              s.change_id AS change_id, \
              {commit_expr}, \
              s.untracked AS untracked, \
@@ -184,10 +162,6 @@ fn build_effective_state_by_version_view_query(
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL\
            {ranked_pushdown}",
-        descriptor_table = descriptor_table,
-        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         vtable_name = VTABLE_NAME,
         source_pushdown = source_pushdown,
         ranked_pushdown = ranked_pushdown,
@@ -195,6 +169,7 @@ fn build_effective_state_by_version_view_query(
         commit_ctes = commit_ctes,
         commit_expr = commit_expr,
         commit_join = commit_join,
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
     );
     parse_single_query(&sql)
 }
@@ -208,26 +183,11 @@ fn build_effective_state_by_version_count_query(
     let ranked_pushdown = render_where_clause(&ranked_predicates, " AND ");
     let target_versions_cte =
         build_effective_state_target_versions_cte(&target_version_pushdown, VTABLE_NAME);
-    let descriptor_table = quote_ident(&format!(
-        "lix_internal_state_materialized_v1_{}",
-        version_descriptor_schema_key()
-    ));
     let sql = format!(
         "SELECT \
              ranked.entity_id AS entity_id \
          FROM ( \
-           WITH RECURSIVE \
-             version_descriptor AS ( \
-               SELECT \
-                 lix_json_extract(snapshot_content, 'id') AS version_id, \
-                 lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
-               FROM {descriptor_table} \
-               WHERE schema_key = '{descriptor_schema_key}' \
-                 AND file_id = '{descriptor_file_id}' \
-                 AND version_id = '{descriptor_storage_version_id}' \
-                 AND is_tombstone = 0 \
-                 AND snapshot_content IS NOT NULL \
-             ), \
+           WITH \
              {target_versions_cte}, \
              version_chain(target_version_id, ancestor_version_id, depth) AS ( \
                SELECT \
@@ -237,14 +197,11 @@ fn build_effective_state_by_version_count_query(
                FROM target_versions \
                UNION ALL \
                SELECT \
-                 vc.target_version_id, \
-                 vd.inherits_from_version_id AS ancestor_version_id, \
-                 vc.depth + 1 AS depth \
-               FROM version_chain vc \
-               JOIN version_descriptor vd \
-                 ON vd.version_id = vc.ancestor_version_id \
-               WHERE vd.inherits_from_version_id IS NOT NULL \
-                 AND vc.depth < 64 \
+                 version_id AS target_version_id, \
+                 '{global_version}' AS ancestor_version_id, \
+                 1 AS depth \
+               FROM target_versions \
+               WHERE version_id <> '{global_version}' \
              ) \
            SELECT \
              s.entity_id AS entity_id, \
@@ -265,14 +222,11 @@ fn build_effective_state_by_version_count_query(
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL\
            {ranked_pushdown}",
-        descriptor_table = descriptor_table,
-        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
-        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
-        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
         vtable_name = VTABLE_NAME,
         source_pushdown = source_pushdown,
         ranked_pushdown = ranked_pushdown,
         target_versions_cte = target_versions_cte,
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
     );
     parse_single_query(&sql)
 }
@@ -283,16 +237,38 @@ fn build_effective_state_target_versions_cte(
 ) -> String {
     if target_version_pushdown.is_empty() {
         return format!(
-            "all_target_versions AS ( \
-               SELECT version_id FROM version_descriptor \
+            "all_real_versions AS ( \
+               SELECT lix_json_extract(snapshot_content, 'id') AS version_id \
+               FROM {descriptor_table} \
+               WHERE schema_key = '{descriptor_schema_key}' \
+                 AND file_id = '{descriptor_file_id}' \
+                 AND version_id = '{descriptor_storage_version_id}' \
+                 AND global = true \
+                 AND is_tombstone = 0 \
+                 AND snapshot_content IS NOT NULL \
+             ), \
+             all_target_versions AS ( \
+               SELECT DISTINCT version_id \
+               FROM {vtable_name} \
+               WHERE version_id <> '{global_version}' \
                UNION \
-               SELECT DISTINCT version_id FROM {vtable_name} \
+               SELECT version_id \
+               FROM all_real_versions \
              ), \
              target_versions AS ( \
                SELECT version_id \
                FROM all_target_versions \
              )",
-            vtable_name = vtable_name
+            descriptor_table = quote_ident(&format!(
+                "lix_internal_state_materialized_v1_{}",
+                version_descriptor_schema_key()
+            )),
+            descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
+            descriptor_storage_version_id =
+                escape_sql_string(version_descriptor_storage_version_id()),
+            vtable_name = vtable_name,
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
         );
     }
 
@@ -302,31 +278,74 @@ fn build_effective_state_target_versions_cte(
         .any(predicate_contains_placeholder_or_subquery)
     {
         return format!(
-            "all_target_versions AS ( \
-               SELECT version_id FROM version_descriptor \
+            "all_real_versions AS ( \
+               SELECT lix_json_extract(snapshot_content, 'id') AS version_id \
+               FROM {descriptor_table} \
+               WHERE schema_key = '{descriptor_schema_key}' \
+                 AND file_id = '{descriptor_file_id}' \
+                 AND version_id = '{descriptor_storage_version_id}' \
+                 AND global = true \
+                 AND is_tombstone = 0 \
+                 AND snapshot_content IS NOT NULL \
+             ), \
+             all_target_versions AS ( \
+               SELECT DISTINCT version_id \
+               FROM {vtable_name} \
+               WHERE version_id <> '{global_version}' \
                UNION \
-               SELECT DISTINCT version_id FROM {vtable_name} \
+               SELECT version_id \
+               FROM all_real_versions \
              ), \
              target_versions AS ( \
                SELECT version_id \
                FROM all_target_versions \
                WHERE {target_version_filter} \
              )",
+            descriptor_table = quote_ident(&format!(
+                "lix_internal_state_materialized_v1_{}",
+                version_descriptor_schema_key()
+            )),
+            descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
+            descriptor_storage_version_id =
+                escape_sql_string(version_descriptor_storage_version_id()),
             vtable_name = vtable_name,
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
             target_version_filter = target_version_filter
         );
     }
 
     format!(
-        "target_versions AS ( \
+        "all_real_versions AS ( \
+           SELECT lix_json_extract(snapshot_content, 'id') AS version_id \
+           FROM {descriptor_table} \
+           WHERE schema_key = '{descriptor_schema_key}' \
+             AND file_id = '{descriptor_file_id}' \
+             AND version_id = '{descriptor_storage_version_id}' \
+             AND global = true \
+             AND is_tombstone = 0 \
+             AND snapshot_content IS NOT NULL \
+         ), \
+         target_versions AS ( \
            SELECT version_id \
-           FROM version_descriptor \
-           WHERE {target_version_filter} \
-           UNION \
-           SELECT DISTINCT version_id \
-           FROM {vtable_name} \
+           FROM ( \
+             SELECT DISTINCT version_id \
+             FROM {vtable_name} \
+             WHERE version_id <> '{global_version}' \
+             UNION \
+             SELECT version_id \
+             FROM all_real_versions \
+           ) AS all_target_versions \
            WHERE {target_version_filter} \
          )",
+        descriptor_table = quote_ident(&format!(
+            "lix_internal_state_materialized_v1_{}",
+            version_descriptor_schema_key()
+        )),
+        descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+        descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
+        descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
         target_version_filter = target_version_filter,
         vtable_name = vtable_name
     )
@@ -820,7 +839,7 @@ fn build_untracked_union_query(
     let mut union_parts = Vec::new();
     union_parts.push(format!(
         "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, NULL AS inherited_from_version_id, 'untracked' AS change_id, writer_key, true AS untracked, 1 AS priority \
+                created_at, updated_at, global, 'untracked' AS change_id, writer_key, true AS untracked, 1 AS priority \
          FROM {untracked} \
          WHERE {untracked_where}",
         untracked = UNTRACKED_TABLE
@@ -835,7 +854,7 @@ fn build_untracked_union_query(
             .unwrap_or_default();
         union_parts.push(format!(
             "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, inherited_from_version_id, change_id, writer_key, false AS untracked, 2 AS priority \
+                    created_at, updated_at, global, change_id, writer_key, false AS untracked, 2 AS priority \
              FROM {materialized}{materialized_where}",
             materialized = materialized_ident,
             materialized_where = materialized_where
@@ -846,10 +865,10 @@ fn build_untracked_union_query(
 
     let sql = format!(
         "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                created_at, updated_at, inherited_from_version_id, change_id, writer_key, untracked \
+                created_at, updated_at, global, change_id, writer_key, untracked \
          FROM (\
              SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
-                    created_at, updated_at, inherited_from_version_id, change_id, writer_key, untracked, \
+                    created_at, updated_at, global, change_id, writer_key, untracked, \
                     ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
              FROM ({union_sql}) AS lix_state_union\
          ) AS lix_state_ranked \

@@ -23,15 +23,13 @@ pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
         });
     }
     if insert.columns.iter().any(|column| {
-        column
-            .value
-            .eq_ignore_ascii_case("inherited_from_version_id")
+        column.value.eq_ignore_ascii_case("global")
+            || column.value.eq_ignore_ascii_case("lixcol_global")
     }) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "lix_state_by_version insert cannot set inherited_from_version_id; it is computed"
-                    .to_string(),
+            description: "lix_state_by_version insert cannot set global on this surface yet"
+                .to_string(),
         });
     }
     if !insert
@@ -110,13 +108,13 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Update>, LixError> {
     }
     validate_update_assignments_known(&update)?;
     if update.assignments.iter().any(|assignment| {
-        assignment_target_is_column(&assignment.target, "inherited_from_version_id")
+        assignment_target_is_column(&assignment.target, "global")
+            || assignment_target_is_column(&assignment.target, "lixcol_global")
     }) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "lix_state_by_version update cannot set inherited_from_version_id; it is computed"
-                    .to_string(),
+            description: "lix_state_by_version update cannot set global on this surface yet"
+                .to_string(),
         });
     }
 

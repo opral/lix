@@ -57,7 +57,7 @@ async fn run_lix_version_seeded_main_id_deterministic(sim: SimulationArgs) {
 
     let result = engine
         .execute(
-            "SELECT id, name, inherits_from_version_id \
+            "SELECT id, name \
              FROM lix_version \
              WHERE name = 'main'",
             &[],
@@ -75,7 +75,6 @@ async fn run_lix_version_seeded_main_id_deterministic(sim: SimulationArgs) {
     assert_ne!(id, "main");
     sim.assert_deterministic(id);
     assert_text(&row[1], "main");
-    assert_text(&row[2], "global");
 }
 
 simulation_test!(
@@ -85,41 +84,23 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_version_select_reads_seeded_global_version,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine(None)
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+simulation_test!(lix_version_hides_internal_global_lane, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+    engine.init().await.unwrap();
 
-        let result = engine
-            .execute(
-                "SELECT \
-                 id, name, inherits_from_version_id, commit_id, \
-                 schema_key, file_id, version_id, plugin_key, schema_version, untracked \
-                 FROM lix_version \
-                 WHERE id = 'global'",
-                &[],
-            )
-            .await
-            .unwrap();
+    let result = engine
+        .execute(
+            "SELECT id, name FROM lix_version WHERE id = 'global' OR name = 'global'",
+            &[],
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(result.statements[0].rows.len(), 1);
-        let row = &result.statements[0].rows[0];
-        assert_text(&row[0], "global");
-        assert_text(&row[1], "global");
-        assert_eq!(row[2], Value::Null);
-        assert_non_empty_text(&row[3]);
-        assert_text(&row[4], "lix_version");
-        assert_text(&row[5], "lix");
-        assert_text(&row[6], "global");
-        assert_text(&row[7], "lix");
-        assert_text(&row[8], "1");
-        assert_bool(&row[9], false);
-    }
-);
+    assert!(result.statements[0].rows.is_empty());
+});
 
 simulation_test!(
     lix_version_select_reads_seeded_main_version,
@@ -133,7 +114,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT \
-                 id, name, inherits_from_version_id \
+                 id, name, hidden, commit_id \
                  FROM lix_version \
                  WHERE name = 'main'",
                 &[],
@@ -146,7 +127,8 @@ simulation_test!(
         assert_non_empty_text(&row[0]);
         assert_ne!(row[0], Value::Text("main".to_string()));
         assert_text(&row[1], "main");
-        assert_text(&row[2], "global");
+        assert_bool(&row[2], false);
+        assert_non_empty_text(&row[3]);
     }
 );
 
@@ -162,9 +144,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-             id, name, inherits_from_version_id, hidden, commit_id\
+             id, name, hidden, commit_id\
              ) VALUES (\
-             'version-a', 'Version A', NULL, false, 'commit-a'\
+             'version-a', 'Version A', false, 'commit-a'\
              )",
                 &[],
             )
@@ -174,7 +156,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT \
-             id, name, inherits_from_version_id, hidden, commit_id \
+             id, name, hidden, commit_id \
              FROM lix_version \
              WHERE id = 'version-a'",
                 &[],
@@ -186,16 +168,16 @@ simulation_test!(
         let row = &result.statements[0].rows[0];
         assert_text(&row[0], "version-a");
         assert_text(&row[1], "Version A");
-        assert_eq!(row[2], Value::Null);
-        assert_bool(&row[3], false);
-        assert_text(&row[4], "commit-a");
+        assert_bool(&row[2], false);
+        assert_text(&row[3], "commit-a");
 
         let vtable_rows = engine
             .execute(
-                "SELECT schema_key \
+                "SELECT DISTINCT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-a' \
                AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer') \
+               AND snapshot_content IS NOT NULL \
              ORDER BY schema_key",
                 &[],
             )
@@ -221,9 +203,9 @@ simulation_test!(lix_version_insert_requires_commit_id, |sim| async move {
     let error = engine
         .execute(
             "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden\
+                 id, name, hidden\
                  ) VALUES (\
-                 'version-missing-tip', 'Version Missing Tip', NULL, false\
+                 'version-missing-tip', 'Version Missing Tip', false\
                  )",
             &[],
         )
@@ -251,9 +233,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-             id, name, inherits_from_version_id, hidden, commit_id\
+             id, name, hidden, commit_id\
              ) VALUES (\
-             'version-b', 'Version B', NULL, false, 'commit-b'\
+             'version-b', 'Version B', false, 'commit-b'\
              )",
                 &[],
             )
@@ -300,9 +282,9 @@ simulation_test!(lix_version_update_allows_commit_id_only, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_version (\
-             id, name, inherits_from_version_id, hidden, commit_id\
+             id, name, hidden, commit_id\
              ) VALUES (\
-             'version-tip-contract', 'Version Tip Contract', NULL, false, 'commit-tip-0'\
+             'version-tip-contract', 'Version Tip Contract', false, 'commit-tip-0'\
              )",
             &[],
         )
@@ -340,9 +322,9 @@ simulation_test!(lix_version_update_supports_placeholders, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'version-ph', 'Version PH', NULL, false, 'commit-ph'\
+                 'version-ph', 'Version PH', false, 'commit-ph'\
                  )",
             &[],
         )
@@ -390,9 +372,9 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_version (\
-             id, name, inherits_from_version_id, hidden, commit_id\
+             id, name, hidden, commit_id\
              ) VALUES (\
-             'version-c', 'Version C', NULL, false, 'commit-c'\
+             'version-c', 'Version C', false, 'commit-c'\
              )",
             &[],
         )
@@ -412,10 +394,11 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
 
     let deleted_rows = engine
         .execute(
-            "SELECT schema_key, snapshot_content \
+            "SELECT DISTINCT schema_key \
              FROM lix_internal_state_vtable \
              WHERE entity_id = 'version-c' \
                AND schema_key IN ('lix_version_descriptor', 'lix_version_pointer') \
+               AND snapshot_content IS NULL \
              ORDER BY schema_key",
             &[],
         )
@@ -427,12 +410,10 @@ simulation_test!(lix_version_delete_routes_to_tombstones, |sim| async move {
         &deleted_rows.statements[0].rows[0][0],
         "lix_version_descriptor",
     );
-    assert_eq!(deleted_rows.statements[0].rows[0][1], Value::Null);
     assert_text(
         &deleted_rows.statements[0].rows[1][0],
         "lix_version_pointer",
     );
-    assert_eq!(deleted_rows.statements[0].rows[1][1], Value::Null);
 });
 
 simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {
@@ -445,9 +426,9 @@ simulation_test!(lix_version_delete_supports_placeholders, |sim| async move {
     engine
         .execute(
             "INSERT INTO lix_version (\
-             id, name, inherits_from_version_id, hidden, commit_id\
+             id, name, hidden, commit_id\
              ) VALUES (\
-             'version-pd', 'Version PD', NULL, false, 'commit-pd'\
+             'version-pd', 'Version PD', false, 'commit-pd'\
              )",
             &[],
         )
@@ -482,9 +463,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'version-direct', 'version-direct', NULL, false, 'commit-direct'\
+                 'version-direct', 'version-direct', false, 'commit-direct'\
                  )",
                 &[],
             )
@@ -501,16 +482,6 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(before_version.statements[0].rows.len(), 1);
-
-        let global_before = engine
-            .execute("SELECT commit_id FROM lix_version WHERE id = 'global'", &[])
-            .await
-            .unwrap();
-        assert_eq!(global_before.statements[0].rows.len(), 1);
-        let global_before_commit = match &global_before.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text commit_id, got {other:?}"),
-        };
 
         engine
             .execute(
@@ -537,17 +508,6 @@ simulation_test!(
             after_version.statements[0].rows[0][2],
             before_version.statements[0].rows[0][2]
         );
-
-        let global_after = engine
-            .execute("SELECT commit_id FROM lix_version WHERE id = 'global'", &[])
-            .await
-            .unwrap();
-        assert_eq!(global_after.statements[0].rows.len(), 1);
-        let global_after_commit = match &global_after.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text commit_id, got {other:?}"),
-        };
-        assert_ne!(global_after_commit, global_before_commit);
     }
 );
 
@@ -563,9 +523,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'version-state', 'version-state', NULL, false, 'commit-state'\
+                 'version-state', 'version-state', false, 'commit-state'\
                  )",
                 &[],
             )
@@ -625,9 +585,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'v-unique-1', 'v-unique-1', NULL, false, 'commit-unique-1'\
+                 'v-unique-1', 'v-unique-1', false, 'commit-unique-1'\
                  )",
                 &[],
             )
@@ -637,9 +597,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'v-unique-1', 'v-unique-2', NULL, false, 'commit-unique-2'\
+                 'v-unique-1', 'v-unique-2', false, 'commit-unique-2'\
                  )",
                 &[],
             )
@@ -649,9 +609,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'v-unique-3', 'v-unique-3', NULL, false, 'commit-unique-3'\
+                 'v-unique-3', 'v-unique-3', false, 'commit-unique-3'\
                  )",
                 &[],
             )
@@ -688,9 +648,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'v-lenient', 'v-lenient', NULL, false, 'does_not_exist'\
+                 'v-lenient', 'v-lenient', false, 'does_not_exist'\
                  )",
                 &[],
             )
@@ -724,9 +684,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'version-baseline-insert', 'version-baseline-insert', 'global', false, 'commit-baseline-insert'\
+                 'version-baseline-insert', 'version-baseline-insert', false, 'commit-baseline-insert'\
                  )", &[])
             .await
             .unwrap();
@@ -762,7 +722,6 @@ simulation_test!(
             .create_version(lix_engine::CreateVersionOptions {
                 id: Some("version-baseline-delete".to_string()),
                 name: Some("version-baseline-delete".to_string()),
-                inherits_from_version_id: Some("global".to_string()),
                 hidden: false,
             })
             .await
@@ -824,9 +783,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'version-baseline-frozen', 'version-baseline-frozen', 'global', false, 'commit-baseline-frozen-0'\
+                 'version-baseline-frozen', 'version-baseline-frozen', false, 'commit-baseline-frozen-0'\
                  )", &[])
             .await
             .unwrap();

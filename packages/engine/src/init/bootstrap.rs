@@ -80,7 +80,7 @@ impl Engine {
                         "SELECT 1 \
                          FROM sqlite_master \
                          WHERE type = 'table' \
-                           AND name = 'lix_internal_state_materialized_v1_lix_version_pointer' \
+                           AND name = 'lix_internal_state_materialized_v1_lix_global_pointer' \
                          LIMIT 1",
                         &[],
                     )
@@ -94,7 +94,7 @@ impl Engine {
                         "SELECT 1 \
                          FROM information_schema.tables \
                          WHERE table_schema = current_schema() \
-                           AND table_name = 'lix_internal_state_materialized_v1_lix_version_pointer' \
+                           AND table_name = 'lix_internal_state_materialized_v1_lix_global_pointer' \
                          LIMIT 1",
                         &[],
                     )
@@ -110,11 +110,12 @@ impl Engine {
             .backend
             .execute(
                 "SELECT 1 \
-                 FROM lix_internal_state_materialized_v1_lix_version_pointer \
-                 WHERE schema_key = 'lix_version_pointer' \
+                 FROM lix_internal_state_materialized_v1_lix_global_pointer \
+                 WHERE schema_key = 'lix_global_pointer' \
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[],

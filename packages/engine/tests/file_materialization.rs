@@ -404,7 +404,7 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
 
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> (support::simulation_test::SimulationEngine, String) {
+) -> support::simulation_test::SimulationEngine {
     let runtime = Arc::new(
         support::wasmtime_runtime::TestWasmtimeRuntime::new()
             .expect("test wasmtime runtime should initialize"),
@@ -421,7 +421,6 @@ async fn boot_engine_with_json_plugin(
         .expect("boot_simulated_engine should succeed");
     engine.init().await.expect("engine init should succeed");
     register_plugin_schema(&engine).await;
-    let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
         support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
@@ -430,12 +429,12 @@ async fn boot_engine_with_json_plugin(
         .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
-    (engine, main_version_id)
+    engine
 }
 
 async fn boot_engine_with_path_echo_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> (support::simulation_test::SimulationEngine, String) {
+) -> support::simulation_test::SimulationEngine {
     let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
 
     let engine = sim
@@ -449,7 +448,6 @@ async fn boot_engine_with_path_echo_plugin(
         .expect("boot_simulated_engine should succeed");
     engine.init().await.expect("engine init should succeed");
     register_plugin_schema(&engine).await;
-    let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
         support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
@@ -458,12 +456,12 @@ async fn boot_engine_with_path_echo_plugin(
         .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
-    (engine, main_version_id)
+    engine
 }
 
 async fn boot_engine_with_before_aware_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> (support::simulation_test::SimulationEngine, String) {
+) -> support::simulation_test::SimulationEngine {
     let runtime = Arc::new(BeforeAwareRuntime) as Arc<dyn WasmRuntime>;
 
     let engine = sim
@@ -477,7 +475,6 @@ async fn boot_engine_with_before_aware_plugin(
         .expect("boot_simulated_engine should succeed");
     engine.init().await.expect("engine init should succeed");
     register_plugin_schema(&engine).await;
-    let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
         support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
@@ -486,7 +483,7 @@ async fn boot_engine_with_before_aware_plugin(
         .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
-    (engine, main_version_id)
+    engine
 }
 
 async fn detected_json_pointer_entities(
@@ -823,7 +820,7 @@ async fn binary_prefixed_chunk_payload_count_for_blob(
 
 async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     sim: &support::simulation_test::SimulationArgs,
-) -> (support::simulation_test::SimulationEngine, String) {
+) -> support::simulation_test::SimulationEngine {
     let runtime = Arc::new(JsonWithTxtNoopRuntime::new()) as Arc<dyn WasmRuntime>;
 
     let engine = sim
@@ -837,7 +834,6 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
         .expect("boot_simulated_engine should succeed");
     engine.init().await.expect("engine init should succeed");
     register_plugin_schema(&engine).await;
-    let main_version_id = main_version_id(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
         support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
@@ -846,7 +842,7 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
         .install_plugin(&plugin_archive)
         .await
         .expect("install_plugin should succeed");
-    (engine, main_version_id)
+    engine
 }
 
 simulation_test!(
@@ -1501,7 +1497,8 @@ simulation_test!(
     file_update_json_parameterized_detects_and_materializes,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -1547,7 +1544,8 @@ simulation_test!(
     file_update_path_and_data_uses_single_commit_for_descriptor_and_plugin_changes,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -1623,7 +1621,7 @@ simulation_test!(
     direct_state_insert_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -1674,7 +1672,7 @@ simulation_test!(
     direct_state_update_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -1727,7 +1725,7 @@ simulation_test!(
     direct_state_delete_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -1776,7 +1774,8 @@ simulation_test!(
     direct_state_by_version_insert_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -1842,7 +1841,8 @@ simulation_test!(
     direct_state_by_version_update_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -1911,7 +1911,8 @@ simulation_test!(
     direct_state_by_version_delete_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -1976,7 +1977,8 @@ simulation_test!(
     file_update_json_with_path_and_data_detects_and_materializes,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2031,8 +2033,8 @@ simulation_test!(
     file_update_path_only_plugin_switch_tombstones_previous_plugin_entities,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) =
-            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
         let plugin_wasm = plugin_txt_noop_wasm_bytes();
         let plugin_archive = support::simulation_test::build_test_plugin_archive(
             TEST_TXT_PLUGIN_MANIFEST,
@@ -2129,8 +2131,8 @@ simulation_test!(
     file_update_path_only_plugin_switch_does_not_write_non_authoritative_cache_data,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) =
-            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
         let plugin_wasm = plugin_txt_noop_wasm_bytes();
         let plugin_archive = support::simulation_test::build_test_plugin_archive(
             TEST_TXT_PLUGIN_MANIFEST,
@@ -2189,8 +2191,8 @@ simulation_test!(
     file_update_path_only_preserves_existing_data_cache_row,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) =
-            boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
         let plugin_wasm = plugin_txt_noop_wasm_bytes();
         let plugin_archive = support::simulation_test::build_test_plugin_archive(
             TEST_TXT_PLUGIN_MANIFEST,
@@ -2266,7 +2268,7 @@ simulation_test!(
     file_update_cache_miss_uses_reconstructed_before_data_for_detect_stage,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_before_aware_plugin(&sim).await;
+        let engine = boot_engine_with_before_aware_plugin(&sim).await;
         let active_version_id = active_version_id(&engine).await;
 
         engine
@@ -2335,7 +2337,8 @@ simulation_test!(
     file_update_json_by_version_detects_and_materializes,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2391,7 +2394,8 @@ simulation_test!(
     file_update_json_multi_row_update_detects_each_file,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2451,7 +2455,8 @@ simulation_test!(
     file_insert_json_multi_statement_does_not_replay_detected_changes,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2486,7 +2491,8 @@ simulation_test!(
     file_update_json_multi_statement_uses_sequential_before_data,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2527,7 +2533,8 @@ simulation_test!(
     file_update_json_multi_statement_placeholders_preserve_parameter_order,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2571,19 +2578,18 @@ simulation_test!(
     file_update_after_active_version_switch_in_same_batch_uses_new_active_scope,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
         let version_b = "file-active-switch-version-b";
 
         engine
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -2655,7 +2661,8 @@ simulation_test!(
     file_delete_json_tombstones_detected_rows_and_clears_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2709,19 +2716,18 @@ simulation_test!(
     file_by_version_delete_evicts_materialized_cache_row,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
         let version_b = "cache-delete-version-b";
 
         engine
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -2799,7 +2805,8 @@ simulation_test!(
     file_multi_statement_insert_update_delete_keeps_tombstones_and_cache_consistent,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2846,7 +2853,8 @@ simulation_test!(
     file_multi_statement_delete_with_metadata_predicate_works_with_overlay_prefetch,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2879,7 +2887,8 @@ simulation_test!(
     file_read_materializes_cache_miss_without_explicit_materialize,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -2929,7 +2938,7 @@ simulation_test!(
     file_read_cache_miss_does_not_return_empty_when_blob_ref_is_non_empty,
     simulations = [sqlite],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -3008,19 +3017,18 @@ simulation_test!(
     file_by_version_read_materializes_cache_miss_for_non_active_version,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
         let version_b = "file-read-miss-version-b";
 
         engine
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -3085,7 +3093,8 @@ simulation_test!(
     file_insert_select_from_lix_file_materializes_cache_miss_before_source_read,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -3145,19 +3154,19 @@ simulation_test!(
     file_insert_select_from_lix_file_by_version_materializes_non_active_cache_miss,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
         let version_b = "file-read-insert-select-version-b";
 
         engine
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -3226,7 +3235,8 @@ simulation_test!(
     on_demand_plugin_materialization_uses_full_file_path,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, main_version_id) = boot_engine_with_path_echo_plugin(&sim).await;
+        let engine = boot_engine_with_path_echo_plugin(&sim).await;
+        let main_version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -3272,7 +3282,7 @@ simulation_test!(
     file_cache_churn_insert_read_delete_leaves_no_rows,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
 
         for i in 0..40 {
             let file_id = format!("cache-churn-{i}");
@@ -3312,7 +3322,7 @@ simulation_test!(
     file_cache_has_no_orphan_rows_after_mixed_lifecycle,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let engine = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(

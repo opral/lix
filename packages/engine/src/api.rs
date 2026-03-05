@@ -184,7 +184,12 @@ impl Engine {
                 .await;
         }
 
-        let active_version_id = self.active_version_id.read().unwrap().clone();
+        let active_version_id = if allow_internal_tables {
+            self.require_active_version_id()
+                .unwrap_or_else(|_| GLOBAL_VERSION_ID.to_string())
+        } else {
+            self.require_active_version_id()?
+        };
         let writer_key = options.writer_key.as_deref();
         let prepared = shared_path::prepare_execution_with_backend(
             self,

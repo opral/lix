@@ -337,7 +337,7 @@ where
             EntityViewVariant::ByVersion => {
                 let version_expr = match version_id_index {
                     Some(index) => resolved_or_original_expr(row, resolved_row, index),
-                    None => match target.version_id_override.as_ref() {
+                    None => match target.write_version_id_override.as_ref() {
                         Some(value) => string_literal_expr(value),
                         None => {
                             return Err(LixError {
@@ -1444,7 +1444,7 @@ fn append_entity_scope_predicate(
     let scoped = append_optional_and_predicate(scoped, derived_entity_id_predicate);
     let base_override_version_id = (target.variant == EntityViewVariant::Base
         && write_variant == EntityViewVariant::ByVersion)
-        .then(|| target.version_id_override.as_deref())
+        .then(|| target.write_version_id_override.as_deref())
         .flatten();
     if let Some(version_id) = base_override_version_id {
         return Ok(Expr::BinaryOp {
@@ -1461,7 +1461,7 @@ fn append_entity_scope_predicate(
     if write_variant == EntityViewVariant::ByVersion
         && !contains_column_reference(&scoped, "version_id")
     {
-        let Some(version_id) = target.version_id_override.as_deref() else {
+        let Some(version_id) = target.write_version_id_override.as_deref() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
@@ -2443,8 +2443,8 @@ fn unknown_entity_view_column_error(
         "lixcol_root_commit_id",
         "depth",
         "lixcol_depth",
-        "inherited_from_version_id",
-        "lixcol_inherited_from_version_id",
+        "global",
+        "lixcol_global",
     ]
     .into_iter()
     .map(ToString::to_string)
@@ -2470,7 +2470,7 @@ fn find_first_column_index(columns: &HashMap<String, usize>, candidates: &[&str]
 }
 
 fn mutation_variant(target: &EntityViewTarget) -> EntityViewVariant {
-    if target.variant == EntityViewVariant::Base && target.version_id_override.is_some() {
+    if target.variant == EntityViewVariant::Base && target.write_version_id_override.is_some() {
         EntityViewVariant::ByVersion
     } else {
         target.variant
@@ -2574,9 +2574,7 @@ fn rewrite_metadata_column_name(column: &str) -> Option<&'static str> {
         "schema_version" | "lixcol_schema_version" => "schema_version",
         "created_at" | "lixcol_created_at" => "created_at",
         "updated_at" | "lixcol_updated_at" => "updated_at",
-        "inherited_from_version_id" | "lixcol_inherited_from_version_id" => {
-            "inherited_from_version_id"
-        }
+        "global" | "lixcol_global" => "global",
         "change_id" | "lixcol_change_id" => "change_id",
         "metadata" | "lixcol_metadata" => "metadata",
         "untracked" | "lixcol_untracked" => "untracked",
@@ -2654,14 +2652,94 @@ fn parse_expression_from_sql(sql: &str) -> Result<Expr, LixError> {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use serde_json::{json, Map as JsonMap};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use super::{derive_entity_id_expr, rewrite_delete, rewrite_insert, rewrite_update};
+    use super::{
+        derive_entity_id_expr, rewrite_delete, rewrite_insert, rewrite_insert_with_backend,
+        rewrite_update,
+    };
+    use crate::backend::{LixBackend, LixTransaction, SqlDialect};
+    use crate::cel::CelEvaluator;
     use crate::engine::sql::planning::rewrite_engine::entity_views::target::resolve_target_from_view_name;
+    use crate::engine::sql::planning::rewrite_engine::pipeline::statement_pipeline::StatementPipeline;
+    use crate::functions::{SharedFunctionProvider, SystemFunctionProvider};
     use crate::Value as EngineValue;
+    use crate::{LixError, QueryResult};
+
+    struct DynamicSchemaBackend {
+        latest_snapshot_content: String,
+    }
+
+    struct UnusedTransaction;
+
+    #[async_trait(?Send)]
+    impl LixTransaction for UnusedTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[EngineValue],
+        ) -> Result<QueryResult, LixError> {
+            panic!("unused test transaction execute");
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            panic!("unused test transaction commit");
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            panic!("unused test transaction rollback");
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for DynamicSchemaBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(
+            &self,
+            sql: &str,
+            _params: &[EngineValue],
+        ) -> Result<QueryResult, LixError> {
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_stored_schema")
+                && sql.contains("lix_version_override_schema~")
+            {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        EngineValue::Text("1".to_string()),
+                        EngineValue::Text(self.latest_snapshot_content.clone()),
+                    ]],
+                    columns: vec!["schema_version".to_string(), "snapshot_content".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_state_untracked")
+                || sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer")
+            {
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                });
+            }
+
+            Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("unexpected backend test query: {sql}"),
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Ok(Box::new(UnusedTransaction))
+        }
+    }
 
     #[test]
     fn rewrites_lix_key_value_by_version_insert_target() {
@@ -2845,5 +2923,98 @@ mod tests {
             .expect("insert rewrite should succeed")
             .expect("insert should rewrite");
         assert!(rewritten.to_string().contains("lix_state_by_version"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_insert_with_backend_routes_global_override_base_view_through_by_version() {
+        let backend = DynamicSchemaBackend {
+            latest_snapshot_content: json!({
+                "value": {
+                    "x-lix-key": "lix_version_override_schema",
+                    "x-lix-version": "1",
+                    "x-lix-primary-key": ["/id"],
+                    "x-lix-override-lixcols": {
+                        "lixcol_file_id": "\"lix\"",
+                        "lixcol_plugin_key": "\"lix\"",
+                        "lixcol_global": "true"
+                    },
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            })
+            .to_string(),
+        };
+        let sql = "INSERT INTO lix_version_override_schema (\
+                   id, name, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
+                   ) VALUES ('ovr-1', 'Original', 'lix', 'lix', '1')";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let Statement::Insert(insert) = statement else {
+            panic!("expected insert statement");
+        };
+
+        let rewritten = rewrite_insert_with_backend(
+            &backend,
+            insert,
+            &[],
+            &CelEvaluator::new(),
+            SharedFunctionProvider::new(SystemFunctionProvider),
+        )
+        .await
+        .expect("rewrite should succeed")
+        .expect("insert should rewrite");
+
+        let rendered = rewritten.to_string();
+        assert_eq!(rewritten.table.to_string(), "lix_state_by_version");
+        assert!(rendered.contains("version_id"));
+        assert!(rendered.contains("'global'"));
+    }
+
+    #[tokio::test]
+    async fn statement_pipeline_preserves_global_override_insert_scope() {
+        let backend = DynamicSchemaBackend {
+            latest_snapshot_content: json!({
+                "value": {
+                    "x-lix-key": "lix_version_override_schema",
+                    "x-lix-version": "1",
+                    "x-lix-primary-key": ["/id"],
+                    "x-lix-override-lixcols": {
+                        "lixcol_file_id": "\"lix\"",
+                        "lixcol_plugin_key": "\"lix\"",
+                        "lixcol_global": "true"
+                    },
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            })
+            .to_string(),
+        };
+        let sql = "INSERT INTO lix_version_override_schema (\
+                   id, name, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
+                   ) VALUES ('ovr-1', 'Original', 'lix', 'lix', '1')";
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let statement = statements.remove(0);
+        let pipeline = StatementPipeline::new(&[], None);
+        let mut provider = SystemFunctionProvider;
+
+        let output = pipeline
+            .rewrite_statement_with_backend(&backend, statement, &mut provider, &[])
+            .await
+            .expect("pipeline rewrite should succeed");
+
+        assert!(!output.statements.is_empty());
+        assert!(output.mutations.iter().any(|mutation| mutation.schema_key
+            == "lix_version_override_schema"
+            && mutation.version_id == "global"));
     }
 }

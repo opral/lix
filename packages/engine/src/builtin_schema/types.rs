@@ -42,13 +42,17 @@ pub(crate) struct LixVersionDescriptor {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
-    pub inherits_from_version_id: Option<String>,
-    #[serde(default)]
     pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LixVersionPointer {
+    pub id: String,
+    pub commit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LixGlobalPointer {
     pub id: String,
     pub commit_id: String,
 }

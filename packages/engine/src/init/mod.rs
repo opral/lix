@@ -27,9 +27,9 @@ const INIT_STATEMENTS: &[&str] = &[
      schema_version TEXT NOT NULL,\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
+     global BOOLEAN NOT NULL DEFAULT false,\
      plugin_key TEXT NOT NULL,\
      snapshot_content TEXT,\
-     inherited_from_version_id TEXT,\
      change_id TEXT NOT NULL,\
      metadata TEXT,\
      writer_key TEXT,\
@@ -40,6 +40,8 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_version_id \
      ON lix_internal_state_materialized_v1_lix_stored_schema (version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_global_version \
+     ON lix_internal_state_materialized_v1_lix_stored_schema (global, version_id)",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_vfe \
      ON lix_internal_state_materialized_v1_lix_stored_schema (version_id, file_id, entity_id)",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_materialized_v1_lix_stored_schema_ve \
@@ -57,6 +59,7 @@ const INIT_STATEMENTS: &[&str] = &[
      schema_key TEXT NOT NULL,\
      file_id TEXT NOT NULL,\
      version_id TEXT NOT NULL,\
+     global BOOLEAN NOT NULL DEFAULT false,\
      plugin_key TEXT NOT NULL,\
      snapshot_content TEXT,\
      metadata TEXT,\
@@ -68,6 +71,8 @@ const INIT_STATEMENTS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_untracked_version_id \
      ON lix_internal_state_untracked (version_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_state_untracked_global_version \
+     ON lix_internal_state_untracked (global, version_id)",
     "CREATE INDEX IF NOT EXISTS ix_unt_v_f_s_e \
      ON lix_internal_state_untracked (version_id, file_id, schema_key, entity_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
