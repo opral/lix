@@ -1,6 +1,7 @@
 ---
 date: "2026-03-04"
 og:description: "The Rust rewrite is complete. 33x faster file writes, lix was trending on HackerNews, and what's next in March."
+og:image: "./cover.png"
 ---
 
 # February 2026 Update: Rust Rewrite Complete
@@ -8,10 +9,8 @@ og:description: "The Rust rewrite is complete. 33x faster file writes, lix was t
 **TL;DR**
 
 - 33x faster file writes
-- Lix was trending on HackerNews
+- GitHub stars grew from 70 to over 500
 - Real workload and AX (user) testing in March
-
----
 
 ## The Rust rewrite is complete
 
@@ -54,7 +53,7 @@ Lix now intercepts and rewrites queries before they hit SQLite, batching what us
        └───────┘                 └──────────────┘
 ```
 
-## Lix was trending on HN
+## GitHub stars and HackerNews
 
 Lix was trending on HackerNews in late January. The outcome was an instant jump in GitHub stars and inbound requests to try out lix. Most inbound interest is around AI agents operating on non-code files and formats Git can't handle (Excel, XML, SSIS packages) well.
 
