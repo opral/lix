@@ -1,5 +1,10 @@
 [
   {
+    "path": "./003-february-2026-update/index.md",
+    "slug": "february-2026-update",
+    "authors": ["samuelstroschein"]
+  },
+  {
     "path": "./002-modeling-a-company-as-a-repository/index.md",
     "slug": "modeling-a-company-as-a-repository",
     "authors": ["samuelstroschein"]
