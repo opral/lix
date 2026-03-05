@@ -5,6 +5,7 @@ use crate::builtin_schema::types::{LixAccount, LixActiveAccount};
 use crate::builtin_schema::{
     builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 pub(crate) const ACCOUNT_STORAGE_VERSION_ID: &str = "global";
@@ -154,11 +155,16 @@ fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {
         .unwrap_or_else(|| {
             panic!("builtin schema '{schema_key}' must define string lixcol_plugin_key")
         });
-    let storage_version_id = overrides
-        .get("lixcol_version_id")
-        .and_then(JsonValue::as_str)
-        .map(decode_lixcol_literal)
-        .unwrap_or_else(|| ACCOUNT_STORAGE_VERSION_ID.to_string());
+    let storage_version_id =
+        if overrides.get("lixcol_global").and_then(JsonValue::as_str) == Some("true") {
+            GLOBAL_VERSION_ID.to_string()
+        } else {
+            overrides
+                .get("lixcol_version_id")
+                .and_then(JsonValue::as_str)
+                .map(decode_lixcol_literal)
+                .unwrap_or_else(|| ACCOUNT_STORAGE_VERSION_ID.to_string())
+        };
 
     SchemaMetadata {
         schema_key: parsed_schema_key,

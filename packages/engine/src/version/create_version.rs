@@ -4,7 +4,6 @@ use crate::{errors, Engine, EngineTransaction, ExecuteOptions, LixError, Value};
 pub struct CreateVersionOptions {
     pub id: Option<String>,
     pub name: Option<String>,
-    pub inherits_from_version_id: Option<String>,
     #[serde(default)]
     pub hidden: bool,
 }
@@ -13,7 +12,6 @@ pub struct CreateVersionOptions {
 pub struct CreateVersionResult {
     pub id: String,
     pub name: String,
-    pub inherits_from_version_id: String,
 }
 
 pub async fn create_version(
@@ -60,32 +58,29 @@ async fn create_version_in_transaction(
     let id =
         normalize_optional_non_empty_text(options.id, "id")?.unwrap_or(generate_uuid(tx).await?);
     let name = normalize_optional_non_empty_text(options.name, "name")?.unwrap_or(id.clone());
-    let inherits_from_version_id = normalize_optional_non_empty_text(
-        options.inherits_from_version_id,
-        "inherits_from_version_id",
-    )?
-    .unwrap_or(active_version_id);
+    if id == crate::version::GLOBAL_VERSION_ID {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "version id 'global' is reserved".to_string(),
+        });
+    }
     let hidden = options.hidden;
 
     tx.execute(
         "INSERT INTO lix_version (\
-         id, name, inherits_from_version_id, hidden, commit_id\
-         ) VALUES ($1, $2, $3, $4, $5)",
+         id, name, hidden, commit_id\
+         ) VALUES ($1, $2, $3, $4)",
         &[
             Value::Text(id.clone()),
             Value::Text(name.clone()),
-            Value::Text(inherits_from_version_id.clone()),
             Value::Boolean(hidden),
             Value::Text(active_commit_id.clone()),
         ],
     )
     .await?;
 
-    Ok(CreateVersionResult {
-        id,
-        name,
-        inherits_from_version_id,
-    })
+    let _ = active_version_id;
+    Ok(CreateVersionResult { id, name })
 }
 
 async fn generate_uuid(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {

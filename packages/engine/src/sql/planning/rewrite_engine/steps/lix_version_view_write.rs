@@ -186,15 +186,10 @@ pub async fn rewrite_update_with_backend(
                     description: "lix_version update cannot set empty name".to_string(),
                 });
             }
-            let next_inherits = assignment_values
-                .inherits_from_version_id
-                .clone()
-                .unwrap_or(existing.inherits_from_version_id.clone());
             let next_hidden = assignment_values.hidden.unwrap_or(existing.hidden);
             let snapshot = serde_json::from_str::<JsonValue>(&version_descriptor_snapshot_content(
                 &existing.id,
                 &next_name,
-                next_inherits.as_deref(),
                 next_hidden,
             ))
             .map_err(|error| LixError {
@@ -321,7 +316,6 @@ struct InsertSnapshotRow {
 struct VersionRow {
     id: String,
     name: String,
-    inherits_from_version_id: Option<String>,
     hidden: bool,
     commit_id: String,
 }
@@ -329,7 +323,6 @@ struct VersionRow {
 #[derive(Debug, Clone, Default)]
 struct VersionAssignments {
     name: Option<String>,
-    inherits_from_version_id: Option<Option<String>>,
     hidden: Option<bool>,
     commit_id: Option<String>,
 }
@@ -350,7 +343,7 @@ pub struct VersionRewritePlan {
 
 impl VersionAssignments {
     fn touches_descriptor(&self) -> bool {
-        self.name.is_some() || self.inherits_from_version_id.is_some() || self.hidden.is_some()
+        self.name.is_some() || self.hidden.is_some()
     }
 
     fn touches_tip(&self) -> bool {
@@ -387,10 +380,6 @@ fn parse_update_assignments(
             "name" => {
                 parsed.name = Some(value_required_string(&value, "name")?);
             }
-            "inherits_from_version_id" => {
-                parsed.inherits_from_version_id =
-                    Some(value_optional_string(&value, "inherits_from_version_id")?);
-            }
             "hidden" => {
                 parsed.hidden = Some(value_bool(&value, "hidden")?);
             }
@@ -419,12 +408,6 @@ fn parse_insert_rows(
     for (row, resolved_row) in rows.iter().zip(resolved_rows.iter()) {
         let id = field_required_string(field_map.get("id"), resolved_row, row, "id")?;
         let name = field_required_string(field_map.get("name"), resolved_row, row, "name")?;
-        let inherits_from_version_id = field_optional_string(
-            field_map.get("inherits_from_version_id"),
-            resolved_row,
-            row,
-            "inherits_from_version_id",
-        )?;
         let hidden = field_optional_bool(field_map.get("hidden"), resolved_row, row, "hidden")?
             .unwrap_or(false);
 
@@ -444,17 +427,13 @@ fn parse_insert_rows(
             });
         }
 
-        let descriptor_snapshot =
-            serde_json::from_str::<JsonValue>(&version_descriptor_snapshot_content(
-                &id,
-                &name,
-                inherits_from_version_id.as_deref(),
-                hidden,
-            ))
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("failed to encode version descriptor snapshot: {error}"),
-            })?;
+        let descriptor_snapshot = serde_json::from_str::<JsonValue>(
+            &version_descriptor_snapshot_content(&id, &name, hidden),
+        )
+        .map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("failed to encode version descriptor snapshot: {error}"),
+        })?;
         let tip_snapshot =
             serde_json::from_str::<JsonValue>(&version_pointer_snapshot_content(&id, &commit_id))
                 .map_err(|error| LixError {
@@ -489,7 +468,7 @@ async fn query_lix_version_rows(
         .unwrap_or_default();
     let sql = format!(
         "SELECT \
-         id, name, inherits_from_version_id, hidden, commit_id \
+         id, name, hidden, commit_id \
          FROM {view}{where_sql}",
         view = LIX_VERSION_VIEW_NAME
     );
@@ -526,23 +505,21 @@ async fn query_lix_version_rows(
 
     let mut rows = Vec::new();
     for row in result.rows {
-        if row.len() < 5 {
+        if row.len() < 4 {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "lix_version rewrite expected 5 columns from row loader query"
+                description: "lix_version rewrite expected 4 columns from row loader query"
                     .to_string(),
             });
         }
         let id = value_required_string(&row[0], "id")?;
         let name = value_required_string(&row[1], "name")?;
-        let inherits_from_version_id = value_optional_string(&row[2], "inherits_from_version_id")?;
-        let hidden = value_bool_from_existing_row(&row[3], "hidden")?;
-        let commit_id = value_required_string(&row[4], "commit_id")?;
+        let hidden = value_bool_from_existing_row(&row[2], "hidden")?;
+        let commit_id = value_required_string(&row[3], "commit_id")?;
 
         rows.push(VersionRow {
             id,
             name,
-            inherits_from_version_id,
             hidden,
             commit_id,
         });
@@ -712,13 +689,7 @@ fn build_vtable_insert_for_schema(
 }
 
 fn insert_field_map(columns: &[Ident]) -> Result<BTreeMap<String, usize>, LixError> {
-    let allowed: BTreeSet<&str> = BTreeSet::from([
-        "id",
-        "name",
-        "inherits_from_version_id",
-        "hidden",
-        "commit_id",
-    ]);
+    let allowed: BTreeSet<&str> = BTreeSet::from(["id", "name", "hidden", "commit_id"]);
     let mut map = BTreeMap::new();
     for (index, column) in columns.iter().enumerate() {
         let key = column.value.to_ascii_lowercase();

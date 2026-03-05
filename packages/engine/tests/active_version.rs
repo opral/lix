@@ -63,6 +63,20 @@ async fn read_active_version_view_row(
     (id, version_id)
 }
 
+async fn insert_version(
+    engine: &support::simulation_test::SimulationEngine,
+    version_id: &str,
+) {
+    let sql = format!(
+        "INSERT INTO lix_version (\
+         id, name, hidden, commit_id\
+         ) VALUES (\
+         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
+         )",
+    );
+    engine.execute(&sql, &[]).await.unwrap();
+}
+
 async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs) {
     let engine = sim
         .boot_simulated_engine_deterministic()
@@ -197,20 +211,21 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
+        insert_version(&engine, "version-switch-target").await;
 
         let (before_id, _) = read_active_version_view_row(&engine).await;
 
         engine
             .execute(
                 "UPDATE lix_active_version SET version_id = $1",
-                &[Value::Text("global".to_string())],
+                &[Value::Text("version-switch-target".to_string())],
             )
             .await
             .unwrap();
 
         let (after_id, after_version_id) = read_active_version_view_row(&engine).await;
         assert_eq!(after_id, before_id);
-        assert_eq!(after_version_id, "global");
+        assert_eq!(after_version_id, "version-switch-target");
     }
 );
 
@@ -248,14 +263,15 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
+        insert_version(&engine, "version-existing-fk").await;
 
         engine
-            .execute("UPDATE lix_active_version SET version_id = 'global'", &[])
+            .execute("UPDATE lix_active_version SET version_id = 'version-existing-fk'", &[])
             .await
             .unwrap();
 
         let (_, version_id) = read_active_version_view_row(&engine).await;
-        assert_eq!(version_id, "global");
+        assert_eq!(version_id, "version-existing-fk");
     }
 );
 

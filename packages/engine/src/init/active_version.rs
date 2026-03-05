@@ -7,8 +7,8 @@ impl Engine {
             .backend
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_internal_state_materialized_v1_lix_version_pointer \
-                 WHERE schema_key = 'lix_version_pointer' \
+                 FROM lix_internal_state_materialized_v1_lix_global_pointer \
+                 WHERE schema_key = 'lix_global_pointer' \
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
@@ -21,9 +21,9 @@ impl Engine {
             .await?;
         if let Some(row) = pointer_result.rows.first() {
             if let Some(Value::Text(snapshot_content)) = row.first() {
-                let snapshot: crate::builtin_schema::types::LixVersionPointer =
+                let snapshot: crate::builtin_schema::types::LixGlobalPointer =
                     serde_json::from_str(snapshot_content).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                            "version pointer snapshot_content invalid JSON while loading latest commit id: {error}"
+                            "global pointer snapshot_content invalid JSON while loading latest commit id: {error}"
                         ),
                     })?;
                 if !snapshot.commit_id.is_empty() {
@@ -52,7 +52,7 @@ impl Engine {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description:
-                    "init invariant violation: commits exist but global version pointer is missing"
+                    "init invariant violation: commits exist but global pointer is missing"
                         .to_string(),
             });
         }
@@ -127,7 +127,7 @@ impl Engine {
             return Ok(());
         }
 
-        self.set_active_version_id(GLOBAL_VERSION_ID.to_string());
+        self.set_active_version_id(DEFAULT_ACTIVE_VERSION_NAME.to_string());
         Ok(())
     }
 }

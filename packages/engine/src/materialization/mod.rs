@@ -4,11 +4,11 @@ mod plan;
 mod types;
 
 pub use types::{
-    InheritanceWinnerDebugRow, LatestVisibleWinnerDebugRow, MaterializationApplyReport,
-    MaterializationDebugMode, MaterializationDebugTrace, MaterializationPlan,
-    MaterializationReport, MaterializationRequest, MaterializationScope, MaterializationWarning,
-    MaterializationWrite, MaterializationWriteOp, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionAncestryDebugRow, VersionPointerDebugRow,
+    LatestVisibleWinnerDebugRow, MaterializationApplyReport, MaterializationDebugMode,
+    MaterializationDebugTrace, MaterializationPlan, MaterializationReport, MaterializationRequest,
+    MaterializationScope, MaterializationWarning, MaterializationWrite, MaterializationWriteOp,
+    ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
+    VersionAncestryDebugRow, VersionPointerDebugRow,
 };
 
 use crate::{LixBackend, LixError};

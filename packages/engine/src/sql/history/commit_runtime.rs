@@ -373,6 +373,7 @@ pub(crate) fn build_statement_batch_from_generate_commit_result(
                 Ident::new("schema_version"),
                 Ident::new("file_id"),
                 Ident::new("version_id"),
+                Ident::new("global"),
                 Ident::new("plugin_key"),
                 Ident::new("snapshot_content"),
                 Ident::new("change_id"),
@@ -599,6 +600,7 @@ fn materialized_row_values_parameterized(
         text_param_expr(&row.schema_version, next_placeholder, params),
         text_param_expr(&row.file_id, next_placeholder, params),
         text_param_expr(&row.lixcol_version_id, next_placeholder, params),
+        boolean_expr(row.lixcol_version_id == GLOBAL_VERSION),
         text_param_expr(&row.plugin_key, next_placeholder, params),
         optional_text_param_expr(row.snapshot_content.as_deref(), next_placeholder, params),
         text_param_expr(&row.id, next_placeholder, params),
@@ -682,6 +684,12 @@ fn build_materialized_on_conflict() -> OnInsert {
             assignments: vec![
                 sqlparser::ast::Assignment {
                     target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("global")),
+                    ])),
+                    value: Expr::Identifier(Ident::new("excluded.global")),
+                },
+                sqlparser::ast::Assignment {
+                    target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName(vec![
                         ObjectNamePart::Identifier(Ident::new("schema_version")),
                     ])),
                     value: Expr::Identifier(Ident::new("excluded.schema_version")),
@@ -744,6 +752,10 @@ fn placeholder_expr(index_1_based: usize) -> Expr {
 
 fn number_expr(value: &str) -> Expr {
     Expr::Value(SqlValue::Number(value.to_string(), false).into())
+}
+
+fn boolean_expr(value: bool) -> Expr {
+    Expr::Value(SqlValue::Boolean(value).into())
 }
 
 fn null_expr() -> Expr {

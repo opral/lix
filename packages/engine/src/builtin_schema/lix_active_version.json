@@ -8,7 +8,7 @@
     "lixcol_file_id": "\"lix\"",
     "lixcol_plugin_key": "\"lix\"",
     "lixcol_untracked": "true",
-    "lixcol_version_id": "\"global\""
+    "lixcol_global": "true"
   },
   "type": "object",
   "properties": {

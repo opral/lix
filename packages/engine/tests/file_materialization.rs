@@ -1623,7 +1623,7 @@ simulation_test!(
     direct_state_insert_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -1674,7 +1674,7 @@ simulation_test!(
     direct_state_update_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -1727,7 +1727,7 @@ simulation_test!(
     direct_state_delete_refreshes_file_data_cache,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -2266,7 +2266,7 @@ simulation_test!(
     file_update_cache_miss_uses_reconstructed_before_data_for_detect_stage,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_before_aware_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_before_aware_plugin(&sim).await;
         let active_version_id = active_version_id(&engine).await;
 
         engine
@@ -2578,12 +2578,11 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -2716,12 +2715,11 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -2929,7 +2927,7 @@ simulation_test!(
     file_read_cache_miss_does_not_return_empty_when_blob_ref_is_non_empty,
     simulations = [sqlite],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(
@@ -3015,12 +3013,11 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -3152,12 +3149,11 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_version (\
-                     id, name, inherits_from_version_id, hidden, commit_id\
+                     id, name, hidden, commit_id\
                      ) VALUES (\
-                     '{version_b}', '{version_b}', '{main_version}', false, 'commit-{version_b}'\
+                     '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b,
-                    main_version = main_version_id
+                    version_b = version_b
                 ),
                 &[],
             )
@@ -3272,7 +3268,7 @@ simulation_test!(
     file_cache_churn_insert_read_delete_leaves_no_rows,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
 
         for i in 0..40 {
             let file_id = format!("cache-churn-{i}");
@@ -3312,7 +3308,7 @@ simulation_test!(
     file_cache_has_no_orphan_rows_after_mixed_lifecycle,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let (engine, _main_version_id) = boot_engine_with_json_plugin(&sim).await;
+        let (engine, main_version_id) = boot_engine_with_json_plugin(&sim).await;
 
         engine
             .execute(

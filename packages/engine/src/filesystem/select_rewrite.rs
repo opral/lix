@@ -137,7 +137,7 @@ fn build_filesystem_projection_query(
                     f.lixcol_file_id, \
                     f.lixcol_plugin_key, \
                     f.lixcol_schema_version, \
-                    f.lixcol_inherited_from_version_id, \
+                    f.lixcol_global, \
                     f.lixcol_change_id, \
                     f.lixcol_created_at, \
                     f.lixcol_updated_at, \
@@ -439,11 +439,12 @@ fn build_filesystem_projection_query(
                     schema_key AS lixcol_schema_key, \
                     schema_version AS lixcol_schema_version, \
                     version_id AS lixcol_version_id, \
-                    inherited_from_version_id AS lixcol_inherited_from_version_id, \
+                    global AS lixcol_global, \
                     change_id AS lixcol_change_id, \
                     metadata AS lixcol_metadata, \
                     created_at AS lixcol_created_at, \
                     updated_at AS lixcol_updated_at, \
+                    commit_id AS lixcol_commit_id, \
                     untracked AS lixcol_untracked \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
@@ -475,19 +476,17 @@ fn build_filesystem_projection_query(
                 d.lixcol_entity_id, \
                 d.lixcol_schema_key, \
                 d.lixcol_schema_version, \
-                d.lixcol_inherited_from_version_id, \
+                d.lixcol_global, \
                 d.lixcol_change_id, \
                 d.lixcol_created_at, \
                 d.lixcol_updated_at, \
-                v.commit_id AS lixcol_commit_id, \
+                d.lixcol_commit_id, \
                 d.lixcol_untracked, \
                 d.lixcol_metadata \
              FROM directory_descriptor_rows d \
              LEFT JOIN directory_paths dp \
                ON dp.id = d.id \
               AND dp.lixcol_version_id = d.lixcol_version_id \
-             LEFT JOIN lix_version v \
-               ON v.id = d.lixcol_version_id \
              WHERE {active_version_scope}",
             active_version_scope = active_version_scope_predicate("d.lixcol_version_id")
         ),
@@ -501,11 +500,12 @@ fn build_filesystem_projection_query(
                     schema_key AS lixcol_schema_key, \
                     schema_version AS lixcol_schema_version, \
                     version_id AS lixcol_version_id, \
-                    inherited_from_version_id AS lixcol_inherited_from_version_id, \
+                    global AS lixcol_global, \
                     change_id AS lixcol_change_id, \
                     metadata AS lixcol_metadata, \
                     created_at AS lixcol_created_at, \
                     updated_at AS lixcol_updated_at, \
+                    commit_id AS lixcol_commit_id, \
                     untracked AS lixcol_untracked \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_directory_descriptor' \
@@ -538,19 +538,17 @@ fn build_filesystem_projection_query(
                 d.lixcol_schema_key, \
                 d.lixcol_schema_version, \
                 d.lixcol_version_id, \
-                d.lixcol_inherited_from_version_id, \
+                d.lixcol_global, \
                 d.lixcol_change_id, \
                 d.lixcol_created_at, \
                 d.lixcol_updated_at, \
-                v.commit_id AS lixcol_commit_id, \
+                d.lixcol_commit_id, \
                 d.lixcol_untracked, \
                 d.lixcol_metadata \
              FROM directory_descriptor_rows d \
              LEFT JOIN directory_paths dp \
                ON dp.id = d.id \
-              AND dp.lixcol_version_id = d.lixcol_version_id \
-             LEFT JOIN lix_version v \
-               ON v.id = d.lixcol_version_id"
+              AND dp.lixcol_version_id = d.lixcol_version_id"
             .to_string(),
         DIRECTORY_HISTORY_VIEW => {
             let state_history_view =
@@ -709,10 +707,11 @@ fn build_file_by_version_projection_sql() -> String {
             version_id AS lixcol_version_id, \
             plugin_key AS lixcol_plugin_key, \
             schema_version AS lixcol_schema_version, \
-            inherited_from_version_id AS lixcol_inherited_from_version_id, \
+            global AS lixcol_global, \
             change_id AS lixcol_change_id, \
             created_at AS lixcol_created_at, \
             updated_at AS lixcol_updated_at, \
+            commit_id AS lixcol_commit_id, \
             writer_key AS lixcol_writer_key, \
             untracked AS lixcol_untracked, \
             metadata AS lixcol_metadata \
@@ -747,11 +746,11 @@ fn build_file_by_version_projection_sql() -> String {
         f.lixcol_version_id, \
         f.lixcol_plugin_key, \
         f.lixcol_schema_version, \
-        f.lixcol_inherited_from_version_id, \
+        f.lixcol_global, \
         f.lixcol_change_id, \
         f.lixcol_created_at, \
         f.lixcol_updated_at, \
-        v.commit_id AS lixcol_commit_id, \
+        f.lixcol_commit_id, \
         f.lixcol_writer_key, \
         f.lixcol_untracked, \
         f.lixcol_metadata \
@@ -759,8 +758,6 @@ fn build_file_by_version_projection_sql() -> String {
      LEFT JOIN directory_paths dp \
        ON dp.id = f.directory_id \
       AND dp.lixcol_version_id = f.lixcol_version_id \
-     LEFT JOIN lix_version v \
-       ON v.id = f.lixcol_version_id \
      LEFT JOIN lix_internal_file_data_cache fd \
        ON fd.file_id = f.id \
       AND fd.version_id = f.lixcol_version_id \
@@ -1133,7 +1130,8 @@ mod tests {
         assert!(rewritten.contains("LEFT JOIN lix_internal_binary_blob_store bbs"));
         assert!(rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
-        assert!(rewritten.contains("LEFT JOIN lix_version v"));
+        assert!(rewritten.contains("commit_id AS lixcol_commit_id"));
+        assert!(!rewritten.contains("LEFT JOIN lix_version v"));
     }
 
     #[test]

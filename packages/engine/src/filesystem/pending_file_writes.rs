@@ -1875,8 +1875,8 @@ fn allowed_file_selection_columns() -> Vec<&'static str> {
         "lixcol_root_commit_id",
         "depth",
         "lixcol_depth",
-        "inherited_from_version_id",
-        "lixcol_inherited_from_version_id",
+        "global",
+        "lixcol_global",
         "untracked",
         "lixcol_untracked",
         "created_at",
@@ -2397,7 +2397,7 @@ async fn execute_delete_overlay_prefetch_query(
         "WITH {alias}(\
             id, directory_id, name, extension, path, data, metadata, hidden, \
             lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_version_id, version_id, \
-            lixcol_plugin_key, lixcol_schema_version, lixcol_inherited_from_version_id, \
+            lixcol_plugin_key, lixcol_schema_version, lixcol_global, \
             lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
             lixcol_writer_key, lixcol_untracked, lixcol_metadata\
          ) AS (VALUES {}) \

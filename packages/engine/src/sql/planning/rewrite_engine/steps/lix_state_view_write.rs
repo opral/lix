@@ -41,6 +41,17 @@ pub async fn rewrite_insert_with_backend(
                     .to_string(),
         });
     }
+    if insert.columns.iter().any(|column| {
+        column.value.eq_ignore_ascii_case("global")
+            || column.value.eq_ignore_ascii_case("lixcol_global")
+    }) {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "lix_state insert cannot set global on this surface yet; use lix_state_by_version semantics instead"
+                    .to_string(),
+        });
+    }
 
     let active_version_id = load_active_version_id(backend).await?;
     let expected_columns = insert.columns.len();
@@ -140,6 +151,15 @@ pub async fn rewrite_update_with_backend(
             description:
                 "lix_state update cannot set version_id; active version is resolved automatically"
                     .to_string(),
+        });
+    }
+    if update.assignments.iter().any(|assignment| {
+        assignment_target_is_column(&assignment.target, "global")
+            || assignment_target_is_column(&assignment.target, "lixcol_global")
+    }) {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "lix_state update cannot set global on this surface yet".to_string(),
         });
     }
 

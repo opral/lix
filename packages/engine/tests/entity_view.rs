@@ -2,12 +2,40 @@ mod support;
 
 use lix_engine::Value;
 use serde_json::{json, Value as JsonValue};
+use support::simulation_test::assert_boolean_like;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
         Value::Text(actual) => assert_eq!(actual, expected),
         other => panic!("expected text value '{expected}', got {other:?}"),
     }
+}
+
+fn is_true(value: &Value) -> bool {
+    match value {
+        Value::Boolean(actual) => *actual,
+        Value::Integer(actual) => *actual != 0,
+        Value::Text(actual) => matches!(actual.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        Value::Null => false,
+        other => panic!("expected boolean-like value, got {other:?}"),
+    }
+}
+
+fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<Value>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    if columns.contains(&index) {
+                        Value::Boolean(is_true(value))
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
@@ -49,10 +77,9 @@ async fn seed_key_value_row(
     engine.execute(&sql, &[]).await.unwrap();
 }
 
-async fn install_version_override_schema_with_version(
+async fn install_global_override_schema(
     engine: &support::simulation_test::SimulationEngine,
     schema_key: &str,
-    version_id: &str,
 ) {
     let snapshot = json!({
         "value": {
@@ -62,7 +89,7 @@ async fn install_version_override_schema_with_version(
             "x-lix-override-lixcols": {
                 "lixcol_file_id": "\"lix\"",
                 "lixcol_plugin_key": "\"lix\"",
-                "lixcol_version_id": format!("\"{version_id}\""),
+                "lixcol_global": "true",
             },
             "type": "object",
             "properties": {
@@ -82,20 +109,14 @@ async fn install_version_override_schema_with_version(
     engine.execute(&sql, &[]).await.unwrap();
 }
 
-async fn install_version_override_schema(engine: &support::simulation_test::SimulationEngine) {
-    install_version_override_schema_with_version(engine, "lix_version_override_schema", "global")
-        .await;
-}
-
-async fn install_child_version_override_schema(
+async fn install_global_override_schema_for_version_override_schema(
     engine: &support::simulation_test::SimulationEngine,
 ) {
-    install_version_override_schema_with_version(
-        engine,
-        "lix_version_override_child_schema",
-        "version-child",
-    )
-    .await;
+    install_global_override_schema(engine, "lix_version_override_schema").await;
+}
+
+async fn install_global_override_child_schema(engine: &support::simulation_test::SimulationEngine) {
+    install_global_override_schema(engine, "lix_version_override_child_schema").await;
 }
 
 async fn install_select_override_schema(engine: &support::simulation_test::SimulationEngine) {
@@ -103,7 +124,7 @@ async fn install_select_override_schema(engine: &support::simulation_test::Simul
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
+             '{\"value\":{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_global\":\"true\",\"lixcol_untracked\":\"true\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
         .unwrap();
@@ -114,7 +135,7 @@ async fn install_inherited_override_schema(engine: &support::simulation_test::Si
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_inherited_from_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
+             '{\"value\":{\"x-lix-key\":\"lix_inherited_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
         .unwrap();
@@ -125,7 +146,7 @@ async fn install_default_values_schema(engine: &support::simulation_test::Simula
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
+             '{\"value\":{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
         .unwrap();
@@ -136,7 +157,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}}'\
+             '{\"value\":{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
         .unwrap();
@@ -145,7 +166,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
              'lix_stored_schema', \
-             '{\"value\":{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}}'\
+             '{\"value\":{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\",\"lixcol_global\":\"true\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}}'\
              )", &[])
         .await
         .unwrap();
@@ -414,7 +435,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[3]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "variant-2");
         assert_text(&rows.statements[0].rows[0][1], "msg-2");
@@ -422,7 +443,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_entity_by_version_view_inherits_from_parent_version,
+    lix_entity_by_version_view_reads_visible_global_rows,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -433,9 +454,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'version-child', 'version-child', 'global', false, 'commit-child'\
+                 'version-child', 'version-child', false, 'commit-child'\
                  )",
                 &[],
             )
@@ -446,7 +467,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT key, value, lixcol_version_id, lixcol_inherited_from_version_id \
+                "SELECT key, value, lixcol_version_id, lixcol_global \
                  FROM lix_key_value_by_version \
                  WHERE key = 'inherit-key' \
                    AND lixcol_version_id = 'version-child'",
@@ -455,12 +476,12 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[3]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "inherit-key");
         assert_text(&rows.statements[0].rows[0][1], "from-global");
         assert_text(&rows.statements[0].rows[0][2], "version-child");
-        assert_text(&rows.statements[0].rows[0][3], "global");
+        assert_boolean_like(&rows.statements[0].rows[0][3], true);
     }
 );
 
@@ -513,21 +534,21 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_entity_view_base_insert_read_honors_lixcol_version_id_override,
+    lix_entity_view_base_insert_read_honors_lixcol_global_override,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
-        install_version_override_schema(&engine).await;
+        install_global_override_schema_for_version_override_schema(&engine).await;
 
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'active-test', 'active-test', NULL, false, 'commit-active'\
+                 'active-test', 'active-test', false, 'commit-active'\
                  )",
                 &[],
             )
@@ -589,14 +610,14 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_entity_view_base_update_honors_lixcol_version_id_override,
+    lix_entity_view_base_update_honors_lixcol_global_override,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
-        install_version_override_schema(&engine).await;
+        install_global_override_schema_for_version_override_schema(&engine).await;
 
         engine
             .execute(
@@ -677,26 +698,14 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_entity_view_base_select_with_lixcol_version_id_override_inherits_parent_state,
+    lix_entity_view_base_select_with_lixcol_global_override_reads_global_state,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.unwrap();
-        install_child_version_override_schema(&engine).await;
-
-        engine
-            .execute(
-                "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
-                 ) VALUES (\
-                 'version-child', 'version-child', 'global', false, 'commit-child'\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
+        install_global_override_child_schema(&engine).await;
         engine
             .execute(
                 "INSERT INTO lix_internal_state_vtable (\
@@ -709,7 +718,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT id, name, lixcol_inherited_from_version_id \
+                "SELECT id, name, lixcol_global \
                  FROM lix_version_override_child_schema \
                  WHERE id = 'ovr-inherit-1'",
                 &[],
@@ -717,11 +726,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[2]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "ovr-inherit-1");
         assert_text(&rows.statements[0].rows[0][1], "Global");
-        assert_text(&rows.statements[0].rows[0][2], "global");
+        assert_boolean_like(&rows.statements[0].rows[0][2], true);
     }
 );
 
@@ -764,15 +773,18 @@ simulation_test!(
 
         let by_version_rows = engine
             .execute(
-                "SELECT id, lixcol_version_id, lixcol_inherited_from_version_id \
+                "SELECT id, lixcol_version_id, lixcol_global \
                  FROM lix_select_override_schema_by_version \
                  ORDER BY id, lixcol_version_id",
                 &[],
             )
             .await
             .unwrap();
-        sim.assert_deterministic(by_version_rows.statements[0].rows.clone());
-        assert_eq!(by_version_rows.statements[0].rows.len(), 3);
+        sim.assert_deterministic(normalize_bool_like_rows(
+            &by_version_rows.statements[0].rows,
+            &[2],
+        ));
+        assert_eq!(by_version_rows.statements[0].rows.len(), 2);
         let mut match_global_rows = Vec::new();
         let mut match_main_rows = Vec::new();
         for row in &by_version_rows.statements[0].rows {
@@ -788,19 +800,15 @@ simulation_test!(
         }
 
         assert_eq!(match_global_rows.len(), 2);
-        assert_eq!(match_main_rows.len(), 1);
+        assert_eq!(match_main_rows.len(), 0);
 
-        let has_global_local = match_global_rows.iter().any(|row| {
-            matches!((&row[1], &row[2]), (Value::Text(version), Value::Null) if version == "global")
-        });
-        assert!(has_global_local);
-
-        let has_inherited = match_global_rows.iter().any(|row| {
-            matches!((&row[1], &row[2]), (Value::Text(version), Value::Text(parent)) if version != "global" && !parent.is_empty())
-        });
-        assert!(has_inherited);
-
-        assert_eq!(match_main_rows[0][2], Value::Null);
+        assert!(match_global_rows.iter().all(|row| is_true(&row[2])));
+        assert!(match_global_rows
+            .iter()
+            .all(|row| { matches!(&row[1], Value::Text(version) if version != "global") }));
+        assert!(match_global_rows
+            .iter()
+            .any(|row| { matches!(&row[1], Value::Text(version) if version == "main") }));
     }
 );
 
@@ -817,9 +825,9 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_version (\
-                 id, name, inherits_from_version_id, hidden, commit_id\
+                 id, name, hidden, commit_id\
                  ) VALUES (\
-                 'active-inherited', 'active-inherited', 'global', false, 'commit-inherited'\
+                 'active-inherited', 'active-inherited', false, 'commit-inherited'\
                  )",
                 &[],
             )
@@ -845,17 +853,17 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT id, lixcol_inherited_from_version_id \
+                "SELECT id, lixcol_global \
                  FROM lix_inherited_override_schema \
                  ORDER BY id",
                 &[],
             )
             .await
             .unwrap();
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[1]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "inherited-match");
-        assert_text(&rows.statements[0].rows[0][1], "global");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
     }
 );
 

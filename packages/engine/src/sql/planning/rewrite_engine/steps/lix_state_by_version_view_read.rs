@@ -232,9 +232,9 @@ mod tests {
             .expect("query should be rewritten");
         let sql = rewritten.to_string();
 
-        assert!(sql.contains("FROM version_descriptor WHERE version_id = 'bench-v-023'"));
-        assert!(sql.contains("FROM lix_internal_state_vtable WHERE version_id = 'bench-v-023'"));
-        assert!(!sql.contains("FROM all_target_versions"));
+        assert!(sql.contains("SELECT DISTINCT version_id FROM lix_internal_state_vtable WHERE version_id <> 'global'"));
+        assert!(sql.contains("UNION SELECT version_id FROM all_real_versions"));
+        assert!(sql.contains("AS all_target_versions WHERE version_id = 'bench-v-023'"));
         assert!(!sql.contains("ranked.version_id = 'bench-v-023'"));
         assert!(!sql.contains("sv.version_id = 'bench-v-023'"));
     }
@@ -253,12 +253,12 @@ mod tests {
         let sql = rewritten.to_string();
 
         assert!(sql.contains(
-            "FROM version_descriptor WHERE version_id IN ('bench-v-022', 'bench-v-023')"
+            "SELECT DISTINCT version_id FROM lix_internal_state_vtable WHERE version_id <> 'global'"
         ));
+        assert!(sql.contains("UNION SELECT version_id FROM all_real_versions"));
         assert!(sql.contains(
-            "FROM lix_internal_state_vtable WHERE version_id IN ('bench-v-022', 'bench-v-023')"
+            "AS all_target_versions WHERE version_id IN ('bench-v-022', 'bench-v-023')"
         ));
-        assert!(!sql.contains("FROM all_target_versions"));
         assert!(!sql.contains("ranked.version_id IN ('bench-v-022', 'bench-v-023')"));
         assert!(!sql.contains("sv.version_id IN ('bench-v-022', 'bench-v-023')"));
     }
