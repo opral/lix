@@ -35,7 +35,10 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
         .await
         .unwrap();
     assert_eq!(result.statements[0].rows.len(), 1);
-    text_value(&result.statements[0].rows[0][0], "lix_active_version.version_id")
+    text_value(
+        &result.statements[0].rows[0][0],
+        "lix_active_version.version_id",
+    )
 }
 
 async fn global_pointer_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
@@ -55,7 +58,10 @@ async fn global_pointer_commit_id(engine: &support::simulation_test::SimulationE
         .await
         .unwrap();
     assert_eq!(result.statements[0].rows.len(), 1);
-    text_value(&result.statements[0].rows[0][0], "lix_global_pointer.commit_id")
+    text_value(
+        &result.statements[0].rows[0][0],
+        "lix_global_pointer.commit_id",
+    )
 }
 
 fn boot_sqlite_engine_at_path(path: &Path) -> lix_engine::Engine {
@@ -252,6 +258,10 @@ fn init_reopen_preserves_working_changes_sqlite() {
                         .await
                         .expect_err("reopen init should report already initialized");
                     assert_eq!(reopen_init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
+                    engine_b
+                        .open()
+                        .await
+                        .expect("reopen open should load active version state");
 
                     let after = engine_b
                         .execute(
@@ -771,10 +781,7 @@ simulation_test!(
             }
         }
 
-        assert!(
-            has_checkpoint,
-            "expected checkpoint label in global lane"
-        );
+        assert!(has_checkpoint, "expected checkpoint label in global lane");
         let checkpoint_label_id =
             checkpoint_label_id.expect("checkpoint label id should be present");
         let global_commit_id = global_pointer_commit_id(&engine).await;

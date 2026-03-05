@@ -1,5 +1,4 @@
 use super::*;
-use crate::errors;
 
 impl Engine {
     pub(crate) async fn load_latest_commit_id(&self) -> Result<Option<String>, LixError> {
@@ -12,6 +11,7 @@ impl Engine {
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND is_tombstone = 0 \
                    AND snapshot_content IS NOT NULL \
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
@@ -61,29 +61,18 @@ impl Engine {
     }
 
     pub(crate) async fn generate_runtime_uuid(&self) -> Result<String, LixError> {
-        let result = self.execute("SELECT lix_uuid_v7()", &[]).await?;
-        let [statement] = result.statements.as_slice() else {
-            return Err(errors::unexpected_statement_count_error(
-                "lix_uuid_v7 query",
-                1,
-                result.statements.len(),
-            ));
-        };
-        let row = statement.rows.first().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "lix_uuid_v7 query returned no rows".to_string(),
-        })?;
-        let value = row.first().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "lix_uuid_v7 query returned no columns".to_string(),
-        })?;
-        match value {
-            Value::Text(text) => Ok(text.clone()),
-            other => Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("lix_uuid_v7 query returned non-text value: {other:?}"),
-            }),
-        }
+        let (settings, sequence_start, functions) = self
+            .prepare_runtime_functions_with_backend(self.backend.as_ref())
+            .await?;
+        let uuid = functions.call_uuid_v7();
+        self.persist_runtime_sequence_with_backend(
+            self.backend.as_ref(),
+            settings,
+            sequence_start,
+            &functions,
+        )
+        .await?;
+        Ok(uuid)
     }
 
     pub(crate) async fn load_and_cache_active_version(&self) -> Result<(), LixError> {
@@ -127,7 +116,10 @@ impl Engine {
             return Ok(());
         }
 
-        self.set_active_version_id(DEFAULT_ACTIVE_VERSION_NAME.to_string());
-        Ok(())
+        self.clear_active_version_id();
+        Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "engine invariant violation: active version row is missing".to_string(),
+        })
     }
 }

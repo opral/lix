@@ -115,6 +115,7 @@ impl Engine {
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 &[],

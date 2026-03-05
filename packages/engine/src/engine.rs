@@ -32,7 +32,7 @@ use crate::version::{
     version_descriptor_schema_version, version_descriptor_snapshot_content,
     version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
     version_pointer_schema_key, version_pointer_schema_version, version_pointer_snapshot_content,
-    version_pointer_storage_version_id, DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID,
+    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::WasmRuntime;
 use crate::{ExecuteResult, LixBackend, LixError, LixTransaction, QueryResult, Value};
@@ -96,7 +96,7 @@ pub struct Engine {
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
     init_state: AtomicU8,
-    active_version_id: RwLock<String>,
+    active_version_id: RwLock<Option<String>>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, crate::plugin::runtime::CachedPluginComponent>>,
@@ -382,7 +382,7 @@ impl Engine {
             boot_deterministic_settings,
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
-            active_version_id: RwLock::new(DEFAULT_ACTIVE_VERSION_NAME.to_string()),
+            active_version_id: RwLock::new(None),
             access_to_internal: args.access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
@@ -967,6 +967,7 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         ));
+        engine.set_active_version_id("version-test".to_string());
 
         let error = engine
             .execute("SELECT * FROM unknown_table", &[])
@@ -1027,6 +1028,7 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         ));
+        engine.set_active_version_id("version-test".to_string());
 
         execute_multi_statement_sequential_with_options(
             &engine,
@@ -1064,6 +1066,7 @@ mod tests {
                 .expect("installed plugins cache lock");
             *cache = Some(Vec::new());
         }
+        engine.set_active_version_id("version-test".to_string());
 
         let mut tx = engine
             .begin_transaction_with_options(ExecuteOptions::default())
@@ -1116,6 +1119,7 @@ mod tests {
                 .expect("installed plugins cache lock");
             *cache = Some(Vec::new());
         }
+        engine.set_active_version_id("version-test".to_string());
 
         let mut tx = engine
             .begin_transaction_with_options(ExecuteOptions::default())
@@ -1192,8 +1196,8 @@ mod tests {
                 .active_version_id
                 .read()
                 .expect("active_version_id lock")
-                .as_str(),
-            "after"
+                .as_deref(),
+            Some("after")
         );
         assert!(
             engine

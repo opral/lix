@@ -11,7 +11,7 @@ impl Engine {
             engine: self,
             transaction: Some(transaction),
             options,
-            active_version_id: self.active_version_id.read().unwrap().clone(),
+            active_version_id: self.require_active_version_id()?,
             active_version_changed: false,
             installed_plugins_cache_invalidation_pending: false,
             pending_state_commit_stream_changes: Vec::new(),

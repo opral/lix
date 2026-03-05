@@ -75,6 +75,7 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                           AND entity_id = 'global' \
                           AND file_id = 'lix' \
                           AND version_id = 'global' \
+                          AND global = true \
                           AND is_tombstone = 0 \
                           AND snapshot_content IS NOT NULL \
                         LIMIT 1 \

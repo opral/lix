@@ -1,5 +1,6 @@
 use super::*;
 use crate::errors;
+use crate::version::DEFAULT_ACTIVE_VERSION_NAME;
 
 const SYSTEM_ROOT_DIRECTORY_PATH: &str = "/.lix/";
 const SYSTEM_APP_DATA_DIRECTORY_PATH: &str = "/.lix/app_data/";
@@ -210,6 +211,7 @@ impl Engine {
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND snapshot_content IS NOT NULL \
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
@@ -503,6 +505,7 @@ impl Engine {
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
+               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",

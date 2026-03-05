@@ -2163,7 +2163,10 @@ simulation_test!(
             .await
             .expect("pre-delete query should succeed");
         assert_eq!(visible_rows.statements[0].rows.len(), 1);
-        assert_text(&visible_rows.statements[0].rows[0][0], "file-global-readme-tombstone");
+        assert_text(
+            &visible_rows.statements[0].rows[0][0],
+            "file-global-readme-tombstone",
+        );
         assert_text(&visible_rows.statements[0].rows[0][1], "/readme.md");
         assert_boolean_like(&visible_rows.statements[0].rows[0][2], true);
 
