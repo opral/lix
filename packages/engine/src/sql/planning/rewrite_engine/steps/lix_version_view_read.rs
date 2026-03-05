@@ -66,6 +66,7 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_descriptor' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND entity_id <> 'global' \
                    AND snapshot_content IS NOT NULL \
                ) AS d \
@@ -80,6 +81,7 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_pointer' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND snapshot_content IS NOT NULL \
                ) AS t \
                  ON t.id = d.id";

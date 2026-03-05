@@ -526,7 +526,7 @@ impl Engine {
             "INSERT INTO {table} (\
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', false, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
             table = table,
             entity_id = escape_sql_string(entity_id),
@@ -557,6 +557,7 @@ impl Engine {
              WHERE schema_key = '{schema_key}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
+               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL",
             table = table,
@@ -618,6 +619,7 @@ impl Engine {
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
+               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
@@ -638,7 +640,7 @@ impl Engine {
             "INSERT INTO {table} (\
              entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', false, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
              )",
             table = table,
             entity_id = escape_sql_string(entity_id),
