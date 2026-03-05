@@ -17,16 +17,6 @@
     "name": {
       "type": "string"
     },
-    "inherits_from_version_id": {
-      "anyOf": [
-        {
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "hidden": {
       "type": "boolean",
       "default": false

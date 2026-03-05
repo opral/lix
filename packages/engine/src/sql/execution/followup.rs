@@ -8,7 +8,7 @@ use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::version::{
     version_descriptor_file_id, version_descriptor_schema_key,
-    version_descriptor_storage_version_id,
+    version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineValue};
 
@@ -491,11 +491,9 @@ async fn load_effective_scope_delete_rows(
         version_descriptor_schema_key()
     ));
     let sql = format!(
-        "WITH RECURSIVE \
-           version_descriptor AS ( \
-             SELECT \
-               lix_json_extract(snapshot_content, 'id') AS version_id, \
-               lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id \
+        "WITH \
+           all_real_versions AS ( \
+             SELECT lix_json_extract(snapshot_content, 'id') AS version_id \
              FROM {descriptor_table} \
              WHERE schema_key = '{descriptor_schema_key}' \
                AND file_id = '{descriptor_file_id}' \
@@ -504,25 +502,26 @@ async fn load_effective_scope_delete_rows(
                AND snapshot_content IS NOT NULL \
            ), \
            all_target_versions AS ( \
-             SELECT DISTINCT version_id FROM {schema_table} \
+             SELECT DISTINCT version_id \
+             FROM {schema_table} \
+             WHERE version_id <> '{global_version}' \
              UNION \
-             SELECT DISTINCT version_id FROM version_descriptor \
+             SELECT version_id \
+             FROM all_real_versions \
            ), \
            version_chain(target_version_id, ancestor_version_id, depth) AS ( \
              SELECT version_id AS target_version_id, version_id AS ancestor_version_id, 0 AS depth \
              FROM all_target_versions \
              UNION ALL \
              SELECT \
-               vc.target_version_id, \
-               vd.inherits_from_version_id AS ancestor_version_id, \
-               vc.depth + 1 AS depth \
-             FROM version_chain vc \
-             JOIN version_descriptor vd ON vd.version_id = vc.ancestor_version_id \
-             WHERE vd.inherits_from_version_id IS NOT NULL \
-               AND vc.depth < 64 \
+               version_id AS target_version_id, \
+               '{global_version}' AS ancestor_version_id, \
+               1 AS depth \
+             FROM all_target_versions \
+             WHERE version_id <> '{global_version}' \
            ), \
            ranked AS ( \
-             SELECT \
+           SELECT \
                s.entity_id AS entity_id, \
                s.file_id AS file_id, \
                vc.target_version_id AS version_id, \
@@ -531,12 +530,8 @@ async fn load_effective_scope_delete_rows(
                s.metadata AS metadata, \
                s.snapshot_content AS snapshot_content, \
                '{schema_key}' AS schema_key, \
+               s.global AS global, \
                false AS untracked, \
-               CASE \
-                 WHEN s.inherited_from_version_id IS NOT NULL THEN s.inherited_from_version_id \
-                 WHEN vc.depth = 0 THEN NULL \
-                 ELSE s.version_id \
-               END AS inherited_from_version_id, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY vc.target_version_id, s.entity_id, s.file_id \
                  ORDER BY vc.depth ASC \
@@ -554,6 +549,7 @@ async fn load_effective_scope_delete_rows(
         descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
         descriptor_file_id = escape_sql_string(version_descriptor_file_id()),
         descriptor_storage_version_id = escape_sql_string(version_descriptor_storage_version_id()),
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
         schema_table = schema_table,
         schema_key = escape_sql_string(&plan.schema_key),
     );

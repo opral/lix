@@ -6,9 +6,9 @@ use crate::builtin_schema::types::LixVersionPointer;
 use crate::builtin_schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::materialization::loader::{load_data, ChangeRecord, LoadedData};
 use crate::materialization::types::{
-    InheritanceWinnerDebugRow, LatestVisibleWinnerDebugRow, MaterializationDebugMode,
-    MaterializationDebugTrace, MaterializationPlan, MaterializationRequest, MaterializationScope,
-    MaterializationWarning, MaterializationWrite, MaterializationWriteOp, StageStat,
+    LatestVisibleWinnerDebugRow, MaterializationDebugMode, MaterializationDebugTrace,
+    MaterializationPlan, MaterializationRequest, MaterializationScope, MaterializationWarning,
+    MaterializationWrite, MaterializationWriteOp, ScopeWinnerDebugRow, StageStat,
     TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
     VersionPointerDebugRow,
 };
@@ -34,7 +34,7 @@ struct VisibleRow {
 #[derive(Debug, Clone)]
 struct FinalStateRow {
     version_id: String,
-    inherited_from_version_id: Option<String>,
+    global: bool,
     source: VisibleRow,
 }
 
@@ -940,52 +940,15 @@ fn resolve_target_versions(
 fn build_version_ancestry(
     data: &LoadedData,
     target_versions: &BTreeSet<String>,
-    warnings: &mut Vec<MaterializationWarning>,
+    _warnings: &mut Vec<MaterializationWarning>,
     stats: &mut Vec<StageStat>,
 ) -> BTreeMap<String, Vec<(String, usize)>> {
     let mut ancestry: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
 
     for version_id in target_versions {
-        let mut rows = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut current = version_id.clone();
-        let mut depth = 0usize;
-
-        loop {
-            if !seen.insert(current.clone()) {
-                warnings.push(MaterializationWarning {
-                    code: "version_inheritance_cycle".to_string(),
-                    message: format!(
-                        "cycle detected while resolving ancestry for version '{}'",
-                        version_id
-                    ),
-                });
-                break;
-            }
-
-            rows.push((current.clone(), depth));
-            let next = data
-                .version_descriptors
-                .get(&current)
-                .and_then(|descriptor| descriptor.snapshot.inherits_from_version_id.clone());
-
-            let Some(next) = next else {
-                break;
-            };
-
-            if depth >= 64 {
-                warnings.push(MaterializationWarning {
-                    code: "version_inheritance_depth_limit".to_string(),
-                    message: format!(
-                        "ancestry depth exceeded limit while resolving version '{}'",
-                        version_id
-                    ),
-                });
-                break;
-            }
-
-            current = next;
-            depth += 1;
+        let mut rows = vec![(version_id.clone(), 0usize)];
+        if version_id != GLOBAL_VERSION_ID {
+            rows.push((GLOBAL_VERSION_ID.to_string(), 1));
         }
 
         ancestry.insert(version_id.clone(), rows);
@@ -1048,11 +1011,7 @@ fn build_final_state(
                     key,
                     FinalStateRow {
                         version_id: version_id.clone(),
-                        inherited_from_version_id: if *depth == 0 {
-                            None
-                        } else {
-                            Some(ancestor_id.clone())
-                        },
+                        global: ancestor_id == GLOBAL_VERSION_ID || *depth > 0,
                         source: candidate.clone(),
                     },
                 );
@@ -1093,7 +1052,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<MaterializationWrite> {
             entity_id: row.source.entity_id.clone(),
             file_id: row.source.file_id.clone(),
             version_id: row.version_id.clone(),
-            inherited_from_version_id: row.inherited_from_version_id.clone(),
+            global: row.global,
             op,
             snapshot_content: row.source.snapshot_content.clone(),
             metadata: row.source.metadata.clone(),
@@ -1192,15 +1151,15 @@ fn build_debug_trace(
         Vec::new()
     };
 
-    let inheritance_winners = if matches!(req.debug, MaterializationDebugMode::Full) {
+    let scope_winners = if matches!(req.debug, MaterializationDebugMode::Full) {
         final_state
             .iter()
-            .map(|row| InheritanceWinnerDebugRow {
+            .map(|row| ScopeWinnerDebugRow {
                 version_id: row.version_id.clone(),
                 entity_id: row.source.entity_id.clone(),
                 schema_key: row.source.schema_key.clone(),
                 file_id: row.source.file_id.clone(),
-                inherited_from_version_id: row.inherited_from_version_id.clone(),
+                global: row.global,
                 change_id: row.source.change_id.clone(),
             })
             .take(limit)
@@ -1215,6 +1174,6 @@ fn build_debug_trace(
         traversed_edges: traversed_edges.into_iter().take(limit).collect(),
         version_ancestry: ancestry_rows.into_iter().take(limit).collect(),
         latest_visible_winners,
-        inheritance_winners,
+        scope_winners,
     })
 }

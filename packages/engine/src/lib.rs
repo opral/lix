@@ -50,10 +50,10 @@ pub use engine::{
 pub use error::LixError;
 pub use errors::ErrorCode;
 pub use materialization::{
-    apply_materialization_plan, materialization_plan, materialize, InheritanceWinnerDebugRow,
-    LatestVisibleWinnerDebugRow, MaterializationApplyReport, MaterializationDebugMode,
-    MaterializationDebugTrace, MaterializationPlan, MaterializationReport, MaterializationRequest,
-    MaterializationScope, MaterializationWarning, MaterializationWrite, MaterializationWriteOp,
+    apply_materialization_plan, materialization_plan, materialize, LatestVisibleWinnerDebugRow,
+    MaterializationApplyReport, MaterializationDebugMode, MaterializationDebugTrace,
+    MaterializationPlan, MaterializationReport, MaterializationRequest, MaterializationScope,
+    MaterializationWarning, MaterializationWrite, MaterializationWriteOp, ScopeWinnerDebugRow,
     StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow, VersionAncestryDebugRow,
     VersionPointerDebugRow,
 };

@@ -286,7 +286,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    observe_lix_state_emits_when_switching_active_version,
+    observe_lix_state_emits_when_switching_from_global_visibility_to_local_shadow,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -297,7 +297,6 @@ simulation_test!(
 
         let branch = engine
             .create_version(CreateVersionOptions {
-                inherits_from_version_id: Some("global".to_string()),
                 ..Default::default()
             })
             .await
@@ -339,11 +338,6 @@ simulation_test!(
             .await
             .expect("branch state insert should succeed");
 
-        engine
-            .switch_version("global".to_string())
-            .await
-            .expect("switch to global should succeed");
-
         let mut observed = engine
             .observe(ObserveQuery::new(
                 "SELECT lix_json_extract(snapshot_content, 'value') \
@@ -379,7 +373,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    observe_lix_file_emits_when_switching_active_version,
+    observe_lix_file_emits_when_switching_from_global_visibility_to_local_shadow,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -390,7 +384,6 @@ simulation_test!(
 
         let branch = engine
             .create_version(CreateVersionOptions {
-                inherits_from_version_id: Some("global".to_string()),
                 ..Default::default()
             })
             .await
@@ -420,11 +413,6 @@ simulation_test!(
             .await
             .expect("branch file update should succeed");
 
-        engine
-            .switch_version("global".to_string())
-            .await
-            .expect("switch to global should succeed");
-
         let mut observed = engine
             .observe(ObserveQuery::new(
                 "SELECT data FROM lix_file WHERE path = ?1",
@@ -452,7 +440,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    observe_lix_state_mixed_tracked_and_untracked_changes_emit_only_on_visible_delta,
+    observe_lix_state_mixed_tracked_and_untracked_changes_emit_only_on_local_shadow_delta,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -463,7 +451,6 @@ simulation_test!(
 
         let branch = engine
             .create_version(CreateVersionOptions {
-                inherits_from_version_id: Some("global".to_string()),
                 ..Default::default()
             })
             .await
@@ -504,11 +491,6 @@ simulation_test!(
             )
             .await
             .expect("branch state insert should succeed");
-
-        engine
-            .switch_version("global".to_string())
-            .await
-            .expect("switch to global should succeed");
 
         let mut observed = engine
             .observe(ObserveQuery::new(

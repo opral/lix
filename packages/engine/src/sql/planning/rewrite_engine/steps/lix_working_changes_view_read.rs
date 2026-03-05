@@ -49,32 +49,51 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                 ORDER BY updated_at DESC \
                 LIMIT 1 \
             ), \
-            version_pointer AS ( \
-                SELECT snapshot_content \
-                FROM lix_internal_state_materialized_v1_lix_version_pointer \
-                WHERE schema_key = 'lix_version_pointer' \
-                  AND entity_id = (SELECT version_id FROM active_version) \
-                  AND file_id = 'lix' \
-                  AND version_id = 'global' \
-                  AND is_tombstone = 0 \
-                  AND snapshot_content IS NOT NULL \
-                LIMIT 1 \
-            ), \
-            tip_commit AS ( \
-                SELECT lix_json_extract(snapshot_content, 'commit_id') AS id \
-                FROM version_pointer \
-                LIMIT 1 \
-            ), \
-            baseline_commit AS ( \
-                SELECT COALESCE( \
+            scope_heads AS ( \
+                SELECT \
+                    'local' AS scope, \
+                    (SELECT version_id FROM active_version) AS checkpoint_version_id, \
                     ( \
-                        SELECT checkpoint_commit_id \
-                        FROM lix_internal_last_checkpoint \
-                        WHERE version_id = (SELECT version_id FROM active_version) \
+                        SELECT lix_json_extract(snapshot_content, 'commit_id') \
+                        FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                        WHERE schema_key = 'lix_version_pointer' \
+                          AND entity_id = (SELECT version_id FROM active_version) \
+                          AND file_id = 'lix' \
+                          AND version_id = 'global' \
+                          AND is_tombstone = 0 \
+                          AND snapshot_content IS NOT NULL \
                         LIMIT 1 \
-                    ), \
-                    (SELECT id FROM tip_commit) \
-                ) AS id \
+                    ) AS tip_commit_id \
+                UNION ALL \
+                SELECT \
+                    'global' AS scope, \
+                    'global' AS checkpoint_version_id, \
+                    ( \
+                        SELECT lix_json_extract(snapshot_content, 'commit_id') \
+                        FROM lix_internal_state_materialized_v1_lix_global_pointer \
+                        WHERE schema_key = 'lix_global_pointer' \
+                          AND entity_id = 'global' \
+                          AND file_id = 'lix' \
+                          AND version_id = 'global' \
+                          AND is_tombstone = 0 \
+                          AND snapshot_content IS NOT NULL \
+                        LIMIT 1 \
+                    ) AS tip_commit_id \
+            ), \
+            scope_baselines AS ( \
+                SELECT \
+                    scope, \
+                    tip_commit_id, \
+                    COALESCE( \
+                        ( \
+                            SELECT checkpoint_commit_id \
+                            FROM lix_internal_last_checkpoint \
+                            WHERE version_id = checkpoint_version_id \
+                            LIMIT 1 \
+                        ), \
+                        tip_commit_id \
+                    ) AS baseline_commit_id \
+                FROM scope_heads \
             ), \
             commit_rows AS ( \
                 SELECT \
@@ -138,20 +157,25 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             tip_ancestry AS ( \
                 SELECT \
-                    ancestor_id AS commit_id, \
-                    depth \
-                FROM lix_internal_commit_ancestry \
-                WHERE commit_id = (SELECT id FROM tip_commit) \
+                    scope.scope AS scope, \
+                    anc.ancestor_id AS commit_id, \
+                    anc.depth AS depth \
+                FROM scope_baselines scope \
+                JOIN lix_internal_commit_ancestry anc \
+                    ON anc.commit_id = scope.tip_commit_id \
             ), \
             baseline_ancestry AS ( \
                 SELECT \
-                    ancestor_id AS commit_id, \
-                    depth \
-                FROM lix_internal_commit_ancestry \
-                WHERE commit_id = (SELECT id FROM baseline_commit) \
+                    scope.scope AS scope, \
+                    anc.ancestor_id AS commit_id, \
+                    anc.depth AS depth \
+                FROM scope_baselines scope \
+                JOIN lix_internal_commit_ancestry anc \
+                    ON anc.commit_id = scope.baseline_commit_id \
             ), \
             tip_candidates AS ( \
                 SELECT \
+                    anc.scope AS scope, \
                     cse.entity_id, \
                     cse.schema_key, \
                     cse.file_id, \
@@ -166,48 +190,55 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             tip_min_depth AS ( \
                 SELECT \
+                    scope, \
                     entity_id, \
                     schema_key, \
                     file_id, \
                     MIN(depth) AS depth \
                 FROM tip_candidates \
-                GROUP BY entity_id, schema_key, file_id \
+                GROUP BY scope, entity_id, schema_key, file_id \
             ), \
             tip_best_created_at AS ( \
                 SELECT \
+                    tc.scope, \
                     tc.entity_id, \
                     tc.schema_key, \
                     tc.file_id, \
                     MAX(tc.commit_created_at) AS commit_created_at \
                 FROM tip_candidates tc \
                 JOIN tip_min_depth d \
-                    ON d.entity_id = tc.entity_id \
+                    ON d.scope = tc.scope \
+                   AND d.entity_id = tc.entity_id \
                    AND d.schema_key = tc.schema_key \
                    AND d.file_id = tc.file_id \
                    AND d.depth = tc.depth \
-                GROUP BY tc.entity_id, tc.schema_key, tc.file_id \
+                GROUP BY tc.scope, tc.entity_id, tc.schema_key, tc.file_id \
             ), \
             tip_entries AS ( \
                 SELECT \
+                    tc.scope, \
                     tc.entity_id, \
                     tc.schema_key, \
                     tc.file_id, \
                     MAX(tc.change_id) AS change_id \
                 FROM tip_candidates tc \
                 JOIN tip_min_depth d \
-                    ON d.entity_id = tc.entity_id \
+                    ON d.scope = tc.scope \
+                   AND d.entity_id = tc.entity_id \
                    AND d.schema_key = tc.schema_key \
                    AND d.file_id = tc.file_id \
                    AND d.depth = tc.depth \
                 JOIN tip_best_created_at bc \
-                    ON bc.entity_id = tc.entity_id \
+                    ON bc.scope = tc.scope \
+                   AND bc.entity_id = tc.entity_id \
                    AND bc.schema_key = tc.schema_key \
                    AND bc.file_id = tc.file_id \
                    AND bc.commit_created_at = tc.commit_created_at \
-                GROUP BY tc.entity_id, tc.schema_key, tc.file_id \
+                GROUP BY tc.scope, tc.entity_id, tc.schema_key, tc.file_id \
             ), \
             baseline_candidates AS ( \
                 SELECT \
+                    anc.scope AS scope, \
                     cse.entity_id, \
                     cse.schema_key, \
                     cse.file_id, \
@@ -222,48 +253,55 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
             ), \
             baseline_min_depth AS ( \
                 SELECT \
+                    scope, \
                     entity_id, \
                     schema_key, \
                     file_id, \
                     MIN(depth) AS depth \
                 FROM baseline_candidates \
-                GROUP BY entity_id, schema_key, file_id \
+                GROUP BY scope, entity_id, schema_key, file_id \
             ), \
             baseline_best_created_at AS ( \
                 SELECT \
+                    bc.scope, \
                     bc.entity_id, \
                     bc.schema_key, \
                     bc.file_id, \
                     MAX(bc.commit_created_at) AS commit_created_at \
                 FROM baseline_candidates bc \
                 JOIN baseline_min_depth d \
-                    ON d.entity_id = bc.entity_id \
+                    ON d.scope = bc.scope \
+                   AND d.entity_id = bc.entity_id \
                    AND d.schema_key = bc.schema_key \
                    AND d.file_id = bc.file_id \
                    AND d.depth = bc.depth \
-                GROUP BY bc.entity_id, bc.schema_key, bc.file_id \
+                GROUP BY bc.scope, bc.entity_id, bc.schema_key, bc.file_id \
             ), \
             baseline_entries AS ( \
                 SELECT \
+                    bc.scope, \
                     bc.entity_id, \
                     bc.schema_key, \
                     bc.file_id, \
                     MAX(bc.change_id) AS change_id \
                 FROM baseline_candidates bc \
                 JOIN baseline_min_depth d \
-                    ON d.entity_id = bc.entity_id \
+                    ON d.scope = bc.scope \
+                   AND d.entity_id = bc.entity_id \
                    AND d.schema_key = bc.schema_key \
                    AND d.file_id = bc.file_id \
                    AND d.depth = bc.depth \
                 JOIN baseline_best_created_at bca \
-                    ON bca.entity_id = bc.entity_id \
+                    ON bca.scope = bc.scope \
+                   AND bca.entity_id = bc.entity_id \
                    AND bca.schema_key = bc.schema_key \
                    AND bca.file_id = bc.file_id \
                    AND bca.commit_created_at = bc.commit_created_at \
-                GROUP BY bc.entity_id, bc.schema_key, bc.file_id \
+                GROUP BY bc.scope, bc.entity_id, bc.schema_key, bc.file_id \
             ), \
             paired_entries AS ( \
                 SELECT \
+                    tip.scope AS scope, \
                     tip.entity_id AS entity_id, \
                     tip.schema_key AS schema_key, \
                     tip.file_id AS file_id, \
@@ -271,13 +309,15 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                     tip.change_id AS after_change_id \
                 FROM tip_entries tip \
                 LEFT JOIN baseline_entries base \
-                    ON base.entity_id = tip.entity_id \
+                    ON base.scope = tip.scope \
+                   AND base.entity_id = tip.entity_id \
                    AND base.schema_key = tip.schema_key \
                    AND base.file_id = tip.file_id \
  \
                 UNION ALL \
  \
                 SELECT \
+                    base.scope AS scope, \
                     base.entity_id AS entity_id, \
                     base.schema_key AS schema_key, \
                     base.file_id AS file_id, \
@@ -285,13 +325,15 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                     NULL AS after_change_id \
                 FROM baseline_entries base \
                 LEFT JOIN tip_entries tip \
-                    ON tip.entity_id = base.entity_id \
+                    ON tip.scope = base.scope \
+                   AND tip.entity_id = base.entity_id \
                    AND tip.schema_key = base.schema_key \
                    AND tip.file_id = base.file_id \
                 WHERE tip.entity_id IS NULL \
             ), \
             resolved_rows AS ( \
                 SELECT \
+                    pair.scope AS scope, \
                     pair.entity_id AS entity_id, \
                     pair.schema_key AS schema_key, \
                     pair.file_id AS file_id, \
@@ -310,6 +352,7 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                     entity_id, \
                     schema_key, \
                     file_id, \
+                    CASE WHEN scope = 'global' THEN true ELSE false END AS lixcol_global, \
                     CASE \
                         WHEN before_row_snapshot IS NULL AND after_row_snapshot IS NOT NULL THEN NULL \
                         ELSE before_change_id \
@@ -320,11 +363,21 @@ fn build_lix_working_changes_view_query() -> Result<Query, LixError> {
                     END AS after_change_id, \
                     CASE \
                         WHEN before_row_snapshot IS NULL AND after_row_snapshot IS NOT NULL THEN NULL \
-                        ELSE (SELECT id FROM baseline_commit) \
+                        ELSE ( \
+                            SELECT baseline_commit_id \
+                            FROM scope_baselines scope \
+                            WHERE scope.scope = resolved_rows.scope \
+                            LIMIT 1 \
+                        ) \
                     END AS before_commit_id, \
                     CASE \
                         WHEN before_row_snapshot IS NOT NULL AND after_row_snapshot IS NULL THEN NULL \
-                        ELSE (SELECT id FROM tip_commit) \
+                        ELSE ( \
+                            SELECT tip_commit_id \
+                            FROM scope_baselines scope \
+                            WHERE scope.scope = resolved_rows.scope \
+                            LIMIT 1 \
+                        ) \
                     END AS after_commit_id, \
                     CASE \
                         WHEN before_row_snapshot IS NOT NULL AND after_row_snapshot IS NULL THEN 'removed' \

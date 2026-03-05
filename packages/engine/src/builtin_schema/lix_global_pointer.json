@@ -1,32 +1,21 @@
 {
-  "x-lix-key": "lix_commit_edge",
+  "x-lix-key": "lix_global_pointer",
   "x-lix-version": "1",
   "x-lix-primary-key": [
-    "/parent_id",
-    "/child_id"
+    "/id"
   ],
   "x-lix-foreign-keys": [
     {
       "properties": [
-        "/parent_id"
+        "/commit_id"
       ],
       "references": {
         "schemaKey": "lix_commit",
         "properties": [
           "/id"
         ]
-      }
-    },
-    {
-      "properties": [
-        "/child_id"
-      ],
-      "references": {
-        "schemaKey": "lix_commit",
-        "properties": [
-          "/id"
-        ]
-      }
+      },
+      "mode": "materialized"
     }
   ],
   "x-lix-override-lixcols": {
@@ -36,16 +25,17 @@
   },
   "type": "object",
   "properties": {
-    "parent_id": {
-      "type": "string"
+    "id": {
+      "type": "string",
+      "default": "global"
     },
-    "child_id": {
+    "commit_id": {
       "type": "string"
     }
   },
   "required": [
-    "parent_id",
-    "child_id"
+    "id",
+    "commit_id"
   ],
   "additionalProperties": false
 }

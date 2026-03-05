@@ -119,9 +119,9 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT id, path, data \
-                 FROM lix_file_by_version \
+                 FROM lix_file \
                  WHERE path = '/.lix/plugins/plugin_json.lixplugin' \
-                   AND lixcol_version_id = 'global'",
+                   AND lixcol_global = true",
                 &[],
             )
             .await
@@ -348,9 +348,9 @@ simulation_test!(
         let plugin_count = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_file_by_version \
-                 WHERE lixcol_version_id = 'global' \
-                   AND path = '/.lix/plugins/plugin_json.lixplugin'",
+                 FROM lix_file \
+                 WHERE path = '/.lix/plugins/plugin_json.lixplugin' \
+                   AND lixcol_global = true",
                 &[],
             )
             .await
@@ -417,9 +417,9 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT id, path, data \
-                 FROM lix_file_by_version \
-                 WHERE lixcol_version_id = 'global' \
-                   AND path = '/.lix/plugins/plugin_json.lixplugin'",
+                 FROM lix_file \
+                 WHERE path = '/.lix/plugins/plugin_json.lixplugin' \
+                   AND lixcol_global = true",
                 &[],
             )
             .await

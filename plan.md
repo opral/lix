@@ -1,208 +1,122 @@
-# Single-Cutover Read Simplification: AST Pushdown + Unified `by_version` Core
+# Remove Inheritance in `packages/engine` with an Internal Global Lane
 
 ## Summary
 
-This plan performs a single cutover (no feature flag) to simplify read architecture around one semantic core:
+- Verified against `packages/engine` on `next`: the engine is pointer-and-checkpoint based, so the design should stay aligned with `lix_version_pointer`, `lix_working_changes`, materialization, and vtable rewrites.
+- Remove version inheritance entirely. Replace it with explicit scope: rows are either local or global via `lixcol_global`.
+- Keep a single internal global lane for storage and commit tracking:
+  - local rows: `global = false`, `version_id = <real version>`
+  - global rows: `global = true`, `version_id = 'global'`
+- Keep `version_id` non-null everywhere. Do not use `NULL` version ids.
+- Hide the internal global lane from `lix_version`; public version APIs only expose real branch versions.
+- Rename the singleton global head schema to `lix_global_pointer`.
 
-1. `lix_state_by_version` is the only state-read semantic core.
-2. `lix_state` is only an adapter: inject active `version_id`, hide `version_id`.
-3. Entity views are pure projection adapters over `lix_state` / `lix_state_by_version` / `lix_state_history`.
-4. Predicate pushdown becomes AST-based (`Expr`), not SQL-string based.
-5. Wrapper projections are column-pruned so `commit_id` is only projected when required.
+## Key Changes
 
-Chosen strategy and defaults:
+### Public model
 
-- Rollout: **Single Cutover**
-- Pushdown scope: **Conservative** (`AND` conjunctions of safe forms only)
+- Remove `inherits_from_version_id` from:
+  - `CreateVersionOptions`
+  - `CreateVersionResult`
+  - `LixVersionDescriptor`
+  - `lix_version_descriptor`
+  - `lix_version` read/write rewrites
+  - public row shapes and tests
+- Add `lixcol_global` anywhere row scope is surfaced today, alongside `lixcol_untracked`.
+- Remove `lixcol_inherited_from_version_id` from all public views and entity/file projections.
+- `lix_version` shows only real versions. The internal `global` lane is not returned and cannot become the active version.
+- Reserve the version id `"global"` so user-created versions cannot collide with the internal lane.
 
-## Decisions Locked
+### Storage and tracked heads
 
-1. No public SQL contract change for visible columns beyond existing `lix_state` rule (`version_id` remains hidden/rejected).
-2. `SELECT *` and wildcard queries keep current behavior; conservative fallback may keep full projection.
-3. Commit mapping should run only when query shape actually requires `commit_id` (or fallback complexity policy says “safe to keep on”).
-4. No partial migration: old string pushdown path is removed in same cutover.
+- Keep `version_id TEXT NOT NULL`.
+- Add `global BOOLEAN NOT NULL DEFAULT false` to raw scoped state storage and tracked materialized state.
+- Global rows are stored once in the internal lane with `version_id = 'global'`.
+- Keep local version heads in `lix_version_pointer`.
+- Add singleton `lix_global_pointer { commit_id }` for the tracked head of global scope.
+- Keep the checkpoint store keyed by version id and add a global baseline row at `version_id = 'global'`.
 
-## Important Interface / Type Changes
+### Read and write resolution
 
-1. Replace string pushdown carrier:
+- Delete all inheritance and ancestry logic from:
+  - vtable read rewrites
+  - followup execution
+  - filesystem mutation rewrite/version-chain cache
+  - materialization ancestry stages
+- Replace it with explicit overlay resolution:
+  - local transaction
+  - global transaction
+  - local untracked
+  - global untracked
+  - local tracked
+  - global tracked
+- For the same `(entity_id, schema_key, file_id)`, local wins over global.
+- A local delete of a visible global row creates a local tombstone; it hides the global row only in that version.
+- Global writes only happen when `lixcol_global = true` is explicit.
+- Public resolved `_by_version` views must project global rows with the requested real `version_id`, plus `lixcol_global = true`.
+  - This preserves `WHERE version_id = 'v1'` behavior on public SQL.
+  - Internally, source reads must still include both the target local lane and the internal global lane.
 
-- From: `StatePushdown { source_predicates: Vec<String>, ranked_predicates: Vec<String> }`
-- To: AST carrier with explicit bucketed predicates (for example `Vec<Expr>` per bucket plus metadata).
+### Working changes and checkpoint
 
-2. Add column-usage analysis API for relation-local pruning:
+- Keep the working-changes mental model symmetric across scopes.
+- `lix_working_changes` becomes the union of:
+  - local pending changes against the active version checkpoint
+  - global pending changes against the global checkpoint baseline
+- Global working changes are based on:
+  - global untracked rows
+  - `lix_global_pointer`
+  - the `version_id = 'global'` checkpoint row
+- `create_checkpoint()` updates both baselines:
+  - active local version checkpoint
+  - global checkpoint row
+- Keep the current local-only return shape of `create_checkpoint()`, even though it updates both scopes.
 
-- New helper that returns required columns for a target relation from a `Select`.
-- Includes projection, filters, grouping, ordering, having/qualify, and wildcard fallback.
+## Test Plan
 
-3. Wrapper-query builders switch to AST construction:
+- Bootstrapping seeds `main`, `lix_version_pointer`, and `lix_global_pointer`, but no public `global` version row.
+- Creating a version no longer stores or returns inheritance metadata.
+- A committed global row is visible from every version with `lixcol_global = true`.
+- A local row shadows a global row only in that version.
+- A local tombstone hides a global row only in that version.
+- `lix_state_by_version`, entity `_by_version`, and filesystem `_by_version` views return real target `version_id` values for global rows, never the internal `'global'` id.
+- Rewrite tests confirm no recursive `version_chain` or inheritance CTEs remain.
+- Version-filter pushdown tests confirm source reads include the internal global lane when resolving a real target version.
+- `lix_working_changes` shows both local and global pending changes.
+- `create_checkpoint()` clears both local and global working changes.
+- Mixed local/global tracked writes advance the correct heads only:
+  - local writes move the owning `lix_version_pointer`
+  - global writes move `lix_global_pointer`
 
-- `lix_state` wrapper query builder in [lix_state_view_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/lix_state_view_read.rs)
-- Entity wrapper query builder in [entity_views/read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/entity_views/read.rs)
+## Assumptions
 
-4. Remove dead active-read constructor from [vtable_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/vtable_read.rs):
+- No backward compatibility is required.
+- The internal global lane is a storage/runtime detail only.
+- `lixcol_global = false` is the default unless a write or schema override sets it.
+- The earlier `version_id = NULL` design is superseded; the engine-fit design is non-null `version_id` plus internal `version_id = 'global'`.
 
-- `build_effective_state_active_query` (unused) and related dead code.
+## Notes
 
-## Implementation Plan
+- If you find a severe architectural simplification possibility while implementing this plan, prompt the user for guidance.
 
-1. Introduce AST pushdown primitives in [state_pushdown.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/state_pushdown.rs).
+- Append to the progress log on significant milestones
 
-- Keep current conservative extraction policy (`Eq`, `InList`, `InSubquery`, `IsNull/IsNotNull` under `AND`).
-- Return extracted predicates as `Expr` plus bucket (`Source` vs `Ranked`), not rendered SQL strings.
-- Keep non-extracted predicates in outer `selection` unchanged.
-- Add AST qualifier rewrite helper to retarget extracted expressions to aliases (`s` or `ranked`) without string replacement.
+## Progress logs
 
-2. Add relation column-usage analysis helper (new module under rewrite engine, e.g. `steps/column_usage.rs`).
-
-- Inputs: `Select`, relation alias/name, `allow_unqualified`.
-- Output: required canonical state columns.
-- Conservative fallback to `AllColumns` when any of the following hold:
-  - wildcard projection,
-  - complex shapes where reliable column inference is unsafe,
-  - ambiguous multi-relation references.
-- Ensure this helper is reusable by both `lix_state` and entity wrappers.
-
-3. Rewrite `lix_state` read wrapper to AST builder in [lix_state_view_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/lix_state_view_read.rs).
-
-- Remove `build_lix_state_wrapper_query(extra_predicates: &[String])`.
-- Build `Query` AST directly:
-  - `FROM lix_state_by_version AS s`
-  - `WHERE s.version_id = <active-version-subquery>`
-  - plus extracted source/ranked-safe pushdowns re-targeted for wrapper scope.
-- Apply column pruning:
-  - project only required visible `lix_state` columns for this relation.
-  - include `commit_id` only when required.
-  - never include `version_id`/`lixcol_version_id`.
-- Preserve existing explicit rejection of `version_id`/`lixcol_version_id` references.
-
-4. Rewrite entity adapters to AST in [entity_views/read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/entity_views/read.rs).
-
-- Remove SQL string assembly/parsing for wrapper query generation.
-- Build AST projections:
-  - property extraction via `lix_json_extract(snapshot_content, ...) AS <prop>`
-  - `lixcol_*` aliases per variant.
-- Source mapping remains strict:
-  - base -> `lix_state` (or pinned override route via `lix_state_by_version`)
-  - by_version -> `lix_state_by_version`
-  - history -> `lix_state_history`
-- Preserve only allowed extra logic:
-  - schema_key scoping,
-  - schema override predicates,
-  - minimal history root/version pushdown.
-- Convert history pushdown representation to AST predicates (no string serialization during extraction/routing).
-
-5. Keep `lix_state_by_version` as core lowering entry in [lix_state_by_version_view_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/lix_state_by_version_view_read.rs).
-
-- Continue computing `include_commit_mapping` from query shape, but now wrapper input should omit `commit_id` unless needed.
-- Maintain conservative behavior for complex query shapes (fallback can still enable commit mapping).
-- Replace any remaining pushdown string assumptions with AST bucket consumption.
-
-6. Remove dead active-path builder in [vtable_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/vtable_read.rs).
-
-- Delete `build_effective_state_active_query` and any dead helpers only tied to active-path semantics.
-- Confirm all active-state reads come through `lix_state -> lix_state_by_version`.
-
-7. Update architecture/documentation in [architecture-current-state.md](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/docs/architecture-current-state.md).
-
-- Explicitly document:
-  - one state-read core,
-  - adapter roles,
-  - AST pushdown model,
-  - projection pruning behavior and commit-mapping trigger rules.
-
-8. Keep pipeline ordering as-is but codify dependency in comments/tests:
-
-- [logical_views.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/pipeline/rules/query/canonical/logical_views.rs)
-- `lix_state` rewrite must run before `lix_state_by_version` rewrite.
-
-## Test Cases and Scenarios
-
-1. Pushdown AST unit tests in [state_pushdown.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/state_pushdown.rs).
-
-- Extract `AND` conjunction into correct buckets with preserved AST.
-- Leave unsupported predicate shapes in outer selection unchanged.
-- Verify alias requalification is structurally correct.
-
-2. `lix_state` wrapper rewrite tests in [lix_state_view_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/lix_state_view_read.rs).
-
-- `SELECT entity_id FROM lix_state` does not project `commit_id`.
-- `SELECT commit_id FROM lix_state` does project `commit_id`.
-- `SELECT * FROM lix_state` keeps full visible projection.
-- `version_id` and `lixcol_version_id` read rejection remains unchanged.
-
-3. `lix_state_by_version` commit-mapping rewrite tests in [lix_state_by_version_view_read.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/src/sql/planning/rewrite_engine/steps/lix_state_by_version_view_read.rs).
-
-- No-commit projection omits commit CTEs.
-- Commit projection includes commit CTEs.
-- Complex fallback cases still enable mapping when required.
-
-4. Integration regression tests in [state_view.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/tests/state_view.rs).
-
-- Existing `commit_id` correctness when selected.
-- No behavior regression for active-version routing and `version_id` rejection.
-- Validate query results unaffected for non-commit projections.
-
-5. Entity wrapper regressions in [entity_view.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/tests/entity_view.rs) and [entity_history_view.rs](/Users/samuel/.codex/worktrees/3daf/lix-codex-app/packages/engine/tests/entity_history_view.rs).
-
-- Base/by-version/history routing preserved.
-- Override predicates still honored.
-- History root/version pushdown preserved.
-
-6. Full targeted suites to run:
-
-- `cargo test -p lix_engine --test state_view`
-- `cargo test -p lix_engine --test state_by_version_view`
-- `cargo test -p lix_engine --test entity_view`
-- `cargo test -p lix_engine --test entity_history_view`
-- `cargo test -p lix_engine --test vtable_write`
-- `cargo test -p lix_engine`
-
-## Acceptance Criteria
-
-1. All state/entity read paths lower through `lix_state_by_version` semantics (directly or via adapter).
-2. No pushdown route relies on SQL string construction for predicate transport/classification.
-3. `lix_state` no longer forces `commit_id` projection for queries that do not reference it.
-4. Commit-mapping CTEs are absent in rewritten SQL when `commit_id` is not required.
-5. Existing behavior and tests for `version_id` rejection and effective-state semantics remain green.
-
-## Assumptions and Defaults
-
-1. Single cutover is acceptable without feature-flag fallback.
-2. Conservative pushdown is sufficient for this cutover; broader operator support is explicitly deferred.
-3. External user-facing SQL contracts remain stable except performance improvements and internal simplification.
-4. In ambiguous/complex query shapes, correctness is prioritized over aggressive pruning/pushdown.
-
-## Progress report 
-
-- 2026-03-04: Implemented AST pushdown carrier in `state_pushdown.rs` (`StatePushdown` now stores `Expr`), added alias-retarget helper, and added regression/unit coverage for extraction + `IS NULL` + alias remap behavior.
-- 2026-03-04: Reworked `lix_state_view_read.rs` wrapper rewrite to AST construction:
-  - derived wrapper query is built as AST over `lix_state_by_version AS s`.
-  - active-version predicate is injected as AST (`s.version_id = (<active-version subquery>)`).
-  - pushdown predicates are now AST (including ranked->source alias retargeting without string replacement).
-  - wrapper projection is commit-aware via `column_usage` helper; `commit_id` is omitted unless referenced.
-- 2026-03-04: Added `steps/column_usage.rs` and wired it into `lix_state` read rewrite for projection pruning policy.
-- 2026-03-04: Reworked `entity_views/read.rs` query construction to AST (no dynamic SQL assembly for wrapper SELECT composition), including history pushdown transport as AST expressions.
-- 2026-03-04: Removed dead active-read constructor path from `vtable_read.rs` (`build_effective_state_active_*`) to align with single `by_version` read core.
-- 2026-03-04: Fixed effective-scope delete regression for `inherited_from_version_id` predicates:
-  - added split plan fields in `VtableDeletePlan` for materialized effective-scope SQL vs untracked-safe SQL.
-  - added `rewrite_delete_effective_scope_maps_inherited_from_version_predicate_for_untracked_cleanup` unit coverage in `vtable_write.rs`.
-  - wired followup untracked cleanup to use the untracked-safe predicate channel.
-- 2026-03-04: Fixed untracked update routing regression for `writer_key`:
-  - untracked update paths now strip `writer_key` assignments (tracked paths keep `writer_key`).
-  - validated with `writer_key` integration suite.
-- 2026-03-04: Validation checkpoint complete:
-  - `cargo test -p lix_engine --test vtable_write` passed.
-  - `cargo test -p lix_engine --test state_inheritance` passed.
-  - `cargo test -p lix_engine --test writer_key` passed.
-  - full `cargo test -p lix_engine` passed.
-- 2026-03-04: Added `writer_key` parity for untracked state:
-  - schema/init now ensures `lix_internal_state_untracked.writer_key` exists (new column + migration guard).
-  - untracked insert/upsert paths in `vtable_write` now persist/update `writer_key`.
-  - untracked read projection in `vtable_read` now returns stored `writer_key` instead of `NULL`.
-  - added `untracked_writer_key_matches_materialized_writer_key` integration coverage in `writer_key.rs` (SQLite + Postgres).
-  - validation checkpoint: `cargo test -p lix_engine --test writer_key`, `cargo test -p lix_engine --test state_view`, and `cargo test -p lix_engine --test vtable_write` all passed.
-- 2026-03-04: Centralized `lix_state` column contracts in `steps/state_columns.rs`:
-  - moved visible-column contract to `LIX_STATE_VISIBLE_COLUMNS` and reused it from `lix_state_view_read`.
-  - removed duplicate non-commit projection list in `column_usage` by deriving from shared visible columns.
-  - moved update-allowed column contracts for `lix_state` and `lix_state_by_version` into shared constants and reused in both write validators.
-  - validation checkpoint: `cargo test -p lix_engine --test state_view` and `cargo test -p lix_engine --test state_by_version_view` passed.
+- 2026-03-05 11:34: Crafted plan
+- 2026-03-05 13:22: Removed public inheritance fields from version descriptors/API, added builtin `lix_global_pointer`, and hid the internal `global` lane from `lix_version`
+- 2026-03-05 14:07: Wired global checkpoint/global-pointer plumbing through bootstrap, `create_checkpoint()`, `lix_working_changes`, materialization ancestry, and effective-state rewrites; `cargo check -p lix_engine` passes and `cargo test -p lix_engine --test checkpoint checkpoint_labels_current_commit_sqlite` passes
+- 2026-03-05 16:02: Switched public state/entity/filesystem metadata surfaces from inherited markers to `global`/`lixcol_global`, stopped filesystem projections from deriving commit ids through `lix_version`, and kept the package green with `cargo check -p lix_engine`, `cargo test -p lix_engine --test checkpoint`, `cargo test -p lix_engine --test entity_view --no-run`, `cargo test -p lix_engine --test filesystem_view --no-run`, and the `filesystem::select_rewrite::tests::rewrites_simple_file_path_data_query_to_projection` unit test
+- 2026-03-05 12:30: Replaced the remaining internal `inherited_from_version_id` plumbing in `packages/engine/src` with explicit `global` booleans across raw/materialized state DDL, materialization writes/debug rows, vtable/followup effective-state readers, and vtable delete cleanup; verified with `cargo fmt --package lix_engine`, `cargo check -p lix_engine`, `cargo test -p lix_engine --test materialization --no-run`, `cargo test -p lix_engine --lib --no-run`, `cargo test -p lix_engine rewrite_delete_effective_scope_preserves_global_predicate_for_untracked_cleanup -- --nocapture`, and `cargo test -p lix_engine --test materialization apply_materialization_plan_full_scope_clears_existing_rows_in_schema_tables -- --nocapture`
+- 2026-03-05 12:38: Finished the scope-flag follow-through by stamping `global` in the immediate write/commit-runtime paths, updating the remaining inheritance-era tests and schema overrides to `global`/`lixcol_global`, and clearing the repo-wide `inherited_from_version_id` references from `packages/engine`; verified with `cargo fmt --package lix_engine`, `cargo test -p lix_engine --test state_by_version_view --test state_inheritance --test entity_view --test filesystem_view --no-run`, `cargo test -p lix_engine --test filesystem_view filesystem_views_expose_expected_lixcol_columns -- --nocapture`, `cargo test -p lix_engine --test entity_view lix_entity_view_select_pushes_down_inherited_from_version_override -- --nocapture`, `cargo test -p lix_engine --test state_by_version_view lix_state_by_version_select_inherits_from_parent_version -- --nocapture`, and `cargo test -p lix_engine --test state_inheritance lix_state_delete_with_inherited_null_filter_deletes_only_local_rows -- --nocapture`
+- 2026-03-05 13:00: Moved schema-level global scope onto `lixcol_global = true` for the engine metadata schemas, split entity-view read overrides from write-lane routing so global-only schemas still read through `lix_state` but write through the internal `global` lane, and refreshed the dynamic entity-view tests to assert the new global projection behavior instead of inheritance-era `lixcol_version_id = 'global'`; verified with `cargo fmt --package lix_engine`, `cargo check -p lix_engine`, `cargo test -p lix_engine --lib --no-run`, `cargo test -p lix_engine --test init --no-run`, `cargo test -p lix_engine --test entity_view --no-run`, `cargo test -p lix_engine --test entity_view lix_entity_view_base_insert_read_honors_lixcol_global_override -- --nocapture`, and `cargo test -p lix_engine --test entity_view lix_entity_view_select_pushes_down_literal_lixcol_overrides -- --nocapture`
+- 2026-03-05 13:03: Collapsed `filesystem/mutation_rewrite.rs` off the recursive `inherits_from_version_id` lookup to a fixed local-plus-global chain (`[version_id, global]`), which removes one of the remaining core inheritance hooks from engine logic; verified with the `version_chain_lookup_uses_session_cache_for_repeated_version` unit target and confirmed that the old “duplicate inherited path in child version” filesystem canaries now fail because their expectations still encode cross-version inheritance instead of explicit global shadowing.
+- 2026-03-05 13:18: Rewrote the remaining inheritance-era filesystem canaries to use explicit global rows instead of parent-version visibility, removed the redundant nested duplicate-path case, and turned the old vacuous child-tombstone case into a real local-delete-over-global test. Verified with `cargo test -p lix_engine --test filesystem_view directory_duplicate_global_path_is_rejected_in_child_version -- --nocapture`, `cargo test -p lix_engine --test filesystem_view file_duplicate_global_path_is_rejected_in_child_version -- --nocapture`, `cargo test -p lix_engine --test filesystem_view file_path_update_to_global_path_is_rejected_in_child_version -- --nocapture`, `cargo test -p lix_engine --test filesystem_view file_reinsert_path_after_child_tombstone_of_global_file_succeeds -- --nocapture`, and `cargo test -p lix_engine --test filesystem_view -- --nocapture`.
+- 2026-03-05 14:02: Finished the remaining inheritance-era test cleanup outside the filesystem suite. `state_view` and `on_conflict_views` now seed versions without the removed parent column, `version_view` now asserts the current public contract (no `inherits_from_version_id`, no public `global` row, less brittle internal row-count expectations), and `file_materialization` now inserts extra versions through the simplified `lix_version` shape. Verified with `cargo test -p lix_engine --test state_view -- --nocapture`, `cargo test -p lix_engine --test on_conflict_views -- --nocapture`, `cargo test -p lix_engine --test version_view -- --nocapture`, `cargo test -p lix_engine --test file_materialization -- --nocapture`, and a final `cargo test -p lix_engine --test state_view --test on_conflict_views --test version_view --test file_materialization --no-run`.
+- 2026-03-05 14:11: Fixed the `--lib` regressions in `lix_state_by_version_view_read` by updating the version-id pushdown unit tests to the current target-version CTE shape: concrete `version_id` filters now apply on the local-plus-real-version union instead of a direct `version_descriptor` CTE filter. Verified with `cargo test -p lix_engine --lib -- --nocapture`.
+- 2026-03-05 14:16: Fixed `active_version` by removing the last public-`global` version assumptions from the FK-switch tests. The suite now creates real versions before switching `lix_active_version.version_id`, which matches the new model where `global` is an internal lane, not a public version row. Verified with `cargo test -p lix_engine --test active_version -- --nocapture`.
+- 2026-03-05 14:22: Fixed `entity_view` by updating the remaining by-version visibility canary to the new global-scope model and normalizing the actual `lixcol_global` column instead of `lixcol_version_id`, which removed the cross-backend deterministic mismatch. Verified with `cargo test -p lix_engine --test entity_view -- --nocapture`.
+- 2026-03-05 14:31: Fixed `init` by replacing the remaining public-`global` version assertions with the real engine contract: bootstrap-global checks now read `lix_global_pointer`, per-version checkpoint tests combine the public main version with the internal global checkpoint row, and system-directory visibility is asserted through an active-version by-version read filtered by `lixcol_global = true`. Verified with `cargo test -p lix_engine --test init -- --nocapture`.
+- 2026-03-05 14:36: Fixed `observe` by rewriting the last active-version-switch scenarios away from `switch_version(\"global\")`. The tests now start from the default real version, where global rows are already visible, and assert that switching into a branch-local shadow emits the expected observe delta. Verified with `cargo test -p lix_engine --test observe -- --nocapture`.
+- 2026-03-05 14:40: Fixed `plugin_install` by moving the archive persistence assertions off `lix_file_by_version ... lixcol_version_id = 'global'` and onto the real public contract: installed plugin archives are visible in `lix_file` and flagged by `lixcol_global = true`. Verified with `cargo test -p lix_engine --test plugin_install -- --nocapture`.
+- 2026-03-05 14:45: Fixed `state_by_version_view` by normalizing the remaining backend-dependent boolean column in the local-over-global overlay test and renaming the inheritance-era canaries to explicit global/local semantics (`reads_visible_global_row`, `prefers_local_row_over_global_row`, `local_tombstone_hides_global_row`). Verified with `cargo test -p lix_engine --test state_by_version_view -- --nocapture`.

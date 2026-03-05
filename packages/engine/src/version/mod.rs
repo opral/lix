@@ -1,7 +1,9 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::builtin_schema::types::{LixActiveVersion, LixVersionDescriptor, LixVersionPointer};
+use crate::builtin_schema::types::{
+    LixActiveVersion, LixGlobalPointer, LixVersionDescriptor, LixVersionPointer,
+};
 use crate::builtin_schema::{
     builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
 };
@@ -19,6 +21,7 @@ pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
 static ACTIVE_VERSION_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_POINTER_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
+static GLOBAL_POINTER_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 
 struct SchemaMetadata {
     schema_key: String,
@@ -105,16 +108,10 @@ pub(crate) fn version_descriptor_storage_version_id() -> &'static str {
     &version_descriptor_schema_metadata().storage_version_id
 }
 
-pub(crate) fn version_descriptor_snapshot_content(
-    id: &str,
-    name: &str,
-    inherits_from_version_id: Option<&str>,
-    hidden: bool,
-) -> String {
+pub(crate) fn version_descriptor_snapshot_content(id: &str, name: &str, hidden: bool) -> String {
     serde_json::to_string(&LixVersionDescriptor {
         id: id.to_string(),
         name: Some(name.to_string()),
-        inherits_from_version_id: inherits_from_version_id.map(ToString::to_string),
         hidden,
     })
     .expect("lix_version_descriptor snapshot serialization must succeed")
@@ -148,6 +145,34 @@ pub(crate) fn version_pointer_snapshot_content(id: &str, commit_id: &str) -> Str
     .expect("lix_version_pointer snapshot serialization must succeed")
 }
 
+pub(crate) fn global_pointer_schema_key() -> &'static str {
+    &global_pointer_schema_metadata().schema_key
+}
+
+pub(crate) fn global_pointer_schema_version() -> &'static str {
+    &global_pointer_schema_metadata().schema_version
+}
+
+pub(crate) fn global_pointer_file_id() -> &'static str {
+    &global_pointer_schema_metadata().file_id
+}
+
+pub(crate) fn global_pointer_plugin_key() -> &'static str {
+    &global_pointer_schema_metadata().plugin_key
+}
+
+pub(crate) fn global_pointer_storage_version_id() -> &'static str {
+    &global_pointer_schema_metadata().storage_version_id
+}
+
+pub(crate) fn global_pointer_snapshot_content(commit_id: &str) -> String {
+    serde_json::to_string(&LixGlobalPointer {
+        id: GLOBAL_VERSION_ID.to_string(),
+        commit_id: commit_id.to_string(),
+    })
+    .expect("lix_global_pointer snapshot serialization must succeed")
+}
+
 fn active_version_schema_metadata() -> &'static SchemaMetadata {
     ACTIVE_VERSION_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_active_version"))
 }
@@ -159,6 +184,10 @@ fn version_descriptor_schema_metadata() -> &'static SchemaMetadata {
 
 fn version_pointer_schema_metadata() -> &'static SchemaMetadata {
     VERSION_POINTER_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_version_pointer"))
+}
+
+fn global_pointer_schema_metadata() -> &'static SchemaMetadata {
+    GLOBAL_POINTER_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_global_pointer"))
 }
 
 fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {
@@ -193,11 +222,16 @@ fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {
         .unwrap_or_else(|| {
             panic!("builtin schema '{schema_key}' must define string lixcol_plugin_key")
         });
-    let storage_version_id = overrides
-        .get("lixcol_version_id")
-        .and_then(JsonValue::as_str)
-        .map(decode_lixcol_literal)
-        .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string());
+    let storage_version_id =
+        if overrides.get("lixcol_global").and_then(JsonValue::as_str) == Some("true") {
+            GLOBAL_VERSION_ID.to_string()
+        } else {
+            overrides
+                .get("lixcol_version_id")
+                .and_then(JsonValue::as_str)
+                .map(decode_lixcol_literal)
+                .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string())
+        };
 
     SchemaMetadata {
         schema_key: parsed_schema_key,

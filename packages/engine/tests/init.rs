@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lix_engine::{boot, BootArgs, ExecuteOptions, NoopWasmRuntime};
+use lix_engine::{boot, BootArgs, NoopWasmRuntime};
 
 fn text_value(value: &lix_engine::Value, field: &str) -> String {
     match value {
@@ -21,6 +21,41 @@ fn i64_value(value: &lix_engine::Value, field: &str) -> i64 {
         }),
         other => panic!("expected i64 value for {field}, got {other:?}"),
     }
+}
+
+async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let result = engine
+        .execute(
+            "SELECT version_id \
+             FROM lix_active_version \
+             ORDER BY id \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statements[0].rows.len(), 1);
+    text_value(&result.statements[0].rows[0][0], "lix_active_version.version_id")
+}
+
+async fn global_pointer_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let result = engine
+        .execute(
+            "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_global_pointer' \
+               AND entity_id = 'global' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC, created_at DESC, change_id DESC \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statements[0].rows.len(), 1);
+    text_value(&result.statements[0].rows[0][0], "lix_global_pointer.commit_id")
 }
 
 fn boot_sqlite_engine_at_path(path: &Path) -> lix_engine::Engine {
@@ -528,7 +563,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
 });
 
 simulation_test!(
-    init_seeds_bootstrap_change_set_for_bootstrap_commit,
+    init_seeds_bootstrap_change_set_for_bootstrap_global_pointer_commit,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -537,22 +572,7 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
-        let version_result = engine
-            .execute(
-                "SELECT commit_id \
-             FROM lix_version \
-             WHERE id = 'global' \
-             LIMIT 1",
-                &[],
-            )
-            .await
-            .unwrap();
-        sim.assert_deterministic(version_result.statements[0].rows.clone());
-        assert_eq!(version_result.statements[0].rows.len(), 1);
-        let commit_id = match &version_result.statements[0].rows[0][0] {
-            lix_engine::Value::Text(value) => value.clone(),
-            other => panic!("expected text commit_id for global version, got {other:?}"),
-        };
+        let commit_id = global_pointer_commit_id(&engine).await;
 
         let change_set_result = engine
             .execute(
@@ -587,7 +607,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    init_seeds_per_version_commit_ids_and_last_checkpoint_pointers,
+    init_seeds_main_version_and_global_checkpoint_pointers,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -596,36 +616,28 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
-        let active_version = engine
-            .execute(
-                "SELECT version_id \
-                 FROM lix_active_version \
-                 ORDER BY id \
-                 LIMIT 1",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(active_version.statements[0].rows.len(), 1);
-        let main_version_id = text_value(&active_version.statements[0].rows[0][0], "version_id");
+        let main_version_id = active_version_id(&engine).await;
         assert_ne!(main_version_id, "global");
 
-        let versions = engine
+        let main_version = engine
             .execute(
                 "SELECT id, commit_id \
                  FROM lix_version \
-                 WHERE id IN ('global', $1) \
-                 ORDER BY id",
+                 WHERE id = $1 \
+                 LIMIT 1",
                 &[lix_engine::Value::Text(main_version_id.clone())],
             )
             .await
             .unwrap();
-        sim.assert_deterministic(versions.statements[0].rows.clone());
+        sim.assert_deterministic(main_version.statements[0].rows.clone());
         assert_eq!(
-            versions.statements[0].rows.len(),
-            2,
-            "expected global + main version rows"
+            main_version.statements[0].rows.len(),
+            1,
+            "expected exactly one public main version row"
         );
+        let main_commit_id = text_value(&main_version.statements[0].rows[0][1], "commit_id");
+        let global_commit_id = global_pointer_commit_id(&engine).await;
+
         let baselines = engine
             .execute(
                 "SELECT version_id, checkpoint_commit_id \
@@ -643,9 +655,11 @@ simulation_test!(
             "expected baseline pointer rows for global + main"
         );
 
-        for version_row in &versions.statements[0].rows {
-            let version_id = text_value(&version_row[0], "id");
-            let commit_id = text_value(&version_row[1], "commit_id");
+        let version_records = [
+            (main_version_id.clone(), main_commit_id),
+            ("global".to_string(), global_commit_id),
+        ];
+        for (version_id, commit_id) in version_records {
             assert!(
                 !commit_id.is_empty(),
                 "version '{version_id}' must have commit_id"
@@ -710,7 +724,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    init_seeds_checkpoint_label_in_global_version,
+    init_seeds_checkpoint_label_in_global_lane,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -759,23 +773,11 @@ simulation_test!(
 
         assert!(
             has_checkpoint,
-            "expected checkpoint label in global version"
+            "expected checkpoint label in global lane"
         );
         let checkpoint_label_id =
             checkpoint_label_id.expect("checkpoint label id should be present");
-        let global_version = engine
-            .execute(
-                "SELECT commit_id \
-                 FROM lix_version \
-                 WHERE id = 'global' \
-                 LIMIT 1",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(global_version.statements[0].rows.len(), 1);
-        let global_commit_id =
-            text_value(&global_version.statements[0].rows[0][0], "global.commit_id");
+        let global_commit_id = global_pointer_commit_id(&engine).await;
 
         let checkpoint_links = engine
             .execute(
@@ -807,15 +809,17 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         .expect("boot_simulated_engine should succeed");
 
     engine.init().await.unwrap();
+    let active_version_id = active_version_id(&engine).await;
 
     let result = engine
         .execute(
             "SELECT path, hidden \
                  FROM lix_directory_by_version \
-                 WHERE lixcol_version_id = 'global' \
+                 WHERE lixcol_version_id = $1 \
+                   AND lixcol_global = true \
                    AND path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/') \
                  ORDER BY path",
-            &[],
+            &[lix_engine::Value::Text(active_version_id)],
         )
         .await
         .unwrap();
