@@ -505,6 +505,29 @@ fn should_run_binary_cas_gc(
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
+fn collect_binary_blob_ref_targets(
+    mutations: &[MutationRow],
+    detected_file_domain_changes: &[DetectedFileDomainChange],
+) -> BTreeSet<(String, String)> {
+    let mut targets = BTreeSet::new();
+
+    for mutation in mutations {
+        if mutation.untracked || mutation.schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
+            continue;
+        }
+        targets.insert((mutation.file_id.clone(), mutation.version_id.clone()));
+    }
+
+    for change in detected_file_domain_changes {
+        if change.schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
+            continue;
+        }
+        targets.insert((change.file_id.clone(), change.version_id.clone()));
+    }
+
+    targets
+}
+
 fn collect_postprocess_file_cache_targets(
     rows: &[Vec<Value>],
     schema_key: &str,

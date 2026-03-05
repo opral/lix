@@ -7,8 +7,8 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 use lix_engine::{
-    LixError, MaterializationDebugMode, MaterializationRequest, MaterializationScope, Value,
-    WasmComponentInstance, WasmLimits, WasmRuntime,
+    ExecuteOptions, LixError, MaterializationDebugMode, MaterializationRequest,
+    MaterializationScope, Value, WasmComponentInstance, WasmLimits, WasmRuntime,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -908,6 +908,302 @@ simulation_test!(
                 .unwrap_or_default(),
             7
         );
+    }
+);
+
+simulation_test!(
+    direct_binary_blob_ref_write_rejects_missing_blob_hash,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('blob-ref-missing', '/blob-ref-missing.bin', lix_text_encode('abc'))",
+                &[],
+            )
+            .await
+            .expect("seed file insert should succeed");
+
+        let err = engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
+                     ) VALUES (\
+                     'blob-ref-missing', 'lix_binary_blob_ref', '1', 'blob-ref-missing', '{}', 'manual', \
+                     '{{\"id\":\"blob-ref-missing\",\"blob_hash\":\"fakehash\",\"size_bytes\":3}}'\
+                     )",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect_err("missing blob hash should be rejected");
+        assert!(
+            err.description
+                .contains("lix_binary_blob_ref integrity violation"),
+            "expected integrity error, got {}",
+            err.description
+        );
+    }
+);
+
+simulation_test!(
+    direct_binary_blob_ref_write_syncs_internal_binary_ref_index,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('blob-source', '/blob-source.bin', lix_text_encode('source'))",
+                &[],
+            )
+            .await
+            .expect("source file insert should succeed");
+
+        let source_ref = engine
+            .execute(
+                &format!(
+                    "SELECT blob_hash, size_bytes \
+                     FROM lix_internal_binary_file_version_ref \
+                     WHERE file_id = 'blob-source' \
+                       AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("source blob ref lookup should succeed");
+        assert_eq!(source_ref.statements[0].rows.len(), 1);
+        let source_blob_hash = match &source_ref.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected source blob_hash text, got {other:?}"),
+        };
+        let source_size = match &source_ref.statements[0].rows[0][1] {
+            Value::Integer(value) => *value,
+            other => panic!("expected source size integer, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('blob-target', '/blob-target.bin', lix_text_encode('target'))",
+                &[],
+            )
+            .await
+            .expect("target file insert should succeed");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
+                     ) VALUES (\
+                     'blob-target', 'lix_binary_blob_ref', '1', 'blob-target', '{}', 'manual', \
+                     '{{\"id\":\"blob-target\",\"blob_hash\":\"{}\",\"size_bytes\":{}}}'\
+                     )",
+                    version_id, source_blob_hash, source_size
+                ),
+                &[],
+            )
+            .await
+            .expect("binary blob ref insert with existing hash should succeed");
+
+        let target_ref = engine
+            .execute(
+                &format!(
+                    "SELECT blob_hash, size_bytes \
+                     FROM lix_internal_binary_file_version_ref \
+                     WHERE file_id = 'blob-target' \
+                       AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("target blob ref lookup should succeed");
+        assert_eq!(target_ref.statements[0].rows.len(), 1);
+        match &target_ref.statements[0].rows[0][0] {
+            Value::Text(value) => assert_eq!(value, &source_blob_hash),
+            other => panic!("expected target blob_hash text, got {other:?}"),
+        }
+        match &target_ref.statements[0].rows[0][1] {
+            Value::Integer(value) => assert_eq!(*value, source_size),
+            other => panic!("expected target size integer, got {other:?}"),
+        }
+    }
+);
+
+simulation_test!(
+    transaction_direct_binary_blob_ref_write_rejects_missing_blob_hash,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('blob-ref-missing-tx', '/blob-ref-missing-tx.bin', lix_text_encode('abc'))",
+                &[],
+            )
+            .await
+            .expect("seed file insert should succeed");
+
+        let err = engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                let version_id = version_id.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
+                             ) VALUES (\
+                             'blob-ref-missing-tx', 'lix_binary_blob_ref', '1', 'blob-ref-missing-tx', '{}', 'manual', \
+                             '{{\"id\":\"blob-ref-missing-tx\",\"blob_hash\":\"fakehash\",\"size_bytes\":3}}'\
+                             )",
+                            version_id
+                        ),
+                        &[],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect_err("missing blob hash should be rejected in transaction path");
+        assert!(
+            err.description
+                .contains("lix_binary_blob_ref integrity violation"),
+            "expected integrity error, got {}",
+            err.description
+        );
+    }
+);
+
+simulation_test!(
+    file_update_data_by_path_updates_builtin_binary_blob_ref,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: Vec::new(),
+                active_account: None,
+                wasm_runtime: runtime,
+                access_to_internal: true,
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.expect("engine init should succeed");
+        let version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-path-update', '/file-path-update.bin', lix_text_encode('before'))",
+                &[],
+            )
+            .await
+            .expect("seed file insert should succeed");
+
+        let before_ref = engine
+            .execute(
+                &format!(
+                    "SELECT blob_hash \
+                     FROM lix_internal_binary_file_version_ref \
+                     WHERE file_id = 'file-path-update' \
+                       AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("before binary ref lookup should succeed");
+        assert_eq!(before_ref.statements[0].rows.len(), 1);
+        let before_hash = match &before_ref.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected before blob hash text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = lix_text_encode('after') \
+                 WHERE path = '/file-path-update.bin'",
+                &[],
+            )
+            .await
+            .expect("update by path should succeed");
+
+        let updated = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'file-path-update' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("read after update should succeed");
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        match &updated.statements[0].rows[0][0] {
+            Value::Blob(value) => assert_eq!(value, b"after"),
+            other => panic!("expected blob data after update, got {other:?}"),
+        }
+
+        let after_ref = engine
+            .execute(
+                &format!(
+                    "SELECT blob_hash \
+                     FROM lix_internal_binary_file_version_ref \
+                     WHERE file_id = 'file-path-update' \
+                       AND version_id = '{}'",
+                    version_id
+                ),
+                &[],
+            )
+            .await
+            .expect("after binary ref lookup should succeed");
+        assert_eq!(after_ref.statements[0].rows.len(), 1);
+        let after_hash = match &after_ref.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected after blob hash text, got {other:?}"),
+        };
+        assert_ne!(after_hash, before_hash);
     }
 );
 

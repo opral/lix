@@ -142,7 +142,8 @@ fn rewrite_table_factor(
                     allow_unqualified,
                 )
             };
-            let derived_query = build_lix_state_wrapper_query(&projection_columns, &pushdown_predicates)?;
+            let derived_query =
+                build_lix_state_wrapper_query(&projection_columns, &pushdown_predicates)?;
             let derived_alias = alias.clone().or_else(|| Some(default_lix_state_alias()));
             *relation = TableFactor::Derived {
                 lateral: false,

@@ -75,9 +75,10 @@ pub(crate) fn take_pushdown_predicates(
     for predicate in split_conjunction(selection_expr) {
         let extracted = extract_pushdown_predicate(&predicate, relation_name, allow_unqualified)
             .and_then(|(column, predicate_expr)| match column.as_str() {
-                "entity_id" | "schema_key" | "file_id" => {
-                    Some((PushdownBucket::Source, qualify_pushdown_predicate(predicate_expr, "s")))
-                }
+                "entity_id" | "schema_key" | "file_id" => Some((
+                    PushdownBucket::Source,
+                    qualify_pushdown_predicate(predicate_expr, "s"),
+                )),
                 "version_id" => Some((
                     PushdownBucket::Ranked,
                     qualify_pushdown_predicate(predicate_expr, "ranked"),
@@ -120,9 +121,7 @@ pub(crate) fn retarget_pushdown_predicates(
 ) -> Vec<Expr> {
     predicates
         .iter()
-        .map(|predicate| {
-            retarget_pushdown_expr(predicate.clone(), from_qualifier, to_qualifier)
-        })
+        .map(|predicate| retarget_pushdown_expr(predicate.clone(), from_qualifier, to_qualifier))
         .collect()
 }
 
@@ -220,8 +219,11 @@ fn retarget_pushdown_expr(mut expr: Expr, from_qualifier: &str, to_qualifier: &s
                 ));
             }
             for condition in conditions.iter_mut() {
-                condition.condition =
-                    retarget_pushdown_expr(condition.condition.clone(), from_qualifier, to_qualifier);
+                condition.condition = retarget_pushdown_expr(
+                    condition.condition.clone(),
+                    from_qualifier,
+                    to_qualifier,
+                );
                 condition.result =
                     retarget_pushdown_expr(condition.result.clone(), from_qualifier, to_qualifier);
             }
@@ -481,8 +483,14 @@ mod tests {
 
         assert_eq!(pushdown.source_predicates.len(), 1);
         assert_eq!(pushdown.ranked_predicates.len(), 1);
-        assert_eq!(pushdown.source_predicates[0].to_string(), "s.schema_key = 'x'");
-        assert_eq!(pushdown.ranked_predicates[0].to_string(), "ranked.plugin_key = 'p'");
+        assert_eq!(
+            pushdown.source_predicates[0].to_string(),
+            "s.schema_key = 'x'"
+        );
+        assert_eq!(
+            pushdown.ranked_predicates[0].to_string(),
+            "ranked.plugin_key = 'p'"
+        );
         assert_eq!(
             selection.as_ref().expect("remaining selection").to_string(),
             "untracked = true"
@@ -512,7 +520,10 @@ mod tests {
 
         assert_eq!(pushdown.source_predicates.len(), 1);
         assert_eq!(pushdown.ranked_predicates.len(), 1);
-        assert_eq!(pushdown.source_predicates[0].to_string(), "s.file_id IS NULL");
+        assert_eq!(
+            pushdown.source_predicates[0].to_string(),
+            "s.file_id IS NULL"
+        );
         assert_eq!(
             pushdown.ranked_predicates[0].to_string(),
             "ranked.version_id IS NOT NULL"

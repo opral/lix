@@ -181,13 +181,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic_normalized(visible.rows.clone());
-        assert_eq!(visible.rows.len(), 1);
+        sim.assert_deterministic_normalized(visible.statements[0].rows.clone());
+        assert_eq!(visible.statements[0].rows.len(), 1);
         assert_eq!(
-            visible.rows[0][0],
+            visible.statements[0].rows[0][0],
             Value::Text("{\"key\":\"effective-updated\"}".to_string())
         );
-        assert_boolean_like(&visible.rows[0][1], true);
+        assert_boolean_like(&visible.statements[0].rows[0][1], true);
 
         let tracked = engine
             .execute(
@@ -202,9 +202,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tracked.rows.len(), 1);
+        assert_eq!(tracked.statements[0].rows.len(), 1);
         assert_eq!(
-            tracked.rows[0][0],
+            tracked.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked-initial\"}".to_string())
         );
     }
@@ -270,13 +270,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic_normalized(visible.rows.clone());
-        assert_eq!(visible.rows.len(), 1);
+        sim.assert_deterministic_normalized(visible.statements[0].rows.clone());
+        assert_eq!(visible.statements[0].rows.len(), 1);
         assert_eq!(
-            visible.rows[0][0],
+            visible.statements[0].rows[0][0],
             Value::Text("{\"key\":\"alias-updated\"}".to_string())
         );
-        assert_boolean_like(&visible.rows[0][1], true);
+        assert_boolean_like(&visible.statements[0].rows[0][1], true);
     }
 );
 
@@ -340,13 +340,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic_normalized(visible_new.rows.clone());
-        assert_eq!(visible_new.rows.len(), 1);
+        sim.assert_deterministic_normalized(visible_new.statements[0].rows.clone());
+        assert_eq!(visible_new.statements[0].rows.len(), 1);
         assert_eq!(
-            visible_new.rows[0][0],
+            visible_new.statements[0].rows[0][0],
             Value::Text("{\"key\":\"effective-moved\"}".to_string())
         );
-        assert_boolean_like(&visible_new.rows[0][1], true);
+        assert_boolean_like(&visible_new.statements[0].rows[0][1], true);
 
         let tracked_old = engine
             .execute(
@@ -361,9 +361,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tracked_old.rows.len(), 1);
+        assert_eq!(tracked_old.statements[0].rows.len(), 1);
         assert_eq!(
-            tracked_old.rows[0][0],
+            tracked_old.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked-initial\"}".to_string())
         );
 
@@ -380,7 +380,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(tracked_new.rows.len(), 0);
+        assert_eq!(tracked_new.statements[0].rows.len(), 0);
     }
 );
 
@@ -443,13 +443,13 @@ simulation_test!(
             )
             .await
             .unwrap();
-        sim.assert_deterministic_normalized(visible.rows.clone());
-        assert_eq!(visible.rows.len(), 1);
+        sim.assert_deterministic_normalized(visible.statements[0].rows.clone());
+        assert_eq!(visible.statements[0].rows.len(), 1);
         assert_eq!(
-            visible.rows[0][0],
+            visible.statements[0].rows[0][0],
             Value::Text("{\"key\":\"tracked-initial\"}".to_string())
         );
-        assert_boolean_like(&visible.rows[0][1], false);
+        assert_boolean_like(&visible.statements[0].rows[0][1], false);
 
         let untracked = engine
             .execute(
@@ -463,7 +463,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(untracked.rows[0][0], Value::Integer(0));
+        assert_eq!(untracked.statements[0].rows[0][0], Value::Integer(0));
     }
 );
 

@@ -12,11 +12,17 @@ pub(crate) async fn apply_sql_backed_effects(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     untracked_filesystem_update_domain_changes: &[DetectedFileDomainChange],
     plugin_changes_committed: bool,
+    read_only_query: bool,
     file_data_cache_invalidation_targets: &BTreeSet<(String, String)>,
     file_path_cache_invalidation_targets: &BTreeSet<(String, String)>,
 ) -> Result<(), LixError> {
     let should_run_binary_gc =
         crate::engine::should_run_binary_cas_gc(mutations, detected_file_domain_changes);
+    let mut binary_blob_ref_targets =
+        crate::engine::collect_binary_blob_ref_targets(mutations, detected_file_domain_changes);
+    if binary_blob_ref_targets.is_empty() && !read_only_query {
+        binary_blob_ref_targets = engine.load_binary_blob_ref_index_targets().await?;
+    }
 
     if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
         engine
@@ -33,6 +39,9 @@ pub(crate) async fn apply_sql_backed_effects(
         .await?;
     engine
         .persist_pending_file_path_updates(pending_file_writes)
+        .await?;
+    engine
+        .sync_binary_blob_ref_index_for_targets(&binary_blob_ref_targets)
         .await?;
     engine
         .ensure_builtin_binary_blob_store_for_targets(file_data_cache_invalidation_targets)

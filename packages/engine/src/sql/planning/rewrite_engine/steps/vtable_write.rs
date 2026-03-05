@@ -396,9 +396,11 @@ pub fn rewrite_update(
         untracked_update.assignments = filter_update_assignments(original_assignments.clone());
         ensure_updated_at_assignment(&mut untracked_update.assignments);
         untracked_update.selection = Some(stripped_selection.clone());
-        if let Some(validation) =
-            build_update_validation_plan(&untracked_update, Some(UNTRACKED_TABLE.to_string()), params)?
-        {
+        if let Some(validation) = build_update_validation_plan(
+            &untracked_update,
+            Some(UNTRACKED_TABLE.to_string()),
+            params,
+        )? {
             validations.push(validation);
         }
         pre_statements.push(Statement::Update(untracked_update));
@@ -425,13 +427,12 @@ pub fn rewrite_update(
             "version_id",
             &materialized_table_ref,
         );
-        let effective_scope_predicate =
-            build_not_exists_untracked_shadow_predicate(
-                &materialized_table_ref,
-                &entity_id_expr_sql,
-                &file_id_expr_sql,
-                &version_id_expr_sql,
-            )?;
+        let effective_scope_predicate = build_not_exists_untracked_shadow_predicate(
+            &materialized_table_ref,
+            &entity_id_expr_sql,
+            &file_id_expr_sql,
+            &version_id_expr_sql,
+        )?;
         Expr::BinaryOp {
             left: Box::new(stripped_selection),
             op: BinaryOperator::And,
@@ -554,10 +555,7 @@ pub fn rewrite_delete_with_options(
             None
         };
     let effective_scope_untracked_selection_sql = if effective_scope_without_untracked_predicate {
-        Some(
-            rewrite_inherited_from_version_id_to_null(&stripped_selection)
-                .to_string(),
-        )
+        Some(rewrite_inherited_from_version_id_to_null(&stripped_selection).to_string())
     } else {
         None
     };
@@ -625,12 +623,16 @@ fn rewrite_inherited_from_version_id_to_null(expr: &Expr) -> Expr {
 
         fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
             let is_inherited_from_version_id = match expr {
-                Expr::Identifier(ident) => {
-                    ident.value.eq_ignore_ascii_case("inherited_from_version_id")
-                }
+                Expr::Identifier(ident) => ident
+                    .value
+                    .eq_ignore_ascii_case("inherited_from_version_id"),
                 Expr::CompoundIdentifier(parts) => parts
                     .last()
-                    .map(|ident| ident.value.eq_ignore_ascii_case("inherited_from_version_id"))
+                    .map(|ident| {
+                        ident
+                            .value
+                            .eq_ignore_ascii_case("inherited_from_version_id")
+                    })
                     .unwrap_or(false),
                 _ => false,
             };
@@ -1277,9 +1279,7 @@ fn build_untracked_insert(
                         .map(|value| string_expr(&value))
                         .unwrap_or_else(null_expr)
                 }
-                None => writer_key
-                    .map(string_expr)
-                    .unwrap_or_else(null_expr),
+                None => writer_key.map(string_expr).unwrap_or_else(null_expr),
             },
             resolved_expr_or_original(
                 materialized.get(schema_version_idx),
@@ -3110,12 +3110,10 @@ mod tests {
             Statement::Update(update) => update,
             _ => panic!("expected update pre-statement"),
         };
-        assert!(
-            pre_statement
-                .table
-                .to_string()
-                .contains("lix_internal_state_untracked")
-        );
+        assert!(pre_statement
+            .table
+            .to_string()
+            .contains("lix_internal_state_untracked"));
         assert!(pre_statement.returning.is_none());
 
         let statement = match planned.statement {

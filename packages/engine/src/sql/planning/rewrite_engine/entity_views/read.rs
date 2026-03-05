@@ -474,9 +474,9 @@ fn override_predicates(target: &EntityViewTarget) -> Vec<Expr> {
         .override_predicates
         .iter()
         .map(|predicate| match &predicate.value {
-            JsonValue::Null => Expr::IsNull(Box::new(Expr::Identifier(Ident::new(
-                &predicate.column,
-            )))),
+            JsonValue::Null => {
+                Expr::IsNull(Box::new(Expr::Identifier(Ident::new(&predicate.column))))
+            }
             value => Expr::BinaryOp {
                 left: Box::new(Expr::Identifier(Ident::new(&predicate.column))),
                 op: BinaryOperator::Eq,

@@ -371,7 +371,10 @@ simulation_test!(
             .expect("observe next should succeed")
             .expect("observe update event should exist");
         assert_eq!(update.sequence, 1);
-        assert_eq!(update.rows.rows, vec![vec![Value::Text("branch".to_string())]]);
+        assert_eq!(
+            update.rows.rows,
+            vec![vec![Value::Text("branch".to_string())]]
+        );
     }
 );
 

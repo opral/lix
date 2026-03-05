@@ -31,8 +31,8 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
         )
         .await
         .expect("active version commit query should succeed");
-    assert_eq!(active.rows.len(), 1);
-    value_as_text(&active.rows[0][0])
+    assert_eq!(active.statements[0].rows.len(), 1);
+    value_as_text(&active.statements[0].rows[0][0])
 }
 
 simulation_test!(create_version_defaults_to_active_parent, |sim| async move {

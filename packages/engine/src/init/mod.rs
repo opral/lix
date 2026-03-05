@@ -261,7 +261,9 @@ async fn ensure_binary_chunk_codec_columns(backend: &dyn LixBackend) -> Result<(
     Ok(())
 }
 
-async fn ensure_state_untracked_writer_key_column(backend: &dyn LixBackend) -> Result<(), LixError> {
+async fn ensure_state_untracked_writer_key_column(
+    backend: &dyn LixBackend,
+) -> Result<(), LixError> {
     ensure_column_exists(
         backend,
         "lix_internal_state_untracked",

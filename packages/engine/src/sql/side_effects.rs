@@ -330,6 +330,16 @@ impl Engine {
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
         let should_run_binary_gc = should_run_binary_cas_gc(&[], &detected_file_domain_changes);
+        let mut binary_blob_ref_targets = detected_file_domain_changes
+            .iter()
+            .filter(|change| change.schema_key == "lix_binary_blob_ref")
+            .map(|change| (change.file_id.clone(), change.version_id.clone()))
+            .collect::<BTreeSet<_>>();
+        if binary_blob_ref_targets.is_empty() {
+            binary_blob_ref_targets = self
+                .load_binary_blob_ref_index_targets_in_transaction(transaction)
+                .await?;
+        }
         let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
             &std::mem::take(&mut side_effects.untracked_filesystem_update_domain_changes),
         );
@@ -364,6 +374,11 @@ impl Engine {
         self.persist_pending_file_path_updates_in_transaction(
             transaction,
             &side_effects.pending_file_writes,
+        )
+        .await?;
+        self.sync_binary_blob_ref_index_for_targets_in_transaction(
+            transaction,
+            &binary_blob_ref_targets,
         )
         .await?;
         self.ensure_builtin_binary_blob_store_for_targets_in_transaction(
@@ -728,6 +743,222 @@ impl Engine {
                 .await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn sync_binary_blob_ref_index_for_targets(
+        &self,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let upsert_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
+        let delete_sql = format!(
+            "DELETE FROM {} \
+             WHERE file_id = $1 \
+               AND version_id = $2",
+            tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+        );
+        let now = crate::functions::timestamp::timestamp();
+
+        for (file_id, version_id) in targets {
+            let snapshot = load_latest_binary_blob_ref_snapshot_for_target(
+                self.backend.as_ref(),
+                file_id,
+                version_id,
+            )
+            .await?;
+
+            let Some(snapshot) = snapshot else {
+                self.backend
+                    .execute(
+                        &delete_sql,
+                        &[
+                            Value::Text(file_id.clone()),
+                            Value::Text(version_id.clone()),
+                        ],
+                    )
+                    .await?;
+                continue;
+            };
+
+            if !binary_blob_exists(self.backend.as_ref(), &snapshot.blob_hash).await? {
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "lix_binary_blob_ref integrity violation: missing blob_hash '{}' for file '{}' version '{}'",
+                        snapshot.blob_hash, file_id, version_id
+                    ),
+                });
+            }
+
+            let size_bytes = i64::try_from(snapshot.size_bytes).map_err(|_| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "lix_binary_blob_ref integrity violation: size_bytes out of range for file '{}' version '{}'",
+                    file_id, version_id
+                ),
+            })?;
+            self.backend
+                .execute(
+                    &upsert_sql,
+                    &[
+                        Value::Text(file_id.clone()),
+                        Value::Text(version_id.clone()),
+                        Value::Text(snapshot.blob_hash),
+                        Value::Integer(size_bytes),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn sync_binary_blob_ref_index_for_targets_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        targets: &BTreeSet<(String, String)>,
+    ) -> Result<(), LixError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let upsert_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
+        let delete_sql = format!(
+            "DELETE FROM {} \
+             WHERE file_id = $1 \
+               AND version_id = $2",
+            tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+        );
+        let now = crate::functions::timestamp::timestamp();
+
+        for (file_id, version_id) in targets {
+            let snapshot = load_latest_binary_blob_ref_snapshot_for_target_in_transaction(
+                transaction,
+                file_id,
+                version_id,
+            )
+            .await?;
+
+            let Some(snapshot) = snapshot else {
+                transaction
+                    .execute(
+                        &delete_sql,
+                        &[
+                            Value::Text(file_id.clone()),
+                            Value::Text(version_id.clone()),
+                        ],
+                    )
+                    .await?;
+                continue;
+            };
+
+            if !binary_blob_exists_in_transaction(transaction, &snapshot.blob_hash).await? {
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "lix_binary_blob_ref integrity violation: missing blob_hash '{}' for file '{}' version '{}'",
+                        snapshot.blob_hash, file_id, version_id
+                    ),
+                });
+            }
+
+            let size_bytes = i64::try_from(snapshot.size_bytes).map_err(|_| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "lix_binary_blob_ref integrity violation: size_bytes out of range for file '{}' version '{}'",
+                    file_id, version_id
+                ),
+            })?;
+            transaction
+                .execute(
+                    &upsert_sql,
+                    &[
+                        Value::Text(file_id.clone()),
+                        Value::Text(version_id.clone()),
+                        Value::Text(snapshot.blob_hash),
+                        Value::Integer(size_bytes),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn load_binary_blob_ref_index_targets(
+        &self,
+    ) -> Result<BTreeSet<(String, String)>, LixError> {
+        let sql =
+            if binary_blob_ref_materialized_relation_exists_with_backend(self.backend.as_ref())
+                .await?
+            {
+                format!(
+                    "SELECT file_id, version_id \
+                 FROM {} \
+                 WHERE is_tombstone = 0 \
+                   AND snapshot_content IS NOT NULL \
+                 UNION \
+                 SELECT file_id, version_id \
+                 FROM {}",
+                    tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF,
+                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+                )
+            } else {
+                format!(
+                    "SELECT file_id, version_id \
+                 FROM {}",
+                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+                )
+            };
+        let result = self.backend.execute(&sql, &[]).await?;
+        let mut targets = BTreeSet::new();
+        for row in &result.rows {
+            targets.insert((
+                text_value_required(row, 0, "file_id")?,
+                text_value_required(row, 1, "version_id")?,
+            ));
+        }
+        Ok(targets)
+    }
+
+    pub(crate) async fn load_binary_blob_ref_index_targets_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+    ) -> Result<BTreeSet<(String, String)>, LixError> {
+        let sql =
+            if binary_blob_ref_materialized_relation_exists_in_transaction(transaction).await? {
+                format!(
+                    "SELECT file_id, version_id \
+                     FROM {} \
+                     WHERE is_tombstone = 0 \
+                       AND snapshot_content IS NOT NULL \
+                     UNION \
+                     SELECT file_id, version_id \
+                     FROM {}",
+                    tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF,
+                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+                )
+            } else {
+                format!(
+                    "SELECT file_id, version_id \
+                     FROM {}",
+                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
+                )
+            };
+        let result = transaction.execute(&sql, &[]).await?;
+        let mut targets = BTreeSet::new();
+        for row in &result.rows {
+            targets.insert((
+                text_value_required(row, 0, "file_id")?,
+                text_value_required(row, 1, "version_id")?,
+            ));
+        }
+        Ok(targets)
     }
 
     pub(crate) async fn ensure_builtin_binary_blob_store_for_targets(
@@ -1174,6 +1405,76 @@ async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
+                parsed.id, file_id
+            ),
+        });
+    }
+    Ok(Some(parsed))
+}
+
+async fn load_latest_binary_blob_ref_snapshot_for_target(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
+    if !binary_blob_ref_materialized_relation_exists_with_backend(backend).await? {
+        return Ok(None);
+    }
+    let sql = state_queries::select_latest_binary_blob_ref_snapshot_sql();
+    let result = backend
+        .execute(
+            &sql,
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
+    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
+    if parsed.id != file_id {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "lix_binary_blob_ref integrity violation: snapshot id '{}' does not match file_id '{}'",
+                parsed.id, file_id
+            ),
+        });
+    }
+    Ok(Some(parsed))
+}
+
+async fn load_latest_binary_blob_ref_snapshot_for_target_in_transaction(
+    transaction: &mut dyn LixTransaction,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
+    if !binary_blob_ref_materialized_relation_exists_in_transaction(transaction).await? {
+        return Ok(None);
+    }
+    let sql = state_queries::select_latest_binary_blob_ref_snapshot_sql();
+    let result = transaction
+        .execute(
+            &sql,
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
+    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
+    if parsed.id != file_id {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "lix_binary_blob_ref integrity violation: snapshot id '{}' does not match file_id '{}'",
                 parsed.id, file_id
             ),
         });
@@ -1776,6 +2077,44 @@ async fn binary_blob_ref_relation_exists_with_backend(
     }
 }
 
+async fn binary_blob_ref_materialized_relation_exists_with_backend(
+    backend: &dyn LixBackend,
+) -> Result<bool, LixError> {
+    match backend.dialect() {
+        SqlDialect::Sqlite => {
+            let result = backend
+                .execute(
+                    "SELECT 1 \
+                     FROM sqlite_master \
+                     WHERE name = $1 \
+                       AND type IN ('table', 'view') \
+                     LIMIT 1",
+                    &[Value::Text(
+                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
+                    )],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+        SqlDialect::Postgres => {
+            let result = backend
+                .execute(
+                    "SELECT 1 \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = current_schema() \
+                       AND c.relname = $1 \
+                     LIMIT 1",
+                    &[Value::Text(
+                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
+                    )],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+    }
+}
+
 async fn binary_blob_ref_relation_exists_in_transaction(
     transaction: &mut dyn LixTransaction,
 ) -> Result<bool, LixError> {
@@ -1803,6 +2142,44 @@ async fn binary_blob_ref_relation_exists_in_transaction(
                        AND c.relname = $1 \
                      LIMIT 1",
                     &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+    }
+}
+
+async fn binary_blob_ref_materialized_relation_exists_in_transaction(
+    transaction: &mut dyn LixTransaction,
+) -> Result<bool, LixError> {
+    match transaction.dialect() {
+        SqlDialect::Sqlite => {
+            let result = transaction
+                .execute(
+                    "SELECT 1 \
+                     FROM sqlite_master \
+                     WHERE name = $1 \
+                       AND type IN ('table', 'view') \
+                     LIMIT 1",
+                    &[Value::Text(
+                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
+                    )],
+                )
+                .await?;
+            Ok(!result.rows.is_empty())
+        }
+        SqlDialect::Postgres => {
+            let result = transaction
+                .execute(
+                    "SELECT 1 \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = current_schema() \
+                       AND c.relname = $1 \
+                     LIMIT 1",
+                    &[Value::Text(
+                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
+                    )],
                 )
                 .await?;
             Ok(!result.rows.is_empty())

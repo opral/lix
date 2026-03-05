@@ -247,6 +247,7 @@ impl Engine {
             &prepared.intent.detected_file_domain_changes,
             &prepared.intent.untracked_filesystem_update_domain_changes,
             execution.plugin_changes_committed,
+            prepared.plan.requirements.read_only_query,
             &cache_targets.file_data_cache_invalidation_targets,
             &cache_targets.file_path_cache_invalidation_targets,
         )

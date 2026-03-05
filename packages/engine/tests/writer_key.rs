@@ -112,8 +112,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(materialized.rows.len(), 1);
-        assert_text(&materialized.rows[0][0], "editor:both");
+        assert_eq!(materialized.statements[0].rows.len(), 1);
+        assert_text(&materialized.statements[0].rows[0][0], "editor:both");
 
         let untracked = engine
             .execute(
@@ -128,8 +128,8 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(untracked.rows.len(), 1);
-        assert_text(&untracked.rows[0][0], "editor:both");
+        assert_eq!(untracked.statements[0].rows.len(), 1);
+        assert_text(&untracked.statements[0].rows[0][0], "editor:both");
 
         let view_rows = engine
             .execute(
@@ -144,11 +144,11 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(view_rows.rows.len(), 2);
-        assert_text(&view_rows.rows[0][0], "wk-tracked");
-        assert_text(&view_rows.rows[0][1], "editor:both");
-        assert_text(&view_rows.rows[1][0], "wk-untracked");
-        assert_text(&view_rows.rows[1][1], "editor:both");
+        assert_eq!(view_rows.statements[0].rows.len(), 2);
+        assert_text(&view_rows.statements[0].rows[0][0], "wk-tracked");
+        assert_text(&view_rows.statements[0].rows[0][1], "editor:both");
+        assert_text(&view_rows.statements[0].rows[1][0], "wk-untracked");
+        assert_text(&view_rows.statements[0].rows[1][1], "editor:both");
     }
 );
 

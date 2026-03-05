@@ -16,8 +16,8 @@ use crate::engine::sql::planning::rewrite_engine::{
     escape_sql_string, object_name_matches, parse_single_query, quote_ident,
 };
 use crate::version::{
-    version_descriptor_file_id, version_descriptor_schema_key, version_descriptor_storage_version_id,
-    GLOBAL_VERSION_ID,
+    version_descriptor_file_id, version_descriptor_schema_key,
+    version_descriptor_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{errors, LixBackend, LixError, Value as LixValue};
 
@@ -332,9 +332,7 @@ fn build_effective_state_target_versions_cte(
     )
 }
 
-fn split_effective_by_version_ranked_pushdown(
-    pushdown: &StatePushdown,
-) -> (Vec<Expr>, Vec<Expr>) {
+fn split_effective_by_version_ranked_pushdown(pushdown: &StatePushdown) -> (Vec<Expr>, Vec<Expr>) {
     let mut target_version = Vec::new();
     let mut ranked = Vec::new();
     for predicate in &pushdown.ranked_predicates {
@@ -475,8 +473,7 @@ fn predicate_contains_subquery(predicate: &Expr) -> bool {
             predicate_contains_subquery(expr) || predicate_contains_subquery(pattern)
         }
         Expr::InList { expr, list, .. } => {
-            predicate_contains_subquery(expr)
-                || list.iter().any(predicate_contains_subquery)
+            predicate_contains_subquery(expr) || list.iter().any(predicate_contains_subquery)
         }
         Expr::Tuple(items) => items.iter().any(predicate_contains_subquery),
         Expr::Case {
