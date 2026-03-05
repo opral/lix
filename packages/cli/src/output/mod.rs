@@ -20,13 +20,17 @@ pub fn print_execute_result_table(result: &ExecuteResult) {
 }
 
 pub fn print_execute_result_json(result: &ExecuteResult) {
-    let payload = serde_json::json!({
-        "statements": result.statements.iter().map(query_result_to_json).collect::<Vec<_>>(),
-    });
+    let payload = execute_result_to_json(result);
     println!(
         "{}",
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
     );
+}
+
+fn execute_result_to_json(result: &ExecuteResult) -> JsonValue {
+    serde_json::json!({
+        "statements": result.statements.iter().map(query_result_to_json).collect::<Vec<_>>(),
+    })
 }
 
 fn print_query_result_table(result: &QueryResult) {
@@ -78,14 +82,15 @@ fn value_to_text(value: &Value) -> String {
 
 fn value_to_json(value: &Value) -> JsonValue {
     match value {
-        Value::Null => serde_json::json!({ "kind": "null", "value": null }),
-        Value::Boolean(v) => serde_json::json!({ "kind": "bool", "value": v }),
-        Value::Integer(v) => serde_json::json!({ "kind": "int", "value": v }),
-        Value::Real(v) => serde_json::json!({ "kind": "float", "value": v }),
-        Value::Text(v) => serde_json::json!({ "kind": "text", "value": v }),
+        Value::Null => JsonValue::Null,
+        Value::Boolean(v) => JsonValue::Bool(*v),
+        Value::Integer(v) => serde_json::json!(v),
+        Value::Real(v) => serde_json::Number::from_f64(*v)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Value::Text(v) => JsonValue::String(v.clone()),
         Value::Blob(bytes) => serde_json::json!({
-            "kind": "blob",
-            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "$blob": base64::engine::general_purpose::STANDARD.encode(bytes),
         }),
     }
 }
@@ -113,27 +118,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_to_json_uses_canonical_blob_shape() {
+    fn value_to_json_uses_blob_tagged_shape() {
         let value = Value::Blob(vec![0x01, 0x02, 0x03]);
         let json = value_to_json(&value);
         assert_eq!(
             json,
             serde_json::json!({
-                "kind": "blob",
-                "base64": "AQID"
+                "$blob": "AQID"
             })
         );
     }
 
     #[test]
-    fn value_to_json_uses_canonical_int_shape() {
-        let value = Value::Integer(7);
-        let json = value_to_json(&value);
+    fn value_to_json_uses_native_scalars() {
+        assert_eq!(value_to_json(&Value::Null), JsonValue::Null);
+        assert_eq!(value_to_json(&Value::Boolean(true)), JsonValue::Bool(true));
+        assert_eq!(value_to_json(&Value::Integer(7)), serde_json::json!(7));
+        assert_eq!(value_to_json(&Value::Real(2.5)), serde_json::json!(2.5));
         assert_eq!(
-            json,
+            value_to_json(&Value::Text("hello".to_string())),
+            JsonValue::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn execute_result_to_json_preserves_envelope_and_order() {
+        let result = ExecuteResult {
+            statements: vec![
+                QueryResult {
+                    columns: vec!["n".to_string(), "payload".to_string()],
+                    rows: vec![
+                        vec![Value::Integer(1), Value::Text("a".to_string())],
+                        vec![Value::Integer(2), Value::Blob(vec![0x01, 0x02])],
+                    ],
+                },
+                QueryResult {
+                    columns: vec![],
+                    rows: vec![],
+                },
+            ],
+        };
+
+        assert_eq!(
+            execute_result_to_json(&result),
             serde_json::json!({
-                "kind": "int",
-                "value": 7
+                "statements": [
+                    {
+                        "columns": ["n", "payload"],
+                        "rows": [
+                            [1, "a"],
+                            [2, {"$blob": "AQI="}],
+                        ],
+                    },
+                    {
+                        "columns": [],
+                        "rows": [],
+                    },
+                ],
             })
         );
     }
