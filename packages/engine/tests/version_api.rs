@@ -63,11 +63,10 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
 
     assert!(!created.id.is_empty());
     assert_eq!(created.name, created.id);
-    assert_eq!(created.inherits_from_version_id, active_version_id);
 
     let created_row = engine
         .execute(
-            "SELECT id, name, inherits_from_version_id, hidden, commit_id \
+            "SELECT id, name, hidden, commit_id \
              FROM lix_version \
              WHERE id = $1",
             &[Value::Text(created.id.clone())],
@@ -78,9 +77,8 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     let row = &created_row.statements[0].rows[0];
     assert_eq!(value_as_text(&row[0]), created.id);
     assert_eq!(value_as_text(&row[1]), created.name);
-    assert_eq!(value_as_text(&row[2]), created.inherits_from_version_id);
-    assert!(!value_as_bool(&row[3]));
-    assert_eq!(value_as_text(&row[4]), active_commit_id);
+    assert!(!value_as_bool(&row[2]));
+    assert_eq!(value_as_text(&row[3]), active_commit_id);
     let baseline_row = engine
         .execute(
             "SELECT checkpoint_commit_id \
@@ -212,18 +210,16 @@ simulation_test!(
             .create_version(CreateVersionOptions {
                 id: Some("branch-alpha".to_string()),
                 name: Some("Branch Alpha".to_string()),
-                inherits_from_version_id: Some("global".to_string()),
                 hidden: true,
             })
             .await
             .expect("create_version should succeed");
         assert_eq!(created.id, "branch-alpha");
         assert_eq!(created.name, "Branch Alpha");
-        assert_eq!(created.inherits_from_version_id, "global");
 
         let created_row = engine
             .execute(
-                "SELECT id, name, inherits_from_version_id, hidden \
+                "SELECT id, name, hidden \
                  FROM lix_version \
                  WHERE id = 'branch-alpha'",
                 &[],
@@ -234,8 +230,7 @@ simulation_test!(
         let row = &created_row.statements[0].rows[0];
         assert_eq!(value_as_text(&row[0]), "branch-alpha");
         assert_eq!(value_as_text(&row[1]), "Branch Alpha");
-        assert_eq!(value_as_text(&row[2]), "global");
-        assert!(value_as_bool(&row[3]));
+        assert!(value_as_bool(&row[2]));
 
         engine
             .switch_version("branch-alpha".to_string())

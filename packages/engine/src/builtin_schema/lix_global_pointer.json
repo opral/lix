@@ -1,8 +1,22 @@
 {
-  "x-lix-key": "lix_version_descriptor",
+  "x-lix-key": "lix_global_pointer",
   "x-lix-version": "1",
   "x-lix-primary-key": [
     "/id"
+  ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/commit_id"
+      ],
+      "references": {
+        "schemaKey": "lix_commit",
+        "properties": [
+          "/id"
+        ]
+      },
+      "mode": "materialized"
+    }
   ],
   "x-lix-override-lixcols": {
     "lixcol_file_id": "\"lix\"",
@@ -13,19 +27,15 @@
   "properties": {
     "id": {
       "type": "string",
-      "x-lix-default": "lix_uuid_v7()"
+      "default": "global"
     },
-    "name": {
+    "commit_id": {
       "type": "string"
-    },
-    "hidden": {
-      "type": "boolean",
-      "default": false
     }
   },
   "required": [
     "id",
-    "name"
+    "commit_id"
   ],
   "additionalProperties": false
 }

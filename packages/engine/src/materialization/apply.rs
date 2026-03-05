@@ -34,11 +34,7 @@ pub(crate) async fn apply_materialization_plan_internal(
             .as_ref()
             .map(|value| format!("'{}'", escape_sql_string(value)))
             .unwrap_or_else(|| "NULL".to_string());
-        let inherited_from_version_sql = write
-            .inherited_from_version_id
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
+        let global_sql = if write.global { "true" } else { "false" };
         let metadata_sql = write
             .metadata
             .as_ref()
@@ -47,15 +43,15 @@ pub(crate) async fn apply_materialization_plan_internal(
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content, inherited_from_version_id, change_id, metadata, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', '{plugin_key}', {snapshot_content}, {inherited_from_version_id}, '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'\
              ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
+             global = excluded.global, \
              plugin_key = excluded.plugin_key, \
              snapshot_content = excluded.snapshot_content, \
-             inherited_from_version_id = excluded.inherited_from_version_id, \
              change_id = excluded.change_id, \
              metadata = excluded.metadata, \
              is_tombstone = excluded.is_tombstone, \
@@ -67,9 +63,9 @@ pub(crate) async fn apply_materialization_plan_internal(
             schema_version = escape_sql_string(&write.schema_version),
             file_id = escape_sql_string(&write.file_id),
             version_id = escape_sql_string(&write.version_id),
+            global = global_sql,
             plugin_key = escape_sql_string(&write.plugin_key),
             snapshot_content = snapshot_sql,
-            inherited_from_version_id = inherited_from_version_sql,
             change_id = escape_sql_string(&write.change_id),
             metadata = metadata_sql,
             is_tombstone = is_tombstone,

@@ -23,7 +23,7 @@ impl Engine {
         options: &ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
         let mut transaction = self.backend.begin_transaction().await?;
-        let mut active_version_id = self.active_version_id.read().unwrap().clone();
+        let mut active_version_id = self.require_active_version_id()?;
         let starting_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
         let installed_plugins_cache_invalidation_pending =

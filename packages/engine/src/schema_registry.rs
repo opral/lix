@@ -18,9 +18,9 @@ pub fn register_schema_sql(schema_key: &str) -> String {
          schema_version TEXT NOT NULL,\
          file_id TEXT NOT NULL,\
          version_id TEXT NOT NULL,\
+         global BOOLEAN NOT NULL DEFAULT false,\
          plugin_key TEXT NOT NULL,\
          snapshot_content TEXT,\
-         inherited_from_version_id TEXT,\
          change_id TEXT NOT NULL,\
          metadata TEXT,\
          writer_key TEXT,\
@@ -43,6 +43,11 @@ pub fn register_schema_sql_statements(schema_key: &str, dialect: SqlDialect) -> 
         format!(
             "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id)",
             index = quote_ident(&format!("idx_{}_version_id", table_name)),
+            table = table_ident,
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (global, version_id)",
+            index = quote_ident(&format!("idx_{}_global_version", table_name)),
             table = table_ident,
         ),
         format!(
@@ -76,27 +81,6 @@ pub fn register_schema_sql_statements(schema_key: &str, dialect: SqlDialect) -> 
         ),
     ];
     statements.extend(index_statements);
-
-    if schema_key == "lix_version_descriptor" {
-        let inherits_from_expr = json_text_extract_expr(dialect, "inherits_from_version_id");
-        let id_expr = json_text_extract_expr(dialect, "id");
-        statements.push(format!(
-            "CREATE INDEX IF NOT EXISTS {index} \
-             ON {table}({inherits_from_expr}) \
-             WHERE {inherits_from_expr} IS NOT NULL",
-            index = quote_ident(&format!("idx_{}_inherits_from", table_name)),
-            table = table_ident,
-            inherits_from_expr = inherits_from_expr,
-        ));
-        statements.push(format!(
-            "CREATE INDEX IF NOT EXISTS {index} \
-             ON {table}({id_expr}, {inherits_from_expr})",
-            index = quote_ident(&format!("idx_{}_id_parent", table_name)),
-            table = table_ident,
-            id_expr = id_expr,
-            inherits_from_expr = inherits_from_expr,
-        ));
-    }
 
     if schema_key == "lix_file_descriptor" {
         let directory_expr = json_text_extract_expr(dialect, "directory_id");
@@ -152,22 +136,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn version_descriptor_indexes_use_sqlite_json_extract_on_sqlite() {
-        let statements =
+    fn version_descriptor_indexes_do_not_reference_inheritance_state() {
+        let sqlite_statements =
             register_schema_sql_statements("lix_version_descriptor", SqlDialect::Sqlite).join("\n");
-        assert!(statements.contains("json_extract(snapshot_content, '$.inherits_from_version_id')"));
-        assert!(!statements.contains("jsonb_extract_path_text("));
-    }
-
-    #[test]
-    fn version_descriptor_indexes_use_postgres_json_extract_on_postgres() {
-        let statements =
+        let postgres_statements =
             register_schema_sql_statements("lix_version_descriptor", SqlDialect::Postgres)
                 .join("\n");
-        assert!(statements.contains(
-            "jsonb_extract_path_text(CAST(snapshot_content AS JSONB), 'inherits_from_version_id')"
-        ));
-        assert!(!statements.contains("json_extract(snapshot_content"));
+        assert!(!sqlite_statements.contains("inherits_from_version_id"));
+        assert!(!postgres_statements.contains("inherits_from_version_id"));
     }
 
     #[test]

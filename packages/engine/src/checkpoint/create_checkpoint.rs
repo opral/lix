@@ -41,31 +41,51 @@ async fn create_checkpoint_in_transaction(
         });
     };
     let version_id = text_at(row, 0, "version_id")?;
-    let commit_id = text_at(row, 1, "commit_id")?;
+    let local_commit_id = text_at(row, 1, "commit_id")?;
+    let global_commit_id = load_global_pointer_commit_id(tx).await?;
 
-    let commit = load_commit(tx, &commit_id).await?.ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("commit '{commit_id}' is missing"),
-    })?;
+    let commit = load_commit(tx, &local_commit_id)
+        .await?
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("commit '{local_commit_id}' is missing"),
+        })?;
     if commit.change_set_id.trim().is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("commit '{commit_id}' has empty change_set_id"),
+            description: format!("commit '{local_commit_id}' has empty change_set_id"),
         });
     }
 
-    ensure_checkpoint_label_on_commit(tx, &commit_id).await?;
+    ensure_checkpoint_label_on_commit(tx, &local_commit_id).await?;
+    if global_commit_id != local_commit_id {
+        ensure_checkpoint_label_on_commit(tx, &global_commit_id).await?;
+    }
     tx.execute_internal(
         "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
          VALUES ($1, $2) \
          ON CONFLICT (version_id) DO UPDATE \
          SET checkpoint_commit_id = excluded.checkpoint_commit_id",
-        &[Value::Text(version_id), Value::Text(commit_id.clone())],
+        &[
+            Value::Text(version_id),
+            Value::Text(local_commit_id.clone()),
+        ],
+    )
+    .await?;
+    tx.execute_internal(
+        "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
+         VALUES ($1, $2) \
+         ON CONFLICT (version_id) DO UPDATE \
+         SET checkpoint_commit_id = excluded.checkpoint_commit_id",
+        &[
+            Value::Text(crate::version::GLOBAL_VERSION_ID.to_string()),
+            Value::Text(global_commit_id.clone()),
+        ],
     )
     .await?;
 
     Ok(CreateCheckpointResult {
-        id: commit_id,
+        id: local_commit_id,
         change_set_id: commit.change_set_id,
     })
 }
@@ -80,10 +100,15 @@ async fn load_commit(
     commit_id: &str,
 ) -> Result<Option<CommitRow>, LixError> {
     let result = tx
-        .execute(
-            "SELECT change_set_id \
-             FROM lix_commit \
-             WHERE id = $1 \
+        .execute_internal(
+            "SELECT lix_json_extract(snapshot_content, 'change_set_id') \
+             FROM lix_internal_state_vtable \
+             WHERE schema_key = 'lix_commit' \
+               AND entity_id = $1 \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC, created_at DESC, change_id DESC \
              LIMIT 1",
             &[Value::Text(commit_id.to_string())],
         )
@@ -101,6 +126,39 @@ async fn load_commit(
     Ok(Some(CommitRow {
         change_set_id: text_at(row, 0, "change_set_id")?,
     }))
+}
+
+async fn load_global_pointer_commit_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
+    let result = tx
+        .execute_internal(
+            "SELECT lix_json_extract(snapshot_content, 'commit_id') \
+             FROM lix_internal_state_materialized_v1_lix_global_pointer \
+             WHERE schema_key = 'lix_global_pointer' \
+               AND entity_id = 'global' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND global = true \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC, created_at DESC, change_id DESC \
+             LIMIT 1",
+            &[],
+        )
+        .await?;
+    let [statement] = result.statements.as_slice() else {
+        return Err(errors::unexpected_statement_count_error(
+            "global pointer commit query",
+            1,
+            result.statements.len(),
+        ));
+    };
+    let Some(row) = statement.rows.first() else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "global pointer row is missing".to_string(),
+        });
+    };
+    text_at(row, 0, "lix_global_pointer.commit_id")
 }
 
 async fn ensure_checkpoint_label_on_commit(
@@ -204,7 +262,7 @@ async fn load_checkpoint_label_id(tx: &mut EngineTransaction<'_>) -> Result<Stri
     }
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "checkpoint label row is missing in global version".to_string(),
+        description: "checkpoint label row is missing in the global lane".to_string(),
     })
 }
 

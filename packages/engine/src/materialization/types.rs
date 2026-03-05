@@ -42,7 +42,7 @@ pub struct MaterializationWrite {
     pub entity_id: String,
     pub file_id: String,
     pub version_id: String,
-    pub inherited_from_version_id: Option<String>,
+    pub global: bool,
     pub op: MaterializationWriteOp,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
@@ -104,12 +104,12 @@ pub struct LatestVisibleWinnerDebugRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct InheritanceWinnerDebugRow {
+pub struct ScopeWinnerDebugRow {
     pub version_id: String,
     pub entity_id: String,
     pub schema_key: String,
     pub file_id: String,
-    pub inherited_from_version_id: Option<String>,
+    pub global: bool,
     pub change_id: String,
 }
 
@@ -120,7 +120,7 @@ pub struct MaterializationDebugTrace {
     pub traversed_edges: Vec<TraversedEdgeDebugRow>,
     pub version_ancestry: Vec<VersionAncestryDebugRow>,
     pub latest_visible_winners: Vec<LatestVisibleWinnerDebugRow>,
-    pub inheritance_winners: Vec<InheritanceWinnerDebugRow>,
+    pub scope_winners: Vec<ScopeWinnerDebugRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -32,7 +32,7 @@
   "x-lix-override-lixcols": {
     "lixcol_file_id": "\"lix\"",
     "lixcol_plugin_key": "\"lix\"",
-    "lixcol_version_id": "\"global\""
+    "lixcol_global": "true"
   },
   "type": "object",
   "properties": {

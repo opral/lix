@@ -836,7 +836,7 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
 mod tests {
     use super::{observe_source_key, ObserveQuery, OBSERVE_TICK_POLL_INTERVAL};
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
-    use crate::{boot, BootArgs, ExecuteOptions, LixError, NoopWasmRuntime, QueryResult, Value};
+    use crate::{boot, BootArgs, LixError, NoopWasmRuntime, QueryResult, Value};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -914,6 +914,7 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         ));
+        engine.set_active_version_id("version-test".to_string());
 
         let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
         let mut observed_a = engine
@@ -956,6 +957,7 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         ));
+        engine.set_active_version_id("version-test".to_string());
 
         let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
         let mut observed_a = engine

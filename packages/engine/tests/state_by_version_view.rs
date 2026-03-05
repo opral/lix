@@ -1,12 +1,38 @@
 mod support;
 
 use lix_engine::Value;
+use support::simulation_test::assert_boolean_like;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
         Value::Text(actual) => assert_eq!(actual, expected),
         other => panic!("expected text value '{expected}', got {other:?}"),
     }
+}
+
+fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<Value>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    if columns.contains(&index) {
+                        match value {
+                            Value::Boolean(actual) => Value::Boolean(*actual),
+                            Value::Integer(actual) => Value::Boolean(*actual != 0),
+                            Value::Text(actual) => Value::Boolean(matches!(
+                                actual.trim().to_ascii_lowercase().as_str(),
+                                "1" | "true"
+                            )),
+                            other => panic!("expected boolean-like value, got {other:?}"),
+                        }
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
@@ -23,9 +49,9 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
 async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
     let sql = format!(
         "INSERT INTO lix_version (\
-         id, name, inherits_from_version_id, hidden, commit_id\
+         id, name, hidden, commit_id\
          ) VALUES (\
-         '{version_id}', '{version_id}', 'global', false, 'commit-{version_id}'\
+         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
          )",
     );
     engine.execute(&sql, &[]).await.unwrap();
@@ -76,7 +102,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[2]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         let commit_id = match &rows.statements[0].rows[0][0] {
             Value::Text(value) => value,
@@ -113,7 +139,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[1]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "entity-sel");
         assert_text(&rows.statements[0].rows[0][1], "version-a");
@@ -122,7 +148,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_by_version_select_inherits_from_parent_version,
+    lix_state_by_version_select_reads_visible_global_row,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -142,7 +168,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT entity_id, version_id, inherited_from_version_id, snapshot_content \
+                "SELECT entity_id, version_id, global, snapshot_content \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-inherited' \
@@ -152,17 +178,17 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[2]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "entity-inherited");
         assert_text(&rows.statements[0].rows[0][1], "version-child");
-        assert_text(&rows.statements[0].rows[0][2], "global");
+        assert_boolean_like(&rows.statements[0].rows[0][2], true);
         assert_text(&rows.statements[0].rows[0][3], "{\"value\":\"global\"}");
     }
 );
 
 simulation_test!(
-    lix_state_by_version_select_prefers_child_row_over_parent,
+    lix_state_by_version_select_prefers_local_row_over_global_row,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -189,7 +215,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT version_id, inherited_from_version_id, snapshot_content \
+                "SELECT version_id, global, snapshot_content \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
                    AND entity_id = 'entity-override' \
@@ -199,10 +225,10 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[1]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "version-child");
-        assert_eq!(rows.statements[0].rows[0][1], Value::Null);
+        assert_boolean_like(&rows.statements[0].rows[0][1], false);
         assert_text(&rows.statements[0].rows[0][2], "{\"value\":\"child\"}");
     }
 );
@@ -234,7 +260,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_by_version_select_child_tombstone_hides_parent_row,
+    lix_state_by_version_select_local_tombstone_hides_global_row,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)

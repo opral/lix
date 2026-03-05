@@ -520,7 +520,7 @@ impl Engine {
 
         let (sql, params) = build_detected_file_domain_changes_insert(&deduped_changes, untracked);
         let mut transaction = self.backend.begin_transaction().await?;
-        let mut active_version_id = self.active_version_id.read().unwrap().clone();
+        let mut active_version_id = self.require_active_version_id()?;
         let previous_active_version_id = active_version_id.clone();
         let mut pending_state_commit_stream_changes = Vec::new();
         let result = self
@@ -1234,12 +1234,27 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn require_active_version_id(&self) -> Result<String, LixError> {
+        let guard = self.active_version_id.read().map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "active version cache lock poisoned".to_string(),
+        })?;
+        guard
+            .clone()
+            .ok_or_else(crate::errors::not_initialized_error)
+    }
+
+    pub(crate) fn clear_active_version_id(&self) {
+        let mut guard = self.active_version_id.write().unwrap();
+        *guard = None;
+    }
+
     pub(crate) fn set_active_version_id(&self, version_id: String) {
         let mut guard = self.active_version_id.write().unwrap();
-        if *guard == version_id {
+        if guard.as_ref() == Some(&version_id) {
             return;
         }
-        *guard = version_id;
+        *guard = Some(version_id);
     }
 }
 

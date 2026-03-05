@@ -39,7 +39,6 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
     let sql = "SELECT \
                  d.id AS id, \
                  d.name AS name, \
-                 d.inherits_from_version_id AS inherits_from_version_id, \
                  d.hidden AS hidden, \
                  t.commit_id AS commit_id, \
                  d.entity_id AS entity_id, \
@@ -63,11 +62,12 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    updated_at, \
                    lix_json_extract(snapshot_content, 'id') AS id, \
                    lix_json_extract(snapshot_content, 'name') AS name, \
-                   lix_json_extract(snapshot_content, 'inherits_from_version_id') AS inherits_from_version_id, \
                    lix_json_extract(snapshot_content, 'hidden') AS hidden \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_descriptor' \
                    AND version_id = 'global' \
+                   AND global = true \
+                   AND entity_id <> 'global' \
                    AND snapshot_content IS NOT NULL \
                ) AS d \
                LEFT JOIN ( \
@@ -81,6 +81,7 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_pointer' \
                    AND version_id = 'global' \
+                   AND global = true \
                    AND snapshot_content IS NOT NULL \
                ) AS t \
                  ON t.id = d.id";

@@ -17,6 +17,7 @@ const LIX_CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
 const LIX_COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const LIX_VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
 const LIX_VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
+const LIX_GLOBAL_POINTER_SCHEMA_KEY: &str = "lix_global_pointer";
 const LIX_ACTIVE_VERSION_SCHEMA_KEY: &str = "lix_active_version";
 const LIX_CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const LIX_COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -36,6 +37,7 @@ const LIX_CHANGE_SET_SCHEMA_JSON: &str = include_str!("lix_change_set.json");
 const LIX_COMMIT_SCHEMA_JSON: &str = include_str!("lix_commit.json");
 const LIX_VERSION_DESCRIPTOR_SCHEMA_JSON: &str = include_str!("lix_version_descriptor.json");
 const LIX_VERSION_POINTER_SCHEMA_JSON: &str = include_str!("lix_version_pointer.json");
+const LIX_GLOBAL_POINTER_SCHEMA_JSON: &str = include_str!("lix_global_pointer.json");
 const LIX_ACTIVE_VERSION_SCHEMA_JSON: &str = include_str!("lix_active_version.json");
 const LIX_CHANGE_SET_ELEMENT_SCHEMA_JSON: &str = include_str!("lix_change_set_element.json");
 const LIX_COMMIT_EDGE_SCHEMA_JSON: &str = include_str!("lix_commit_edge.json");
@@ -55,6 +57,7 @@ static LIX_CHANGE_SET_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_VERSION_DESCRIPTOR_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_VERSION_POINTER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+static LIX_GLOBAL_POINTER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_ACTIVE_VERSION_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_CHANGE_SET_ELEMENT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COMMIT_EDGE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -75,6 +78,7 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_COMMIT_SCHEMA_KEY,
     LIX_VERSION_DESCRIPTOR_SCHEMA_KEY,
     LIX_VERSION_POINTER_SCHEMA_KEY,
+    LIX_GLOBAL_POINTER_SCHEMA_KEY,
     LIX_ACTIVE_VERSION_SCHEMA_KEY,
     LIX_CHANGE_SET_ELEMENT_SCHEMA_KEY,
     LIX_COMMIT_EDGE_SCHEMA_KEY,
@@ -136,6 +140,9 @@ pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static Jso
         LIX_VERSION_POINTER_SCHEMA_KEY => Some(LIX_VERSION_POINTER_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_version_pointer.json", LIX_VERSION_POINTER_SCHEMA_JSON)
         })),
+        LIX_GLOBAL_POINTER_SCHEMA_KEY => Some(LIX_GLOBAL_POINTER_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_global_pointer.json", LIX_GLOBAL_POINTER_SCHEMA_JSON)
+        })),
         LIX_ACTIVE_VERSION_SCHEMA_KEY => Some(LIX_ACTIVE_VERSION_SCHEMA.get_or_init(|| {
             parse_builtin_schema("lix_active_version.json", LIX_ACTIVE_VERSION_SCHEMA_JSON)
         })),
@@ -183,6 +190,7 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
         LIX_COMMIT_SCHEMA_KEY => Some(LIX_COMMIT_SCHEMA_JSON),
         LIX_VERSION_DESCRIPTOR_SCHEMA_KEY => Some(LIX_VERSION_DESCRIPTOR_SCHEMA_JSON),
         LIX_VERSION_POINTER_SCHEMA_KEY => Some(LIX_VERSION_POINTER_SCHEMA_JSON),
+        LIX_GLOBAL_POINTER_SCHEMA_KEY => Some(LIX_GLOBAL_POINTER_SCHEMA_JSON),
         LIX_ACTIVE_VERSION_SCHEMA_KEY => Some(LIX_ACTIVE_VERSION_SCHEMA_JSON),
         LIX_CHANGE_SET_ELEMENT_SCHEMA_KEY => Some(LIX_CHANGE_SET_ELEMENT_SCHEMA_JSON),
         LIX_COMMIT_EDGE_SCHEMA_KEY => Some(LIX_COMMIT_EDGE_SCHEMA_JSON),

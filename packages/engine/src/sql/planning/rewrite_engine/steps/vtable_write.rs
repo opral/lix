@@ -29,6 +29,7 @@ use crate::engine::sql::planning::rewrite_engine::{
 };
 use crate::errors;
 use crate::functions::LixFunctionProvider;
+use crate::version::GLOBAL_VERSION_ID;
 #[cfg(test)]
 use crate::SqlDialect;
 use crate::Value as EngineValue;
@@ -135,6 +136,18 @@ pub fn rewrite_insert_with_writer_key(
             description: "vtable insert requires explicit columns".to_string(),
         });
     }
+    if insert
+        .columns
+        .iter()
+        .any(|column| column.value.eq_ignore_ascii_case("global"))
+    {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "vtable insert cannot set global directly yet; route global writes through the global lane"
+                    .to_string(),
+        });
+    }
 
     let split_rows = split_insert_rows(&insert, params)?;
     let tracked_rows = split_rows.tracked;
@@ -195,6 +208,18 @@ pub async fn rewrite_insert_with_backend(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "vtable insert requires explicit columns".to_string(),
+        });
+    }
+    if insert
+        .columns
+        .iter()
+        .any(|column| column.value.eq_ignore_ascii_case("global"))
+    {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "vtable insert cannot set global directly yet; route global writes through the global lane"
+                    .to_string(),
         });
     }
 
@@ -555,7 +580,7 @@ pub fn rewrite_delete_with_options(
             None
         };
     let effective_scope_untracked_selection_sql = if effective_scope_without_untracked_predicate {
-        Some(rewrite_inherited_from_version_id_to_null(&stripped_selection).to_string())
+        Some(stripped_selection.to_string())
     } else {
         None
     };
@@ -615,41 +640,6 @@ pub fn rewrite_delete_with_options(
     })))
 }
 
-fn rewrite_inherited_from_version_id_to_null(expr: &Expr) -> Expr {
-    struct InheritedFromVersionIdNullRewriter;
-
-    impl VisitorMut for InheritedFromVersionIdNullRewriter {
-        type Break = ();
-
-        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-            let is_inherited_from_version_id = match expr {
-                Expr::Identifier(ident) => ident
-                    .value
-                    .eq_ignore_ascii_case("inherited_from_version_id"),
-                Expr::CompoundIdentifier(parts) => parts
-                    .last()
-                    .map(|ident| {
-                        ident
-                            .value
-                            .eq_ignore_ascii_case("inherited_from_version_id")
-                    })
-                    .unwrap_or(false),
-                _ => false,
-            };
-
-            if is_inherited_from_version_id {
-                *expr = null_expr();
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut rewritten = expr.clone();
-    let mut visitor = InheritedFromVersionIdNullRewriter;
-    let _ = (&mut rewritten).visit(&mut visitor);
-    rewritten
-}
-
 fn build_untracked_on_conflict() -> OnInsert {
     OnInsert::OnConflict(OnConflict {
         conflict_target: Some(ConflictTarget::Columns(vec![
@@ -660,6 +650,15 @@ fn build_untracked_on_conflict() -> OnInsert {
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
             assignments: vec![
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("global")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("global"),
+                    ]),
+                },
                 Assignment {
                     target: AssignmentTarget::ColumnName(ObjectName(vec![
                         ObjectNamePart::Identifier(Ident::new("snapshot_content")),
@@ -729,6 +728,15 @@ fn build_materialized_on_conflict() -> OnInsert {
         ])),
         action: OnConflictAction::DoUpdate(DoUpdate {
             assignments: vec![
+                Assignment {
+                    target: AssignmentTarget::ColumnName(ObjectName(vec![
+                        ObjectNamePart::Identifier(Ident::new("global")),
+                    ])),
+                    value: Expr::CompoundIdentifier(vec![
+                        Ident::new("excluded"),
+                        Ident::new("global"),
+                    ]),
+                },
                 Assignment {
                     target: AssignmentTarget::ColumnName(ObjectName(vec![
                         ObjectNamePart::Identifier(Ident::new("snapshot_content")),
@@ -903,6 +911,11 @@ fn rewrite_tracked_rows(
         let change_id = functions.uuid_v7();
         let created_at = functions.timestamp();
         let updated_at = created_at.clone();
+        let version_id = resolved_string_required(
+            materialized.get(version_idx),
+            row.get(version_idx),
+            "version_id",
+        )?;
 
         let metadata_expr = match metadata_idx {
             Some(index) => resolved_expr_or_original(materialized.get(index), row.get(index))?,
@@ -944,7 +957,8 @@ fn rewrite_tracked_rows(
                 row.get(schema_version_idx),
             )?,
             resolved_expr_or_original(materialized.get(file_idx), row.get(file_idx))?,
-            resolved_expr_or_original(materialized.get(version_idx), row.get(version_idx))?,
+            string_expr(&version_id),
+            boolean_expr(version_id == GLOBAL_VERSION_ID),
             resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
             snapshot_content,
             string_expr(&change_id),
@@ -1045,6 +1059,7 @@ fn rewrite_tracked_rows(
                 Ident::new("schema_version"),
                 Ident::new("file_id"),
                 Ident::new("version_id"),
+                Ident::new("global"),
                 Ident::new("plugin_key"),
                 Ident::new("snapshot_content"),
                 Ident::new("change_id"),
@@ -1256,11 +1271,17 @@ fn build_untracked_insert(
     let mut mapped_rows = Vec::new();
     for (row, materialized) in rows {
         let now = functions.timestamp();
+        let version_id = resolved_string_required(
+            materialized.get(version_idx),
+            row.get(version_idx),
+            "version_id",
+        )?;
         mapped_rows.push(vec![
             resolved_expr_or_original(materialized.get(entity_idx), row.get(entity_idx))?,
             resolved_expr_or_original(materialized.get(schema_idx), row.get(schema_idx))?,
             resolved_expr_or_original(materialized.get(file_idx), row.get(file_idx))?,
-            resolved_expr_or_original(materialized.get(version_idx), row.get(version_idx))?,
+            string_expr(&version_id),
+            boolean_expr(version_id == GLOBAL_VERSION_ID),
             resolved_expr_or_original(materialized.get(plugin_idx), row.get(plugin_idx))?,
             resolved_expr_or_original(materialized.get(snapshot_idx), row.get(snapshot_idx))?,
             match metadata_idx {
@@ -1336,6 +1357,7 @@ fn build_untracked_insert(
             Ident::new("schema_key"),
             Ident::new("file_id"),
             Ident::new("version_id"),
+            Ident::new("global"),
             Ident::new("plugin_key"),
             Ident::new("snapshot_content"),
             Ident::new("metadata"),
@@ -1409,11 +1431,12 @@ fn validate_update_assignment_targets(assignments: &[Assignment]) -> Result<(), 
                         .to_string(),
             });
         }
-        if column.eq_ignore_ascii_case("inherited_from_version_id") {
+        if column.eq_ignore_ascii_case("global") {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "vtable update cannot set inherited_from_version_id; it is computed"
-                    .to_string(),
+                description:
+                    "vtable update cannot change global scope; delete and recreate the row"
+                        .to_string(),
             });
         }
         return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
@@ -1836,6 +1859,10 @@ fn string_expr(value: &str) -> Expr {
 
 fn number_expr(value: &str) -> Expr {
     Expr::Value(Value::Number(value.to_string(), false).into())
+}
+
+fn boolean_expr(value: bool) -> Expr {
+    Expr::Value(Value::Boolean(value).into())
 }
 
 fn null_expr() -> Expr {
@@ -3389,10 +3416,9 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_delete_effective_scope_maps_inherited_from_version_predicate_for_untracked_cleanup()
-    {
+    fn rewrite_delete_effective_scope_preserves_global_predicate_for_untracked_cleanup() {
         let sql = r#"DELETE FROM lix_internal_state_vtable
-            WHERE schema_key = 'test_schema' AND inherited_from_version_id IS NULL"#;
+            WHERE schema_key = 'test_schema' AND global = false"#;
         let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse sql");
         let statement = statements.remove(0);
 
@@ -3415,15 +3441,14 @@ mod tests {
             .effective_scope_selection_sql
             .as_deref()
             .expect("effective scope sql");
-        assert!(effective_sql.contains("inherited_from_version_id IS NULL"));
+        assert!(effective_sql.contains("global = false"));
 
         let untracked_sql = planned
             .plan
             .effective_scope_untracked_selection_sql
             .as_deref()
             .expect("untracked scope sql");
-        assert!(untracked_sql.contains("NULL IS NULL"));
-        assert!(!untracked_sql.contains("inherited_from_version_id"));
+        assert!(untracked_sql.contains("global = false"));
     }
 
     #[test]

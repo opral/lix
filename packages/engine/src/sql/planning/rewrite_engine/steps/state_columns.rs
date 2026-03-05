@@ -7,7 +7,7 @@ pub(crate) const LIX_STATE_VISIBLE_COLUMNS: [&str; 14] = [
     "schema_version",
     "created_at",
     "updated_at",
-    "inherited_from_version_id",
+    "global",
     "change_id",
     "commit_id",
     "untracked",
@@ -26,7 +26,7 @@ pub(crate) const LIX_STATE_BY_VERSION_MUTABLE_COLUMNS: [&str; 11] = [
     "metadata",
     "writer_key",
     "untracked",
-    "inherited_from_version_id",
+    "global",
 ];
 
 pub(crate) const LIX_STATE_MUTABLE_COLUMNS: [&str; 12] = [
@@ -41,7 +41,7 @@ pub(crate) const LIX_STATE_MUTABLE_COLUMNS: [&str; 12] = [
     "metadata",
     "writer_key",
     "untracked",
-    "inherited_from_version_id",
+    "global",
 ];
 
 pub(crate) fn lix_state_visible_columns_without_commit() -> Vec<&'static str> {

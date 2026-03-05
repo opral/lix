@@ -72,13 +72,13 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
 async fn insert_version(
     engine: &support::simulation_test::SimulationEngine,
     version_id: &str,
-    parent_version_id: &str,
+    _parent_version_id: &str,
 ) {
     let sql = format!(
         "INSERT INTO lix_version (\
-         id, name, inherits_from_version_id, hidden, commit_id\
+         id, name, hidden, commit_id\
          ) VALUES (\
-         '{version_id}', '{version_id}', '{parent_version_id}', false, 'commit-{version_id}'\
+         '{version_id}', '{version_id}', false, 'commit-{version_id}'\
          )",
     );
     engine.execute(&sql, &[]).await.unwrap();
@@ -1991,7 +1991,7 @@ simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
 });
 
 simulation_test!(
-    directory_duplicate_inherited_path_is_rejected_in_child_version,
+    directory_duplicate_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -2000,17 +2000,17 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
-        let child_version_id = "directory-inheritance-child";
+        let child_version_id = "directory-global-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
         engine
             .execute(
-                "INSERT INTO lix_directory (id, path, parent_id, name) \
-                 VALUES ('dir-parent-docs', '/docs/', NULL, 'docs')",
+                "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
+                 VALUES ('dir-global-docs', '/docs/', NULL, 'docs', 'global')",
                 &[],
             )
             .await
-            .expect("parent version directory insert should succeed");
+            .expect("global directory insert should succeed");
 
         engine
             .execute(
@@ -2030,7 +2030,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("duplicate inherited directory path should fail");
+            .expect_err("duplicate global directory path should fail");
         assert!(
             err.description.contains("Unique constraint violation")
                 || err.description.contains("already exists"),
@@ -2073,7 +2073,7 @@ simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
 });
 
 simulation_test!(
-    file_duplicate_inherited_path_is_rejected_in_child_version,
+    file_duplicate_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -2082,17 +2082,17 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
-        let child_version_id = "file-inheritance-child";
+        let child_version_id = "file-global-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-readme', '/readme.md', lix_text_encode('ignored'))",
+                "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                 VALUES ('file-global-readme', '/readme.md', lix_text_encode('ignored'), 'global')",
                 &[],
             )
             .await
-            .expect("parent version file insert should succeed");
+            .expect("global file insert should succeed");
 
         engine
             .execute(
@@ -2112,7 +2112,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("duplicate inherited file path should fail");
+            .expect_err("duplicate global file path should fail");
         assert!(
             err.description.contains("Unique constraint violation")
                 || err.description.contains("already exists"),
@@ -2123,7 +2123,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_duplicate_inherited_nested_path_is_rejected_in_child_version,
+    file_reinsert_path_after_child_tombstone_of_global_file_succeeds,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -2132,17 +2132,17 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
-        let child_version_id = "file-inheritance-nested-child";
+        let child_version_id = "file-global-tombstone-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-docs-readme', '/docs/readme.md', lix_text_encode('ignored'))",
+                "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                 VALUES ('file-global-readme-tombstone', '/readme.md', lix_text_encode('ignored'), 'global')",
                 &[],
             )
             .await
-            .expect("parent version nested file insert should succeed");
+            .expect("global file insert should succeed");
 
         engine
             .execute(
@@ -2155,63 +2155,28 @@ simulation_test!(
             .await
             .expect("active version switch should succeed");
 
-        let err = engine
+        let visible_rows = engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-child-docs-readme', '/docs/readme.md', lix_text_encode('ignored'))",
+                "SELECT id, path, lixcol_global FROM lix_file WHERE path = '/readme.md'",
                 &[],
             )
             .await
-            .expect_err("duplicate inherited nested file path should fail");
-        assert!(
-            err.description.contains("Unique constraint violation")
-                || err.description.contains("already exists"),
-            "unexpected error: {}",
-            err.description
+            .expect("pre-delete query should succeed");
+        assert_eq!(visible_rows.statements[0].rows.len(), 1);
+        assert_text(
+            &visible_rows.statements[0].rows[0][0],
+            "file-global-readme-tombstone",
         );
-    }
-);
-
-simulation_test!(
-    file_reinsert_path_after_child_tombstone_of_inherited_file_succeeds,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_engine_deterministic()
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
-
-        let parent_version_id = active_version_id(&engine).await;
-        let child_version_id = "file-inheritance-tombstone-child";
-        insert_version(&engine, child_version_id, &parent_version_id).await;
+        assert_text(&visible_rows.statements[0].rows[0][1], "/readme.md");
+        assert_boolean_like(&visible_rows.statements[0].rows[0][2], true);
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-readme-tombstone', '/readme.md', lix_text_encode('ignored'))",
+                "DELETE FROM lix_file WHERE id = 'file-global-readme-tombstone'",
                 &[],
             )
             .await
-            .expect("parent version file insert should succeed");
-
-        engine
-            .execute(
-                &format!(
-                    "UPDATE lix_active_version SET version_id = '{}'",
-                    child_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("active version switch should succeed");
-
-        engine
-            .execute(
-                "DELETE FROM lix_file WHERE id = 'file-parent-readme-tombstone'",
-                &[],
-            )
-            .await
-            .expect("child tombstone delete should succeed");
+            .expect("local tombstone against global file should succeed");
 
         let deleted_rows = engine
             .execute("SELECT id FROM lix_file WHERE path = '/readme.md'", &[])
@@ -2219,7 +2184,7 @@ simulation_test!(
             .expect("post-delete query should succeed");
         assert!(
             deleted_rows.statements[0].rows.is_empty(),
-            "deleted inherited file should not be visible in child version",
+            "deleted global file should not be visible in child version",
         );
 
         engine
@@ -2233,7 +2198,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT id, path FROM lix_file WHERE path = '/readme.md'",
+                "SELECT id, path, lixcol_global FROM lix_file WHERE path = '/readme.md'",
                 &[],
             )
             .await
@@ -2244,6 +2209,7 @@ simulation_test!(
             "file-child-readme-tombstone",
         );
         assert_text(&rows.statements[0].rows[0][1], "/readme.md");
+        assert_boolean_like(&rows.statements[0].rows[0][2], false);
     }
 );
 
@@ -2413,7 +2379,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_path_update_to_inherited_path_is_rejected_in_child_version,
+    file_path_update_to_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine_deterministic()
@@ -2422,17 +2388,17 @@ simulation_test!(
         engine.init().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
-        let child_version_id = "file-inheritance-update-collision-child";
+        let child_version_id = "file-global-update-collision-child";
         insert_version(&engine, child_version_id, &parent_version_id).await;
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-parent-a', '/docs/a.md', lix_text_encode('ignored'))",
+                "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                 VALUES ('file-global-a', '/docs/a.md', lix_text_encode('ignored'), 'global')",
                 &[],
             )
             .await
-            .expect("parent version file insert should succeed");
+            .expect("global file insert should succeed");
 
         engine
             .execute(
@@ -2460,7 +2426,7 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("updating to inherited path should fail");
+            .expect_err("updating to global path should fail");
         assert!(
             err.description.contains("Unique constraint violation")
                 || err.description.contains("already exists"),
@@ -3009,7 +2975,7 @@ simulation_test!(
             .execute(
                 "SELECT \
                 lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
-                lixcol_schema_version, lixcol_inherited_from_version_id, lixcol_change_id, \
+                lixcol_schema_version, lixcol_global, lixcol_change_id, \
                 lixcol_created_at, lixcol_updated_at, lixcol_writer_key, lixcol_untracked, lixcol_metadata \
              FROM lix_file WHERE id = 'lixcol-file'", &[])
             .await
@@ -3017,6 +2983,7 @@ simulation_test!(
         assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_text(&file_rows.statements[0].rows[0][1], "lix_file_descriptor");
         assert_text(&file_rows.statements[0].rows[0][3], "lix");
+        assert_boolean_like(&file_rows.statements[0].rows[0][5], false);
         match &file_rows.statements[0].rows[0][9] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected lixcol_writer_key as text/null, got {other:?}"),
@@ -3070,10 +3037,12 @@ simulation_test!(
         let directory_rows = engine
             .execute(
                 "SELECT \
-                lixcol_entity_id, lixcol_schema_key, lixcol_schema_version, lixcol_inherited_from_version_id, \
+                lixcol_entity_id, lixcol_schema_key, lixcol_schema_version, lixcol_global, \
                 lixcol_change_id, lixcol_created_at, lixcol_updated_at, lixcol_commit_id, \
                 lixcol_untracked, lixcol_metadata \
-             FROM lix_directory WHERE id = 'lixcol-dir'", &[])
+             FROM lix_directory WHERE id = 'lixcol-dir'",
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(directory_rows.statements[0].rows.len(), 1);
@@ -3085,6 +3054,7 @@ simulation_test!(
             Value::Text(value) => assert!(!value.is_empty(), "expected non-empty schema version"),
             other => panic!("expected lixcol_schema_version as text, got {other:?}"),
         }
+        assert_boolean_like(&directory_rows.statements[0].rows[0][3], false);
         match &directory_rows.statements[0].rows[0][9] {
             Value::Text(_) | Value::Null => {}
             other => panic!("expected lixcol_metadata as text/null, got {other:?}"),
