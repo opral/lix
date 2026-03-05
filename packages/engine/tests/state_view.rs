@@ -1040,10 +1040,13 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic_normalized(visible.rows.clone());
-        assert_eq!(visible.rows.len(), 1);
-        assert_text(&visible.rows[0][0], "{\"value\":\"effective-updated\"}");
-        assert_boolean_like(&visible.rows[0][1], true);
+        sim.assert_deterministic_normalized(visible.statements[0].rows.clone());
+        assert_eq!(visible.statements[0].rows.len(), 1);
+        assert_text(
+            &visible.statements[0].rows[0][0],
+            "{\"value\":\"effective-updated\"}",
+        );
+        assert_boolean_like(&visible.statements[0].rows[0][1], true);
 
         let tracked = engine
             .execute(
@@ -1059,8 +1062,11 @@ simulation_test!(
             .await
             .unwrap();
 
-        assert_eq!(tracked.rows.len(), 1);
-        assert_text(&tracked.rows[0][0], "{\"value\":\"tracked-initial\"}");
+        assert_eq!(tracked.statements[0].rows.len(), 1);
+        assert_text(
+            &tracked.statements[0].rows[0][0],
+            "{\"value\":\"tracked-initial\"}",
+        );
     }
 );
 

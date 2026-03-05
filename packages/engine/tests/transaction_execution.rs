@@ -269,8 +269,9 @@ simulation_test!(
                             &[],
                         )
                         .await?;
-                    assert_eq!(rows.rows.len(), 1);
-                    assert_blob_text(&rows.rows[0][0], "after");
+                    assert_eq!(rows.statements.len(), 2);
+                    assert_eq!(rows.statements[1].rows.len(), 1);
+                    assert_blob_text(&rows.statements[1].rows[0][0], "after");
                     Ok(())
                 })
             })
@@ -311,8 +312,9 @@ simulation_test!(
                             &[],
                         )
                         .await?;
-                    assert_eq!(before.rows.len(), 1);
-                    let before_commit = match &before.rows[0][0] {
+                    assert_eq!(before.statements.len(), 1);
+                    assert_eq!(before.statements[0].rows.len(), 1);
+                    let before_commit = match &before.statements[0].rows[0][0] {
                         Value::Text(value) => value.clone(),
                         other => panic!("expected commit id text, got {other:?}"),
                     };
@@ -329,8 +331,9 @@ simulation_test!(
                             &[],
                         )
                         .await?;
-                    assert_eq!(after.rows.len(), 1);
-                    let after_commit = match &after.rows[0][0] {
+                    assert_eq!(after.statements.len(), 2);
+                    assert_eq!(after.statements[1].rows.len(), 1);
+                    let after_commit = match &after.statements[1].rows[0][0] {
                         Value::Text(value) => value.clone(),
                         other => panic!("expected commit id text, got {other:?}"),
                     };

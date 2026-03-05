@@ -145,7 +145,7 @@ async fn count_version_pointer_changes(engine: &SimulationEngine, version_id: &s
         )
         .await
         .unwrap();
-    as_i64(&result.rows[0][0])
+    as_i64(&result.statements[0].rows[0][0])
 }
 
 async fn active_version_id(engine: &SimulationEngine) -> String {
@@ -159,7 +159,7 @@ async fn active_version_id(engine: &SimulationEngine) -> String {
         )
         .await
         .unwrap();
-    as_text(&result.rows[0][0])
+    as_text(&result.statements[0].rows[0][0])
 }
 
 simulation_test!(

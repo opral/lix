@@ -95,11 +95,7 @@ fn expr_references_relation_commit_column(
         }
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
             expr_references_relation_commit_column(expr, relation_name, allow_unqualified)
-                || expr_references_relation_commit_column(
-                    pattern,
-                    relation_name,
-                    allow_unqualified,
-                )
+                || expr_references_relation_commit_column(pattern, relation_name, allow_unqualified)
         }
         Expr::InList { expr, list, .. } => {
             expr_references_relation_commit_column(expr, relation_name, allow_unqualified)
@@ -135,11 +131,7 @@ fn expr_references_relation_commit_column(
         Expr::Function(function) => match &function.args {
             FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
-                    expr_references_relation_commit_column(
-                        inner,
-                        relation_name,
-                        allow_unqualified,
-                    )
+                    expr_references_relation_commit_column(inner, relation_name, allow_unqualified)
                 }
                 FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => match arg {
                     FunctionArgExpr::Expr(inner) => expr_references_relation_commit_column(

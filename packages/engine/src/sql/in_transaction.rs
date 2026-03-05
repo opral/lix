@@ -81,6 +81,15 @@ impl Engine {
             &prepared.plan.preprocess.mutations,
             &prepared.intent.detected_file_domain_changes,
         );
+        let mut binary_blob_ref_targets = collect_binary_blob_ref_targets(
+            &prepared.plan.preprocess.mutations,
+            &prepared.intent.detected_file_domain_changes,
+        );
+        if binary_blob_ref_targets.is_empty() && !prepared.plan.requirements.read_only_query {
+            binary_blob_ref_targets = self
+                .load_binary_blob_ref_index_targets_in_transaction(transaction)
+                .await?;
+        }
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without
@@ -141,6 +150,11 @@ impl Engine {
             self.persist_pending_file_path_updates_in_transaction(
                 transaction,
                 &prepared.intent.pending_file_writes,
+            )
+            .await?;
+            self.sync_binary_blob_ref_index_for_targets_in_transaction(
+                transaction,
+                &binary_blob_ref_targets,
             )
             .await?;
             self.ensure_builtin_binary_blob_store_for_targets_in_transaction(

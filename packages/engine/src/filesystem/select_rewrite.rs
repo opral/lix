@@ -120,215 +120,38 @@ fn build_filesystem_projection_query(
     pushdown: &HistoryPredicatePushdown,
 ) -> Result<Option<Query>, LixError> {
     let sql = match view_name.to_ascii_lowercase().as_str() {
-        FILE_VIEW => format!(
-            "WITH RECURSIVE directory_descriptor_rows AS (\
-                 SELECT \
-                    lix_json_extract(snapshot_content, 'id') AS id, \
-                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_extract(snapshot_content, 'name') AS name, \
-                    version_id AS lixcol_version_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_directory_descriptor' \
-                   AND snapshot_content IS NOT NULL \
-                   AND {active_version_scope_descriptor}\
-             ), \
-             directory_paths AS (\
-                 SELECT \
-                    d.id, \
-                    d.lixcol_version_id, \
-                    '/' || d.name || '/' AS path \
-                 FROM directory_descriptor_rows d \
-                 WHERE d.parent_id IS NULL \
-                 UNION ALL \
-                 SELECT \
-                    child.id, \
-                    child.lixcol_version_id, \
-                    parent.path || child.name || '/' AS path \
-                 FROM directory_descriptor_rows child \
-                 JOIN directory_paths parent \
-                   ON parent.id = child.parent_id \
-                  AND parent.lixcol_version_id = child.lixcol_version_id\
-             ), \
-             file_descriptor_rows AS (\
-                 SELECT \
-                    lix_json_extract(snapshot_content, 'id') AS id, \
-                    lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_extract(snapshot_content, 'name') AS name, \
-                    lix_json_extract(snapshot_content, 'extension') AS extension, \
-                    lix_json_extract(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
-                    entity_id AS lixcol_entity_id, \
-                    schema_key AS lixcol_schema_key, \
-                    file_id AS lixcol_file_id, \
-                    version_id AS lixcol_version_id, \
-                    plugin_key AS lixcol_plugin_key, \
-                    schema_version AS lixcol_schema_version, \
-                    inherited_from_version_id AS lixcol_inherited_from_version_id, \
-                    change_id AS lixcol_change_id, \
-                    created_at AS lixcol_created_at, \
-                    updated_at AS lixcol_updated_at, \
-                    writer_key AS lixcol_writer_key, \
-                    untracked AS lixcol_untracked, \
-                    metadata AS lixcol_metadata \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND snapshot_content IS NOT NULL \
-                   AND {active_version_scope_descriptor}\
-             ) \
-             SELECT \
-                f.id, \
-                f.directory_id, \
-                f.name, \
-                f.extension, \
-                CASE \
-                    WHEN f.directory_id IS NULL THEN \
-                        CASE \
-                            WHEN f.extension IS NULL OR f.extension = '' THEN '/' || f.name \
-                            ELSE '/' || f.name || '.' || f.extension \
-                        END \
-                    WHEN dp.path IS NULL THEN NULL \
-                    ELSE \
-                        CASE \
-                            WHEN f.extension IS NULL OR f.extension = '' THEN dp.path || f.name \
-                            ELSE dp.path || f.name || '.' || f.extension \
-                        END \
-                END AS path, \
-                COALESCE(fd.data, bbs.data) AS data, \
-                f.metadata, \
-                f.hidden, \
-                f.lixcol_entity_id, \
-                f.lixcol_schema_key, \
-                f.lixcol_file_id, \
-                f.lixcol_plugin_key, \
-                f.lixcol_schema_version, \
-                f.lixcol_inherited_from_version_id, \
-                f.lixcol_change_id, \
-                f.lixcol_created_at, \
-                f.lixcol_updated_at, \
-                v.commit_id AS lixcol_commit_id, \
-                f.lixcol_writer_key, \
-                f.lixcol_untracked, \
-                f.lixcol_metadata \
-             FROM file_descriptor_rows f \
-             LEFT JOIN directory_paths dp \
-               ON dp.id = f.directory_id \
-              AND dp.lixcol_version_id = f.lixcol_version_id \
-             LEFT JOIN lix_version v \
-               ON v.id = f.lixcol_version_id \
-             LEFT JOIN lix_internal_file_data_cache fd \
-               ON fd.file_id = f.id \
-              AND fd.version_id = f.lixcol_version_id \
-             LEFT JOIN lix_internal_binary_file_version_ref bfr \
-               ON bfr.file_id = f.id \
-              AND bfr.version_id = f.lixcol_version_id \
-             LEFT JOIN lix_internal_binary_blob_store bbs \
-               ON bbs.blob_hash = bfr.blob_hash \
-             WHERE {active_version_scope}",
-            active_version_scope = active_version_scope_predicate("f.lixcol_version_id"),
-            active_version_scope_descriptor = active_version_scope_predicate("version_id")
-        ),
-        FILE_BY_VERSION_VIEW => "WITH RECURSIVE directory_descriptor_rows AS (\
-                 SELECT \
-                    lix_json_extract(snapshot_content, 'id') AS id, \
-                    lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
-                    lix_json_extract(snapshot_content, 'name') AS name, \
-                    version_id AS lixcol_version_id \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_directory_descriptor' \
-                   AND snapshot_content IS NOT NULL\
-             ), \
-             directory_paths AS (\
-                 SELECT \
-                    d.id, \
-                    d.lixcol_version_id, \
-                    '/' || d.name || '/' AS path \
-                 FROM directory_descriptor_rows d \
-                 WHERE d.parent_id IS NULL \
-                 UNION ALL \
-                 SELECT \
-                    child.id, \
-                    child.lixcol_version_id, \
-                    parent.path || child.name || '/' AS path \
-                 FROM directory_descriptor_rows child \
-                 JOIN directory_paths parent \
-                   ON parent.id = child.parent_id \
-                  AND parent.lixcol_version_id = child.lixcol_version_id\
-             ), \
-             file_descriptor_rows AS (\
-                 SELECT \
-                    lix_json_extract(snapshot_content, 'id') AS id, \
-                    lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
-                    lix_json_extract(snapshot_content, 'name') AS name, \
-                    lix_json_extract(snapshot_content, 'extension') AS extension, \
-                    lix_json_extract(snapshot_content, 'metadata') AS metadata, \
-                    lix_json_extract(snapshot_content, 'hidden') AS hidden, \
-                    entity_id AS lixcol_entity_id, \
-                    schema_key AS lixcol_schema_key, \
-                    file_id AS lixcol_file_id, \
-                    version_id AS lixcol_version_id, \
-                    plugin_key AS lixcol_plugin_key, \
-                    schema_version AS lixcol_schema_version, \
-                    inherited_from_version_id AS lixcol_inherited_from_version_id, \
-                    change_id AS lixcol_change_id, \
-                    created_at AS lixcol_created_at, \
-                    updated_at AS lixcol_updated_at, \
-                    writer_key AS lixcol_writer_key, \
-                    untracked AS lixcol_untracked, \
-                    metadata AS lixcol_metadata \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_file_descriptor' \
-                   AND snapshot_content IS NOT NULL\
-             ) \
-             SELECT \
-                f.id, \
-                f.directory_id, \
-                f.name, \
-                f.extension, \
-                CASE \
-                    WHEN f.directory_id IS NULL THEN \
-                        CASE \
-                            WHEN f.extension IS NULL OR f.extension = '' THEN '/' || f.name \
-                            ELSE '/' || f.name || '.' || f.extension \
-                        END \
-                    WHEN dp.path IS NULL THEN NULL \
-                    ELSE \
-                        CASE \
-                            WHEN f.extension IS NULL OR f.extension = '' THEN dp.path || f.name \
-                            ELSE dp.path || f.name || '.' || f.extension \
-                        END \
-                END AS path, \
-                COALESCE(fd.data, bbs.data) AS data, \
-                f.metadata, \
-                f.hidden, \
-                f.lixcol_entity_id, \
-                f.lixcol_schema_key, \
-                f.lixcol_file_id, \
-                f.lixcol_version_id, \
-                f.lixcol_plugin_key, \
-                f.lixcol_schema_version, \
-                f.lixcol_inherited_from_version_id, \
-                f.lixcol_change_id, \
-                f.lixcol_created_at, \
-                f.lixcol_updated_at, \
-                v.commit_id AS lixcol_commit_id, \
-                f.lixcol_writer_key, \
-                f.lixcol_untracked, \
-                f.lixcol_metadata \
-             FROM file_descriptor_rows f \
-             LEFT JOIN directory_paths dp \
-               ON dp.id = f.directory_id \
-              AND dp.lixcol_version_id = f.lixcol_version_id \
-             LEFT JOIN lix_version v \
-               ON v.id = f.lixcol_version_id \
-             LEFT JOIN lix_internal_file_data_cache fd \
-               ON fd.file_id = f.id \
-              AND fd.version_id = f.lixcol_version_id \
-             LEFT JOIN lix_internal_binary_file_version_ref bfr \
-               ON bfr.file_id = f.id \
-              AND bfr.version_id = f.lixcol_version_id \
-             LEFT JOIN lix_internal_binary_blob_store bbs \
-               ON bbs.blob_hash = bfr.blob_hash"
-            .to_string(),
+        FILE_VIEW => {
+            let by_version_sql = build_file_by_version_projection_sql();
+            format!(
+                "SELECT \
+                    f.id, \
+                    f.directory_id, \
+                    f.name, \
+                    f.extension, \
+                    f.path, \
+                    f.data, \
+                    f.metadata, \
+                    f.hidden, \
+                    f.lixcol_entity_id, \
+                    f.lixcol_schema_key, \
+                    f.lixcol_file_id, \
+                    f.lixcol_plugin_key, \
+                    f.lixcol_schema_version, \
+                    f.lixcol_inherited_from_version_id, \
+                    f.lixcol_change_id, \
+                    f.lixcol_created_at, \
+                    f.lixcol_updated_at, \
+                    f.lixcol_commit_id, \
+                    f.lixcol_writer_key, \
+                    f.lixcol_untracked, \
+                    f.lixcol_metadata \
+                 FROM ({by_version_sql}) AS f \
+                 WHERE {active_version_scope}",
+                by_version_sql = by_version_sql,
+                active_version_scope = active_version_scope_predicate("f.lixcol_version_id")
+            )
+        }
+        FILE_BY_VERSION_VIEW => build_file_by_version_projection_sql(),
         FILE_HISTORY_VIEW | FILE_HISTORY_BY_VERSION_VIEW => {
             let state_history_view =
                 history_state_view_name(view_name).ok_or_else(|| LixError {
@@ -529,9 +352,20 @@ fn build_filesystem_projection_query(
                             ORDER BY \
                                 fhr.lixcol_depth ASC, \
                                 fhr.lixcol_commit_id DESC, \
-                                fhr.lixcol_change_id DESC\
+                            fhr.lixcol_change_id DESC\
                         ) - 1 AS lixcol_depth \
                     FROM file_history_rows fhr\
+                 ), \
+                 binary_blob_ref_history_rows AS (\
+                    SELECT \
+                        sh.file_id AS id, \
+                        sh.root_commit_id AS lixcol_root_commit_id, \
+                        sh.depth AS lixcol_depth, \
+                        lix_json_extract(sh.snapshot_content, 'blob_hash') AS blob_hash \
+                    FROM {state_history_view} sh \
+                    WHERE sh.schema_key = 'lix_binary_blob_ref' \
+                      AND sh.snapshot_content IS NOT NULL \
+                      {state_history_predicates_sh}\
                  ) \
                  SELECT \
                     f.id, \
@@ -548,7 +382,7 @@ fn build_filesystem_projection_query(
                                 ELSE dp.path || f.name || '.' || f.extension \
                             END \
                     END AS path, \
-                    fd.data AS data, \
+                    COALESCE(fd.data, bbs.data) AS data, \
                     f.metadata, \
                     f.hidden, \
                     f.lixcol_entity_id, \
@@ -576,7 +410,19 @@ fn build_filesystem_projection_query(
                  LEFT JOIN lix_internal_file_history_data_cache fd \
                    ON fd.file_id = f.id \
                   AND fd.root_commit_id = f.lixcol_root_commit_id \
-                  AND fd.depth = f.lixcol_depth",
+                  AND fd.depth = f.lixcol_depth \
+                 LEFT JOIN binary_blob_ref_history_rows bhr \
+                   ON bhr.id = f.id \
+                  AND bhr.lixcol_root_commit_id = f.lixcol_root_commit_id \
+                  AND bhr.lixcol_depth = (\
+                      SELECT MIN(candidate.lixcol_depth) \
+                      FROM binary_blob_ref_history_rows candidate \
+                      WHERE candidate.id = f.id \
+                        AND candidate.lixcol_root_commit_id = f.lixcol_root_commit_id \
+                        AND candidate.lixcol_depth >= f.lixcol_raw_depth\
+                  ) \
+                 LEFT JOIN lix_internal_binary_blob_store bbs \
+                   ON bbs.blob_hash = bhr.blob_hash",
                 state_history_view = state_history_view,
                 state_history_predicates = state_history_predicates,
                 state_history_predicates_sh = state_history_predicates_sh,
@@ -819,6 +665,111 @@ fn build_filesystem_projection_query(
     };
 
     Ok(Some(parse_single_query(&sql)?))
+}
+
+fn build_file_by_version_projection_sql() -> String {
+    "WITH RECURSIVE directory_descriptor_rows AS (\
+         SELECT \
+            lix_json_extract(snapshot_content, 'id') AS id, \
+            lix_json_extract(snapshot_content, 'parent_id') AS parent_id, \
+            lix_json_extract(snapshot_content, 'name') AS name, \
+            version_id AS lixcol_version_id \
+         FROM lix_state_by_version \
+         WHERE schema_key = 'lix_directory_descriptor' \
+           AND snapshot_content IS NOT NULL\
+     ), \
+     directory_paths AS (\
+         SELECT \
+            d.id, \
+            d.lixcol_version_id, \
+            '/' || d.name || '/' AS path \
+         FROM directory_descriptor_rows d \
+         WHERE d.parent_id IS NULL \
+         UNION ALL \
+         SELECT \
+            child.id, \
+            child.lixcol_version_id, \
+            parent.path || child.name || '/' AS path \
+         FROM directory_descriptor_rows child \
+         JOIN directory_paths parent \
+           ON parent.id = child.parent_id \
+          AND parent.lixcol_version_id = child.lixcol_version_id\
+     ), \
+     file_descriptor_rows AS (\
+         SELECT \
+            lix_json_extract(snapshot_content, 'id') AS id, \
+            lix_json_extract(snapshot_content, 'directory_id') AS directory_id, \
+            lix_json_extract(snapshot_content, 'name') AS name, \
+            lix_json_extract(snapshot_content, 'extension') AS extension, \
+            lix_json_extract(snapshot_content, 'metadata') AS metadata, \
+            lix_json_extract(snapshot_content, 'hidden') AS hidden, \
+            entity_id AS lixcol_entity_id, \
+            schema_key AS lixcol_schema_key, \
+            file_id AS lixcol_file_id, \
+            version_id AS lixcol_version_id, \
+            plugin_key AS lixcol_plugin_key, \
+            schema_version AS lixcol_schema_version, \
+            inherited_from_version_id AS lixcol_inherited_from_version_id, \
+            change_id AS lixcol_change_id, \
+            created_at AS lixcol_created_at, \
+            updated_at AS lixcol_updated_at, \
+            writer_key AS lixcol_writer_key, \
+            untracked AS lixcol_untracked, \
+            metadata AS lixcol_metadata \
+         FROM lix_state_by_version \
+         WHERE schema_key = 'lix_file_descriptor' \
+           AND snapshot_content IS NOT NULL\
+     ) \
+     SELECT \
+        f.id, \
+        f.directory_id, \
+        f.name, \
+        f.extension, \
+        CASE \
+            WHEN f.directory_id IS NULL THEN \
+                CASE \
+                    WHEN f.extension IS NULL OR f.extension = '' THEN '/' || f.name \
+                    ELSE '/' || f.name || '.' || f.extension \
+                END \
+            WHEN dp.path IS NULL THEN NULL \
+            ELSE \
+                CASE \
+                    WHEN f.extension IS NULL OR f.extension = '' THEN dp.path || f.name \
+                    ELSE dp.path || f.name || '.' || f.extension \
+                END \
+        END AS path, \
+        COALESCE(fd.data, bbs.data) AS data, \
+        f.metadata, \
+        f.hidden, \
+        f.lixcol_entity_id, \
+        f.lixcol_schema_key, \
+        f.lixcol_file_id, \
+        f.lixcol_version_id, \
+        f.lixcol_plugin_key, \
+        f.lixcol_schema_version, \
+        f.lixcol_inherited_from_version_id, \
+        f.lixcol_change_id, \
+        f.lixcol_created_at, \
+        f.lixcol_updated_at, \
+        v.commit_id AS lixcol_commit_id, \
+        f.lixcol_writer_key, \
+        f.lixcol_untracked, \
+        f.lixcol_metadata \
+     FROM file_descriptor_rows f \
+     LEFT JOIN directory_paths dp \
+       ON dp.id = f.directory_id \
+      AND dp.lixcol_version_id = f.lixcol_version_id \
+     LEFT JOIN lix_version v \
+       ON v.id = f.lixcol_version_id \
+     LEFT JOIN lix_internal_file_data_cache fd \
+       ON fd.file_id = f.id \
+      AND fd.version_id = f.lixcol_version_id \
+     LEFT JOIN lix_internal_binary_file_version_ref bfr \
+       ON bfr.file_id = f.id \
+      AND bfr.version_id = f.lixcol_version_id \
+     LEFT JOIN lix_internal_binary_blob_store bbs \
+       ON bbs.blob_hash = bfr.blob_hash"
+        .to_string()
 }
 
 fn collect_history_pushdown_predicates(
@@ -1205,6 +1156,25 @@ mod tests {
         assert!(rewritten.contains("directory_paths"));
         assert!(!rewritten.contains("dir_level_0"));
         assert!(!rewritten.contains("dir_level_1"));
+    }
+
+    #[test]
+    fn rewrites_file_history_reads_with_binary_blob_fallback() {
+        let sql = "SELECT id, data FROM lix_file_history WHERE id = 'f1'";
+        let statements = parse_sql_statements(sql).expect("parse");
+        let query = match statements.into_iter().next().expect("statement") {
+            sqlparser::ast::Statement::Query(query) => *query,
+            _ => panic!("expected query"),
+        };
+        let rewritten = rewrite_query(query)
+            .expect("rewrite")
+            .expect("query should be rewritten")
+            .to_string();
+
+        assert!(rewritten.contains("COALESCE(fd.data, bbs.data) AS data"));
+        assert!(rewritten.contains("binary_blob_ref_history_rows"));
+        assert!(rewritten.contains("schema_key = 'lix_binary_blob_ref'"));
+        assert!(rewritten.contains("LEFT JOIN lix_internal_binary_blob_store bbs"));
     }
 
     #[test]

@@ -493,8 +493,8 @@ simulation_test!(
             .await
             .expect("decode read should succeed");
 
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "insert-value");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "insert-value");
     }
 );
 
@@ -533,8 +533,8 @@ simulation_test!(
             .await
             .expect("decode read should succeed");
 
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "after");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "after");
     }
 );
 
@@ -578,8 +578,8 @@ simulation_test!(
             .await
             .expect("decode read should succeed");
 
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "cache-miss");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "cache-miss");
     }
 );
 
@@ -614,8 +614,8 @@ simulation_test!(
             )
             .await
             .expect("blob hash query should succeed");
-        assert_eq!(blob_hash_rows.rows.len(), 1);
-        let blob_hash = match &blob_hash_rows.rows[0][0] {
+        assert_eq!(blob_hash_rows.statements[0].rows.len(), 1);
+        let blob_hash = match &blob_hash_rows.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text blob hash, got {other:?}"),
         };
@@ -650,8 +650,8 @@ simulation_test!(
             .await
             .expect("decode read should succeed");
 
-        assert_eq!(rows.rows.len(), 1);
-        assert_text(&rows.rows[0][0], "manifest-only");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "manifest-only");
     }
 );
 
@@ -686,8 +686,8 @@ simulation_test!(
             )
             .await
             .expect("blob hash query should succeed");
-        assert_eq!(blob_hash_rows.rows.len(), 1);
-        let blob_hash = match &blob_hash_rows.rows[0][0] {
+        assert_eq!(blob_hash_rows.statements[0].rows.len(), 1);
+        let blob_hash = match &blob_hash_rows.statements[0].rows[0][0] {
             Value::Text(value) => value.clone(),
             other => panic!("expected text blob hash, got {other:?}"),
         };
