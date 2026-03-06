@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::commit::{
     append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
+    AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
     AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
 };
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
@@ -47,6 +48,36 @@ pub(crate) struct PreparedExecutionContext {
 
 pub(crate) struct CacheTargets {
     pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
+}
+
+struct Sql2AppendInvariantChecker<'a> {
+    planned_write: &'a crate::sql2::planner::ir::PlannedWrite,
+    schema_cache: crate::validation::SchemaCache,
+}
+
+impl<'a> Sql2AppendInvariantChecker<'a> {
+    fn new(planned_write: &'a crate::sql2::planner::ir::PlannedWrite) -> Self {
+        Self {
+            planned_write,
+            schema_cache: crate::validation::SchemaCache::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl AppendCommitInvariantChecker for Sql2AppendInvariantChecker<'_> {
+    async fn recheck_invariants(
+        &mut self,
+        transaction: &mut dyn LixTransaction,
+    ) -> Result<(), AppendCommitError> {
+        let backend = TransactionBackendAdapter::new(transaction);
+        validate_sql2_append_time_write(&backend, &self.schema_cache, self.planned_write)
+            .await
+            .map_err(|error| AppendCommitError {
+                kind: AppendCommitErrorKind::Internal,
+                message: error.description,
+            })
+    }
 }
 
 pub(crate) async fn prepare_execution_with_backend(
@@ -208,17 +239,6 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         }
     }
 
-    {
-        let validation_backend = TransactionBackendAdapter::new(transaction);
-        let validation_cache = crate::validation::SchemaCache::new();
-        validate_sql2_append_time_write(
-            &validation_backend,
-            &validation_cache,
-            &sql2_write.planned_write,
-        )
-        .await?;
-    }
-
     if domain_change_batch.changes.is_empty() {
         return Ok(Some(SqlExecutionOutcome {
             public_result: QueryResult {
@@ -233,6 +253,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
 
     let mut append_functions = prepared.functions.clone();
     let timestamp = append_functions.timestamp();
+    let mut invariant_checker = Sql2AppendInvariantChecker::new(&sql2_write.planned_write);
     let append_result = append_commit_if_preconditions_hold(
         transaction,
         AppendCommitArgs {
@@ -245,6 +266,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             )?,
         },
         &mut append_functions,
+        Some(&mut invariant_checker),
     )
     .await
     .map_err(append_commit_error_to_lix_error)?;
