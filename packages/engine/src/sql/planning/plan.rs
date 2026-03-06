@@ -1,5 +1,6 @@
 use crate::cel::CelEvaluator;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::LixBackend;
 use crate::Value;
 use std::collections::BTreeSet;
@@ -21,6 +22,7 @@ pub(crate) async fn build_execution_plan<P>(
     evaluator: &CelEvaluator,
     parsed_statements: Vec<Statement>,
     params: &[Value],
+    dependency_spec_override: Option<DependencySpec>,
     functions: SharedFunctionProvider<P>,
     detected_file_domain_changes_by_statement: &DetectedFileDomainChangesByStatement,
     pending_file_delete_targets: &BTreeSet<(String, String)>,
@@ -44,8 +46,11 @@ where
     .map_err(PlannerError::preprocess)?;
 
     let requirements = derive_plan_requirements(&parsed_statements);
-    let dependency_spec = derive_dependency_spec_from_statements(&parsed_statements, params)
-        .map_err(PlannerError::parse)?;
+    let dependency_spec = match dependency_spec_override {
+        Some(spec) => spec,
+        None => derive_dependency_spec_from_statements(&parsed_statements, params)
+            .map_err(PlannerError::parse)?,
+    };
     let effects = derive_plan_effects(
         &preprocess,
         writer_key,

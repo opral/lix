@@ -84,6 +84,9 @@ pub(crate) async fn prepare_execution_with_backend(
         &engine.cel_evaluator,
         statements,
         params,
+        sql2_read
+            .as_ref()
+            .and_then(|prepared| prepared.dependency_spec.clone()),
         functions.clone(),
         &intent.detected_file_domain_changes_by_statement,
         &intent.pending_file_delete_targets,

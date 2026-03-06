@@ -1,6 +1,8 @@
 use crate::sql2::catalog::SurfaceRegistry;
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::canonicalize::{canonicalize_read, CanonicalizedRead};
+use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::{LixBackend, Value};
 use sqlparser::ast::Statement;
 
@@ -8,12 +10,14 @@ use sqlparser::ast::Statement;
 pub(crate) struct Sql2DebugTrace {
     pub(crate) bound_statements: Vec<BoundStatement>,
     pub(crate) surface_bindings: Vec<String>,
+    pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) lowered_sql: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Sql2PreparedRead {
     pub(crate) canonicalized: CanonicalizedRead,
+    pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) debug_trace: Sql2DebugTrace,
 }
 
@@ -42,13 +46,16 @@ pub(crate) async fn prepare_sql2_read(
         },
     );
     let canonicalized = canonicalize_read(bound_statement.clone(), &registry).ok()?;
+    let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
 
     Some(Sql2PreparedRead {
         debug_trace: Sql2DebugTrace {
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
+            dependency_spec: dependency_spec.clone(),
             lowered_sql: Vec::new(),
         },
+        dependency_spec,
         canonicalized,
     })
 }
@@ -119,6 +126,18 @@ mod tests {
         .expect("builtin entity read should canonicalize");
 
         assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_key_value"]);
+        assert_eq!(
+            prepared
+                .dependency_spec
+                .expect("dependency spec should be derived")
+                .schema_keys
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                "lix_active_version".to_string(),
+                "lix_key_value".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -160,6 +179,7 @@ mod tests {
                 .as_deref(),
             Some("message")
         );
+        assert!(prepared.dependency_spec.is_some());
     }
 
     #[tokio::test]
@@ -169,6 +189,23 @@ mod tests {
             &backend,
             &parse_one(
                 "SELECT * FROM lix_state s JOIN lix_state_by_version b ON s.entity_id = b.entity_id",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+    }
+
+    #[tokio::test]
+    async fn returns_none_for_nested_subqueries_that_stay_on_legacy_path() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT entity_id FROM lix_state WHERE entity_id IN (SELECT entity_id FROM lix_state_by_version)",
             ),
             &[],
             "main",
