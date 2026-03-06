@@ -1,7 +1,7 @@
-use crate::engine::sql::ast::utils::{resolve_placeholder_index, PlaceholderState};
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::ir::{ReadPlan, VersionScope};
 use crate::sql_shared::dependency_spec::{DependencyPrecision, DependencySpec};
+use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
     BinaryOperator, Expr, Query, Statement, TableFactor, UnaryOperator, Value as SqlValue, Visit,

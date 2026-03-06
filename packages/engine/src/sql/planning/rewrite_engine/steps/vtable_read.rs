@@ -1233,7 +1233,7 @@ async fn fetch_registered_schema_keys(backend: &dyn LixBackend) -> Result<Vec<St
     let result = backend
         .execute(
             "SELECT entity_id \
-             FROM lix_internal_state_materialized_v1_lix_stored_schema \
+             FROM lix_internal_stored_schema_bootstrap \
              WHERE schema_key = 'lix_stored_schema' \
                AND version_id = 'global' \
                AND is_tombstone = 0 \

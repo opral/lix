@@ -206,6 +206,8 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
         let source = fs::read_to_string(&file).expect("source file should be readable");
         for forbidden in [
             "crate::engine::sql::planning::",
+            "crate::engine::sql::ast::utils",
+            "crate::sql::ast::utils",
             "crate::engine::sql::execution::followup",
             "crate::engine::sql::surfaces::registry",
             "rewrite_engine",
