@@ -2,6 +2,9 @@ use crate::sql2::catalog::SurfaceRegistry;
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::canonicalize::{canonicalize_read, CanonicalizedRead};
 use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+use crate::sql2::planner::semantics::effective_state_resolver::{
+    build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
+};
 use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::{LixBackend, Value};
 use sqlparser::ast::Statement;
@@ -11,6 +14,8 @@ pub(crate) struct Sql2DebugTrace {
     pub(crate) bound_statements: Vec<BoundStatement>,
     pub(crate) surface_bindings: Vec<String>,
     pub(crate) dependency_spec: Option<DependencySpec>,
+    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
+    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
     pub(crate) lowered_sql: Vec<String>,
 }
 
@@ -18,6 +23,8 @@ pub(crate) struct Sql2DebugTrace {
 pub(crate) struct Sql2PreparedRead {
     pub(crate) canonicalized: CanonicalizedRead,
     pub(crate) dependency_spec: Option<DependencySpec>,
+    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
+    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
     pub(crate) debug_trace: Sql2DebugTrace,
 }
 
@@ -47,15 +54,21 @@ pub(crate) async fn prepare_sql2_read(
     );
     let canonicalized = canonicalize_read(bound_statement.clone(), &registry).ok()?;
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
+    let (effective_state_request, effective_state_plan) =
+        build_effective_state(&canonicalized, dependency_spec.as_ref())?;
 
     Some(Sql2PreparedRead {
         debug_trace: Sql2DebugTrace {
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
             dependency_spec: dependency_spec.clone(),
+            effective_state_request: Some(effective_state_request.clone()),
+            effective_state_plan: Some(effective_state_plan.clone()),
             lowered_sql: Vec::new(),
         },
         dependency_spec,
+        effective_state_request: Some(effective_state_request),
+        effective_state_plan: Some(effective_state_plan),
         canonicalized,
     })
 }
@@ -138,6 +151,15 @@ mod tests {
                 "lix_key_value".to_string()
             ]
         );
+        assert_eq!(
+            prepared
+                .effective_state_request
+                .expect("effective-state request should be built")
+                .schema_set
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["lix_key_value".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -180,6 +202,7 @@ mod tests {
             Some("message")
         );
         assert!(prepared.dependency_spec.is_some());
+        assert!(prepared.effective_state_plan.is_some());
     }
 
     #[tokio::test]
