@@ -21,6 +21,15 @@ const INIT_STATEMENTS: &[&str] = &[
      metadata TEXT,\
      created_at TEXT NOT NULL\
      )",
+    "CREATE TABLE IF NOT EXISTS lix_internal_commit_idempotency (\
+     write_lane TEXT NOT NULL,\
+     idempotency_key TEXT NOT NULL,\
+     commit_id TEXT NOT NULL,\
+     created_at TEXT NOT NULL,\
+     PRIMARY KEY (write_lane, idempotency_key)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_commit_idempotency_commit_id \
+     ON lix_internal_commit_idempotency (commit_id)",
     "CREATE TABLE IF NOT EXISTS lix_internal_stored_schema_bootstrap (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\

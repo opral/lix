@@ -1,6 +1,19 @@
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProposedDomainChange {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) schema_version: Option<String>,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) version_id: String,
+    pub(crate) writer_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainChangeInput {
     pub id: String,
     pub entity_id: String,
