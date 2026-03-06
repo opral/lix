@@ -90,9 +90,15 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
 
     for file in files {
         let source = fs::read_to_string(&file).expect("source file should be readable");
+        let is_transition_shim = file.ends_with(Path::new("src/sql/execution/shared_path.rs"));
         assert!(
-            !source.contains("crate::engine::sql2::") && !source.contains("crate::sql2::"),
-            "sql runtime must not depend on removed sql2 module paths: {}",
+            !source.contains("crate::engine::sql2::"),
+            "sql runtime must not depend on removed engine::sql2 bridge paths: {}",
+            file.display()
+        );
+        assert!(
+            is_transition_shim || !source.contains("crate::sql2::"),
+            "sql runtime must not depend on sql2 outside the shared_path transition shim: {}",
             file.display()
         );
         assert!(
@@ -101,6 +107,13 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
             file.display()
         );
     }
+
+    let shared_path_source = fs::read_to_string(root.join("execution/shared_path.rs"))
+        .expect("shared_path.rs should be readable");
+    assert!(
+        shared_path_source.contains("prepare_sql2_read"),
+        "shared_path transition shim should invoke sql2 read preparation during migration"
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
+use crate::sql2::runtime::{prepare_sql2_read, Sql2PreparedRead};
 use crate::validation::{validate_inserts, validate_updates};
 use crate::{LixBackend, LixError, Value};
 
@@ -25,6 +26,7 @@ pub(crate) struct PreparedExecutionContext {
     pub(crate) sequence_start: i64,
     pub(crate) functions: SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) plan: ExecutionPlan,
+    pub(crate) sql2_read: Option<Sql2PreparedRead>,
 }
 
 pub(crate) struct CacheTargets {
@@ -59,6 +61,9 @@ pub(crate) async fn prepare_execution_with_backend(
             active_version_id,
         )
         .await?;
+
+    let sql2_read =
+        prepare_sql2_read(backend, &statements, params, active_version_id, writer_key).await;
 
     let intent = collect_execution_intent_with_backend(
         engine,
@@ -107,6 +112,7 @@ pub(crate) async fn prepare_execution_with_backend(
         sequence_start,
         functions,
         plan,
+        sql2_read,
     })
 }
 
