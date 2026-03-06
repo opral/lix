@@ -7,8 +7,9 @@ use crate::sql2::planner::ir::{
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
-    Expr, GroupByExpr, Insert, LimitClause, ObjectNamePart, OrderBy, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue, Visit, Visitor,
+    AssignmentTarget, Delete, Expr, FromTable, GroupByExpr, Insert, LimitClause, ObjectNamePart,
+    OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, Update, Value as SqlValue, Visit, Visitor,
 };
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -121,29 +122,24 @@ pub(crate) fn canonicalize_write(
     bound_statement: BoundStatement,
     registry: &SurfaceRegistry,
 ) -> Result<CanonicalizedWrite, CanonicalizeError> {
-    if bound_statement.statement_kind != StatementKind::Insert {
-        return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports INSERT statements",
-        ));
+    let statement = bound_statement.statement.clone();
+    match statement {
+        Statement::Insert(insert) => canonicalize_insert_write(bound_statement, &insert, registry),
+        Statement::Update(update) => canonicalize_update_write(bound_statement, &update, registry),
+        Statement::Delete(delete) => canonicalize_delete_write(bound_statement, &delete, registry),
+        _ => Err(CanonicalizeError::unsupported(
+            "sql2 day-1 write canonicalizer only supports INSERT/UPDATE/DELETE statements",
+        )),
     }
+}
 
-    let Statement::Insert(insert) = &bound_statement.statement else {
-        return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer requires a top-level INSERT",
-        ));
-    };
+fn canonicalize_insert_write(
+    bound_statement: BoundStatement,
+    insert: &Insert,
+    registry: &SurfaceRegistry,
+) -> Result<CanonicalizedWrite, CanonicalizeError> {
     let surface_binding = bind_insert_surface(insert, registry)?;
-    if !surface_binding.resolution_capabilities.semantic_write {
-        return Err(CanonicalizeError::unsupported(format!(
-            "surface '{}' is not writable in sql2",
-            surface_binding.descriptor.public_name
-        )));
-    }
-    if surface_binding.descriptor.surface_family != SurfaceFamily::State {
-        return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports lix_state* surfaces",
-        ));
-    }
+    validate_state_write_surface(&surface_binding, insert_write_surface_supported)?;
     if !insert.assignments.is_empty() || insert.on.is_some() || insert.returning.is_some() {
         return Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer only supports plain VALUES inserts without ON CONFLICT or RETURNING",
@@ -162,6 +158,85 @@ pub(crate) fn canonicalize_write(
             selector: WriteSelector::default(),
             payload: MutationPayload::FullSnapshot(payload),
             mode,
+            execution_context: bound_statement.execution_context,
+        },
+    })
+}
+
+fn canonicalize_update_write(
+    bound_statement: BoundStatement,
+    update: &Update,
+    registry: &SurfaceRegistry,
+) -> Result<CanonicalizedWrite, CanonicalizeError> {
+    if update.from.is_some()
+        || update.returning.is_some()
+        || update.limit.is_some()
+        || update.or.is_some()
+    {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 update canonicalizer only supports simple UPDATE statements without FROM/RETURNING/LIMIT/OR",
+        ));
+    }
+    let surface_binding = bind_update_surface(update, registry)?;
+    validate_state_write_surface(&surface_binding, update_delete_surface_supported)?;
+    let selection = update.selection.as_ref().ok_or_else(|| {
+        CanonicalizeError::unsupported(
+            "sql2 day-1 update canonicalizer requires an explicit WHERE predicate",
+        )
+    })?;
+    let payload = assignment_payload(&update.assignments, &bound_statement.bound_parameters)?;
+    let mode = write_mode_from_payload(&payload);
+
+    Ok(CanonicalizedWrite {
+        bound_statement: bound_statement.clone(),
+        surface_binding: surface_binding.clone(),
+        write_command: WriteCommand {
+            operation_kind: WriteOperationKind::Update,
+            target: surface_binding,
+            selector: WriteSelector {
+                residual_predicates: vec![selection.to_string()],
+            },
+            payload: MutationPayload::Patch(payload),
+            mode,
+            execution_context: bound_statement.execution_context,
+        },
+    })
+}
+
+fn canonicalize_delete_write(
+    bound_statement: BoundStatement,
+    delete: &Delete,
+    registry: &SurfaceRegistry,
+) -> Result<CanonicalizedWrite, CanonicalizeError> {
+    if !delete.tables.is_empty()
+        || delete.using.is_some()
+        || delete.returning.is_some()
+        || !delete.order_by.is_empty()
+        || delete.limit.is_some()
+    {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 delete canonicalizer only supports simple DELETE statements without USING/RETURNING/ORDER BY/LIMIT",
+        ));
+    }
+    let surface_binding = bind_delete_surface(delete, registry)?;
+    validate_state_write_surface(&surface_binding, update_delete_surface_supported)?;
+    let selection = delete.selection.as_ref().ok_or_else(|| {
+        CanonicalizeError::unsupported(
+            "sql2 day-1 delete canonicalizer requires an explicit WHERE predicate",
+        )
+    })?;
+
+    Ok(CanonicalizedWrite {
+        bound_statement: bound_statement.clone(),
+        surface_binding: surface_binding.clone(),
+        write_command: WriteCommand {
+            operation_kind: WriteOperationKind::Delete,
+            target: surface_binding,
+            selector: WriteSelector {
+                residual_predicates: vec![selection.to_string()],
+            },
+            payload: MutationPayload::Tombstone,
+            mode: WriteMode::Tracked,
             execution_context: bound_statement.execution_context,
         },
     })
@@ -321,6 +396,90 @@ fn bind_insert_surface(
     })
 }
 
+fn bind_update_surface(
+    update: &Update,
+    registry: &SurfaceRegistry,
+) -> Result<SurfaceBinding, CanonicalizeError> {
+    bind_table_with_joins_surface(&update.table, registry)
+}
+
+fn bind_delete_surface(
+    delete: &Delete,
+    registry: &SurfaceRegistry,
+) -> Result<SurfaceBinding, CanonicalizeError> {
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    let [table] = tables.as_slice() else {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 delete canonicalizer requires a single table target",
+        ));
+    };
+    bind_table_with_joins_surface(table, registry)
+}
+
+fn bind_table_with_joins_surface(
+    table: &TableWithJoins,
+    registry: &SurfaceRegistry,
+) -> Result<SurfaceBinding, CanonicalizeError> {
+    if !table.joins.is_empty() {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 write canonicalizer does not support JOIN targets",
+        ));
+    }
+    let TableFactor::Table { name, .. } = &table.relation else {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 write canonicalizer only supports direct table targets",
+        ));
+    };
+    registry.bind_object_name(name).ok_or_else(|| {
+        let surface_name = name
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.clone())
+            .unwrap_or_else(|| name.to_string());
+        CanonicalizeError::unsupported(format!(
+            "surface '{surface_name}' is not registered in sql2 SurfaceRegistry"
+        ))
+    })
+}
+
+fn validate_state_write_surface(
+    surface_binding: &SurfaceBinding,
+    surface_rule: impl Fn(&SurfaceBinding) -> bool,
+) -> Result<(), CanonicalizeError> {
+    if !surface_binding.resolution_capabilities.semantic_write {
+        return Err(CanonicalizeError::unsupported(format!(
+            "surface '{}' is not writable in sql2",
+            surface_binding.descriptor.public_name
+        )));
+    }
+    if surface_binding.descriptor.surface_family != SurfaceFamily::State {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 write canonicalizer only supports lix_state* surfaces",
+        ));
+    }
+    if !surface_rule(surface_binding) {
+        return Err(CanonicalizeError::unsupported(format!(
+            "sql2 day-1 write canonicalizer does not yet support '{}' for this operation",
+            surface_binding.descriptor.public_name
+        )));
+    }
+    Ok(())
+}
+
+fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
+    matches!(
+        surface_binding.descriptor.public_name.as_str(),
+        "lix_state" | "lix_state_by_version"
+    )
+}
+
+fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
+    surface_binding.descriptor.public_name == "lix_state_by_version"
+}
+
 fn insert_payload(
     insert: &Insert,
     params: &[Value],
@@ -353,6 +512,40 @@ fn insert_payload(
     for (column, expr) in insert.columns.iter().zip(row.iter()) {
         let value = expr_to_value(expr, params, &mut placeholder_state)?;
         payload.insert(column.value.to_ascii_lowercase(), value);
+    }
+    Ok(payload)
+}
+
+fn assignment_payload(
+    assignments: &[sqlparser::ast::Assignment],
+    params: &[Value],
+) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
+    if assignments.is_empty() {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 update canonicalizer requires at least one assignment",
+        ));
+    }
+
+    let mut placeholder_state = PlaceholderState::new();
+    let mut payload = BTreeMap::new();
+    for assignment in assignments {
+        let AssignmentTarget::ColumnName(column_name) = &assignment.target else {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 update canonicalizer only supports named column assignments",
+            ));
+        };
+        let key = column_name
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.to_ascii_lowercase())
+            .ok_or_else(|| {
+                CanonicalizeError::unsupported(
+                    "sql2 day-1 update canonicalizer requires named assignment columns",
+                )
+            })?;
+        let value = expr_to_value(&assignment.value, params, &mut placeholder_state)?;
+        payload.insert(key, value);
     }
     Ok(payload)
 }

@@ -3,7 +3,9 @@ use crate::sql2::planner::ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteMode,
 };
+use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
+use sqlparser::ast::{BinaryOperator, Expr, Statement, Value as SqlValue};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +61,7 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
             }
         }
         crate::sql2::catalog::DefaultScopeSemantics::ExplicitVersion => {
-            let Some(version_id) = payload_text_value(canonicalized, "version_id") else {
+            let Some(version_id) = write_text_value(canonicalized, "version_id") else {
                 return Err(ProofError {
                     message: format!(
                         "sql2 write proof requires explicit version_id for '{}'",
@@ -85,16 +87,20 @@ fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
         return SchemaProof::Exact(BTreeSet::from([schema_key]));
     }
 
-    match payload_text_value(canonicalized, "schema_key") {
+    match write_text_value(canonicalized, "schema_key") {
         Some(schema_key) => SchemaProof::Exact(BTreeSet::from([schema_key])),
         None => SchemaProof::Unknown,
     }
 }
 
 fn prove_target_set(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
-    payload_text_value(canonicalized, "entity_id")
+    write_text_value(canonicalized, "entity_id")
         .map(|entity_id| TargetSetProof::Exact(BTreeSet::from([entity_id])))
         .or(Some(TargetSetProof::Unknown))
+}
+
+fn write_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
+    payload_text_value(canonicalized, key).or_else(|| selection_text_value(canonicalized, key))
 }
 
 fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
@@ -106,6 +112,90 @@ fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<S
 
     match payload.get(key) {
         Some(Value::Text(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn selection_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
+    let selection = match &canonicalized.bound_statement.statement {
+        Statement::Update(update) => update.selection.as_ref(),
+        Statement::Delete(delete) => delete.selection.as_ref(),
+        _ => None,
+    }?;
+    let mut placeholder_state = PlaceholderState::new();
+    extract_string_equality(
+        selection,
+        key,
+        &canonicalized.bound_statement.bound_parameters,
+        &mut placeholder_state,
+    )
+}
+
+fn extract_string_equality(
+    expr: &Expr,
+    key: &str,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Option<String> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => extract_string_equality(left, key, params, placeholder_state)
+            .or_else(|| extract_string_equality(right, key, params, placeholder_state)),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if expr_references_column(left, key) {
+                expr_to_string_value(right, params, placeholder_state)
+            } else if expr_references_column(right, key) {
+                expr_to_string_value(left, params, placeholder_state)
+            } else {
+                None
+            }
+        }
+        Expr::Nested(inner) => extract_string_equality(inner, key, params, placeholder_state),
+        _ => None,
+    }
+}
+
+fn expr_references_column(expr: &Expr, key: &str) -> bool {
+    match expr {
+        Expr::Identifier(identifier) => identifier.value.eq_ignore_ascii_case(key),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case(key)),
+        Expr::Nested(inner) => expr_references_column(inner, key),
+        _ => false,
+    }
+}
+
+fn expr_to_string_value(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+) -> Option<String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::SingleQuotedString(value)
+            | SqlValue::DoubleQuotedString(value)
+            | SqlValue::TripleSingleQuotedString(value)
+            | SqlValue::TripleDoubleQuotedString(value) => Some(value.clone()),
+            SqlValue::Placeholder(token) => {
+                let index =
+                    resolve_placeholder_index(token, params.len(), placeholder_state).ok()?;
+                match params.get(index) {
+                    Some(Value::Text(value)) => Some(value.clone()),
+                    Some(Value::Integer(value)) => Some(value.to_string()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        Expr::Nested(inner) => expr_to_string_value(inner, params, placeholder_state),
         _ => None,
     }
 }
@@ -172,6 +262,34 @@ mod tests {
         assert_eq!(
             planned.scope_proof,
             ScopeProof::SingleVersion("version-a".to_string())
+        );
+    }
+
+    #[test]
+    fn proves_scope_and_target_from_lix_state_by_version_update_predicate() {
+        let planned = prove_write(&canonicalized_write(
+            "UPDATE lix_state_by_version \
+             SET snapshot_content = '{\"value\":\"after\"}' \
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'entity-1' \
+               AND version_id = 'version-a'",
+            "main",
+        ))
+        .expect("proofs should succeed");
+
+        assert_eq!(
+            planned.scope_proof,
+            ScopeProof::SingleVersion("version-a".to_string())
+        );
+        assert_eq!(
+            planned.schema_proof,
+            SchemaProof::Exact(BTreeSet::from(["lix_key_value".to_string()]))
+        );
+        assert_eq!(
+            planned.target_set_proof,
+            Some(TargetSetProof::Exact(BTreeSet::from([
+                "entity-1".to_string()
+            ])))
         );
     }
 }
