@@ -1583,5 +1583,7 @@ The rewrite is done when all of the following are true:
 - 2026-03-06: Re-guided the migration around the existing `packages/engine/tests/**` integration suite as the primary source of truth, with targeted differential/unit tests as secondary diagnostics and no separate shadow rollout protocol for v1.
 - 2026-03-06: Added a tiny day-1 `ReadPlan` shell (`Scan`, `Filter`, `Project`, `Sort`, `Limit`) so migrated reads keep basic query shape inside the semantic boundary without forcing a full optimizer algebra.
 - 2026-03-06: Landed the first implementation checkpoint: scaffolded `packages/engine/src/sql2/`, added the initial `BoundStatement`/`SurfaceRegistry`/day-1 IR and effective-state contract types, and replaced the old “`sql2` must stay removed” guardrail with migration guardrails that keep `sql2` isolated from legacy rewrite, followup, and classifier code.
+- 2026-03-06 13:16 PST: Committed the first implementation checkpoint as `a4d8ec45` (`Add initial sql2 semantic rewrite scaffold`) before starting the next slice so the clean-slate boundary and migration guardrails are preserved as an explicit checkpoint.
+- 2026-03-06 13:19 PST: Landed the next checkpoint in `sql2` by adding a day-1 read canonicalizer for simple `SELECT` statements over `lix_state*` and schema-derived entity surfaces, producing `ReadCommand` plans rooted in `CanonicalStateScan` with explicit `Filter`/`Project`/`Sort`/`Limit` nodes instead of leaving that shape implicit in legacy rewrite code.
 
 (use timestamps e.g. hour minuate from now on in logs)

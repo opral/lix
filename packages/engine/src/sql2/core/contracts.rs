@@ -37,6 +37,21 @@ pub(crate) struct BoundStatement {
 }
 
 impl BoundStatement {
+    pub(crate) fn from_statement(
+        statement: Statement,
+        bound_parameters: Vec<Value>,
+        execution_context: ExecutionContext,
+    ) -> Self {
+        let statement_kind = crate::sql2::core::parser::statement_kind(&statement);
+        Self::new(
+            statement,
+            statement_kind,
+            bound_parameters,
+            Vec::new(),
+            execution_context,
+        )
+    }
+
     pub(crate) fn new(
         statement: Statement,
         statement_kind: StatementKind,
