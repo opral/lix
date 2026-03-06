@@ -75,4 +75,4 @@ Real production workloads will surface performance issues and bugs that should b
 
 AX testing? Yes. That's a fundamental shift in 2026. The old way of discussing APIs and/or conducting user interviews are not needed anymore. Ask an agent to do a task, then follow up with "What friction points did you run into?" and fix the friction points.
 
-![](./ax-testing.png)
+![AX testing](./ax-testing.png)
