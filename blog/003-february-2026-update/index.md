@@ -1,10 +1,10 @@
-# ---
+---
 date: "2026-03-04"
 og:description: "The Rust rewrite is complete. 33x faster file writes, lix was trending on HackerNews, and what's next in March."
 og:image: "./cover.png"
 ---
 
-February 2026 Update: Rust Rewrite Complete
+# February 2026 Update: Rust Rewrite Complete
 
 **TL;DR**
 
@@ -59,7 +59,7 @@ Lix was trending on HackerNews in late January. The outcome was an instant jump 
 
 [https://news.ycombinator.com/item?id=46713387](https://news.ycombinator.com/item?id=46713387)
 
-![](./github-stars.png)
+![HackerNews trending](./github-stars.png)
 
 ![GitHub stars growth](./hackernews.png)
 
