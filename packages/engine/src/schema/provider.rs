@@ -6,7 +6,7 @@ use serde_json::{json, Value as JsonValue};
 use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
-use super::key::SchemaKey;
+use super::key::{schema_from_stored_snapshot, SchemaKey};
 
 const STORED_SCHEMA_TABLE: &str = "lix_internal_state_materialized_v1_lix_stored_schema";
 const GLOBAL_VERSION: &str = "global";
@@ -66,6 +66,42 @@ impl<'a> SqlStoredSchemaProvider<'a> {
         self.cache.insert(key.clone(), schema.clone());
 
         Ok(Some((key, schema)))
+    }
+
+    pub(crate) async fn load_latest_schema_entries(
+        &mut self,
+    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
+        let sql = format!(
+            "SELECT snapshot_content FROM {table} \
+             WHERE version_id = '{global_version}' \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL",
+            table = STORED_SCHEMA_TABLE,
+            global_version = GLOBAL_VERSION,
+        );
+
+        let result = self.backend.execute(&sql, &[]).await?;
+        let mut latest_by_schema_key = HashMap::<String, (SchemaKey, JsonValue)>::new();
+        for row in result.rows {
+            let snapshot_content = value_to_string(&row[0], "snapshot_content")?;
+            let snapshot: JsonValue =
+                serde_json::from_str(&snapshot_content).map_err(|err| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!("stored schema snapshot_content invalid JSON: {err}"),
+                })?;
+            let (key, schema) = schema_from_stored_snapshot(&snapshot)?;
+            self.cache.insert(key.clone(), schema.clone());
+
+            let should_replace = latest_by_schema_key
+                .get(&key.schema_key)
+                .map(|(existing, _)| schema_key_is_newer(&key, existing))
+                .unwrap_or(true);
+            if should_replace {
+                latest_by_schema_key.insert(key.schema_key.clone(), (key, schema));
+            }
+        }
+
+        Ok(latest_by_schema_key.into_values().collect())
     }
 
     async fn load_schema_row(&self, key: &SchemaKey) -> Result<Option<JsonValue>, LixError> {
@@ -188,6 +224,13 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
     }
 }
 
+fn schema_key_is_newer(candidate: &SchemaKey, existing: &SchemaKey) -> bool {
+    match (candidate.version_number(), existing.version_number()) {
+        (Some(candidate), Some(existing)) => candidate > existing,
+        _ => candidate.schema_version > existing.schema_version,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -258,6 +301,16 @@ mod tests {
                             columns: vec!["snapshot_content".to_string()],
                         });
                     }
+                } else {
+                    return Ok(QueryResult {
+                        rows: self
+                            .schema_rows
+                            .values()
+                            .cloned()
+                            .map(|snapshot_content| vec![Value::Text(snapshot_content)])
+                            .collect(),
+                        columns: vec!["snapshot_content".to_string()],
+                    });
                 }
                 return Ok(QueryResult {
                     rows: Vec::new(),
@@ -426,5 +479,55 @@ mod tests {
             backend.query_count_containing("SELECT snapshot_content FROM"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn load_latest_schema_entries_returns_latest_version_per_schema_key() {
+        let backend = FakeBackend::default()
+            .with_schema(
+                "users~1",
+                &stored_snapshot(json!({
+                    "x-lix-key": "users",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                })),
+            )
+            .with_schema(
+                "users~2",
+                &stored_snapshot(json!({
+                    "x-lix-key": "users",
+                    "x-lix-version": "2",
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" }
+                    }
+                })),
+            )
+            .with_schema(
+                "projects~3",
+                &stored_snapshot(json!({
+                    "x-lix-key": "projects",
+                    "x-lix-version": "3",
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                })),
+            );
+        let mut provider = SqlStoredSchemaProvider::new(&backend);
+        let mut entries = provider
+            .load_latest_schema_entries()
+            .await
+            .expect("entries should load");
+        entries.sort_by(|left, right| left.0.schema_key.cmp(&right.0.schema_key));
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, SchemaKey::new("projects", "3"));
+        assert_eq!(entries[1].0, SchemaKey::new("users", "2"));
+        assert_eq!(entries[1].1["properties"]["name"]["type"], json!("string"));
     }
 }
