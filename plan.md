@@ -1,127 +1,200 @@
-# Remove Inheritance in `packages/engine` with an Internal Global Lane
+# Canonical `lix_file` Payload Redesign
 
 ## Summary
 
-- Verified against `packages/engine` on `next`: the engine is pointer-and-checkpoint based, so the design should stay aligned with `lix_version_pointer`, `lix_working_changes`, materialization, and vtable rewrites.
-- Remove version inheritance entirely. Replace it with explicit scope: rows are either local or global via `lixcol_global`.
-- Keep a single internal global lane for storage and commit tracking:
-  - local rows: `global = false`, `version_id = <real version>`
-  - global rows: `global = true`, `version_id = 'global'`
-- Keep `version_id` non-null everywhere. Do not use `NULL` version ids.
-- Hide the internal global lane from `lix_version`; public version APIs only expose real branch versions.
-- Rename the singleton global head schema to `lix_global_pointer`.
+- No backward compatibility constraints.
+- Make tracked payload state authoritative.
+- `lix_file.data` becomes a pure projection of tracked payload state.
+- The filesystem becomes binary-file-first and plugin-free.
+- Remove filesystem cache/index tables from the live read/write path.
+- Scope this plan to live filesystem reads and writes only.
+- Leave `lix_file_history` and `lix_file_history_by_version` untouched and out of scope.
 
-## Key Changes
+## Canonical Model
 
-### Public model
+- A file is the composition of tracked descriptor state in `lix_file_descriptor`, tracked payload-pointer state in `lix_binary_blob_ref`, and CAS storage keyed by `blob_hash`.
+- `lix_file` and `lix_file_by_version` are read-only projections over descriptor state plus payload-pointer state.
+- Live reads resolve bytes from tracked `lix_binary_blob_ref` plus CAS only.
+- `lix_internal_file_data_cache` and `lix_internal_binary_file_version_ref` are removed from the filesystem design.
 
-- Remove `inherits_from_version_id` from:
-  - `CreateVersionOptions`
-  - `CreateVersionResult`
-  - `LixVersionDescriptor`
-  - `lix_version_descriptor`
-  - `lix_version` read/write rewrites
-  - public row shapes and tests
-- Add `lixcol_global` anywhere row scope is surfaced today, alongside `lixcol_untracked`.
-- Remove `lixcol_inherited_from_version_id` from all public views and entity/file projections.
-- `lix_version` shows only real versions. The internal `global` lane is not returned and cannot become the active version.
-- Reserve the version id `"global"` so user-created versions cannot collide with the internal lane.
+## Public Contract
 
-### Storage and tracked heads
+- `INSERT/UPDATE/DELETE lix_file*` must lower into a typed file-mutation intent before execution.
+- `data` is a first-class write input, not a column that gets stripped during rewrite.
+- `SELECT data FROM lix_file*` reads directly from tracked payload pointers plus CAS.
+- Read-after-write must be correct in single-statement execution, multi-statement execution, explicit transaction execution, and script execution.
 
-- Keep `version_id TEXT NOT NULL`.
-- Add `global BOOLEAN NOT NULL DEFAULT false` to raw scoped state storage and tracked materialized state.
-- Global rows are stored once in the internal lane with `version_id = 'global'`.
-- Keep local version heads in `lix_version_pointer`.
-- Add singleton `lix_global_pointer { commit_id }` for the tracked head of global scope.
-- Keep the checkpoint store keyed by version id and add a global baseline row at `version_id = 'global'`.
+## Out Of Scope
 
-### Read and write resolution
+- `lix_file_history`
+- `lix_file_history_by_version`
+- history-specific materialization or cleanup
+- any non-filesystem semantic extraction built on top of file bytes
 
-- Delete all inheritance and ancestry logic from:
-  - vtable read rewrites
-  - followup execution
-  - filesystem mutation rewrite/version-chain cache
-  - materialization ancestry stages
-- Replace it with explicit overlay resolution:
-  - local transaction
-  - global transaction
-  - local untracked
-  - global untracked
-  - local tracked
-  - global tracked
-- For the same `(entity_id, schema_key, file_id)`, local wins over global.
-- A local delete of a visible global row creates a local tombstone; it hides the global row only in that version.
-- Global writes only happen when `lixcol_global = true` is explicit.
-- Public resolved `_by_version` views must project global rows with the requested real `version_id`, plus `lixcol_global = true`.
-  - This preserves `WHERE version_id = 'v1'` behavior on public SQL.
-  - Internally, source reads must still include both the target local lane and the internal global lane.
+## Source Of Truth
 
-### Working changes and checkpoint
+- Tracked descriptor shape remains in `lix_file_descriptor`.
+- Tracked payload shape remains in `lix_binary_blob_ref`.
+- CAS bytes are addressed by `blob_hash`.
+- Filesystem reads resolve from tracked payload state plus CAS.
+- The filesystem layer does not invoke plugins on reads or writes.
 
-- Keep the working-changes mental model symmetric across scopes.
-- `lix_working_changes` becomes the union of:
-  - local pending changes against the active version checkpoint
-  - global pending changes against the global checkpoint baseline
-- Global working changes are based on:
-  - global untracked rows
-  - `lix_global_pointer`
-  - the `version_id = 'global'` checkpoint row
-- `create_checkpoint()` updates both baselines:
-  - active local version checkpoint
-  - global checkpoint row
-- Keep the current local-only return shape of `create_checkpoint()`, even though it updates both scopes.
+## Execution Model
+
+1. Parse SQL into AST statements.
+2. Lower `lix_file*` mutations into `FileMutationIntent`.
+3. Resolve exact target scope and file ids before execution.
+4. Persist new blobs into CAS for authoritative payload writes.
+5. Persist tracked `lix_binary_blob_ref` mutations.
+6. Persist tracked `lix_file_descriptor` mutations.
+
+## `FileMutationIntent`
+
+- `file_id`
+- `version_id`
+- `before_path`
+- `after_path`
+- `descriptor_patch`
+- `payload`
+- `writer_key`
+
+`payload` should be one of:
+
+- `Unchanged`
+- `Set(bytes)`
+- `Delete`
+
+This intent must be produced once and then reused by:
+
+- SQL rewrite/planning
+- live filesystem write execution
+
+## Required Architectural Changes
+
+### Reads
+
+- Rewrite `lix_file*` reads to join descriptor rows to tracked `lix_binary_blob_ref` rows first.
+- Resolve bytes from CAS directly from the tracked `blob_hash`.
+- Make missing blob hashes a hard integrity error.
+- Remove all plugin involvement from the normal filesystem read path.
+- Remove filesystem cache/index reads entirely.
+
+### Writes
+
+- Stop stripping `data` from `INSERT lix_file`.
+- Stop stripping `data` from `UPDATE lix_file`.
+- Stop turning data-only file updates into noop SQL plus follow-up side effects.
+- Lower every file mutation through the same typed intent path in all execution modes.
+- Persist tracked payload changes in the same transaction as descriptor changes.
+- Remove filesystem cache/index writes entirely.
+
+### Filesystem Scope
+
+- The filesystem layer has no plugin hooks.
+- Filesystem writes do not invoke `detectChanges`.
+- Filesystem reads do not invoke `applyChanges`.
+- Any higher-level semantic extraction must live outside the filesystem contract.
+
+### Cache Removal
+
+- Delete `lix_internal_binary_file_version_ref` from the live filesystem architecture.
+- Delete `lix_internal_file_data_cache` from the live filesystem architecture.
+- Remove any planner or side-effect logic that relies on those tables.
+- Ensure the only live payload lookup path is tracked `lix_binary_blob_ref` plus CAS.
+
+## Code To Delete
+
+- `strip_file_data_from_insert`
+- data-stripping/noop rewrite behavior for `UPDATE lix_file`
+- `pending_file_writes` as a correctness path
+- read-time `materialize_missing_file_data_with_plugins(...)` for normal `lix_file*` reads
+- filesystem-triggered `detectChanges` and `applyChanges` integration
+- `lix_internal_file_data_cache` reads/writes in the live filesystem path
+- `lix_internal_binary_file_version_ref` reads/writes in the live filesystem path
+- duplicate statement-rewrite/coalescing paths that special-case `lix_file` separately from the canonical pipeline
+
+## Implementation Phases
+
+### Phase 1: Remove Plugins And Caches From Live Filesystem
+
+- Remove filesystem-triggered `detectChanges`.
+- Remove filesystem-triggered `applyChanges`.
+- Remove `lix_internal_file_data_cache` and `lix_internal_binary_file_version_ref` from live read/write logic.
+- Add guardrails that forbid plugin hooks and cache-table dependencies in live filesystem code.
+
+### Phase 2: Canonical Intent
+
+- Introduce `FileMutationIntent` and build it directly from parsed statements plus params.
+- Make planning and live filesystem execution consume that intent instead of reparsing or prefetching through `lix_file`.
+- Add guardrails that forbid data-stripping/noop fallback for file writes.
+
+### Phase 3: Canonical Read Path
+
+- Rewrite `lix_file` and `lix_file_by_version` to source payload pointers from tracked `lix_binary_blob_ref`.
+- Read bytes from CAS directly.
+- Make CAS lookup the only live payload read path.
+
+### Phase 4: Canonical Write Path
+
+- Lower `INSERT/UPDATE/DELETE lix_file*` into descriptor mutations plus payload-pointer mutations.
+- Persist CAS blobs and tracked `lix_binary_blob_ref` rows in the same transaction.
+- Preserve statement barriers so multi-statement scripts observe prior file writes immediately.
+
+### Phase 5: Cleanup
+
+- Remove legacy side-effect inference and duplicate transaction coalescing paths.
+- Collapse the engine onto one write pipeline for file mutations.
+- Simplify docs and tests to the new model.
 
 ## Test Plan
 
-- Bootstrapping seeds `main`, `lix_version_pointer`, and `lix_global_pointer`, but no public `global` version row.
-- Creating a version no longer stores or returns inheritance metadata.
-- A committed global row is visible from every version with `lixcol_global = true`.
-- A local row shadows a global row only in that version.
-- A local tombstone hides a global row only in that version.
-- `lix_state_by_version`, entity `_by_version`, and filesystem `_by_version` views return real target `version_id` values for global rows, never the internal `'global'` id.
-- Rewrite tests confirm no recursive `version_chain` or inheritance CTEs remain.
-- Version-filter pushdown tests confirm source reads include the internal global lane when resolving a real target version.
-- `lix_working_changes` shows both local and global pending changes.
-- `create_checkpoint()` clears both local and global working changes.
-- Mixed local/global tracked writes advance the correct heads only:
-  - local writes move the owning `lix_version_pointer`
-  - global writes move `lix_global_pointer`
+- Insert file bytes, then read them back immediately through `lix_file`.
+- Update file bytes, then read them back immediately through `lix_file`.
+- Ensure the same behavior in single-statement execute, multi-statement execute, explicit transaction callbacks, and `BEGIN ... COMMIT` script execution.
+- Ensure descriptor-only updates do not rewrite `lix_binary_blob_ref`.
+- Ensure data-only updates do rewrite `lix_binary_blob_ref`.
+- Ensure live filesystem reads do not touch removed cache tables.
+- Ensure missing `blob_hash` targets fail with integrity errors.
+- Ensure filesystem reads and writes do not invoke plugin hooks at all.
+- Ensure deletes tombstone descriptor visibility in live views.
+
+## Guardrails
+
+- `lix_file.data` is never computed from plugin code.
+- File write planning never depends on reading `lix_file` or `lix_file_by_version`.
+- There is exactly one canonical pipeline for file writes across all execution modes.
+- Live filesystem reads and writes do not depend on filesystem cache/index tables.
+- Read-after-write correctness is tested at statement barriers and transaction boundaries.
+- The filesystem layer does not call `detectChanges` or `applyChanges`.
+- History views are untouched by this plan.
+
+## Deliverables
+
+- one canonical `FileMutationIntent` path
+- one canonical `lix_file*` read projection path
+- tracked `lix_binary_blob_ref` as the only payload pointer source of truth
+- no plugin dependence inside the filesystem layer
+- no filesystem cache/index tables in the live path
+- removal of the legacy inferred file-write side-effect machinery
 
 ## Assumptions
 
-- No backward compatibility is required.
-- The internal global lane is a storage/runtime detail only.
-- `lixcol_global = false` is the default unless a write or schema override sets it.
-- The earlier `version_id = NULL` design is superseded; the engine-fit design is non-null `version_id` plus internal `version_id = 'global'`.
+- `lix_binary_blob_ref` remains the tracked payload-pointer schema.
+- CAS remains internal storage, not a public SQL surface.
+- We can change public docs and behavior without preserving the current plugin-coupled filesystem story.
+- History stays unchanged during this work.
 
-## Notes
+## Progress Log
 
-- If you find a severe architectural simplification possibility while implementing this plan, prompt the user for guidance.
-
-- Append to the progress log on significant milestones
-
-## Progress logs
-
-- 2026-03-05 11:34: Crafted plan
-- 2026-03-05 13:22: Removed public inheritance fields from version descriptors/API, added builtin `lix_global_pointer`, and hid the internal `global` lane from `lix_version`
-- 2026-03-05 14:07: Wired global checkpoint/global-pointer plumbing through bootstrap, `create_checkpoint()`, `lix_working_changes`, materialization ancestry, and effective-state rewrites; `cargo check -p lix_engine` passes and `cargo test -p lix_engine --test checkpoint checkpoint_labels_current_commit_sqlite` passes
-- 2026-03-05 16:02: Switched public state/entity/filesystem metadata surfaces from inherited markers to `global`/`lixcol_global`, stopped filesystem projections from deriving commit ids through `lix_version`, and kept the package green with `cargo check -p lix_engine`, `cargo test -p lix_engine --test checkpoint`, `cargo test -p lix_engine --test entity_view --no-run`, `cargo test -p lix_engine --test filesystem_view --no-run`, and the `filesystem::select_rewrite::tests::rewrites_simple_file_path_data_query_to_projection` unit test
-- 2026-03-05 12:30: Replaced the remaining internal `inherited_from_version_id` plumbing in `packages/engine/src` with explicit `global` booleans across raw/materialized state DDL, materialization writes/debug rows, vtable/followup effective-state readers, and vtable delete cleanup; verified with `cargo fmt --package lix_engine`, `cargo check -p lix_engine`, `cargo test -p lix_engine --test materialization --no-run`, `cargo test -p lix_engine --lib --no-run`, `cargo test -p lix_engine rewrite_delete_effective_scope_preserves_global_predicate_for_untracked_cleanup -- --nocapture`, and `cargo test -p lix_engine --test materialization apply_materialization_plan_full_scope_clears_existing_rows_in_schema_tables -- --nocapture`
-- 2026-03-05 12:38: Finished the scope-flag follow-through by stamping `global` in the immediate write/commit-runtime paths, updating the remaining inheritance-era tests and schema overrides to `global`/`lixcol_global`, and clearing the repo-wide `inherited_from_version_id` references from `packages/engine`; verified with `cargo fmt --package lix_engine`, `cargo test -p lix_engine --test state_by_version_view --test state_inheritance --test entity_view --test filesystem_view --no-run`, `cargo test -p lix_engine --test filesystem_view filesystem_views_expose_expected_lixcol_columns -- --nocapture`, `cargo test -p lix_engine --test entity_view lix_entity_view_select_pushes_down_inherited_from_version_override -- --nocapture`, `cargo test -p lix_engine --test state_by_version_view lix_state_by_version_select_inherits_from_parent_version -- --nocapture`, and `cargo test -p lix_engine --test state_inheritance lix_state_delete_with_inherited_null_filter_deletes_only_local_rows -- --nocapture`
-- 2026-03-05 13:00: Moved schema-level global scope onto `lixcol_global = true` for the engine metadata schemas, split entity-view read overrides from write-lane routing so global-only schemas still read through `lix_state` but write through the internal `global` lane, and refreshed the dynamic entity-view tests to assert the new global projection behavior instead of inheritance-era `lixcol_version_id = 'global'`; verified with `cargo fmt --package lix_engine`, `cargo check -p lix_engine`, `cargo test -p lix_engine --lib --no-run`, `cargo test -p lix_engine --test init --no-run`, `cargo test -p lix_engine --test entity_view --no-run`, `cargo test -p lix_engine --test entity_view lix_entity_view_base_insert_read_honors_lixcol_global_override -- --nocapture`, and `cargo test -p lix_engine --test entity_view lix_entity_view_select_pushes_down_literal_lixcol_overrides -- --nocapture`
-- 2026-03-05 13:03: Collapsed `filesystem/mutation_rewrite.rs` off the recursive `inherits_from_version_id` lookup to a fixed local-plus-global chain (`[version_id, global]`), which removes one of the remaining core inheritance hooks from engine logic; verified with the `version_chain_lookup_uses_session_cache_for_repeated_version` unit target and confirmed that the old “duplicate inherited path in child version” filesystem canaries now fail because their expectations still encode cross-version inheritance instead of explicit global shadowing.
-- 2026-03-05 13:18: Rewrote the remaining inheritance-era filesystem canaries to use explicit global rows instead of parent-version visibility, removed the redundant nested duplicate-path case, and turned the old vacuous child-tombstone case into a real local-delete-over-global test. Verified with `cargo test -p lix_engine --test filesystem_view directory_duplicate_global_path_is_rejected_in_child_version -- --nocapture`, `cargo test -p lix_engine --test filesystem_view file_duplicate_global_path_is_rejected_in_child_version -- --nocapture`, `cargo test -p lix_engine --test filesystem_view file_path_update_to_global_path_is_rejected_in_child_version -- --nocapture`, `cargo test -p lix_engine --test filesystem_view file_reinsert_path_after_child_tombstone_of_global_file_succeeds -- --nocapture`, and `cargo test -p lix_engine --test filesystem_view -- --nocapture`.
-- 2026-03-05 14:02: Finished the remaining inheritance-era test cleanup outside the filesystem suite. `state_view` and `on_conflict_views` now seed versions without the removed parent column, `version_view` now asserts the current public contract (no `inherits_from_version_id`, no public `global` row, less brittle internal row-count expectations), and `file_materialization` now inserts extra versions through the simplified `lix_version` shape. Verified with `cargo test -p lix_engine --test state_view -- --nocapture`, `cargo test -p lix_engine --test on_conflict_views -- --nocapture`, `cargo test -p lix_engine --test version_view -- --nocapture`, `cargo test -p lix_engine --test file_materialization -- --nocapture`, and a final `cargo test -p lix_engine --test state_view --test on_conflict_views --test version_view --test file_materialization --no-run`.
-- 2026-03-05 14:11: Fixed the `--lib` regressions in `lix_state_by_version_view_read` by updating the version-id pushdown unit tests to the current target-version CTE shape: concrete `version_id` filters now apply on the local-plus-real-version union instead of a direct `version_descriptor` CTE filter. Verified with `cargo test -p lix_engine --lib -- --nocapture`.
-- 2026-03-05 14:16: Fixed `active_version` by removing the last public-`global` version assumptions from the FK-switch tests. The suite now creates real versions before switching `lix_active_version.version_id`, which matches the new model where `global` is an internal lane, not a public version row. Verified with `cargo test -p lix_engine --test active_version -- --nocapture`.
-- 2026-03-05 14:22: Fixed `entity_view` by updating the remaining by-version visibility canary to the new global-scope model and normalizing the actual `lixcol_global` column instead of `lixcol_version_id`, which removed the cross-backend deterministic mismatch. Verified with `cargo test -p lix_engine --test entity_view -- --nocapture`.
-- 2026-03-05 14:31: Fixed `init` by replacing the remaining public-`global` version assertions with the real engine contract: bootstrap-global checks now read `lix_global_pointer`, per-version checkpoint tests combine the public main version with the internal global checkpoint row, and system-directory visibility is asserted through an active-version by-version read filtered by `lixcol_global = true`. Verified with `cargo test -p lix_engine --test init -- --nocapture`.
-- 2026-03-05 14:36: Fixed `observe` by rewriting the last active-version-switch scenarios away from `switch_version(\"global\")`. The tests now start from the default real version, where global rows are already visible, and assert that switching into a branch-local shadow emits the expected observe delta. Verified with `cargo test -p lix_engine --test observe -- --nocapture`.
-- 2026-03-05 14:40: Fixed `plugin_install` by moving the archive persistence assertions off `lix_file_by_version ... lixcol_version_id = 'global'` and onto the real public contract: installed plugin archives are visible in `lix_file` and flagged by `lixcol_global = true`. Verified with `cargo test -p lix_engine --test plugin_install -- --nocapture`.
-- 2026-03-05 14:45: Fixed `state_by_version_view` by normalizing the remaining backend-dependent boolean column in the local-over-global overlay test and renaming the inheritance-era canaries to explicit global/local semantics (`reads_visible_global_row`, `prefers_local_row_over_global_row`, `local_tombstone_hides_global_row`). Verified with `cargo test -p lix_engine --test state_by_version_view -- --nocapture`.
-- 2026-03-05 14:41: Applied the canonical active-version cache fix: `Engine.active_version_id` is now an unloaded-or-real-id cache (`Option<String>`) instead of a fake `"main"` placeholder, public execution/transaction/plugin-install/script paths now require a loaded active version, internal bootstrap execution keeps the internal `global` fallback only for seeding, and missing `lix_active_version` rows now fail as an invariant violation instead of silently substituting a version name. Updated the pre-init execution coverage to assert `LIX_ERROR_NOT_INITIALIZED`, switched the reopen-init sqlite test to call `open()` before querying, and seeded the few lib/observe unit tests that intentionally bypass init with a real synthetic version id. Verified with `cargo test -p lix_engine --test execute -- --nocapture`, `cargo test -p lix_engine --test active_version -- --nocapture`, `cargo test -p lix_engine --test init -- --nocapture`, `cargo test -p lix_engine --test plugin_install -- --nocapture`, `cargo test -p lix_engine --test observe -- --nocapture`, and `cargo test -p lix_engine --lib -- --nocapture`.
-- 2026-03-05 14:48: Hardened every direct `lix_global_pointer` lookup to assert `global = true` in addition to the internal `version_id = 'global'` lane. This covers the reviewed seed path plus bootstrap detection, checkpoint loading, active-version bootstrap, and `lix_working_changes` tip resolution. Verified with `cargo test -p lix_engine --test init init_seeds_main_version_and_global_checkpoint_pointers_sqlite -- --nocapture`, `cargo test -p lix_engine --test checkpoint -- --nocapture`, and `cargo test -p lix_engine --lib lix_working_changes_view_read -- --nocapture`.
-- 2026-03-05 14:56: Cleaned the dead `main_version_id` bindings in `packages/engine/tests/file_materialization.rs` by renaming only the genuinely unused destructured values to `_main_version_id`, keeping the helper return shape stable while removing the noisy test-target warnings. Verified with `cargo test -p lix_engine --test file_materialization --no-run`; the target still emits unrelated unused-import/dead-helper warnings, but the `main_version_id` warnings are gone.
-- 2026-03-05 14:58: Simplified the `file_materialization` test helpers further by removing the `main_version_id` return value entirely from the boot helpers. The helpers now return only the engine, and each test queries `main_version_id(&engine).await` only when it actually needs that value. Verified with `cargo test -p lix_engine --test file_materialization --no-run`.
-- 2026-03-05 15:18: Fixed the version-metadata scope inconsistency instead of papering over Cursor's idempotency finding. `lix_version_descriptor` and `lix_version_pointer` now declare `lixcol_global = true`, the seed/materialized paths write them with `global = true`, and the raw readers that enumerate versions or resolve version tips now explicitly filter on `global = true`. This aligns the boolean scope flag with the existing internal `version_id = 'global'` lane for shared version metadata. Verified with `cargo test -p lix_engine --test init -- --nocapture`, `cargo test -p lix_engine --test version_view -- --nocapture`, `cargo test -p lix_engine --test active_version -- --nocapture`, and `cargo test -p lix_engine --lib -- --nocapture`.
+- 2026-03-05 16:07: Drafted the canonical redesign plan. The target model is descriptor state + tracked payload pointer + CAS.
+- 2026-03-06: Simplified the target further: the filesystem is now explicitly plugin-free. No `detectChanges`, no `applyChanges`, and no binary fallback language in the filesystem contract.
+- 2026-03-06: Narrowed scope to the smallest live filesystem cut: tracked `lix_file_descriptor`, tracked `lix_binary_blob_ref`, CAS storage, no filesystem plugins, no filesystem caches, and live `lix_file` / `lix_file_by_version` only. History is explicitly untouched and out of scope.
+- 2026-03-06: Rewired the live read path so `lix_file` and `lix_file_by_version` resolve payload bytes from tracked `lix_binary_blob_ref` state plus CAS. Normal live reads no longer materialize file data through plugin hooks or filesystem caches.
+- 2026-03-06: Rewired the live write path so authoritative file writes and deletes emit tracked `lix_binary_blob_ref` changes directly. The live execution path now skips filesystem cache/index maintenance, and cache-miss coverage was updated to assert state-plus-CAS behavior instead of cache repopulation.
+- 2026-03-06: Added a shared live file projection builder and moved live write planning onto it. `pending_file_writes` and filesystem mutation scoping now prefetch against tracked descriptor state plus `lix_binary_blob_ref` plus CAS through the canonical projection, instead of consulting filesystem cache tables or the logical `lix_file*` views.
+- 2026-03-06: Fixed the explicit-version regression in the postprocess path. Filesystem payload ref changes are now still persisted when descriptor updates on `lix_file_by_version` go through SQL postprocess, so by-version path+data updates round-trip correctly instead of dropping the payload rewrite.
+- 2026-03-06: Removed the remaining live filesystem plugin-detection branch from execution intent collection. `collect_execution_side_effects_with_backend_from_statements` now only gathers filesystem-owned side effects, so live `lix_file*` writes no longer carry dead `detect_plugin_file_changes` or plugin-cache plumbing even as disabled options.
+- 2026-03-06: Replaced the fake no-op SQL shell for data-only filesystem updates with an explicit effect-only rewrite output. `UPDATE lix_file SET data = ...` now lowers to zero prepared SQL statements in the rewrite engine, while the live payload write still persists through the filesystem-owned side-effect path.
+- 2026-03-06: Removed the last live filesystem sentinel and cache-maintenance shim. Data-only `lix_file` updates now travel through an explicit `FilesystemUpdateRewrite::EffectOnly` branch instead of synthesized `SELECT 0 WHERE 1 = 0` SQL, the stale `PostprocessPlan::DomainChangesOnly` branch is gone, and unused live cache/index invalidation and binary-fallback maintenance helpers were deleted from the runtime path.
+- 2026-03-06: Pruned the remaining dead live filesystem cache/materialization probes. The old binary-ref index loaders, file-data-unavailable probes, cache-table query builders, and unused cache-table constants that were only supporting the retired live cache path are now deleted.
+- 2026-03-06: Realigned the filesystem test surface to the simplified live contract. Live view tests now read tracked `lix_binary_blob_ref` state directly, payload-corruption cases assert `NULL` when the CAS blob row is missing, and the old plugin/cache-era `file_materialization` suite was fenced off so only binary-first live/CAS coverage remains active. The four originally failing targets (`file_history_view`, `file_materialization`, `filesystem_view`, `writer_key`) now pass again.

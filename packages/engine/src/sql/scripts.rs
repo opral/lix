@@ -97,8 +97,6 @@ impl Engine {
                     params,
                     active_version_id,
                     options.writer_key.as_deref(),
-                    false,
-                    false,
                 )
                 .await?
             };
@@ -107,8 +105,6 @@ impl Engine {
                 pending_file_delete_targets: pending_file_delete_targets.clone(),
                 detected_file_domain_changes: filesystem_tracked_domain_changes,
                 untracked_filesystem_update_domain_changes,
-                file_data_cache_invalidation_targets: pending_file_delete_targets.clone(),
-                file_path_cache_invalidation_targets: pending_file_delete_targets,
             })
         } else {
             None

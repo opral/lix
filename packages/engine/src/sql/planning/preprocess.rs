@@ -328,5 +328,5 @@ fn from_rewrite_output(output: super::rewrite_engine::RewriteOutput) -> Statemen
 }
 
 fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
-    matches!(plan, Some(other) if !matches!(other, PostprocessPlan::VtableUpdate(_)))
+    matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }

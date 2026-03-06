@@ -8,6 +8,9 @@ use crate::engine::sql::ast::utils::{
 use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::errors;
+use crate::filesystem::live_projection::{
+    build_live_file_prefetch_projection_sql, LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
+};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -49,6 +52,13 @@ enum FileWriteTarget {
 struct ExactFileUpdateTarget {
     file_id: String,
     explicit_version_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveFilePrefetchRow {
+    path: String,
+    data: Option<Vec<u8>>,
+    blob_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -344,19 +354,17 @@ async fn collect_delete_writes(
     };
     validate_file_selection_columns(delete.selection.as_ref(), "delete WHERE")?;
 
-    let mut query_sql = match target {
-        FileWriteTarget::ActiveVersion => format!(
-            "SELECT id, path, data, lixcol_version_id, \
-                    'pending.collect_delete_writes' AS __lix_trace \
-             FROM lix_file_by_version \
-             WHERE lixcol_version_id = '{}'",
+    let mut query_sql = format!(
+        "SELECT id, path, data, lixcol_version_id \
+         FROM ({}) AS live_files",
+        build_live_file_prefetch_projection_sql()
+    );
+    if matches!(target, FileWriteTarget::ActiveVersion) {
+        query_sql.push_str(&format!(
+            " WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
-        ),
-        FileWriteTarget::ExplicitVersion => "SELECT id, path, data, lixcol_version_id, \
-                    'pending.collect_delete_writes' AS __lix_trace \
-             FROM lix_file_by_version"
-            .to_string(),
-    };
+        ));
+    }
     if let Some(selection) = delete.selection.as_ref() {
         query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
             " AND "
@@ -570,51 +578,48 @@ async fn collect_update_writes(
                     return Ok(());
                 }
 
-                let cache_keys = [key.clone()];
-                let before_paths = load_before_path_from_cache_batch(backend, &cache_keys).await?;
-                if let Some(before_path) = before_paths.get(&key) {
-                    let before_data = load_before_data_from_cache_batch(backend, &cache_keys)
-                        .await?
-                        .get(&key)
-                        .cloned();
-                    let path = next_path.clone().unwrap_or_else(|| before_path.clone());
+                let live_rows =
+                    load_live_file_prefetch_rows_by_key(backend, std::slice::from_ref(&key))
+                        .await?;
+                if let Some(before_row) = live_rows.get(&key) {
+                    let path = next_path.clone().unwrap_or_else(|| before_row.path.clone());
                     let mut write = PendingFileWrite {
                         file_id: exact_target.file_id,
                         version_id,
-                        before_path: Some(before_path.clone()),
+                        before_path: Some(before_row.path.clone()),
                         after_path: Some(path),
                         data_is_authoritative: saw_data_assignment,
-                        before_data,
+                        before_data: before_row.data.clone(),
                         after_data: assigned_after_data.clone().unwrap_or_default(),
                     };
-                    if !write.data_is_authoritative && write.before_data.is_some() {
+                    if !write.data_is_authoritative {
+                        ensure_non_authoritative_before_data_available(
+                            &write.file_id,
+                            &write.version_id,
+                            before_row.blob_hash.as_deref(),
+                            write.before_data.as_deref(),
+                        )?;
                         write.after_data = write.before_data.clone().unwrap_or_default();
                     }
-                    // If this was a non-data update and data cache is missing, we cannot trust
-                    // an empty blob fallback. Continue with the full prefetch path so before_data
-                    // is resolved from state and after_data is preserved.
-                    if write.data_is_authoritative || write.before_data.is_some() {
-                        writes.push(write);
-                        return Ok(());
-                    }
+                    writes.push(write);
+                    return Ok(());
                 }
             }
         }
     }
 
-    let mut query_sql = match target {
-        FileWriteTarget::ActiveVersion => format!(
-            "SELECT id, path, data, lixcol_version_id, \
-                    'pending.collect_update_writes' AS __lix_trace \
-             FROM lix_file_by_version \
-             WHERE lixcol_version_id = '{}'",
+    let live_projection_sql = build_live_file_prefetch_projection_sql();
+    let mut query_sql = format!(
+        "SELECT id, path, data, lixcol_version_id, {blob_hash_column} \
+         FROM ({live_projection_sql}) AS live_files",
+        blob_hash_column = LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
+    );
+    if matches!(target, FileWriteTarget::ActiveVersion) {
+        query_sql.push_str(&format!(
+            " WHERE lixcol_version_id = '{}'",
             escape_sql_string(active_version_id)
-        ),
-        FileWriteTarget::ExplicitVersion => "SELECT id, path, data, lixcol_version_id, \
-                    'pending.collect_update_writes' AS __lix_trace \
-             FROM lix_file_by_version"
-            .to_string(),
-    };
+        ));
+    }
     if let Some(selection) = update.selection.as_ref() {
         query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
             " AND "
@@ -642,7 +647,6 @@ async fn collect_update_writes(
     .rows;
 
     let mut pending = Vec::with_capacity(rows.len());
-    let mut cache_lookup_keys = BTreeSet::<(String, String)>::new();
 
     for row in rows {
         let Some(before_file_id) = row.get(0).and_then(value_as_text) else {
@@ -675,9 +679,7 @@ async fn collect_update_writes(
                 .unwrap_or_else(|| active_version_id.to_string()),
         };
         let before_data = row.get(2).and_then(value_as_blob_or_text_bytes);
-        if before_data.is_none() || before_data.as_ref().is_some_and(|bytes| bytes.is_empty()) {
-            cache_lookup_keys.insert((file_id.clone(), version_id.clone()));
-        }
+        let blob_hash = row.get(4).and_then(value_as_text);
 
         let (data_is_authoritative, after_data) = if saw_data_assignment {
             if let Some(data_by_id) = &assigned_after_data_by_id {
@@ -693,6 +695,15 @@ async fn collect_update_writes(
             (false, Vec::new())
         };
 
+        if !data_is_authoritative {
+            ensure_non_authoritative_before_data_available(
+                &file_id,
+                &version_id,
+                blob_hash.as_deref(),
+                before_data.as_deref(),
+            )?;
+        }
+
         pending.push(PendingFileWrite {
             file_id,
             version_id,
@@ -702,29 +713,6 @@ async fn collect_update_writes(
             before_data,
             after_data,
         });
-    }
-
-    if !cache_lookup_keys.is_empty() {
-        let cache_data = load_before_data_from_cache_batch(
-            backend,
-            &cache_lookup_keys.into_iter().collect::<Vec<_>>(),
-        )
-        .await?;
-        for write in &mut pending {
-            let key = (write.file_id.clone(), write.version_id.clone());
-            if write.before_data.is_none() {
-                write.before_data = cache_data.get(&key).cloned();
-            } else if write
-                .before_data
-                .as_ref()
-                .is_some_and(|bytes| bytes.is_empty())
-                && !cache_data.contains_key(&key)
-            {
-                // lix_file views coalesce cache misses to empty blobs; convert that shape back
-                // to None so detect stage can reconstruct true before_data from state.
-                write.before_data = None;
-            }
-        }
     }
 
     for write in &mut pending {
@@ -829,16 +817,17 @@ async fn collect_delete_targets(
              ) AS file_descriptor_ids"
             .to_string(),
         (FileWriteTarget::ActiveVersion, false) => format!(
-            "SELECT id, lixcol_version_id, \
-                    'pending.collect_delete_targets' AS __lix_trace \
-             FROM lix_file_by_version \
-             WHERE lixcol_version_id = '{}'",
-            escape_sql_string(active_version_id)
+            "SELECT id, lixcol_version_id \
+             FROM ({live_projection_sql}) AS live_files \
+             WHERE lixcol_version_id = '{active_version_id}'",
+            live_projection_sql = build_live_file_prefetch_projection_sql(),
+            active_version_id = escape_sql_string(active_version_id),
         ),
-        (FileWriteTarget::ExplicitVersion, false) => "SELECT id, lixcol_version_id, \
-                    'pending.collect_delete_targets' AS __lix_trace \
-             FROM lix_file_by_version"
-            .to_string(),
+        (FileWriteTarget::ExplicitVersion, false) => format!(
+            "SELECT id, lixcol_version_id \
+             FROM ({}) AS live_files",
+            build_live_file_prefetch_projection_sql()
+        ),
     };
     if let Some(selection) = delete.selection.as_ref() {
         query_sql.push_str(if matches!(target, FileWriteTarget::ActiveVersion) {
@@ -1533,16 +1522,17 @@ fn insert_target_table_name(insert: &sqlparser::ast::Insert) -> Option<String> {
     object_name_terminal(name)
 }
 
-async fn load_before_data_from_cache_batch(
+async fn load_live_file_prefetch_rows_by_key(
     backend: &dyn LixBackend,
     keys: &[(String, String)],
-) -> Result<BTreeMap<(String, String), Vec<u8>>, LixError> {
+) -> Result<BTreeMap<(String, String), LiveFilePrefetchRow>, LixError> {
     if keys.is_empty() {
         return Ok(BTreeMap::new());
     }
 
     const PAIRS_PER_CHUNK: usize = 200;
     let mut out = BTreeMap::new();
+    let live_projection_sql = build_live_file_prefetch_projection_sql();
 
     for chunk in keys.chunks(PAIRS_PER_CHUNK) {
         let mut params = Vec::with_capacity(chunk.len() * 2);
@@ -1551,82 +1541,67 @@ async fn load_before_data_from_cache_batch(
             let file_param = index * 2 + 1;
             let version_param = file_param + 1;
             predicates.push(format!(
-                "(file_id = ${file_param} AND version_id = ${version_param})"
+                "(id = ${file_param} AND lixcol_version_id = ${version_param})"
             ));
             params.push(Value::Text(file_id.clone()));
             params.push(Value::Text(version_id.clone()));
         }
 
         let sql = format!(
-            "SELECT file_id, version_id, data \
-             FROM lix_internal_file_data_cache \
+            "SELECT id, path, data, lixcol_version_id, {blob_hash_column} \
+             FROM ({live_projection_sql}) AS live_files \
              WHERE {}",
-            predicates.join(" OR ")
+            predicates.join(" OR "),
+            blob_hash_column = LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN,
         );
-        let rows = backend.execute(&sql, &params).await?.rows;
+        let rows = execute_prefetch_query(
+            backend,
+            "pending.load_live_file_prefetch_rows",
+            &sql,
+            &params,
+        )
+        .await?
+        .rows;
         for row in rows {
             let Some(file_id) = row.first().and_then(value_as_text) else {
                 continue;
             };
-            let Some(version_id) = row.get(1).and_then(value_as_text) else {
+            let Some(path) = row.get(1).and_then(value_as_text) else {
                 continue;
             };
-            let Some(data) = row.get(2).and_then(value_as_blob_or_text_bytes) else {
+            let Some(version_id) = row.get(3).and_then(value_as_text) else {
                 continue;
             };
-            out.insert((file_id, version_id), data);
+            out.insert(
+                (file_id, version_id),
+                LiveFilePrefetchRow {
+                    path,
+                    data: row.get(2).and_then(value_as_blob_or_text_bytes),
+                    blob_hash: row.get(4).and_then(value_as_text),
+                },
+            );
         }
     }
 
     Ok(out)
 }
 
-async fn load_before_path_from_cache_batch(
-    backend: &dyn LixBackend,
-    keys: &[(String, String)],
-) -> Result<BTreeMap<(String, String), String>, LixError> {
-    if keys.is_empty() {
-        return Ok(BTreeMap::new());
+fn ensure_non_authoritative_before_data_available(
+    file_id: &str,
+    version_id: &str,
+    blob_hash: Option<&str>,
+    before_data: Option<&[u8]>,
+) -> Result<(), LixError> {
+    if blob_hash.is_some() && before_data.is_none() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "filesystem payload lookup failed for file '{}' in version '{}'",
+                file_id, version_id
+            ),
+        });
     }
-
-    const PAIRS_PER_CHUNK: usize = 200;
-    let mut out = BTreeMap::new();
-
-    for chunk in keys.chunks(PAIRS_PER_CHUNK) {
-        let mut params = Vec::with_capacity(chunk.len() * 2);
-        let mut predicates = Vec::with_capacity(chunk.len());
-        for (index, (file_id, version_id)) in chunk.iter().enumerate() {
-            let file_param = index * 2 + 1;
-            let version_param = file_param + 1;
-            predicates.push(format!(
-                "(file_id = ${file_param} AND version_id = ${version_param})"
-            ));
-            params.push(Value::Text(file_id.clone()));
-            params.push(Value::Text(version_id.clone()));
-        }
-
-        let sql = format!(
-            "SELECT file_id, version_id, path \
-             FROM lix_internal_file_path_cache \
-             WHERE {}",
-            predicates.join(" OR ")
-        );
-        let rows = backend.execute(&sql, &params).await?.rows;
-        for row in rows {
-            let Some(file_id) = row.first().and_then(value_as_text) else {
-                continue;
-            };
-            let Some(version_id) = row.get(1).and_then(value_as_text) else {
-                continue;
-            };
-            let Some(path) = row.get(2).and_then(value_as_text) else {
-                continue;
-            };
-            out.insert((file_id, version_id), path);
-        }
-    }
-
-    Ok(out)
+    Ok(())
 }
 
 fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget> {
@@ -2087,7 +2062,7 @@ mod tests {
     use std::sync::Arc;
 
     struct FastPathFallbackBackend {
-        fallback_query_seen: Arc<AtomicBool>,
+        live_projection_query_seen: Arc<AtomicBool>,
     }
 
     struct UnusedTransaction;
@@ -2100,40 +2075,23 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_file_path_cache") {
-                return Ok(QueryResult {
-                    rows: vec![vec![
-                        Value::Text("file-1".to_string()),
-                        Value::Text("v1".to_string()),
-                        Value::Text("/src/a.md".to_string()),
-                    ]],
-                    columns: vec![
-                        "file_id".to_string(),
-                        "version_id".to_string(),
-                        "path".to_string(),
-                    ],
-                });
-            }
-            if sql.contains("FROM lix_internal_file_data_cache") {
-                return Ok(QueryResult {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                });
-            }
-            if sql.contains("pending.collect_update_writes") {
-                self.fallback_query_seen.store(true, Ordering::SeqCst);
+            if sql.contains("__lix_blob_hash") {
+                self.live_projection_query_seen
+                    .store(true, Ordering::SeqCst);
                 return Ok(QueryResult {
                     rows: vec![vec![
                         Value::Text("file-1".to_string()),
                         Value::Text("/src/a.md".to_string()),
                         Value::Blob(b"seed-data".to_vec()),
                         Value::Text("v1".to_string()),
+                        Value::Text("blob-1".to_string()),
                     ]],
                     columns: vec![
                         "file_id".to_string(),
                         "path".to_string(),
                         "data".to_string(),
                         "version_id".to_string(),
+                        "__lix_blob_hash".to_string(),
                     ],
                 });
             }
@@ -2181,19 +2139,21 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("pending.collect_update_writes") {
+            if sql.contains("__lix_blob_hash") {
                 return Ok(QueryResult {
                     rows: vec![vec![
                         Value::Text("file-1".to_string()),
                         Value::Text("/seed.md".to_string()),
                         Value::Blob(b"seed".to_vec()),
                         Value::Text("v1".to_string()),
+                        Value::Text("blob-seed".to_string()),
                     ]],
                     columns: vec![
                         "file_id".to_string(),
                         "path".to_string(),
                         "data".to_string(),
                         "version_id".to_string(),
+                        "__lix_blob_hash".to_string(),
                     ],
                 });
             }
@@ -2282,10 +2242,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_update_fast_path_falls_back_when_data_cache_misses() {
-        let fallback_query_seen = Arc::new(AtomicBool::new(false));
+    async fn exact_update_fast_path_reads_live_projection_without_cache_tables() {
+        let live_projection_query_seen = Arc::new(AtomicBool::new(false));
         let backend = FastPathFallbackBackend {
-            fallback_query_seen: Arc::clone(&fallback_query_seen),
+            live_projection_query_seen: Arc::clone(&live_projection_query_seen),
         };
 
         let writes = collect_pending_file_writes(
@@ -2298,8 +2258,8 @@ mod tests {
         .expect("collect_pending_file_writes should succeed");
 
         assert!(
-            fallback_query_seen.load(Ordering::SeqCst),
-            "cache miss must fall back to full prefetch query instead of early return"
+            live_projection_query_seen.load(Ordering::SeqCst),
+            "exact-target update should resolve through the live projection instead of cache tables"
         );
         assert_eq!(writes.writes.len(), 1);
         let write = &writes.writes[0];

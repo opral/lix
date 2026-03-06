@@ -1,5 +1,3 @@
-pub(crate) const INTERNAL_FILE_DATA_CACHE: &str = "lix_internal_file_data_cache";
-pub(crate) const INTERNAL_FILE_PATH_CACHE: &str = "lix_internal_file_path_cache";
 pub(crate) const INTERNAL_BINARY_BLOB_STORE: &str = "lix_internal_binary_blob_store";
 pub(crate) const INTERNAL_BINARY_BLOB_MANIFEST: &str = "lix_internal_binary_blob_manifest";
 pub(crate) const INTERNAL_BINARY_CHUNK_STORE: &str = "lix_internal_binary_chunk_store";

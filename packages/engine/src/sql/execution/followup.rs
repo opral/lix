@@ -126,23 +126,6 @@ pub(crate) async fn build_delete_followup_statements(
     bind_statement_batch_for_dialect(batch, executor.dialect())
 }
 
-pub(crate) async fn build_domain_change_followup_statements(
-    transaction: &mut dyn LixTransaction,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
-) -> Result<Vec<PreparedStatement>, LixError> {
-    let mut executor = TransactionExecutor { transaction };
-    let batch = build_domain_change_followup_statement_batch(
-        &mut executor,
-        detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await?;
-    bind_statement_batch_for_dialect(batch, executor.dialect())
-}
-
 async fn build_update_followup_statement_batch(
     executor: &mut dyn SqlExecutor,
     plan: &VtableUpdatePlan,
@@ -406,65 +389,6 @@ async fn delete_effective_scope_untracked_rows(
     let bound = bind_sql_with_state(&sql, params, executor.dialect(), PlaceholderState::new())?;
     executor.execute(&bound.sql, &bound.params).await?;
     Ok(())
-}
-
-async fn build_domain_change_followup_statement_batch(
-    executor: &mut dyn SqlExecutor,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-    functions: &mut dyn LixFunctionProvider,
-) -> Result<StatementBatch, LixError> {
-    if detected_file_domain_changes.is_empty() {
-        return Ok(StatementBatch {
-            statements: Vec::new(),
-            params: Vec::new(),
-        });
-    }
-
-    let timestamp = functions.timestamp();
-    let mut domain_changes = Vec::with_capacity(detected_file_domain_changes.len());
-    let mut affected_versions = BTreeSet::new();
-
-    for change in detected_file_domain_changes {
-        affected_versions.insert(change.version_id.clone());
-        let domain_writer_key = change
-            .writer_key
-            .clone()
-            .or_else(|| writer_key.map(ToString::to_string));
-        domain_changes.push(DomainChangeInput {
-            id: functions.uuid_v7(),
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            version_id: change.version_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            created_at: timestamp.clone(),
-            writer_key: domain_writer_key,
-        });
-    }
-
-    let mut commit_executor = CommitExecutorAdapter { executor };
-    let versions = load_version_info_for_versions(&mut commit_executor, &affected_versions).await?;
-    let active_accounts =
-        load_commit_active_accounts(&mut commit_executor, &domain_changes).await?;
-    let commit_result = generate_commit(
-        GenerateCommitArgs {
-            timestamp,
-            active_accounts,
-            changes: domain_changes,
-            versions,
-        },
-        || functions.uuid_v7(),
-    )?;
-    build_statement_batch_from_generate_commit_result(
-        commit_result,
-        functions,
-        0,
-        executor.dialect(),
-    )
 }
 
 struct EffectiveScopeDeleteRow {

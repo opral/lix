@@ -4,7 +4,7 @@ use super::super::contracts::result_contract::ResultContract;
 use super::super::vtable::registry::validate_postprocess_plan;
 
 pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), PlannerError> {
-    if plan.preprocess.prepared_statements.is_empty() {
+    if plan.preprocess.prepared_statements.is_empty() && !allows_effect_only_execution(plan) {
         return Err(PlannerError::invariant(
             "sql planner produced an execution plan without statements",
         ));
@@ -52,17 +52,18 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
     Ok(())
 }
 
+fn allows_effect_only_execution(plan: &ExecutionPlan) -> bool {
+    matches!(plan.result_contract, ResultContract::DmlNoReturning)
+        && plan.preprocess.postprocess.is_none()
+        && plan.preprocess.mutations.is_empty()
+        && plan.preprocess.update_validations.is_empty()
+}
+
 fn requires_single_statement_postprocess(
     plan: Option<&crate::engine::sql::contracts::postprocess_actions::PostprocessPlan>,
 ) -> bool {
     matches!(
         plan,
-        Some(other)
-            if !matches!(
-                other,
-                crate::engine::sql::contracts::postprocess_actions::PostprocessPlan::VtableUpdate(
-                    _
-                )
-            )
+        Some(crate::engine::sql::contracts::postprocess_actions::PostprocessPlan::VtableDelete(_))
     )
 }

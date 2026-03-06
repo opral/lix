@@ -240,30 +240,83 @@ fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
 }
 
 #[test]
-fn guardrail_authoritative_writes_do_not_invalidate_file_data_cache_targets() {
+fn guardrail_live_filesystem_effects_do_not_carry_cache_invalidation_targets() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let effects_source =
         fs::read_to_string(root.join("src/sql/semantics/state_resolution/effects.rs"))
             .expect("effects.rs should be readable");
 
     assert!(
-        !effects_source.contains(
-            "file_data_cache_invalidation_targets\n        .extend(authoritative_pending_file_write_targets.iter().cloned());"
-        ),
-        "authoritative file writes must be write-through, not file-data-cache invalidation targets"
+        !effects_source.contains("file_data_cache_invalidation_targets"),
+        "live filesystem effects must not derive file-data-cache invalidation targets"
+    );
+    assert!(
+        !effects_source.contains("file_path_cache_invalidation_targets"),
+        "live filesystem effects must not derive file-path-cache invalidation targets"
     );
 }
 
 #[test]
-fn guardrail_filesystem_data_only_updates_use_domain_changes_only_postprocess() {
+fn guardrail_filesystem_data_only_updates_use_explicit_effect_only_rewrite() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let canonical_source = fs::read_to_string(
         root.join("src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/mod.rs"),
     )
     .expect("canonical statement rule source should be readable");
+    let mutation_source = fs::read_to_string(root.join("src/filesystem/mutation_rewrite.rs"))
+        .expect("mutation_rewrite.rs should be readable");
 
     assert!(
-        canonical_source.contains("PostprocessPlan::DomainChangesOnly"),
-        "filesystem data-only updates must be able to emit DomainChangesOnly postprocess"
+        canonical_source.contains("FilesystemUpdateRewrite::EffectOnly"),
+        "canonical filesystem rewrite must branch on explicit effect-only updates"
+    );
+    assert!(
+        mutation_source.contains("FilesystemUpdateRewrite::EffectOnly"),
+        "filesystem mutation rewrite must emit explicit effect-only updates"
+    );
+    assert!(
+        !canonical_source.contains("filesystem_noop_statement"),
+        "canonical filesystem rewrite must not pattern-match fake no-op SQL"
+    );
+    assert!(
+        !mutation_source.contains("failed to build filesystem no-op statement"),
+        "filesystem mutation rewrite must not synthesize fake no-op SQL statements"
+    );
+}
+
+#[test]
+fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let side_effects_source = fs::read_to_string(root.join("src/sql/side_effects.rs"))
+        .expect("side_effects.rs should be readable");
+    let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
+        .expect("shared_path.rs should be readable");
+    let intent_source = fs::read_to_string(root.join("src/sql/execution/intent.rs"))
+        .expect("intent.rs should be readable");
+
+    assert!(
+        !side_effects_source
+            .contains("detect_file_changes_for_pending_writes_by_statement_with_backend"),
+        "live filesystem side-effect collection must not retain a plugin detect branch"
+    );
+    assert!(
+        !side_effects_source.contains("detect_file_changes_with_plugins_with_cache"),
+        "live filesystem side-effect collection must not call plugin file detection"
+    );
+    assert!(
+        !shared_path_source.contains("detect_plugin_file_changes"),
+        "execution preparation must not thread filesystem plugin-detect options"
+    );
+    assert!(
+        !shared_path_source.contains("allow_plugin_cache"),
+        "execution preparation must not thread filesystem plugin-cache options"
+    );
+    assert!(
+        !intent_source.contains("detect_plugin_file_changes"),
+        "execution intent collection must not expose filesystem plugin-detect options"
+    );
+    assert!(
+        !intent_source.contains("allow_plugin_cache"),
+        "execution intent collection must not expose filesystem plugin-cache options"
     );
 }

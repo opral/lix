@@ -58,6 +58,19 @@ impl<'a> StatementContext<'a> {
     pub(crate) fn take_output(&mut self, statements: Vec<Statement>) -> RewriteOutput {
         RewriteOutput {
             statements,
+            effect_only: false,
+            params: std::mem::take(&mut self.generated_params),
+            registrations: std::mem::take(&mut self.registrations),
+            postprocess: self.postprocess.take(),
+            mutations: std::mem::take(&mut self.mutations),
+            update_validations: std::mem::take(&mut self.update_validations),
+        }
+    }
+
+    pub(crate) fn take_effect_only_output(&mut self) -> RewriteOutput {
+        RewriteOutput {
+            statements: Vec::new(),
+            effect_only: true,
             params: std::mem::take(&mut self.generated_params),
             registrations: std::mem::take(&mut self.registrations),
             postprocess: self.postprocess.take(),

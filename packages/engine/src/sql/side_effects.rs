@@ -9,6 +9,10 @@ use super::storage::queries::{
 use super::storage::tables;
 use crate::SqlDialect;
 
+const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
+const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
+
 pub(crate) struct FilesystemUpdateDomainChangeCollection {
     pub(crate) untracked_changes: Vec<DetectedFileDomainChange>,
     pub(crate) tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
@@ -120,6 +124,56 @@ async fn resolve_pending_write_file_id_in_transaction(
     Ok(file_id)
 }
 
+fn binary_blob_ref_change_for_bytes(
+    file_id: &str,
+    version_id: &str,
+    data: &[u8],
+    writer_key: Option<&str>,
+) -> Result<DetectedFileDomainChange, LixError> {
+    let size_bytes = u64::try_from(data.len()).map_err(|_| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "binary blob size exceeds supported range for file '{}' version '{}'",
+            file_id, version_id
+        ),
+    })?;
+    let snapshot_content = serde_json::json!({
+        "id": file_id,
+        "blob_hash": crate::plugin::runtime::binary_blob_hash_hex(data),
+        "size_bytes": size_bytes,
+    })
+    .to_string();
+    Ok(DetectedFileDomainChange {
+        entity_id: file_id.to_string(),
+        schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+        schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
+        file_id: file_id.to_string(),
+        version_id: version_id.to_string(),
+        plugin_key: INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
+        snapshot_content: Some(snapshot_content),
+        metadata: None,
+        writer_key: writer_key.map(ToString::to_string),
+    })
+}
+
+fn binary_blob_ref_tombstone_change_for_target(
+    file_id: &str,
+    version_id: &str,
+    writer_key: Option<&str>,
+) -> DetectedFileDomainChange {
+    DetectedFileDomainChange {
+        entity_id: file_id.to_string(),
+        schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+        schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
+        file_id: file_id.to_string(),
+        version_id: version_id.to_string(),
+        plugin_key: INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
+        snapshot_content: None,
+        metadata: None,
+        writer_key: writer_key.map(ToString::to_string),
+    }
+}
+
 impl Engine {
     pub(crate) async fn maybe_materialize_reads_with_backend_from_statements(
         &self,
@@ -127,53 +181,8 @@ impl Engine {
         statements: &[Statement],
         active_version_id: &str,
     ) -> Result<(), LixError> {
-        if let Some(scope) =
-            history_plugin_inputs::file_read_materialization_scope_for_statements(statements)
-        {
-            let versions = match scope {
-                history_plugin_inputs::FileReadMaterializationScope::ActiveVersionOnly => {
-                    let mut set = BTreeSet::new();
-                    set.insert(active_version_id.to_string());
-                    Some(set)
-                }
-                history_plugin_inputs::FileReadMaterializationScope::AllVersions => None,
-            };
-            if let Err(error) = crate::plugin::runtime::materialize_missing_file_data_with_plugins(
-                backend,
-                self.wasm_runtime.as_ref(),
-                versions.as_ref(),
-            )
-            .await
-            {
-                if let Some(unavailable) = first_unavailable_file_data_target_with_binary_ref(
-                    backend,
-                    scope,
-                    active_version_id,
-                )
-                .await?
-                {
-                    return Err(crate::errors::file_data_unavailable_error(
-                        &unavailable.file_id,
-                        &unavailable.version_id,
-                        unavailable.blob_hash.as_deref(),
-                    ));
-                }
-                return Err(error);
-            }
-            if let Some(unavailable) = first_unavailable_file_data_target_with_binary_ref(
-                backend,
-                scope,
-                active_version_id,
-            )
-            .await?
-            {
-                return Err(crate::errors::file_data_unavailable_error(
-                    &unavailable.file_id,
-                    &unavailable.version_id,
-                    unavailable.blob_hash.as_deref(),
-                ));
-            }
-        }
+        let _ = backend;
+        let _ = active_version_id;
         if history_plugin_inputs::file_history_read_materialization_required_for_statements(
             statements,
         ) {
@@ -193,8 +202,6 @@ impl Engine {
         params: &[Value],
         active_version_id: &str,
         writer_key: Option<&str>,
-        allow_plugin_cache: bool,
-        detect_plugin_file_changes: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes_from_statements(
@@ -231,22 +238,8 @@ impl Engine {
                 ),
             })?;
 
-        let detected_file_changes_by_statement = if detect_plugin_file_changes {
-            self.detect_file_changes_for_pending_writes_by_statement_with_backend(
-                backend,
-                &pending_file_writes_by_statement,
-                allow_plugin_cache,
-            )
-            .await?
-        } else {
-            vec![Vec::new(); pending_file_writes_by_statement.len()]
-        };
-        let mut detected_file_domain_changes_by_statement = detected_file_changes_by_statement
-            .into_iter()
-            .map(|changes| {
-                detected_file_domain_changes_from_detected_file_changes(&changes, writer_key)
-            })
-            .collect::<Vec<_>>();
+        let mut detected_file_domain_changes_by_statement =
+            vec![Vec::new(); pending_file_writes_by_statement.len()];
 
         let filesystem_update_domain_changes =
             collect_filesystem_update_detected_file_domain_changes_from_statements(
@@ -311,47 +304,28 @@ impl Engine {
 
         let mut detected_file_domain_changes =
             std::mem::take(&mut side_effects.detected_file_domain_changes);
-        if !side_effects.pending_file_writes.is_empty() {
-            let detected_by_statement = {
-                let backend = TransactionBackendAdapter::new(transaction);
-                self.detect_file_changes_for_pending_writes_by_statement_with_backend(
-                    &backend,
-                    &[side_effects.pending_file_writes.clone()],
-                    false,
-                )
-                .await?
-            };
-            if let Some(detected) = detected_by_statement.into_iter().next() {
-                detected_file_domain_changes.extend(
-                    detected_file_domain_changes_from_detected_file_changes(&detected, writer_key),
-                );
-            }
-        }
+        detected_file_domain_changes.extend(
+            self.collect_live_filesystem_payload_domain_changes_in_transaction(
+                transaction,
+                &side_effects.pending_file_writes,
+                &side_effects.pending_file_delete_targets,
+                writer_key,
+            )
+            .await?,
+        );
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
         let should_run_binary_gc = should_run_binary_cas_gc(&[], &detected_file_domain_changes);
-        let mut binary_blob_ref_targets = detected_file_domain_changes
-            .iter()
-            .filter(|change| change.schema_key == "lix_binary_blob_ref")
-            .map(|change| (change.file_id.clone(), change.version_id.clone()))
-            .collect::<BTreeSet<_>>();
-        if binary_blob_ref_targets.is_empty() {
-            binary_blob_ref_targets = self
-                .load_binary_blob_ref_index_targets_in_transaction(transaction)
-                .await?;
-        }
         let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
             &std::mem::take(&mut side_effects.untracked_filesystem_update_domain_changes),
         );
-        let pending_file_delete_targets =
-            std::mem::take(&mut side_effects.pending_file_delete_targets);
-        side_effects
-            .file_data_cache_invalidation_targets
-            .extend(pending_file_delete_targets.iter().cloned());
-        side_effects
-            .file_path_cache_invalidation_targets
-            .extend(pending_file_delete_targets);
+        let _ = std::mem::take(&mut side_effects.pending_file_delete_targets);
 
+        self.persist_pending_file_data_updates_in_transaction(
+            transaction,
+            &side_effects.pending_file_writes,
+        )
+        .await?;
         if !detected_file_domain_changes.is_empty() {
             self.persist_detected_file_domain_changes_in_transaction(
                 transaction,
@@ -366,104 +340,12 @@ impl Engine {
             )
             .await?;
         }
-        self.persist_pending_file_data_updates_in_transaction(
-            transaction,
-            &side_effects.pending_file_writes,
-        )
-        .await?;
-        self.persist_pending_file_path_updates_in_transaction(
-            transaction,
-            &side_effects.pending_file_writes,
-        )
-        .await?;
-        self.sync_binary_blob_ref_index_for_targets_in_transaction(
-            transaction,
-            &binary_blob_ref_targets,
-        )
-        .await?;
-        self.ensure_builtin_binary_blob_store_for_targets_in_transaction(
-            transaction,
-            &side_effects.file_data_cache_invalidation_targets,
-        )
-        .await?;
         if should_run_binary_gc {
             self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
                 .await?;
         }
-        self.invalidate_file_data_cache_entries_in_transaction(
-            transaction,
-            &side_effects.file_data_cache_invalidation_targets,
-        )
-        .await?;
-        self.invalidate_file_path_cache_entries_in_transaction(
-            transaction,
-            &side_effects.file_path_cache_invalidation_targets,
-        )
-        .await?;
 
         Ok(())
-    }
-    pub(crate) async fn detect_file_changes_for_pending_writes_by_statement_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-        writes_by_statement: &[Vec<crate::filesystem::pending_file_writes::PendingFileWrite>],
-        allow_plugin_cache: bool,
-    ) -> Result<Vec<Vec<crate::plugin::runtime::DetectedFileChange>>, LixError> {
-        let installed_plugins = self
-            .load_installed_plugins_with_backend(backend, allow_plugin_cache)
-            .await?;
-
-        let mut loaded_instances = {
-            self.plugin_component_cache
-                .lock()
-                .map_err(|_| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "plugin component cache lock poisoned".to_string(),
-                })?
-                .clone()
-        };
-        let mut detected_by_statement = Vec::with_capacity(writes_by_statement.len());
-        for writes in writes_by_statement {
-            if writes.is_empty() {
-                detected_by_statement.push(Vec::new());
-                continue;
-            }
-
-            let requests = writes
-                .iter()
-                .map(|write| crate::plugin::runtime::FileChangeDetectionRequest {
-                    file_id: write.file_id.clone(),
-                    version_id: write.version_id.clone(),
-                    before_path: write.before_path.clone(),
-                    after_path: write.after_path.clone(),
-                    data_is_authoritative: write.data_is_authoritative,
-                    before_data: write.before_data.clone(),
-                    after_data: write.after_data.clone(),
-                })
-                .collect::<Vec<_>>();
-            let detected = crate::plugin::runtime::detect_file_changes_with_plugins_with_cache(
-                backend,
-                self.wasm_runtime.as_ref(),
-                &requests,
-                &installed_plugins,
-                &mut loaded_instances,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("file detect stage failed: {}", error.description),
-            })?;
-            detected_by_statement.push(dedupe_detected_file_changes(&detected));
-        }
-        {
-            let mut guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "plugin component cache lock poisoned".to_string(),
-            })?;
-            *guard = loaded_instances;
-        }
-
-        Ok(detected_by_statement)
     }
 
     pub(crate) async fn persist_detected_file_domain_changes(
@@ -573,6 +455,73 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) async fn collect_live_filesystem_payload_domain_changes(
+        &self,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+        delete_targets: &BTreeSet<(String, String)>,
+        writer_key: Option<&str>,
+    ) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+        let mut latest_by_key = BTreeMap::new();
+
+        for write in writes {
+            if !write.data_is_authoritative {
+                continue;
+            }
+            let resolved_file_id =
+                resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
+            let change = binary_blob_ref_change_for_bytes(
+                &resolved_file_id,
+                &write.version_id,
+                &write.after_data,
+                writer_key,
+            )?;
+            latest_by_key.insert((resolved_file_id, write.version_id.clone()), change);
+        }
+
+        for (file_id, version_id) in delete_targets {
+            latest_by_key.insert(
+                (file_id.clone(), version_id.clone()),
+                binary_blob_ref_tombstone_change_for_target(file_id, version_id, writer_key),
+            );
+        }
+
+        Ok(latest_by_key.into_values().collect())
+    }
+
+    pub(crate) async fn collect_live_filesystem_payload_domain_changes_in_transaction(
+        &self,
+        transaction: &mut dyn LixTransaction,
+        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+        delete_targets: &BTreeSet<(String, String)>,
+        writer_key: Option<&str>,
+    ) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+        let mut latest_by_key = BTreeMap::new();
+
+        for write in writes {
+            if !write.data_is_authoritative {
+                continue;
+            }
+            let resolved_file_id =
+                resolve_pending_write_file_id_in_transaction(transaction, write).await?;
+            let change = binary_blob_ref_change_for_bytes(
+                &resolved_file_id,
+                &write.version_id,
+                &write.after_data,
+                writer_key,
+            )?;
+            latest_by_key.insert((resolved_file_id, write.version_id.clone()), change);
+        }
+
+        for (file_id, version_id) in delete_targets {
+            latest_by_key.insert(
+                (file_id.clone(), version_id.clone()),
+                binary_blob_ref_tombstone_change_for_target(file_id, version_id, writer_key),
+            );
+        }
+
+        Ok(latest_by_key.into_values().collect())
+    }
+
     pub(crate) async fn persist_pending_file_data_updates(
         &self,
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
@@ -602,18 +551,6 @@ impl Engine {
                 &write.after_data,
             )
             .await?;
-        }
-
-        self.record_intent_verification_checks(latest_index_by_key.len());
-        if let Err(error) = verify_binary_file_version_refs_with_backend(
-            self.backend.as_ref(),
-            writes,
-            &latest_index_by_key,
-        )
-        .await
-        {
-            self.record_intent_verification_failure();
-            return Err(error);
         }
 
         Ok(())
@@ -651,428 +588,6 @@ impl Engine {
             .await?;
         }
 
-        self.record_intent_verification_checks(latest_index_by_key.len());
-        if let Err(error) = verify_binary_file_version_refs_in_transaction(
-            transaction,
-            writes,
-            &latest_index_by_key,
-        )
-        .await
-        {
-            self.record_intent_verification_failure();
-            return Err(error);
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn persist_pending_file_path_updates(
-        &self,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    ) -> Result<(), LixError> {
-        let upsert_sql = filesystem_queries::upsert_file_path_cache_sql();
-        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for (index, write) in writes.iter().enumerate() {
-            let resolved_file_id =
-                resolve_pending_write_file_id_with_backend(self.backend.as_ref(), write).await?;
-            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
-        }
-
-        for ((file_id, version_id), index) in latest_by_key {
-            let write = &writes[index];
-            let Some(path) = write.after_path.as_deref() else {
-                continue;
-            };
-            let Some((name, extension)) = file_name_and_extension_from_path(path) else {
-                continue;
-            };
-            self.backend
-                .execute(
-                    &upsert_sql,
-                    &[
-                        Value::Text(file_id),
-                        Value::Text(version_id),
-                        Value::Text(name),
-                        match extension {
-                            Some(value) => Value::Text(value),
-                            None => Value::Null,
-                        },
-                        Value::Text(path.to_string()),
-                    ],
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn persist_pending_file_path_updates_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    ) -> Result<(), LixError> {
-        let upsert_sql = filesystem_queries::upsert_file_path_cache_sql();
-        let mut latest_by_key: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for (index, write) in writes.iter().enumerate() {
-            let resolved_file_id =
-                resolve_pending_write_file_id_in_transaction(transaction, write).await?;
-            latest_by_key.insert((resolved_file_id, write.version_id.clone()), index);
-        }
-
-        for ((file_id, version_id), index) in latest_by_key {
-            let write = &writes[index];
-            let Some(path) = write.after_path.as_deref() else {
-                continue;
-            };
-            let Some((name, extension)) = file_name_and_extension_from_path(path) else {
-                continue;
-            };
-            transaction
-                .execute(
-                    &upsert_sql,
-                    &[
-                        Value::Text(file_id),
-                        Value::Text(version_id),
-                        Value::Text(name),
-                        match extension {
-                            Some(value) => Value::Text(value),
-                            None => Value::Null,
-                        },
-                        Value::Text(path.to_string()),
-                    ],
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn sync_binary_blob_ref_index_for_targets(
-        &self,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        let upsert_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
-        let delete_sql = format!(
-            "DELETE FROM {} \
-             WHERE file_id = $1 \
-               AND version_id = $2",
-            tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
-        );
-        let now = crate::functions::timestamp::timestamp();
-
-        for (file_id, version_id) in targets {
-            let snapshot = load_latest_binary_blob_ref_snapshot_for_target(
-                self.backend.as_ref(),
-                file_id,
-                version_id,
-            )
-            .await?;
-
-            let Some(snapshot) = snapshot else {
-                self.backend
-                    .execute(
-                        &delete_sql,
-                        &[
-                            Value::Text(file_id.clone()),
-                            Value::Text(version_id.clone()),
-                        ],
-                    )
-                    .await?;
-                continue;
-            };
-
-            if !binary_blob_exists(self.backend.as_ref(), &snapshot.blob_hash).await? {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "lix_binary_blob_ref integrity violation: missing blob_hash '{}' for file '{}' version '{}'",
-                        snapshot.blob_hash, file_id, version_id
-                    ),
-                });
-            }
-
-            let size_bytes = i64::try_from(snapshot.size_bytes).map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "lix_binary_blob_ref integrity violation: size_bytes out of range for file '{}' version '{}'",
-                    file_id, version_id
-                ),
-            })?;
-            self.backend
-                .execute(
-                    &upsert_sql,
-                    &[
-                        Value::Text(file_id.clone()),
-                        Value::Text(version_id.clone()),
-                        Value::Text(snapshot.blob_hash),
-                        Value::Integer(size_bytes),
-                        Value::Text(now.clone()),
-                    ],
-                )
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn sync_binary_blob_ref_index_for_targets_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        let upsert_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
-        let delete_sql = format!(
-            "DELETE FROM {} \
-             WHERE file_id = $1 \
-               AND version_id = $2",
-            tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
-        );
-        let now = crate::functions::timestamp::timestamp();
-
-        for (file_id, version_id) in targets {
-            let snapshot = load_latest_binary_blob_ref_snapshot_for_target_in_transaction(
-                transaction,
-                file_id,
-                version_id,
-            )
-            .await?;
-
-            let Some(snapshot) = snapshot else {
-                transaction
-                    .execute(
-                        &delete_sql,
-                        &[
-                            Value::Text(file_id.clone()),
-                            Value::Text(version_id.clone()),
-                        ],
-                    )
-                    .await?;
-                continue;
-            };
-
-            if !binary_blob_exists_in_transaction(transaction, &snapshot.blob_hash).await? {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "lix_binary_blob_ref integrity violation: missing blob_hash '{}' for file '{}' version '{}'",
-                        snapshot.blob_hash, file_id, version_id
-                    ),
-                });
-            }
-
-            let size_bytes = i64::try_from(snapshot.size_bytes).map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "lix_binary_blob_ref integrity violation: size_bytes out of range for file '{}' version '{}'",
-                    file_id, version_id
-                ),
-            })?;
-            transaction
-                .execute(
-                    &upsert_sql,
-                    &[
-                        Value::Text(file_id.clone()),
-                        Value::Text(version_id.clone()),
-                        Value::Text(snapshot.blob_hash),
-                        Value::Integer(size_bytes),
-                        Value::Text(now.clone()),
-                    ],
-                )
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn load_binary_blob_ref_index_targets(
-        &self,
-    ) -> Result<BTreeSet<(String, String)>, LixError> {
-        let sql =
-            if binary_blob_ref_materialized_relation_exists_with_backend(self.backend.as_ref())
-                .await?
-            {
-                format!(
-                    "SELECT file_id, version_id \
-                 FROM {} \
-                 WHERE is_tombstone = 0 \
-                   AND snapshot_content IS NOT NULL \
-                 UNION \
-                 SELECT file_id, version_id \
-                 FROM {}",
-                    tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF,
-                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
-                )
-            } else {
-                format!(
-                    "SELECT file_id, version_id \
-                 FROM {}",
-                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
-                )
-            };
-        let result = self.backend.execute(&sql, &[]).await?;
-        let mut targets = BTreeSet::new();
-        for row in &result.rows {
-            targets.insert((
-                text_value_required(row, 0, "file_id")?,
-                text_value_required(row, 1, "version_id")?,
-            ));
-        }
-        Ok(targets)
-    }
-
-    pub(crate) async fn load_binary_blob_ref_index_targets_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-    ) -> Result<BTreeSet<(String, String)>, LixError> {
-        let sql =
-            if binary_blob_ref_materialized_relation_exists_in_transaction(transaction).await? {
-                format!(
-                    "SELECT file_id, version_id \
-                     FROM {} \
-                     WHERE is_tombstone = 0 \
-                       AND snapshot_content IS NOT NULL \
-                     UNION \
-                     SELECT file_id, version_id \
-                     FROM {}",
-                    tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF,
-                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
-                )
-            } else {
-                format!(
-                    "SELECT file_id, version_id \
-                     FROM {}",
-                    tables::filesystem::INTERNAL_BINARY_FILE_VERSION_REF,
-                )
-            };
-        let result = transaction.execute(&sql, &[]).await?;
-        let mut targets = BTreeSet::new();
-        for row in &result.rows {
-            targets.insert((
-                text_value_required(row, 0, "file_id")?,
-                text_value_required(row, 1, "version_id")?,
-            ));
-        }
-        Ok(targets)
-    }
-
-    pub(crate) async fn ensure_builtin_binary_blob_store_for_targets(
-        &self,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        for (file_id, version_id) in targets {
-            let snapshot = load_builtin_binary_blob_ref_snapshot_for_target(
-                self.backend.as_ref(),
-                file_id,
-                version_id,
-            )
-            .await?;
-            let Some(snapshot) = snapshot else {
-                continue;
-            };
-
-            if binary_blob_exists(self.backend.as_ref(), &snapshot.blob_hash).await? {
-                continue;
-            }
-
-            let data = load_file_cache_blob(self.backend.as_ref(), file_id, version_id)
-                .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "builtin binary fallback: missing file_data_cache bytes for file '{}' version '{}' while backfilling blob hash '{}'",
-                        file_id, version_id, snapshot.blob_hash
-                    ),
-                })?;
-            let actual_hash = crate::plugin::runtime::binary_blob_hash_hex(&data);
-            if actual_hash != snapshot.blob_hash {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "builtin binary fallback: cache bytes hash mismatch for file '{}' version '{}': expected '{}' from state, got '{}'",
-                        file_id, version_id, snapshot.blob_hash, actual_hash
-                    ),
-                });
-            }
-            if data.len() as u64 != snapshot.size_bytes {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "builtin binary fallback: cache bytes size mismatch for file '{}' version '{}': expected {} bytes from state, got {}",
-                        file_id,
-                        version_id,
-                        snapshot.size_bytes,
-                        data.len()
-                    ),
-                });
-            }
-
-            persist_binary_blob_with_fastcdc_backend(
-                self.backend.as_ref(),
-                file_id,
-                version_id,
-                &data,
-            )
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn ensure_builtin_binary_blob_store_for_targets_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        for (file_id, version_id) in targets {
-            let snapshot = load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
-                transaction,
-                file_id,
-                version_id,
-            )
-            .await?;
-            let Some(snapshot) = snapshot else {
-                continue;
-            };
-
-            if binary_blob_exists_in_transaction(transaction, &snapshot.blob_hash).await? {
-                continue;
-            }
-
-            let data = load_file_cache_blob_in_transaction(transaction, file_id, version_id)
-                .await?
-                .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "builtin binary fallback: missing file_data_cache bytes for file '{}' version '{}' while backfilling blob hash '{}'",
-                        file_id, version_id, snapshot.blob_hash
-                    ),
-                })?;
-            let actual_hash = crate::plugin::runtime::binary_blob_hash_hex(&data);
-            if actual_hash != snapshot.blob_hash {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "builtin binary fallback: cache bytes hash mismatch for file '{}' version '{}': expected '{}' from state, got '{}'",
-                        file_id, version_id, snapshot.blob_hash, actual_hash
-                    ),
-                });
-            }
-            if data.len() as u64 != snapshot.size_bytes {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "builtin binary fallback: cache bytes size mismatch for file '{}' version '{}': expected {} bytes from state, got {}",
-                        file_id,
-                        version_id,
-                        snapshot.size_bytes,
-                        data.len()
-                    ),
-                });
-            }
-
-            persist_binary_blob_with_fastcdc_in_transaction(
-                transaction,
-                file_id,
-                version_id,
-                &data,
-            )
-            .await?;
-        }
-
         Ok(())
     }
 
@@ -1085,153 +600,6 @@ impl Engine {
         transaction: &mut dyn LixTransaction,
     ) -> Result<(), LixError> {
         garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
-    }
-
-    pub(crate) async fn invalidate_file_data_cache_entries(
-        &self,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        const PAIRS_PER_CHUNK: usize = 200;
-        let keys = targets.iter().cloned().collect::<Vec<_>>();
-
-        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            let mut predicates = Vec::with_capacity(chunk.len());
-            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
-                let file_param = index * 2 + 1;
-                let version_param = file_param + 1;
-                predicates.push(format!(
-                    "(file_id = ${file_param} AND version_id = ${version_param})"
-                ));
-                params.push(Value::Text(file_id.clone()));
-                params.push(Value::Text(version_id.clone()));
-            }
-            let sql =
-                filesystem_queries::delete_file_data_cache_where_sql(&predicates.join(" OR "));
-
-            self.backend.execute(&sql, &params).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn invalidate_file_data_cache_entries_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        const PAIRS_PER_CHUNK: usize = 200;
-        let keys = targets.iter().cloned().collect::<Vec<_>>();
-
-        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            let mut predicates = Vec::with_capacity(chunk.len());
-            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
-                let file_param = index * 2 + 1;
-                let version_param = file_param + 1;
-                predicates.push(format!(
-                    "(file_id = ${file_param} AND version_id = ${version_param})"
-                ));
-                params.push(Value::Text(file_id.clone()));
-                params.push(Value::Text(version_id.clone()));
-            }
-            let sql =
-                filesystem_queries::delete_file_data_cache_where_sql(&predicates.join(" OR "));
-
-            transaction.execute(&sql, &params).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn invalidate_file_path_cache_entries(
-        &self,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        const PAIRS_PER_CHUNK: usize = 200;
-        let keys = targets.iter().cloned().collect::<Vec<_>>();
-
-        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            let mut predicates = Vec::with_capacity(chunk.len());
-            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
-                let file_param = index * 2 + 1;
-                let version_param = file_param + 1;
-                predicates.push(format!(
-                    "(file_id = ${file_param} AND version_id = ${version_param})"
-                ));
-                params.push(Value::Text(file_id.clone()));
-                params.push(Value::Text(version_id.clone()));
-            }
-            let sql =
-                filesystem_queries::delete_file_path_cache_where_sql(&predicates.join(" OR "));
-
-            self.backend.execute(&sql, &params).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn invalidate_file_path_cache_entries_in_transaction(
-        &self,
-        transaction: &mut dyn LixTransaction,
-        targets: &BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-
-        const PAIRS_PER_CHUNK: usize = 200;
-        let keys = targets.iter().cloned().collect::<Vec<_>>();
-
-        for chunk in keys.chunks(PAIRS_PER_CHUNK) {
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            let mut predicates = Vec::with_capacity(chunk.len());
-            for (index, (file_id, version_id)) in chunk.iter().enumerate() {
-                let file_param = index * 2 + 1;
-                let version_param = file_param + 1;
-                predicates.push(format!(
-                    "(file_id = ${file_param} AND version_id = ${version_param})"
-                ));
-                params.push(Value::Text(file_id.clone()));
-                params.push(Value::Text(version_id.clone()));
-            }
-            let sql =
-                filesystem_queries::delete_file_path_cache_where_sql(&predicates.join(" OR "));
-
-            transaction.execute(&sql, &params).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn refresh_file_data_for_versions(
-        &self,
-        targets: BTreeSet<(String, String)>,
-    ) -> Result<(), LixError> {
-        let versions = targets
-            .into_iter()
-            .map(|(_, version_id)| version_id)
-            .collect::<BTreeSet<_>>();
-        if versions.is_empty() {
-            return Ok(());
-        }
-
-        self.materialize(&MaterializationRequest {
-            scope: MaterializationScope::Versions(versions),
-            debug: MaterializationDebugMode::Off,
-            debug_row_limit: 1,
-        })
-        .await?;
-        Ok(())
     }
 
     pub(crate) fn require_active_version_id(&self) -> Result<String, LixError> {
@@ -1256,52 +624,6 @@ impl Engine {
         }
         *guard = Some(version_id);
     }
-}
-
-struct FileDataUnavailableTarget {
-    file_id: String,
-    version_id: String,
-    blob_hash: Option<String>,
-}
-
-async fn first_unavailable_file_data_target_with_binary_ref(
-    backend: &dyn LixBackend,
-    scope: history_plugin_inputs::FileReadMaterializationScope,
-    active_version_id: &str,
-) -> Result<Option<FileDataUnavailableTarget>, LixError> {
-    let mut params = Vec::new();
-    let scope_sql = match scope {
-        history_plugin_inputs::FileReadMaterializationScope::ActiveVersionOnly => {
-            params.push(Value::Text(active_version_id.to_string()));
-            "AND bfr.version_id = $1"
-        }
-        history_plugin_inputs::FileReadMaterializationScope::AllVersions => "",
-    };
-    let sql = format!(
-        "SELECT bfr.file_id, bfr.version_id, bfr.blob_hash \
-         FROM lix_internal_binary_file_version_ref bfr \
-         JOIN lix_internal_file_path_cache fp \
-           ON fp.file_id = bfr.file_id \
-          AND fp.version_id = bfr.version_id \
-         LEFT JOIN lix_internal_file_data_cache fd \
-           ON fd.file_id = bfr.file_id \
-          AND fd.version_id = bfr.version_id \
-         LEFT JOIN lix_internal_binary_blob_store bbs \
-           ON bbs.blob_hash = bfr.blob_hash \
-         WHERE fd.data IS NULL \
-           AND bbs.data IS NULL \
-           {scope_sql} \
-         LIMIT 1"
-    );
-    let result = backend.execute(&sql, &params).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(FileDataUnavailableTarget {
-        file_id: text_value_required(row, 0, "file_id")?,
-        version_id: text_value_required(row, 1, "version_id")?,
-        blob_hash: Some(text_value_required(row, 2, "blob_hash")?),
-    }))
 }
 
 fn build_detected_file_domain_changes_insert(
@@ -1348,214 +670,6 @@ fn values_row_placeholders_sql(row_index: usize, values_per_row: usize) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     format!("({placeholders})")
-}
-
-fn parse_builtin_binary_blob_ref_snapshot(
-    raw: &str,
-) -> Result<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot, LixError> {
-    serde_json::from_str(raw).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "builtin binary fallback: invalid lix_binary_blob_ref snapshot_content: {error}"
-        ),
-    })
-}
-
-async fn load_builtin_binary_blob_ref_snapshot_for_target(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
-    let sql = state_queries::select_builtin_binary_blob_ref_snapshot_sql();
-    let result = backend
-        .execute(
-            &sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Text(crate::plugin::runtime::BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string()),
-            ],
-        )
-        .await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
-    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
-    if parsed.id != file_id {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
-                parsed.id, file_id
-            ),
-        });
-    }
-    Ok(Some(parsed))
-}
-
-async fn load_builtin_binary_blob_ref_snapshot_for_target_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
-    let sql = state_queries::select_builtin_binary_blob_ref_snapshot_sql();
-    let result = transaction
-        .execute(
-            &sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Text(crate::plugin::runtime::BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string()),
-            ],
-        )
-        .await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
-    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
-    if parsed.id != file_id {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "builtin binary fallback: snapshot id '{}' does not match file_id '{}'",
-                parsed.id, file_id
-            ),
-        });
-    }
-    Ok(Some(parsed))
-}
-
-async fn load_latest_binary_blob_ref_snapshot_for_target(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
-    if !binary_blob_ref_materialized_relation_exists_with_backend(backend).await? {
-        return Ok(None);
-    }
-    let sql = state_queries::select_latest_binary_blob_ref_snapshot_sql();
-    let result = backend
-        .execute(
-            &sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
-    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
-    if parsed.id != file_id {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "lix_binary_blob_ref integrity violation: snapshot id '{}' does not match file_id '{}'",
-                parsed.id, file_id
-            ),
-        });
-    }
-    Ok(Some(parsed))
-}
-
-async fn load_latest_binary_blob_ref_snapshot_for_target_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<crate::plugin::runtime::BuiltinBinaryBlobRefSnapshot>, LixError> {
-    if !binary_blob_ref_materialized_relation_exists_in_transaction(transaction).await? {
-        return Ok(None);
-    }
-    let sql = state_queries::select_latest_binary_blob_ref_snapshot_sql();
-    let result = transaction
-        .execute(
-            &sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let raw_snapshot = text_value_required(row, 0, "snapshot_content")?;
-    let parsed = parse_builtin_binary_blob_ref_snapshot(&raw_snapshot)?;
-    if parsed.id != file_id {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "lix_binary_blob_ref integrity violation: snapshot id '{}' does not match file_id '{}'",
-                parsed.id, file_id
-            ),
-        });
-    }
-    Ok(Some(parsed))
-}
-
-async fn binary_blob_exists(backend: &dyn LixBackend, blob_hash: &str) -> Result<bool, LixError> {
-    let sql = filesystem_queries::binary_blob_exists_sql();
-    let result = backend
-        .execute(&sql, &[Value::Text(blob_hash.to_string())])
-        .await?;
-    Ok(!result.rows.is_empty())
-}
-
-async fn binary_blob_exists_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    blob_hash: &str,
-) -> Result<bool, LixError> {
-    let sql = filesystem_queries::binary_blob_exists_sql();
-    let result = transaction
-        .execute(&sql, &[Value::Text(blob_hash.to_string())])
-        .await?;
-    Ok(!result.rows.is_empty())
-}
-
-async fn load_file_cache_blob(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let sql = filesystem_queries::select_file_data_cache_blob_sql();
-    let result = backend
-        .execute(
-            &sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(blob_value_required(row, 0, "data")?))
-}
-
-async fn load_file_cache_blob_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let sql = filesystem_queries::select_file_data_cache_blob_sql();
-    let result = transaction
-        .execute(
-            &sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(blob_value_required(row, 0, "data")?))
 }
 
 const FASTCDC_MIN_CHUNK_BYTES: usize = 16 * 1024;
@@ -1645,8 +759,6 @@ async fn persist_binary_blob_with_fastcdc(
     let insert_manifest_sql = filesystem_queries::insert_binary_blob_manifest_sql();
     let insert_chunk_store_sql = filesystem_queries::insert_binary_chunk_store_sql();
     let insert_manifest_chunk_sql = filesystem_queries::insert_binary_blob_manifest_chunk_sql();
-    let upsert_file_version_ref_sql = filesystem_queries::upsert_binary_file_version_ref_sql();
-    let upsert_file_data_cache_sql = filesystem_queries::upsert_file_data_cache_sql();
 
     let blob_hash = crate::plugin::runtime::binary_blob_hash_hex(data);
     let size_bytes = i64::try_from(data.len()).map_err(|_| LixError {
@@ -1743,169 +855,7 @@ async fn persist_binary_blob_with_fastcdc(
             )
             .await?;
     }
-
-    executor
-        .execute_sql(
-            &upsert_file_version_ref_sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Text(blob_hash),
-                Value::Integer(size_bytes),
-                Value::Text(now),
-            ],
-        )
-        .await?;
-    executor
-        .execute_sql(
-            &upsert_file_data_cache_sql,
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Blob(data.to_vec()),
-            ],
-        )
-        .await?;
-
-    Ok(())
-}
-
-async fn verify_binary_file_version_refs_with_backend(
-    backend: &dyn LixBackend,
-    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    expected_index_by_key: &BTreeMap<(String, String), usize>,
-) -> Result<(), LixError> {
-    if expected_index_by_key.is_empty() {
-        return Ok(());
-    }
-
-    let sql = filesystem_queries::select_binary_file_version_ref_sql();
-    for ((file_id, version_id), index) in expected_index_by_key {
-        let write = writes.get(*index).ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "file data write verification failed: invalid write index {} for file '{}' version '{}'",
-                index, file_id, version_id
-            ),
-        })?;
-        let expected_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
-        let expected_size = i64::try_from(write.after_data.len()).map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "file data write verification failed: expected size overflow for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-
-        let result = backend
-            .execute(
-                &sql,
-                &[
-                    Value::Text(file_id.clone()),
-                    Value::Text(version_id.clone()),
-                ],
-            )
-            .await?;
-        let Some(row) = result.rows.first() else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write verification failed: missing binary ref for file '{}' version '{}'",
-                    file_id, version_id
-                ),
-            });
-        };
-        let actual_hash = text_value_required(row, 0, "blob_hash")?;
-        if actual_hash != expected_hash {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write verification failed: blob hash mismatch for file '{}' version '{}': expected '{}', got '{}'",
-                    file_id, version_id, expected_hash, actual_hash
-                ),
-            });
-        }
-        let actual_size = int_value_required(row, 1, "size_bytes")?;
-        if actual_size != expected_size {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write verification failed: size mismatch for file '{}' version '{}': expected {}, got {}",
-                    file_id, version_id, expected_size, actual_size
-                ),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-async fn verify_binary_file_version_refs_in_transaction(
-    transaction: &mut dyn LixTransaction,
-    writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
-    expected_index_by_key: &BTreeMap<(String, String), usize>,
-) -> Result<(), LixError> {
-    if expected_index_by_key.is_empty() {
-        return Ok(());
-    }
-
-    let sql = filesystem_queries::select_binary_file_version_ref_sql();
-    for ((file_id, version_id), index) in expected_index_by_key {
-        let write = writes.get(*index).ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "file data write verification failed (tx): invalid write index {} for file '{}' version '{}'",
-                index, file_id, version_id
-            ),
-        })?;
-        let expected_hash = crate::plugin::runtime::binary_blob_hash_hex(&write.after_data);
-        let expected_size = i64::try_from(write.after_data.len()).map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "file data write verification failed (tx): expected size overflow for file '{}' version '{}'",
-                file_id, version_id
-            ),
-        })?;
-
-        let result = transaction
-            .execute(
-                &sql,
-                &[
-                    Value::Text(file_id.clone()),
-                    Value::Text(version_id.clone()),
-                ],
-            )
-            .await?;
-        let Some(row) = result.rows.first() else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write verification failed (tx): missing binary ref for file '{}' version '{}'",
-                    file_id, version_id
-                ),
-            });
-        };
-        let actual_hash = text_value_required(row, 0, "blob_hash")?;
-        if actual_hash != expected_hash {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write verification failed (tx): blob hash mismatch for file '{}' version '{}': expected '{}', got '{}'",
-                    file_id, version_id, expected_hash, actual_hash
-                ),
-            });
-        }
-        let actual_size = int_value_required(row, 1, "size_bytes")?;
-        if actual_size != expected_size {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "file data write verification failed (tx): size mismatch for file '{}' version '{}': expected {}, got {}",
-                    file_id, version_id, expected_size, actual_size
-                ),
-            });
-        }
-    }
+    let _ = (file_id, version_id, blob_hash, size_bytes, now);
 
     Ok(())
 }
@@ -1961,45 +911,6 @@ fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError>
         chunk_data,
         ruzstd::encoding::CompressionLevel::Fastest,
     ))
-}
-
-fn text_value_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
-    match row.get(index) {
-        Some(Value::Text(value)) => Ok(value.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "builtin binary fallback: expected text column '{}' at index {}",
-                column, index
-            ),
-        }),
-    }
-}
-
-fn blob_value_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, LixError> {
-    match row.get(index) {
-        Some(Value::Blob(value)) => Ok(value.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "builtin binary fallback: expected blob column '{}' at index {}",
-                column, index
-            ),
-        }),
-    }
-}
-
-fn int_value_required(row: &[Value], index: usize, column: &str) -> Result<i64, LixError> {
-    match row.get(index) {
-        Some(Value::Integer(value)) => Ok(*value),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "builtin binary fallback: expected integer column '{}' at index {}",
-                column, index
-            ),
-        }),
-    }
 }
 
 async fn garbage_collect_unreachable_binary_cas_with_backend(
@@ -2092,44 +1003,6 @@ async fn binary_blob_ref_relation_exists_with_backend(
     }
 }
 
-async fn binary_blob_ref_materialized_relation_exists_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<bool, LixError> {
-    match backend.dialect() {
-        SqlDialect::Sqlite => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(
-                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
-                    )],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-        SqlDialect::Postgres => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM pg_catalog.pg_class c \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = current_schema() \
-                       AND c.relname = $1 \
-                     LIMIT 1",
-                    &[Value::Text(
-                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
-                    )],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-    }
-}
-
 async fn binary_blob_ref_relation_exists_in_transaction(
     transaction: &mut dyn LixTransaction,
 ) -> Result<bool, LixError> {
@@ -2157,44 +1030,6 @@ async fn binary_blob_ref_relation_exists_in_transaction(
                        AND c.relname = $1 \
                      LIMIT 1",
                     &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-    }
-}
-
-async fn binary_blob_ref_materialized_relation_exists_in_transaction(
-    transaction: &mut dyn LixTransaction,
-) -> Result<bool, LixError> {
-    match transaction.dialect() {
-        SqlDialect::Sqlite => {
-            let result = transaction
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(
-                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
-                    )],
-                )
-                .await?;
-            Ok(!result.rows.is_empty())
-        }
-        SqlDialect::Postgres => {
-            let result = transaction
-                .execute(
-                    "SELECT 1 \
-                     FROM pg_catalog.pg_class c \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = current_schema() \
-                       AND c.relname = $1 \
-                     LIMIT 1",
-                    &[Value::Text(
-                        tables::state::INTERNAL_STATE_MATERIALIZED_LIX_BINARY_BLOB_REF.to_string(),
-                    )],
                 )
                 .await?;
             Ok(!result.rows.is_empty())

@@ -41,6 +41,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
     match rewritten {
         Some(vtable_write::UpdateRewrite::Statement(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
@@ -52,6 +53,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
             statements.push(rewrite.statement);
             Ok(RewriteOutput {
                 statements,
+                effect_only: false,
                 params: Vec::new(),
                 registrations: Vec::new(),
                 postprocess: Some(PostprocessPlan::VtableUpdate(rewrite.plan)),
@@ -64,6 +66,7 @@ pub(crate) fn rewrite_update(update: Update, params: &[Value]) -> Result<Rewrite
             if is_allowed_internal_write_target(&target) {
                 Ok(RewriteOutput {
                     statements: vec![Statement::Update(update)],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
@@ -95,6 +98,7 @@ pub(crate) fn rewrite_delete(
     match rewritten {
         Some(vtable_write::DeleteRewrite::Statement(statement)) => Ok(RewriteOutput {
             statements: vec![statement],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
@@ -103,6 +107,7 @@ pub(crate) fn rewrite_delete(
         }),
         Some(vtable_write::DeleteRewrite::Planned(rewrite)) => Ok(RewriteOutput {
             statements: vec![rewrite.statement],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(rewrite.plan)),
@@ -114,6 +119,7 @@ pub(crate) fn rewrite_delete(
             if is_allowed_internal_write_target(&target) {
                 Ok(RewriteOutput {
                     statements: vec![Statement::Delete(delete)],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,

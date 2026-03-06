@@ -20,6 +20,4 @@ pub(crate) struct PlanEffects {
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pub(crate) next_active_version_id: Option<String>,
     pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
-    pub(crate) file_data_cache_invalidation_targets: BTreeSet<(String, String)>,
-    pub(crate) file_path_cache_invalidation_targets: BTreeSet<(String, String)>,
 }

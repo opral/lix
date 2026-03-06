@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::engine::{
-    direct_state_file_cache_refresh_targets, file_descriptor_cache_eviction_targets,
-};
+use crate::engine::direct_state_file_cache_refresh_targets;
 use crate::state_commit_stream::state_commit_stream_changes_from_mutations;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -26,13 +24,8 @@ pub(crate) fn derive_effects_from_state_resolution(
     let state_commit_stream_changes =
         state_commit_stream_changes_from_mutations(&preprocess.mutations, writer_key);
     let file_cache_refresh_targets = direct_state_file_cache_refresh_targets(&preprocess.mutations);
-    let descriptor_cache_eviction_targets =
-        file_descriptor_cache_eviction_targets(&preprocess.mutations);
-    let mut file_path_cache_invalidation_targets = BTreeSet::new();
-    file_path_cache_invalidation_targets.extend(descriptor_cache_eviction_targets);
-    file_path_cache_invalidation_targets.extend(pending_file_delete_targets.iter().cloned());
-    let file_data_cache_invalidation_targets = file_path_cache_invalidation_targets.clone();
     let _ = authoritative_pending_file_write_targets;
+    let _ = pending_file_delete_targets;
     let next_active_version_id = active_version_from_mutations(&preprocess.mutations)
         .map_err(PlannerError::preprocess)?
         .or(
@@ -44,8 +37,6 @@ pub(crate) fn derive_effects_from_state_resolution(
         state_commit_stream_changes,
         next_active_version_id,
         file_cache_refresh_targets,
-        file_data_cache_invalidation_targets,
-        file_path_cache_invalidation_targets,
     })
 }
 

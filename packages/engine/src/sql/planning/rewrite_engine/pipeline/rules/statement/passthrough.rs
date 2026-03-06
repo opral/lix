@@ -5,6 +5,7 @@ use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 pub(crate) fn apply(statement: Statement) -> RewriteOutput {
     RewriteOutput {
         statements: vec![statement],
+        effect_only: false,
         params: Vec::new(),
         registrations: Vec::new(),
         postprocess: None,

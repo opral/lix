@@ -200,22 +200,6 @@ pub(crate) fn file_data_expects_bytes_error() -> LixError {
     )
 }
 
-pub(crate) fn file_data_unavailable_error(
-    file_id: &str,
-    version_id: &str,
-    blob_hash: Option<&str>,
-) -> LixError {
-    let blob_suffix = blob_hash
-        .map(|value| format!(" (blob_hash={value})"))
-        .unwrap_or_default();
-    build_error(
-        ErrorCode::FileDataUnavailable,
-        &format!(
-            "file data is unavailable for file_id='{file_id}' version_id='{version_id}'{blob_suffix}"
-        ),
-    )
-}
-
 pub(crate) fn unexpected_statement_count_error(
     context: &str,
     expected: usize,
@@ -230,7 +214,7 @@ pub(crate) fn unexpected_statement_count_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        already_initialized_error, file_data_expects_bytes_error, file_data_unavailable_error,
+        already_initialized_error, file_data_expects_bytes_error,
         internal_table_access_denied_error, not_initialized_error, read_only_view_write_error,
         schema_not_registered_error, sql_unknown_column_error, sql_unknown_table_error,
         table_not_found_read_error, transaction_control_statement_denied_error,
@@ -308,13 +292,6 @@ mod tests {
         assert_eq!(
             file_data_expects_bytes.code,
             "LIX_ERROR_FILE_DATA_EXPECTS_BYTES"
-        );
-
-        let file_data_unavailable =
-            file_data_unavailable_error("file-a", "version-a", Some("abc123"));
-        assert_eq!(
-            file_data_unavailable.code,
-            "LIX_ERROR_FILE_DATA_UNAVAILABLE"
         );
 
         let unexpected_statement_count = unexpected_statement_count_error("unit test", 1, 2);

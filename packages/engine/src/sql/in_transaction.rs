@@ -24,7 +24,7 @@ impl Engine {
             });
         }
         let writer_key = options.writer_key.as_deref();
-        let defer_side_effects = deferred_side_effects.is_some();
+        let _defer_side_effects = deferred_side_effects.is_some();
         let prepared = {
             let backend = TransactionBackendAdapter::new(transaction);
             shared_path::prepare_execution_with_backend(
@@ -35,8 +35,6 @@ impl Engine {
                 active_version_id.as_str(),
                 writer_key,
                 shared_path::PreparationPolicy {
-                    allow_plugin_cache: false,
-                    detect_plugin_file_changes: !defer_side_effects,
                     skip_side_effect_collection,
                 },
             )
@@ -70,26 +68,9 @@ impl Engine {
             *active_version_id = version_id.clone();
         }
 
-        let cache_targets = shared_path::derive_cache_targets(
-            &prepared.plan,
-            execution.postprocess_file_cache_targets.clone(),
-        );
         let mut state_commit_stream_changes =
             prepared.plan.effects.state_commit_stream_changes.clone();
         state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
-        let should_run_binary_gc = should_run_binary_cas_gc(
-            &prepared.plan.preprocess.mutations,
-            &prepared.intent.detected_file_domain_changes,
-        );
-        let mut binary_blob_ref_targets = collect_binary_blob_ref_targets(
-            &prepared.plan.preprocess.mutations,
-            &prepared.intent.detected_file_domain_changes,
-        );
-        if binary_blob_ref_targets.is_empty() && !prepared.plan.requirements.read_only_query {
-            binary_blob_ref_targets = self
-                .load_binary_blob_ref_index_targets_in_transaction(transaction)
-                .await?;
-        }
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {
             // Internal callers can request executing SQL rewrite/validation without
@@ -98,18 +79,6 @@ impl Engine {
             deferred
                 .pending_file_writes
                 .extend(prepared.intent.pending_file_writes.clone());
-            deferred.file_data_cache_invalidation_targets.extend(
-                cache_targets
-                    .file_data_cache_invalidation_targets
-                    .iter()
-                    .cloned(),
-            );
-            deferred.file_path_cache_invalidation_targets.extend(
-                cache_targets
-                    .file_path_cache_invalidation_targets
-                    .iter()
-                    .cloned(),
-            );
             if !execution.plugin_changes_committed {
                 deferred
                     .detected_file_domain_changes
@@ -122,15 +91,6 @@ impl Engine {
                     .clone(),
             );
         } else {
-            if !execution.plugin_changes_committed
-                && !prepared.intent.detected_file_domain_changes.is_empty()
-            {
-                self.persist_detected_file_domain_changes_in_transaction(
-                    transaction,
-                    &prepared.intent.detected_file_domain_changes,
-                )
-                .await?;
-            }
             if !prepared
                 .intent
                 .untracked_filesystem_update_domain_changes
@@ -147,35 +107,36 @@ impl Engine {
                 &prepared.intent.pending_file_writes,
             )
             .await?;
-            self.persist_pending_file_path_updates_in_transaction(
-                transaction,
-                &prepared.intent.pending_file_writes,
-            )
-            .await?;
-            self.sync_binary_blob_ref_index_for_targets_in_transaction(
-                transaction,
-                &binary_blob_ref_targets,
-            )
-            .await?;
-            self.ensure_builtin_binary_blob_store_for_targets_in_transaction(
-                transaction,
-                &cache_targets.file_data_cache_invalidation_targets,
-            )
-            .await?;
-            if should_run_binary_gc {
+            let filesystem_payload_domain_changes = self
+                .collect_live_filesystem_payload_domain_changes_in_transaction(
+                    transaction,
+                    &prepared.intent.pending_file_writes,
+                    &prepared.intent.pending_file_delete_targets,
+                    writer_key,
+                )
+                .await?;
+            let mut tracked_domain_changes = prepared.intent.detected_file_domain_changes.clone();
+            tracked_domain_changes.extend(filesystem_payload_domain_changes.clone());
+            tracked_domain_changes = dedupe_detected_file_domain_changes(&tracked_domain_changes);
+            let tracked_domain_changes_to_persist = if execution.plugin_changes_committed {
+                dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes)
+            } else {
+                tracked_domain_changes.clone()
+            };
+            if !tracked_domain_changes_to_persist.is_empty() {
+                self.persist_detected_file_domain_changes_in_transaction(
+                    transaction,
+                    &tracked_domain_changes_to_persist,
+                )
+                .await?;
+            }
+            if should_run_binary_cas_gc(
+                &prepared.plan.preprocess.mutations,
+                &tracked_domain_changes,
+            ) {
                 self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
                     .await?;
             }
-            self.invalidate_file_data_cache_entries_in_transaction(
-                transaction,
-                &cache_targets.file_data_cache_invalidation_targets,
-            )
-            .await?;
-            self.invalidate_file_path_cache_entries_in_transaction(
-                transaction,
-                &cache_targets.file_path_cache_invalidation_targets,
-            )
-            .await?;
         }
         self.persist_runtime_sequence_with_backend(
             &TransactionBackendAdapter::new(transaction),

@@ -35,7 +35,6 @@ pub(crate) fn validate_postprocess_plan(plan: &PostprocessPlan) -> Result<(), Li
     let schema_key = match plan {
         PostprocessPlan::VtableUpdate(update) => &update.schema_key,
         PostprocessPlan::VtableDelete(delete) => &delete.schema_key,
-        PostprocessPlan::DomainChangesOnly => return Ok(()),
     };
     if !schema_key_is_valid(schema_key) {
         return Err(LixError {

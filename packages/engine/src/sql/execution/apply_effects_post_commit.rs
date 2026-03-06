@@ -11,9 +11,7 @@ pub(crate) async fn apply_runtime_post_commit_effects(
     writer_key: Option<&str>,
     state_commit_stream_changes: Vec<StateCommitStreamChange>,
 ) -> Result<(), LixError> {
-    engine
-        .refresh_file_data_for_versions(file_cache_refresh_targets)
-        .await?;
+    let _ = file_cache_refresh_targets;
     if should_invalidate_installed_plugins_cache {
         engine.invalidate_installed_plugins_cache()?;
     }

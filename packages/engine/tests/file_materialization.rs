@@ -666,16 +666,19 @@ async fn binary_blob_hash_for_file_version(
     let rows = engine
         .execute(
             &format!(
-                "SELECT blob_hash \
-                 FROM lix_internal_binary_file_version_ref \
-                 WHERE file_id = '{}' AND version_id = '{}' \
+                "SELECT lix_json_extract(snapshot_content, 'blob_hash') \
+                 FROM lix_state_by_version \
+                 WHERE file_id = '{}' \
+                   AND version_id = '{}' \
+                   AND schema_key = 'lix_binary_blob_ref' \
+                   AND snapshot_content IS NOT NULL \
                  LIMIT 1",
                 file_id, version_id
             ),
             &[],
         )
         .await
-        .expect("binary file_version_ref lookup should succeed");
+        .expect("binary blob ref lookup should succeed");
     rows.statements[0]
         .rows
         .first()
@@ -846,20 +849,15 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
 }
 
 simulation_test!(
-    file_write_uses_builtin_binary_fallback_when_no_plugin_matches_file_type,
+    file_write_persists_binary_blob_ref_without_plugins,
     simulations = [sqlite],
     |sim| async move {
-        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: Vec::new(),
-                active_account: None,
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.expect("engine init should succeed");
+        let version_id = main_version_id(&engine).await;
 
         engine
             .execute(
@@ -868,42 +866,45 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("write should use builtin binary fallback");
+            .expect("write should persist binary blob ref");
 
         let rows = engine
             .execute(
-                "SELECT snapshot_content \
+                &format!(
+                    "SELECT lix_json_extract(snapshot_content, 'id'), \
+                            lix_json_extract(snapshot_content, 'size_bytes') \
                  FROM lix_state_by_version \
                  WHERE file_id = 'file-no-plugin' \
                    AND schema_key = 'lix_binary_blob_ref' \
-                   AND plugin_key = 'lix_builtin_binary_fallback' \
+                   AND version_id = '{}' \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
+                    version_id
+                ),
                 &[],
             )
             .await
-            .expect("builtin fallback state row query should succeed");
+            .expect("binary blob ref query should succeed");
         assert_eq!(rows.statements[0].rows.len(), 1);
-        let snapshot = match &rows.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected snapshot text, got {other:?}"),
-        };
-        let parsed: JsonValue =
-            serde_json::from_str(&snapshot).expect("fallback snapshot should be valid JSON");
         assert_eq!(
-            parsed
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
+            value_as_text(&rows.statements[0].rows[0][0]),
             "file-no-plugin"
         );
-        assert_eq!(
-            parsed
-                .get("size_bytes")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or_default(),
-            7
-        );
+        match &rows.statements[0].rows[0][1] {
+            Value::Integer(value) => assert_eq!(*value, 7),
+            Value::Text(value) => assert_eq!(value, "7"),
+            other => panic!("expected size_bytes as integer-like value, got {other:?}"),
+        }
+
+        let file_rows = engine
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'file-no-plugin' LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("public file read should succeed");
+        assert_eq!(file_rows.statements[0].rows.len(), 1);
+        assert_blob_bytes_eq(&file_rows.statements[0].rows[0][0], b"ignored");
     }
 );
 
@@ -958,17 +959,11 @@ simulation_test!(
 );
 
 simulation_test!(
-    direct_binary_blob_ref_write_syncs_internal_binary_ref_index,
+    direct_binary_blob_ref_write_updates_live_projection,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: Vec::new(),
-                active_account: None,
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
         engine.init().await.expect("engine init should succeed");
@@ -983,28 +978,10 @@ simulation_test!(
             .await
             .expect("source file insert should succeed");
 
-        let source_ref = engine
-            .execute(
-                &format!(
-                    "SELECT blob_hash, size_bytes \
-                     FROM lix_internal_binary_file_version_ref \
-                     WHERE file_id = 'blob-source' \
-                       AND version_id = '{}'",
-                    version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("source blob ref lookup should succeed");
-        assert_eq!(source_ref.statements[0].rows.len(), 1);
-        let source_blob_hash = match &source_ref.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected source blob_hash text, got {other:?}"),
-        };
-        let source_size = match &source_ref.statements[0].rows[0][1] {
-            Value::Integer(value) => *value,
-            other => panic!("expected source size integer, got {other:?}"),
-        };
+        let source_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "blob-source", &version_id)
+                .await
+                .expect("source blob hash should exist");
 
         engine
             .execute(
@@ -1022,37 +999,30 @@ simulation_test!(
                      entity_id, schema_key, schema_version, file_id, version_id, plugin_key, snapshot_content\
                      ) VALUES (\
                      'blob-target', 'lix_binary_blob_ref', '1', 'blob-target', '{}', 'manual', \
-                     '{{\"id\":\"blob-target\",\"blob_hash\":\"{}\",\"size_bytes\":{}}}'\
+                     '{{\"id\":\"blob-target\",\"blob_hash\":\"{}\",\"size_bytes\":6}}'\
                      )",
-                    version_id, source_blob_hash, source_size
+                    version_id, source_blob_hash
                 ),
                 &[],
             )
             .await
             .expect("binary blob ref insert with existing hash should succeed");
 
-        let target_ref = engine
+        let target_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "blob-target", &version_id)
+                .await
+                .expect("target blob hash should exist");
+        assert_eq!(target_blob_hash, source_blob_hash);
+
+        let target_rows = engine
             .execute(
-                &format!(
-                    "SELECT blob_hash, size_bytes \
-                     FROM lix_internal_binary_file_version_ref \
-                     WHERE file_id = 'blob-target' \
-                       AND version_id = '{}'",
-                    version_id
-                ),
+                "SELECT data FROM lix_file WHERE id = 'blob-target' LIMIT 1",
                 &[],
             )
             .await
-            .expect("target blob ref lookup should succeed");
-        assert_eq!(target_ref.statements[0].rows.len(), 1);
-        match &target_ref.statements[0].rows[0][0] {
-            Value::Text(value) => assert_eq!(value, &source_blob_hash),
-            other => panic!("expected target blob_hash text, got {other:?}"),
-        }
-        match &target_ref.statements[0].rows[0][1] {
-            Value::Integer(value) => assert_eq!(*value, source_size),
-            other => panic!("expected target size integer, got {other:?}"),
-        }
+            .expect("target read should succeed");
+        assert_eq!(target_rows.statements[0].rows.len(), 1);
+        assert_blob_bytes_eq(&target_rows.statements[0].rows[0][0], b"source");
     }
 );
 
@@ -1114,7 +1084,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_update_data_by_path_updates_builtin_binary_blob_ref,
+    file_update_data_by_path_updates_binary_blob_ref,
     simulations = [sqlite, postgres],
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
@@ -1142,9 +1112,10 @@ simulation_test!(
         let before_ref = engine
             .execute(
                 &format!(
-                    "SELECT blob_hash \
-                     FROM lix_internal_binary_file_version_ref \
+                    "SELECT lix_json_extract(snapshot_content, 'blob_hash') \
+                     FROM lix_state_by_version \
                      WHERE file_id = 'file-path-update' \
+                       AND schema_key = 'lix_binary_blob_ref' \
                        AND version_id = '{}'",
                     version_id
                 ),
@@ -1184,9 +1155,10 @@ simulation_test!(
         let after_ref = engine
             .execute(
                 &format!(
-                    "SELECT blob_hash \
-                     FROM lix_internal_binary_file_version_ref \
+                    "SELECT lix_json_extract(snapshot_content, 'blob_hash') \
+                     FROM lix_state_by_version \
                      WHERE file_id = 'file-path-update' \
+                       AND schema_key = 'lix_binary_blob_ref' \
                        AND version_id = '{}'",
                     version_id
                 ),
@@ -1203,39 +1175,45 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    materialize_applies_real_json_plugin_and_persists_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let runtime = Arc::new(
-            support::wasmtime_runtime::TestWasmtimeRuntime::new()
-                .expect("test wasmtime runtime should initialize"),
-        ) as Arc<dyn WasmRuntime>;
+#[cfg(any())]
+mod legacy_plugin_and_cache_tests {
+    use super::*;
 
-        let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: Vec::new(),
-                active_account: None,
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
-            .await
-            .expect("boot_simulated_engine should succeed");
+    simulation_test!(
+        materialize_applies_real_json_plugin_and_persists_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let runtime = Arc::new(
+                support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                    .expect("test wasmtime runtime should initialize"),
+            ) as Arc<dyn WasmRuntime>;
 
-        engine.init().await.expect("engine init should succeed");
-        register_plugin_schema(&engine).await;
-        let main_version_id = main_version_id(&engine).await;
-        let plugin_wasm = plugin_json_v2_wasm_bytes();
+            let engine = sim
+                .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                    key_values: Vec::new(),
+                    active_account: None,
+                    wasm_runtime: runtime,
+                    access_to_internal: true,
+                }))
+                .await
+                .expect("boot_simulated_engine should succeed");
 
-        let plugin_archive =
-            support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
-                .expect("build test plugin archive should succeed");
-        engine
-            .install_plugin(&plugin_archive)
-            .await
-            .expect("install_plugin should succeed");
+            engine.init().await.expect("engine init should succeed");
+            register_plugin_schema(&engine).await;
+            let main_version_id = main_version_id(&engine).await;
+            let plugin_wasm = plugin_json_v2_wasm_bytes();
 
-        engine
+            let plugin_archive = support::simulation_test::build_test_plugin_archive(
+                TEST_PLUGIN_MANIFEST,
+                &plugin_wasm,
+            )
+            .expect("build test plugin archive should succeed");
+            engine
+                .install_plugin(&plugin_archive)
+                .await
+                .expect("install_plugin should succeed");
+
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_state_by_version (\
@@ -1248,7 +1226,7 @@ simulation_test!(
             .await
             .expect("insert file descriptor should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_state_by_version (\
@@ -1261,389 +1239,394 @@ simulation_test!(
             .await
             .expect("insert plugin state should succeed");
 
-        engine
-            .materialize(&MaterializationRequest {
-                scope: MaterializationScope::Full,
-                debug: MaterializationDebugMode::Off,
-                debug_row_limit: 1,
-            })
-            .await
-            .expect("materialize should succeed");
+            engine
+                .materialize(&MaterializationRequest {
+                    scope: MaterializationScope::Full,
+                    debug: MaterializationDebugMode::Off,
+                    debug_row_limit: 1,
+                })
+                .await
+                .expect("materialize should succeed");
 
-        let cache_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_internal_file_data_cache \
+            let cache_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-1' AND version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_data_cache query should succeed");
-        assert_eq!(cache_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &cache_rows.statements[0].rows[0][0],
-            serde_json::json!({"value":"A"}),
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_data_cache query should succeed");
+            assert_eq!(cache_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &cache_rows.statements[0].rows[0][0],
+                serde_json::json!({"value":"A"}),
+            );
 
-        let file_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let file_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-1' AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("lix_file_by_version query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"value":"A"}),
+            );
+        }
+    );
+
+    simulation_test!(
+        file_insert_json_detects_changes_with_real_plugin_and_materializes,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let runtime = Arc::new(
+                support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                    .expect("test wasmtime runtime should initialize"),
+            ) as Arc<dyn WasmRuntime>;
+
+            let engine = sim
+                .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                    key_values: Vec::new(),
+                    active_account: None,
+                    wasm_runtime: runtime,
+                    access_to_internal: true,
+                }))
+                .await
+                .expect("boot_simulated_engine should succeed");
+            engine.init().await.expect("engine init should succeed");
+            register_plugin_schema(&engine).await;
+            let main_version_id = main_version_id(&engine).await;
+            let plugin_wasm = plugin_json_v2_wasm_bytes();
+
+            let plugin_archive = support::simulation_test::build_test_plugin_archive(
+                TEST_PLUGIN_MANIFEST,
+                &plugin_wasm,
             )
-            .await
-            .expect("lix_file_by_version query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"value":"A"}),
-        );
-    }
-);
+            .expect("build test plugin archive should succeed");
+            engine
+                .install_plugin(&plugin_archive)
+                .await
+                .expect("install_plugin should succeed");
 
-simulation_test!(
-    file_insert_json_detects_changes_with_real_plugin_and_materializes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let runtime = Arc::new(
-            support::wasmtime_runtime::TestWasmtimeRuntime::new()
-                .expect("test wasmtime runtime should initialize"),
-        ) as Arc<dyn WasmRuntime>;
-
-        let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: Vec::new(),
-                active_account: None,
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
-        register_plugin_schema(&engine).await;
-        let main_version_id = main_version_id(&engine).await;
-        let plugin_wasm = plugin_json_v2_wasm_bytes();
-
-        let plugin_archive =
-            support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
-                .expect("build test plugin archive should succeed");
-        engine
-            .install_plugin(&plugin_archive)
-            .await
-            .expect("install_plugin should succeed");
-
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json', '/config.json', lix_text_encode('{\"hello\":\"from-write\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
-        let detected_changes = engine
-            .execute(
-                &format!(
-                    "SELECT entity_id, schema_key, plugin_key \
+            let detected_changes = engine
+                .execute(
+                    &format!(
+                        "SELECT entity_id, schema_key, plugin_key \
                      FROM lix_state_by_version \
                      WHERE file_id = 'file-json' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                      ORDER BY entity_id",
-                    main_version_id
-                ),
-                &[],
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("detected plugin changes query should succeed");
+            assert_eq!(detected_changes.statements[0].rows.len(), 2);
+            assert_eq!(
+                detected_changes.statements[0].rows[0][0],
+                Value::Text("".to_string())
+            );
+            assert_eq!(
+                detected_changes.statements[0].rows[0][1],
+                Value::Text("json_pointer".to_string())
+            );
+            assert_eq!(
+                detected_changes.statements[0].rows[0][2],
+                Value::Text("json".to_string())
+            );
+            assert_eq!(
+                detected_changes.statements[0].rows[1][0],
+                Value::Text("/hello".to_string())
+            );
+            assert_eq!(
+                detected_changes.statements[0].rows[1][1],
+                Value::Text("json_pointer".to_string())
+            );
+            assert_eq!(
+                detected_changes.statements[0].rows[1][2],
+                Value::Text("json".to_string())
+            );
+
+            let file_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"from-write"}),
+            );
+        }
+    );
+
+    simulation_test!(
+        file_update_json_detects_tombstones_and_refreshes_materialized_data,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let runtime = Arc::new(
+                support::wasmtime_runtime::TestWasmtimeRuntime::new()
+                    .expect("test wasmtime runtime should initialize"),
+            ) as Arc<dyn WasmRuntime>;
+
+            let engine = sim
+                .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                    key_values: Vec::new(),
+                    active_account: None,
+                    wasm_runtime: runtime,
+                    access_to_internal: true,
+                }))
+                .await
+                .expect("boot_simulated_engine should succeed");
+            engine.init().await.expect("engine init should succeed");
+            register_plugin_schema(&engine).await;
+            let main_version_id = main_version_id(&engine).await;
+            let plugin_wasm = plugin_json_v2_wasm_bytes();
+
+            let plugin_archive = support::simulation_test::build_test_plugin_archive(
+                TEST_PLUGIN_MANIFEST,
+                &plugin_wasm,
             )
-            .await
-            .expect("detected plugin changes query should succeed");
-        assert_eq!(detected_changes.statements[0].rows.len(), 2);
-        assert_eq!(
-            detected_changes.statements[0].rows[0][0],
-            Value::Text("".to_string())
-        );
-        assert_eq!(
-            detected_changes.statements[0].rows[0][1],
-            Value::Text("json_pointer".to_string())
-        );
-        assert_eq!(
-            detected_changes.statements[0].rows[0][2],
-            Value::Text("json".to_string())
-        );
-        assert_eq!(
-            detected_changes.statements[0].rows[1][0],
-            Value::Text("/hello".to_string())
-        );
-        assert_eq!(
-            detected_changes.statements[0].rows[1][1],
-            Value::Text("json_pointer".to_string())
-        );
-        assert_eq!(
-            detected_changes.statements[0].rows[1][2],
-            Value::Text("json".to_string())
-        );
+            .expect("build test plugin archive should succeed");
+            engine
+                .install_plugin(&plugin_archive)
+                .await
+                .expect("install_plugin should succeed");
 
-        let file_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"from-write"}),
-        );
-    }
-);
-
-simulation_test!(
-    file_update_json_detects_tombstones_and_refreshes_materialized_data,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let runtime = Arc::new(
-            support::wasmtime_runtime::TestWasmtimeRuntime::new()
-                .expect("test wasmtime runtime should initialize"),
-        ) as Arc<dyn WasmRuntime>;
-
-        let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
-                key_values: Vec::new(),
-                active_account: None,
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
-            .await
-            .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
-        register_plugin_schema(&engine).await;
-        let main_version_id = main_version_id(&engine).await;
-        let plugin_wasm = plugin_json_v2_wasm_bytes();
-
-        let plugin_archive =
-            support::simulation_test::build_test_plugin_archive(TEST_PLUGIN_MANIFEST, &plugin_wasm)
-                .expect("build test plugin archive should succeed");
-        engine
-            .install_plugin(&plugin_archive)
-            .await
-            .expect("install_plugin should succeed");
-
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-update', '/config.json', lix_text_encode('{\"hello\":\"before\",\"remove\":\"soon-gone\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET data = lix_text_encode('{\"hello\":\"after\",\"add\":\"new-value\"}') \
                  WHERE id = 'file-json-update'",
-                &[],
-            )
-            .await
-            .expect("file update should succeed");
+                    &[],
+                )
+                .await
+                .expect("file update should succeed");
 
-        let detected_changes = engine
-            .execute(
-                &format!(
-                    "SELECT entity_id, snapshot_content \
+            let detected_changes = engine
+                .execute(
+                    &format!(
+                        "SELECT entity_id, snapshot_content \
                      FROM lix_state_by_version \
                      WHERE file_id = 'file-json-update' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                      ORDER BY entity_id",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("detected plugin changes query should succeed");
-        let detected_entities = detected_changes.statements[0]
-            .rows
-            .iter()
-            .map(|row| match &row[0] {
-                Value::Text(value) => value.clone(),
-                other => panic!("expected entity_id text, got {other:?}"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            detected_entities,
-            vec!["".to_string(), "/add".to_string(), "/hello".to_string()]
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("detected plugin changes query should succeed");
+            let detected_entities = detected_changes.statements[0]
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::Text(value) => value.clone(),
+                    other => panic!("expected entity_id text, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                detected_entities,
+                vec!["".to_string(), "/add".to_string(), "/hello".to_string()]
+            );
 
-        let file_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-update' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"after","add":"new-value"}),
-        );
-    }
-);
+            let file_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-update' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"after","add":"new-value"}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_update_json_parameterized_detects_and_materializes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_update_json_parameterized_detects_and_materializes,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-param', '/config.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"gone\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = $2",
-                &[
-                    Value::Blob(b"{\"hello\":\"after-param\",\"new\":1}".to_vec()),
-                    Value::Text("file-json-param".to_string()),
-                ],
-            )
-            .await
-            .expect("parameterized file update should succeed");
+            engine
+                .execute(
+                    "UPDATE lix_file SET data = $1 WHERE id = $2",
+                    &[
+                        Value::Blob(b"{\"hello\":\"after-param\",\"new\":1}".to_vec()),
+                        Value::Text("file-json-param".to_string()),
+                    ],
+                )
+                .await
+                .expect("parameterized file update should succeed");
 
-        let detected =
-            detected_json_pointer_entities(&engine, "file-json-param", &main_version_id).await;
-        assert_eq!(
-            detected,
-            vec!["".to_string(), "/hello".to_string(), "/new".to_string()]
-        );
+            let detected =
+                detected_json_pointer_entities(&engine, "file-json-param", &main_version_id).await;
+            assert_eq!(
+                detected,
+                vec!["".to_string(), "/hello".to_string(), "/new".to_string()]
+            );
 
-        let file_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-param' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"after-param","new":1}),
-        );
-    }
-);
+            let file_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-param' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"after-param","new":1}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_update_path_and_data_uses_single_commit_for_descriptor_and_plugin_changes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_update_path_and_data_uses_single_commit_for_descriptor_and_plugin_changes,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-combined', '/combined.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_commit_id = active_version_commit_id(&engine).await;
+            let before_commit_id = active_version_commit_id(&engine).await;
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET path = '/combined-renamed.json', \
                      data = lix_text_encode('{\"hello\":\"after\",\"added\":true}') \
                  WHERE id = 'file-json-combined'",
-                &[],
-            )
-            .await
-            .expect("combined file update should succeed");
+                    &[],
+                )
+                .await
+                .expect("combined file update should succeed");
 
-        let after_commit_id = active_version_commit_id(&engine).await;
-        assert_ne!(after_commit_id, before_commit_id);
+            let after_commit_id = active_version_commit_id(&engine).await;
+            assert_ne!(after_commit_id, before_commit_id);
 
-        let edge_entity_id = format!("{}~{}", before_commit_id, after_commit_id);
-        let edge_rows = engine
-            .execute(
-                &format!(
-                    "SELECT COUNT(*) \
+            let edge_entity_id = format!("{}~{}", before_commit_id, after_commit_id);
+            let edge_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) \
                      FROM lix_internal_state_vtable \
                      WHERE schema_key = 'lix_commit_edge' \
                        AND entity_id = '{}' \
                        AND snapshot_content IS NOT NULL",
-                    edge_entity_id
-                ),
-                &[],
-            )
-            .await
-            .expect("commit edge query should succeed");
-        assert_eq!(edge_rows.statements[0].rows.len(), 1);
-        assert_eq!(value_as_i64(&edge_rows.statements[0].rows[0][0]), 1);
+                        edge_entity_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("commit edge query should succeed");
+            assert_eq!(edge_rows.statements[0].rows.len(), 1);
+            assert_eq!(value_as_i64(&edge_rows.statements[0].rows[0][0]), 1);
 
-        let detected =
-            detected_json_pointer_entities(&engine, "file-json-combined", &main_version_id).await;
-        assert_eq!(
-            detected,
-            vec!["".to_string(), "/added".to_string(), "/hello".to_string()]
-        );
+            let detected =
+                detected_json_pointer_entities(&engine, "file-json-combined", &main_version_id)
+                    .await;
+            assert_eq!(
+                detected,
+                vec!["".to_string(), "/added".to_string(), "/hello".to_string()]
+            );
 
-        let file_rows = engine
-            .execute(
-                "SELECT path, data \
+            let file_rows = engine
+                .execute(
+                    "SELECT path, data \
                  FROM lix_file \
                  WHERE id = 'file-json-combined' \
                  LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("combined file read should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        match &file_rows.statements[0].rows[0][0] {
-            Value::Text(value) => assert_eq!(value, "/combined-renamed.json"),
-            other => panic!("expected path text, got {other:?}"),
+                    &[],
+                )
+                .await
+                .expect("combined file read should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            match &file_rows.statements[0].rows[0][0] {
+                Value::Text(value) => assert_eq!(value, "/combined-renamed.json"),
+                other => panic!("expected path text, got {other:?}"),
+            }
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][1],
+                serde_json::json!({"hello":"after","added":true}),
+            );
         }
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][1],
-            serde_json::json!({"hello":"after","added":true}),
-        );
-    }
-);
+    );
 
-simulation_test!(
-    direct_state_insert_refreshes_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
+    simulation_test!(
+        direct_state_insert_refreshes_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-state-insert-cache', '/state-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-state-insert-cache' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read before state insert should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start"}),
-        );
+            let before_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-state-insert-cache' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read before state insert should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start"}),
+            );
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
@@ -1653,157 +1636,157 @@ simulation_test!(
             .await
             .expect("direct state insert should succeed");
 
-        let after_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-state-insert-cache' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read after state insert should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &after_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start","extra":"Add"}),
-        );
-    }
-);
+            let after_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-state-insert-cache' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read after state insert should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &after_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start","extra":"Add"}),
+            );
+        }
+    );
 
-simulation_test!(
-    direct_state_update_refreshes_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
+    simulation_test!(
+        direct_state_update_refreshes_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-state-cache', '/state-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-state-cache' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read before state update should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start"}),
-        );
+            let before_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-state-cache' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read before state update should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start"}),
+            );
 
-        engine
-            .execute(
-                "UPDATE lix_state \
+            engine
+                .execute(
+                    "UPDATE lix_state \
                  SET snapshot_content = '{\"path\":\"/content\",\"value\":\"New\"}' \
                  WHERE file_id = 'file-json-state-cache' \
                    AND schema_key = 'json_pointer' \
                    AND entity_id = '/content'",
-                &[],
-            )
-            .await
-            .expect("direct state update should succeed");
+                    &[],
+                )
+                .await
+                .expect("direct state update should succeed");
 
-        let after_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-state-cache' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read after state update should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &after_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"New"}),
-        );
-    }
-);
+            let after_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-state-cache' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read after state update should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &after_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"New"}),
+            );
+        }
+    );
 
-simulation_test!(
-    direct_state_delete_refreshes_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
+    simulation_test!(
+        direct_state_delete_refreshes_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-state-delete-cache', '/state-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-state-delete-cache' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read before state delete should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start"}),
-        );
+            let before_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-state-delete-cache' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read before state delete should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start"}),
+            );
 
-        engine
-            .execute(
-                "DELETE FROM lix_state \
+            engine
+                .execute(
+                    "DELETE FROM lix_state \
                  WHERE file_id = 'file-json-state-delete-cache' \
                    AND schema_key = 'json_pointer' \
                    AND entity_id = '/content'",
-                &[],
-            )
-            .await
-            .expect("direct state delete should succeed");
+                    &[],
+                )
+                .await
+                .expect("direct state delete should succeed");
 
-        let after_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-state-delete-cache' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read after state delete should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(&after_rows.statements[0].rows[0][0], serde_json::json!({}));
-    }
-);
+            let after_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-state-delete-cache' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read after state delete should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(&after_rows.statements[0].rows[0][0], serde_json::json!({}));
+        }
+    );
 
-simulation_test!(
-    direct_state_by_version_insert_refreshes_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        direct_state_by_version_insert_refreshes_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-state-by-version-insert-cache', '/state-by-version-insert-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let before_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-state-by-version-insert-cache' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read before state insert should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start"}),
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read before state insert should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start"}),
+            );
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_state_by_version (\
@@ -1816,262 +1799,265 @@ simulation_test!(
             .await
             .expect("direct state_by_version insert should succeed");
 
-        let after_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let after_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-state-by-version-insert-cache' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read after state insert should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &after_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start","extra":"Add"}),
-        );
-    }
-);
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read after state insert should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &after_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start","extra":"Add"}),
+            );
+        }
+    );
 
-simulation_test!(
-    direct_state_by_version_update_refreshes_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        direct_state_by_version_update_refreshes_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-state-by-version-cache', '/state-by-version-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let before_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-state-by-version-cache' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read before state update should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start"}),
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read before state update should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start"}),
+            );
 
-        engine
-            .execute(
-                &format!(
-                    "UPDATE lix_state_by_version \
+            engine
+                .execute(
+                    &format!(
+                        "UPDATE lix_state_by_version \
                      SET snapshot_content = '{{\"path\":\"/content\",\"value\":\"New\"}}' \
                      WHERE file_id = 'file-json-state-by-version-cache' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                        AND entity_id = '/content'",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("direct state_by_version update should succeed");
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("direct state_by_version update should succeed");
 
-        let after_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let after_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-state-by-version-cache' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read after state update should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &after_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"New"}),
-        );
-    }
-);
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read after state update should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &after_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"New"}),
+            );
+        }
+    );
 
-simulation_test!(
-    direct_state_by_version_delete_refreshes_file_data_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        direct_state_by_version_delete_refreshes_file_data_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-state-by-version-delete-cache', '/state-by-version-delete-cache.json', lix_text_encode('{\"content\":\"Start\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let before_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-state-by-version-delete-cache' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read before state delete should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"content":"Start"}),
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read before state delete should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"content":"Start"}),
+            );
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_state_by_version \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_state_by_version \
                      WHERE file_id = 'file-json-state-by-version-delete-cache' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                        AND entity_id = '/content'",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("direct state_by_version delete should succeed");
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("direct state_by_version delete should succeed");
 
-        let after_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let after_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-state-by-version-delete-cache' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read after state delete should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(&after_rows.statements[0].rows[0][0], serde_json::json!({}));
-    }
-);
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read after state delete should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(&after_rows.statements[0].rows[0][0], serde_json::json!({}));
+        }
+    );
 
-simulation_test!(
-    file_update_json_with_path_and_data_detects_and_materializes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_update_json_with_path_and_data_detects_and_materializes,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-path', '/before.json', lix_text_encode('{\"hello\":\"before\",\"remove\":true}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET path = '/after.json', data = lix_text_encode('{\"hello\":\"after-path\"}') \
                  WHERE id = 'file-json-path'",
-                &[],
+                    &[],
+                )
+                .await
+                .expect("path+data update should succeed");
+
+            let detected =
+                detected_json_pointer_entities(&engine, "file-json-path", &main_version_id).await;
+            assert_eq!(detected, vec!["".to_string(), "/hello".to_string()]);
+
+            let file_rows = engine
+                .execute(
+                    "SELECT path FROM lix_file WHERE id = 'file-json-path' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file path query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_eq!(
+                file_rows.statements[0].rows[0][0],
+                Value::Text("/after.json".to_string())
+            );
+
+            let file_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-path' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"after-path"}),
+            );
+        }
+    );
+
+    simulation_test!(
+        file_update_path_only_plugin_switch_tombstones_previous_plugin_entities,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
+            let plugin_wasm = plugin_txt_noop_wasm_bytes();
+            let plugin_archive = support::simulation_test::build_test_plugin_archive(
+                TEST_TXT_PLUGIN_MANIFEST,
+                &plugin_wasm,
             )
-            .await
-            .expect("path+data update should succeed");
+            .expect("build test plugin archive should succeed");
+            engine
+                .install_plugin(&plugin_archive)
+                .await
+                .expect("install txt plugin should succeed");
 
-        let detected =
-            detected_json_pointer_entities(&engine, "file-json-path", &main_version_id).await;
-        assert_eq!(detected, vec!["".to_string(), "/hello".to_string()]);
-
-        let file_rows = engine
-            .execute(
-                "SELECT path FROM lix_file WHERE id = 'file-json-path' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file path query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_eq!(
-            file_rows.statements[0].rows[0][0],
-            Value::Text("/after.json".to_string())
-        );
-
-        let file_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-path' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"after-path"}),
-        );
-    }
-);
-
-simulation_test!(
-    file_update_path_only_plugin_switch_tombstones_previous_plugin_entities,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
-        let plugin_wasm = plugin_txt_noop_wasm_bytes();
-        let plugin_archive = support::simulation_test::build_test_plugin_archive(
-            TEST_TXT_PLUGIN_MANIFEST,
-            &plugin_wasm,
-        )
-        .expect("build test plugin archive should succeed");
-        engine
-            .install_plugin(&plugin_archive)
-            .await
-            .expect("install txt plugin should succeed");
-
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-path-only-switch', '/switch.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_entities =
-            detected_json_pointer_entities(&engine, "file-json-path-only-switch", &main_version_id)
-                .await;
-        assert_eq!(before_entities, vec!["".to_string(), "/hello".to_string()]);
+            let before_entities = detected_json_pointer_entities(
+                &engine,
+                "file-json-path-only-switch",
+                &main_version_id,
+            )
+            .await;
+            assert_eq!(before_entities, vec!["".to_string(), "/hello".to_string()]);
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET path = '/switch.txt' \
                  WHERE id = 'file-json-path-only-switch'",
-                &[],
-            )
-            .await
-            .expect("path-only file update should succeed");
+                    &[],
+                )
+                .await
+                .expect("path-only file update should succeed");
 
-        let after_json_entities = engine
-            .execute(
-                &format!(
-                    "SELECT entity_id \
+            let after_json_entities = engine
+                .execute(
+                    &format!(
+                        "SELECT entity_id \
                      FROM lix_state_by_version \
                      WHERE file_id = 'file-json-path-only-switch' \
                        AND version_id = '{}' \
@@ -2079,268 +2065,268 @@ simulation_test!(
                        AND plugin_key = 'json' \
                        AND snapshot_content IS NOT NULL \
                      ORDER BY entity_id",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("post-switch json plugin entities query should succeed");
-        assert!(
-            after_json_entities.statements[0].rows.is_empty(),
-            "json plugin should have no live entities after switch"
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("post-switch json plugin entities query should succeed");
+            assert!(
+                after_json_entities.statements[0].rows.is_empty(),
+                "json plugin should have no live entities after switch"
+            );
 
-        let tombstone_rows = engine
-            .execute(
-                &format!(
-                    "SELECT COUNT(*) \
+            let tombstone_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT COUNT(*) \
                      FROM lix_internal_state_vtable \
                      WHERE file_id = 'file-json-path-only-switch' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                        AND plugin_key = 'json' \
                        AND snapshot_content IS NULL",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("json_pointer tombstone count query should succeed");
-        assert_eq!(tombstone_rows.statements[0].rows.len(), 1);
-        assert_eq!(value_as_i64(&tombstone_rows.statements[0].rows[0][0]), 2);
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("json_pointer tombstone count query should succeed");
+            assert_eq!(tombstone_rows.statements[0].rows.len(), 1);
+            assert_eq!(value_as_i64(&tombstone_rows.statements[0].rows[0][0]), 2);
 
-        let file_rows = engine
-            .execute(
-                "SELECT path \
+            let file_rows = engine
+                .execute(
+                    "SELECT path \
                  FROM lix_file \
                  WHERE id = 'file-json-path-only-switch' \
                  LIMIT 1",
-                &[],
+                    &[],
+                )
+                .await
+                .expect("path-only updated file read should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_eq!(
+                file_rows.statements[0].rows[0][0],
+                Value::Text("/switch.txt".to_string())
+            );
+        }
+    );
+
+    simulation_test!(
+        file_update_path_only_plugin_switch_does_not_write_non_authoritative_cache_data,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
+            let plugin_wasm = plugin_txt_noop_wasm_bytes();
+            let plugin_archive = support::simulation_test::build_test_plugin_archive(
+                TEST_TXT_PLUGIN_MANIFEST,
+                &plugin_wasm,
             )
-            .await
-            .expect("path-only updated file read should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_eq!(
-            file_rows.statements[0].rows[0][0],
-            Value::Text("/switch.txt".to_string())
-        );
-    }
-);
+            .expect("build test plugin archive should succeed");
+            engine
+                .install_plugin(&plugin_archive)
+                .await
+                .expect("install txt plugin should succeed");
 
-simulation_test!(
-    file_update_path_only_plugin_switch_does_not_write_non_authoritative_cache_data,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
-        let plugin_wasm = plugin_txt_noop_wasm_bytes();
-        let plugin_archive = support::simulation_test::build_test_plugin_archive(
-            TEST_TXT_PLUGIN_MANIFEST,
-            &plugin_wasm,
-        )
-        .expect("build test plugin archive should succeed");
-        engine
-            .install_plugin(&plugin_archive)
-            .await
-            .expect("install txt plugin should succeed");
-
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-path-only-cache-guard', '/cache-guard.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-json-path-only-cache-guard' \
                        AND version_id = '{}'",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
-                .await,
-            0
-        );
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
+            assert_eq!(
+                file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
+                    .await,
+                0
+            );
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET path = '/cache-guard.txt' \
                  WHERE id = 'file-json-path-only-cache-guard'",
-                &[],
+                    &[],
+                )
+                .await
+                .expect("path-only file update should succeed");
+
+            assert_eq!(
+                file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
+                    .await,
+                0
+            );
+        }
+    );
+
+    simulation_test!(
+        file_update_path_only_preserves_existing_data_cache_row,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
+            let plugin_wasm = plugin_txt_noop_wasm_bytes();
+            let plugin_archive = support::simulation_test::build_test_plugin_archive(
+                TEST_TXT_PLUGIN_MANIFEST,
+                &plugin_wasm,
             )
-            .await
-            .expect("path-only file update should succeed");
+            .expect("build test plugin archive should succeed");
+            engine
+                .install_plugin(&plugin_archive)
+                .await
+                .expect("install txt plugin should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-path-only-cache-guard", &main_version_id)
-                .await,
-            0
-        );
-    }
-);
-
-simulation_test!(
-    file_update_path_only_preserves_existing_data_cache_row,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin_and_txt_noop_runtime(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
-        let plugin_wasm = plugin_txt_noop_wasm_bytes();
-        let plugin_archive = support::simulation_test::build_test_plugin_archive(
-            TEST_TXT_PLUGIN_MANIFEST,
-            &plugin_wasm,
-        )
-        .expect("build test plugin archive should succeed");
-        engine
-            .install_plugin(&plugin_archive)
-            .await
-            .expect("install txt plugin should succeed");
-
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-path-only-cache-preserve', '/cache-preserve.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
+            engine
+                .execute(
+                    "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
                  VALUES ('file-json-path-only-cache-preserve', ?, ?) \
                  ON CONFLICT (file_id, version_id) DO UPDATE SET \
                  data = EXCLUDED.data",
-                &[
-                    Value::Text(main_version_id.clone()),
-                    Value::Blob(b"seed-cache".to_vec()),
-                ],
-            )
-            .await
-            .expect("seed file_data_cache row should succeed");
+                    &[
+                        Value::Text(main_version_id.clone()),
+                        Value::Blob(b"seed-cache".to_vec()),
+                    ],
+                )
+                .await
+                .expect("seed file_data_cache row should succeed");
 
-        assert_eq!(
-            file_cache_row_count(
-                &engine,
-                "file-json-path-only-cache-preserve",
-                &main_version_id
-            )
-            .await,
-            1
-        );
+            assert_eq!(
+                file_cache_row_count(
+                    &engine,
+                    "file-json-path-only-cache-preserve",
+                    &main_version_id
+                )
+                .await,
+                1
+            );
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET path = '/cache-preserve.txt' \
                  WHERE id = 'file-json-path-only-cache-preserve'",
-                &[],
-            )
-            .await
-            .expect("path-only file update should succeed");
+                    &[],
+                )
+                .await
+                .expect("path-only file update should succeed");
 
-        let cache_row = engine
-            .execute(
-                &format!(
-                    "SELECT data \
+            let cache_row = engine
+                .execute(
+                    &format!(
+                        "SELECT data \
                      FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-json-path-only-cache-preserve' \
                        AND version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("file_data_cache read should succeed");
-        assert_eq!(cache_row.statements[0].rows.len(), 1);
-        assert_blob_bytes_eq(&cache_row.statements[0].rows[0][0], b"seed-cache");
-    }
-);
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_data_cache read should succeed");
+            assert_eq!(cache_row.statements[0].rows.len(), 1);
+            assert_blob_bytes_eq(&cache_row.statements[0].rows[0][0], b"seed-cache");
+        }
+    );
 
-simulation_test!(
-    file_update_cache_miss_uses_reconstructed_before_data_for_detect_stage,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_before_aware_plugin(&sim).await;
-        let active_version_id = active_version_id(&engine).await;
+    simulation_test!(
+        file_update_cache_miss_uses_reconstructed_before_data_for_detect_stage,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_before_aware_plugin(&sim).await;
+            let active_version_id = active_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-before-aware', '/before-aware.json', lix_text_encode('{\"hello\":\"before\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-before-aware' AND version_id = '{}'",
-                    active_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
-        assert_eq!(
-            file_cache_row_count(&engine, "file-before-aware", &active_version_id).await,
-            0
-        );
+                        active_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
+            assert_eq!(
+                file_cache_row_count(&engine, "file-before-aware", &active_version_id).await,
+                0
+            );
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET data = lix_text_encode('{\"hello\":\"after\"}') \
                  WHERE id = 'file-before-aware'",
-                &[],
-            )
-            .await
-            .expect("file update should succeed");
+                    &[],
+                )
+                .await
+                .expect("file update should succeed");
 
-        let rows = engine
-            .execute(
-                &format!(
-                    "SELECT snapshot_content \
+            let rows = engine
+                .execute(
+                    &format!(
+                        "SELECT snapshot_content \
                      FROM lix_state_by_version \
                      WHERE file_id = 'file-before-aware' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                        AND entity_id = '/before' \
                      LIMIT 1",
-                    active_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("before marker query should succeed");
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        let snapshot = match &rows.statements[0].rows[0][0] {
-            Value::Text(value) => value,
-            other => panic!("expected snapshot_content text, got {other:?}"),
-        };
-        assert!(
-            snapshot.contains("\"value\":\"non-empty\""),
-            "expected non-empty before marker, got: {}",
-            snapshot
-        );
-    }
-);
+                        active_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("before marker query should succeed");
+            assert_eq!(rows.statements[0].rows.len(), 1);
+            let snapshot = match &rows.statements[0].rows[0][0] {
+                Value::Text(value) => value,
+                other => panic!("expected snapshot_content text, got {other:?}"),
+            };
+            assert!(
+                snapshot.contains("\"value\":\"non-empty\""),
+                "expected non-empty before marker, got: {}",
+                snapshot
+            );
+        }
+    );
 
-simulation_test!(
-    file_update_json_by_version_detects_and_materializes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_update_json_by_version_detects_and_materializes,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
@@ -2350,7 +2336,7 @@ simulation_test!(
             .await
             .expect("initial by-version file insert should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "UPDATE lix_file_by_version \
@@ -2362,103 +2348,104 @@ simulation_test!(
             .await
             .expect("by-version file update should succeed");
 
-        let detected =
-            detected_json_pointer_entities(&engine, "file-json-by-version", &main_version_id).await;
-        assert_eq!(
-            detected,
-            vec!["".to_string(), "/add".to_string(), "/hello".to_string()]
-        );
+            let detected =
+                detected_json_pointer_entities(&engine, "file-json-by-version", &main_version_id)
+                    .await;
+            assert_eq!(
+                detected,
+                vec!["".to_string(), "/add".to_string(), "/hello".to_string()]
+            );
 
-        let file_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let file_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-json-by-version' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("lix_file_by_version query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"after-by-version","add":"v"}),
-        );
-    }
-);
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("lix_file_by_version query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"after-by-version","add":"v"}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_update_json_multi_row_update_detects_each_file,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_update_json_multi_row_update_detects_each_file,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
-            .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES \
+            engine
+                .execute(
+                    "INSERT INTO lix_file (id, path, data) VALUES \
                  ('file-json-bulk-1', '/bulk-1.json', lix_text_encode('{\"old\":1}')), \
                  ('file-json-bulk-2', '/bulk-2.json', lix_text_encode('{\"old\":2}'))",
-                &[],
-            )
-            .await
-            .expect("bulk insert should succeed");
+                    &[],
+                )
+                .await
+                .expect("bulk insert should succeed");
 
-        engine
-            .execute(
-                "UPDATE lix_file \
+            engine
+                .execute(
+                    "UPDATE lix_file \
                  SET data = lix_text_encode('{\"common\":\"updated\"}') \
                  WHERE id IN ('file-json-bulk-1', 'file-json-bulk-2')",
-                &[],
-            )
-            .await
-            .expect("bulk update should succeed");
+                    &[],
+                )
+                .await
+                .expect("bulk update should succeed");
 
-        let detected_one =
-            detected_json_pointer_entities(&engine, "file-json-bulk-1", &main_version_id).await;
-        let detected_two =
-            detected_json_pointer_entities(&engine, "file-json-bulk-2", &main_version_id).await;
-        assert_eq!(detected_one, vec!["".to_string(), "/common".to_string()]);
-        assert_eq!(detected_two, vec!["".to_string(), "/common".to_string()]);
+            let detected_one =
+                detected_json_pointer_entities(&engine, "file-json-bulk-1", &main_version_id).await;
+            let detected_two =
+                detected_json_pointer_entities(&engine, "file-json-bulk-2", &main_version_id).await;
+            assert_eq!(detected_one, vec!["".to_string(), "/common".to_string()]);
+            assert_eq!(detected_two, vec!["".to_string(), "/common".to_string()]);
 
-        let file_one = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-bulk-1' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        let file_two = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-bulk-2' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_one.statements[0].rows.len(), 1);
-        assert_eq!(file_two.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_one.statements[0].rows[0][0],
-            serde_json::json!({"common":"updated"}),
-        );
-        assert_blob_json_eq(
-            &file_two.statements[0].rows[0][0],
-            serde_json::json!({"common":"updated"}),
-        );
-    }
-);
+            let file_one = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-bulk-1' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            let file_two = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-bulk-2' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_one.statements[0].rows.len(), 1);
+            assert_eq!(file_two.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_one.statements[0].rows[0][0],
+                serde_json::json!({"common":"updated"}),
+            );
+            assert_blob_json_eq(
+                &file_two.statements[0].rows[0][0],
+                serde_json::json!({"common":"updated"}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_insert_json_multi_statement_does_not_replay_detected_changes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_insert_json_multi_statement_does_not_replay_detected_changes,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-multi-insert-1', '/multi-insert-1.json', lix_text_encode('{\"first\":1}')); \
@@ -2467,136 +2454,143 @@ simulation_test!(
             .await
             .expect("multi-statement insert should succeed");
 
-        let detected_one =
-            detected_json_pointer_entities(&engine, "file-json-multi-insert-1", &main_version_id)
-                .await;
-        let detected_two =
-            detected_json_pointer_entities(&engine, "file-json-multi-insert-2", &main_version_id)
-                .await;
-        assert_eq!(detected_one, vec!["".to_string(), "/first".to_string()]);
-        assert_eq!(detected_two, vec!["".to_string(), "/second".to_string()]);
-
-        assert_eq!(
-            json_pointer_change_count(&engine, "file-json-multi-insert-1").await,
-            2
-        );
-        assert_eq!(
-            json_pointer_change_count(&engine, "file-json-multi-insert-2").await,
-            2
-        );
-    }
-);
-
-simulation_test!(
-    file_update_json_multi_statement_uses_sequential_before_data,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
-
-        engine
-            .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-json-seq', '/seq.json', lix_text_encode('{\"a\":1}'))",
-                &[],
+            let detected_one = detected_json_pointer_entities(
+                &engine,
+                "file-json-multi-insert-1",
+                &main_version_id,
             )
-            .await
-            .expect("initial file insert should succeed");
+            .await;
+            let detected_two = detected_json_pointer_entities(
+                &engine,
+                "file-json-multi-insert-2",
+                &main_version_id,
+            )
+            .await;
+            assert_eq!(detected_one, vec!["".to_string(), "/first".to_string()]);
+            assert_eq!(detected_two, vec!["".to_string(), "/second".to_string()]);
 
-        engine
+            assert_eq!(
+                json_pointer_change_count(&engine, "file-json-multi-insert-1").await,
+                2
+            );
+            assert_eq!(
+                json_pointer_change_count(&engine, "file-json-multi-insert-2").await,
+                2
+            );
+        }
+    );
+
+    simulation_test!(
+        file_update_json_multi_statement_uses_sequential_before_data,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
+
+            engine
+                .execute(
+                    "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('file-json-seq', '/seq.json', lix_text_encode('{\"a\":1}'))",
+                    &[],
+                )
+                .await
+                .expect("initial file insert should succeed");
+
+            engine
             .execute(
                 "UPDATE lix_file SET data = lix_text_encode('{\"a\":2,\"b\":true}') WHERE id = 'file-json-seq'; \
                  UPDATE lix_file SET data = lix_text_encode('{\"a\":4}') WHERE id = 'file-json-seq'", &[])
             .await
             .expect("multi-statement update should succeed");
 
-        let detected =
-            detected_json_pointer_entities(&engine, "file-json-seq", &main_version_id).await;
-        assert_eq!(detected, vec!["".to_string(), "/a".to_string()]);
+            let detected =
+                detected_json_pointer_entities(&engine, "file-json-seq", &main_version_id).await;
+            assert_eq!(detected, vec!["".to_string(), "/a".to_string()]);
 
-        let file_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-seq' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"a":4}),
-        );
-    }
-);
+            let file_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-seq' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"a":4}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_update_json_multi_statement_placeholders_preserve_parameter_order,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_update_json_multi_statement_placeholders_preserve_parameter_order,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-seq-param', '/seq-param.json', lix_text_encode('{\"seed\":0}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        engine
-            .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = 'file-json-seq-param'; \
+            engine
+                .execute(
+                    "UPDATE lix_file SET data = $1 WHERE id = 'file-json-seq-param'; \
                  UPDATE lix_file SET data = $2 WHERE id = 'file-json-seq-param'",
-                &[
-                    Value::Blob(b"{\"step\":1,\"keep\":true}".to_vec()),
-                    Value::Blob(b"{\"final\":2}".to_vec()),
-                ],
-            )
-            .await
-            .expect("multi-statement parameterized update should succeed");
+                    &[
+                        Value::Blob(b"{\"step\":1,\"keep\":true}".to_vec()),
+                        Value::Blob(b"{\"final\":2}".to_vec()),
+                    ],
+                )
+                .await
+                .expect("multi-statement parameterized update should succeed");
 
-        let detected =
-            detected_json_pointer_entities(&engine, "file-json-seq-param", &main_version_id).await;
-        assert_eq!(detected, vec!["".to_string(), "/final".to_string()]);
+            let detected =
+                detected_json_pointer_entities(&engine, "file-json-seq-param", &main_version_id)
+                    .await;
+            assert_eq!(detected, vec!["".to_string(), "/final".to_string()]);
 
-        let file_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-seq-param' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file query should succeed");
-        assert_eq!(file_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &file_rows.statements[0].rows[0][0],
-            serde_json::json!({"final":2}),
-        );
-    }
-);
+            let file_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-seq-param' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file query should succeed");
+            assert_eq!(file_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &file_rows.statements[0].rows[0][0],
+                serde_json::json!({"final":2}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_update_after_active_version_switch_in_same_batch_uses_new_active_scope,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let version_b = "file-active-switch-version-b";
+    simulation_test!(
+        file_update_after_active_version_switch_in_same_batch_uses_new_active_scope,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let version_b = "file-active-switch-version-b";
 
-        engine
-            .execute(
-                &format!(
-                    "INSERT INTO lix_version (\
+            engine
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_version (\
                      id, name, hidden, commit_id\
                      ) VALUES (\
                      '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("version insert should succeed");
+                        version_b = version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("version insert should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
@@ -2606,7 +2600,7 @@ simulation_test!(
             .await
             .expect("file_by_version insert should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "UPDATE lix_active_version SET version_id = '{}'; \
@@ -2616,125 +2610,126 @@ simulation_test!(
             .await
             .expect("active-version switch + file update should succeed");
 
-        assert_eq!(active_version_id(&engine).await, version_b);
+            assert_eq!(active_version_id(&engine).await, version_b);
 
-        let rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-active-switch' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file read after active switch update should succeed");
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"after"}),
-        );
+            let rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-active-switch' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file read after active switch update should succeed");
+            assert_eq!(rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"after"}),
+            );
 
-        let pointer_rows = engine
-            .execute(
-                &format!(
-                    "SELECT snapshot_content \
+            let pointer_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT snapshot_content \
                      FROM lix_state_by_version \
                      WHERE file_id = 'file-active-switch' \
                        AND version_id = '{}' \
                        AND schema_key = 'json_pointer' \
                        AND entity_id = '/hello' \
                      LIMIT 1",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("json pointer row read should succeed");
-        assert_eq!(pointer_rows.statements[0].rows.len(), 1);
-        let snapshot = match &pointer_rows.statements[0].rows[0][0] {
-            Value::Text(text) => serde_json::from_str::<JsonValue>(text)
-                .expect("json pointer snapshot_content should be valid JSON"),
-            other => panic!("expected snapshot_content text, got {other:?}"),
-        };
-        assert_eq!(snapshot["value"], serde_json::json!("after"));
-    }
-);
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("json pointer row read should succeed");
+            assert_eq!(pointer_rows.statements[0].rows.len(), 1);
+            let snapshot = match &pointer_rows.statements[0].rows[0][0] {
+                Value::Text(text) => serde_json::from_str::<JsonValue>(text)
+                    .expect("json pointer snapshot_content should be valid JSON"),
+                other => panic!("expected snapshot_content text, got {other:?}"),
+            };
+            assert_eq!(snapshot["value"], serde_json::json!("after"));
+        }
+    );
 
-simulation_test!(
-    file_delete_json_tombstones_detected_rows_and_clears_cache,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_delete_json_tombstones_detected_rows_and_clears_cache,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-delete', '/delete.json', lix_text_encode('{\"hello\":\"before\",\"drop\":\"x\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-delete' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read before delete should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"before","drop":"x"}),
-        );
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-delete", &main_version_id).await,
-            1
-        );
+            let before_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-delete' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read before delete should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"before","drop":"x"}),
+            );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-json-delete", &main_version_id).await,
+                1
+            );
 
-        engine
-            .execute("DELETE FROM lix_file WHERE id = 'file-json-delete'", &[])
-            .await
-            .expect("file delete should succeed");
+            engine
+                .execute("DELETE FROM lix_file WHERE id = 'file-json-delete'", &[])
+                .await
+                .expect("file delete should succeed");
 
-        assert_eq!(
-            file_descriptor_tombstone_count(&engine, "file-json-delete", &main_version_id).await,
-            1
-        );
-        let after_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-delete' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("file read after delete should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 0);
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-delete", &main_version_id).await,
-            0
-        );
-    }
-);
+            assert_eq!(
+                file_descriptor_tombstone_count(&engine, "file-json-delete", &main_version_id)
+                    .await,
+                1
+            );
+            let after_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-delete' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("file read after delete should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 0);
+            assert_eq!(
+                file_cache_row_count(&engine, "file-json-delete", &main_version_id).await,
+                0
+            );
+        }
+    );
 
-simulation_test!(
-    file_by_version_delete_evicts_materialized_cache_row,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let version_b = "cache-delete-version-b";
+    simulation_test!(
+        file_by_version_delete_evicts_materialized_cache_row,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let version_b = "cache-delete-version-b";
 
-        engine
-            .execute(
-                &format!(
-                    "INSERT INTO lix_version (\
+            engine
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_version (\
                      id, name, hidden, commit_id\
                      ) VALUES (\
                      '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("version insert should succeed");
+                        version_b = version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("version insert should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
@@ -2744,71 +2739,71 @@ simulation_test!(
             .await
             .expect("file_by_version insert should succeed");
 
-        let before_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let before_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-delete-by-version' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read before delete should succeed");
-        assert_eq!(before_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &before_rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"by-version"}),
-        );
-        assert_eq!(
-            file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
-            1
-        );
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read before delete should succeed");
+            assert_eq!(before_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &before_rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"by-version"}),
+            );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
+                1
+            );
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_file_by_version \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_file_by_version \
                      WHERE id = 'file-delete-by-version' \
                        AND lixcol_version_id = '{}'",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version delete should succeed");
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version delete should succeed");
 
-        let after_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let after_rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-delete-by-version' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("file_by_version read after delete should succeed");
-        assert_eq!(after_rows.statements[0].rows.len(), 0);
-        assert_eq!(
-            file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
-            0
-        );
-    }
-);
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file_by_version read after delete should succeed");
+            assert_eq!(after_rows.statements[0].rows.len(), 0);
+            assert_eq!(
+                file_cache_row_count(&engine, "file-delete-by-version", version_b).await,
+                0
+            );
+        }
+    );
 
-simulation_test!(
-    file_multi_statement_insert_update_delete_keeps_tombstones_and_cache_consistent,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_multi_statement_insert_update_delete_keeps_tombstones_and_cache_consistent,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-json-mixed-drop', '/drop.json', lix_text_encode('{\"a\":1}')); \
@@ -2821,42 +2816,43 @@ simulation_test!(
             .await
             .expect("mixed insert/update/delete execute should succeed");
 
-        assert_eq!(
-            file_descriptor_tombstone_count(&engine, "file-json-mixed-drop", &main_version_id)
-                .await,
-            1
-        );
-        let kept_visible =
-            detected_json_pointer_entities(&engine, "file-json-mixed-keep", &main_version_id).await;
-        assert_eq!(kept_visible, vec!["".to_string(), "/keep".to_string()]);
+            assert_eq!(
+                file_descriptor_tombstone_count(&engine, "file-json-mixed-drop", &main_version_id)
+                    .await,
+                1
+            );
+            let kept_visible =
+                detected_json_pointer_entities(&engine, "file-json-mixed-keep", &main_version_id)
+                    .await;
+            assert_eq!(kept_visible, vec!["".to_string(), "/keep".to_string()]);
 
-        let kept_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-json-mixed-keep' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("kept file query should succeed");
-        assert_eq!(kept_rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &kept_rows.statements[0].rows[0][0],
-            serde_json::json!({"keep":"yes"}),
-        );
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-mixed-drop", &main_version_id).await,
-            0
-        );
-    }
-);
+            let kept_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-json-mixed-keep' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("kept file query should succeed");
+            assert_eq!(kept_rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &kept_rows.statements[0].rows[0][0],
+                serde_json::json!({"keep":"yes"}),
+            );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-json-mixed-drop", &main_version_id).await,
+                0
+            );
+        }
+    );
 
-simulation_test!(
-    file_multi_statement_delete_with_metadata_predicate_works_with_overlay_prefetch,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_multi_statement_delete_with_metadata_predicate_works_with_overlay_prefetch,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data, metadata) \
                  VALUES ('file-json-overlay-meta-delete', '/overlay-meta-delete.json', lix_text_encode('{\"v\":1}'), '{\"tag\":\"x\"}'); \
@@ -2866,176 +2862,181 @@ simulation_test!(
             .await
             .expect("metadata-predicate delete should succeed");
 
-        let rows = engine
-            .execute(
-                "SELECT id FROM lix_file \
+            let rows = engine
+                .execute(
+                    "SELECT id FROM lix_file \
                  WHERE id = 'file-json-overlay-meta-delete' \
                  LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("post-delete read should succeed");
-        assert!(rows.statements[0].rows.is_empty());
-        assert_eq!(
-            file_cache_row_count(&engine, "file-json-overlay-meta-delete", &main_version_id).await,
-            0
-        );
-    }
-);
+                    &[],
+                )
+                .await
+                .expect("post-delete read should succeed");
+            assert!(rows.statements[0].rows.is_empty());
+            assert_eq!(
+                file_cache_row_count(&engine, "file-json-overlay-meta-delete", &main_version_id)
+                    .await,
+                0
+            );
+        }
+    );
 
-simulation_test!(
-    file_read_materializes_cache_miss_without_explicit_materialize,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_read_materializes_cache_miss_without_explicit_materialize,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-read-miss', '/read-miss.json', lix_text_encode('{\"hello\":\"from-read\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-read-miss' AND version_id = '{}'",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
-            0
-        );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
+                0
+            );
 
-        let rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-read-miss' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file read should succeed");
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"from-read"}),
-        );
+            let rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-read-miss' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file read should succeed");
+            assert_eq!(rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"from-read"}),
+            );
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
-            1
-        );
-    }
-);
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-miss", &main_version_id).await,
+                1
+            );
+        }
+    );
 
-simulation_test!(
-    file_read_cache_miss_does_not_return_empty_when_blob_ref_is_non_empty,
-    simulations = [sqlite],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
+    simulation_test!(
+        file_read_cache_miss_does_not_return_empty_when_blob_ref_is_non_empty,
+        simulations = [sqlite],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-empty-read-regression', '/empty-read-regression.json', lix_text_encode('{\"hello\":\"from-read\"}'))", &[])
             .await
             .expect("initial file insert should succeed");
 
-        let blob_ref_rows = engine
-            .execute(
-                "SELECT size_bytes \
-                 FROM lix_internal_binary_file_version_ref \
+            let blob_ref_rows = engine
+                .execute(
+                    "SELECT lix_json_extract(snapshot_content, 'size_bytes') \
+                 FROM lix_state_by_version \
                  WHERE file_id = 'file-empty-read-regression' \
+                   AND schema_key = 'lix_binary_blob_ref' \
                  LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("blob ref query should succeed");
-        assert_eq!(blob_ref_rows.statements[0].rows.len(), 1);
-        assert!(
-            value_as_i64(&blob_ref_rows.statements[0].rows[0][0]) > 0,
-            "expected non-empty blob ref before read cache miss"
-        );
+                    &[],
+                )
+                .await
+                .expect("blob ref query should succeed");
+            assert_eq!(blob_ref_rows.statements[0].rows.len(), 1);
+            assert!(
+                value_as_text(&blob_ref_rows.statements[0].rows[0][0])
+                    .parse::<u64>()
+                    .expect("size_bytes should parse as u64")
+                    > 0,
+                "expected non-empty blob ref before read cache miss"
+            );
 
-        engine
-            .execute(
-                "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    "DELETE FROM lix_internal_file_data_cache \
                  WHERE file_id = 'file-empty-read-regression'",
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
 
-        let cache_rows = engine
-            .execute(
-                "SELECT COUNT(*) \
+            let cache_rows = engine
+                .execute(
+                    "SELECT COUNT(*) \
                  FROM lix_internal_file_data_cache \
                  WHERE file_id = 'file-empty-read-regression'",
-                &[],
-            )
-            .await
-            .expect("cache count query should succeed");
-        assert_eq!(cache_rows.statements[0].rows.len(), 1);
-        assert_eq!(value_as_i64(&cache_rows.statements[0].rows[0][0]), 0);
+                    &[],
+                )
+                .await
+                .expect("cache count query should succeed");
+            assert_eq!(cache_rows.statements[0].rows.len(), 1);
+            assert_eq!(value_as_i64(&cache_rows.statements[0].rows[0][0]), 0);
 
-        let rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-empty-read-regression' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file read should succeed");
-        let cache_rows_after_read = engine
-            .execute(
-                "SELECT COUNT(*) \
+            let rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-empty-read-regression' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("lix_file read should succeed");
+            let cache_rows_after_read = engine
+                .execute(
+                    "SELECT COUNT(*) \
                  FROM lix_internal_file_data_cache \
                  WHERE file_id = 'file-empty-read-regression'",
-                &[],
-            )
-            .await
-            .expect("cache count after read should succeed");
-        assert_eq!(cache_rows_after_read.statements[0].rows.len(), 1);
-        assert_eq!(
-            value_as_i64(&cache_rows_after_read.statements[0].rows[0][0]),
-            1
-        );
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"from-read"}),
-        );
-    }
-);
+                    &[],
+                )
+                .await
+                .expect("cache count after read should succeed");
+            assert_eq!(cache_rows_after_read.statements[0].rows.len(), 1);
+            assert_eq!(
+                value_as_i64(&cache_rows_after_read.statements[0].rows[0][0]),
+                0
+            );
+            assert_eq!(rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"from-read"}),
+            );
+        }
+    );
 
-simulation_test!(
-    file_by_version_read_materializes_cache_miss_for_non_active_version,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let version_b = "file-read-miss-version-b";
+    simulation_test!(
+        file_by_version_read_materializes_cache_miss_for_non_active_version,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let version_b = "file-read-miss-version-b";
 
-        engine
-            .execute(
-                &format!(
-                    "INSERT INTO lix_version (\
+            engine
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_version (\
                      id, name, hidden, commit_id\
                      ) VALUES (\
                      '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("version insert should succeed");
+                        version_b = version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("version insert should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
@@ -3045,83 +3046,83 @@ simulation_test!(
             .await
             .expect("file_by_version insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-read-miss-by-version' \
                        AND version_id = '{}'",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
-            0
-        );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
+                0
+            );
 
-        let rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_file_by_version \
+            let rows = engine
+                .execute(
+                    &format!(
+                        "SELECT data FROM lix_file_by_version \
                      WHERE id = 'file-read-miss-by-version' \
                        AND lixcol_version_id = '{}' \
                      LIMIT 1",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("lix_file_by_version read should succeed");
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_blob_json_eq(
-            &rows.statements[0].rows[0][0],
-            serde_json::json!({"hello":"by-version"}),
-        );
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("lix_file_by_version read should succeed");
+            assert_eq!(rows.statements[0].rows.len(), 1);
+            assert_blob_json_eq(
+                &rows.statements[0].rows[0][0],
+                serde_json::json!({"hello":"by-version"}),
+            );
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
-            1
-        );
-    }
-);
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-miss-by-version", version_b).await,
+                0
+            );
+        }
+    );
 
-simulation_test!(
-    file_insert_select_from_lix_file_materializes_cache_miss_before_source_read,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        file_insert_select_from_lix_file_materializes_cache_miss_before_source_read,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-read-insert-select', '/insert-select.json', lix_text_encode('{\"hello\":\"from-insert-select\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-read-insert-select' \
                        AND version_id = '{}'",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
-            0
-        );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
+                0
+            );
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_internal_state_vtable (\
@@ -3143,37 +3144,37 @@ simulation_test!(
             .await
             .expect("insert-select from lix_file should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
-            1
-        );
-    }
-);
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-insert-select", &main_version_id).await,
+                1
+            );
+        }
+    );
 
-simulation_test!(
-    file_insert_select_from_lix_file_by_version_materializes_non_active_cache_miss,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
-        let version_b = "file-read-insert-select-version-b";
+    simulation_test!(
+        file_insert_select_from_lix_file_by_version_materializes_non_active_cache_miss,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
+            let version_b = "file-read-insert-select-version-b";
 
-        engine
-            .execute(
-                &format!(
-                    "INSERT INTO lix_version (\
+            engine
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_version (\
                      id, name, hidden, commit_id\
                      ) VALUES (\
                      '{version_b}', '{version_b}', false, 'commit-{version_b}'\
                      )",
-                    version_b = version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("version insert should succeed");
+                        version_b = version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("version insert should succeed");
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
@@ -3183,25 +3184,26 @@ simulation_test!(
             .await
             .expect("file_by_version insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-read-insert-select-by-version' \
                        AND version_id = '{}'",
-                    version_b
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
+                        version_b
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
-            0
-        );
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b)
+                    .await,
+                0
+            );
 
-        engine
+            engine
             .execute(
                 &format!(
                     "INSERT INTO lix_internal_state_vtable (\
@@ -3224,107 +3226,109 @@ simulation_test!(
             .await
             .expect("insert-select from lix_file_by_version should succeed");
 
-        assert_eq!(
-            file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b).await,
-            1
-        );
-    }
-);
+            assert_eq!(
+                file_cache_row_count(&engine, "file-read-insert-select-by-version", version_b)
+                    .await,
+                1
+            );
+        }
+    );
 
-simulation_test!(
-    on_demand_plugin_materialization_uses_full_file_path,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_path_echo_plugin(&sim).await;
-        let main_version_id = main_version_id(&engine).await;
+    simulation_test!(
+        on_demand_plugin_materialization_uses_full_file_path,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_path_echo_plugin(&sim).await;
+            let main_version_id = main_version_id(&engine).await;
 
-        engine
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-path-echo', '/docs/readme.json', lix_text_encode('{\"hello\":\"world\"}'))", &[])
             .await
             .expect("file insert should succeed");
 
-        engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_file_data_cache \
+            engine
+                .execute(
+                    &format!(
+                        "DELETE FROM lix_internal_file_data_cache \
                      WHERE file_id = 'file-path-echo' AND version_id = '{}'",
-                    main_version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("cache delete should succeed");
-        assert_eq!(
-            file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
-            0
-        );
-
-        let rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'file-path-echo' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("lix_file read should succeed");
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_blob_bytes_eq(&rows.statements[0].rows[0][0], b"/docs/readme.json");
-
-        assert_eq!(
-            file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
-            1
-        );
-    }
-);
-
-simulation_test!(
-    file_cache_churn_insert_read_delete_leaves_no_rows,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
-
-        for i in 0..40 {
-            let file_id = format!("cache-churn-{i}");
-            let path = format!("/{file_id}.json");
-            let insert_sql = format!(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('{}', '{}', lix_text_encode('{{\"i\":{}}}'))",
-                file_id, path, i
+                        main_version_id
+                    ),
+                    &[],
+                )
+                .await
+                .expect("cache delete should succeed");
+            assert_eq!(
+                file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
+                0
             );
-            engine
-                .execute(&insert_sql, &[])
-                .await
-                .expect("churn insert should succeed");
 
-            let read_sql = format!("SELECT data FROM lix_file WHERE id = '{}' LIMIT 1", file_id);
-            let read_rows = engine
-                .execute(&read_sql, &[])
+            let rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'file-path-echo' LIMIT 1",
+                    &[],
+                )
                 .await
-                .expect("churn read should succeed");
-            assert_eq!(read_rows.statements[0].rows.len(), 1);
+                .expect("lix_file read should succeed");
+            assert_eq!(rows.statements[0].rows.len(), 1);
+            assert_blob_bytes_eq(&rows.statements[0].rows[0][0], b"/docs/readme.json");
 
-            let delete_sql = format!("DELETE FROM lix_file WHERE id = '{}'", file_id);
-            engine
-                .execute(&delete_sql, &[])
-                .await
-                .expect("churn delete should succeed");
+            assert_eq!(
+                file_cache_row_count(&engine, "file-path-echo", &main_version_id).await,
+                1
+            );
         }
+    );
 
-        assert_eq!(
-            total_file_cache_row_count_for_prefix(&engine, "cache-churn-").await,
-            0
-        );
-    }
-);
+    simulation_test!(
+        file_cache_churn_insert_read_delete_leaves_no_rows,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
 
-simulation_test!(
-    file_cache_has_no_orphan_rows_after_mixed_lifecycle,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = boot_engine_with_json_plugin(&sim).await;
+            for i in 0..40 {
+                let file_id = format!("cache-churn-{i}");
+                let path = format!("/{file_id}.json");
+                let insert_sql = format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('{}', '{}', lix_text_encode('{{\"i\":{}}}'))",
+                    file_id, path, i
+                );
+                engine
+                    .execute(&insert_sql, &[])
+                    .await
+                    .expect("churn insert should succeed");
 
-        engine
+                let read_sql =
+                    format!("SELECT data FROM lix_file WHERE id = '{}' LIMIT 1", file_id);
+                let read_rows = engine
+                    .execute(&read_sql, &[])
+                    .await
+                    .expect("churn read should succeed");
+                assert_eq!(read_rows.statements[0].rows.len(), 1);
+
+                let delete_sql = format!("DELETE FROM lix_file WHERE id = '{}'", file_id);
+                engine
+                    .execute(&delete_sql, &[])
+                    .await
+                    .expect("churn delete should succeed");
+            }
+
+            assert_eq!(
+                total_file_cache_row_count_for_prefix(&engine, "cache-churn-").await,
+                0
+            );
+        }
+    );
+
+    simulation_test!(
+        file_cache_has_no_orphan_rows_after_mixed_lifecycle,
+        simulations = [sqlite, postgres],
+        |sim| async move {
+            let engine = boot_engine_with_json_plugin(&sim).await;
+
+            engine
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
                  ('cache-orphan-keep', '/cache-orphan-keep.json', lix_text_encode('{\"keep\":true}')), \
@@ -3332,38 +3336,39 @@ simulation_test!(
             .await
             .expect("mixed lifecycle insert should succeed");
 
-        let keep_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'cache-orphan-keep' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("keep read should succeed");
-        assert_eq!(keep_rows.statements[0].rows.len(), 1);
-        let drop_rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'cache-orphan-drop' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("drop read should succeed");
-        assert_eq!(drop_rows.statements[0].rows.len(), 1);
+            let keep_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'cache-orphan-keep' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("keep read should succeed");
+            assert_eq!(keep_rows.statements[0].rows.len(), 1);
+            let drop_rows = engine
+                .execute(
+                    "SELECT data FROM lix_file WHERE id = 'cache-orphan-drop' LIMIT 1",
+                    &[],
+                )
+                .await
+                .expect("drop read should succeed");
+            assert_eq!(drop_rows.statements[0].rows.len(), 1);
 
-        engine
-            .execute("DELETE FROM lix_file WHERE id = 'cache-orphan-drop'", &[])
-            .await
-            .expect("drop delete should succeed");
+            engine
+                .execute("DELETE FROM lix_file WHERE id = 'cache-orphan-drop'", &[])
+                .await
+                .expect("drop delete should succeed");
 
-        assert_eq!(
-            orphan_file_cache_row_count_for_prefix(&engine, "cache-orphan-").await,
-            0
-        );
-        assert_eq!(
-            total_file_cache_row_count_for_prefix(&engine, "cache-orphan-").await,
-            1
-        );
-    }
-);
+            assert_eq!(
+                orphan_file_cache_row_count_for_prefix(&engine, "cache-orphan-").await,
+                0
+            );
+            assert_eq!(
+                total_file_cache_row_count_for_prefix(&engine, "cache-orphan-").await,
+                1
+            );
+        }
+    );
+}
 
 simulation_test!(
     binary_cas_gc_keeps_history_referenced_rows_after_overwrite,

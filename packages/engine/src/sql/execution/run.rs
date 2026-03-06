@@ -18,10 +18,7 @@ use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
 use super::execute_prepared::{execute_prepared_with_backend, execute_prepared_with_transaction};
-use super::followup::{
-    build_delete_followup_statements, build_domain_change_followup_statements,
-    build_update_followup_statements,
-};
+use super::followup::{build_delete_followup_statements, build_update_followup_statements};
 
 pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
@@ -142,7 +139,6 @@ pub(crate) async fn execute_plan_sql(
                         }
                     }
                 }
-                PostprocessPlan::DomainChangesOnly => {}
             }
 
             let additional_schema_keys = detected_file_domain_changes
@@ -189,22 +185,6 @@ pub(crate) async fn execute_plan_sql(
                         delete_plan,
                         &result.rows,
                         followup_params,
-                        detected_file_domain_changes,
-                        writer_key,
-                        &mut followup_functions,
-                    )
-                    .await
-                    {
-                        Ok(statements) => statements,
-                        Err(error) => {
-                            let _ = transaction.rollback().await;
-                            return Err(ExecutorError::execute(error));
-                        }
-                    }
-                }
-                PostprocessPlan::DomainChangesOnly => {
-                    match build_domain_change_followup_statements(
-                        transaction.as_mut(),
                         detected_file_domain_changes,
                         writer_key,
                         &mut followup_functions,
@@ -325,7 +305,6 @@ pub(crate) async fn execute_plan_sql_with_transaction(
                     .map_err(ExecutorError::execute)?;
                     state_commit_stream_changes.extend(changes);
                 }
-                PostprocessPlan::DomainChangesOnly => {}
             }
 
             let additional_schema_keys = detected_file_domain_changes
@@ -363,14 +342,6 @@ pub(crate) async fn execute_plan_sql_with_transaction(
                     delete_plan,
                     &result.rows,
                     followup_params,
-                    detected_file_domain_changes,
-                    writer_key,
-                    &mut followup_functions,
-                )
-                .await
-                .map_err(ExecutorError::execute)?,
-                PostprocessPlan::DomainChangesOnly => build_domain_change_followup_statements(
-                    transaction,
                     detected_file_domain_changes,
                     writer_key,
                     &mut followup_functions,

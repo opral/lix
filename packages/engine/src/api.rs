@@ -199,8 +199,6 @@ impl Engine {
             &active_version_id,
             writer_key,
             shared_path::PreparationPolicy {
-                allow_plugin_cache: true,
-                detect_plugin_file_changes: true,
                 skip_side_effect_collection: false,
             },
         )
@@ -249,12 +247,11 @@ impl Engine {
             self,
             &prepared.plan.preprocess.mutations,
             &prepared.intent.pending_file_writes,
+            &prepared.intent.pending_file_delete_targets,
             &prepared.intent.detected_file_domain_changes,
             &prepared.intent.untracked_filesystem_update_domain_changes,
             execution.plugin_changes_committed,
-            prepared.plan.requirements.read_only_query,
-            &cache_targets.file_data_cache_invalidation_targets,
-            &cache_targets.file_path_cache_invalidation_targets,
+            writer_key,
         )
         .await?;
 
