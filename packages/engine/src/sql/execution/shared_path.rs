@@ -1,21 +1,28 @@
 use std::collections::BTreeSet;
 
+use crate::commit::{
+    append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitPreconditions,
+    AppendExpectedTip, AppendWriteLane,
+};
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::Engine;
-use crate::functions::SharedFunctionProvider;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
     prepare_sql2_read, prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
 };
 use crate::validation::{validate_inserts, validate_updates};
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
 use super::super::contracts::execution_plan::ExecutionPlan;
+use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
 use super::super::planning::plan::build_execution_plan;
 use super::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,
 };
+use super::run::SqlExecutionOutcome;
 use sqlparser::ast::Statement;
 
 pub(crate) struct PreparationPolicy {
@@ -139,5 +146,164 @@ pub(crate) fn derive_cache_targets(
 
     CacheTargets {
         file_cache_refresh_targets,
+    }
+}
+
+pub(crate) async fn maybe_execute_sql2_write_with_backend(
+    engine: &Engine,
+    prepared: &PreparedExecutionContext,
+    writer_key: Option<&str>,
+) -> Result<Option<SqlExecutionOutcome>, LixError> {
+    if !sql2_tracked_insert_is_live(prepared) {
+        return Ok(None);
+    }
+
+    let mut transaction = engine.backend.begin_transaction().await?;
+    let execution =
+        match maybe_execute_sql2_write_with_transaction(transaction.as_mut(), prepared, writer_key)
+            .await?
+        {
+            Some(execution) => execution,
+            None => return Ok(None),
+        };
+    transaction.commit().await?;
+    Ok(Some(execution))
+}
+
+pub(crate) async fn maybe_execute_sql2_write_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    prepared: &PreparedExecutionContext,
+    writer_key: Option<&str>,
+) -> Result<Option<SqlExecutionOutcome>, LixError> {
+    if !sql2_tracked_insert_is_live(prepared) {
+        return Ok(None);
+    }
+
+    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+        return Ok(None);
+    };
+    let Some(domain_change_batch) = sql2_write.domain_change_batch.as_ref() else {
+        return Ok(None);
+    };
+    let Some(commit_preconditions) = sql2_write.planned_write.commit_preconditions.as_ref() else {
+        return Ok(None);
+    };
+
+    for registration in &prepared.plan.preprocess.registrations {
+        for statement in
+            register_schema_sql_statements(&registration.schema_key, transaction.dialect())
+        {
+            transaction.execute(&statement, &[]).await?;
+        }
+    }
+
+    let mut append_functions = prepared.functions.clone();
+    let timestamp = append_functions.timestamp();
+    append_commit_if_preconditions_hold(
+        transaction,
+        AppendCommitArgs {
+            timestamp,
+            changes: domain_change_batch.changes.clone(),
+            preconditions: append_preconditions(
+                sql2_write,
+                domain_change_batch,
+                commit_preconditions,
+            )?,
+        },
+        &mut append_functions,
+    )
+    .await
+    .map_err(append_commit_error_to_lix_error)?;
+
+    let _ = writer_key;
+    Ok(Some(SqlExecutionOutcome {
+        public_result: QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        },
+        postprocess_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed: true,
+        state_commit_stream_changes: Vec::new(),
+    }))
+}
+
+fn sql2_tracked_insert_is_live(prepared: &PreparedExecutionContext) -> bool {
+    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+        return false;
+    };
+
+    matches!(
+        prepared.plan.result_contract,
+        ResultContract::DmlNoReturning
+    ) && matches!(
+        sql2_write.planned_write.command.operation_kind,
+        crate::sql2::planner::ir::WriteOperationKind::Insert
+    ) && matches!(
+        sql2_write.planned_write.command.mode,
+        crate::sql2::planner::ir::WriteMode::Tracked
+    ) && sql2_write.domain_change_batch.is_some()
+        && sql2_write.planned_write.commit_preconditions.is_some()
+        && prepared.plan.preprocess.postprocess.is_none()
+        && prepared.plan.preprocess.update_validations.is_empty()
+        && prepared.intent.detected_file_domain_changes.is_empty()
+        && prepared.intent.pending_file_writes.is_empty()
+        && prepared.intent.pending_file_delete_targets.is_empty()
+        && prepared
+            .intent
+            .untracked_filesystem_update_domain_changes
+            .is_empty()
+}
+
+fn append_preconditions(
+    sql2_write: &Sql2PreparedWrite,
+    batch: &crate::sql2::planner::semantics::domain_changes::DomainChangeBatch,
+    commit_preconditions: &crate::sql2::planner::ir::CommitPreconditions,
+) -> Result<AppendCommitPreconditions, LixError> {
+    let write_lane = match &commit_preconditions.write_lane {
+        crate::sql2::planner::ir::WriteLane::SingleVersion(version_id) => {
+            AppendWriteLane::Version(version_id.clone())
+        }
+        crate::sql2::planner::ir::WriteLane::ActiveVersion => {
+            let version_id = batch
+                .changes
+                .first()
+                .map(|change| change.version_id.clone())
+                .or_else(|| {
+                    sql2_write
+                        .planned_write
+                        .command
+                        .execution_context
+                        .requested_version_id
+                        .clone()
+                })
+                .ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "sql2 append execution requires a concrete active version id"
+                        .to_string(),
+                })?;
+            AppendWriteLane::Version(version_id)
+        }
+        crate::sql2::planner::ir::WriteLane::GlobalAdmin => AppendWriteLane::GlobalAdmin,
+    };
+    let expected_tip = match &commit_preconditions.expected_tip {
+        crate::sql2::planner::ir::ExpectedTip::CommitId(commit_id) => {
+            AppendExpectedTip::CommitId(commit_id.clone())
+        }
+        crate::sql2::planner::ir::ExpectedTip::CreateIfMissing => {
+            AppendExpectedTip::CreateIfMissing
+        }
+    };
+
+    Ok(AppendCommitPreconditions {
+        write_lane,
+        expected_tip,
+        idempotency_key: commit_preconditions.idempotency_key.0.clone(),
+    })
+}
+
+fn append_commit_error_to_lix_error(error: crate::commit::AppendCommitError) -> LixError {
+    LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error.message,
     }
 }
