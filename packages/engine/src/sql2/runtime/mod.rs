@@ -473,4 +473,106 @@ mod tests {
 
         assert!(prepared.is_none());
     }
+
+    #[tokio::test]
+    async fn prepares_state_by_version_updates_into_tracked_write_artifacts() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "version-a".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "version-a".to_string(),
+                commit_id: "commit-456".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'entity-1' \
+                   AND version_id = 'version-a'",
+            ),
+            &[],
+            "main",
+            Some("writer-a"),
+        )
+        .await
+        .expect("state update should prepare through sql2");
+
+        assert_eq!(
+            prepared.planned_write.scope_proof,
+            ScopeProof::SingleVersion("version-a".to_string())
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .target_write_lane,
+            Some(WriteLane::SingleVersion("version-a".to_string()))
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .commit_preconditions
+                .as_ref()
+                .expect("tracked write should include commit preconditions")
+                .expected_tip,
+            ExpectedTip::CommitId("commit-456".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepares_state_by_version_deletes_into_tracked_write_artifacts() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "version-a".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "version-a".to_string(),
+                commit_id: "commit-789".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one(
+                "DELETE FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'entity-1' \
+                   AND version_id = 'version-a'",
+            ),
+            &[],
+            "main",
+            Some("writer-a"),
+        )
+        .await
+        .expect("state delete should prepare through sql2");
+
+        assert_eq!(
+            prepared.planned_write.scope_proof,
+            ScopeProof::SingleVersion("version-a".to_string())
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .intended_post_state[0]
+                .tombstone,
+            true
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .commit_preconditions
+                .as_ref()
+                .expect("tracked write should include commit preconditions")
+                .expected_tip,
+            ExpectedTip::CommitId("commit-789".to_string())
+        );
+    }
 }

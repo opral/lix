@@ -1,6 +1,6 @@
 use crate::sql2::planner::ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePlan, RowLineage, SchemaProof,
-    ScopeProof, WriteLane, WriteMode,
+    ScopeProof, TargetSetProof, WriteLane, WriteMode,
 };
 use crate::Value;
 
@@ -12,10 +12,7 @@ pub(crate) struct WriteResolveError {
 pub(crate) fn resolve_write_plan(
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let entity_id =
-        payload_text_value(planned_write, "entity_id").ok_or_else(|| WriteResolveError {
-            message: "sql2 write resolver requires entity_id for day-1 state inserts".to_string(),
-        })?;
+    let entity_id = resolved_entity_id(planned_write)?;
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?;
     let target_write_lane = match planned_write.command.mode {
@@ -39,6 +36,22 @@ pub(crate) fn resolve_write_plan(
             source_commit_id: None,
         }],
         target_write_lane,
+    })
+}
+
+fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+    if let Some(TargetSetProof::Exact(entity_ids)) = &planned_write.target_set_proof {
+        if entity_ids.len() == 1 {
+            return Ok(entity_ids
+                .iter()
+                .next()
+                .expect("singleton exact target-set proof")
+                .clone());
+        }
+    }
+
+    payload_text_value(planned_write, "entity_id").ok_or_else(|| WriteResolveError {
+        message: "sql2 day-1 write resolver requires an exact entity target".to_string(),
     })
 }
 
