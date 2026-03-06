@@ -95,7 +95,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -144,7 +147,10 @@ simulation_test!(install_plugin_rejects_missing_manifest, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("engine init should succeed");
+    engine
+        .initialize()
+        .await
+        .expect("engine init should succeed");
 
     let archive = build_archive(&[("plugin.wasm", &[0x00, 0x61, 0x73, 0x6d])]);
     let err = engine
@@ -162,7 +168,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -191,7 +200,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -223,7 +235,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -256,7 +271,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -289,7 +307,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -323,7 +344,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let manifest = plugin_manifest_json(
             "plugin_json",
@@ -377,7 +401,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         let first_manifest = plugin_manifest_json(
             "plugin_json",

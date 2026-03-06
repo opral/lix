@@ -8,7 +8,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -49,7 +49,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -83,7 +83,7 @@ simulation_test!(requires_stored_schema, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
             .execute(
@@ -110,7 +110,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -145,7 +145,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -186,7 +186,7 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -229,7 +229,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -273,7 +273,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -309,7 +309,7 @@ simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(

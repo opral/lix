@@ -157,7 +157,7 @@ fn run() -> Result<(), LixError> {
         },
     )?);
     let engine = boot(BootArgs::new(backend, wasm_runtime));
-    runtime.block_on(engine.init())?;
+    runtime.block_on(engine.initialize())?;
 
     let mut dataset = build_dataset(files_per_class);
     let dataset_summary = summarize_dataset(&dataset);

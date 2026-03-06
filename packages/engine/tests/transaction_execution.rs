@@ -107,7 +107,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let error = engine
 
@@ -155,7 +155,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -219,7 +219,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let active_version_id = active_version_id(&engine).await;
         let stored_schema_snapshot = serde_json::json!({
@@ -319,7 +319,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -360,7 +360,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -426,7 +426,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -459,7 +459,7 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -497,7 +497,7 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let error = engine
             .execute("ROLLBACK;", &[])
@@ -515,7 +515,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let sql = insert_many_key_values_sql(4_000);
         engine
@@ -538,7 +538,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let (sql, params) = build_large_multi_statement_select_script_and_params(20, 500_000);
         engine
@@ -556,7 +556,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -608,7 +608,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -654,7 +654,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine
             .execute(
@@ -691,7 +691,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let panic_result = std::panic::AssertUnwindSafe(engine.transaction(
             ExecuteOptions::default(),

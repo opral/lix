@@ -227,7 +227,10 @@ async fn boot_engine_with_json_plugin(
         }))
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("engine init should succeed");
+    engine
+        .initialize()
+        .await
+        .expect("engine init should succeed");
     register_plugin_schema(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
@@ -1323,7 +1326,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
 
         engine
             .execute(

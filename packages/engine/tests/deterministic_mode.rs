@@ -65,7 +65,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let mode_metadata = engine
             .execute(
@@ -125,7 +125,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -184,7 +184,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(register_test_schema_sql(), &[])
@@ -270,7 +270,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -315,7 +315,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(register_defaults_schema_sql(), &[])
@@ -379,7 +379,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -419,7 +419,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let before = read_sequence_value(&engine).await;
         let mut millis = Vec::new();

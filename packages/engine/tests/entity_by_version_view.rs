@@ -31,7 +31,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let version_id = active_version_id(&engine).await;
         let version_id_sql = version_id.replace('\'', "''");
 
@@ -125,7 +125,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let err = engine
             .execute(
@@ -154,7 +154,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let version_id = active_version_id(&engine).await;
 
         engine
@@ -214,7 +214,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let version_id = active_version_id(&engine).await;
 
         engine

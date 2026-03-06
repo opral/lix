@@ -53,7 +53,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -93,7 +93,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let version_id = active_version_id(&engine).await;
 
         engine
@@ -137,7 +137,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
@@ -197,7 +197,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
         insert_version(&engine, "version-a").await;
@@ -248,7 +248,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let schema_json = "{\"x-lix-key\":\"on_conflict_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}";
 

@@ -21,7 +21,7 @@ pub struct BootAccount {
     pub name: String,
 }
 
-pub struct BootArgs {
+pub struct EngineConfig {
     pub backend: Box<dyn LixBackend + Send + Sync>,
     pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub key_values: Vec<BootKeyValue>,
@@ -29,17 +29,12 @@ pub struct BootArgs {
     pub access_to_internal: bool,
 }
 
-pub struct InitLixArgs {
-    pub backend: Box<dyn LixBackend + Send + Sync>,
-    pub wasm_runtime: Arc<dyn WasmRuntime>,
-    pub key_values: Vec<BootKeyValue>,
+pub struct OpenOrInitResult {
+    pub engine: Engine,
+    pub initialized: bool,
 }
 
-pub struct InitLixResult {
-    pub created: bool,
-}
-
-impl BootArgs {
+impl EngineConfig {
     pub fn new(
         backend: Box<dyn LixBackend + Send + Sync>,
         wasm_runtime: Arc<dyn WasmRuntime>,
@@ -54,21 +49,36 @@ impl BootArgs {
     }
 }
 
-pub fn boot(args: BootArgs) -> Engine {
-    let boot_deterministic_settings = infer_boot_deterministic_settings(&args.key_values);
-    Engine::from_boot_args(args, boot_deterministic_settings)
+impl Engine {
+    pub async fn open(config: EngineConfig) -> Result<Self, LixError> {
+        let engine = boot(config);
+        engine.open_existing().await?;
+        Ok(engine)
+    }
+
+    pub async fn init(config: EngineConfig) -> Result<Self, LixError> {
+        let engine = boot(config);
+        engine.initialize().await?;
+        Ok(engine)
+    }
+
+    pub async fn open_or_init(config: EngineConfig) -> Result<OpenOrInitResult, LixError> {
+        let engine = boot(config);
+        let initialized = engine.initialize_if_needed().await?;
+        Ok(OpenOrInitResult {
+            engine,
+            initialized,
+        })
+    }
 }
 
-pub async fn init_lix(args: InitLixArgs) -> Result<InitLixResult, LixError> {
-    let engine = boot(BootArgs {
-        backend: args.backend,
-        wasm_runtime: args.wasm_runtime,
-        key_values: args.key_values,
-        active_account: None,
-        access_to_internal: false,
-    });
-    let created = engine.init_if_needed().await?;
-    Ok(InitLixResult { created })
+#[doc(hidden)]
+pub type BootArgs = EngineConfig;
+
+#[doc(hidden)]
+pub fn boot(args: EngineConfig) -> Engine {
+    let boot_deterministic_settings = infer_boot_deterministic_settings(&args.key_values);
+    Engine::from_boot_args(args, boot_deterministic_settings)
 }
 
 pub(crate) fn infer_boot_deterministic_settings(

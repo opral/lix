@@ -18,7 +18,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine
             .execute(
@@ -57,7 +57,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine
             .execute(
@@ -95,7 +95,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine
         .execute(

@@ -262,7 +262,7 @@ async fn seed_engine(with_plugin: bool) -> Result<lix_engine::Engine, LixError> 
         Arc::new(NoopWasmRuntime)
     };
     let engine = boot(BootArgs::new(backend, runtime));
-    engine.init().await?;
+    engine.initialize().await?;
 
     if with_plugin {
         engine

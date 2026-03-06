@@ -54,8 +54,8 @@ fn begin_transaction_commit_persists_changes() {
             .await
             .expect("verification query should succeed");
 
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Value::Integer(1));
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(result.statements[0].rows[0][0], Value::Integer(1));
     });
 }
 
@@ -90,7 +90,7 @@ fn begin_transaction_rollback_discards_changes() {
             .await
             .expect("verification query should succeed");
 
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Value::Integer(0));
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(result.statements[0].rows[0][0], Value::Integer(0));
     });
 }

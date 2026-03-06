@@ -55,7 +55,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let version_id = active_version_id(&engine).await;
 
         seed_key_value_row(&engine, "key-history", "value-history", &version_id).await;
@@ -85,7 +85,7 @@ simulation_test!(lix_entity_history_rejects_writes, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let insert_err = engine
         .execute(

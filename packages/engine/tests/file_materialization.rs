@@ -445,7 +445,10 @@ async fn boot_engine_with_json_plugin(
         }))
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("engine init should succeed");
+    engine
+        .initialize()
+        .await
+        .expect("engine init should succeed");
     register_plugin_schema(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
@@ -473,7 +476,10 @@ async fn boot_engine_with_path_echo_plugin(
         }))
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("engine init should succeed");
+    engine
+        .initialize()
+        .await
+        .expect("engine init should succeed");
     register_plugin_schema(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
@@ -501,7 +507,10 @@ async fn boot_engine_with_before_aware_plugin(
         }))
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("engine init should succeed");
+    engine
+        .initialize()
+        .await
+        .expect("engine init should succeed");
     register_plugin_schema(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
@@ -871,7 +880,10 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
         }))
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("engine init should succeed");
+    engine
+        .initialize()
+        .await
+        .expect("engine init should succeed");
     register_plugin_schema(&engine).await;
     let plugin_wasm = plugin_json_v2_wasm_bytes();
     let plugin_archive =
@@ -892,7 +904,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let version_id = main_version_id(&engine).await;
 
         engine
@@ -958,7 +973,10 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let version_id = main_version_id(&engine).await;
 
         engine
@@ -1002,7 +1020,10 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let version_id = main_version_id(&engine).await;
 
         engine
@@ -1076,7 +1097,10 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let version_id = main_version_id(&engine).await;
 
         engine
@@ -1133,7 +1157,10 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let version_id = main_version_id(&engine).await;
 
         engine
@@ -1234,7 +1261,10 @@ mod legacy_plugin_and_cache_tests {
                 .await
                 .expect("boot_simulated_engine should succeed");
 
-            engine.init().await.expect("engine init should succeed");
+            engine
+                .initialize()
+                .await
+                .expect("engine init should succeed");
             register_plugin_schema(&engine).await;
             let main_version_id = main_version_id(&engine).await;
             let plugin_wasm = plugin_json_v2_wasm_bytes();
@@ -1340,7 +1370,10 @@ mod legacy_plugin_and_cache_tests {
                 }))
                 .await
                 .expect("boot_simulated_engine should succeed");
-            engine.init().await.expect("engine init should succeed");
+            engine
+                .initialize()
+                .await
+                .expect("engine init should succeed");
             register_plugin_schema(&engine).await;
             let main_version_id = main_version_id(&engine).await;
             let plugin_wasm = plugin_json_v2_wasm_bytes();
@@ -1436,7 +1469,10 @@ mod legacy_plugin_and_cache_tests {
                 }))
                 .await
                 .expect("boot_simulated_engine should succeed");
-            engine.init().await.expect("engine init should succeed");
+            engine
+                .initialize()
+                .await
+                .expect("engine init should succeed");
             register_plugin_schema(&engine).await;
             let main_version_id = main_version_id(&engine).await;
             let plugin_wasm = plugin_json_v2_wasm_bytes();
@@ -3420,7 +3456,10 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let main_version_id = main_version_id(&engine).await;
 
         engine
@@ -3495,7 +3534,10 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let main_version_id = main_version_id(&engine).await;
 
         engine
@@ -3559,7 +3601,10 @@ simulation_test!(
             }))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("engine init should succeed");
+        engine
+            .initialize()
+            .await
+            .expect("engine init should succeed");
         let main_version_id = main_version_id(&engine).await;
 
         let payload = vec![0u8; 300_000];

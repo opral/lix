@@ -7,7 +7,8 @@ use crate::version::{
 use crate::{LixError, SqlDialect, Value};
 
 impl Engine {
-    pub async fn init(&self) -> Result<(), LixError> {
+    #[doc(hidden)]
+    pub async fn initialize(&self) -> Result<(), LixError> {
         self.try_mark_init_in_progress()?;
 
         let init_result = async {
@@ -47,8 +48,9 @@ impl Engine {
         result
     }
 
-    pub async fn init_if_needed(&self) -> Result<bool, LixError> {
-        match self.init().await {
+    #[doc(hidden)]
+    pub async fn initialize_if_needed(&self) -> Result<bool, LixError> {
+        match self.initialize().await {
             Ok(()) => Ok(true),
             Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
                 self.load_and_cache_active_version().await?;

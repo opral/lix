@@ -20,7 +20,7 @@ simulation_test!(key_value_crud_is_handled_through_vtable, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(&insert_key_value_sql("key0", "\"value0\""), &[])
@@ -107,7 +107,7 @@ simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let fixtures = [
         ("key0", "{\"foo\":\"bar\"}"),
@@ -190,7 +190,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(&insert_key_value_sql("type_test_string", "\"1\""), &[])
@@ -241,7 +241,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(&insert_key_value_sql("array_extract", "[10,20,30]"), &[])

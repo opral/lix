@@ -83,7 +83,7 @@ async fn seed_engine(
 ) -> Result<lix_engine::Engine, LixError> {
     let backend = Box::new(BenchSqliteBackend::in_memory());
     let engine = boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime)));
-    engine.init().await?;
+    engine.initialize().await?;
 
     let schema_snapshot = json!({
         "value": {

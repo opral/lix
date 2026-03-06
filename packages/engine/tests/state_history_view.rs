@@ -75,7 +75,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -121,7 +121,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -188,7 +188,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -247,7 +247,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -316,7 +316,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -402,7 +402,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let insert_err = engine
             .execute(
@@ -434,7 +434,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -505,7 +505,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
@@ -601,7 +601,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
         engine
