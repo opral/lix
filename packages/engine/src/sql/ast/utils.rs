@@ -8,18 +8,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+pub(crate) use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, SqlDialect, Value};
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PlaceholderState {
-    next_ordinal: usize,
-}
-
-impl PlaceholderState {
-    pub(crate) fn new() -> Self {
-        Self { next_ordinal: 0 }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct BoundSql {
@@ -212,44 +202,6 @@ impl VisitorMut for PlaceholderBinder<'_> {
     }
 }
 
-pub(crate) fn resolve_placeholder_index(
-    token: &str,
-    params_len: usize,
-    state: &mut PlaceholderState,
-) -> Result<usize, LixError> {
-    let trimmed = token.trim();
-
-    let source_index = if trimmed.is_empty() || trimmed == "?" {
-        let source_index = state.next_ordinal;
-        state.next_ordinal += 1;
-        source_index
-    } else if let Some(numeric) = trimmed.strip_prefix('?') {
-        let parsed = parse_1_based_index(trimmed, numeric)?;
-        state.next_ordinal = state.next_ordinal.max(parsed);
-        parsed - 1
-    } else if let Some(numeric) = trimmed.strip_prefix('$') {
-        let parsed = parse_1_based_index(trimmed, numeric)?;
-        state.next_ordinal = state.next_ordinal.max(parsed);
-        parsed - 1
-    } else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("unsupported SQL placeholder format '{trimmed}'"),
-        });
-    };
-
-    if source_index >= params_len {
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "placeholder '{trimmed}' references parameter {} but only {} parameters were provided",
-                source_index + 1,
-                params_len
-            ),
-        });
-    }
-
-    Ok(source_index)
-}
-
 fn dense_index_for_source(
     source_index: usize,
     source_to_dense: &mut HashMap<usize, usize>,
@@ -269,20 +221,6 @@ fn placeholder_for_dialect(dialect: SqlDialect, dense_index_1_based: usize) -> S
         SqlDialect::Sqlite => format!("?{dense_index_1_based}"),
         SqlDialect::Postgres => format!("${dense_index_1_based}"),
     }
-}
-
-fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
-    let parsed = numeric.parse::<usize>().map_err(|_| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("invalid SQL placeholder '{token}'"),
-    })?;
-    if parsed == 0 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("invalid SQL placeholder '{token}'"),
-        });
-    }
-    Ok(parsed)
 }
 
 fn resolve_expr(

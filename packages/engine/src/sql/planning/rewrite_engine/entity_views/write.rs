@@ -2710,7 +2710,7 @@ mod tests {
             sql: &str,
             _params: &[EngineValue],
         ) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_stored_schema")
+            if sql.contains("FROM lix_internal_stored_schema_bootstrap")
                 && sql.contains("lix_version_override_schema~")
             {
                 return Ok(QueryResult {

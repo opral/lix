@@ -171,6 +171,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 }
 
                 let mut current_insert = insert;
+                let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
                     lix_state_by_version_write::rewrite_insert(current_insert.clone())?
                 {
@@ -181,6 +182,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 {
                     context.registrations.push(rewritten.registration);
                     context.mutations.push(rewritten.mutation);
+                    supplemental_statements.extend(rewritten.supplemental_statements);
                     let Statement::Insert(insert_statement) = rewritten.statement else {
                         return Err(LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -214,6 +216,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                         });
                     }
                 }
+                statements.extend(supplemental_statements);
 
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }
@@ -469,11 +472,13 @@ where
                     current_insert = rewritten;
                 }
 
+                let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
                     stored_schema_write::rewrite_insert(current_insert.clone(), context.params)?
                 {
                     context.registrations.push(rewritten.registration);
                     context.mutations.push(rewritten.mutation);
+                    supplemental_statements.extend(rewritten.supplemental_statements);
                     let Statement::Insert(insert_statement) = rewritten.statement else {
                         return Err(LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -514,6 +519,7 @@ where
                         });
                     }
                 }
+                statements.extend(supplemental_statements);
 
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }

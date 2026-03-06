@@ -14,10 +14,13 @@ const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 const GLOBAL_VERSION: &str = "global";
 const ENGINE_FILE_ID: &str = "lix";
 const ENGINE_PLUGIN_KEY: &str = "lix";
+const BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
+const MATERIALIZED_TABLE: &str = "lix_internal_state_materialized_v1_lix_stored_schema";
 
 #[derive(Debug, Clone)]
 pub struct StoredSchemaRewrite {
     pub statement: Statement,
+    pub supplemental_statements: Vec<Statement>,
     pub registration: SchemaRegistration,
     pub mutation: MutationRow,
 }
@@ -215,15 +218,18 @@ pub fn rewrite_insert(
     let rewritten = Insert {
         columns,
         source: Some(source),
-        table: TableObject::TableName(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
-            "lix_internal_state_materialized_v1_lix_stored_schema",
-        ))])),
+        table: table_object(BOOTSTRAP_TABLE),
         on: Some(build_on_conflict_do_nothing()),
         ..insert
+    };
+    let mirrored = Insert {
+        table: table_object(MATERIALIZED_TABLE),
+        ..rewritten.clone()
     };
 
     Ok(Some(StoredSchemaRewrite {
         statement: Statement::Insert(rewritten),
+        supplemental_statements: vec![Statement::Insert(mirrored)],
         registration: SchemaRegistration {
             schema_key: schema_key_value,
         },
@@ -250,6 +256,12 @@ fn build_on_conflict_do_nothing() -> OnInsert {
         ])),
         action: OnConflictAction::DoNothing,
     })
+}
+
+fn table_object(table_name: &str) -> TableObject {
+    TableObject::TableName(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+        table_name,
+    ))]))
 }
 
 fn table_object_is_vtable(table: &TableObject) -> bool {
@@ -499,6 +511,10 @@ mod tests {
             Statement::Insert(insert) => insert,
             _ => panic!("expected insert"),
         };
+        let supplemental = match rewritten.supplemental_statements.as_slice() {
+            [Statement::Insert(insert)] => insert,
+            _ => panic!("expected mirrored materialized insert"),
+        };
 
         let row = extract_row(&insert);
         let entity_idx = column_index(&insert.columns, "entity_id");
@@ -520,10 +536,8 @@ mod tests {
         assert_eq!(expr_string(&row[tombstone_idx]), "0");
         assert_eq!(expr_string(&row[created_idx]), "1970-01-01T00:00:00Z");
         assert_eq!(expr_string(&row[updated_idx]), "1970-01-01T00:00:00Z");
-        assert!(insert
-            .table
-            .to_string()
-            .contains("lix_internal_state_materialized_v1_lix_stored_schema"));
+        assert!(insert.table.to_string().contains(BOOTSTRAP_TABLE));
+        assert!(supplemental.table.to_string().contains(MATERIALIZED_TABLE));
         assert!(insert
             .on
             .as_ref()
@@ -557,12 +571,23 @@ mod tests {
             Statement::Insert(insert) => insert,
             _ => panic!("expected insert"),
         };
+        let supplemental = match rewritten.supplemental_statements.as_slice() {
+            [Statement::Insert(insert)] => insert,
+            _ => panic!("expected mirrored materialized insert"),
+        };
         assert!(
             insert
                 .columns
                 .iter()
                 .all(|column| !column.value.eq_ignore_ascii_case("untracked")),
             "rewritten stored schema insert must not include untracked column"
+        );
+        assert!(
+            supplemental
+                .columns
+                .iter()
+                .all(|column| !column.value.eq_ignore_ascii_case("untracked")),
+            "mirrored materialized stored schema insert must not include untracked column"
         );
     }
 }

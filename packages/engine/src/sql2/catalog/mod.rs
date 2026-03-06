@@ -791,7 +791,7 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_stored_schema") {
+            if sql.contains("FROM lix_internal_stored_schema_bootstrap") {
                 let rows = self
                     .schema_rows
                     .values()

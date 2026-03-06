@@ -8,7 +8,7 @@ use crate::{LixBackend, LixError, Value};
 
 use super::key::{schema_from_stored_snapshot, SchemaKey};
 
-const STORED_SCHEMA_TABLE: &str = "lix_internal_state_materialized_v1_lix_stored_schema";
+const STORED_SCHEMA_TABLE: &str = "lix_internal_stored_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
 const INTERNAL_SCHEMA_VERSION: &str = "1";
 

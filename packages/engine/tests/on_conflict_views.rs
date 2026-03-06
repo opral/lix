@@ -275,7 +275,7 @@ simulation_test!(
         let rows = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_state_materialized_v1_lix_stored_schema \
+                 FROM lix_internal_stored_schema_bootstrap \
                  WHERE entity_id = 'on_conflict_schema~1' \
                    AND file_id = 'lix' \
                    AND version_id = 'global'",
