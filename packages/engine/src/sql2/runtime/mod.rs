@@ -4,9 +4,13 @@ use crate::sql2::planner::canonicalize::{
     canonicalize_read, canonicalize_write, CanonicalizedRead, CanonicalizedWrite,
 };
 use crate::sql2::planner::ir::{
-    PlannedWrite, ResolvedWritePlan, SchemaProof, ScopeProof, TargetSetProof, WriteCommand,
+    CommitPreconditions, PlannedWrite, ResolvedWritePlan, SchemaProof, ScopeProof, TargetSetProof,
+    WriteCommand,
 };
 use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+use crate::sql2::planner::semantics::domain_changes::{
+    build_domain_change_batch, derive_commit_preconditions, DomainChangeBatch,
+};
 use crate::sql2::planner::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
@@ -28,6 +32,8 @@ pub(crate) struct Sql2DebugTrace {
     pub(crate) schema_proof: Option<SchemaProof>,
     pub(crate) target_set_proof: Option<TargetSetProof>,
     pub(crate) resolved_write_plan: Option<ResolvedWritePlan>,
+    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) commit_preconditions: Option<CommitPreconditions>,
     pub(crate) lowered_sql: Vec<String>,
 }
 
@@ -44,6 +50,7 @@ pub(crate) struct Sql2PreparedRead {
 pub(crate) struct Sql2PreparedWrite {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
+    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
     pub(crate) debug_trace: Sql2DebugTrace,
 }
 
@@ -88,6 +95,8 @@ pub(crate) async fn prepare_sql2_read(
             schema_proof: None,
             target_set_proof: None,
             resolved_write_plan: None,
+            domain_change_batch: None,
+            commit_preconditions: None,
             lowered_sql: Vec::new(),
         },
         dependency_spec,
@@ -125,6 +134,11 @@ pub(crate) async fn prepare_sql2_write(
     let mut planned_write = prove_write(&canonicalized).ok()?;
     let resolved_write_plan = resolve_write_plan(&planned_write).ok()?;
     planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
+    let domain_change_batch = build_domain_change_batch(&planned_write).ok()?;
+    let commit_preconditions = derive_commit_preconditions(backend, &planned_write)
+        .await
+        .ok()?;
+    planned_write.commit_preconditions = commit_preconditions.clone();
 
     Some(Sql2PreparedWrite {
         debug_trace: Sql2DebugTrace {
@@ -138,9 +152,12 @@ pub(crate) async fn prepare_sql2_write(
             schema_proof: Some(planned_write.schema_proof.clone()),
             target_set_proof: planned_write.target_set_proof.clone(),
             resolved_write_plan: Some(resolved_write_plan),
+            domain_change_batch: domain_change_batch.clone(),
+            commit_preconditions: commit_preconditions.clone(),
             lowered_sql: Vec::new(),
         },
         planned_write,
+        domain_change_batch,
         canonicalized,
     })
 }
@@ -148,10 +165,10 @@ pub(crate) async fn prepare_sql2_write(
 #[cfg(test)]
 mod tests {
     use super::{prepare_sql2_read, prepare_sql2_write};
-    use crate::sql2::planner::ir::{ScopeProof, WriteLane, WriteMode};
+    use crate::sql2::planner::ir::{ExpectedTip, ScopeProof, WriteLane, WriteMode};
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{json, to_string};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -160,6 +177,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         stored_schema_rows: HashMap<String, String>,
+        version_pointer_rows: HashMap<String, String>,
     }
 
     #[async_trait(?Send)]
@@ -177,6 +195,20 @@ mod tests {
                         .cloned()
                         .map(|snapshot| vec![Value::Text(snapshot)])
                         .collect(),
+                    columns: vec!["snapshot_content".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer") {
+                let rows = self
+                    .version_pointer_rows
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("entity_id = '{}'", version_id))
+                    })
+                    .map(|(_, snapshot)| vec![Value::Text(snapshot.clone())])
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
                     columns: vec!["snapshot_content".to_string()],
                 });
             }
@@ -314,7 +346,15 @@ mod tests {
 
     #[tokio::test]
     async fn prepares_state_by_version_inserts_into_planned_writes() {
-        let backend = FakeBackend::default();
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "version-a".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "version-a".to_string(),
+                commit_id: "commit-123".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
         let prepared = prepare_sql2_write(
             &backend,
             &parse_one(
@@ -343,17 +383,42 @@ mod tests {
         assert_eq!(
             prepared
                 .planned_write
+                .commit_preconditions
+                .as_ref()
+                .expect("tracked write should include commit preconditions")
+                .expected_tip,
+            ExpectedTip::CommitId("commit-123".to_string())
+        );
+        assert_eq!(
+            prepared
+                .planned_write
                 .resolved_write_plan
                 .as_ref()
                 .expect("resolved write plan should exist")
                 .target_write_lane,
             Some(WriteLane::SingleVersion("version-a".to_string()))
         );
+        assert_eq!(
+            prepared
+                .domain_change_batch
+                .as_ref()
+                .expect("tracked write should include a domain change batch")
+                .write_lane,
+            WriteLane::SingleVersion("version-a".to_string())
+        );
     }
 
     #[tokio::test]
     async fn prepares_active_version_state_inserts_with_active_lane() {
-        let backend = FakeBackend::default();
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "main".to_string(),
+                commit_id: "commit-main".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
         let prepared = prepare_sql2_write(
             &backend,
             &parse_one(
@@ -382,6 +447,15 @@ mod tests {
                 .expect("resolved write plan should exist")
                 .target_write_lane,
             Some(WriteLane::ActiveVersion)
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .commit_preconditions
+                .as_ref()
+                .expect("tracked write should include commit preconditions")
+                .expected_tip,
+            ExpectedTip::CommitId("commit-main".to_string())
         );
     }
 
