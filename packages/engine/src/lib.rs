@@ -23,6 +23,7 @@ mod plugin;
 mod schema;
 mod schema_registry;
 mod snapshot;
+pub(crate) mod sql2;
 mod state_commit_stream;
 mod types;
 mod validation;

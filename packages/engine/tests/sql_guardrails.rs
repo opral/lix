@@ -171,16 +171,41 @@ fn guardrail_legacy_sql_bridge_alias_usage_is_forbidden() {
 }
 
 #[test]
-fn guardrail_legacy_sql2_directory_stays_removed() {
+fn guardrail_sql2_directory_exists_alongside_legacy_sql_runtime() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
-        !root.join("src/sql2").exists(),
-        "legacy src/sql2 directory must stay removed"
+        root.join("src/sql2").exists(),
+        "src/sql2 directory must exist for the semantic rewrite"
     );
     assert!(
         root.join("src/sql").exists(),
-        "src/sql runtime directory must exist"
+        "src/sql runtime directory must remain available during migration"
     );
+}
+
+#[test]
+fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_modules() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql2");
+    let mut files = Vec::new();
+    collect_rust_sources(&root, &mut files);
+
+    for file in files {
+        let source = fs::read_to_string(&file).expect("source file should be readable");
+        for forbidden in [
+            "crate::engine::sql::planning::",
+            "crate::engine::sql::execution::followup",
+            "crate::engine::sql::surfaces::registry",
+            "rewrite_engine",
+            "classify_statement(",
+            "preprocess_with_surfaces_to_plan(",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "sql2 must not depend on legacy rewrite/followup/classifier/planning code: {}",
+                file.display()
+            );
+        }
+    }
 }
 
 #[test]
