@@ -2,6 +2,7 @@
 mod append_commit;
 mod generate_commit;
 mod runtime;
+mod state_source;
 mod types;
 
 #[allow(unused_imports)]
@@ -13,8 +14,12 @@ pub(crate) use append_commit::{
 pub use generate_commit::generate_commit;
 pub(crate) use runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,
-    StatementBatch,
+    load_commit_active_accounts, StatementBatch,
+};
+pub(crate) use state_source::{
+    load_committed_version_tip_commit_id, load_exact_committed_state_row,
+    load_version_info_for_versions, CommitQueryExecutor, ExactCommittedStateRow,
+    ExactCommittedStateRowRequest,
 };
 pub(crate) use types::ProposedDomainChange;
 pub use types::{

@@ -7,9 +7,9 @@ use crate::sql2::planner::ir::{
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
-    AssignmentTarget, Delete, Expr, FromTable, GroupByExpr, Insert, LimitClause, ObjectNamePart,
-    OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableWithJoins, Update, Value as SqlValue, Visit, Visitor,
+    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, GroupByExpr, Insert, LimitClause,
+    ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins, Update, Value as SqlValue, Visit, Visitor,
 };
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -193,9 +193,7 @@ fn canonicalize_update_write(
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Update,
             target: surface_binding,
-            selector: WriteSelector {
-                residual_predicates: vec![selection.to_string()],
-            },
+            selector: write_selector(selection, &bound_statement.bound_parameters)?,
             payload: MutationPayload::Patch(payload),
             mode,
             execution_context: bound_statement.execution_context,
@@ -232,9 +230,7 @@ fn canonicalize_delete_write(
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Delete,
             target: surface_binding,
-            selector: WriteSelector {
-                residual_predicates: vec![selection.to_string()],
-            },
+            selector: write_selector(selection, &bound_statement.bound_parameters)?,
             payload: MutationPayload::Tombstone,
             mode: WriteMode::Tracked,
             execution_context: bound_statement.execution_context,
@@ -548,6 +544,88 @@ fn assignment_payload(
         payload.insert(key, value);
     }
     Ok(payload)
+}
+
+fn write_selector(expr: &Expr, params: &[Value]) -> Result<WriteSelector, CanonicalizeError> {
+    let mut placeholder_state = PlaceholderState::new();
+    let mut exact_filters = BTreeMap::new();
+    let exact_only =
+        collect_exact_selector_filters(expr, params, &mut placeholder_state, &mut exact_filters);
+
+    Ok(WriteSelector {
+        residual_predicates: vec![expr.to_string()],
+        exact_filters,
+        exact_only,
+    })
+}
+
+fn collect_exact_selector_filters(
+    expr: &Expr,
+    params: &[Value],
+    placeholder_state: &mut PlaceholderState,
+    exact_filters: &mut BTreeMap<String, Value>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_exact_selector_filters(left, params, placeholder_state, exact_filters)
+                && collect_exact_selector_filters(right, params, placeholder_state, exact_filters)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let Some(column) = selector_column_name(left).or_else(|| selector_column_name(right))
+            else {
+                return false;
+            };
+            if !selector_column_is_supported(&column) {
+                return false;
+            }
+            let value_expr = if selector_column_name(left).is_some() {
+                right
+            } else {
+                left
+            };
+            let Ok(value) = expr_to_value(value_expr, params, placeholder_state) else {
+                return false;
+            };
+            match exact_filters.get(&column) {
+                Some(existing) if existing != &value => false,
+                Some(_) => true,
+                None => {
+                    exact_filters.insert(column, value);
+                    true
+                }
+            }
+        }
+        Expr::Nested(inner) => {
+            collect_exact_selector_filters(inner, params, placeholder_state, exact_filters)
+        }
+        _ => false,
+    }
+}
+
+fn selector_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(identifier) => Some(identifier.value.to_ascii_lowercase()),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|identifier| identifier.value.to_ascii_lowercase()),
+        Expr::Nested(inner) => selector_column_name(inner),
+        _ => None,
+    }
+}
+
+fn selector_column_is_supported(column: &str) -> bool {
+    matches!(
+        column,
+        "entity_id" | "schema_key" | "file_id" | "version_id" | "plugin_key" | "schema_version"
+    )
 }
 
 fn expr_to_value(

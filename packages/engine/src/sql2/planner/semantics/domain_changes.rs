@@ -1,5 +1,4 @@
-use crate::builtin_schema::types::LixVersionPointer;
-use crate::commit::ProposedDomainChange;
+use crate::commit::{load_committed_version_tip_commit_id, ProposedDomainChange};
 use crate::sql2::planner::ir::{
     CommitPreconditions, ExpectedTip, IdempotencyKey, PlannedWrite, WriteLane, WriteMode,
 };
@@ -53,6 +52,7 @@ pub(crate) fn build_domain_change_batch(
             .version_id
             .clone()
             .unwrap_or_else(|| "active".to_string());
+        let writer_key = command_writer_key(planned_write);
         let operation_key = if row.tombstone {
             "state.delete"
         } else {
@@ -73,7 +73,7 @@ pub(crate) fn build_domain_change_batch(
             version_id: row.version_id.clone().ok_or_else(|| DomainChangeError {
                 message: "sql2 domain-change derivation requires a concrete version_id".to_string(),
             })?,
-            writer_key: planned_write.command.execution_context.writer_key.clone(),
+            writer_key,
         });
         semantic_effects.push(SemanticEffect {
             effect_key: operation_key.to_string(),
@@ -115,7 +115,16 @@ pub(crate) async fn derive_commit_preconditions(
                 .to_string(),
         })?;
     let version_id = version_id_for_write_lane(&write_lane, planned_write)?;
-    let current_tip = load_current_tip_commit_id(backend, &version_id).await?;
+    let mut executor = backend;
+    let current_tip = load_committed_version_tip_commit_id(&mut executor, &version_id)
+        .await
+        .map_err(domain_change_backend_error)?
+        .ok_or_else(|| DomainChangeError {
+            message: format!(
+                "sql2 commit precondition derivation could not find a version tip for '{}'",
+                version_id
+            ),
+        })?;
     let idempotency_key = build_idempotency_key(planned_write, &write_lane, &current_tip)?;
 
     Ok(Some(CommitPreconditions {
@@ -144,60 +153,6 @@ fn version_id_for_write_lane(
                 .to_string(),
         }),
     }
-}
-
-async fn load_current_tip_commit_id(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<String, DomainChangeError> {
-    let sql = format!(
-        "SELECT snapshot_content \
-         FROM lix_internal_state_materialized_v1_lix_version_pointer \
-         WHERE schema_key = 'lix_version_pointer' \
-           AND entity_id = '{version_id}' \
-           AND file_id = 'lix' \
-           AND version_id = 'global' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-         LIMIT 1",
-        version_id = escape_sql_string(version_id),
-    );
-    let result = backend
-        .execute(&sql, &[])
-        .await
-        .map_err(domain_change_backend_error)?;
-    let Some(row) = result.rows.first() else {
-        return Err(DomainChangeError {
-            message: format!(
-                "sql2 commit precondition derivation could not find a version tip for '{}'",
-                version_id
-            ),
-        });
-    };
-    let Some(crate::Value::Text(snapshot_content)) = row.first() else {
-        return Err(DomainChangeError {
-            message: format!(
-                "sql2 commit precondition derivation expected text snapshot_content for '{}'",
-                version_id
-            ),
-        });
-    };
-    let pointer: LixVersionPointer =
-        serde_json::from_str(snapshot_content).map_err(|error| DomainChangeError {
-            message: format!(
-                "sql2 commit precondition derivation could not parse version tip snapshot for '{}': {error}",
-                version_id
-            ),
-        })?;
-    if pointer.commit_id.is_empty() {
-        return Err(DomainChangeError {
-            message: format!(
-                "sql2 commit precondition derivation found an empty commit_id for '{}'",
-                version_id
-            ),
-        });
-    }
-    Ok(pointer.commit_id)
 }
 
 fn build_idempotency_key(
@@ -244,8 +199,24 @@ fn text_value(
     }
 }
 
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
+fn command_writer_key(planned_write: &PlannedWrite) -> Option<String> {
+    match &planned_write.command.payload {
+        crate::sql2::planner::ir::MutationPayload::FullSnapshot(payload)
+        | crate::sql2::planner::ir::MutationPayload::Patch(payload) => {
+            if !payload.contains_key("writer_key") {
+                return planned_write.command.execution_context.writer_key.clone();
+            }
+
+            match payload.get("writer_key") {
+                Some(crate::Value::Text(value)) => Some(value.clone()),
+                Some(crate::Value::Null) | None => None,
+                _ => None,
+            }
+        }
+        crate::sql2::planner::ir::MutationPayload::Tombstone => {
+            planned_write.command.execution_context.writer_key.clone()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -275,10 +246,12 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer") {
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_pointer'")
+            {
                 if let Some(expected_version_id) = &self.expected_version_id {
                     assert!(
-                        sql.contains(&format!("entity_id = '{}'", expected_version_id)),
+                        sql.contains(&format!("c.entity_id = '{}'", expected_version_id)),
                         "unexpected version pointer query: {sql}"
                     );
                 }
@@ -317,7 +290,7 @@ mod tests {
         }
     }
 
-    fn planned_write(
+    async fn planned_write(
         sql: &str,
         requested_version_id: &str,
     ) -> crate::sql2::planner::ir::PlannedWrite {
@@ -336,18 +309,21 @@ mod tests {
         let canonicalized =
             canonicalize_write(bound, &registry).expect("write should canonicalize");
         let mut planned_write = prove_write(&canonicalized).expect("proofs should succeed");
-        let resolved_write_plan = resolve_write_plan(&planned_write).expect("write should resolve");
+        let resolved_write_plan = resolve_write_plan(&FakeBackend::default(), &planned_write)
+            .await
+            .expect("write should resolve");
         planned_write.resolved_write_plan = Some(resolved_write_plan);
         planned_write
     }
 
-    #[test]
-    fn builds_tracked_domain_change_batch_for_state_insert() {
+    #[tokio::test]
+    async fn builds_tracked_domain_change_batch_for_state_insert() {
         let planned_write = planned_write(
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
             "main",
-        );
+        )
+        .await;
 
         let batch = build_domain_change_batch(&planned_write)
             .expect("domain changes should derive")
@@ -371,7 +347,8 @@ mod tests {
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
             "main",
-        );
+        )
+        .await;
         let backend = FakeBackend {
             version_tip_commit_id: Some("commit-123".to_string()),
             expected_version_id: Some("version-a".to_string()),

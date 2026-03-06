@@ -1,3 +1,4 @@
+use crate::commit::ProposedDomainChange;
 use crate::engine::sql::contracts::planned_statement::{MutationOperation, MutationRow};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
@@ -522,6 +523,54 @@ pub(crate) fn state_commit_stream_changes_from_postprocess_rows(
     Ok(changes)
 }
 
+pub(crate) fn state_commit_stream_changes_from_domain_changes(
+    changes: &[ProposedDomainChange],
+    operation: StateCommitStreamOperation,
+) -> Result<Vec<StateCommitStreamChange>, LixError> {
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut resolved = Vec::with_capacity(changes.len());
+    for change in changes {
+        let snapshot_content = match &change.snapshot_content {
+            Some(snapshot_content) => Some(
+                serde_json::from_str(snapshot_content).map_err(|error| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "domain change state commit stream expected JSON snapshot_content text: {error}"
+                    ),
+                })?,
+            ),
+            None => None,
+        };
+        resolved.push(StateCommitStreamChange {
+            operation,
+            entity_id: change.entity_id.clone(),
+            schema_key: change.schema_key.clone(),
+            schema_version: change.schema_version.clone().ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "domain change state commit stream requires schema_version"
+                    .to_string(),
+            })?,
+            file_id: change.file_id.clone().ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "domain change state commit stream requires file_id".to_string(),
+            })?,
+            version_id: change.version_id.clone(),
+            plugin_key: change.plugin_key.clone().ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "domain change state commit stream requires plugin_key".to_string(),
+            })?,
+            snapshot_content,
+            untracked: false,
+            writer_key: change.writer_key.clone(),
+        });
+    }
+
+    Ok(resolved)
+}
+
 fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
     let value = row.get(index).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -575,7 +624,11 @@ fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOpe
 
 #[cfg(test)]
 mod tests {
-    use super::{state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation};
+    use super::{
+        state_commit_stream_changes_from_domain_changes,
+        state_commit_stream_changes_from_postprocess_rows, StateCommitStreamOperation,
+    };
+    use crate::commit::ProposedDomainChange;
     use crate::Value;
 
     #[test]
@@ -634,5 +687,30 @@ mod tests {
         assert_eq!(changes[0].entity_id, "entity-2");
         assert_eq!(changes[0].snapshot_content, None);
         assert_eq!(changes[0].writer_key, None);
+    }
+
+    #[test]
+    fn domain_changes_map_to_update_changes() {
+        let changes = state_commit_stream_changes_from_domain_changes(
+            &[ProposedDomainChange {
+                entity_id: "entity-1".to_string(),
+                schema_key: "lix_key_value".to_string(),
+                schema_version: Some("1".to_string()),
+                file_id: Some("file-1".to_string()),
+                plugin_key: Some("lix".to_string()),
+                snapshot_content: Some("{\"value\":\"after\"}".to_string()),
+                metadata: None,
+                version_id: "version-a".to_string(),
+                writer_key: Some("writer-a".to_string()),
+            }],
+            StateCommitStreamOperation::Update,
+        )
+        .expect("domain changes should map");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].operation, StateCommitStreamOperation::Update);
+        assert_eq!(changes[0].entity_id, "entity-1");
+        assert_eq!(changes[0].schema_key, "lix_key_value");
+        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-a"));
     }
 }

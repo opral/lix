@@ -143,9 +143,11 @@ pub(crate) enum MutationPayload {
     Tombstone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct WriteSelector {
     pub(crate) residual_predicates: Vec<String>,
+    pub(crate) exact_filters: BTreeMap<String, Value>,
+    pub(crate) exact_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
