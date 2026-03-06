@@ -61,7 +61,7 @@ Lix was trending on HackerNews in late January. The outcome was an instant jump 
 
 ![](./github-stars.png)
 
-![](./hackernews.png)
+![GitHub stars growth](./hackernews.png)
 
 ## What's next in March
 
