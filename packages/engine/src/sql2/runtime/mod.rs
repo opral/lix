@@ -1,10 +1,17 @@
 use crate::sql2::catalog::SurfaceRegistry;
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
-use crate::sql2::planner::canonicalize::{canonicalize_read, CanonicalizedRead};
+use crate::sql2::planner::canonicalize::{
+    canonicalize_read, canonicalize_write, CanonicalizedRead, CanonicalizedWrite,
+};
+use crate::sql2::planner::ir::{
+    PlannedWrite, ResolvedWritePlan, SchemaProof, ScopeProof, TargetSetProof, WriteCommand,
+};
 use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
 use crate::sql2::planner::semantics::effective_state_resolver::{
     build_effective_state, EffectiveStatePlan, EffectiveStateRequest,
 };
+use crate::sql2::planner::semantics::proof_engine::prove_write;
+use crate::sql2::planner::semantics::write_resolver::resolve_write_plan;
 use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::{LixBackend, Value};
 use sqlparser::ast::Statement;
@@ -16,6 +23,11 @@ pub(crate) struct Sql2DebugTrace {
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
+    pub(crate) write_command: Option<WriteCommand>,
+    pub(crate) scope_proof: Option<ScopeProof>,
+    pub(crate) schema_proof: Option<SchemaProof>,
+    pub(crate) target_set_proof: Option<TargetSetProof>,
+    pub(crate) resolved_write_plan: Option<ResolvedWritePlan>,
     pub(crate) lowered_sql: Vec<String>,
 }
 
@@ -25,6 +37,13 @@ pub(crate) struct Sql2PreparedRead {
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
+    pub(crate) debug_trace: Sql2DebugTrace,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Sql2PreparedWrite {
+    pub(crate) canonicalized: CanonicalizedWrite,
+    pub(crate) planned_write: PlannedWrite,
     pub(crate) debug_trace: Sql2DebugTrace,
 }
 
@@ -64,6 +83,11 @@ pub(crate) async fn prepare_sql2_read(
             dependency_spec: dependency_spec.clone(),
             effective_state_request: Some(effective_state_request.clone()),
             effective_state_plan: Some(effective_state_plan.clone()),
+            write_command: None,
+            scope_proof: None,
+            schema_proof: None,
+            target_set_proof: None,
+            resolved_write_plan: None,
             lowered_sql: Vec::new(),
         },
         dependency_spec,
@@ -73,9 +97,58 @@ pub(crate) async fn prepare_sql2_read(
     })
 }
 
+pub(crate) async fn prepare_sql2_write(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Option<Sql2PreparedWrite> {
+    if parsed_statements.len() != 1 {
+        return None;
+    }
+
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .ok()?;
+    let statement = parsed_statements[0].clone();
+    let bound_statement = BoundStatement::from_statement(
+        statement,
+        params.to_vec(),
+        ExecutionContext {
+            dialect: Some(backend.dialect()),
+            writer_key: writer_key.map(ToString::to_string),
+            requested_version_id: Some(active_version_id.to_string()),
+        },
+    );
+    let canonicalized = canonicalize_write(bound_statement.clone(), &registry).ok()?;
+    let mut planned_write = prove_write(&canonicalized).ok()?;
+    let resolved_write_plan = resolve_write_plan(&planned_write).ok()?;
+    planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
+
+    Some(Sql2PreparedWrite {
+        debug_trace: Sql2DebugTrace {
+            bound_statements: vec![bound_statement],
+            surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
+            dependency_spec: None,
+            effective_state_request: None,
+            effective_state_plan: None,
+            write_command: Some(canonicalized.write_command.clone()),
+            scope_proof: Some(planned_write.scope_proof.clone()),
+            schema_proof: Some(planned_write.schema_proof.clone()),
+            target_set_proof: planned_write.target_set_proof.clone(),
+            resolved_write_plan: Some(resolved_write_plan),
+            lowered_sql: Vec::new(),
+        },
+        planned_write,
+        canonicalized,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::prepare_sql2_read;
+    use super::{prepare_sql2_read, prepare_sql2_write};
+    use crate::sql2::planner::ir::{ScopeProof, WriteLane, WriteMode};
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
@@ -230,6 +303,94 @@ mod tests {
             &parse_one(
                 "SELECT entity_id FROM lix_state WHERE entity_id IN (SELECT entity_id FROM lix_state_by_version)",
             ),
+            &[],
+            "main",
+            None,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepares_state_by_version_inserts_into_planned_writes() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1'\
+                 )",
+            ),
+            &[],
+            "main",
+            Some("writer-a"),
+        )
+        .await
+        .expect("state insert should prepare through sql2");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_state_by_version"]
+        );
+        assert_eq!(
+            prepared.planned_write.scope_proof,
+            ScopeProof::SingleVersion("version-a".to_string())
+        );
+        assert_eq!(prepared.planned_write.command.mode, WriteMode::Tracked);
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .target_write_lane,
+            Some(WriteLane::SingleVersion("version-a".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepares_active_version_state_inserts_with_active_lane() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-1', 'lix_key_value', 'lix', 'lix', '{\"key\":\"hello\"}', '1'\
+                 )",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("active-version state insert should prepare through sql2");
+
+        assert_eq!(
+            prepared.planned_write.scope_proof,
+            ScopeProof::ActiveVersion
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .target_write_lane,
+            Some(WriteLane::ActiveVersion)
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_none_for_entity_writes_that_stay_on_legacy_path() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')"),
             &[],
             "main",
             None,
