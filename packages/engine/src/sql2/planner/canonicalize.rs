@@ -5,8 +5,9 @@ use crate::sql2::planner::ir::{
 };
 use sqlparser::ast::{
     Expr, GroupByExpr, LimitClause, ObjectNamePart, OrderBy, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor,
+    SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalizeError {
@@ -158,8 +159,58 @@ fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError>
             "sql2 day-1 canonicalizer requires a single surface scan without joins",
         ));
     }
+    if query_contains_nested_query_shape(query) {
+        return Err(CanonicalizeError::unsupported(
+            "sql2 day-1 canonicalizer does not support subqueries or derived tables",
+        ));
+    }
 
     Ok(select)
+}
+
+fn query_contains_nested_query_shape(query: &Query) -> bool {
+    struct Collector {
+        query_count: usize,
+        has_derived_tables: bool,
+        has_expression_subqueries: bool,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            self.query_count += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            if matches!(table_factor, TableFactor::Derived { .. }) {
+                self.has_derived_tables = true;
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(
+                expr,
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
+            ) {
+                self.has_expression_subqueries = true;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        query_count: 0,
+        has_derived_tables: false,
+        has_expression_subqueries: false,
+    };
+    let _ = query.visit(&mut collector);
+    collector.query_count > 1 || collector.has_derived_tables || collector.has_expression_subqueries
 }
 
 fn bind_single_surface(
@@ -433,6 +484,26 @@ mod tests {
             error
                 .message
                 .contains("requires a single surface scan without joins"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn rejects_nested_subqueries_for_day_one_shell() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let error = canonicalize_read(
+            bound_statement(
+                "SELECT entity_id FROM lix_state WHERE entity_id IN (SELECT entity_id FROM lix_state_by_version)",
+            ),
+            &registry,
+        )
+        .expect_err("subqueries should be rejected");
+
+        assert!(
+            error
+                .message
+                .contains("does not support subqueries or derived tables"),
             "unexpected error: {}",
             error.message
         );

@@ -24,6 +24,7 @@ mod schema;
 mod schema_registry;
 mod snapshot;
 pub(crate) mod sql2;
+pub(crate) mod sql_shared;
 mod state_commit_stream;
 mod types;
 mod validation;
