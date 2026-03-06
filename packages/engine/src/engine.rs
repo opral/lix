@@ -233,7 +233,7 @@ impl Drop for EngineTransaction<'_> {
     }
 }
 
-struct TransactionBackendAdapter<'a> {
+pub(crate) struct TransactionBackendAdapter<'a> {
     dialect: crate::SqlDialect,
     transaction: Mutex<*mut (dyn LixTransaction + 'a)>,
     _lifetime: PhantomData<&'a ()>,
@@ -330,7 +330,7 @@ unsafe impl<'a> Send for TransactionBackendAdapter<'a> {}
 unsafe impl<'a> Sync for TransactionBackendAdapter<'a> {}
 
 impl<'a> TransactionBackendAdapter<'a> {
-    fn new(transaction: &'a mut dyn LixTransaction) -> Self {
+    pub(crate) fn new(transaction: &'a mut dyn LixTransaction) -> Self {
         Self {
             dialect: transaction.dialect(),
             transaction: Mutex::new(transaction as *mut (dyn LixTransaction + 'a)),

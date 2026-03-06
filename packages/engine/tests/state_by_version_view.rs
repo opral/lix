@@ -36,12 +36,32 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 }
 
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+    register_stored_schema_snapshot(
+        engine,
+        "{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}",
+    )
+    .await;
+}
+
+async fn register_immutable_schema(engine: &support::simulation_test::SimulationEngine) {
+    register_stored_schema_snapshot(
+        engine,
+        "{\"value\":{\"x-lix-key\":\"immutable_state_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}",
+    )
+    .await;
+}
+
+async fn register_stored_schema_snapshot(
+    engine: &support::simulation_test::SimulationEngine,
+    snapshot_content: &str,
+) {
     engine
         .execute(
             "INSERT INTO lix_internal_state_vtable (schema_key, snapshot_content) VALUES (\
-             'lix_stored_schema',\
-             '{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}'\
-             )", &[])
+             'lix_stored_schema', $1\
+             )",
+            &[Value::Text(snapshot_content.to_string())],
+        )
         .await
         .unwrap();
 }
@@ -63,18 +83,69 @@ async fn insert_state_row(
     version_id: &str,
     snapshot_content: &str,
 ) {
+    insert_state_row_for_schema(
+        engine,
+        entity_id,
+        "test_state_schema",
+        version_id,
+        snapshot_content,
+    )
+    .await;
+}
+
+async fn insert_state_row_for_schema(
+    engine: &support::simulation_test::SimulationEngine,
+    entity_id: &str,
+    schema_key: &str,
+    version_id: &str,
+    snapshot_content: &str,
+) {
     let sql = format!(
         "INSERT INTO lix_internal_state_vtable (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{entity_id}', 'test_state_schema', 'test-file', '{version_id}', 'lix', '{snapshot_content}', '1'\
+         '{entity_id}', '{schema_key}', 'test-file', '{version_id}', 'lix', '{snapshot_content}', '1'\
          )",
         entity_id = entity_id,
+        schema_key = schema_key,
         version_id = version_id,
         snapshot_content = snapshot_content.replace('\'', "''"),
     );
     engine.execute(&sql, &[]).await.unwrap();
 }
+
+simulation_test!(
+    lix_state_by_version_insert_rejects_invalid_snapshot_content,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-invalid', 'test_state_schema', 'test-file', 'version-a', 'lix', '{\"value\":1}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("invalid snapshot_content should fail on sql2 insert");
+
+        assert!(
+            err.description
+                .contains("snapshot_content does not match schema 'test_state_schema' (1)"),
+            "unexpected error: {}",
+            err.description
+        );
+    }
+);
 
 simulation_test!(
     lix_state_by_version_select_exposes_commit_id,
@@ -671,6 +742,48 @@ simulation_test!(
         assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"A-updated\"}");
         assert_text(&rows.statements[0].rows[1][0], "version-b");
         assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"B\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_update_rejects_immutable_schema,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_immutable_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row_for_schema(
+            &engine,
+            "entity-upd-immutable",
+            "immutable_state_schema",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+
+        let err = engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'immutable_state_schema' \
+                   AND entity_id = 'entity-upd-immutable' \
+                   AND file_id = 'test-file' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .expect_err("immutable schema update should fail on sql2 path");
+
+        assert!(
+            err.description
+                .contains("Schema 'immutable_state_schema' is immutable and cannot be updated."),
+            "unexpected error: {}",
+            err.description
+        );
     }
 );
 

@@ -13,6 +13,7 @@ use crate::schema::{
     schema_from_stored_snapshot, validate_lix_schema_definition, OverlaySchemaProvider, SchemaKey,
     SchemaProvider, SqlStoredSchemaProvider,
 };
+use crate::sql2::planner::ir::{PlannedStateRow, PlannedWrite, WriteOperationKind};
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -137,6 +138,59 @@ pub async fn validate_updates(
     Ok(())
 }
 
+pub(crate) async fn validate_sql2_batch_local_write(
+    backend: &dyn LixBackend,
+    cache: &SchemaCache,
+    planned_write: &PlannedWrite,
+) -> Result<(), LixError> {
+    validate_sql2_write(backend, cache, planned_write).await
+}
+
+pub(crate) async fn validate_sql2_append_time_write(
+    backend: &dyn LixBackend,
+    cache: &SchemaCache,
+    planned_write: &PlannedWrite,
+) -> Result<(), LixError> {
+    validate_sql2_write(backend, cache, planned_write).await
+}
+
+async fn validate_sql2_write(
+    backend: &dyn LixBackend,
+    cache: &SchemaCache,
+    planned_write: &PlannedWrite,
+) -> Result<(), LixError> {
+    let resolved = planned_write
+        .resolved_write_plan
+        .as_ref()
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "sql2 validation requires a resolved write plan".to_string(),
+        })?;
+    let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+
+    if planned_write.command.operation_kind == WriteOperationKind::Update {
+        for row in &resolved.intended_post_state {
+            if row.tombstone {
+                continue;
+            }
+            validate_sql2_update_is_mutable(&mut schema_provider, row).await?;
+        }
+    }
+
+    for row in &resolved.intended_post_state {
+        validate_sql2_planned_row(
+            backend,
+            &mut schema_provider,
+            cache,
+            planned_write.command.operation_kind,
+            row,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
     provider: &mut P,
     cache: &SchemaCache,
@@ -174,37 +228,71 @@ async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
     Ok(())
 }
 
-async fn validate_filesystem_insert_integrity(
-    backend: &dyn LixBackend,
-    row: &MutationRow,
-    snapshot: &JsonValue,
+async fn validate_sql2_update_is_mutable(
+    provider: &mut OverlaySchemaProvider<'_>,
+    row: &PlannedStateRow,
 ) -> Result<(), LixError> {
-    if row.schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
-        return Ok(());
-    }
+    let key = SchemaKey::new(
+        row.schema_key.clone(),
+        planned_row_required_text(row, "schema_version")?,
+    );
+    let schema = provider.load_schema(&key).await?;
 
-    let blob_hash = snapshot
-        .get("blob_hash")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "lix_binary_blob_ref integrity violation: snapshot_content missing blob_hash"
-                    .to_string(),
-        })?;
-
-    if !binary_cas_blob_exists(backend, blob_hash).await? {
+    if schema.get("x-lix-immutable").and_then(|v| v.as_bool()) == Some(true) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "lix_binary_blob_ref integrity violation: blob_hash '{}' is missing from binary CAS",
-                blob_hash
+                "Schema '{}' is immutable and cannot be updated.",
+                row.schema_key
             ),
         });
     }
 
     Ok(())
+}
+
+async fn validate_sql2_planned_row(
+    backend: &dyn LixBackend,
+    provider: &mut OverlaySchemaProvider<'_>,
+    cache: &SchemaCache,
+    operation_kind: WriteOperationKind,
+    row: &PlannedStateRow,
+) -> Result<(), LixError> {
+    if row.tombstone {
+        return Ok(());
+    }
+
+    let Some(snapshot) = planned_row_snapshot(row)? else {
+        return Ok(());
+    };
+
+    if row.schema_key == STORED_SCHEMA_KEY {
+        validate_stored_schema_snapshot(provider, &snapshot).await?;
+        let (key, schema) = schema_from_stored_snapshot(&snapshot)?;
+        provider.remember_pending_schema(key, schema);
+        return Ok(());
+    }
+
+    let key = SchemaKey::new(
+        row.schema_key.clone(),
+        planned_row_required_text(row, "schema_version")?,
+    );
+    validate_snapshot_content(provider, cache, &key, &snapshot).await?;
+    validate_entity_id_matches_primary_key(provider, &key, &row.entity_id, &snapshot).await?;
+
+    if operation_kind == WriteOperationKind::Insert {
+        validate_filesystem_snapshot_integrity(backend, &row.schema_key, &snapshot).await?;
+    }
+
+    Ok(())
+}
+
+async fn validate_filesystem_insert_integrity(
+    backend: &dyn LixBackend,
+    row: &MutationRow,
+    snapshot: &JsonValue,
+) -> Result<(), LixError> {
+    validate_filesystem_snapshot_integrity(backend, &row.schema_key, snapshot).await
 }
 
 async fn binary_cas_blob_exists(
@@ -238,6 +326,39 @@ async fn validate_stored_schema_snapshot<P: SchemaProvider + ?Sized>(
     let schema_value = extract_stored_schema_value(snapshot)?;
     validate_lix_schema_definition(schema_value)?;
     validate_foreign_key_reference_targets(provider, schema_value).await?;
+    Ok(())
+}
+
+async fn validate_filesystem_snapshot_integrity(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+    snapshot: &JsonValue,
+) -> Result<(), LixError> {
+    if schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
+        return Ok(());
+    }
+
+    let blob_hash = snapshot
+        .get("blob_hash")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "lix_binary_blob_ref integrity violation: snapshot_content missing blob_hash"
+                    .to_string(),
+        })?;
+
+    if !binary_cas_blob_exists(backend, blob_hash).await? {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "lix_binary_blob_ref integrity violation: blob_hash '{}' is missing from binary CAS",
+                blob_hash
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -385,6 +506,52 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("expected text value for {name}"),
         }),
+    }
+}
+
+fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String, LixError> {
+    row.values
+        .get(name)
+        .and_then(planned_row_text_value)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("sql2 validation requires text-compatible '{name}'"),
+        })
+}
+
+fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixError> {
+    let Some(value) = row.values.get("snapshot_content") else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => serde_json::from_str::<JsonValue>(text)
+            .map(Some)
+            .map_err(|err| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "snapshot_content for schema '{}' is not valid JSON during sql2 validation: {err}",
+                    row.schema_key
+                ),
+            }),
+        other => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "snapshot_content for schema '{}' must be text or null during sql2 validation, got {other:?}",
+                row.schema_key
+            ),
+        }),
+    }
+}
+
+fn planned_row_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.clone()),
+        Value::Integer(value) => Some(value.to_string()),
+        Value::Boolean(value) => Some(value.to_string()),
+        Value::Real(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 

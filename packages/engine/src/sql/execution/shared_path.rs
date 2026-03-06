@@ -5,7 +5,7 @@ use crate::commit::{
     AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
 };
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::engine::Engine;
+use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
@@ -14,7 +14,10 @@ use crate::sql2::runtime::{
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, StateCommitStreamOperation,
 };
-use crate::validation::{validate_inserts, validate_updates};
+use crate::validation::{
+    validate_inserts, validate_sql2_append_time_write, validate_sql2_batch_local_write,
+    validate_updates,
+};
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
 use super::super::contracts::execution_plan::ExecutionPlan;
@@ -123,6 +126,10 @@ pub(crate) async fn prepare_execution_with_backend(
         )
         .await?;
     }
+    if let Some(sql2_write) = sql2_write.as_ref() {
+        validate_sql2_batch_local_write(backend, &engine.schema_cache, &sql2_write.planned_write)
+            .await?;
+    }
 
     Ok(PreparedExecutionContext {
         intent,
@@ -199,6 +206,17 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         {
             transaction.execute(&statement, &[]).await?;
         }
+    }
+
+    {
+        let validation_backend = TransactionBackendAdapter::new(transaction);
+        let validation_cache = crate::validation::SchemaCache::new();
+        validate_sql2_append_time_write(
+            &validation_backend,
+            &validation_cache,
+            &sql2_write.planned_write,
+        )
+        .await?;
     }
 
     if domain_change_batch.changes.is_empty() {
