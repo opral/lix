@@ -8,8 +8,8 @@ mod types;
 #[allow(unused_imports)]
 pub(crate) use append_commit::{
     append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
-    AppendCommitError, AppendCommitErrorKind, AppendCommitPreconditions, AppendCommitResult,
-    AppendExpectedTip, AppendWriteLane,
+    AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
+    AppendCommitPreconditions, AppendCommitResult, AppendExpectedTip, AppendWriteLane,
 };
 pub use generate_commit::generate_commit;
 pub(crate) use runtime::{

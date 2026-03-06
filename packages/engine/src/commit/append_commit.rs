@@ -75,10 +75,19 @@ pub(crate) struct AppendCommitError {
     pub(crate) message: String,
 }
 
+#[async_trait(?Send)]
+pub(crate) trait AppendCommitInvariantChecker {
+    async fn recheck_invariants(
+        &mut self,
+        transaction: &mut dyn LixTransaction,
+    ) -> Result<(), AppendCommitError>;
+}
+
 pub(crate) async fn append_commit_if_preconditions_hold(
     transaction: &mut dyn LixTransaction,
     args: AppendCommitArgs,
     functions: &mut dyn LixFunctionProvider,
+    invariant_checker: Option<&mut dyn AppendCommitInvariantChecker>,
 ) -> Result<AppendCommitResult, AppendCommitError> {
     if args.changes.is_empty() {
         return Err(AppendCommitError {
@@ -90,14 +99,19 @@ pub(crate) async fn append_commit_if_preconditions_hold(
     let concrete_lane = concrete_lane(&args.preconditions)?;
     validate_change_versions(&args.changes, &concrete_lane)?;
 
-    let mut executor = TransactionCommitExecutor { transaction };
-    let current_tip = load_current_tip_commit_id(&mut executor, &concrete_lane).await?;
-    let existing_replay = load_existing_idempotency_commit_id(
-        &mut executor,
-        &concrete_lane,
-        &args.preconditions.idempotency_key,
-    )
-    .await?;
+    let current_tip = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        load_current_tip_commit_id(&mut executor, &concrete_lane).await?
+    };
+    let existing_replay = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        load_existing_idempotency_commit_id(
+            &mut executor,
+            &concrete_lane,
+            &args.preconditions.idempotency_key,
+        )
+        .await?
+    };
 
     match (&args.preconditions.expected_tip, current_tip.as_deref()) {
         (AppendExpectedTip::CommitId(expected), Some(current)) if current != expected => {
@@ -152,17 +166,27 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         });
     }
 
+    if let Some(invariant_checker) = invariant_checker {
+        invariant_checker.recheck_invariants(transaction).await?;
+    }
+
     let domain_changes = materialize_domain_changes(&args.timestamp, &args.changes, functions)?;
     let affected_versions = domain_changes
         .iter()
         .map(|change| change.version_id.clone())
         .collect::<BTreeSet<_>>();
-    let versions = load_version_info_for_versions(&mut executor, &affected_versions)
-        .await
-        .map_err(backend_error)?;
-    let active_accounts = load_commit_active_accounts(&mut executor, &domain_changes)
-        .await
-        .map_err(backend_error)?;
+    let versions = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        load_version_info_for_versions(&mut executor, &affected_versions)
+            .await
+            .map_err(backend_error)?
+    };
+    let active_accounts = {
+        let mut executor = TransactionCommitExecutor { transaction };
+        load_commit_active_accounts(&mut executor, &domain_changes)
+            .await
+            .map_err(backend_error)?
+    };
     let commit_result = generate_commit(
         GenerateCommitArgs {
             timestamp: args.timestamp.clone(),
@@ -439,7 +463,8 @@ fn escape_sql_string(value: &str) -> String {
 mod tests {
     use super::{
         append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
-        AppendCommitErrorKind, AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
+        AppendCommitError, AppendCommitErrorKind, AppendCommitInvariantChecker,
+        AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
     };
     use crate::functions::LixFunctionProvider;
     use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
@@ -573,6 +598,26 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingInvariantChecker {
+        calls: usize,
+        failure: Option<AppendCommitError>,
+    }
+
+    #[async_trait(?Send)]
+    impl AppendCommitInvariantChecker for RecordingInvariantChecker {
+        async fn recheck_invariants(
+            &mut self,
+            _transaction: &mut dyn LixTransaction,
+        ) -> Result<(), AppendCommitError> {
+            self.calls += 1;
+            if let Some(error) = self.failure.clone() {
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn applies_commit_when_tip_matches_expected() {
         let mut transaction = FakeTransaction::default();
@@ -580,6 +625,7 @@ mod tests {
             .version_tips
             .insert("version-a".to_string(), "commit-123".to_string());
         let mut functions = CountingFunctionProvider::default();
+        let mut checker = RecordingInvariantChecker::default();
 
         let result = append_commit_if_preconditions_hold(
             &mut transaction,
@@ -593,12 +639,14 @@ mod tests {
                 },
             },
             &mut functions,
+            Some(&mut checker),
         )
         .await
         .expect("append should succeed");
 
         assert_eq!(result.disposition, AppendCommitDisposition::Applied);
         assert!(result.commit_result.is_some());
+        assert_eq!(checker.calls, 1);
         assert!(
             transaction
                 .executed_sql
@@ -619,6 +667,7 @@ mod tests {
             "commit-456".to_string(),
         );
         let mut functions = CountingFunctionProvider::default();
+        let mut checker = RecordingInvariantChecker::default();
 
         let result = append_commit_if_preconditions_hold(
             &mut transaction,
@@ -632,6 +681,7 @@ mod tests {
                 },
             },
             &mut functions,
+            Some(&mut checker),
         )
         .await
         .expect("replay should succeed");
@@ -639,6 +689,7 @@ mod tests {
         assert_eq!(result.disposition, AppendCommitDisposition::Replay);
         assert_eq!(result.committed_tip, "commit-456");
         assert!(result.commit_result.is_none());
+        assert_eq!(checker.calls, 0);
     }
 
     #[tokio::test]
@@ -648,6 +699,7 @@ mod tests {
             .version_tips
             .insert("version-a".to_string(), "commit-456".to_string());
         let mut functions = CountingFunctionProvider::default();
+        let mut checker = RecordingInvariantChecker::default();
 
         let error = append_commit_if_preconditions_hold(
             &mut transaction,
@@ -661,11 +713,13 @@ mod tests {
                 },
             },
             &mut functions,
+            Some(&mut checker),
         )
         .await
         .expect_err("tip drift should fail");
 
         assert_eq!(error.kind, AppendCommitErrorKind::TipDrift);
+        assert_eq!(checker.calls, 0);
     }
 
     #[tokio::test]
@@ -685,6 +739,7 @@ mod tests {
                 },
             },
             &mut functions,
+            None,
         )
         .await
         .expect_err("missing lane should fail");
@@ -709,6 +764,7 @@ mod tests {
                 },
             },
             &mut functions,
+            None,
         )
         .await
         .expect("create-if-missing should succeed");
@@ -733,11 +789,55 @@ mod tests {
                 },
             },
             &mut functions,
+            None,
         )
         .await
         .expect_err("global admin should stay unsupported in v1");
 
         assert_eq!(error.kind, AppendCommitErrorKind::UnsupportedWriteLane);
+    }
+
+    #[tokio::test]
+    async fn invariant_recheck_failure_aborts_append_before_commit_generation() {
+        let mut transaction = FakeTransaction::default();
+        transaction
+            .version_tips
+            .insert("version-a".to_string(), "commit-123".to_string());
+        let mut functions = CountingFunctionProvider::default();
+        let mut checker = RecordingInvariantChecker {
+            calls: 0,
+            failure: Some(AppendCommitError {
+                kind: AppendCommitErrorKind::Internal,
+                message: "append invariant failed".to_string(),
+            }),
+        };
+
+        let error = append_commit_if_preconditions_hold(
+            &mut transaction,
+            AppendCommitArgs {
+                timestamp: "2026-03-06T14:22:00.000Z".to_string(),
+                changes: vec![sample_change()],
+                preconditions: AppendCommitPreconditions {
+                    write_lane: AppendWriteLane::Version("version-a".to_string()),
+                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
+                    idempotency_key: "idem-1".to_string(),
+                },
+            },
+            &mut functions,
+            Some(&mut checker),
+        )
+        .await
+        .expect_err("append invariant failure should abort");
+
+        assert_eq!(checker.calls, 1);
+        assert_eq!(error.message, "append invariant failed");
+        assert!(
+            !transaction
+                .executed_sql
+                .iter()
+                .any(|sql| sql.starts_with("INSERT INTO lix_internal_commit_idempotency ")),
+            "append should abort before persisting idempotency state"
+        );
     }
 
     fn extract_single_quoted_value(sql: &str, prefix: &str) -> Option<String> {
