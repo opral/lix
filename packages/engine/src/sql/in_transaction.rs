@@ -41,27 +41,37 @@ impl Engine {
             .await?
         };
 
-        let execution = match run::execute_plan_sql_with_transaction(
+        let execution = match shared_path::maybe_execute_sql2_write_with_transaction(
             transaction,
-            &prepared.plan,
-            &prepared.intent.detected_file_domain_changes,
-            prepared.plan.requirements.should_refresh_file_cache,
-            &prepared.functions,
+            &prepared,
             writer_key,
         )
         .await
-        .map_err(LixError::from)
         {
-            Ok(execution) => execution,
-            Err(error) => {
-                let backend = TransactionBackendAdapter::new(transaction);
-                return Err(normalize_sql_execution_error_with_backend(
-                    &backend,
-                    error,
-                    &parsed_statements,
-                )
-                .await);
-            }
+            Ok(Some(execution)) => execution,
+            Ok(None) => match run::execute_plan_sql_with_transaction(
+                transaction,
+                &prepared.plan,
+                &prepared.intent.detected_file_domain_changes,
+                prepared.plan.requirements.should_refresh_file_cache,
+                &prepared.functions,
+                writer_key,
+            )
+            .await
+            .map_err(LixError::from)
+            {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let backend = TransactionBackendAdapter::new(transaction);
+                    return Err(normalize_sql_execution_error_with_backend(
+                        &backend,
+                        error,
+                        &parsed_statements,
+                    )
+                    .await);
+                }
+            },
+            Err(error) => return Err(error),
         };
 
         if let Some(version_id) = &prepared.plan.effects.next_active_version_id {

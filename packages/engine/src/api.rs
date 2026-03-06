@@ -204,27 +204,34 @@ impl Engine {
         )
         .await?;
 
-        let execution = match run::execute_plan_sql(
-            self,
-            &prepared.plan,
-            &prepared.intent.detected_file_domain_changes,
-            prepared.plan.requirements.should_refresh_file_cache,
-            &prepared.functions,
-            writer_key,
-        )
-        .await
-        .map_err(LixError::from)
-        {
-            Ok(execution) => execution,
-            Err(error) => {
-                return Err(normalize_sql_execution_error_with_backend(
-                    self.backend.as_ref(),
-                    error,
-                    &parsed_statements,
+        let execution =
+            match shared_path::maybe_execute_sql2_write_with_backend(self, &prepared, writer_key)
+                .await
+            {
+                Ok(Some(execution)) => execution,
+                Ok(None) => match run::execute_plan_sql(
+                    self,
+                    &prepared.plan,
+                    &prepared.intent.detected_file_domain_changes,
+                    prepared.plan.requirements.should_refresh_file_cache,
+                    &prepared.functions,
+                    writer_key,
                 )
-                .await)
-            }
-        };
+                .await
+                .map_err(LixError::from)
+                {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        return Err(normalize_sql_execution_error_with_backend(
+                            self.backend.as_ref(),
+                            error,
+                            &parsed_statements,
+                        )
+                        .await)
+                    }
+                },
+                Err(error) => return Err(error),
+            };
 
         run::persist_runtime_sequence(
             self,

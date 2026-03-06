@@ -401,6 +401,50 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_by_version_insert_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'entity-ins-idem', 'test_state_schema', 'test-file', 'version-a', 'lix', '1', '{\"value\":\"inserted\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "version:version-a");
+        match &rows.statements[0].rows[0][1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
+    }
+);
+
+simulation_test!(
     lix_state_by_version_insert_supports_placeholders,
     |sim| async move {
         let engine = sim
