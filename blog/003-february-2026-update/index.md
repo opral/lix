@@ -35,7 +35,7 @@ v0.5 and below could not optimize beyond what the vtable API of the database pro
 Lix now intercepts and rewrites queries before they hit SQLite, batching what used to be per-row vtable callbacks into single bulk operations. For more information read [RFC 001](https://lix.dev/rfc/001-preprocess-writes).
 
 
-```mermaid
+```plain
          v0.5                           next
         ──────                          ────
        ┌───────┐                     ┌───────┐
