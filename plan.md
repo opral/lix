@@ -1,200 +1,1587 @@
-# Canonical `lix_file` Payload Redesign
+# Engine Semantic Rewrite Plan
 
-## Summary
+## Objective
 
-- No backward compatibility constraints.
-- Make tracked payload state authoritative.
-- `lix_file.data` becomes a pure projection of tracked payload state.
-- The filesystem becomes binary-file-first and plugin-free.
-- Remove filesystem cache/index tables from the live read/write path.
-- Scope this plan to live filesystem reads and writes only.
-- Leave `lix_file_history` and `lix_file_history_by_version` untouched and out of scope.
+Rebuild `packages/engine` around one coherent semantic architecture that is explicit about:
 
-## Canonical Model
+- logical query meaning
+- effective-state resolution
+- write legality
+- authoritative invariant checking
+- commit generation
+- projections and materialization
 
-- A file is the composition of tracked descriptor state in `lix_file_descriptor`, tracked payload-pointer state in `lix_binary_blob_ref`, and CAS storage keyed by `blob_hash`.
-- `lix_file` and `lix_file_by_version` are read-only projections over descriptor state plus payload-pointer state.
-- Live reads resolve bytes from tracked `lix_binary_blob_ref` plus CAS only.
-- `lix_internal_file_data_cache` and `lix_internal_binary_file_version_ref` are removed from the filesystem design.
+Reasoning:
 
-## Public Contract
+The current engine still spreads the same semantics across AST rewrites, vtable lowering, followup reconstruction, validation queries, and effect detection. That creates semantic drift, makes concurrency bugs hard to reason about, and forces behavior to be inferred from SQL shape instead of from explicit domain meaning.
 
-- `INSERT/UPDATE/DELETE lix_file*` must lower into a typed file-mutation intent before execution.
-- `data` is a first-class write input, not a column that gets stripped during rewrite.
-- `SELECT data FROM lix_file*` reads directly from tracked payload pointers plus CAS.
-- Read-after-write must be correct in single-statement execution, multi-statement execution, explicit transaction execution, and script execution.
+## Scope
 
-## Out Of Scope
+- This is an intentionally breaking rewrite.
+- Backward compatibility with the current internal pipeline is not a goal.
+- Obsolete tests should be deleted, not adapted.
+- The public SQL entrypoint remains the vtable/public-surface layer.
+- Optimization must not bypass the public surface model by teaching callers to hit storage tables directly.
 
-- `lix_file_history`
-- `lix_file_history_by_version`
-- history-specific materialization or cleanup
-- any non-filesystem semantic extraction built on top of file bytes
+Reasoning:
+The engine should keep one public contract and one internal implementation model. Preserving old rewrite boundaries would only lock in the current drift.
 
-## Source Of Truth
+## Architectural Thesis
 
-- Tracked descriptor shape remains in `lix_file_descriptor`.
-- Tracked payload shape remains in `lix_binary_blob_ref`.
-- CAS bytes are addressed by `blob_hash`.
-- Filesystem reads resolve from tracked payload state plus CAS.
-- The filesystem layer does not invoke plugins on reads or writes.
+The engine should have:
 
-## Execution Model
+1. one canonical semantic model before backend-specific lowering
+   Why: core semantics should be decided once before SQL is emitted, but day 1 does not require a fully general optimizer IR.
+2. one shared effective-state resolver used by both reads and writes
+   Why: visibility, overlay, tombstone, and winner semantics must exist exactly once.
+3. one authoritative tracked write boundary based on domain changes, not materialized rows
+   Why: in an event-sourced system, the commit/event batch is the write truth and projections are derived outputs.
+4. one conservative proof engine for the scope, schema, and any target bounds the live path actually needs
+   Why: legality and pushdown should come from the same semantic facts, but unsafe inference must fail closed.
+5. one explicit concurrency/precondition model for tracked writes
+   Why: bounded scope alone does not prevent races or stale writes.
 
-1. Parse SQL into AST statements.
-2. Lower `lix_file*` mutations into `FileMutationIntent`.
-3. Resolve exact target scope and file ids before execution.
-4. Persist new blobs into CAS for authoritative payload writes.
-5. Persist tracked `lix_binary_blob_ref` mutations.
-6. Persist tracked `lix_file_descriptor` mutations.
+## Non-Goals
 
-## `FileMutationIntent`
+- Do not build a general cost-based optimizer in the first rewrite.
+- Do not preserve the old multi-pass SQL rewrite engine as the main path.
+- Do not use read models or materialized state as the authority for tracked write decisions.
+- Do not infer cache invalidation or semantic effects from emitted SQL text.
 
-- `file_id`
-- `version_id`
-- `before_path`
-- `after_path`
-- `descriptor_patch`
-- `payload`
-- `writer_key`
+Reasoning:
+The first rewrite should simplify and harden the engine. A small rule-based planner with strong semantics is better than a large optimizer that reintroduces hidden complexity.
 
-`payload` should be one of:
+## Hard Rules
 
-- `Unchanged`
-- `Set(bytes)`
-- `Delete`
+1. After binding and surface resolution, no phase may infer core semantics by scanning SQL text.
+2. Proofs are conservative. If the proof engine cannot prove a property, it must return `Unknown` or `Unbounded`.
+3. Tracked writes decide domain changes from authoritative pre-state, not from followup `RETURNING` rows.
+4. Materialized tables and read models are outputs, never the source of truth for tracked semantics.
+5. Every tracked write carries explicit `CommitPreconditions`.
+6. Side effects, cache invalidation, and notifications derive from semantic effects, not SQL inspection.
+7. All new SQL rewrite code lives under `src/sql2/` and must not depend on legacy rewrite, followup, classifier, or planning modules in `src/sql/`.
+8. Shared parser, binder, AST, lowering, catalog, and contract primitives should only be extracted when `sql2` actually needs them.
+9. If shared SQL primitives need to serve both paths during migration, move them into a neutral shared module instead of forcing an upfront `sql2` re-home.
+10. `src/sql/` is frozen as a legacy reference during migration; a fully self-sufficient `sql2/` tree is an end state, not a phase-1 prerequisite.
 
-This intent must be produced once and then reused by:
+Reasoning:
+These rules directly eliminate the classes of drift visible today in AST-shape checks, followup reconstruction, validation re-queries, and post-hoc effect detection.
 
-- SQL rewrite/planning
-- live filesystem write execution
+## Target Execution Model
 
-## Required Architectural Changes
+### Day-1 activation slice
 
-### Reads
+The first live cut of the new planner only needs this authority chain:
 
-- Rewrite `lix_file*` reads to join descriptor rows to tracked `lix_binary_blob_ref` rows first.
-- Resolve bytes from CAS directly from the tracked `blob_hash`.
-- Make missing blob hashes a hard integrity error.
-- Remove all plugin involvement from the normal filesystem read path.
-- Remove filesystem cache/index reads entirely.
+1. `SurfaceBinding`
+2. canonical state-backed scan or `WriteCommand`
+3. `EffectiveStateResolver`
+4. `ResolvedWritePlan`
+5. `DomainChangeBatch`
+6. `CommitPreconditions`
+7. `append_commit_if_preconditions_hold(...)`
+8. lowered SQL and derived projection updates plus materialization
 
-### Writes
+Reasoning:
+This is the smallest slice that makes the new architecture real. It fixes the event-sourced authority problem first and lets larger read-planner abstractions grow later without keeping the old write path alive.
 
-- Stop stripping `data` from `INSERT lix_file`.
-- Stop stripping `data` from `UPDATE lix_file`.
-- Stop turning data-only file updates into noop SQL plus follow-up side effects.
-- Lower every file mutation through the same typed intent path in all execution modes.
-- Persist tracked payload changes in the same transaction as descriptor changes.
-- Remove filesystem cache/index writes entirely.
+### Read path
 
-### Filesystem Scope
+1. Parse SQL into AST.
+2. Bind parameters into a typed `BoundStatement`.
+3. Resolve public surfaces into `SurfaceBinding`s.
+4. Lower into a canonical semantic scan/command form.
+5. Attach semantic facts and conservative proofs.
+6. Resolve effective state through a shared resolver.
+7. Perform rule-based pushdown where proven safe.
+8. Lower to backend SQL.
+9. Execute.
+10. Derive read dependencies and cache metadata from the semantic plan.
 
-- The filesystem layer has no plugin hooks.
-- Filesystem writes do not invoke `detectChanges`.
-- Filesystem reads do not invoke `applyChanges`.
-- Any higher-level semantic extraction must live outside the filesystem contract.
+Reasoning:
+Reads need one canonical semantic form before lowering. A broader logical IR can grow later, but the first cut only needs enough structure to share effective-state semantics and preserve residual filtering correctly.
 
-### Cache Removal
+### Tracked write path
 
-- Delete `lix_internal_binary_file_version_ref` from the live filesystem architecture.
-- Delete `lix_internal_file_data_cache` from the live filesystem architecture.
-- Remove any planner or side-effect logic that relies on those tables.
-- Ensure the only live payload lookup path is tracked `lix_binary_blob_ref` plus CAS.
+1. Parse, bind, and resolve surfaces.
+2. Build a `WriteCommand` that describes the target surface, mutation kind, selector, payload, mode, and execution context.
+3. Prove scope, schema, and any required target bounds conservatively.
+4. Resolve authoritative pre-state through the same effective-state resolver used by reads.
+5. Build a `DomainChangeBatch` plus `CommitPreconditions`.
+6. Run pure batch-local invariant validation on that batch.
+7. Append/generate the commit from the proven batch, re-checking current-state-dependent invariants inside the append transaction.
+8. Project derived surfaces and materialize persisted read models from the committed domain changes.
+9. Emit semantic effects, invalidations, and notifications.
 
-## Code To Delete
+Reasoning:
+This order matches event-sourced best practice. The authoritative write artifact is the domain change batch plus its preconditions, not a patchwork of materialized-row updates that are converted back into changes later.
 
-- `strip_file_data_from_insert`
-- data-stripping/noop rewrite behavior for `UPDATE lix_file`
-- `pending_file_writes` as a correctness path
-- read-time `materialize_missing_file_data_with_plugins(...)` for normal `lix_file*` reads
-- filesystem-triggered `detectChanges` and `applyChanges` integration
-- `lix_internal_file_data_cache` reads/writes in the live filesystem path
-- `lix_internal_binary_file_version_ref` reads/writes in the live filesystem path
-- duplicate statement-rewrite/coalescing paths that special-case `lix_file` separately from the canonical pipeline
+### Untracked write path
 
-## Implementation Phases
+1. Reuse the same `SurfaceBinding`, `WriteCommand`, proof types, and `ResolvedWritePlan` as tracked writes.
+2. Diverge only after semantic write resolution.
+3. Skip `DomainChangeBatch`, `CommitPreconditions`, and commit append.
+4. Lower the resolved untracked write directly to backend SQL.
+5. Still derive semantic effects from the resolved write plan, not from SQL text.
 
-### Phase 1: Remove Plugins And Caches From Live Filesystem
+Reasoning:
+Untracked writes do not need the full event-sourced pipeline, but they must still share the same semantic write path up to `ResolvedWritePlan`. Otherwise the engine will drift back into tracked and untracked write systems with different legality and targeting behavior.
 
-- Remove filesystem-triggered `detectChanges`.
-- Remove filesystem-triggered `applyChanges`.
-- Remove `lix_internal_file_data_cache` and `lix_internal_binary_file_version_ref` from live read/write logic.
-- Add guardrails that forbid plugin hooks and cache-table dependencies in live filesystem code.
+## Core Semantic Model
 
-### Phase 2: Canonical Intent
+### 1. Bound statement
 
-- Introduce `FileMutationIntent` and build it directly from parsed statements plus params.
-- Make planning and live filesystem execution consume that intent instead of reparsing or prefetching through `lix_file`.
-- Add guardrails that forbid data-stripping/noop fallback for file writes.
+Introduce a typed bound representation:
 
-### Phase 3: Canonical Read Path
+- `BoundStatement`
+  - statement kind
+  - bound parameters
+  - normalized scalar literals
+  - execution context
 
-- Rewrite `lix_file` and `lix_file_by_version` to source payload pointers from tracked `lix_binary_blob_ref`.
-- Read bytes from CAS directly.
-- Make CAS lookup the only live payload read path.
+Reasoning:
+The binder should be the last phase that knows about placeholders and raw surface syntax. Later phases should consume normalized values, not parameter positions.
 
-### Phase 4: Canonical Write Path
+### 1a. `sql2` core modules
 
-- Lower `INSERT/UPDATE/DELETE lix_file*` into descriptor mutations plus payload-pointer mutations.
-- Persist CAS blobs and tracked `lix_binary_blob_ref` rows in the same transaction.
-- Preserve statement barriers so multi-statement scripts observe prior file writes immediately.
+Before the rewrite goes deep, introduce the `sql2` modules the new planner actually owns directly:
 
-### Phase 5: Cleanup
+- `src/sql2/core/`
+  - parser entrypoints
+  - AST utilities
+  - placeholder binding
+  - generic logical-function parsing/lowering
+  - shared contracts that are not rewrite-engine-specific
 
-- Remove legacy side-effect inference and duplicate transaction coalescing paths.
-- Collapse the engine onto one write pipeline for file mutations.
-- Simplify docs and tests to the new model.
+If `sql2` needs a generic SQL primitive that is currently trapped under legacy `src/sql/**`, extract that primitive into a neutral shared module at that time rather than front-loading a full re-home.
 
-## Test Plan
+The new rewrite may depend on `sql2/core/**` and neutral shared SQL modules, but must not depend on legacy rewrite, followup, classifier, or planning modules under `src/sql/**`.
 
-- Insert file bytes, then read them back immediately through `lix_file`.
-- Update file bytes, then read them back immediately through `lix_file`.
-- Ensure the same behavior in single-statement execute, multi-statement execute, explicit transaction callbacks, and `BEGIN ... COMMIT` script execution.
-- Ensure descriptor-only updates do not rewrite `lix_binary_blob_ref`.
-- Ensure data-only updates do rewrite `lix_binary_blob_ref`.
-- Ensure live filesystem reads do not touch removed cache tables.
-- Ensure missing `blob_hash` targets fail with integrity errors.
-- Ensure filesystem reads and writes do not invoke plugin hooks at all.
-- Ensure deletes tombstone descriptor visibility in live views.
+Reasoning:
+The right clean-slate boundary is between `src/sql2/**` and the legacy rewrite/followup/classifier stack, not between the new rewrite and every reusable primitive that currently happens to live under `src/sql/**`. Fixing the semantic authority chain does not require a second upfront migration of every parser/AST/binder/lowering helper.
 
-## Guardrails
+### 2. Surface binding
 
-- `lix_file.data` is never computed from plugin code.
-- File write planning never depends on reading `lix_file` or `lix_file_by_version`.
-- There is exactly one canonical pipeline for file writes across all execution modes.
-- Live filesystem reads and writes do not depend on filesystem cache/index tables.
-- Read-after-write correctness is tested at statement barriers and transaction boundaries.
-- The filesystem layer does not call `detectChanges` or `applyChanges`.
-- History views are untouched by this plan.
+Introduce:
 
-## Deliverables
+- `SurfaceRegistry`
+  - maps public relation names to surface descriptors
+  - owns the only live registry of public surfaces in `sql2/catalog/**`
+  - contains both builtin surfaces and dynamic schema-derived surfaces
+  - tracks a `CatalogEpoch` for dynamic surface descriptors
+  - resolves aliases and visible column contracts
+  - binds each reference to one surface family plus family-local variant
 
-- one canonical `FileMutationIntent` path
-- one canonical `lix_file*` read projection path
-- tracked `lix_binary_blob_ref` as the only payload pointer source of truth
-- no plugin dependence inside the filesystem layer
-- no filesystem cache/index tables in the live path
-- removal of the legacy inferred file-write side-effect machinery
+- `SurfaceDescriptor`
+  - public relation name
+  - surface family
+  - surface variant
+  - visible and hidden columns
+  - writable/read-only capability
+  - default scope semantics
+  - surface traits and defaults
 
-## Assumptions
+- `SurfaceBinding`
+  - resolved surface descriptor
+  - bound `CatalogEpoch` for dynamic surfaces where applicable
+  - exposed columns
+  - writable/read-only capability
+  - default scope semantics
+  - implicit overrides
+  - storage/resolution capabilities
 
-- `lix_binary_blob_ref` remains the tracked payload-pointer schema.
-- CAS remains internal storage, not a public SQL surface.
-- We can change public docs and behavior without preserving the current plugin-coupled filesystem story.
-- History stays unchanged during this work.
+- `SurfaceVariant`
+  - family-local variants such as `Default`, `ByVersion`, `History`, `Active`, and `WorkingChanges`
+
+Reasoning:
+Surface meaning should be resolved once as family plus variant plus defaults. Public surfaces are not syntax sugar for each other, but they also should not each require a unique compiler identity when one canonical family scan is enough.
+
+Hard rule:
+
+- `sql2/catalog/**` owns one `SurfaceRegistry`
+- no second live registry, table catalog, or statement classifier may define public-surface meaning in parallel
+- legacy registries remain frozen migration references only and are deleted at cutover
+
+Bootstrap rule:
+
+- builtin surface descriptors load first
+- dynamic schema-derived surface descriptors load second from an authoritative state source
+- that dynamic descriptor load must not go through public-surface planning
+- public admin surfaces such as `lix_stored_schema` are planner outputs, not planner bootstrap inputs
+
+Reasoning:
+The planner must not need the public surface system to discover the public surface system. Dynamic surfaces come from stored schema state, but the bootstrap path for loading those descriptors must read authoritative state directly and then register the resulting descriptors into `SurfaceRegistry`.
+
+Dynamic-surface invalidation rule:
+
+- commits that change stored schema descriptors must invalidate dynamic surface descriptors
+- `SurfaceBinding`s and prepared/bound statements that depend on dynamic surfaces must carry the `CatalogEpoch` they were bound against
+- if that epoch no longer matches the live registry, the statement must be rebound before execution
+- v1 may satisfy this conservatively by rebinding dynamic surfaces per statement instead of keeping long-lived dynamic-surface bindings
+
+Reasoning:
+This is about catalog staleness, not general schema evolution. Dynamic surfaces can appear or change when stored schemas change, so the planner needs one explicit invalidation contract or stale bindings become inevitable.
+
+Reasoning:
+The current engine spreads public-surface knowledge across a table registry, surface classifiers, and dynamic entity-view resolution. The new architecture should collapse that into one `sql2/catalog/**` registry so surface meaning cannot drift between subsystems.
+
+### 2a. Surface families
+
+Public surfaces should be grouped into semantic families that share underlying machinery without rewriting into each other as public SQL:
+
+- `StateFamily`
+  - `lix_state`
+  - `lix_state_by_version`
+  - `lix_state_history`
+- `EntityFamily`
+  - schema-derived entity views such as `lix_key_value`, `lix_entity_label`, and their `_by_version` / `_history` variants
+- `FilesystemFamily`
+  - `lix_file`
+  - `lix_file_by_version`
+- `AdminFamily`
+  - `lix_version`
+  - `lix_active_version`
+  - `lix_stored_schema`
+  - `lix_active_account`
+- `ChangeFamily`
+  - `lix_change`
+  - `lix_working_changes`
+
+Reasoning:
+Families let surfaces share one canonical family scan plus effective-state logic without recreating the old architecture where one public surface is implemented as a rewrite into another public surface.
+
+### 2b. Semantic kernels
+
+Public surface families do not all need distinct semantic kernels.
+
+Day 1 should use these kernels:
+
+- state-backed kernel
+  - `CanonicalStateScan`
+  - used by `lix_state*`
+  - used by `lix_entity*` via schema-driven projection/defaults
+  - used by filesystem-style state wrappers where semantics are still state-backed
+- admin/version surfaces stay on the frozen legacy path in v1
+- add a lightweight `AdminScan` or `CanonicalStateScan + AdminProjectionSpec` only after the state kernel has settled and a concrete simplification case exists
+
+Reasoning:
+The current engine already treats entity views as wrappers over state semantics. The cleanest architecture keeps one canonical state kernel for state-backed surfaces in the first cut and only adds admin/version execution semantics after the authority chain is live.
+
+### 2b1. Semantic data model
+
+The planner should make the data model explicit:
+
+- authoritative log
+  - commits, change records, and snapshots
+  - this is the write truth
+  - internal committed change storage such as `lix_internal_change` plus `lix_internal_snapshot` belongs here
+  - public change surfaces such as `lix_change` are projections over this log, not the log authority itself
+- canonical resolved state
+  - effective current rows derived from the authoritative log plus overlay rules
+  - this uses one shared state row model across flexible schemas
+  - `lix_state*` exposes this directly
+- state-backed derived surfaces
+  - `lix_entity*` is schema projection/defaults over canonical resolved state
+  - filesystem-style surfaces are derived projections over state-backed descriptors plus external payload stores such as CAS/blob storage
+  - `lix_version` is an admin projection over global state rows such as version descriptors and version pointers
+  - `lix_active_version` is an admin projection over global state rows with schema key `lix_active_version`
+  - `lix_stored_schema` is an admin projection over canonical state rows for stored schema descriptors
+  - `lix_active_account` is an admin projection over global state rows with schema key `lix_active_account`
+  - keep other version/admin surfaces separate only if they are not actually reducible to canonical state semantics
+
+Commit rows may be represented in storage through the same general change machinery, but semantically a commit is still the append boundary that makes a batch of changes authoritative. It should not be treated as just another current-state row.
+
+Reasoning:
+The clean architecture is not “everything is one SQL view.” It is “one authoritative log, one canonical resolved state model, and projections over those.” The universal API story comes from the shared row model for state, not from forcing every public surface into the same semantic kernel.
+
+### 2c. Surface compilation rule
+
+The new planner must not model surfaces like this:
+
+- `lix_state` as a SQL rewrite to `lix_state_by_version`
+- `lix_version` as a SQL rewrite to `lix_state_by_version`
+- entity or filesystem surfaces as SQL rewrites to `lix_state`
+- public surfaces as semantic wrappers over `lix_internal_state_vtable`
+
+Instead, it should model them like this:
+
+- each public surface binds directly to a `SurfaceDescriptor`
+- family plus variant determine the canonical family scan/spec
+- the family-level canonicalization step may canonicalize multiple public surfaces in the same family into one canonical semantic scan/spec
+- the canonical family scan/spec then lowers into shared logical semantics
+- the backend lowerer then emits physical SQL against internal storage relations
+
+Reasoning:
+Public surfaces should be sibling semantic entrypoints over shared machinery, not a chain of SQL rewrites over other public surfaces or internal vtables. Semantic canonicalization within a family is desirable because it reduces compiler duplication while keeping the public contract explicit.
+
+### 2d. Canonical family scans
+
+Each semantic kernel should converge to one canonical scan/spec where practical.
+
+Examples:
+
+- state-backed kernel
+  - `lix_state` canonicalizes to `CanonicalStateScan` with:
+    - `version_scope = ActiveVersion`
+    - `expose_version_id = false`
+  - `lix_state_by_version` canonicalizes to the same `CanonicalStateScan` with:
+    - `version_scope = Explicit`
+    - `expose_version_id = true`
+- entity views
+  - `lix_entity` canonicalizes to `CanonicalStateScan + EntityProjectionSpec` with:
+    - `version_scope = ActiveVersion`
+    - schema-driven projection/defaults
+    - version columns hidden by default
+  - `lix_entity_by_version` canonicalizes to the same `CanonicalStateScan + EntityProjectionSpec` with:
+    - `version_scope = Explicit`
+    - schema-driven projection/defaults
+    - version columns exposed
+This canonicalization is semantic, not SQL-shaped:
+
+- it does not rewrite one public surface into another public SQL surface
+- it does not force explain output to pretend that one public surface is implemented as another
+- it gives proofs, effective-state resolution, and lowering one canonical form per semantic kernel
+
+Reasoning:
+This keeps the simplification benefits of canonicalization without recreating the old architecture where behavior is encoded as stacked public-surface rewrites. Entity surfaces stay lightweight wrappers over state semantics instead of becoming a second core scan model.
+
+### 3. Logical relational IR
+
+Longer-term, the planner may grow into one logical algebra:
+
+- `RelExpr`
+  - `SurfaceScan`
+  - `Project`
+  - `Filter`
+  - `Join`
+  - `Aggregate`
+  - `Sort`
+  - `Limit`
+  - `Union`
+  - `Values`
+
+- `ScalarExpr`
+  - bound literals
+  - column refs
+  - normalized comparisons
+  - deterministic scalar functions
+
+- `RelProps`
+  - output schema
+  - uniqueness facts
+  - cardinality bounds where known
+  - scope facts
+  - pushdown-safe predicate classes
+
+Reasoning:
+`ReadIntent` alone is too narrow for a mature planner. But this broader algebra is an expansion path, not a day-1 requirement.
+
+`RelExpr::SurfaceScan` should carry a `SurfaceBinding`, not just a table name.
+
+Reasoning:
+The logical plan leaf is the public semantic surface, not a backend relation or a rewritten intermediate surface.
+
+### 3a. Day-1 semantic core
+
+The first live slice only needs:
+
+- `CanonicalStateScan`
+- `ReadPlan`
+- `EntityProjectionSpec`
+- `WriteCommand`
+- `ResolvedWritePlan`
+- `DomainChangeBatch`
+- `CommitPreconditions`
+
+Reasoning:
+This is enough to establish the new semantic authority chain without requiring a full optimizer framework before the core write-path bug is fixed. The key addition on the read side is a tiny relational shell so query shape does not fall back to ad hoc AST/lowering behavior outside the semantic boundary.
+
+### 4. Read command
+
+Use a tiny day-1 relational shell for reads:
+
+- `ReadPlan`
+  - `Scan`
+    - canonical state-backed scan root
+  - `Filter`
+    - residual or pushdown-candidate predicate over a child plan
+  - `Project`
+    - output column and expression shaping over a child plan
+  - `Sort`
+    - explicit ordering over a child plan
+  - `Limit`
+    - limit/offset over a child plan
+
+Reasoning:
+The first cut does not need a full optimizer algebra, but it does need an explicit boundary for basic query shape. Otherwise the engine will recreate the current split between semantic state logic and “everything else” handled implicitly in AST rewrites or lowering.
+
+Represent reads as:
+
+- `ReadCommand`
+  - `ReadPlan` root
+  - `ReadContract`
+    - v1: `CommittedAtStart`
+  - requested commit mapping
+
+Reasoning:
+The read command should capture semantic intent only. Day 1 keeps that intent small but explicit: canonical scan semantics plus filter/project/sort/limit shape. Predicate placement, dependency analysis, and backend capability decisions are planned artifacts derived later.
+
+- `PlannedRead`
+  - `ReadCommand`
+  - proofs and derived properties
+  - chosen `StateSource`
+  - pushdown predicates and residual predicates
+  - dependency requirements
+  - backend pushdown decisions
+
+Reasoning:
+Separating `ReadCommand` from `PlannedRead` keeps the semantic contract small while still making planning and explain output explicit.
+
+V1 restriction:
+
+- state-backed reads that fit `Scan -> Filter -> Project -> Sort -> Limit` migrate first
+- read shapes that truly require `Join`, `Aggregate`, `Union`, or other broader relational operators may stay on the frozen legacy path until the shell expands
+
+Reasoning:
+This keeps the day-1 read model honest. The shell is large enough to prevent semantic leakage back into AST rewriting, but still small enough to avoid building a full optimizer before the authority chain is stable.
+
+### 5. Write command
+
+Represent writes as:
+
+- `WriteCommand`
+  - operation kind: `Insert | Update | Delete`
+  - target `SurfaceBinding`
+  - selector over canonical state rows
+  - mutation payload
+    - full snapshot replacement
+    - patch
+    - tombstone
+  - tracked vs untracked mode
+  - execution context
+
+Reasoning:
+Writes still need a selector and a mutation payload, but they are semantic commands over logical rows, not planned or lowered execution artifacts.
+
+- `PlannedWrite`
+  - `WriteCommand`
+  - scope/schema proofs and any required target proofs
+  - chosen `StateSource`
+  - `ResolvedWritePlan`
+  - optional `CommitPreconditions`
+  - residual execution predicates
+  - backend pushdown/lowering decisions
+
+Reasoning:
+Separating `WriteCommand` from `PlannedWrite` keeps legality, source choice, and append preconditions in one planned artifact instead of smearing them across command and lowering layers. Tracked and untracked writes share the same semantic planning object and diverge only after `ResolvedWritePlan`.
+
+V1 tracked-write restriction:
+
+- a tracked write must bind to exactly one authoritative `WriteLane`
+- admissible tracked lanes in v1 are:
+  - `ActiveVersion`
+  - `SingleVersion(version_id)`
+  - `GlobalAdmin`
+- tracked writes that bind to multiple version lanes, multiple authority lanes, or any `FiniteVersionSet` with more than one lane are rejected at bind/planning time
+
+Reasoning:
+`CommitPreconditions` are intentionally single-lane in v1. The planner must reject multi-lane tracked statements before execution rather than pretending they fit the v1 optimistic-concurrency model.
+
+## Semantic Facts and Proofs
+
+### V1 minimal proofs
+
+Day 1 only needs proof objects that are required for tracked-write legality:
+
+- `ScopeProof`
+  - `ActiveVersion`
+  - `SingleVersion(version_id)`
+  - `FiniteVersionSet(set)`
+  - `Unbounded`
+  - `Unknown`
+
+- `SchemaProof`
+  - exact schema set
+  - unknown schema set
+
+- `TargetSetProof`
+  - only introduce this in v1 if the tracked write path truly needs it
+  - start narrow:
+    - exact known target
+    - unknown target
+
+Reasoning:
+The engine needs to distinguish “safe to prove” from “unsafe to guess,” but the first cut only needs enough proof structure to make tracked writes legal or reject them safely. Commit preconditions are still explicit, but they are derived later from the planned write and enforced at the append boundary rather than living inside the proof lattice.
+
+### V1 conservative proof rules
+
+The v1 proof engine should positively support only:
+
+- conjunctions
+- direct equality
+- `IN (...)` over explicit literals or bound values
+- surface defaults and active-version defaults
+
+The v1 proof engine should treat these as `Unknown` or `Unbounded`:
+
+- `OR`
+- `NOT`
+- subqueries
+- joins
+- non-deterministic functions
+- user-defined functions
+- predicates derived only from emitted SQL shape
+
+Reasoning:
+This keeps the proof engine sound and matched to the day-1 scope. It is better to reject some legal writes than to prove a false scope and corrupt data.
+
+### Later proof expansion
+
+After the tracked write path is stable, the proof engine may expand to support:
+
+- `Global` scope where a real write or read path needs it
+- richer `SchemaProof` variants
+- broader `TargetSetProof` categories
+- constant-foldable subqueries
+- key-preserving join-derived proofs
+- read-pushdown-oriented proof classification
+
+Reasoning:
+These are useful planner features, but they should be added because the live engine needs them, not because the first core type section promised a larger proof lattice than day 1 can justify.
+
+### Correctness vs pushdown
+
+The proof engine decides only which predicates may move earlier in the plan. It does not decide whether a predicate is applied at all.
+
+Rules:
+
+- every user predicate must survive into the final logical plan unless it is proven redundant
+- predicates that are proven safe for early evaluation become pushdown predicates
+- predicates that are not proven safe stay as residual predicates above effective-state resolution
+- the backend SQL engine executes both the pushed predicates and the residual predicates in the lowered SQL
+
+Reasoning:
+`lix` owns semantic correctness. SQLite/Postgres owns faithful execution of the lowered SQL. A narrow pushdown policy is safe because unproven predicates are retained later in the plan, not dropped.
+
+Example shape:
+
+```sql
+WITH effective_state AS (
+  -- local/global/untracked/tracked resolution
+  -- tombstones and winner selection
+)
+SELECT *
+FROM effective_state
+WHERE <residual user predicate>;
+```
+
+If part of a predicate is proven safe to push earlier:
+
+```sql
+WITH candidate_rows AS (
+  SELECT *
+  FROM raw_state
+  WHERE file_id = 'f'
+),
+effective_state AS (
+  -- resolve overlay and winners from candidate_rows
+)
+SELECT *
+FROM effective_state
+WHERE json_extract(snapshot_content, '$.x') = 1;
+```
+
+Reasoning:
+This is how the engine avoids false results. The backend can evaluate raw SQL predicates correctly, but it does not know `lix` semantics such as active-version defaults, overlay precedence, or tombstone visibility. `lix` must decide where predicates belong relative to semantic resolution. Conservative pushdown only reduces optimization opportunity; it must not change result correctness.
+
+## Backend Execution Contract
+
+### Ownership boundary
+
+- `lix` owns semantic planning
+- `lix` lowers a complete SQL program that preserves `lix` semantics
+- SQLite/Postgres own faithful execution of that lowered SQL
+- backend optimizers may improve execution of the lowered SQL, but they do not discover `lix` semantics
+
+Reasoning:
+This is the core planner/backend split. `lix` defines meaning; the backend executes that meaning.
+
+### Lowered program contract
+
+The planner must always emit a complete executable SQL program with:
+
+- pushed predicates that are proven safe below semantic boundaries
+- residual predicates retained above semantic boundaries
+- backend-specific lowering only after semantic structure is fixed
+
+Reasoning:
+Narrow pushdown is safe only if the final lowered SQL still contains all non-redundant user predicates.
+
+### Backend execution modes
+
+- `Plan`: show the `lix` semantic plan and the lowered SQL
+- `BackendPlan`: ask the backend to explain the lowered SQL
+- `AnalyzeReadOnly`: optionally run backend analyze/explain for read-only queries only
+
+Reasoning:
+The explain surface should reflect both levels of planning without conflating them.
+
+## Backend Lowering Contract
+
+### Day-1 contract
+
+Start with a narrow backend contract:
+
+- `BackendLowerer`
+  - lowers canonical semantic plans into backend SQL
+- `PushdownSupport`
+  - `Exact`
+  - `Inexact`
+  - `Unsupported`
+- `PushdownDecision`
+  - accepted pushed predicates
+  - rejected predicates with reasons
+  - required residual predicates
+
+Reasoning:
+Mature planners start with a small contract for pushdown and residual filtering. Day 1 does not need a large backend capability taxonomy as long as movable predicates fail closed and residual filtering stays explicit.
+
+### Policy
+
+- the proof engine decides whether a predicate is semantically movable
+- the backend contract decides whether the backend can execute that moved predicate exactly
+- `Inexact` and `Unsupported` both keep the predicate as a residual filter
+- the final lowered SQL always preserves all non-redundant predicates
+
+Reasoning:
+Semantic proof without backend equivalence is unsafe, and backend equivalence without semantic proof is also unsafe. A small `Exact / Inexact / Unsupported` contract is enough to keep the first cut correct.
+
+## Shared Effective-State Resolver
+
+### Core abstraction
+
+Create one shared semantic resolver:
+
+- `EffectiveStateRequest`
+  - schema set
+  - version scope
+  - whether global overlay is included
+  - whether untracked overlay is included
+  - whether tombstones participate
+  - predicate classes
+  - required columns
+
+- `EffectiveStatePlan`
+  - canonical source relations
+  - overlay lanes
+  - winner-selection semantics
+  - pushdown-safe predicates
+  - post-resolution predicates
+
+- `ResolvedStateRows`
+  - resolved visible rows
+  - hidden/shadowed rows where needed for writes
+  - lineage metadata for commit mapping and validation
+
+Reasoning:
+The engine needs one place that defines visibility and overlay semantics. Reads and writes should both call this resolver, but they should not share a giant all-purpose planner object.
+
+### Source-of-truth contract
+
+The shared resolver must not be just one SQL builder over one physical source. It needs an explicit split between:
+
+- `StateSource`
+  - loads candidate rows from a declared authority
+  - examples:
+    - authoritative committed source for state-backed reads and tracked writes
+    - untracked source where relevant
+- `OverlayResolver`
+  - applies local/global/untracked/tombstone semantics
+  - computes winner ordering
+  - projects resolved rows into requested surface scope
+- `EffectiveStateResolver`
+  - orchestrates `StateSource + OverlayResolver`
+  - exposes one semantic contract to reads and writes without forcing them to share one physical read path
+
+Reasoning:
+If the shared resolver is just a shared SQL builder over a projection-backed source, the rewrite can accidentally preserve today’s projection-based authority model. The shared part must be the overlay and winner semantics; the source of candidate rows must remain explicit.
+
+### Authority rules
+
+- tracked writes must use an authoritative `StateSource`
+- tracked write legality and commit generation must not depend on projection/materialized state as authority
+- v1 planner reads use `CommittedAtStart` consistency only
+- each semantic kernel chooses exactly one authoritative `StateSource` in v1
+- planner-managed reads must use that one authoritative `StateSource` in v1
+- proving equivalence between alternative read sources is out of scope for v1
+- best-effort or lagging projection reads are out of scope until the planner introduces an explicit freshness contract
+- all `StateSource`s must feed the same `OverlayResolver` semantics
+
+Reasoning:
+This removes the hardest hidden correctness burden from v1. The first cut should not depend on proving that two different read sources are semantically equivalent for the same semantic kernel.
+
+### V1 read consistency
+
+For the first version of the new query planner, adopt one explicit read-consistency model:
+
+- `CommittedAtStart`
+  - a read must reflect every commit durably committed before the read began
+  - it does not need to include commits that finish after the read starts
+
+This means:
+
+- exactly one authoritative source qualifies per semantic kernel in v1
+- lagging, projected, async, or alternative read sources do not qualify in v1
+- alternative read sources can be introduced later only behind an explicit equivalence/freshness contract
+
+Reasoning:
+`CommittedAtStart` is only simple if the planner reads from one clearly defined authority. Allowing multiple “equivalent” authorities in v1 would reintroduce exactly the semantic burden the rewrite is trying to remove.
+
+### Required semantics
+
+Define once:
+
+- local tracked rows vs global tracked rows
+- local untracked rows vs global untracked rows
+- tombstone visibility and winner effects
+- overlay precedence
+- projection of resolved rows onto requested surface/version scope
+- lineage needed for commit mapping and mutation planning
+
+Reasoning:
+These semantics are the core of the engine. If they exist in more than one place, the rewrite will fail regardless of file layout.
+
+### Separation of concerns
+
+- `EffectiveStateResolver` owns semantic resolution.
+- `ReadPlanner` consumes resolved state for reads.
+- `WriteResolver` consumes resolved state for writes.
+
+Reasoning:
+One shared semantic kernel is good. One giant shared planner is not. Reads and writes have different downstream concerns and should not be forced through identical physical planning.
+
+## Authoritative Tracked Write Boundary
+
+### New authority model
+
+All writes should produce:
+
+- `ResolvedWritePlan`
+  - authoritative pre-state rows
+  - intended post-state rows
+  - tombstones
+  - lineage and target metadata
+
+Tracked writes should additionally produce:
+
+- `DomainChangeBatch`
+  - change records to commit
+  - affected write lane
+  - writer metadata
+  - semantic effects
+
+- `CommitPreconditions`
+  - `WriteLane`
+  - `ExpectedTip`
+  - `IdempotencyKey`
+
+Reasoning:
+The write truth must be the change batch plus its preconditions. Materialized rows are projections; they should not be the object that commit generation has to rediscover semantics from.
+
+### Commit boundary
+
+`generate_commit()` should remain a pure commit-construction step. It should accept only:
+
+- already-proven `DomainChangeBatch`
+- already-validated invariants
+- authoritative current boundary context loaded at append time
+
+It should not:
+
+- discover scope
+- discover target versions
+- compensate for missing validation
+- inspect materialized SQL rewrites
+
+Reasoning:
+Commit generation should be mechanical. If it is still repairing missing semantic information, the architecture is not actually separated.
+
+### Atomic append boundary
+
+Add one explicit transactional boundary:
+
+- `append_commit_if_preconditions_hold(tx, validated_batch, commit_preconditions) -> AppendCommitResult`
+
+This boundary is responsible for:
+
+1. loading the authoritative current tip for the command's `WriteLane` inside the same transaction that will append the commit
+2. rejecting unknown or missing versions instead of seeding optimistic defaults
+3. checking `ExpectedTip` atomically against current storage state
+4. enforcing idempotency keys atomically
+5. re-running every current-state-dependent invariant check inside that same transaction snapshot
+6. calling `generate_commit()` only after preconditions and append-transaction invariants hold
+7. appending commit/change rows and updating version/global pointers in the same transaction
+8. making materialization consume the committed batch, not participate in deciding whether the commit is valid
+
+Reasoning:
+Without one explicit append boundary, preconditions are only documentation. Correctness requires one place that closes stale-write races by checking preconditions and performing commit append under the same transaction.
+
+## Concurrency and Idempotency
+
+### Required model
+
+Every tracked write must produce one `CommitPreconditions` object:
+
+- `WriteLane`
+  - `ActiveVersion`
+  - `ExplicitVersion(version_id)`
+  - `GlobalAdmin`
+
+- `CommitPreconditions`
+  - exactly one `WriteLane` per command
+  - `ExpectedTip(commit_id)` or an explicit create-if-missing variant where the command is allowed to create the lane
+  - `IdempotencyKey(key)`
+
+Reasoning:
+Scope legality answers “may this write target these rows?” Concurrency answers “is this write still valid against the current tip of one concrete write lane?” Both are required.
+
+V1 legality rule:
+
+- `FiniteVersionSet` may remain a useful proof result for reads and later planner growth
+- but tracked writes in v1 may only continue if planning can collapse them to exactly one authoritative `WriteLane`
+- otherwise the planner must reject the statement before execution begins
+
+Reasoning:
+This keeps the narrowed concurrency model honest. A bounded multi-version proof is not enough if the append boundary only supports one authoritative lane per tracked command.
+
+### Atomic enforcement point
+
+Preconditions must be enforced at exactly one point: the transactional append boundary that both verifies the current tip for the command's `WriteLane` and writes the new commit/pointer state.
+
+Required ordering:
+
+1. start transaction
+2. load the current authoritative tip for the command's `WriteLane`
+3. reject missing versions or missing lanes unless the command is explicitly a creation path that proved it may create them
+4. compare the current tip with `CommitPreconditions`
+5. enforce idempotency key uniqueness or replay semantics
+6. re-run current-state-dependent invariant checks against that same transaction snapshot
+7. invoke `generate_commit()` using the authoritative current context that was just checked
+8. append commit/change rows
+9. update version/global pointers in the same transaction
+10. commit transaction
+11. run materialization and post-commit effects from the committed batch
+
+Reasoning:
+This is the actual race-closing sequence. If preconditions are checked before this boundary or pointer updates happen outside it, stale writes are still possible.
+
+### Later expansion
+
+If later commands truly need broader coordination, the planner may add:
+
+- multi-boundary preconditions
+- revision-based preconditions in addition to `ExpectedTip`
+- explicit no-intervening-write constraints across multiple lanes
+
+Reasoning:
+These are useful end-state tools, but they should be earned by real commands that need them. V1 should stay small and centered on one optimistic-concurrency lane per command.
+
+### Write behavior
+
+- Reject tracked writes that cannot produce a safe `CommitPreconditions` set.
+- Reject tracked writes when the transactional append boundary observes tip drift on the selected `WriteLane`.
+- Make retries idempotent where possible.
+- Never rely on read-model staleness windows for write correctness.
+
+Reasoning:
+Without this, the rewrite hardens syntax but still allows stale semantic decisions under concurrent writers.
+
+## Invariant Enforcement
+
+### V1 invariant classes
+
+Model v1 invariants in three classes:
+
+1. Pure batch-local checks
+   - payload/schema JSON validation
+   - `packages/engine/src/schema/definition.json` validation for stored schema registration payloads
+   - schema registration metadata shape checks
+   - primary-key/entity-id consistency derived from `x-lix-primary-key`
+   - any other invariant that depends only on the intended batch plus already-bound schema metadata
+
+2. Append-transaction checks
+   - uniqueness derived from `x-lix-primary-key` and `x-lix-unique`
+   - immediate foreign key existence derived from `x-lix-foreign-keys` with immediate mode
+   - version existence for resolved version scopes
+   - immutable update/delete checks and any other invariant that depends on current committed state
+   - these must be re-read inside `append_commit_if_preconditions_hold(...)` against the same transaction snapshot used for tip checks
+
+3. Physical constraints and triggers
+   - backend uniqueness constraints, FK constraints, indexes, and triggers used as defense in depth or as selected primary enforcement where simpler
+
+Reasoning:
+Not every invariant has the same race profile. Batch-local checks should happen before append because they do not depend on current storage state. State-dependent checks must be re-run inside the append transaction or they still race with concurrent writers.
+
+### Authoritative invariant checker
+
+Create `AuthoritativeInvariantChecker` over the final `DomainChangeBatch` and authoritative pre-state:
+
+- pure batch-local checks before append
+- append-transaction checks inside `append_commit_if_preconditions_hold(...)`
+- any generated backend constraint/triggers needed for race resistance
+
+Reasoning:
+Invariants should be checked against the actual intended mutation set, not against partially rewritten SQL or post-hoc followup rows.
+
+### Physical constraints
+
+Use backend constraints, indexes, and triggers as defense in depth where they simplify enforcement.
+
+Reasoning:
+The semantic checker remains the source of truth for intended mutations, but backend constraints are still valuable for race resistance and operational safety.
+
+## Read Planning and Lowering
+
+### Read optimization
+
+Keep the first version rule-based:
+
+- normalize predicates
+- push predicates only when proven safe
+- exploit exact/bounded schema and target proofs
+- use uniqueness facts to simplify joins and limits where safe
+
+Reasoning:
+A deterministic rule-based planner is enough to gain most of the simplification. Cost-based planning can be added later if the logical boundary is clean.
+
+### Proofs plus residuals
+
+Every lowered read plan must explicitly track:
+
+- pushdown predicates
+- residual predicates
+- backend capability rejections
+
+Every write selector must explicitly track:
+
+- legality proofs
+- execution predicates that remain in the final lowered SQL
+- backend capability rejections that force residual evaluation
+
+Reasoning:
+This makes correctness mechanical. Narrow pushdown changes where a predicate runs, not whether it runs.
+
+### Lowering
+
+Lower only after semantics are fixed:
+
+- backend SQL generation
+- backend-specific expression lowering
+- adapter/enforcer insertion where needed
+- residual predicate placement
+- backend pushdown decisions
+
+Reasoning:
+Lowering is a backend concern. It should not invent semantics or compensate for missing logical information.
+
+## Explainability and Plan Inspection
+
+### Explain API
+
+Day 1 only needs planner/debug traces. A stable explain API can land once the new path is live.
+
+Initial debug output should cover:
+
+- bound statement
+- surface bindings
+- canonical scan/command
+- proofs
+- effective-state plan
+- pushdown vs residual split
+- lowered SQL
+- commit preconditions and invariant checks for writes
+- semantic effects
+
+Later, provide a structured explain API and render SQL `EXPLAIN` on top of it:
+
+- `Engine::explain(sql, params, options) -> ExplainReport`
+- SQL forms:
+  - `EXPLAIN <query>`
+  - `EXPLAIN (FORMAT JSON) <query>`
+  - `EXPLAIN BACKEND <query>`
+  - later: `EXPLAIN ANALYZE <read-only query>`
+
+Reasoning:
+The explain path should reuse the real planner pipeline. But explainability should not block the day-1 write-path cutover.
+
+### Explain payload shape
+
+Expose:
+
+- `ExplainOptions`
+  - mode
+  - verbosity
+  - requested stages
+  - redact literals
+  - debug row limit
+  - include backend explain
+- `ExplainReport`
+  - stable summary
+  - versioned stage payloads
+  - warnings
+- `ExplainStageReport`
+  - parsed/bound statement
+  - canonical scan/command or logical plan
+  - proofs
+  - effective-state plan
+  - pushdown vs residual split
+  - lowered SQL
+  - backend explain
+  - effects
+
+Reasoning:
+The stable summary gives callers a durable contract. Versioned stage payloads let the planner evolve without freezing every internal debug shape forever.
+
+### Inspection requirements
+
+Require debug output for:
+
+- bound statement
+- surface bindings
+- canonical scan/command
+- proofs
+- effective-state plan
+- pushdown vs residual split
+- lowered SQL
+- commit preconditions and invariant checks for writes
+- semantic effects
+
+Reasoning:
+Every serious query-planner migration depends on explainability. Without it, correctness and performance regressions are much harder to diagnose.
+
+## Projections and Materialization
+
+### Terminology
+
+- a `projection` is a derived semantic surface or read model shape
+- `materialization` is the persisted/runtime form of a projection
+- v1 keeps this distinction explicit so planner semantics stay separate from rebuild/apply mechanics
+
+### Model
+
+- Projections are derived from committed domain changes.
+- Materialization is the persisted/runtime application of those projections.
+- Read models are disposable and rebuildable from commits.
+- Materialization lag must not affect tracked write correctness.
+
+### V1 replay contract
+
+- the authoritative replay source is the internal committed change contract, not a public query surface
+- in v1 that means internal committed change storage such as `lix_internal_change` plus `lix_internal_snapshot`
+- `lix_change` remains a public projection over that internal log
+- v1 rebuildability assumes stable internal `lix_*` change, commit, and version schemas
+- rebuild tools only need to understand those stable internal schemas in v1
+- general schema drift, event upcasters, and unknown historical plugin/custom change handling are out of scope for now
+
+Reasoning:
+The rewrite needs a replay contract, but v1 does not need a full event-versioning framework. The first cut only promises that derived state can be rebuilt from the stable internal `lix_*` committed-change storage the engine already owns, without routing replay through a public surface.
+
+Reasoning:
+This is the event-sourcing boundary that most directly simplifies the architecture. Once materialization stops being authoritative, the write path becomes easier to reason about and easier to rebuild.
+
+### Consequences
+
+- Delete followup reconstruction of tracked writes from `RETURNING` rows.
+- Stop using materialized tables as the authority for commit generation.
+- Keep rebuild tools for materialized projections and read models.
+
+Reasoning:
+This removes one of the main current sources of drift.
+
+## Side Effects and Observation
+
+### New model
+
+Produce side effects from committed semantic results:
+
+- cache invalidation targets
+- dynamic surface catalog invalidation when stored-schema commits change public descriptors
+- file refresh targets
+- state commit stream changes
+- post-commit notifications
+
+Reasoning:
+Effects should be attached to committed semantic changes, not guessed from SQL text or AST fragments after the fact.
+
+## Proposed File Structure
+
+`packages/engine/src/sql2/`
+
+- `core/`
+  - parser entrypoints
+  - AST utilities
+  - placeholder binding
+  - generic logical-function parsing/lowering
+  - shared SQL-facing contracts
+- `catalog/`
+  - builtin surface descriptors
+  - dynamic schema-derived descriptor bootstrap
+  - dynamic descriptor invalidation and `CatalogEpoch`
+  - `SurfaceRegistry`
+  - `SurfaceDescriptor`
+  - `SurfaceBinding`
+- `planner/`
+  - canonicalization helpers
+  - `ir/`
+    - `canonical_state_scan.rs`
+    - `read_plan.rs`
+    - `admin_projection_spec.rs`
+    - `entity_projection_spec.rs`
+    - `read_command.rs`
+    - `write_command.rs`
+    - `planned_write.rs`
+    - `proofs.rs`
+  - `semantics/`
+    - `effective_state_resolver.rs`
+    - `proof_engine.rs`
+    - `write_resolver.rs`
+    - `domain_changes.rs`
+  - `backend/`
+    - `pushdown.rs`
+    - `lowerer.rs`
+- `runtime/`
+  - SQL request orchestration
+  - explain/debug trace assembly
+  - handoff to commit/materialization/effects runtime
+- `backend/`
+  - SQL execution runner
+  - transaction coordination
+  - dialect/runtime adapters
+
+Top-level domain/runtime modules remain separate from `sql2/**`:
+
+- `packages/engine/src/commit/`
+  - `generate_commit()`
+  - commit append support
+- `packages/engine/src/materialization/`
+  - materialized projections
+  - rebuild tools
+- `packages/engine/src/effects/`
+  - cache invalidation
+  - file refresh targets
+  - state commit stream changes
+  - post-commit notifications
+
+Optional shared migration support, only when needed:
+
+- `packages/engine/src/sql_shared/`
+  - generic parser, binder, AST, lowering, catalog, or contract primitives extracted out of legacy-only modules so both paths can use them during migration
+
+Later expansion modules may add:
+
+- `ir/canonical_change_scan.rs`
+- `ir/rel_expr.rs`
+- `ir/scalar_expr.rs`
+- `ir/planned_read.rs`
+- `ir/properties.rs`
+- `planner/`
+- `explain/`
+
+`packages/engine/src/sql/`
+
+- legacy planner/execution tree during migration
+- not a dependency target for new `sql2/**` code
+- extract genuinely shared SQL primitives out only when `sql2` actually needs them, and place them in a neutral shared module instead of duplicating them
+- deleted entirely after `sql2` cutover
+
+Reasoning:
+The file structure should reflect the day-1 semantic authority chain first. Broader planner and explain modules can grow later without forcing the first cut to build the entire future architecture up front.
+
+## Legacy SQL Modules To Delete After `sql2` Cutover
+
+- `sql/planning/rewrite_engine/**`
+- `sql/execution/followup.rs`
+- any surface-specific module whose only job is to rewrite one public SQL surface into another
+- any effect detector that scans emitted SQL text or AST shape after planning
+- the old validation path that re-queries rewritten tables to discover update semantics
+
+Reasoning:
+Keeping these modules around as active alternatives will preserve drift and make the new architecture optional instead of authoritative. During migration they may remain as frozen reference code, but they must not remain live peers of `sql2/**` in production execution. Only the legacy planner/execution/classifier tree is a forbidden dependency and deletion target; generic SQL primitives should be extracted only when the semantic cutover actually needs them.
+
+## Migration Plan
+
+### Migration oracle
+
+- treat the existing integration suite under `packages/engine/tests/**` as the primary migration oracle
+- use the existing simulation harness as the main semantic gate across backend and materialization behavior
+- require the relevant integration tests to pass on the new `sql2` path before each production-facing cutover
+- add targeted planner/unit/differential tests only when the integration suite is too coarse to localize a regression
+- if an existing integration test encodes obsolete or unsound behavior, replace it deliberately with a corrected semantic contract test and document why in the same change
+- do not invent a separate shadow-execution or shadow-rebuild protocol for v1
+
+Reasoning:
+The engine already has broad end-to-end coverage for state, entity, filesystem, version/admin, materialization, validation, observation, and transaction behavior. That suite is a better source of truth for this refactor than a parallel operational cutover framework.
+
+### Phase 1: Establish the clean-slate boundary
+
+Work:
+
+- create `src/sql2/` with the day-1 modules
+- define `BoundStatement`, `SurfaceBinding`, `CanonicalStateScan`, `ReadPlan`, `EntityProjectionSpec`, `ReadCommand`, `WriteCommand`, and `PlannedWrite`
+- freeze the legacy planner/execution parts of `src/sql/`
+- add guardrails so new `sql2/**` code does not depend on legacy rewrite, followup, classifier, or planning modules
+- extract shared SQL primitives only when `sql2` actually needs them, using a neutral shared module instead of duplicating or front-loading a full re-home
+
+Reasoning:
+The rewrite needs hard cut lines first. Otherwise new behavior will continue landing in the old pipeline.
+
+Exit condition:
+
+- no new engine behavior is added directly to the old rewrite or followup stack
+
+### Phase 2: Bind public surfaces to canonical semantic kernels
+
+Work:
+
+- implement `SurfaceBinding`
+- map `lix_state*` onto `CanonicalStateScan`
+- map `lix_entity*` onto `CanonicalStateScan + EntityProjectionSpec`
+- lift simple state-backed read shape into `ReadPlan::Scan`, `Filter`, `Project`, `Sort`, and `Limit`
+- preserve surface-local defaults, visible columns, and schema-driven overrides
+
+Reasoning:
+This is the smallest clean-slate semantic boundary that matches the current engine. It removes SQL-surface rewriting without forcing a full optimizer model on day 1, while still making basic read shape explicit.
+
+Exit condition:
+
+- state-backed surfaces bind to one canonical state kernel before lowering
+
+### Phase 3: Build the shared effective-state resolver
+
+Work:
+
+- implement `EffectiveStateRequest`, `EffectiveStatePlan`, and `ResolvedStateRows`
+- move overlay, tombstone, and winner semantics into the resolver
+- make canonical state-backed scans consume it
+- expose effective-state debug output through planner traces
+
+Reasoning:
+This is the semantic heart of the engine. It must exist before proofing and writes can be trusted.
+
+Exit condition:
+
+- tracked writes and state-backed reads can resolve visibility through the shared resolver
+
+### Phase 4: Add minimal write-side proofing
+
+Work:
+
+- implement the minimal `ScopeProof` and `SchemaProof` needed for tracked writes
+- add a narrow `TargetSetProof` only if the tracked write path proves it actually needs one
+- support active-version, single-version, and bounded explicit version-set proofs
+- reject tracked writes that cannot be collapsed to exactly one authoritative `WriteLane`
+- reject writes that remain `Unknown` or `Unbounded`
+- preserve all other conditions as residual execution predicates
+- emit proof and residual data through planner traces
+
+Reasoning:
+The first correctness requirement is write legality. A larger proof and pushdown framework can grow later once the tracked write path is stable.
+
+Exit condition:
+
+- no tracked write legality decision depends on “does the AST mention this column”
+
+### Phase 5: Build the tracked write authority chain
+
+Work:
+
+- resolve authoritative pre-state through the shared resolver
+- build `ResolvedWritePlan`, `DomainChangeBatch`, and `CommitPreconditions`
+- split invariants into pure batch-local checks, append-transaction checks, and physical-constraint support
+- keep payload/schema validation, stored-schema-definition validation, and primary-key/entity-id consistency as batch-local checks
+- move uniqueness, immediate FK, version existence, and other current-state-dependent checks into the append transaction
+- keep commit generation pure
+- implement `append_commit_if_preconditions_hold(...)`
+- perform append-time write-lane tip, idempotency, and current-state-dependent invariant enforcement in the same transaction as commit append and pointer updates
+- emit dynamic catalog invalidation when committed stored-schema changes affect public surface descriptors
+
+Reasoning:
+This is the first truly valuable cutover. It fixes the core event-sourcing bug class by moving authority to one semantic write path and one atomic append boundary, and it must include append-transaction invariants before any production cutover.
+
+Exit condition:
+
+- tracked writes can execute end to end without followup reconstruction or optimistic version seeding, and append-time invariants are enforced inside the transactional boundary
+- tracked writes can execute end to end without followup reconstruction or optimistic version seeding, append-time invariants are enforced inside the transactional boundary, and every tracked command binds to exactly one authoritative `WriteLane`
+
+### Phase 6: Cut tracked `INSERT` / `UPDATE` / `DELETE` over to the new path
+
+Work:
+
+- lower tracked `INSERT`, `UPDATE`, and `DELETE` into the new `WriteCommand`
+- route state-backed entity writes through the same canonical state write path
+- keep the existing tracked-write integration coverage green on the new path, especially `vtable_write.rs`, `state_view.rs`, `entity_view.rs`, `on_conflict_views.rs`, `transaction_execution.rs`, `commit.rs`, `schema_definition_validation.rs`, and `snapshot_content_validation.rs`
+- use targeted `DomainChangeBatch` differential fixtures only when the integration suite is too coarse to isolate a mismatch
+- add targeted regression fixtures for known drift bugs
+
+Reasoning:
+This is the highest-value simplification in the current engine. It removes the split between tracked insert rewriting and update/delete followup reconstruction, but it is only safe after phase 5 has already landed append-time invariants and the existing tracked-write integration suite stays green.
+
+Exit condition:
+
+- tracked insert/update/delete share one authoritative commit-generation path, and the relevant tracked-write integration tests pass on the new path
+
+### Phase 7: Land derived materialization and post-commit cleanup
+
+Work:
+
+- align materialization so it only consumes committed changes
+- keep materialization derived and non-authoritative for v1 surfaces
+- keep the existing derived-state integration coverage green, especially `materialization.rs`, `file_materialization.rs`, `state_commit_stream.rs`, and `observe.rs`
+- surface invariant-check plans and write-phase traces
+
+Reasoning:
+This closes the loop on the event-sourced boundary after cutover: materialized state becomes a derived output again, post-commit runtime behavior is aligned with the authoritative write path, and the existing materialization/rebuild tests remain the acceptance criteria instead of a separate shadow rollout protocol.
+
+Exit condition:
+
+- materialized state is no longer write authority, post-commit runtime behavior is aligned with the authoritative write path, and the relevant materialization/observation integration tests pass on the new path
+
+### Phase 8: Adopt the new path for state-backed reads and narrow pushdown
+
+Work:
+
+- route `lix_state*` and `lix_entity*` reads through the new canonical state kernel
+- route migrated read shape through the day-1 `ReadPlan` shell
+- keep residual filtering explicit
+- implement the narrow `Exact / Inexact / Unsupported` backend pushdown contract
+- keep the existing state-backed read integration coverage green on the new path, especially `state_view.rs`, `state_by_version_view.rs`, `state_history_view.rs`, `state_inheritance.rs`, `entity_view.rs`, `entity_by_version_view.rs`, and `entity_history_view.rs`
+- use targeted old-vs-new differential fixtures only when the integration suite is too coarse to isolate a mismatch
+- keep broader read shapes on the frozen legacy path until the read shell expands
+- derive read dependencies and cache metadata from the semantic plan
+
+Reasoning:
+Once the write path is stable, the read path can adopt the same state semantics without requiring a full optimizer framework. The main cutover gate is the existing integration suite, not a separate shadow-read protocol.
+
+Exit condition:
+
+- state-backed reads share the new semantic kernel, preserve correctness with residual filtering, and the relevant state-backed read integration tests pass on the new path
+
+### Public surface migration matrix
+
+- `lix_state*`
+  - migrate in v1
+  - bind in phase 2 and cut reads over in phase 8
+- `lix_entity*`
+  - migrate in v1
+  - bind in phase 2 and cut reads/writes over with the canonical state kernel
+- `lix_version`
+  - stay on the frozen legacy path in v1
+  - decide after the state kernel settles whether it should use a lightweight `AdminScan` or `CanonicalStateScan + AdminProjectionSpec`
+  - phase 10 must not delete legacy support for it until it is migrated or intentionally removed
+- `lix_active_version`
+  - stay on the frozen legacy path in v1
+  - decide after the state kernel settles whether it should use a lightweight `AdminScan` or `CanonicalStateScan + AdminProjectionSpec`
+  - phase 10 must not delete legacy support for it until it is migrated or intentionally removed
+- `lix_stored_schema`
+  - stay on the frozen legacy path in v1
+  - decide after the state kernel settles whether it should use a lightweight `AdminScan` or `CanonicalStateScan + AdminProjectionSpec`
+  - phase 10 must not delete legacy support for it until it is migrated or intentionally removed
+- `lix_active_account`
+  - stay on the frozen legacy path in v1
+  - decide after the state kernel settles whether it should use a lightweight `AdminScan` or `CanonicalStateScan + AdminProjectionSpec`
+  - phase 10 must not delete legacy support for it until it is migrated or intentionally removed
+- filesystem surfaces
+  - stay on the frozen legacy path until a dedicated projection spec exists
+  - phase 10 must not delete legacy support for them until they are migrated or intentionally removed
+- `lix_change`
+  - defer to phase 9
+  - phase 10 must not delete legacy support for it until it is migrated or intentionally removed
+- `lix_working_changes`
+  - stay on the frozen legacy path until it is explicitly modeled or intentionally removed
+  - phase 10 must not delete legacy support for it until that decision is made
+
+Reasoning:
+The state-backed kernel lands first, but the plan still needs an explicit disposition for every remaining public surface. Otherwise legacy deletion becomes ambiguous and the migration stops being mechanically checkable.
+
+### Phase 9: Expand planner surfaces where needed
+
+Work:
+
+- add richer read planning only where the engine truly needs it
+- add `CanonicalChangeScan` and move `lix_change` onto the new planner if still valuable
+- expand explain from debug traces into a structured API if still valuable
+- introduce broader relational IR nodes only when joins/subqueries or optimizer behavior demand them
+- add larger backend capability descriptions only when the small pushdown contract is insufficient
+
+Reasoning:
+This keeps the architecture honest. Bigger planner abstractions should be earned by demonstrated need, not built before the core authority chain exists.
+
+Exit condition:
+
+- richer planner abstractions exist only where they simplify real behavior instead of becoming a second framework
+
+### Phase 10: Delete legacy planner/execution code after cutover
+
+Work:
+
+- verify that `sql2/catalog/**` owns the only live `SurfaceRegistry` for public surfaces
+- verify that every public surface in the migration matrix has either migrated or been intentionally removed
+- remove followup reconstruction from production execution
+- remove the old rewrite engine from production execution
+- remove duplicate validation and lowering paths
+- delete tests that only assert obsolete rewrite strings or pipeline internals
+- delete the legacy planner/execution tree once `sql2/**` is the only live SQL path and reusable SQL-facing pieces have been re-homed under `sql2/*`
+
+Reasoning:
+A rewrite is not done when the new path exists. It is done when the old planner/execution path is gone, and the new planner no longer carries hidden dependencies on legacy modules or duplicate generic infrastructure.
+
+Exit condition:
+
+- the semantic architecture is the only execution path
+
+## Testing Strategy
+
+### Primary oracle
+
+- treat `packages/engine/tests/**` as the primary migration oracle
+- keep the existing simulation-backed end-to-end coverage green as behavior moves from `sql/**` to `sql2/**`
+- prefer strengthening or correcting existing integration tests over inventing parallel migration-only harnesses
+- add narrow planner/unit tests only where the integration suite is too coarse to explain a failure
+- if a test has a soundness bug, replace it deliberately with a corrected semantic contract and a short rationale
+
+Reasoning:
+The current suite already covers the engine at the level users actually depend on. It is broad enough to guide the refactor, and it is harder to accidentally game than a separate cutover protocol.
+
+### Keep
+
+Keep tests that encode stable semantic contracts:
+
+- effective-state visibility
+- local/global overlay and shadowing
+- tombstone behavior
+- commit generation
+- writer attribution
+- invariant enforcement
+- materialization rebuild correctness
+- observation and cache effects
+
+Reasoning:
+These are the behaviors the engine actually promises.
+
+### Delete
+
+Delete tests that only assert:
+
+- exact intermediate rewritten SQL strings
+- old module boundaries
+- old multi-pass rewrite behavior
+- followup reconstruction details
+- AST-shape-based legality checks
+
+Reasoning:
+Those tests lock the implementation to the architecture being removed.
+
+### Add
+
+Add new tests only where the existing integration suite is not precise enough:
+
+1. canonical binding/normalization tests
+   Why: protects canonical scan binding and future IR growth where introduced.
+2. effective-state resolver contract tests
+   Why: this is the semantic core shared by reads and writes.
+3. proof-engine contract tests
+   Why: v1 write legality and later pushdown both depend on conservative proofing.
+4. tracked write resolver tests
+   Why: verifies one unified write path.
+5. invariant checker tests
+   Why: enforces write-side safety on the authoritative batch.
+6. concurrency and idempotency tests
+   Why: stale writes and duplicate retries must become explicit failures or safe retries.
+7. materialization rebuild tests
+   Why: proves persisted read models are derived and disposable.
+8. surface-equivalence tests
+   Why: state-backed surfaces must agree on semantics when scoped equivalently.
+9. end-to-end bug reproductions for current state-drift bugs
+   Why: these become the canaries that justify the rewrite.
+10. targeted old-vs-new differential fixtures
+   Why: useful for isolating regressions during migration, but they are a diagnostic aid rather than the primary oracle.
+11. debug trace tests for proof, effective-state, and lowered-SQL visibility
+   Why: the day-1 planner still needs inspection coverage even before a stable explain contract exists.
+
+## Definition of Done
+
+The rewrite is done when all of the following are true:
+
+1. one canonical semantic model exists before lowering
+   Why: planner semantics are no longer encoded in SQL rewrites.
+2. one effective-state resolver is shared by reads and writes
+   Why: visibility semantics exist once.
+3. write legality uses conservative semantic proofs
+   Why: no legality decision depends on syntactic column mention.
+4. tracked writes produce `DomainChangeBatch` plus `CommitPreconditions`
+   Why: the authoritative write boundary is explicit.
+5. tracked integrity enforcement is split between batch-local validation and append-transaction rechecks on the final intended batch
+   Why: invariants apply to what will actually be committed, and current-state-dependent checks must not race the append boundary.
+6. tracked commit append happens only through one transactional `append_commit_if_preconditions_hold(...)` boundary
+   Why: preconditions are enforced atomically relative to commit append and pointer updates.
+7. projections are derived from committed changes and materialization is non-authoritative
+   Why: read models are not write authority.
+8. tracked writes enforce one write-lane optimistic-concurrency contract plus idempotency
+   Why: correctness under concurrent writers is part of the architecture, not an afterthought, but v1 stays intentionally small.
+9. tracked writes that would span multiple authoritative lanes are rejected during binding/planning in v1
+   Why: the single-lane optimistic-concurrency model must be enforced before execution, not only implied at append time.
+10. migrated reads use an explicit day-1 `ReadPlan` shell instead of falling back to implicit AST/lowering behavior
+   Why: semantic state logic must not be separated from basic query shape again.
+11. read lowering is governed by an explicit backend pushdown contract and residual predicates
+   Why: planner/backend correctness is explicit instead of implicit.
+12. debug traces or explain output expose the semantic plan, proof state, predicate placement, and lowered SQL
+   Why: migrations and regressions are diagnosable.
+13. the old rewrite and followup architecture is deleted, and no `sql2/**` code depends on legacy planner/execution/classifier modules
+   Why: there is only one execution path left and the clean-slate boundary is real.
+14. `sql2/catalog/**` owns one `SurfaceRegistry` for builtin and dynamic public surfaces
+   Why: public-surface meaning is defined once instead of drifting across multiple registries.
+15. dynamic-surface bindings are invalidated and rebound after schema-affecting stored-schema commits
+   Why: public surface meaning must not go stale across commits that change dynamic descriptors.
+16. the remaining tests describe semantic behavior, not obsolete pipeline structure
+   Why: the test suite now protects the new architecture instead of the old one.
+17. the relevant existing integration suite passes on the `sql2` path, and any changed expectations are deliberate soundness fixes
+   Why: cutover is gated by the engine's real behavioral contract rather than by a parallel migration-only protocol.
+
+## Immediate Implementation Order
+
+1. scaffold `src/sql2/` and freeze `src/sql/`
+   Reasoning: this creates the cut lines first.
+2. bind state-backed surfaces to `CanonicalStateScan`, entity projection specs, and the day-1 `ReadPlan` shell
+   Reasoning: one canonical state kernel removes the current surface-rewrite layering, and the read shell keeps basic query shape inside the semantic boundary.
+3. land the shared effective-state resolver
+   Reasoning: reads and writes must agree on visibility semantics before anything else.
+4. land minimal write-side proofing plus `ResolvedWritePlan`
+   Reasoning: tracked write legality is the first correctness boundary.
+5. land `DomainChangeBatch`, `CommitPreconditions`, and `append_commit_if_preconditions_hold(...)`
+   Reasoning: this is the highest-value simplification and hardening step.
+6. cut tracked insert/update/delete over to the new path
+   Reasoning: this removes the followup split and makes the authority chain live.
+7. land authoritative invariant checking and derived, non-authoritative materialization alignment
+   Reasoning: this finalizes the event-sourced write boundary without implying a second read-authority model.
+8. adopt the new path for state-backed reads with the day-1 `ReadPlan` shell, narrow pushdown, and residual filtering
+   Reasoning: once the write path is correct, reads can follow the same semantic kernel without falling back to implicit AST/lowering behavior.
+9. remove followup and old rewrites from production execution, then delete the legacy planner/execution tree after any genuinely shared SQL primitives needed during migration have been extracted out of legacy-only modules
+   Reasoning: the rewrite is only complete once the old semantics are no longer live, but that does not require a second blanket re-home of every generic SQL helper up front.
 
 ## Progress Log
 
-- 2026-03-05 16:07: Drafted the canonical redesign plan. The target model is descriptor state + tracked payload pointer + CAS.
-- 2026-03-06: Simplified the target further: the filesystem is now explicitly plugin-free. No `detectChanges`, no `applyChanges`, and no binary fallback language in the filesystem contract.
-- 2026-03-06: Narrowed scope to the smallest live filesystem cut: tracked `lix_file_descriptor`, tracked `lix_binary_blob_ref`, CAS storage, no filesystem plugins, no filesystem caches, and live `lix_file` / `lix_file_by_version` only. History is explicitly untouched and out of scope.
-- 2026-03-06: Rewired the live read path so `lix_file` and `lix_file_by_version` resolve payload bytes from tracked `lix_binary_blob_ref` state plus CAS. Normal live reads no longer materialize file data through plugin hooks or filesystem caches.
-- 2026-03-06: Rewired the live write path so authoritative file writes and deletes emit tracked `lix_binary_blob_ref` changes directly. The live execution path now skips filesystem cache/index maintenance, and cache-miss coverage was updated to assert state-plus-CAS behavior instead of cache repopulation.
-- 2026-03-06: Added a shared live file projection builder and moved live write planning onto it. `pending_file_writes` and filesystem mutation scoping now prefetch against tracked descriptor state plus `lix_binary_blob_ref` plus CAS through the canonical projection, instead of consulting filesystem cache tables or the logical `lix_file*` views.
-- 2026-03-06: Fixed the explicit-version regression in the postprocess path. Filesystem payload ref changes are now still persisted when descriptor updates on `lix_file_by_version` go through SQL postprocess, so by-version path+data updates round-trip correctly instead of dropping the payload rewrite.
-- 2026-03-06: Removed the remaining live filesystem plugin-detection branch from execution intent collection. `collect_execution_side_effects_with_backend_from_statements` now only gathers filesystem-owned side effects, so live `lix_file*` writes no longer carry dead `detect_plugin_file_changes` or plugin-cache plumbing even as disabled options.
-- 2026-03-06: Replaced the fake no-op SQL shell for data-only filesystem updates with an explicit effect-only rewrite output. `UPDATE lix_file SET data = ...` now lowers to zero prepared SQL statements in the rewrite engine, while the live payload write still persists through the filesystem-owned side-effect path.
-- 2026-03-06: Removed the last live filesystem sentinel and cache-maintenance shim. Data-only `lix_file` updates now travel through an explicit `FilesystemUpdateRewrite::EffectOnly` branch instead of synthesized `SELECT 0 WHERE 1 = 0` SQL, the stale `PostprocessPlan::DomainChangesOnly` branch is gone, and unused live cache/index invalidation and binary-fallback maintenance helpers were deleted from the runtime path.
-- 2026-03-06: Pruned the remaining dead live filesystem cache/materialization probes. The old binary-ref index loaders, file-data-unavailable probes, cache-table query builders, and unused cache-table constants that were only supporting the retired live cache path are now deleted.
-- 2026-03-06: Realigned the filesystem test surface to the simplified live contract. Live view tests now read tracked `lix_binary_blob_ref` state directly, payload-corruption cases assert `NULL` when the CAS blob row is missing, and the old plugin/cache-era `file_materialization` suite was fenced off so only binary-first live/CAS coverage remains active. The four originally failing targets (`file_history_view`, `file_materialization`, `filesystem_view`, `writer_key`) now pass again.
+- 2026-03-06: Replaced the previous inheritance/global-lane plan in this file with a semantic rewrite plan centered on a canonical semantic model, a shared effective-state resolver, conservative proofs, authoritative domain-change batches, and explicit commit preconditions.
+- 2026-03-06: Added a `Correctness vs pushdown` section clarifying that conservative proofing only limits early predicate movement; unproven predicates remain as residual filters in the lowered SQL executed by the backend.
+- 2026-03-06: Updated the plan to use a clean-slate `src/sql2/` tree, added an explicit backend execution contract, strengthened pushdown into proofs-plus-residuals, defined an explain/debug direction, added a differential migration phase, and changed old `src/sql/` cleanup language from immediate deletion to frozen legacy reference removed from production execution.
+- 2026-03-06: Narrowed the clean-slate boundary after review: `sql2/**` must not depend on legacy rewrite/followup/classifier modules, but shared parser/binder/AST/lowering primitives are extracted only when needed instead of front-loading a full self-sufficient `sql2` tree.
+- 2026-03-06: Strengthened the concurrency plan with one explicit transactional append boundary, `append_commit_if_preconditions_hold(...)`, so write-lane tip/idempotency checks are enforced atomically relative to commit append and pointer updates rather than remaining architectural intent only.
+- 2026-03-06: Simplified the planner model further by collapsing surface identity to family plus variant, separating `ReadCommand`/`WriteCommand` from `PlannedRead`/`PlannedWrite`, and unifying tracked-write concurrency requirements under one `CommitPreconditions` object.
+- 2026-03-06: Narrowed the architecture around one canonical state-backed kernel for `lix_state*` and `lix_entity*`, kept `lix_change` as a separate log kernel, replaced the broad backend capability layer with a small pushdown contract, and reordered the migration so the tracked-write authority chain lands before broader planner expansion.
+- 2026-03-06: Tightened the v1 read-source policy so each semantic kernel has exactly one authoritative `StateSource`; proving equivalence between alternative read sources is now explicitly out of scope for v1.
+- 2026-03-06: Moved append-transaction invariant enforcement into phase 5 so tracked-write cutover cannot happen before current-state-dependent checks are enforced inside `append_commit_if_preconditions_hold(...)`.
+- 2026-03-06: Pushed `lix_change` planning and structured explain snapshots out of the day-1 slice so the first implementation stays focused on the tracked-write authority chain and state-backed surface cutover.
+- 2026-03-06: Re-guided the migration around the existing `packages/engine/tests/**` integration suite as the primary source of truth, with targeted differential/unit tests as secondary diagnostics and no separate shadow rollout protocol for v1.
+- 2026-03-06: Added a tiny day-1 `ReadPlan` shell (`Scan`, `Filter`, `Project`, `Sort`, `Limit`) so migrated reads keep basic query shape inside the semantic boundary without forcing a full optimizer algebra.
+- 2026-03-06: Landed the first implementation checkpoint: scaffolded `packages/engine/src/sql2/`, added the initial `BoundStatement`/`SurfaceRegistry`/day-1 IR and effective-state contract types, and replaced the old “`sql2` must stay removed” guardrail with migration guardrails that keep `sql2` isolated from legacy rewrite, followup, and classifier code.
+
+(use timestamps e.g. hour minuate from now on in logs)
