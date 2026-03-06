@@ -48,7 +48,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
         engine
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-no-internal', 'v1')",
@@ -73,7 +73,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let (version_id, before_commit_id) = active_version_pointer(&engine).await;
         let checkpoint = engine
@@ -107,7 +107,7 @@ simulation_test!(checkpoint_labels_current_commit, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine_deterministic should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
 
     engine
         .execute(
@@ -147,7 +147,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -182,7 +182,7 @@ simulation_test!(checkpoint_clears_working_changes, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine_deterministic should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
 
     engine
         .execute(
@@ -218,7 +218,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let commits_before = engine
             .execute("SELECT COUNT(*) FROM lix_commit", &[])

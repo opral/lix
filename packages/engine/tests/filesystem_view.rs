@@ -139,7 +139,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -171,7 +171,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -208,7 +208,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -258,7 +258,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -322,7 +322,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
         .execute(
@@ -371,7 +371,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -430,7 +430,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
         .execute(
@@ -488,7 +488,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -515,7 +515,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -547,7 +547,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -587,7 +587,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -632,7 +632,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -690,7 +690,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -755,7 +755,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -789,7 +789,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -854,7 +854,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -920,7 +920,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -981,7 +981,7 @@ simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(
@@ -1035,7 +1035,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -1091,7 +1091,7 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let file_history_err = engine
         .execute(
@@ -1168,7 +1168,7 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let version_a = active_version_id(&engine).await;
     let version_b = "fs-version-b";
@@ -1288,7 +1288,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_sql = version_id.replace('\'', "''");
@@ -1334,7 +1334,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_sql = version_id.replace('\'', "''");
@@ -1398,7 +1398,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_sql = version_id.replace('\'', "''");
@@ -1467,7 +1467,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_sql = version_id.replace('\'', "''");
@@ -1534,7 +1534,7 @@ simulation_test!(file_by_version_requires_version_id, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
     let version_id = active_version_id(&engine).await;
 
     let insert_err = engine
@@ -1649,7 +1649,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_a = active_version_id(&engine).await;
         let version_b = "dir-version-b";
@@ -1765,7 +1765,7 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
     let version_id = active_version_id(&engine).await;
 
     let insert_err = engine
@@ -1883,7 +1883,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -1948,7 +1948,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let err = engine
             .execute("INSERT INTO lix_file (data) VALUES ('ignored')", &[])
@@ -1968,7 +1968,7 @@ simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let err = engine
             .execute(
@@ -1983,7 +1983,7 @@ simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -2007,7 +2007,7 @@ simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -2030,7 +2030,7 @@ simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
             .execute(
@@ -2062,7 +2062,7 @@ simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(
@@ -2101,7 +2101,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -2129,7 +2129,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -2207,7 +2207,7 @@ simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(
@@ -2241,7 +2241,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
         let child_version_id = "directory-global-child";
@@ -2289,7 +2289,7 @@ simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(
@@ -2323,7 +2323,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
         let child_version_id = "file-global-child";
@@ -2373,7 +2373,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
         let child_version_id = "file-global-tombstone-child";
@@ -2465,7 +2465,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -2504,7 +2504,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -2528,7 +2528,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -2579,7 +2579,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let err = engine
             .execute(
@@ -2606,7 +2606,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let err = engine
             .execute("DELETE FROM lix_file WHERE bogus = 'x'", &[])
@@ -2629,7 +2629,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let parent_version_id = active_version_id(&engine).await;
         let child_version_id = "file-global-update-collision-child";
@@ -2687,7 +2687,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -2724,7 +2724,7 @@ simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(
@@ -2765,7 +2765,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -2859,7 +2859,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_id_sql = version_id.replace('\'', "''");
@@ -2933,7 +2933,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3008,7 +3008,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_id_sql = version_id.replace('\'', "''");
@@ -3049,7 +3049,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3087,7 +3087,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_id = active_version_id(&engine).await;
         let version_id_sql = version_id.replace('\'', "''");
@@ -3128,7 +3128,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3183,7 +3183,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3225,7 +3225,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3252,7 +3252,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3316,7 +3316,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3353,7 +3353,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let version_a = active_version_id(&engine).await;
         let version_b = "filesystem-switch-version-b";
@@ -3451,7 +3451,7 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let file_err = engine
         .execute(
@@ -3490,7 +3490,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3628,7 +3628,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
         .execute(
@@ -3673,7 +3673,7 @@ simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     engine
         .execute(
@@ -3732,7 +3732,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3834,7 +3834,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -3908,7 +3908,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let file_err = engine
             .execute("SELECT id FROM file", &[])

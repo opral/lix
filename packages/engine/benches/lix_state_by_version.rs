@@ -103,7 +103,7 @@ fn bench_lix_state_by_version_count_active_scope_subquery(c: &mut Criterion) {
 async fn seed_engine_with_versions() -> Result<lix_engine::Engine, LixError> {
     let backend = Box::new(BenchSqliteBackend::in_memory());
     let engine = boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime)));
-    engine.init().await?;
+    engine.initialize().await?;
 
     insert_stored_schema(&engine).await?;
     insert_versions(&engine).await?;

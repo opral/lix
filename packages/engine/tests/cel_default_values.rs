@@ -47,7 +47,7 @@ simulation_test!(insert_applies_cel_default, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     insert_schema(
         &engine,
@@ -83,7 +83,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         insert_schema(
             &engine,
@@ -128,7 +128,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         insert_schema(
             &engine,
@@ -171,7 +171,7 @@ simulation_test!(insert_uses_json_default_fallback, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     insert_schema(
         &engine,
@@ -201,7 +201,7 @@ simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     insert_schema(
         &engine,
@@ -234,7 +234,7 @@ simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     insert_schema(
         &engine,
@@ -264,7 +264,7 @@ simulation_test!(update_does_not_backfill_defaults, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     insert_schema(
         &engine,
@@ -301,7 +301,7 @@ async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
     enable_deterministic_mode(&engine).await;
 
     insert_schema(
@@ -343,7 +343,7 @@ async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
     enable_deterministic_mode(&engine).await;
 
     insert_schema(
@@ -393,7 +393,7 @@ simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     insert_schema(
         &engine,

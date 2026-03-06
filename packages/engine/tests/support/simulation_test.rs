@@ -66,7 +66,7 @@ pub struct SimulationEngine {
 impl SimulationEngine {
     #[allow(dead_code)]
     pub async fn init(&self) -> Result<(), LixError> {
-        let result = self.engine.init().await;
+        let result = self.engine.initialize().await;
         if result.is_ok() {
             self.initialized.store(true, Ordering::SeqCst);
             if self.behavior == SimulationBehavior::Rematerialization {

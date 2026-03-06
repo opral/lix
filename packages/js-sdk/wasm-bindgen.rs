@@ -4,13 +4,12 @@ mod wasm {
     use futures_util::future::{AbortHandle, Abortable};
     use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
     use lix_engine::{
-        boot, init_lix as engine_init_lix, observe_owned, BootArgs, BootKeyValue,
-        CreateCheckpointResult, CreateVersionOptions, CreateVersionResult, ExecuteOptions,
-        ExecuteResult as EngineExecuteResult, InitLixArgs, LixBackend, LixError, LixTransaction,
-        ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
-        ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, SnapshotChunkWriter,
-        SqlDialect, Value as EngineValue, WasmComponentInstance, WasmLimits, WasmRuntime,
-        WireQueryResult, WireValue,
+        observe_owned, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
+        CreateVersionResult, EngineConfig, ExecuteOptions, ExecuteResult as EngineExecuteResult,
+        LixBackend, LixError, LixTransaction, ObserveEvent as EngineObserveEvent,
+        ObserveEventsOwned as EngineObserveEvents, ObserveQuery as EngineObserveQuery,
+        QueryResult as EngineQueryResult, SnapshotChunkWriter, SqlDialect, Value as EngineValue,
+        WasmComponentInstance, WasmLimits, WasmRuntime, WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -90,7 +89,7 @@ export type LixBootKeyValue = {
 };
 
 export type InitLixResult = {
-  created: boolean;
+  initialized: boolean;
 };
 
 export type CreateVersionOptions = {
@@ -438,14 +437,14 @@ export type LixObserveEvents = {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
         });
-        let boot_args = BootArgs::new(
+        let engine = lix_engine::Engine::open(EngineConfig::new(
             backend,
             Arc::new(JsHostWasmRuntime {
                 runtime: wasm_runtime.into(),
             }) as Arc<dyn WasmRuntime>,
-        );
-        let engine = boot(boot_args);
-        engine.open().await.map_err(js_error)?;
+        ))
+        .await
+        .map_err(js_error)?;
         Ok(Lix {
             engine: Arc::new(engine),
         })
@@ -460,23 +459,25 @@ export type LixObserveEvents = {
         let backend = Box::new(JsBackend {
             backend: backend.into(),
         });
-        let mut init_args = InitLixArgs {
+        let mut config = EngineConfig::new(
             backend,
-            wasm_runtime: Arc::new(JsHostWasmRuntime {
+            Arc::new(JsHostWasmRuntime {
                 runtime: wasm_runtime.into(),
             }) as Arc<dyn WasmRuntime>,
-            key_values: Vec::new(),
-        };
+        );
         if let Some(raw_key_values) = boot_key_values {
-            init_args.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
+            config.key_values = parse_boot_key_values(raw_key_values).map_err(js_error)?;
         }
-        let created = engine_init_lix(init_args).await.map_err(js_error)?.created;
+        let initialized = lix_engine::Engine::open_or_init(config)
+            .await
+            .map_err(js_error)?
+            .initialized;
 
         let object = Object::new();
         Reflect::set(
             &object,
-            &JsValue::from_str("created"),
-            &JsValue::from_bool(created),
+            &JsValue::from_str("initialized"),
+            &JsValue::from_bool(initialized),
         )
         .map_err(js_to_lix_error)
         .map_err(js_error)?;

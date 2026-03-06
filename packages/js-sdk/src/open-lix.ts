@@ -86,7 +86,7 @@ export type OpenLixKeyValue = {
 };
 
 export type InitLixResult = {
-	created: boolean;
+	initialized: boolean;
 };
 
 export type Lix = {
@@ -641,11 +641,11 @@ function normalizeInitLixResult(result: unknown): InitLixResult {
 	if (!result || typeof result !== "object") {
 		throw new Error("initLix() must return an object");
 	}
-	const created = (result as { created?: unknown }).created;
-	if (typeof created !== "boolean") {
-		throw new Error("initLix() result is missing boolean created");
+	const initialized = (result as { initialized?: unknown }).initialized;
+	if (typeof initialized !== "boolean") {
+		throw new Error("initLix() result is missing boolean initialized");
 	}
-	return { created };
+	return { initialized };
 }
 
 function encodeRuntimeSqlParam(

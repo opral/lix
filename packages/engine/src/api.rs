@@ -15,7 +15,8 @@ use crate::{ExecuteResult, LixError, LixTransaction, QueryResult, Value};
 use sqlparser::ast::Statement;
 
 impl Engine {
-    pub async fn open(&self) -> Result<(), LixError> {
+    #[doc(hidden)]
+    pub async fn open_existing(&self) -> Result<(), LixError> {
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }

@@ -24,7 +24,7 @@ simulation_test!(select_works_after_init, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine.execute("SELECT 1 + 1", &[]).await.unwrap();
     sim.assert_deterministic(result.statements[0].rows.clone());
@@ -37,7 +37,7 @@ simulation_test!(explain_lix_state_query_works, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute(
@@ -58,7 +58,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
         .execute(
@@ -93,7 +93,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let result = engine
             .execute("SELECT name FROM sqlite_master ORDER BY name LIMIT 1", &[])
@@ -117,7 +117,7 @@ simulation_test!(internal_table_read_is_allowed, |sim| async move {
         .boot_simulated_engine(Some(boot_args))
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
 
     engine
         .execute("SELECT COUNT(*) FROM lix_internal_state_untracked", &[])
@@ -134,7 +134,7 @@ simulation_test!(
             .boot_simulated_engine(Some(boot_args))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let error = engine
             .execute(
@@ -160,7 +160,7 @@ simulation_test!(
             .boot_simulated_engine(Some(boot_args))
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let mut tx = engine
             .begin_transaction_with_options(ExecuteOptions::default())

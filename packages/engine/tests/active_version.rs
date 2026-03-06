@@ -80,7 +80,7 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
         .await
         .expect("boot_simulated_engine_deterministic should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let row = engine
         .execute(
@@ -141,7 +141,7 @@ simulation_test!(init_seeds_default_active_version, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let row = engine
         .execute(
@@ -192,7 +192,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let (id, version_id) = read_active_version_view_row(&engine).await;
         assert!(!id.is_empty());
@@ -207,7 +207,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         insert_version(&engine, "version-switch-target").await;
 
         let (before_id, _) = read_active_version_view_row(&engine).await;
@@ -233,7 +233,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let error = engine
             .execute(
@@ -259,7 +259,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         insert_version(&engine, "version-existing-fk").await;
 
         engine
@@ -283,7 +283,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let (active_id, _) = read_active_version_view_row(&engine).await;
         engine
             .execute(
@@ -316,7 +316,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
         let (active_id, _) = read_active_version_view_row(&engine).await;
 
         engine

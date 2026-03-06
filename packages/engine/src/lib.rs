@@ -29,9 +29,11 @@ pub use schema::{
 pub use backend::LixBackend;
 pub use backend::LixTransaction;
 pub use backend::SqlDialect;
+#[doc(hidden)]
+pub use engine::{boot, BootArgs};
 pub use engine::{
-    boot, init_lix, BootAccount, BootArgs, BootKeyValue, Engine, EngineTransaction,
-    EngineTransactionFuture, ExecuteOptions, InitLixArgs, InitLixResult,
+    BootAccount, BootKeyValue, Engine, EngineConfig, EngineTransaction, EngineTransactionFuture,
+    ExecuteOptions, OpenOrInitResult,
 };
 pub use errors::{ErrorCode, LixError};
 pub use observe::{observe_owned, ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};

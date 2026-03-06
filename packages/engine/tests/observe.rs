@@ -39,7 +39,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let mut observed = engine
             .observe(ObserveQuery::new(
@@ -94,7 +94,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let mut observed_a = engine
             .observe(ObserveQuery::new(
@@ -151,7 +151,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let mut observed = engine
             .observe(ObserveQuery::new(
@@ -194,7 +194,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let key = "observe-recover-json";
         engine
@@ -271,7 +271,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let mut observed = engine
             .observe(ObserveQuery::new(
@@ -314,7 +314,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(&insert_key_value_sql("observe-dedup", "\"v0\""), &[])
@@ -366,7 +366,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let mut observed = engine
             .observe(ObserveQuery::new(
@@ -417,7 +417,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let branch = engine
             .create_version(CreateVersionOptions {
@@ -504,7 +504,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let branch = engine
             .create_version(CreateVersionOptions {
@@ -571,7 +571,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let branch = engine
             .create_version(CreateVersionOptions {
@@ -686,7 +686,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine.observe(ObserveQuery::new(
             "UPDATE lix_state SET schema_version = '1' WHERE 1 = 0",
@@ -718,11 +718,11 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
             let engine_b = boot_sqlite_engine_at_path(path.clone());
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 
@@ -777,11 +777,11 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
             let engine_b = boot_sqlite_engine_at_path(path.clone());
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 
@@ -847,11 +847,11 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 
@@ -904,11 +904,11 @@ fn observe_postgres_detects_external_untracked_state_insert() {
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 
@@ -968,11 +968,11 @@ fn observe_external_same_writer_key_is_suppressed() {
         let engine_b = boot_postgres_engine_at_url(connection_string);
 
         engine_a
-            .init_if_needed()
+            .initialize_if_needed()
             .await
             .expect("engine_a init should succeed");
         engine_b
-            .init_if_needed()
+            .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
 
@@ -1022,11 +1022,11 @@ fn observe_external_different_writer_key_emits() {
         let engine_b = boot_postgres_engine_at_url(connection_string);
 
         engine_a
-            .init_if_needed()
+            .initialize_if_needed()
             .await
             .expect("engine_a init should succeed");
         engine_b
-            .init_if_needed()
+            .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
 
@@ -1078,11 +1078,11 @@ fn observe_external_null_writer_key_emits() {
         let engine_b = boot_postgres_engine_at_url(connection_string);
 
         engine_a
-            .init_if_needed()
+            .initialize_if_needed()
             .await
             .expect("engine_a init should succeed");
         engine_b
-            .init_if_needed()
+            .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
 
@@ -1131,11 +1131,11 @@ fn observe_external_read_only_transaction_does_not_emit() {
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 
@@ -1180,11 +1180,11 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 
@@ -1252,11 +1252,11 @@ fn observe_external_unrelated_mutation_does_not_emit() {
             let engine_b = boot_postgres_engine_at_url(connection_string);
 
             engine_a
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_a init should succeed");
             engine_b
-                .init_if_needed()
+                .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
 

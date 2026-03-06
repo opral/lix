@@ -61,7 +61,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
         let main_version_id = main_version_id(&engine).await;
@@ -133,7 +133,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
         let main_version_id = main_version_id(&engine).await;
@@ -218,7 +218,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
         let main_version_id = main_version_id(&engine).await;

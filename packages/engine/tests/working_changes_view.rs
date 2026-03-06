@@ -97,7 +97,7 @@ simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine_deterministic should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
     rotate_working_commit(&engine).await;
     let key = unique_key("wc-view-added");
 
@@ -138,7 +138,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-modified");
 
         engine
@@ -198,7 +198,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-removed");
 
         engine
@@ -247,7 +247,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-unchanged");
 
         engine
@@ -287,7 +287,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-collapse");
         let key_sql = key.replace('\'', "''");
         let active_version_id = active_version_id(&engine).await;
@@ -375,7 +375,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-checkpoint-move");
 
         engine
@@ -440,7 +440,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let key_a = unique_key("wc-view-since-cp-a");
         let key_b = unique_key("wc-view-since-cp-b");
@@ -500,7 +500,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let target_key = unique_key("wc-view-target");
         let unrelated_key = unique_key("wc-view-unrelated");
@@ -555,7 +555,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let main_key_a = unique_key("wc-view-main-a");
         let main_key_b = unique_key("wc-view-main-b");
@@ -707,7 +707,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -749,7 +749,7 @@ simulation_test!(
         );
 
         let init_err = engine
-            .init()
+            .initialize()
             .await
             .expect_err("second init should return already initialized");
         assert_eq!(init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
@@ -781,7 +781,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let file_path = format!("/{}.txt", unique_key("wc-view-nested-subquery"));
         engine

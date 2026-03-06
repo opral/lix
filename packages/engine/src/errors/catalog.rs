@@ -68,14 +68,14 @@ fn build_error(code: ErrorCode, description: &str) -> LixError {
 pub(crate) fn already_initialized_error() -> LixError {
     build_error(
         ErrorCode::AlreadyInitialized,
-        "Engine is already initialized. Create a new Engine instance to initialize again.",
+        "Lix is already initialized in this backend target.",
     )
 }
 
 pub(crate) fn not_initialized_error() -> LixError {
     build_error(
         ErrorCode::NotInitialized,
-        "Engine is not initialized. Run initLix({ backend }) before openLix({ backend }).",
+        "Lix is not initialized in this backend target. Initialize it before opening.",
     )
 }
 

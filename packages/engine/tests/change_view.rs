@@ -16,7 +16,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         engine
             .execute(
@@ -76,7 +76,7 @@ simulation_test!(lix_change_rejects_insert_update_delete, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let insert_err = engine
         .execute(

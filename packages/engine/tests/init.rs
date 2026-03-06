@@ -135,7 +135,7 @@ fn init_parallel_open_same_sqlite_path_avoids_raw_unique_conflicts() {
 
                     let result = runtime.block_on(async move {
                         let engine = boot_sqlite_engine_at_path(&path_for_thread);
-                        engine.init().await.map_err(|err| err.to_string())
+                        engine.initialize().await.map_err(|err| err.to_string())
                     });
 
                     let _ = result_tx.send(result);
@@ -203,7 +203,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     .expect("failed to build tokio runtime");
                 runtime.block_on(async move {
                     let engine_a = boot_sqlite_engine_at_path(&path_for_thread);
-                    engine_a.init().await.expect("first init should succeed");
+                    engine_a.initialize().await.expect("first init should succeed");
 
                     engine_a
                         .execute(
@@ -254,12 +254,12 @@ fn init_reopen_preserves_working_changes_sqlite() {
 
                     let engine_b = boot_sqlite_engine_at_path(&path_for_thread);
                     let reopen_init_err = engine_b
-                        .init()
+                        .initialize()
                         .await
                         .expect_err("reopen init should report already initialized");
                     assert_eq!(reopen_init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
                     engine_b
-                        .open()
+                        .open_existing()
                         .await
                         .expect("reopen open should load active version state");
 
@@ -361,7 +361,7 @@ simulation_test!(init_creates_untracked_table, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute("SELECT 1 FROM lix_internal_state_untracked LIMIT 1", &[])
@@ -377,7 +377,7 @@ simulation_test!(init_creates_snapshot_table, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute("SELECT 1 FROM lix_internal_snapshot LIMIT 1", &[])
@@ -393,7 +393,7 @@ simulation_test!(init_creates_change_table, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute("SELECT 1 FROM lix_internal_change LIMIT 1", &[])
@@ -409,7 +409,7 @@ simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute(
@@ -432,7 +432,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine
             .execute(
@@ -454,7 +454,7 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute(
@@ -492,7 +492,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
 
     let result = engine
         .execute(
@@ -580,7 +580,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let commit_id = global_version_commit_id(&engine).await;
 
@@ -624,7 +624,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let main_version_id = active_version_id(&engine).await;
         assert_ne!(main_version_id, "global");
@@ -773,7 +773,7 @@ simulation_test!(
         );
 
         let second_init_err = engine
-            .init()
+            .initialize()
             .await
             .expect_err("second init should return already initialized");
         assert_eq!(second_init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
@@ -787,10 +787,10 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let err = engine
-            .init()
+            .initialize()
             .await
             .expect_err("second init should return already initialized");
         assert_eq!(err.code, "LIX_ERROR_ALREADY_INITIALIZED");
@@ -805,7 +805,7 @@ simulation_test!(
             .await
             .expect("boot_simulated_engine should succeed");
 
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let result = engine
             .execute(
@@ -879,7 +879,7 @@ simulation_test!(init_seeds_global_system_directories, |sim| async move {
         .await
         .expect("boot_simulated_engine should succeed");
 
-    engine.init().await.unwrap();
+    engine.initialize().await.unwrap();
     let active_version_id = active_version_id(&engine).await;
 
     let result = engine

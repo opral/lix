@@ -444,7 +444,7 @@ async fn seed_engine_with_history_config(
 
     let backend = Box::new(BenchSqliteBackend::in_memory());
     let engine = boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime)));
-    engine.init().await?;
+    engine.initialize().await?;
 
     insert_stored_schema(&engine).await?;
     insert_initial_rows(&engine, config.entity_count).await?;

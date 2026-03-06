@@ -40,7 +40,7 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
         .boot_simulated_engine_deterministic()
         .await
         .expect("boot_simulated_engine_deterministic should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
 
     let active_before = engine
         .execute(
@@ -114,7 +114,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let active_before = engine
             .execute(
@@ -170,7 +170,7 @@ simulation_test!(
             .boot_simulated_engine_deterministic()
             .await
             .expect("boot_simulated_engine_deterministic should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         engine
             .execute(
@@ -204,7 +204,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.expect("init should succeed");
+        engine.initialize().await.expect("init should succeed");
 
         let created = engine
             .create_version(CreateVersionOptions {
@@ -255,7 +255,7 @@ simulation_test!(switch_version_rejects_invalid_inputs, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
 
     let empty = engine
         .switch_version("".to_string())
@@ -275,7 +275,7 @@ simulation_test!(create_version_switch_then_checkpoint, |sim| async move {
         .boot_simulated_engine(None)
         .await
         .expect("boot_simulated_engine should succeed");
-    engine.init().await.expect("init should succeed");
+    engine.initialize().await.expect("init should succeed");
 
     let created = engine
         .create_version(CreateVersionOptions::default())

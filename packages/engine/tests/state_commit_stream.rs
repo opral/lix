@@ -39,7 +39,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
@@ -81,7 +81,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
@@ -128,7 +128,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
@@ -180,7 +180,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
@@ -228,7 +228,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
@@ -274,7 +274,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
@@ -317,7 +317,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let entity_id = "state-commit-events-update-op";
         let events = engine.state_commit_stream(StateCommitStreamFilter {
@@ -363,7 +363,7 @@ simulation_test!(
             .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
-        engine.init().await.unwrap();
+        engine.initialize().await.unwrap();
 
         let entity_id = "state-commit-events-delete-op";
         let events = engine.state_commit_stream(StateCommitStreamFilter {

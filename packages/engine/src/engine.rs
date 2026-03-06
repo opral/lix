@@ -21,9 +21,7 @@ use std::sync::RwLock;
 use crate::sql::execution::contracts::effects::FilesystemPayloadDomainChange;
 use crate::sql::execution::contracts::planned_statement::MutationRow;
 
-pub use crate::boot::{
-    boot, init_lix, BootAccount, BootArgs, BootKeyValue, InitLixArgs, InitLixResult,
-};
+pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue, EngineConfig, OpenOrInitResult};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";

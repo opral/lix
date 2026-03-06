@@ -91,7 +91,7 @@ pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
             err
         ))
     })?;
-    Ok(result.created)
+    Ok(result.initialized)
 }
 
 fn find_lix_files(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {
