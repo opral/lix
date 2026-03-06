@@ -132,7 +132,7 @@ pub(crate) async fn prepare_sql2_write(
     );
     let canonicalized = canonicalize_write(bound_statement.clone(), &registry).ok()?;
     let mut planned_write = prove_write(&canonicalized).ok()?;
-    let resolved_write_plan = resolve_write_plan(&planned_write).ok()?;
+    let resolved_write_plan = resolve_write_plan(backend, &planned_write).await.ok()?;
     planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
     let domain_change_batch = build_domain_change_batch(&planned_write).ok()?;
     let commit_preconditions = derive_commit_preconditions(backend, &planned_write)
@@ -178,6 +178,7 @@ mod tests {
     struct FakeBackend {
         stored_schema_rows: HashMap<String, String>,
         version_pointer_rows: HashMap<String, String>,
+        state_rows: HashMap<String, Vec<Vec<Value>>>,
     }
 
     #[async_trait(?Send)]
@@ -198,19 +199,78 @@ mod tests {
                     columns: vec!["snapshot_content".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer") {
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_pointer'")
+            {
                 let rows = self
                     .version_pointer_rows
                     .iter()
                     .filter(|(version_id, _)| {
-                        sql.contains(&format!("entity_id = '{}'", version_id))
+                        sql.contains(&format!("c.entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
                     })
-                    .map(|(_, snapshot)| vec![Value::Text(snapshot.clone())])
+                    .map(|(version_id, snapshot)| {
+                        if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
+                            vec![
+                                Value::Text(version_id.clone()),
+                                Value::Text(snapshot.clone()),
+                            ]
+                        } else {
+                            vec![Value::Text(snapshot.clone())]
+                        }
+                    })
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
                     rows,
-                    columns: vec!["snapshot_content".to_string()],
+                    columns: if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
+                        vec!["entity_id".to_string(), "snapshot_content".to_string()]
+                    } else {
+                        vec!["snapshot_content".to_string()]
+                    },
                 });
+            }
+            if sql.contains("FROM \"lix_internal_state_materialized_v1_") {
+                if let Some((_table_name, rows)) = self
+                    .state_rows
+                    .iter()
+                    .find(|(table_name, _)| sql.contains(table_name.as_str()))
+                {
+                    let entity_filter = extract_sql_string_filter(sql, "entity_id");
+                    let version_filter = extract_sql_string_filter(sql, "version_id");
+                    let filtered_rows = rows
+                        .iter()
+                        .filter(|row| {
+                            let entity_matches = match entity_filter.as_ref() {
+                                Some(entity_id) => {
+                                    matches!(row.first(), Some(Value::Text(value)) if value == entity_id)
+                                }
+                                None => true,
+                            };
+                            let version_matches = match version_filter.as_ref() {
+                                Some(version_id) => {
+                                    matches!(row.get(4), Some(Value::Text(value)) if value == version_id)
+                                }
+                                None => true,
+                            };
+                            entity_matches && version_matches
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    return Ok(QueryResult {
+                        rows: filtered_rows,
+                        columns: vec![
+                            "entity_id".to_string(),
+                            "schema_key".to_string(),
+                            "schema_version".to_string(),
+                            "file_id".to_string(),
+                            "version_id".to_string(),
+                            "plugin_key".to_string(),
+                            "snapshot_content".to_string(),
+                            "metadata".to_string(),
+                            "change_id".to_string(),
+                        ],
+                    });
+                }
             }
             Ok(QueryResult {
                 rows: Vec::new(),
@@ -228,6 +288,14 @@ mod tests {
 
     fn parse_one(sql: &str) -> Vec<Statement> {
         Parser::parse_sql(&GenericDialect {}, sql).expect("SQL should parse")
+    }
+
+    fn extract_sql_string_filter(sql: &str, column: &str) -> Option<String> {
+        let marker = format!("{column} = '");
+        let start = sql.find(&marker)? + marker.len();
+        let rest = &sql[start..];
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
     }
 
     #[tokio::test]
@@ -485,6 +553,20 @@ mod tests {
             })
             .expect("version pointer JSON"),
         );
+        backend.state_rows.insert(
+            "lix_internal_state_materialized_v1_lix_key_value".to_string(),
+            vec![vec![
+                Value::Text("entity-1".to_string()),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("version-a".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("{\"value\":\"before\"}".to_string()),
+                Value::Text("{\"m\":1}".to_string()),
+                Value::Text("change-1".to_string()),
+            ]],
+        );
         let prepared = prepare_sql2_write(
             &backend,
             &parse_one(
@@ -517,6 +599,17 @@ mod tests {
         assert_eq!(
             prepared
                 .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .intended_post_state[0]
+                .values
+                .get("file_id"),
+            Some(&Value::Text("lix".to_string()))
+        );
+        assert_eq!(
+            prepared
+                .planned_write
                 .commit_preconditions
                 .as_ref()
                 .expect("tracked write should include commit preconditions")
@@ -535,6 +628,20 @@ mod tests {
                 commit_id: "commit-789".to_string(),
             })
             .expect("version pointer JSON"),
+        );
+        backend.state_rows.insert(
+            "lix_internal_state_materialized_v1_lix_key_value".to_string(),
+            vec![vec![
+                Value::Text("entity-1".to_string()),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("version-a".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("{\"value\":\"before\"}".to_string()),
+                Value::Null,
+                Value::Text("change-1".to_string()),
+            ]],
         );
         let prepared = prepare_sql2_write(
             &backend,
@@ -564,6 +671,16 @@ mod tests {
                 .intended_post_state[0]
                 .tombstone,
             true
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .tombstones
+                .len(),
+            1
         );
         assert_eq!(
             prepared

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::commit::{
-    append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitPreconditions,
-    AppendExpectedTip, AppendWriteLane,
+    append_commit_if_preconditions_hold, AppendCommitArgs, AppendCommitDisposition,
+    AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
 };
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::Engine;
@@ -10,6 +10,9 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
     prepare_sql2_read, prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
+};
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_domain_changes, StateCommitStreamOperation,
 };
 use crate::validation::{validate_inserts, validate_updates};
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
@@ -154,7 +157,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_backend(
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    if !sql2_tracked_insert_is_live(prepared) {
+    if !sql2_tracked_write_is_live(prepared) {
         return Ok(None);
     }
 
@@ -175,7 +178,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    if !sql2_tracked_insert_is_live(prepared) {
+    if !sql2_tracked_write_is_live(prepared) {
         return Ok(None);
     }
 
@@ -188,6 +191,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     let Some(commit_preconditions) = sql2_write.planned_write.commit_preconditions.as_ref() else {
         return Ok(None);
     };
+    let stream_operation = state_commit_stream_operation(sql2_write);
 
     for registration in &prepared.plan.preprocess.registrations {
         for statement in
@@ -197,9 +201,21 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         }
     }
 
+    if domain_change_batch.changes.is_empty() {
+        return Ok(Some(SqlExecutionOutcome {
+            public_result: QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            },
+            postprocess_file_cache_targets: BTreeSet::new(),
+            plugin_changes_committed: false,
+            state_commit_stream_changes: Vec::new(),
+        }));
+    }
+
     let mut append_functions = prepared.functions.clone();
     let timestamp = append_functions.timestamp();
-    append_commit_if_preconditions_hold(
+    let append_result = append_commit_if_preconditions_hold(
         transaction,
         AppendCommitArgs {
             timestamp,
@@ -215,6 +231,17 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     .await
     .map_err(append_commit_error_to_lix_error)?;
 
+    let plugin_changes_committed =
+        matches!(append_result.disposition, AppendCommitDisposition::Applied);
+    let state_commit_stream_changes = if plugin_changes_committed {
+        state_commit_stream_changes_from_domain_changes(
+            &domain_change_batch.changes,
+            stream_operation,
+        )?
+    } else {
+        Vec::new()
+    };
+
     let _ = writer_key;
     Ok(Some(SqlExecutionOutcome {
         public_result: QueryResult {
@@ -222,12 +249,12 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             columns: Vec::new(),
         },
         postprocess_file_cache_targets: BTreeSet::new(),
-        plugin_changes_committed: true,
-        state_commit_stream_changes: Vec::new(),
+        plugin_changes_committed,
+        state_commit_stream_changes,
     }))
 }
 
-fn sql2_tracked_insert_is_live(prepared: &PreparedExecutionContext) -> bool {
+fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
@@ -236,15 +263,11 @@ fn sql2_tracked_insert_is_live(prepared: &PreparedExecutionContext) -> bool {
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
     ) && matches!(
-        sql2_write.planned_write.command.operation_kind,
-        crate::sql2::planner::ir::WriteOperationKind::Insert
-    ) && matches!(
         sql2_write.planned_write.command.mode,
         crate::sql2::planner::ir::WriteMode::Tracked
     ) && sql2_write.domain_change_batch.is_some()
         && sql2_write.planned_write.commit_preconditions.is_some()
-        && prepared.plan.preprocess.postprocess.is_none()
-        && prepared.plan.preprocess.update_validations.is_empty()
+        && live_sql2_operation_supported(sql2_write)
         && prepared.intent.detected_file_domain_changes.is_empty()
         && prepared.intent.pending_file_writes.is_empty()
         && prepared.intent.pending_file_delete_targets.is_empty()
@@ -252,6 +275,29 @@ fn sql2_tracked_insert_is_live(prepared: &PreparedExecutionContext) -> bool {
             .intent
             .untracked_filesystem_update_domain_changes
             .is_empty()
+}
+
+fn live_sql2_operation_supported(sql2_write: &Sql2PreparedWrite) -> bool {
+    match sql2_write.planned_write.command.operation_kind {
+        crate::sql2::planner::ir::WriteOperationKind::Insert => true,
+        crate::sql2::planner::ir::WriteOperationKind::Update
+        | crate::sql2::planner::ir::WriteOperationKind::Delete => matches!(
+            sql2_write
+                .planned_write
+                .commit_preconditions
+                .as_ref()
+                .map(|preconditions| &preconditions.write_lane),
+            Some(crate::sql2::planner::ir::WriteLane::SingleVersion(_))
+        ),
+    }
+}
+
+fn state_commit_stream_operation(sql2_write: &Sql2PreparedWrite) -> StateCommitStreamOperation {
+    match sql2_write.planned_write.command.operation_kind {
+        crate::sql2::planner::ir::WriteOperationKind::Insert => StateCommitStreamOperation::Insert,
+        crate::sql2::planner::ir::WriteOperationKind::Update => StateCommitStreamOperation::Update,
+        crate::sql2::planner::ir::WriteOperationKind::Delete => StateCommitStreamOperation::Delete,
+    }
 }
 
 fn append_preconditions(

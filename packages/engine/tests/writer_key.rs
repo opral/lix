@@ -507,3 +507,69 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    sql2_state_by_version_update_uses_current_execution_writer_key,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+        register_writer_key_test_schema(&engine).await;
+
+        let version_id = active_version_id(&engine).await;
+        engine
+            .execute_with_options(
+                &format!(
+                    "INSERT INTO lix_internal_state_vtable (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) VALUES (\
+                     'wk-sql2-update', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"before\"}}', '1'\
+                     )"
+                ),
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:initial".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute_with_options(
+                &format!(
+                    "UPDATE lix_state_by_version \
+                     SET snapshot_content = '{{\"key\":\"after\"}}' \
+                     WHERE schema_key = 'wk_writer_key_schema' \
+                       AND entity_id = 'wk-sql2-update' \
+                       AND file_id = 'file-1' \
+                       AND version_id = '{version_id}'"
+                ),
+                &[],
+                ExecuteOptions {
+                    writer_key: Some("editor:update".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let state_row = engine
+            .execute(
+                &format!(
+                    "SELECT writer_key \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'wk_writer_key_schema' \
+                       AND entity_id = 'wk-sql2-update' \
+                       AND file_id = 'file-1' \
+                       AND version_id = '{version_id}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(state_row.statements[0].rows.len(), 1);
+        assert_text(&state_row.statements[0].rows[0][0], "editor:update");
+    }
+);

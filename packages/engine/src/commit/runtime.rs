@@ -13,23 +13,19 @@ use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
     parse_active_account_snapshot,
 };
-use crate::builtin_schema::types::LixVersionPointer;
-use crate::commit::{
-    DomainChangeInput, GenerateCommitResult, MaterializedStateRow, VersionInfo, VersionSnapshot,
-};
-use crate::error_classification::is_missing_relation_error;
 use crate::functions::LixFunctionProvider;
 
 use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
-use crate::{LixError, QueryResult, SqlDialect, Value as EngineValue};
+use crate::{LixError, SqlDialect, Value as EngineValue};
+
+use super::state_source::CommitQueryExecutor;
+use super::types::{DomainChangeInput, GenerateCommitResult, MaterializedStateRow};
 
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 const CHANGE_TABLE: &str = "lix_internal_change";
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
-const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
-const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 const CHANGE_AUTHOR_SCHEMA_KEY: &str = "lix_change_author";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -45,12 +41,6 @@ const MATERIALIZED_INSERT_PARAM_COLUMNS: usize = 13;
 pub(crate) struct StatementBatch {
     pub(crate) statements: Vec<Statement>,
     pub(crate) params: Vec<EngineValue>,
-}
-
-#[async_trait::async_trait(?Send)]
-pub(crate) trait CommitQueryExecutor {
-    async fn execute(&mut self, sql: &str, params: &[EngineValue])
-        -> Result<QueryResult, LixError>;
 }
 
 pub(crate) fn bind_statement_batch_for_dialect(
@@ -121,116 +111,6 @@ pub(crate) async fn load_commit_active_accounts(
     }
 
     Ok(deduped.into_iter().collect())
-}
-
-pub(crate) async fn load_version_info_for_versions(
-    executor: &mut dyn CommitQueryExecutor,
-    version_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<String, VersionInfo>, LixError> {
-    let mut versions = BTreeMap::new();
-    if version_ids.is_empty() {
-        return Ok(versions);
-    }
-
-    for version_id in version_ids {
-        versions.insert(
-            version_id.clone(),
-            VersionInfo {
-                parent_commit_ids: Vec::new(),
-                snapshot: VersionSnapshot {
-                    id: version_id.clone(),
-                },
-            },
-        );
-    }
-
-    let in_list = version_ids
-        .iter()
-        .map(|version_id| format!("'{}'", escape_sql_string(version_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT entity_id, snapshot_content \
-         FROM {table_name} \
-         WHERE schema_key = '{schema_key}' \
-           AND version_id = '{global_version}' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-           AND entity_id IN ({in_list})",
-        table_name = VERSION_POINTER_TABLE,
-        schema_key = VERSION_POINTER_SCHEMA_KEY,
-        global_version = GLOBAL_VERSION,
-        in_list = in_list,
-    );
-
-    match executor.execute(&sql, &[]).await {
-        Ok(result) => {
-            for row in result.rows {
-                if row.len() < 2 {
-                    continue;
-                }
-                let entity_id = match &row[0] {
-                    EngineValue::Text(value) => value.clone(),
-                    EngineValue::Null => continue,
-                    _ => {
-                        return Err(LixError {
-                            code: "LIX_ERROR_UNKNOWN".to_string(),
-                            description: "version tip entity_id must be text".to_string(),
-                        });
-                    }
-                };
-                if !version_ids.contains(&entity_id) {
-                    continue;
-                }
-                let Some(parsed) = parse_version_info_from_tip_snapshot(&row[1], &entity_id)?
-                else {
-                    continue;
-                };
-                versions.insert(entity_id, parsed);
-            }
-        }
-        Err(err) if is_missing_relation_error(&err) => {}
-        Err(err) => return Err(err),
-    }
-
-    Ok(versions)
-}
-
-fn parse_version_info_from_tip_snapshot(
-    value: &EngineValue,
-    fallback_version_id: &str,
-) -> Result<Option<VersionInfo>, LixError> {
-    let raw_snapshot = match value {
-        EngineValue::Text(value) => value,
-        EngineValue::Null => return Ok(None),
-        _ => {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "version tip snapshot_content must be text".to_string(),
-            });
-        }
-    };
-
-    let snapshot: LixVersionPointer =
-        serde_json::from_str(raw_snapshot).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("version tip snapshot_content invalid JSON: {error}"),
-        })?;
-    let version_id = if snapshot.id.is_empty() {
-        fallback_version_id.to_string()
-    } else {
-        snapshot.id
-    };
-    let parent_commit_ids = if snapshot.commit_id.is_empty() {
-        Vec::new()
-    } else {
-        vec![snapshot.commit_id]
-    };
-
-    Ok(Some(VersionInfo {
-        parent_commit_ids,
-        snapshot: VersionSnapshot { id: version_id },
-    }))
 }
 
 pub(crate) fn build_statement_batch_from_generate_commit_result(

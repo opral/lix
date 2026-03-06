@@ -1,17 +1,22 @@
 use std::collections::BTreeSet;
 
 use crate::builtin_schema::types::LixVersionPointer;
-use crate::commit::{
-    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
-    generate_commit, load_commit_active_accounts, load_version_info_for_versions,
-    CommitQueryExecutor, DomainChangeInput, GenerateCommitArgs, GenerateCommitResult,
-    ProposedDomainChange,
-};
 use crate::functions::LixFunctionProvider;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
 
-const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
+use super::generate_commit::generate_commit;
+use super::runtime::{
+    bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
+    load_commit_active_accounts,
+};
+use super::state_source::{
+    load_committed_version_tip_commit_id, load_version_info_for_versions, CommitQueryExecutor,
+};
+use super::types::{
+    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
+};
+
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
 const VERSION_POINTER_SCHEMA_KEY: &str = "lix_version_pointer";
 
@@ -310,45 +315,9 @@ async fn load_current_tip_commit_id(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<Option<String>, AppendCommitError> {
-    let sql = format!(
-        "SELECT snapshot_content \
-         FROM {table_name} \
-         WHERE schema_key = '{schema_key}' \
-           AND entity_id = '{entity_id}' \
-           AND file_id = 'lix' \
-           AND version_id = 'global' \
-           AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
-         LIMIT 1",
-        table_name = VERSION_POINTER_TABLE,
-        schema_key = VERSION_POINTER_SCHEMA_KEY,
-        entity_id = escape_sql_string(&concrete_lane.version_id),
-    );
-    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(Value::Text(snapshot_content)) = row.first() else {
-        return Err(AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
-            message: format!(
-                "append precondition query for '{}' returned a non-text snapshot",
-                concrete_lane.version_id
-            ),
-        });
-    };
-    let pointer: LixVersionPointer =
-        serde_json::from_str(snapshot_content).map_err(|error| AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
-            message: format!(
-                "append precondition query for '{}' returned invalid pointer JSON: {error}",
-                concrete_lane.version_id
-            ),
-        })?;
-    if pointer.commit_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(pointer.commit_id))
+    load_committed_version_tip_commit_id(executor, &concrete_lane.version_id)
+        .await
+        .map_err(backend_error)
 }
 
 async fn load_existing_idempotency_commit_id(
@@ -515,26 +484,38 @@ mod tests {
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
 
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer") {
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_pointer'")
+            {
                 let rows = self
                     .version_tips
                     .iter()
                     .filter(|(version_id, _)| {
-                        sql.contains(&format!("entity_id = '{}'", version_id))
+                        sql.contains(&format!("c.entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
                     })
                     .map(|(version_id, commit_id)| {
-                        vec![Value::Text(
+                        let snapshot = Value::Text(
                             serde_json::json!({
                                 "id": version_id,
                                 "commit_id": commit_id,
                             })
                             .to_string(),
-                        )]
+                        );
+                        if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
+                            vec![Value::Text(version_id.clone()), snapshot]
+                        } else {
+                            vec![snapshot]
+                        }
                     })
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
                     rows,
-                    columns: vec!["snapshot_content".to_string()],
+                    columns: if sql.contains("SELECT c.entity_id, s.content AS snapshot_content") {
+                        vec!["entity_id".to_string(), "snapshot_content".to_string()]
+                    } else {
+                        vec!["snapshot_content".to_string()]
+                    },
                 });
             }
 

@@ -674,6 +674,112 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    lix_state_by_version_update_respects_exact_file_predicate,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-upd-file-scope",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+
+        engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upd-file-scope' \
+                   AND file_id = 'other-file' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT file_id, snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upd-file-scope' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "test-file");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_update_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-upd-idem",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+
+        engine
+            .execute(
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = '{\"value\":\"after\"}' \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-upd-idem' \
+                   AND file_id = 'test-file' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let matched = rows.statements[0]
+            .rows
+            .iter()
+            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == "version:version-a"))
+            .expect("version idempotency row should exist");
+        match &matched[1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
+    }
+);
+
 // TODO(parity): Legacy SDK supports broader placeholder forms in UPDATE assignments.
 // Rust vtable UPDATE currently requires snapshot_content as a direct literal/parameter expression.
 
@@ -822,6 +928,110 @@ simulation_test!(
         sim.assert_deterministic(visible.statements[0].rows.clone());
         assert_eq!(visible.statements[0].rows.len(), 1);
         assert_text(&visible.statements[0].rows[0][0], "version-b");
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_delete_respects_exact_file_predicate,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-del-file-scope",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+
+        engine
+            .execute(
+                "DELETE FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-del-file-scope' \
+                   AND file_id = 'other-file' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT file_id, snapshot_content \
+                 FROM lix_internal_state_vtable \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-del-file-scope' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "test-file");
+        assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_by_version_delete_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        register_test_schema(&engine).await;
+        insert_version(&engine, "version-a").await;
+        insert_state_row(
+            &engine,
+            "entity-del-idem",
+            "version-a",
+            "{\"value\":\"before\"}",
+        )
+        .await;
+
+        engine
+            .execute(
+                "DELETE FROM lix_state_by_version \
+                 WHERE schema_key = 'test_state_schema' \
+                   AND entity_id = 'entity-del-idem' \
+                   AND file_id = 'test-file' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let matched = rows.statements[0]
+            .rows
+            .iter()
+            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == "version:version-a"))
+            .expect("version idempotency row should exist");
+        match &matched[1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
     }
 );
 
