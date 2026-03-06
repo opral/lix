@@ -1,7 +1,7 @@
-use sqlparser::ast::{Delete, Insert, Statement, Update};
+use sqlparser::ast::{Delete, Insert, Update};
 
 use crate::engine::sql::planning::rewrite_engine::steps::filesystem_step;
-use crate::filesystem::mutation_rewrite::ResolvedDirectoryIdMap;
+use crate::filesystem::mutation_rewrite::{FilesystemUpdateRewrite, ResolvedDirectoryIdMap};
 use crate::LixBackend;
 use crate::{LixError, Value};
 
@@ -34,7 +34,7 @@ pub(crate) async fn rewrite_insert_with_backend(
     .await
 }
 
-pub(crate) fn rewrite_update(update: Update) -> Result<Option<Statement>, LixError> {
+pub(crate) fn rewrite_update(update: Update) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     filesystem_step::rewrite_update(update)
 }
 
@@ -42,7 +42,7 @@ pub(crate) async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     update: Update,
     params: &[Value],
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     filesystem_step::rewrite_update_with_backend(backend, update, params).await
 }
 

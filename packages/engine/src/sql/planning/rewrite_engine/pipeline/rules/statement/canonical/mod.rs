@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 
-use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, Query, Select, SelectItem, Statement};
+use sqlparser::ast::Statement;
 
 use crate::engine::sql::contracts::effects::DetectedFileDomainChange as Sql2DetectedFileDomainChange;
 use crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query_with_backend_and_params;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
-use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput};
+use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::engine::sql::planning::rewrite_engine::DetectedFileDomainChange;
+use crate::filesystem::mutation_rewrite::FilesystemUpdateRewrite;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
@@ -67,6 +68,7 @@ where
     let mut queue = VecDeque::from([Pending::Statement(statement)]);
     let mut final_output = RewriteOutput {
         statements: Vec::new(),
+        effect_only: false,
         params: Vec::new(),
         registrations: Vec::new(),
         postprocess: None,
@@ -108,7 +110,7 @@ where
         }
     }
 
-    if final_output.statements.is_empty() {
+    if final_output.statements.is_empty() && !final_output.effect_only {
         Ok(None)
     } else {
         Ok(Some(final_output))
@@ -220,7 +222,16 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_state_history_view_write::reject_update(&update)?;
 
                 if let Some(rewritten) = filesystem_write::rewrite_update(update.clone())? {
-                    current = rewritten;
+                    match rewritten {
+                        FilesystemUpdateRewrite::EffectOnly => {
+                            return Ok(StatementRuleOutcome::Emit(
+                                context.take_effect_only_output(),
+                            ));
+                        }
+                        FilesystemUpdateRewrite::Statement(rewritten) => {
+                            current = rewritten;
+                        }
+                    }
                     continue;
                 }
                 if let Some(rewritten) =
@@ -272,6 +283,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 let query = crate::engine::sql::planning::rewrite_engine::pipeline::query_engine::rewrite_read_query(*query)?;
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![Statement::Query(Box::new(query))],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
@@ -306,6 +318,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                         format,
                         options,
                     }],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
@@ -316,6 +329,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![other],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: None,
@@ -514,12 +528,16 @@ where
                 )
                 .await?
                 {
-                    if filesystem_noop_statement(&rewritten)
-                        && !context.detected_file_domain_changes.is_empty()
-                    {
-                        context.postprocess = Some(PostprocessPlan::DomainChangesOnly);
+                    match rewritten {
+                        FilesystemUpdateRewrite::EffectOnly => {
+                            return Ok(StatementRuleOutcome::Emit(
+                                context.take_effect_only_output(),
+                            ));
+                        }
+                        FilesystemUpdateRewrite::Statement(rewritten) => {
+                            current = rewritten;
+                        }
                     }
-                    current = rewritten;
                     continue;
                 }
 
@@ -683,6 +701,7 @@ where
                         .await?;
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![Statement::Query(Box::new(query))],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: context.postprocess.take(),
@@ -718,6 +737,7 @@ where
                         format,
                         options,
                     }],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: context.postprocess.take(),
@@ -728,6 +748,7 @@ where
             other => {
                 return Ok(StatementRuleOutcome::Emit(RewriteOutput {
                     statements: vec![other],
+                    effect_only: false,
                     params: Vec::new(),
                     registrations: Vec::new(),
                     postprocess: context.postprocess.take(),
@@ -739,116 +760,6 @@ where
     }
 
     Ok(StatementRuleOutcome::Continue(current))
-}
-
-fn filesystem_noop_statement(statement: &Statement) -> bool {
-    let Statement::Query(query) = statement else {
-        return false;
-    };
-    filesystem_noop_query(query)
-}
-
-fn filesystem_noop_query(query: &Query) -> bool {
-    if query.with.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || !query.locks.is_empty()
-        || query.for_clause.is_some()
-        || query.settings.is_some()
-        || query.format_clause.is_some()
-        || !query.pipe_operators.is_empty()
-    {
-        return false;
-    }
-
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    filesystem_noop_select(select)
-}
-
-fn filesystem_noop_select(select: &Select) -> bool {
-    if select.projection.len() != 1 {
-        return false;
-    }
-    if !select.from.is_empty() {
-        return false;
-    }
-    if !select_group_by_is_empty(select) {
-        return false;
-    }
-    if select.distinct.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || select.having.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-    {
-        return false;
-    }
-
-    let Some(selection) = select.selection.as_ref() else {
-        return false;
-    };
-
-    filesystem_noop_projection_item(select.projection.first())
-        && filesystem_noop_predicate(selection)
-}
-
-fn select_group_by_is_empty(select: &Select) -> bool {
-    match &select.group_by {
-        GroupByExpr::Expressions(expressions, modifiers) => {
-            expressions.is_empty() && modifiers.is_empty()
-        }
-        GroupByExpr::All(_) => false,
-    }
-}
-
-fn filesystem_noop_projection_item(item: Option<&SelectItem>) -> bool {
-    let Some(SelectItem::UnnamedExpr(expr)) = item else {
-        return false;
-    };
-    expr_is_integer_literal(expr, 0)
-}
-
-fn filesystem_noop_predicate(expr: &Expr) -> bool {
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = strip_nested_expr(expr)
-    else {
-        return false;
-    };
-
-    (expr_is_integer_literal(left.as_ref(), 1) && expr_is_integer_literal(right.as_ref(), 0))
-        || (expr_is_integer_literal(left.as_ref(), 0) && expr_is_integer_literal(right.as_ref(), 1))
-}
-
-fn strip_nested_expr(mut expr: &Expr) -> &Expr {
-    while let Expr::Nested(inner) = expr {
-        expr = inner.as_ref();
-    }
-    expr
-}
-
-fn expr_is_integer_literal(expr: &Expr, expected: i64) -> bool {
-    let Expr::Value(value) = strip_nested_expr(expr) else {
-        return false;
-    };
-    let sqlparser::ast::Value::Number(number, _) = &value.value else {
-        return false;
-    };
-    number.parse::<i64>().ok() == Some(expected)
 }
 
 fn insert_target_name(insert: &sqlparser::ast::Insert) -> String {
@@ -881,10 +792,35 @@ fn sql_change_to_detected_file_domain_change(
 
 #[cfg(test)]
 mod tests {
-    use super::filesystem_noop_statement;
+    use super::rewrite_backend_statement;
+    use crate::functions::SystemFunctionProvider;
+    use crate::{LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use sqlparser::ast::Statement;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+
+    struct NoopBackend;
+
+    #[async_trait::async_trait(?Send)]
+    impl LixBackend for NoopBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn begin_transaction(&self) -> Result<Box<dyn LixTransaction + '_>, LixError> {
+            Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "transactions are not supported in this test backend".to_string(),
+            })
+        }
+    }
 
     fn parse_statement(sql: &str) -> Statement {
         let mut statements =
@@ -893,21 +829,19 @@ mod tests {
         statements.remove(0)
     }
 
-    #[test]
-    fn filesystem_noop_statement_matches_ast_shape() {
-        let statement = parse_statement("SELECT 0 WHERE 1 = 0");
-        assert!(filesystem_noop_statement(&statement));
-    }
+    #[tokio::test]
+    async fn data_only_filesystem_update_rewrites_to_effect_only_output() {
+        let backend = NoopBackend;
+        let statement = parse_statement("UPDATE lix_file SET data = X'01' WHERE id = 'f1'");
+        let mut functions = SystemFunctionProvider;
 
-    #[test]
-    fn filesystem_noop_statement_ignores_sql_rendering_variants() {
-        let statement = parse_statement("select (0) where (1)=(0)");
-        assert!(filesystem_noop_statement(&statement));
-    }
+        let output = rewrite_backend_statement(&backend, statement, &[], None, &mut functions, &[])
+            .await
+            .expect("rewrite should succeed")
+            .expect("filesystem update should match rewrite rule");
 
-    #[test]
-    fn filesystem_noop_statement_rejects_non_noop_predicate() {
-        let statement = parse_statement("SELECT 0 WHERE 1 = 1");
-        assert!(!filesystem_noop_statement(&statement));
+        assert!(output.statements.is_empty());
+        assert!(output.effect_only);
+        assert!(output.postprocess.is_none());
     }
 }

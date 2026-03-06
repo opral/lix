@@ -19,6 +19,7 @@ use crate::engine::sql::planning::rewrite_engine::{
     rewrite_read_query_with_backend_and_params_in_session, ReadRewriteSession,
 };
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::filesystem::live_projection::build_live_file_prefetch_projection_sql;
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     file_ancestor_directory_paths, normalize_directory_path, normalize_file_path,
@@ -63,6 +64,12 @@ pub struct FilesystemInsertSideEffects {
 pub struct FilesystemUpdateSideEffects {
     pub tracked_directory_changes: Vec<DetectedFileDomainChange>,
     pub untracked_directory_changes: Vec<DetectedFileDomainChange>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum FilesystemUpdateRewrite {
+    Statement(Statement),
+    EffectOnly,
 }
 
 pub fn rewrite_insert(mut insert: Insert) -> Result<Option<Insert>, LixError> {
@@ -467,7 +474,7 @@ pub async fn update_side_effects_with_backend(
     }
 }
 
-pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError> {
+pub fn rewrite_update(mut update: Update) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     let Some(target) = target_from_update_table(&update.table) else {
         return Ok(None);
     };
@@ -488,19 +495,21 @@ pub fn rewrite_update(mut update: Update) -> Result<Option<Statement>, LixError>
                 .unwrap_or(true)
         });
         if update.assignments.is_empty() {
-            return Ok(Some(noop_statement()?));
+            return Ok(Some(FilesystemUpdateRewrite::EffectOnly));
         }
     }
 
     replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
-    Ok(Some(Statement::Update(update)))
+    Ok(Some(FilesystemUpdateRewrite::Statement(Statement::Update(
+        update,
+    ))))
 }
 
 pub async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     mut update: Update,
     params: &[EngineValue],
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     let Some(target) = target_from_update_table(&update.table) else {
         return Ok(None);
     };
@@ -522,7 +531,7 @@ pub async fn rewrite_update_with_backend(
                 .unwrap_or(true)
         });
         if update.assignments.is_empty() {
-            return Ok(Some(noop_statement()?));
+            return Ok(Some(FilesystemUpdateRewrite::EffectOnly));
         }
         rewrite_file_update_assignments_with_backend(
             backend,
@@ -563,7 +572,9 @@ pub async fn rewrite_update_with_backend(
     }
 
     replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
-    Ok(Some(Statement::Update(update)))
+    Ok(Some(FilesystemUpdateRewrite::Statement(Statement::Update(
+        update,
+    ))))
 }
 
 pub fn rewrite_delete(mut delete: Delete) -> Result<Option<Delete>, LixError> {
@@ -2898,27 +2909,37 @@ async fn file_rows_matching_selection(
     read_rewrite_session: &mut ReadRewriteSession,
     operation: &str,
 ) -> Result<Vec<ScopedFileSelectionRow>, LixError> {
-    let where_clause = selection
-        .map(|selection| format!(" WHERE {selection}"))
-        .unwrap_or_default();
     let active_version_id = if target.uses_active_version_scope() {
         Some(load_active_version_id(backend).await?)
     } else {
         None
     };
-    let sql = if target.uses_active_version_scope() {
+    let live_projection_sql = build_live_file_prefetch_projection_sql();
+    let mut sql = if target.uses_active_version_scope() {
         format!(
-            "SELECT id FROM {view_name}{where_clause}",
-            view_name = target.view_name,
-            where_clause = where_clause
+            "SELECT id FROM ({live_projection_sql}) AS live_files \
+             WHERE lixcol_version_id = '{active_version_id}'",
+            active_version_id =
+                escape_sql_string(active_version_id.as_deref().ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description:
+                        "active version id is missing for file scoped selection".to_string(),
+                })?),
         )
     } else {
         format!(
-            "SELECT id, lixcol_version_id FROM {view_name}{where_clause}",
-            view_name = target.view_name,
-            where_clause = where_clause
+            "SELECT id, lixcol_version_id FROM ({}) AS live_files",
+            live_projection_sql
         )
     };
+    if let Some(selection) = selection {
+        sql.push_str(if target.uses_active_version_scope() {
+            " AND "
+        } else {
+            " WHERE "
+        });
+        sql.push_str(&selection.to_string());
+    }
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
     let bound = bind_sql_with_state(
@@ -3040,18 +3061,30 @@ async fn file_ids_matching_update(
         return Ok(rows);
     }
 
-    let where_clause = update
-        .selection
-        .as_ref()
-        .map(|selection| format!(" WHERE {selection}"))
-        .unwrap_or_default();
-    let sql = format!(
-        "SELECT id, lixcol_untracked, \
-                'mutation.file_ids_matching_update' AS __lix_trace \
-         FROM {view_name}{where_clause}",
-        view_name = target.view_name,
-        where_clause = where_clause
+    let active_version_id = if target.uses_active_version_scope() {
+        Some(load_active_version_id(backend).await?)
+    } else {
+        None
+    };
+    let live_projection_sql = build_live_file_prefetch_projection_sql();
+    let mut sql = format!(
+        "SELECT id, lixcol_untracked FROM ({}) AS live_files",
+        live_projection_sql
     );
+    if let Some(active_version_id) = active_version_id.as_ref() {
+        sql.push_str(&format!(
+            " WHERE lixcol_version_id = '{}'",
+            escape_sql_string(active_version_id)
+        ));
+    }
+    if let Some(selection) = update.selection.as_ref() {
+        sql.push_str(if active_version_id.is_some() {
+            " AND "
+        } else {
+            " WHERE "
+        });
+        sql.push_str(&selection.to_string());
+    }
     let rewritten_sql =
         rewrite_single_read_query_for_backend(backend, &sql, params, read_rewrite_session).await?;
     let bound = bind_sql_with_state(&rewritten_sql, params, backend.dialect(), placeholder_state)?;
@@ -3915,29 +3948,13 @@ fn table_name(name: &str) -> ObjectName {
     ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))])
 }
 
-fn noop_statement() -> Result<Statement, LixError> {
-    let mut statements =
-        Parser::parse_sql(&GenericDialect {}, "SELECT 0 WHERE 1 = 0").map_err(|error| {
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.to_string(),
-            }
-        })?;
-    if statements.len() != 1 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "failed to build filesystem no-op statement".to_string(),
-        });
-    }
-    Ok(statements.remove(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         extract_predicate_string_with_params_and_state, json_text_expr_sql, load_version_chain_ids,
         parse_exact_file_descriptor_lookup_rows, parse_expression, rewrite_delete, rewrite_insert,
-        rewrite_update, select_effective_entity_tombstone_state, ReadRewriteSession,
+        rewrite_update, select_effective_entity_tombstone_state, FilesystemUpdateRewrite,
+        ReadRewriteSession,
     };
     use crate::engine::sql::ast::utils::{
         parse_sql_statements, resolve_expr_cell_with_state, PlaceholderState,
@@ -3981,7 +3998,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_data_only_update_to_noop_main_statement() {
+    fn rewrites_data_only_update_to_effect_only_rewrite() {
         let sql = "UPDATE lix_file SET data = X'01' WHERE id = 'f1'";
         let statements = parse_sql_statements(sql).expect("parse");
         let update = match statements.into_iter().next().expect("statement") {
@@ -3992,7 +4009,7 @@ mod tests {
         let rewritten = rewrite_update(update)
             .expect("rewrite")
             .expect("should rewrite");
-        assert_eq!(rewritten.to_string(), "SELECT 0 WHERE 1 = 0");
+        assert!(matches!(rewritten, FilesystemUpdateRewrite::EffectOnly));
     }
 
     #[test]

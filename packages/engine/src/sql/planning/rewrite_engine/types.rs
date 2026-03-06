@@ -21,6 +21,7 @@ pub(crate) type PreparedStatement =
 #[derive(Debug, Clone)]
 pub(crate) struct RewriteOutput {
     pub(crate) statements: Vec<Statement>,
+    pub(crate) effect_only: bool,
     pub(crate) params: Vec<Value>,
     pub(crate) registrations: Vec<SchemaRegistration>,
     pub(crate) postprocess: Option<PostprocessPlan>,

@@ -50,7 +50,12 @@ pub(crate) fn validate_phase_invariants(
 }
 
 pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
-    if output.statements.is_empty() {
+    if output.statements.is_empty()
+        && !(output.effect_only
+            && output.postprocess.is_none()
+            && output.mutations.is_empty()
+            && output.update_validations.is_empty())
+    {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "statement rewrite produced no statements".to_string(),
@@ -114,14 +119,13 @@ pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), Li
                     });
                 }
             }
-            PostprocessPlan::DomainChangesOnly => {}
         }
     }
     Ok(())
 }
 
 fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
-    matches!(plan, Some(other) if !matches!(other, PostprocessPlan::VtableUpdate(_)))
+    matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }
 
 pub(crate) fn validate_no_unresolved_logical_read_views(query: &Query) -> Result<(), LixError> {
@@ -222,6 +226,7 @@ mod tests {
     fn statement_validator_rejects_postprocess_with_mutations() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
@@ -253,6 +258,7 @@ mod tests {
     fn statement_validator_rejects_update_validation_with_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement(), empty_update_statement()],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
@@ -278,6 +284,7 @@ mod tests {
     fn statement_validator_rejects_update_validation_on_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: None,
@@ -303,6 +310,7 @@ mod tests {
     fn statement_validator_rejects_vtable_update_postprocess_on_non_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
@@ -325,6 +333,7 @@ mod tests {
     fn statement_validator_allows_multi_statement_vtable_update_postprocess() {
         let output = RewriteOutput {
             statements: vec![empty_update_statement(), empty_update_statement()],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableUpdate(VtableUpdatePlan {
@@ -344,6 +353,7 @@ mod tests {
     fn statement_validator_rejects_vtable_delete_postprocess_on_non_delete_or_update_statement() {
         let output = RewriteOutput {
             statements: vec![empty_statement()],
+            effect_only: false,
             params: Vec::new(),
             registrations: Vec::new(),
             postprocess: Some(PostprocessPlan::VtableDelete(VtableDeletePlan {
@@ -361,5 +371,21 @@ mod tests {
         assert!(err
             .description
             .contains("vtable delete postprocess requires an UPDATE or DELETE statement"));
+    }
+
+    #[test]
+    fn statement_validator_allows_effect_only_output_without_sql_statements() {
+        let output = RewriteOutput {
+            statements: Vec::new(),
+            effect_only: true,
+            params: Vec::new(),
+            registrations: Vec::new(),
+            postprocess: None,
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+        };
+
+        validate_statement_output(&output)
+            .expect("effect-only output without SQL statements should be valid");
     }
 }

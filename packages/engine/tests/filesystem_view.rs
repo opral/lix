@@ -69,6 +69,34 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     }
 }
 
+async fn binary_blob_hash_for_file_version(
+    engine: &support::simulation_test::SimulationEngine,
+    file_id: &str,
+    version_id: &str,
+) -> String {
+    let rows = engine
+        .execute(
+            &format!(
+                "SELECT lix_json_extract(snapshot_content, 'blob_hash') \
+                 FROM lix_state_by_version \
+                 WHERE file_id = '{}' \
+                   AND version_id = '{}' \
+                   AND schema_key = 'lix_binary_blob_ref' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                file_id, version_id
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected blob hash as text, got {other:?}"),
+    }
+}
+
 async fn insert_version(
     engine: &support::simulation_test::SimulationEngine,
     version_id: &str,
@@ -203,76 +231,69 @@ simulation_test!(
     }
 );
 
-simulation_test!(file_view_update_data_updates_file_cache, |sim| async move {
-    let engine = sim
-        .boot_simulated_engine_deterministic()
-        .await
-        .expect("boot_simulated_engine should succeed");
-    engine.init().await.unwrap();
+simulation_test!(
+    file_view_update_data_updates_binary_blob_ref_without_touching_descriptor_state,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
 
-    engine
+        engine
         .execute(
             "INSERT INTO lix_file (id, path, data) VALUES ('file-2', '/src/readme.md', X'69676E6F726564')", &[])
         .await
         .unwrap();
 
-    let before = engine
-        .execute(
-            "SELECT COUNT(*) FROM lix_internal_state_vtable \
+        let before = engine
+            .execute(
+                "SELECT COUNT(*) FROM lix_internal_state_vtable \
              WHERE schema_key = 'lix_file_descriptor' \
                AND entity_id = 'file-2' \
                AND snapshot_content IS NOT NULL",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(before.statements[0].rows.len(), 1);
-    let version_id = active_version_id(&engine).await;
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.statements[0].rows.len(), 1);
+        let version_id = active_version_id(&engine).await;
+        let before_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "file-2", &version_id).await;
 
-    engine
-        .execute(
-            "UPDATE lix_file SET data = X'69676E6F7265642D616761696E' WHERE id = 'file-2'",
-            &[],
-        )
-        .await
-        .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_file SET data = X'69676E6F7265642D616761696E' WHERE id = 'file-2'",
+                &[],
+            )
+            .await
+            .unwrap();
 
-    let after = engine
-        .execute(
-            "SELECT COUNT(*) FROM lix_internal_state_vtable \
+        let after = engine
+            .execute(
+                "SELECT COUNT(*) FROM lix_internal_state_vtable \
              WHERE schema_key = 'lix_file_descriptor' \
                AND entity_id = 'file-2' \
                AND snapshot_content IS NOT NULL",
-            &[],
-        )
-        .await
-        .unwrap();
+                &[],
+            )
+            .await
+            .unwrap();
 
-    sim.assert_deterministic(after.statements[0].rows.clone());
-    assert_eq!(before.statements[0].rows, after.statements[0].rows);
+        sim.assert_deterministic(after.statements[0].rows.clone());
+        assert_eq!(before.statements[0].rows, after.statements[0].rows);
 
-    let file_row = engine
-        .execute("SELECT data FROM lix_file WHERE id = 'file-2'", &[])
-        .await
-        .unwrap();
-    assert_eq!(file_row.statements[0].rows.len(), 1);
-    assert_blob_text(&file_row.statements[0].rows[0][0], "ignored-again");
-
-    let cache_row = engine
-        .execute(
-            &format!(
-                "SELECT data FROM lix_internal_file_data_cache \
-                 WHERE file_id = 'file-2' \
-                   AND version_id = '{}'",
-                version_id.replace('\'', "''")
-            ),
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(cache_row.statements[0].rows.len(), 1);
-    assert_blob_text(&cache_row.statements[0].rows[0][0], "ignored-again");
-});
+        let file_row = engine
+            .execute("SELECT data FROM lix_file WHERE id = 'file-2'", &[])
+            .await
+            .unwrap();
+        assert_eq!(file_row.statements[0].rows.len(), 1);
+        assert_blob_text(&file_row.statements[0].rows[0][0], "ignored-again");
+        let after_blob_hash =
+            binary_blob_hash_for_file_version(&engine, "file-2", &version_id).await;
+        assert_ne!(before_blob_hash, after_blob_hash);
+    }
+);
 
 simulation_test!(
     lix_file_update_data_with_qmark_params_persists_bytes,
@@ -584,7 +605,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_data_manifest_only_auto_materializes,
+    file_data_returns_null_when_blob_store_row_missing,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -603,22 +624,8 @@ simulation_test!(
             .expect("insert should succeed");
 
         let version_id = active_version_id(&engine).await;
-        let blob_hash_rows = engine
-            .execute(
-                &format!(
-                    "SELECT blob_hash FROM lix_internal_binary_file_version_ref \
-                     WHERE file_id = 'qa-manifest-only' AND version_id = '{}' LIMIT 1",
-                    version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("blob hash query should succeed");
-        assert_eq!(blob_hash_rows.statements[0].rows.len(), 1);
-        let blob_hash = match &blob_hash_rows.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text blob hash, got {other:?}"),
-        };
+        let blob_hash =
+            binary_blob_hash_for_file_version(&engine, "qa-manifest-only", &version_id).await;
 
         engine
             .execute(
@@ -651,12 +658,12 @@ simulation_test!(
             .expect("decode read should succeed");
 
         assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_text(&rows.statements[0].rows[0][0], "manifest-only");
+        assert!(matches!(rows.statements[0].rows[0][0], Value::Null));
     }
 );
 
 simulation_test!(
-    file_data_unrecoverable_returns_explicit_error,
+    file_data_returns_null_when_payload_is_missing,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -675,22 +682,8 @@ simulation_test!(
             .expect("insert should succeed");
 
         let version_id = active_version_id(&engine).await;
-        let blob_hash_rows = engine
-            .execute(
-                &format!(
-                    "SELECT blob_hash FROM lix_internal_binary_file_version_ref \
-                     WHERE file_id = 'qa-unrecoverable' AND version_id = '{}' LIMIT 1",
-                    version_id
-                ),
-                &[],
-            )
-            .await
-            .expect("blob hash query should succeed");
-        assert_eq!(blob_hash_rows.statements[0].rows.len(), 1);
-        let blob_hash = match &blob_hash_rows.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text blob hash, got {other:?}"),
-        };
+        let blob_hash =
+            binary_blob_hash_for_file_version(&engine, "qa-unrecoverable", &version_id).await;
 
         engine
             .execute(
@@ -723,14 +716,15 @@ simulation_test!(
             )
             .await
             .expect("manifest chunk delete should succeed");
-        let error = engine
+        let rows = engine
             .execute(
                 "SELECT lix_text_decode(data) FROM lix_file WHERE id = 'qa-unrecoverable' LIMIT 1",
                 &[],
             )
             .await
-            .expect_err("unrecoverable read should fail");
-        assert_eq!(error.code, "LIX_ERROR_FILE_DATA_UNAVAILABLE");
+            .expect("unrecoverable read should succeed with null payload");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert!(matches!(rows.statements[0].rows[0][0], Value::Null));
     }
 );
 

@@ -8,8 +8,6 @@ use sqlparser::ast::Statement;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IntentCollectionPolicy {
-    pub(crate) allow_plugin_cache: bool,
-    pub(crate) detect_plugin_file_changes: bool,
     pub(crate) skip_side_effect_collection: bool,
 }
 
@@ -53,8 +51,6 @@ pub(crate) async fn collect_execution_intent_with_backend(
                 params,
                 active_version_id,
                 writer_key,
-                policy.allow_plugin_cache,
-                policy.detect_plugin_file_changes,
             )
             .await?
     };

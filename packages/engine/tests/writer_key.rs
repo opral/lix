@@ -407,7 +407,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_file_writes_persist_file_data_cache,
+    transaction_file_writes_persist_payload_reads,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -451,20 +451,6 @@ simulation_test!(
             .unwrap();
         assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_blob_text(&file_rows.statements[0].rows[0][0], "after");
-
-        let version_id = active_version_id(&engine).await;
-        let cache_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data FROM lix_internal_file_data_cache \
-                     WHERE file_id = 'wk-tx-cache' AND version_id = '{version_id}'"
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(cache_rows.statements[0].rows.len(), 1);
-        assert_blob_text(&cache_rows.statements[0].rows[0][0], "after");
     }
 );
 

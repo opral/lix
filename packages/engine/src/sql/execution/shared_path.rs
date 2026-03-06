@@ -16,8 +16,6 @@ use super::intent::{
 use sqlparser::ast::Statement;
 
 pub(crate) struct PreparationPolicy {
-    pub(crate) allow_plugin_cache: bool,
-    pub(crate) detect_plugin_file_changes: bool,
     pub(crate) skip_side_effect_collection: bool,
 }
 
@@ -31,8 +29,6 @@ pub(crate) struct PreparedExecutionContext {
 
 pub(crate) struct CacheTargets {
     pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
-    pub(crate) file_data_cache_invalidation_targets: BTreeSet<(String, String)>,
-    pub(crate) file_path_cache_invalidation_targets: BTreeSet<(String, String)>,
 }
 
 pub(crate) async fn prepare_execution_with_backend(
@@ -73,8 +69,6 @@ pub(crate) async fn prepare_execution_with_backend(
         writer_key,
         &requirements,
         IntentCollectionPolicy {
-            allow_plugin_cache: policy.allow_plugin_cache,
-            detect_plugin_file_changes: policy.detect_plugin_file_changes,
             skip_side_effect_collection: policy.skip_side_effect_collection,
         },
     )
@@ -127,18 +121,8 @@ pub(crate) fn derive_cache_targets(
     } else {
         BTreeSet::new()
     };
-    let mut file_path_cache_invalidation_targets =
-        plan.effects.file_path_cache_invalidation_targets.clone();
-    let mut file_data_cache_invalidation_targets =
-        plan.effects.file_data_cache_invalidation_targets.clone();
-    if plan.requirements.should_refresh_file_cache {
-        file_path_cache_invalidation_targets.extend(file_cache_refresh_targets.iter().cloned());
-        file_data_cache_invalidation_targets.extend(file_cache_refresh_targets.iter().cloned());
-    }
 
     CacheTargets {
         file_cache_refresh_targets,
-        file_data_cache_invalidation_targets,
-        file_path_cache_invalidation_targets,
     }
 }

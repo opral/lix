@@ -13,6 +13,7 @@ pub(crate) fn apply_sync(statement: Statement) -> Result<Option<RewriteOutput>, 
     let rewritten = rewrite_read_query(*query)?;
     Ok(Some(RewriteOutput {
         statements: vec![Statement::Query(Box::new(rewritten))],
+        effect_only: false,
         params: Vec::new(),
         registrations: Vec::new(),
         postprocess: None,
@@ -32,6 +33,7 @@ pub(crate) async fn apply_backend(
     let rewritten = rewrite_read_query_with_backend_and_params(backend, *query, params).await?;
     Ok(Some(RewriteOutput {
         statements: vec![Statement::Query(Box::new(rewritten))],
+        effect_only: false,
         params: Vec::new(),
         registrations: Vec::new(),
         postprocess: None,

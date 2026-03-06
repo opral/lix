@@ -14,8 +14,7 @@ use crate::key_value::{
     KEY_VALUE_GLOBAL_VERSION,
 };
 use crate::materialization::{
-    MaterializationApplyReport, MaterializationDebugMode, MaterializationPlan,
-    MaterializationReport, MaterializationRequest, MaterializationScope,
+    MaterializationApplyReport, MaterializationPlan, MaterializationReport, MaterializationRequest,
 };
 use crate::plugin::types::InstalledPlugin;
 use crate::state_commit_stream::{
@@ -254,8 +253,6 @@ pub(crate) struct DeferredTransactionSideEffects {
     pending_file_delete_targets: BTreeSet<(String, String)>,
     detected_file_domain_changes: Vec<DetectedFileDomainChange>,
     untracked_filesystem_update_domain_changes: Vec<DetectedFileDomainChange>,
-    file_data_cache_invalidation_targets: BTreeSet<(String, String)>,
-    file_path_cache_invalidation_targets: BTreeSet<(String, String)>,
 }
 
 #[derive(Default)]
@@ -410,35 +407,6 @@ impl Engine {
     }
 }
 
-fn file_name_and_extension_from_path(path: &str) -> Option<(String, Option<String>)> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    let file_name = trimmed.rsplit('/').next()?;
-    if file_name.is_empty() {
-        return None;
-    }
-    let last_dot = file_name.rfind('.');
-    let (name, extension) = match last_dot {
-        Some(index) if index > 0 => {
-            let name = file_name[..index].to_string();
-            let extension = file_name[index + 1..].to_string();
-            let extension = if extension.is_empty() {
-                None
-            } else {
-                Some(extension)
-            };
-            (name, extension)
-        }
-        _ => (file_name.to_string(), None),
-    };
-    if name.is_empty() {
-        return None;
-    }
-    Some((name, extension))
-}
-
 fn collapse_pending_file_writes_for_transaction(
     writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
 ) -> Vec<crate::filesystem::pending_file_writes::PendingFileWrite> {
@@ -482,16 +450,6 @@ fn direct_state_file_cache_refresh_targets(
         .filter(|mutation| mutation.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY)
         .filter(|mutation| mutation.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|mutation| (mutation.file_id.clone(), mutation.version_id.clone()))
-        .collect()
-}
-
-fn file_descriptor_cache_eviction_targets(mutations: &[MutationRow]) -> BTreeSet<(String, String)> {
-    mutations
-        .iter()
-        .filter(|mutation| !mutation.untracked)
-        .filter(|mutation| mutation.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
-        .filter(|mutation| mutation.snapshot_content.is_none())
-        .map(|mutation| (mutation.entity_id.clone(), mutation.version_id.clone()))
         .collect()
 }
 
@@ -690,7 +648,7 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
 mod tests {
     use super::{
         boot, detected_file_domain_changes_from_detected_file_changes,
-        detected_file_domain_changes_with_writer_key, file_descriptor_cache_eviction_targets,
+        detected_file_domain_changes_with_writer_key,
         should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
@@ -698,9 +656,7 @@ mod tests {
     use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
     use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
-    use crate::engine::sql::contracts::planned_statement::{
-        MutationOperation, MutationRow, UpdateValidationPlan,
-    };
+    use crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
     use crate::engine::sql::history::plugin_inputs::{
         file_history_read_materialization_required_for_statements,
         file_read_materialization_scope_for_statements, FileReadMaterializationScope,
@@ -1477,48 +1433,6 @@ mod tests {
                  WHERE id = 'file-a' \
              )",
         ));
-    }
-
-    #[test]
-    fn descriptor_delete_targets_cache_eviction_by_entity_id_and_version_id() {
-        let targets = file_descriptor_cache_eviction_targets(&[
-            MutationRow {
-                operation: MutationOperation::Insert,
-                entity_id: "file-a".to_string(),
-                schema_key: "lix_file_descriptor".to_string(),
-                schema_version: "1".to_string(),
-                file_id: "lix".to_string(),
-                version_id: "version-a".to_string(),
-                plugin_key: "lix".to_string(),
-                snapshot_content: None,
-                untracked: false,
-            },
-            MutationRow {
-                operation: MutationOperation::Insert,
-                entity_id: "ignored-dir".to_string(),
-                schema_key: "lix_directory_descriptor".to_string(),
-                schema_version: "1".to_string(),
-                file_id: "lix".to_string(),
-                version_id: "version-a".to_string(),
-                plugin_key: "lix".to_string(),
-                snapshot_content: None,
-                untracked: false,
-            },
-            MutationRow {
-                operation: MutationOperation::Insert,
-                entity_id: "ignored-untracked".to_string(),
-                schema_key: "lix_file_descriptor".to_string(),
-                schema_version: "1".to_string(),
-                file_id: "lix".to_string(),
-                version_id: "version-a".to_string(),
-                plugin_key: "lix".to_string(),
-                snapshot_content: None,
-                untracked: true,
-            },
-        ]);
-
-        assert_eq!(targets.len(), 1);
-        assert!(targets.contains(&("file-a".to_string(), "version-a".to_string())));
     }
 
     #[test]

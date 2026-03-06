@@ -214,9 +214,6 @@ fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
                 None => serialized.push_str("scope_untracked_sql:none"),
             }
         }
-        Some(PostprocessPlan::DomainChangesOnly) => {
-            serialized.push_str("postprocess:domain_changes_only");
-        }
     }
     serialized.push('\u{1f}');
 
@@ -268,7 +265,7 @@ fn preprocess_plan_fingerprint(output: &PreprocessOutput) -> String {
 
 #[cfg(test)]
 fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
-    matches!(plan, Some(other) if !matches!(other, PostprocessPlan::VtableUpdate(_)))
+    matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
 }
 
 #[cfg(test)]

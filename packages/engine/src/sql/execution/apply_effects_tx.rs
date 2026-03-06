@@ -9,24 +9,37 @@ pub(crate) async fn apply_sql_backed_effects(
     engine: &Engine,
     mutations: &[MutationRow],
     pending_file_writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
+    pending_file_delete_targets: &BTreeSet<(String, String)>,
     detected_file_domain_changes: &[DetectedFileDomainChange],
     untracked_filesystem_update_domain_changes: &[DetectedFileDomainChange],
     plugin_changes_committed: bool,
-    read_only_query: bool,
-    file_data_cache_invalidation_targets: &BTreeSet<(String, String)>,
-    file_path_cache_invalidation_targets: &BTreeSet<(String, String)>,
+    writer_key: Option<&str>,
 ) -> Result<(), LixError> {
+    let filesystem_payload_domain_changes = engine
+        .collect_live_filesystem_payload_domain_changes(
+            pending_file_writes,
+            pending_file_delete_targets,
+            writer_key,
+        )
+        .await?;
+    let mut tracked_domain_changes = detected_file_domain_changes.to_vec();
+    tracked_domain_changes.extend(filesystem_payload_domain_changes.clone());
+    tracked_domain_changes =
+        crate::engine::dedupe_detected_file_domain_changes(&tracked_domain_changes);
+    let tracked_domain_changes_to_persist = if plugin_changes_committed {
+        crate::engine::dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes)
+    } else {
+        tracked_domain_changes.clone()
+    };
     let should_run_binary_gc =
-        crate::engine::should_run_binary_cas_gc(mutations, detected_file_domain_changes);
-    let mut binary_blob_ref_targets =
-        crate::engine::collect_binary_blob_ref_targets(mutations, detected_file_domain_changes);
-    if binary_blob_ref_targets.is_empty() && !read_only_query {
-        binary_blob_ref_targets = engine.load_binary_blob_ref_index_targets().await?;
-    }
+        crate::engine::should_run_binary_cas_gc(mutations, &tracked_domain_changes);
 
-    if !plugin_changes_committed && !detected_file_domain_changes.is_empty() {
+    engine
+        .persist_pending_file_data_updates(pending_file_writes)
+        .await?;
+    if !tracked_domain_changes_to_persist.is_empty() {
         engine
-            .persist_detected_file_domain_changes(detected_file_domain_changes)
+            .persist_detected_file_domain_changes(&tracked_domain_changes_to_persist)
             .await?;
     }
     if !untracked_filesystem_update_domain_changes.is_empty() {
@@ -34,26 +47,8 @@ pub(crate) async fn apply_sql_backed_effects(
             .persist_untracked_file_domain_changes(untracked_filesystem_update_domain_changes)
             .await?;
     }
-    engine
-        .persist_pending_file_data_updates(pending_file_writes)
-        .await?;
-    engine
-        .persist_pending_file_path_updates(pending_file_writes)
-        .await?;
-    engine
-        .sync_binary_blob_ref_index_for_targets(&binary_blob_ref_targets)
-        .await?;
-    engine
-        .ensure_builtin_binary_blob_store_for_targets(file_data_cache_invalidation_targets)
-        .await?;
     if should_run_binary_gc {
         engine.garbage_collect_unreachable_binary_cas().await?;
     }
-    engine
-        .invalidate_file_data_cache_entries(file_data_cache_invalidation_targets)
-        .await?;
-    engine
-        .invalidate_file_path_cache_entries(file_path_cache_invalidation_targets)
-        .await?;
     Ok(())
 }

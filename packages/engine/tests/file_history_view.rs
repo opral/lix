@@ -225,51 +225,6 @@ async fn boot_engine_with_json_plugin(
     engine
 }
 
-async fn file_history_cache_row_count(
-    engine: &support::simulation_test::SimulationEngine,
-    file_id: &str,
-    root_commit_id: &str,
-) -> i64 {
-    let rows = engine
-        .execute(
-            &format!(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_file_history_data_cache \
-                 WHERE file_id = '{}' AND root_commit_id = '{}'",
-                file_id, root_commit_id
-            ),
-            &[],
-        )
-        .await
-        .expect("file history data cache count query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    value_as_i64(&rows.statements[0].rows[0][0])
-}
-
-async fn file_history_cache_row_count_at_depth(
-    engine: &support::simulation_test::SimulationEngine,
-    file_id: &str,
-    root_commit_id: &str,
-    depth: i64,
-) -> i64 {
-    let rows = engine
-        .execute(
-            &format!(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_file_history_data_cache \
-                 WHERE file_id = '{}' \
-                   AND root_commit_id = '{}' \
-                   AND depth = {}",
-                file_id, root_commit_id, depth
-            ),
-            &[],
-        )
-        .await
-        .expect("file history data cache depth count query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    value_as_i64(&rows.statements[0].rows[0][0])
-}
-
 simulation_test!(
     file_history_view_materializes_data_per_root_commit_and_depth,
     simulations = [sqlite, postgres],
@@ -407,7 +362,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    file_history_view_read_materializes_history_cache_on_demand,
+    file_history_view_read_resolves_without_history_cache_materialization,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = boot_engine_with_json_plugin(&sim).await;
@@ -429,11 +384,6 @@ simulation_test!(
             .await
             .expect("file update should succeed");
         let update_commit_id = active_version_commit_id(&engine).await;
-
-        assert_eq!(
-            file_history_cache_row_count(&engine, "history-cache", &update_commit_id).await,
-            0
-        );
 
         let rows = engine
             .execute(
@@ -457,16 +407,6 @@ simulation_test!(
         assert_text(&rows.statements[0].rows[0][1], &update_commit_id);
         assert_text(&rows.statements[0].rows[0][2], &update_commit_id);
         assert_integer(&rows.statements[0].rows[0][3], 0);
-
-        assert_eq!(
-            file_history_cache_row_count_at_depth(&engine, "history-cache", &update_commit_id, 0)
-                .await,
-            1
-        );
-        assert_eq!(
-            file_history_cache_row_count(&engine, "history-cache", &update_commit_id).await,
-            2
-        );
     }
 );
 
@@ -1281,7 +1221,10 @@ simulation_test!(
             &file_history.statements[0].rows[0][1],
             "lix_file_descriptor",
         );
-        assert_text(&file_history.statements[0].rows[0][2], "lix");
+        assert_text(
+            &file_history.statements[0].rows[0][2],
+            "history-lixcol-file",
+        );
         assert_not_null(
             &file_history.statements[0].rows[0][3],
             "file_history.lixcol_version_id",

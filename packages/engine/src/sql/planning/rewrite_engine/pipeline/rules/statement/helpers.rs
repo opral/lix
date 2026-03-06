@@ -20,6 +20,7 @@ pub(crate) fn merge_rewrite_output(
         base.postprocess = next.postprocess.take();
     }
     base.statements.extend(next.statements);
+    base.effect_only = base.effect_only || next.effect_only;
     base.params.extend(next.params);
     base.registrations.extend(next.registrations);
     base.mutations.extend(next.mutations);
@@ -55,6 +56,7 @@ pub(crate) fn rewrite_vtable_inserts<P: LixFunctionProvider>(
 
     Ok(RewriteOutput {
         statements,
+        effect_only: false,
         params: generated_params,
         registrations,
         postprocess: None,
@@ -104,6 +106,7 @@ pub(crate) async fn rewrite_vtable_inserts_with_backend<P: LixFunctionProvider>(
 
     Ok(RewriteOutput {
         statements,
+        effect_only: false,
         params: generated_params,
         registrations,
         postprocess: None,

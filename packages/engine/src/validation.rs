@@ -15,6 +15,7 @@ use crate::schema::{
 };
 use crate::{LixBackend, LixError, Value};
 
+const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 
 #[derive(Debug, Default)]
@@ -64,6 +65,7 @@ pub async fn validate_inserts(
             snapshot,
         )
         .await?;
+        validate_filesystem_insert_integrity(backend, row, snapshot).await?;
     }
 
     Ok(())
@@ -170,6 +172,56 @@ async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
     }
 
     Ok(())
+}
+
+async fn validate_filesystem_insert_integrity(
+    backend: &dyn LixBackend,
+    row: &MutationRow,
+    snapshot: &JsonValue,
+) -> Result<(), LixError> {
+    if row.schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
+        return Ok(());
+    }
+
+    let blob_hash = snapshot
+        .get("blob_hash")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "lix_binary_blob_ref integrity violation: snapshot_content missing blob_hash"
+                    .to_string(),
+        })?;
+
+    if !binary_cas_blob_exists(backend, blob_hash).await? {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "lix_binary_blob_ref integrity violation: blob_hash '{}' is missing from binary CAS",
+                blob_hash
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+async fn binary_cas_blob_exists(
+    backend: &dyn LixBackend,
+    blob_hash: &str,
+) -> Result<bool, LixError> {
+    let result = backend
+        .execute(
+            "SELECT 1 \
+             FROM lix_internal_binary_blob_store bs \
+             JOIN lix_internal_binary_blob_manifest bm ON bm.blob_hash = bs.blob_hash \
+             WHERE bs.blob_hash = $1 \
+             LIMIT 1",
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+    Ok(!result.rows.is_empty())
 }
 
 fn extract_stored_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, LixError> {

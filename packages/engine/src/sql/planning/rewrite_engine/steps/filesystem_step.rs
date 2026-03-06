@@ -1,5 +1,6 @@
-use sqlparser::ast::{Delete, Insert, Query, Statement, Update};
+use sqlparser::ast::{Delete, Insert, Query, Update};
 
+pub(crate) use crate::filesystem::mutation_rewrite::FilesystemUpdateRewrite;
 use crate::filesystem::mutation_rewrite::{FilesystemInsertSideEffects, ResolvedDirectoryIdMap};
 use crate::filesystem::{mutation_rewrite, select_rewrite};
 use crate::{LixBackend, LixError, Value as EngineValue};
@@ -44,7 +45,7 @@ pub async fn insert_side_effect_statements_with_backend(
     mutation_rewrite::insert_side_effect_statements_with_backend(backend, insert, params).await
 }
 
-pub fn rewrite_update(update: Update) -> Result<Option<Statement>, LixError> {
+pub fn rewrite_update(update: Update) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     mutation_rewrite::rewrite_update(update)
 }
 
@@ -52,7 +53,7 @@ pub async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     update: Update,
     params: &[EngineValue],
-) -> Result<Option<Statement>, LixError> {
+) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     mutation_rewrite::rewrite_update_with_backend(backend, update, params).await
 }
 

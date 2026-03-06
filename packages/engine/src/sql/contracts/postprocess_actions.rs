@@ -17,5 +17,4 @@ pub(crate) struct VtableDeletePlan {
 pub(crate) enum PostprocessPlan {
     VtableUpdate(VtableUpdatePlan),
     VtableDelete(VtableDeletePlan),
-    DomainChangesOnly,
 }
