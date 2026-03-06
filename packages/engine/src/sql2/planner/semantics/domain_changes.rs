@@ -1,4 +1,5 @@
 use crate::builtin_schema::types::LixVersionPointer;
+use crate::commit::ProposedDomainChange;
 use crate::sql2::planner::ir::{
     CommitPreconditions, ExpectedTip, IdempotencyKey, PlannedWrite, WriteLane, WriteMode,
 };
@@ -13,7 +14,7 @@ pub(crate) struct SemanticEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DomainChangeBatch {
-    pub(crate) change_ids: Vec<String>,
+    pub(crate) changes: Vec<ProposedDomainChange>,
     pub(crate) write_lane: WriteLane,
     pub(crate) writer_key: Option<String>,
     pub(crate) semantic_effects: Vec<SemanticEffect>,
@@ -45,7 +46,7 @@ pub(crate) fn build_domain_change_batch(
                 .to_string(),
         })?;
 
-    let mut change_ids = Vec::new();
+    let mut changes = Vec::new();
     let mut semantic_effects = Vec::new();
     for row in &resolved.intended_post_state {
         let version_descriptor = row
@@ -57,10 +58,23 @@ pub(crate) fn build_domain_change_batch(
         } else {
             "state.upsert"
         };
-        change_ids.push(format!(
-            "sql2:{}:{}:{}:{}",
-            operation_key, row.schema_key, row.entity_id, version_descriptor
-        ));
+        changes.push(ProposedDomainChange {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            schema_version: text_value(&row.values, "schema_version"),
+            file_id: text_value(&row.values, "file_id"),
+            plugin_key: text_value(&row.values, "plugin_key"),
+            snapshot_content: if row.tombstone {
+                None
+            } else {
+                text_value(&row.values, "snapshot_content")
+            },
+            metadata: text_value(&row.values, "metadata"),
+            version_id: row.version_id.clone().ok_or_else(|| DomainChangeError {
+                message: "sql2 domain-change derivation requires a concrete version_id".to_string(),
+            })?,
+            writer_key: planned_write.command.execution_context.writer_key.clone(),
+        });
         semantic_effects.push(SemanticEffect {
             effect_key: operation_key.to_string(),
             target: format!(
@@ -71,7 +85,7 @@ pub(crate) fn build_domain_change_batch(
     }
 
     Ok(Some(DomainChangeBatch {
-        change_ids,
+        changes,
         write_lane,
         writer_key: planned_write.command.execution_context.writer_key.clone(),
         semantic_effects,
@@ -217,6 +231,19 @@ fn domain_change_backend_error(error: LixError) -> DomainChangeError {
     }
 }
 
+fn text_value(
+    values: &std::collections::BTreeMap<String, crate::Value>,
+    key: &str,
+) -> Option<String> {
+    match values.get(key) {
+        Some(crate::Value::Text(value)) => Some(value.clone()),
+        Some(crate::Value::Integer(value)) => Some(value.to_string()),
+        Some(crate::Value::Boolean(value)) => Some(value.to_string()),
+        Some(crate::Value::Real(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -330,9 +357,12 @@ mod tests {
             batch.write_lane,
             WriteLane::SingleVersion("version-a".to_string())
         );
-        assert_eq!(batch.change_ids.len(), 1);
+        assert_eq!(batch.changes.len(), 1);
         assert_eq!(batch.semantic_effects.len(), 1);
         assert_eq!(batch.writer_key.as_deref(), Some("writer-a"));
+        assert_eq!(batch.changes[0].schema_version.as_deref(), Some("1"));
+        assert_eq!(batch.changes[0].file_id.as_deref(), Some("lix"));
+        assert_eq!(batch.changes[0].plugin_key.as_deref(), Some("lix"));
     }
 
     #[tokio::test]
