@@ -216,11 +216,19 @@ fn canonicalize_update_write(
     }
     let surface_binding = bind_update_surface(update, registry)?;
     validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
+    let mut placeholder_state = PlaceholderState::new();
+    let payload = assignment_payload(
+        &surface_binding,
+        &update.assignments,
+        &bound_statement.bound_parameters,
+        &mut placeholder_state,
+    )?;
     let selector = match update.selection.as_ref() {
         Some(selection) => write_selector(
             &surface_binding,
             selection,
             &bound_statement.bound_parameters,
+            &mut placeholder_state,
         )?,
         None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
             exact_only: true,
@@ -232,11 +240,6 @@ fn canonicalize_update_write(
             ))
         }
     };
-    let payload = assignment_payload(
-        &surface_binding,
-        &update.assignments,
-        &bound_statement.bound_parameters,
-    )?;
     let mode = write_mode_for_surface(&surface_binding, &payload);
 
     Ok(CanonicalizedWrite {
@@ -270,11 +273,13 @@ fn canonicalize_delete_write(
     }
     let surface_binding = bind_delete_surface(delete, registry)?;
     validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
+    let mut placeholder_state = PlaceholderState::new();
     let selector = match delete.selection.as_ref() {
         Some(selection) => write_selector(
             &surface_binding,
             selection,
             &bound_statement.bound_parameters,
+            &mut placeholder_state,
         )?,
         None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
             exact_only: true,
@@ -597,6 +602,7 @@ fn assignment_payload(
     surface_binding: &SurfaceBinding,
     assignments: &[sqlparser::ast::Assignment],
     params: &[Value],
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     if assignments.is_empty() {
         return Err(CanonicalizeError::unsupported(
@@ -604,7 +610,6 @@ fn assignment_payload(
         ));
     }
 
-    let mut placeholder_state = PlaceholderState::new();
     let mut payload = BTreeMap::new();
     for assignment in assignments {
         let AssignmentTarget::ColumnName(column_name) = &assignment.target else {
@@ -623,7 +628,7 @@ fn assignment_payload(
                 )
             })?;
         let key = canonical_write_column_key(surface_binding, &raw_key)?;
-        let value = expr_to_value(&assignment.value, params, &mut placeholder_state)?;
+        let value = expr_to_value(&assignment.value, params, placeholder_state)?;
         payload.insert(key, value);
     }
     Ok(payload)
@@ -633,14 +638,14 @@ fn write_selector(
     surface_binding: &SurfaceBinding,
     expr: &Expr,
     params: &[Value],
+    placeholder_state: &mut PlaceholderState,
 ) -> Result<WriteSelector, CanonicalizeError> {
-    let mut placeholder_state = PlaceholderState::new();
     let mut exact_filters = BTreeMap::new();
     let exact_only = collect_exact_selector_filters(
         surface_binding,
         expr,
         params,
-        &mut placeholder_state,
+        placeholder_state,
         &mut exact_filters,
     );
 

@@ -571,6 +571,48 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes(
     Ok(resolved)
 }
 
+pub(crate) fn state_commit_stream_changes_from_planned_rows(
+    rows: &[crate::sql2::planner::ir::PlannedStateRow],
+    operation: StateCommitStreamOperation,
+    untracked: bool,
+    writer_key: Option<&str>,
+) -> Result<Vec<StateCommitStreamChange>, LixError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let writer_key = writer_key.map(str::to_string);
+    let mut resolved = Vec::with_capacity(rows.len());
+    for row in rows {
+        let file_id = planned_row_required_text(row, "file_id")?;
+        let plugin_key = planned_row_required_text(row, "plugin_key")?;
+        let schema_version = planned_row_required_text(row, "schema_version")?;
+        let snapshot_content = planned_row_snapshot_content(row)?;
+        let version_id = row
+            .version_id
+            .clone()
+            .or_else(|| planned_row_optional_text(row, "version_id"));
+
+        resolved.push(StateCommitStreamChange {
+            operation,
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            schema_version,
+            file_id,
+            version_id: version_id.ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "planned row state commit stream requires version_id".to_string(),
+            })?,
+            plugin_key,
+            snapshot_content,
+            untracked,
+            writer_key: writer_key.clone(),
+        });
+    }
+
+    Ok(resolved)
+}
+
 fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
     let value = row.get(index).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -584,6 +626,50 @@ fn row_text(row: &[Value], index: usize, column: &str) -> Result<String, LixErro
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "postprocess state commit stream expected text {column}, got {other:?}"
+            ),
+        }),
+    }
+}
+
+fn planned_row_required_text(
+    row: &crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Result<String, LixError> {
+    planned_row_optional_text(row, key).ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("planned row state commit stream requires '{key}'"),
+    })
+}
+
+fn planned_row_optional_text(
+    row: &crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Option<String> {
+    match row.values.get(key) {
+        Some(Value::Text(text)) => Some(text.clone()),
+        Some(Value::Integer(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn planned_row_snapshot_content(
+    row: &crate::sql2::planner::ir::PlannedStateRow,
+) -> Result<Option<JsonValue>, LixError> {
+    match row.values.get("snapshot_content") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Text(text)) => {
+            let parsed = serde_json::from_str(text).map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "planned row state commit stream expected JSON snapshot_content text: {error}"
+                ),
+            })?;
+            Ok(Some(parsed))
+        }
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "planned row state commit stream expected null/text snapshot_content, got {other:?}"
             ),
         }),
     }

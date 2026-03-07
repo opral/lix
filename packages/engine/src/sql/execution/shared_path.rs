@@ -14,7 +14,8 @@ use crate::sql2::runtime::{
     prepare_sql2_read, prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
 };
 use crate::state_commit_stream::{
-    state_commit_stream_changes_from_domain_changes, StateCommitStreamOperation,
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamOperation,
 };
 use crate::validation::{
     validate_inserts, validate_sql2_append_time_write, validate_sql2_batch_local_write,
@@ -596,12 +597,23 @@ fn semantic_plan_effects_from_untracked_sql2_write(
     sql2_write: &Sql2PreparedWrite,
 ) -> Result<PlanEffects, LixError> {
     let mut effects = PlanEffects::default();
-    if sql2_write.planned_write.command.target.descriptor.public_name != "lix_active_version" {
-        return Ok(effects);
-    }
     let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() else {
         return Ok(effects);
     };
+    effects.state_commit_stream_changes = state_commit_stream_changes_from_planned_rows(
+        &resolved.intended_post_state,
+        state_commit_stream_operation(sql2_write),
+        true,
+        sql2_write
+            .planned_write
+            .command
+            .execution_context
+            .writer_key
+            .as_deref(),
+    )?;
+    if sql2_write.planned_write.command.target.descriptor.public_name != "lix_active_version" {
+        return Ok(effects);
+    }
     for row in resolved.intended_post_state.iter().rev() {
         if row.schema_key != active_version_schema_key()
             || planned_row_optional_text_value(row, "file_id") != Some(active_version_file_id())
