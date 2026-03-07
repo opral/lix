@@ -22,6 +22,17 @@ use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::{LixBackend, Value};
 use sqlparser::ast::Statement;
 
+#[derive(Debug, Clone, PartialEq)]
+struct ExplainEnvelope {
+    describe_alias: sqlparser::ast::DescribeAlias,
+    analyze: bool,
+    verbose: bool,
+    query_plan: bool,
+    estimate: bool,
+    format: Option<sqlparser::ast::AnalyzeFormatKind>,
+    options: Option<Vec<sqlparser::ast::UtilityOption>>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Sql2DebugTrace {
     pub(crate) bound_statements: Vec<BoundStatement>,
@@ -81,7 +92,7 @@ pub(crate) async fn prepare_sql2_read(
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .ok()?;
-    let statement = parsed_statements[0].clone();
+    let (statement, explain_envelope) = explain_query_statement(&parsed_statements[0])?;
     let bound_statement = BoundStatement::from_statement(
         statement,
         params.to_vec(),
@@ -100,7 +111,8 @@ pub(crate) async fn prepare_sql2_read(
         effective_state.as_ref().map(|(_, plan)| plan),
     )
     .ok()
-    .flatten();
+    .flatten()
+    .map(|program| wrap_lowered_read_for_explain(program, explain_envelope.as_ref()));
     let lowered_sql = lowered_read
         .as_ref()
         .map(|program| {
@@ -139,6 +151,64 @@ pub(crate) async fn prepare_sql2_read(
         lowered_read,
         canonicalized,
     })
+}
+
+fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainEnvelope>)> {
+    match statement {
+        Statement::Query(_) => Some((statement.clone(), None)),
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => match statement.as_ref() {
+            Statement::Query(_) => Some((
+                statement.as_ref().clone(),
+                Some(ExplainEnvelope {
+                    describe_alias: describe_alias.clone(),
+                    analyze: *analyze,
+                    verbose: *verbose,
+                    query_plan: *query_plan,
+                    estimate: *estimate,
+                    format: format.clone(),
+                    options: options.clone(),
+                }),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn wrap_lowered_read_for_explain(
+    program: LoweredReadProgram,
+    envelope: Option<&ExplainEnvelope>,
+) -> LoweredReadProgram {
+    let Some(envelope) = envelope else {
+        return program;
+    };
+
+    LoweredReadProgram {
+        statements: program
+            .statements
+            .into_iter()
+            .map(|statement| Statement::Explain {
+                describe_alias: envelope.describe_alias,
+                analyze: envelope.analyze,
+                verbose: envelope.verbose,
+                query_plan: envelope.query_plan,
+                estimate: envelope.estimate,
+                statement: Box::new(statement),
+                format: envelope.format.clone(),
+                options: envelope.options.clone(),
+            })
+            .collect(),
+        pushdown_decision: program.pushdown_decision,
+    }
 }
 
 pub(crate) async fn prepare_sql2_write(
@@ -683,6 +753,41 @@ mod tests {
             .expect("change read should lower");
         assert!(lowered_sql.contains("FROM lix_internal_change ch"));
         assert!(lowered_sql.contains("LEFT JOIN lix_internal_snapshot s"));
+    }
+
+    #[tokio::test]
+    async fn prepares_explain_over_state_reads_with_sql2_lowered_query() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "EXPLAIN SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("explain state read should canonicalize");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_state"]);
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .accepted_predicates,
+            vec!["schema_key = 'lix_key_value'".to_string()]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("explain state read should lower");
+        assert!(lowered_sql.starts_with("EXPLAIN SELECT"));
+        assert!(lowered_sql
+            .contains("FROM (SELECT * FROM lix_state WHERE schema_key = 'lix_key_value')"));
     }
 
     #[tokio::test]
