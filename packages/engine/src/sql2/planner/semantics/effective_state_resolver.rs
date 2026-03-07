@@ -2,12 +2,15 @@ use crate::commit::{
     load_exact_committed_state_row, CommitQueryExecutor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
+use crate::sql2::catalog::SurfaceFamily;
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::ir::{CanonicalStateScan, ReadPlan, VersionScope};
 use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
-use sqlparser::ast::{Expr, OrderByKind, Query, SelectItem, Statement, Visit, Visitor};
+use sqlparser::ast::{
+    BinaryOperator, Expr, OrderByKind, Query, SelectItem, Statement, UnaryOperator, Visit, Visitor,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
@@ -94,11 +97,20 @@ pub(crate) fn build_effective_state(
         predicate_classes: predicate_classes_for_read(canonicalized),
         required_columns: required_columns_for_read(canonicalized, scan),
     };
+    let all_predicates = read_predicates(canonicalized);
+    let pushdown_safe_predicates = pushdown_safe_predicates(canonicalized);
     let plan = EffectiveStatePlan {
         state_source: StateSourceAuthority::AuthoritativeCommitted,
         overlay_lanes: overlay_lanes_for_request(&request),
-        pushdown_safe_predicates: Vec::new(),
-        residual_predicates: residual_predicates(&canonicalized.read_command.root),
+        pushdown_safe_predicates: pushdown_safe_predicates.clone(),
+        residual_predicates: all_predicates
+            .into_iter()
+            .filter(|predicate| {
+                !pushdown_safe_predicates
+                    .iter()
+                    .any(|candidate| candidate == predicate)
+            })
+            .collect(),
     };
     Some((request, plan))
 }
@@ -615,17 +627,102 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn residual_predicates(read_plan: &ReadPlan) -> Vec<String> {
-    match read_plan {
-        ReadPlan::Scan(_) => Vec::new(),
-        ReadPlan::Filter { input, predicate } => {
-            let mut predicates = residual_predicates(input);
-            predicates.push(predicate.sql.clone());
-            predicates
+fn read_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
+    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
+        return Vec::new();
+    };
+    let Some(select) = select_query(query) else {
+        return Vec::new();
+    };
+    let Some(selection) = &select.selection else {
+        return Vec::new();
+    };
+
+    split_conjunctive_predicates(selection)
+        .into_iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
+    if canonicalized.surface_binding.descriptor.surface_family != SurfaceFamily::State {
+        return Vec::new();
+    }
+
+    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
+        return Vec::new();
+    };
+    let Some(select) = select_query(query) else {
+        return Vec::new();
+    };
+    let Some(selection) = &select.selection else {
+        return Vec::new();
+    };
+
+    split_conjunctive_predicates(selection)
+        .into_iter()
+        .filter(|predicate| state_predicate_is_pushdown_safe(predicate))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn split_conjunctive_predicates(expr: &Expr) -> Vec<&Expr> {
+    let mut predicates = Vec::new();
+    collect_conjunctive_predicates(expr, &mut predicates);
+    predicates
+}
+
+fn collect_conjunctive_predicates<'a>(expr: &'a Expr, predicates: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_conjunctive_predicates(left, predicates);
+            collect_conjunctive_predicates(right, predicates);
         }
-        ReadPlan::Project { input, .. }
-        | ReadPlan::Sort { input, .. }
-        | ReadPlan::Limit { input, .. } => residual_predicates(input),
+        Expr::Nested(inner) => collect_conjunctive_predicates(inner, predicates),
+        _ => predicates.push(expr),
+    }
+}
+
+fn state_predicate_is_pushdown_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => state_pushdown_column(left).is_some() && constant_like_expr(right),
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => state_pushdown_column(expr).is_some() && list.iter().all(constant_like_expr),
+        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner),
+        _ => false,
+    }
+}
+
+fn state_pushdown_column(expr: &Expr) -> Option<&'static str> {
+    match filter_column_name(expr) {
+        Some("schema_key") => Some("schema_key"),
+        Some("entity_id") => Some("entity_id"),
+        Some("file_id") => Some("file_id"),
+        _ => None,
+    }
+}
+
+fn constant_like_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(_) => true,
+        Expr::Nested(inner) => constant_like_expr(inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            expr,
+        } => constant_like_expr(expr),
+        Expr::Cast { expr, .. } => constant_like_expr(expr),
+        _ => false,
     }
 }
 
@@ -710,5 +807,27 @@ mod tests {
         assert!(request
             .predicate_classes
             .contains(&"column:schema_key".to_string()));
+    }
+
+    #[test]
+    fn extracts_exact_state_pushdown_predicates_from_top_level_conjunctions() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalized_read(
+            &registry,
+            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND file_id = 'lix'",
+            Vec::new(),
+        );
+
+        let (_request, plan) =
+            build_effective_state(&canonicalized, None).expect("effective-state plan should build");
+
+        assert_eq!(
+            plan.pushdown_safe_predicates,
+            vec![
+                "schema_key = 'lix_key_value'".to_string(),
+                "file_id = 'lix'".to_string()
+            ]
+        );
+        assert!(plan.residual_predicates.is_empty());
     }
 }
