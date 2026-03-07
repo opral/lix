@@ -1,9 +1,9 @@
 use crate::sql2::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql2::core::contracts::{BoundStatement, StatementKind};
 use crate::sql2::planner::ir::{
-    CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan, CanonicalWorkingChangesScan,
-    MutationPayload, PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey,
-    WriteCommand, WriteMode, WriteOperationKind, WriteSelector,
+    CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
+    CanonicalWorkingChangesScan, MutationPayload, PredicateSpec, ProjectionExpr, ReadCommand,
+    ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode, WriteOperationKind, WriteSelector,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -94,6 +94,18 @@ pub(crate) fn canonicalize_read(
                 ))
             })?;
         ReadPlan::working_changes_scan(scan)
+    } else if surface_binding
+        .resolution_capabilities
+        .canonical_filesystem_scan
+    {
+        let scan = CanonicalFilesystemScan::from_surface_binding(surface_binding.clone())
+            .ok_or_else(|| {
+                CanonicalizeError::unsupported(format!(
+                    "surface '{}' did not produce a canonical filesystem scan",
+                    surface_binding.descriptor.public_name
+                ))
+            })?;
+        ReadPlan::filesystem_scan(scan)
     } else if surface_binding
         .resolution_capabilities
         .canonical_admin_scan

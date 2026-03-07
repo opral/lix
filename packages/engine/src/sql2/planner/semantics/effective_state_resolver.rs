@@ -118,9 +118,10 @@ pub(crate) fn build_effective_state(
 fn canonical_state_scan(read_plan: &ReadPlan) -> Option<&CanonicalStateScan> {
     match read_plan {
         ReadPlan::Scan(scan) => Some(scan),
-        ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) | ReadPlan::WorkingChangesScan(_) => {
-            None
-        }
+        ReadPlan::FilesystemScan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::ChangeScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }

@@ -4,9 +4,13 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::core::parser::parse_sql_script;
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
-use crate::sql2::planner::ir::{CanonicalAdminKind, ReadPlan};
+use crate::sql2::planner::ir::{CanonicalAdminKind, FilesystemKind, ReadPlan, VersionScope};
 use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
+};
+use crate::filesystem::live_projection::{
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+    FilesystemProjectionScope,
 };
 use crate::account::{
     active_account_file_id, active_account_schema_key, active_account_storage_version_id,
@@ -90,7 +94,14 @@ pub(crate) fn lower_read_for_execution(
                 pushdown_decision: admin_pushdown_decision(canonicalized),
             })
         }),
-        SurfaceFamily::Filesystem => Ok(None),
+        SurfaceFamily::Filesystem => {
+            lower_filesystem_read_for_execution(canonicalized).map(|statement| {
+                statement.map(|statement| LoweredReadProgram {
+                    statements: vec![statement],
+                    pushdown_decision: filesystem_pushdown_decision(canonicalized),
+                })
+            })
+        }
     }
 }
 
@@ -276,6 +287,66 @@ fn lower_admin_read_for_execution(
     };
 
     let derived_query = build_admin_source_query(admin_scan.kind)?;
+    let derived_alias = alias.clone().or_else(|| {
+        Some(TableAlias {
+            explicit: false,
+            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
+            columns: Vec::new(),
+        })
+    });
+    select.from[0].relation = TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(derived_query),
+        alias: derived_alias,
+    };
+
+    Ok(Some(Statement::Query(query)))
+}
+
+fn lower_filesystem_read_for_execution(
+    canonicalized: &CanonicalizedRead,
+) -> Result<Option<Statement>, LixError> {
+    let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
+        return Ok(None);
+    };
+
+    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
+        return Ok(None);
+    };
+    let select = select_mut(query.as_mut())?;
+    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
+        return Ok(None);
+    };
+
+    let derived_query = match (filesystem_scan.kind, filesystem_scan.version_scope) {
+        (FilesystemKind::File, VersionScope::ActiveVersion) => parse_single_query(
+            &build_filesystem_file_projection_sql(FilesystemProjectionScope::ActiveVersion, false),
+        )?,
+        (FilesystemKind::File, VersionScope::ExplicitVersion)
+            if canonicalized.surface_binding.descriptor.public_name == "lix_file_by_version" =>
+        {
+            parse_single_query(
+                &build_filesystem_file_projection_sql(
+                    FilesystemProjectionScope::ExplicitVersion,
+                    false,
+                ),
+            )?
+        }
+        (FilesystemKind::Directory, VersionScope::ActiveVersion) => parse_single_query(
+            &build_filesystem_directory_projection_sql(FilesystemProjectionScope::ActiveVersion),
+        )?,
+        (FilesystemKind::Directory, VersionScope::ExplicitVersion)
+            if canonicalized.surface_binding.descriptor.public_name == "lix_directory_by_version" =>
+        {
+            parse_single_query(
+                &build_filesystem_directory_projection_sql(
+                    FilesystemProjectionScope::ExplicitVersion,
+                ),
+            )?
+        }
+        _ => return Ok(None),
+    };
+
     let derived_alias = alias.clone().or_else(|| {
         Some(TableAlias {
             explicit: false,
@@ -1345,7 +1416,10 @@ fn canonical_admin_scan(
 ) -> Option<&crate::sql2::planner::ir::CanonicalAdminScan> {
     match read_plan {
         ReadPlan::AdminScan(scan) => Some(scan),
-        ReadPlan::Scan(_) | ReadPlan::ChangeScan(_) | ReadPlan::WorkingChangesScan(_) => None,
+        ReadPlan::Scan(_)
+        | ReadPlan::FilesystemScan(_)
+        | ReadPlan::ChangeScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
@@ -1358,11 +1432,30 @@ fn canonical_working_changes_scan(
 ) -> Option<&crate::sql2::planner::ir::CanonicalWorkingChangesScan> {
     match read_plan {
         ReadPlan::WorkingChangesScan(scan) => Some(scan),
-        ReadPlan::Scan(_) | ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::Scan(_)
+        | ReadPlan::FilesystemScan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::ChangeScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
         | ReadPlan::Limit { input, .. } => canonical_working_changes_scan(input),
+    }
+}
+
+fn canonical_filesystem_scan(
+    read_plan: &ReadPlan,
+) -> Option<&crate::sql2::planner::ir::CanonicalFilesystemScan> {
+    match read_plan {
+        ReadPlan::FilesystemScan(scan) => Some(scan),
+        ReadPlan::Scan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::ChangeScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
+        ReadPlan::Filter { input, .. }
+        | ReadPlan::Project { input, .. }
+        | ReadPlan::Sort { input, .. }
+        | ReadPlan::Limit { input, .. } => canonical_filesystem_scan(input),
     }
 }
 
@@ -1549,6 +1642,24 @@ fn admin_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecisio
                 predicate: predicate.clone(),
                 reason:
                     "sql2 admin-scan lowering keeps admin predicates above the derived admin source"
+                        .to_string(),
+                support: PushdownSupport::Unsupported,
+            })
+            .collect(),
+        residual_predicates,
+    }
+}
+
+fn filesystem_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+    let residual_predicates = read_predicates_from_query(canonicalized);
+    PushdownDecision {
+        accepted_predicates: Vec::new(),
+        rejected_predicates: residual_predicates
+            .iter()
+            .map(|predicate| RejectedPredicate {
+                predicate: predicate.clone(),
+                reason:
+                    "sql2 filesystem lowering keeps filesystem predicates above the derived source"
                         .to_string(),
                 support: PushdownSupport::Unsupported,
             })
@@ -1836,6 +1947,48 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["entity_id = 'entity-1'".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_filesystem_current_and_versioned_reads_through_internal_sources() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+
+        let current = lowered_program(
+            &registry,
+            "SELECT id, path, data FROM lix_file WHERE id = 'file-1'",
+        )
+        .expect("filesystem current read should lower");
+        let current_sql = current.statements[0].to_string();
+
+        assert!(current_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
+        assert!(current_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
+        assert!(current_sql.contains("lix_internal_binary_blob_store"));
+        assert!(!current_sql.contains("FROM lix_file_by_version"));
+        assert_eq!(
+            current.pushdown_decision.residual_predicates,
+            vec!["id = 'file-1'".to_string()]
+        );
+
+        let by_version = lowered_program(
+            &registry,
+            "SELECT id, path FROM lix_directory_by_version \
+             WHERE id = 'dir-1' AND lixcol_version_id = 'version-a'",
+        )
+        .expect("filesystem by-version read should lower");
+        let by_version_sql = by_version.statements[0].to_string();
+
+        assert!(
+            by_version_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor")
+        );
+        assert!(by_version_sql.contains("WITH RECURSIVE all_target_versions AS"));
+        assert!(!by_version_sql.contains("FROM lix_directory_by_version"));
+        assert_eq!(
+            by_version.pushdown_decision.residual_predicates,
+            vec![
+                "id = 'dir-1'".to_string(),
+                "lixcol_version_id = 'version-a'".to_string()
+            ]
         );
     }
 

@@ -1,5 +1,5 @@
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
-use crate::sql2::planner::ir::{CanonicalAdminKind, ReadPlan, VersionScope};
+use crate::sql2::planner::ir::{CanonicalAdminKind, FilesystemKind, ReadPlan, VersionScope};
 use crate::sql_shared::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -18,6 +18,9 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     };
     if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
         return Some(dependency_spec_for_working_changes_scan());
+    }
+    if let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) {
+        return Some(dependency_spec_for_filesystem_scan(filesystem_scan.kind, &canonicalized.surface_binding));
     }
     if let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) {
         return Some(dependency_spec_for_admin_scan(admin_scan.kind));
@@ -64,7 +67,12 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     }
 
     let mut spec = collector.spec;
-    if scan.version_scope == VersionScope::ActiveVersion {
+    if scan.version_scope == VersionScope::ActiveVersion
+        || matches!(
+            scan.binding.descriptor.public_name.as_str(),
+            "lix_file_history" | "lix_directory_history"
+        )
+    {
         spec.depends_on_active_version = true;
         spec.schema_keys.insert("lix_active_version".to_string());
         spec.entity_ids.clear();
@@ -108,18 +116,67 @@ fn dependency_spec_for_working_changes_scan() -> DependencySpec {
     }
 }
 
+fn dependency_spec_for_filesystem_scan(
+    kind: FilesystemKind,
+    binding: &crate::sql2::catalog::SurfaceBinding,
+) -> DependencySpec {
+    let mut spec = DependencySpec {
+        relations: [binding.descriptor.public_name.clone()].into_iter().collect(),
+        ..DependencySpec::default()
+    };
+
+    match kind {
+        FilesystemKind::File => {
+            spec.schema_keys.insert("lix_file_descriptor".to_string());
+            spec.schema_keys.insert("lix_binary_blob_ref".to_string());
+            spec.schema_keys.insert("lix_directory_descriptor".to_string());
+        }
+        FilesystemKind::Directory => {
+            spec.schema_keys.insert("lix_directory_descriptor".to_string());
+        }
+    }
+
+    if matches!(
+        binding.descriptor.public_name.as_str(),
+        "lix_file" | "lix_directory" | "lix_file_history"
+    ) {
+        spec.depends_on_active_version = true;
+        spec.schema_keys.insert("lix_active_version".to_string());
+    }
+
+    spec.precision = DependencyPrecision::Conservative;
+    spec
+}
+
 fn canonical_state_scan(
     read_plan: &ReadPlan,
 ) -> Option<&crate::sql2::planner::ir::CanonicalStateScan> {
     match read_plan {
         ReadPlan::Scan(scan) => Some(scan),
-        ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) | ReadPlan::WorkingChangesScan(_) => {
-            None
-        }
+        ReadPlan::FilesystemScan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::ChangeScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
         | ReadPlan::Limit { input, .. } => canonical_state_scan(input),
+    }
+}
+
+fn canonical_filesystem_scan(
+    read_plan: &ReadPlan,
+) -> Option<&crate::sql2::planner::ir::CanonicalFilesystemScan> {
+    match read_plan {
+        ReadPlan::FilesystemScan(scan) => Some(scan),
+        ReadPlan::Scan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::ChangeScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
+        ReadPlan::Filter { input, .. }
+        | ReadPlan::Project { input, .. }
+        | ReadPlan::Sort { input, .. }
+        | ReadPlan::Limit { input, .. } => canonical_filesystem_scan(input),
     }
 }
 
@@ -128,7 +185,10 @@ fn canonical_admin_scan(
 ) -> Option<&crate::sql2::planner::ir::CanonicalAdminScan> {
     match read_plan {
         ReadPlan::AdminScan(scan) => Some(scan),
-        ReadPlan::Scan(_) | ReadPlan::ChangeScan(_) | ReadPlan::WorkingChangesScan(_) => None,
+        ReadPlan::Scan(_)
+        | ReadPlan::FilesystemScan(_)
+        | ReadPlan::ChangeScan(_)
+        | ReadPlan::WorkingChangesScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
@@ -141,7 +201,10 @@ fn canonical_working_changes_scan(
 ) -> Option<&crate::sql2::planner::ir::CanonicalWorkingChangesScan> {
     match read_plan {
         ReadPlan::WorkingChangesScan(scan) => Some(scan),
-        ReadPlan::Scan(_) | ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::Scan(_)
+        | ReadPlan::FilesystemScan(_)
+        | ReadPlan::AdminScan(_)
+        | ReadPlan::ChangeScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
