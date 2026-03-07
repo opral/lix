@@ -1,8 +1,14 @@
+use crate::commit::{
+    load_exact_committed_state_row, CommitQueryExecutor, ExactCommittedStateRow,
+    ExactCommittedStateRowRequest,
+};
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::ir::{CanonicalStateScan, ReadPlan, VersionScope};
 use crate::sql_shared::dependency_spec::DependencySpec;
+use crate::version::GLOBAL_VERSION_ID;
+use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{Expr, OrderByKind, Query, SelectItem, Statement, Visit, Visitor};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +58,26 @@ pub(crate) struct ResolvedStateRows {
     pub(crate) visible_rows: Vec<ResolvedStateRow>,
     pub(crate) hidden_rows: Vec<ResolvedStateRow>,
     pub(crate) lineage_metadata: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExactEffectiveStateRowRequest {
+    pub(crate) schema_key: String,
+    pub(crate) version_id: String,
+    pub(crate) exact_filters: BTreeMap<String, Value>,
+    pub(crate) include_global_overlay: bool,
+    pub(crate) include_untracked_overlay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExactEffectiveStateRow {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) values: BTreeMap<String, Value>,
+    pub(crate) source_change_id: Option<String>,
+    pub(crate) overlay_lane: OverlayLane,
 }
 
 pub(crate) fn build_effective_state(
@@ -258,12 +284,335 @@ fn filter_column_name(expr: &Expr) -> Option<&'static str> {
 }
 
 fn overlay_lanes_for_request(request: &EffectiveStateRequest) -> Vec<OverlayLane> {
-    let mut lanes = vec![OverlayLane::GlobalTracked, OverlayLane::LocalTracked];
+    let mut lanes = vec![OverlayLane::LocalTracked];
     if request.include_untracked_overlay {
-        lanes.push(OverlayLane::GlobalUntracked);
-        lanes.push(OverlayLane::LocalUntracked);
+        lanes.insert(0, OverlayLane::LocalUntracked);
+    }
+    if request.include_global_overlay {
+        if request.include_untracked_overlay {
+            lanes.push(OverlayLane::GlobalUntracked);
+        }
+        lanes.push(OverlayLane::GlobalTracked);
     }
     lanes
+}
+
+pub(crate) async fn resolve_exact_effective_state_row(
+    backend: &dyn LixBackend,
+    request: &ExactEffectiveStateRowRequest,
+) -> Result<Option<ExactEffectiveStateRow>, LixError> {
+    let requested_untracked = request
+        .exact_filters
+        .get("untracked")
+        .and_then(bool_from_value);
+    let requested_global = request
+        .exact_filters
+        .get("global")
+        .and_then(bool_from_value);
+
+    let mut lanes = vec![OverlayLane::LocalTracked];
+    if request.include_untracked_overlay {
+        lanes.insert(0, OverlayLane::LocalUntracked);
+    }
+    if request.include_global_overlay && request.version_id != GLOBAL_VERSION_ID {
+        if request.include_untracked_overlay {
+            lanes.push(OverlayLane::GlobalUntracked);
+        }
+        lanes.push(OverlayLane::GlobalTracked);
+    }
+
+    for lane in lanes {
+        if !lane_matches_global_filter(lane, requested_global)
+            || !lane_matches_untracked_filter(lane, requested_untracked)
+        {
+            continue;
+        }
+
+        let version_id = if matches!(
+            lane,
+            OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked
+        ) {
+            GLOBAL_VERSION_ID.to_string()
+        } else {
+            request.version_id.clone()
+        };
+
+        let row = match lane {
+            OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
+                load_exact_tracked_effective_row(backend, request, &version_id, lane).await?
+            }
+            OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
+                load_exact_untracked_effective_row(backend, request, &version_id, lane).await?
+            }
+        };
+
+        if row.is_some() {
+            return Ok(row);
+        }
+    }
+
+    Ok(None)
+}
+
+async fn load_exact_tracked_effective_row(
+    backend: &dyn LixBackend,
+    request: &ExactEffectiveStateRowRequest,
+    version_id: &str,
+    overlay_lane: OverlayLane,
+) -> Result<Option<ExactEffectiveStateRow>, LixError> {
+    let mut executor = backend;
+    let Some(entity_id) = request
+        .exact_filters
+        .get("entity_id")
+        .and_then(text_from_value)
+        .map(ToString::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let mut exact_filters = request.exact_filters.clone();
+    exact_filters.remove("entity_id");
+    exact_filters.remove("global");
+    exact_filters.remove("untracked");
+
+    let row = load_exact_committed_state_row(
+        &mut executor,
+        &ExactCommittedStateRowRequest {
+            entity_id,
+            schema_key: request.schema_key.clone(),
+            version_id: version_id.to_string(),
+            exact_filters,
+        },
+    )
+    .await?;
+
+    Ok(row.map(|row| exact_effective_state_row_from_tracked(row, overlay_lane)))
+}
+
+async fn load_exact_untracked_effective_row(
+    backend: &dyn LixBackend,
+    request: &ExactEffectiveStateRowRequest,
+    version_id: &str,
+    overlay_lane: OverlayLane,
+) -> Result<Option<ExactEffectiveStateRow>, LixError> {
+    let mut executor = backend;
+    let row = load_exact_untracked_state_row(
+        &mut executor,
+        &ExactUntrackedStateRowRequest {
+            schema_key: request.schema_key.clone(),
+            version_id: version_id.to_string(),
+            exact_filters: request.exact_filters.clone(),
+        },
+    )
+    .await?;
+
+    Ok(row.map(|row| exact_effective_state_row_from_untracked(row, overlay_lane)))
+}
+
+fn exact_effective_state_row_from_tracked(
+    row: ExactCommittedStateRow,
+    overlay_lane: OverlayLane,
+) -> ExactEffectiveStateRow {
+    ExactEffectiveStateRow {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        version_id: row.version_id.clone(),
+        values: row.values,
+        source_change_id: row.source_change_id,
+        overlay_lane,
+    }
+}
+
+fn exact_effective_state_row_from_untracked(
+    row: ExactUntrackedStateRow,
+    overlay_lane: OverlayLane,
+) -> ExactEffectiveStateRow {
+    ExactEffectiveStateRow {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        version_id: row.version_id.clone(),
+        values: row.values,
+        source_change_id: Some("untracked".to_string()),
+        overlay_lane,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExactUntrackedStateRowRequest {
+    schema_key: String,
+    version_id: String,
+    exact_filters: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ExactUntrackedStateRow {
+    entity_id: String,
+    schema_key: String,
+    file_id: String,
+    version_id: String,
+    values: BTreeMap<String, Value>,
+}
+
+async fn load_exact_untracked_state_row(
+    executor: &mut dyn CommitQueryExecutor,
+    request: &ExactUntrackedStateRowRequest,
+) -> Result<Option<ExactUntrackedStateRow>, LixError> {
+    let mut predicates = vec![
+        format!("schema_key = '{}'", escape_sql_string(&request.schema_key)),
+        format!("version_id = '{}'", escape_sql_string(&request.version_id)),
+        "snapshot_content IS NOT NULL".to_string(),
+    ];
+    for column in [
+        "entity_id",
+        "file_id",
+        "plugin_key",
+        "schema_version",
+        "writer_key",
+    ] {
+        if let Some(value) = request.exact_filters.get(column) {
+            let Some(value) = text_from_value(value) else {
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "sql2 effective-state resolver requires text-compatible exact filter values for '{column}'"
+                    ),
+                });
+            };
+            predicates.push(format!("{column} = '{}'", escape_sql_string(value)));
+        }
+    }
+
+    let sql = format!(
+        "SELECT \
+             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, \
+             snapshot_content, metadata \
+         FROM lix_internal_state_untracked \
+         WHERE {predicates} \
+         LIMIT 2",
+        predicates = predicates.join(" AND "),
+    );
+    let mut result = executor.execute(&sql, &[]).await?;
+    if result.rows.len() > 1 {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "sql2 effective-state resolver requires exactly one untracked target row for '{}@{}'",
+                request.schema_key, request.version_id
+            ),
+        });
+    }
+    let Some(row) = result.rows.pop() else {
+        return Ok(None);
+    };
+    if row.len() < 8 {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "sql2 effective-state resolver query returned too few columns".to_string(),
+        });
+    }
+
+    let entity_id = required_text_value(&row[0], "entity_id")?;
+    let schema_key = required_text_value(&row[1], "schema_key")?;
+    let schema_version = required_text_value(&row[2], "schema_version")?;
+    let file_id = required_text_value(&row[3], "file_id")?;
+    let version_id = required_text_value(&row[4], "version_id")?;
+    let plugin_key = required_text_value(&row[5], "plugin_key")?;
+    let snapshot_content = required_text_value(&row[6], "snapshot_content")?;
+    let metadata = optional_value(&row[7]);
+
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
+    values.insert("schema_key".to_string(), Value::Text(schema_key.clone()));
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(schema_version.clone()),
+    );
+    values.insert("file_id".to_string(), Value::Text(file_id.clone()));
+    values.insert("version_id".to_string(), Value::Text(version_id.clone()));
+    values.insert("plugin_key".to_string(), Value::Text(plugin_key));
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(snapshot_content),
+    );
+    if let Some(metadata) = metadata {
+        values.insert("metadata".to_string(), metadata);
+    }
+
+    Ok(Some(ExactUntrackedStateRow {
+        entity_id,
+        schema_key,
+        file_id,
+        version_id,
+        values,
+    }))
+}
+
+fn lane_matches_global_filter(lane: OverlayLane, requested_global: Option<bool>) -> bool {
+    match requested_global {
+        Some(true) => matches!(
+            lane,
+            OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked
+        ),
+        Some(false) => matches!(
+            lane,
+            OverlayLane::LocalTracked | OverlayLane::LocalUntracked
+        ),
+        None => true,
+    }
+}
+
+fn lane_matches_untracked_filter(lane: OverlayLane, requested_untracked: Option<bool>) -> bool {
+    match requested_untracked {
+        Some(true) => matches!(
+            lane,
+            OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked
+        ),
+        Some(false) => matches!(lane, OverlayLane::LocalTracked | OverlayLane::GlobalTracked),
+        None => true,
+    }
+}
+
+fn bool_from_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Boolean(value) => Some(*value),
+        Value::Integer(value) => Some(*value != 0),
+        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn text_from_value(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn required_text_value(value: &Value, label: &str) -> Result<String, LixError> {
+    match value {
+        Value::Text(value) => Ok(value.clone()),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("sql2 effective-state resolver expected text for '{label}'"),
+        }),
+    }
+}
+
+fn optional_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null => None,
+        other => Some(other.clone()),
+    }
+}
+
+fn escape_sql_string(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 fn residual_predicates(read_plan: &ReadPlan) -> Vec<String> {
@@ -333,10 +682,10 @@ mod tests {
         assert_eq!(
             plan.overlay_lanes,
             vec![
-                OverlayLane::GlobalTracked,
+                OverlayLane::LocalUntracked,
                 OverlayLane::LocalTracked,
                 OverlayLane::GlobalUntracked,
-                OverlayLane::LocalUntracked,
+                OverlayLane::GlobalTracked,
             ]
         );
         assert_eq!(plan.residual_predicates, vec!["key = 'hello'".to_string()]);
