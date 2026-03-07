@@ -4,6 +4,10 @@ use async_trait::async_trait;
 
 use crate::builtin_schema::types::LixVersionPointer;
 use crate::error_classification::is_missing_relation_error;
+use crate::materialization::{
+    materialization_plan, MaterializationDebugMode, MaterializationRequest, MaterializationScope,
+    MaterializationWrite, MaterializationWriteOp,
+};
 use crate::version::{
     version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
 };
@@ -13,7 +17,6 @@ use super::types::{VersionInfo, VersionSnapshot};
 
 const CHANGE_TABLE: &str = "lix_internal_change";
 const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
-const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExactCommittedStateRow {
@@ -30,6 +33,7 @@ pub(crate) struct ExactCommittedStateRowRequest {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
+    pub(crate) global_filter: Option<bool>,
     pub(crate) exact_filters: BTreeMap<String, Value>,
 }
 
@@ -165,46 +169,28 @@ pub(crate) async fn load_version_info_for_versions(
 }
 
 pub(crate) async fn load_exact_committed_state_row(
-    executor: &mut dyn CommitQueryExecutor,
+    backend: &dyn LixBackend,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let mut predicates = vec![
-        format!("entity_id = '{}'", escape_sql_string(&request.entity_id)),
-        format!("version_id = '{}'", escape_sql_string(&request.version_id)),
-        "is_tombstone = 0".to_string(),
-        "snapshot_content IS NOT NULL".to_string(),
-    ];
-    for column in ["schema_key", "file_id", "plugin_key", "schema_version"] {
-        if let Some(value) = request.exact_filters.get(column) {
-            let Some(value) = text_from_value(value) else {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "tracked write state source requires text-compatible exact filter values for '{column}'"
-                    ),
-                });
-            };
-            predicates.push(format!("{column} = '{}'", escape_sql_string(&value)));
-        }
-    }
+    let mut target_versions = BTreeSet::new();
+    target_versions.insert(request.version_id.clone());
+    let plan = materialization_plan(
+        backend,
+        &MaterializationRequest {
+            scope: MaterializationScope::Versions(target_versions),
+            debug: MaterializationDebugMode::Off,
+            debug_row_limit: 0,
+        },
+    )
+    .await?;
 
-    let sql = format!(
-        "SELECT \
-             entity_id, schema_key, schema_version, file_id, version_id, plugin_key, \
-             snapshot_content, metadata, change_id \
-         FROM {table_name} \
-         WHERE {predicates} \
-         LIMIT 2",
-        table_name = quote_ident(&format!("{MATERIALIZED_PREFIX}{}", request.schema_key)),
-        predicates = predicates.join(" AND "),
-    );
-    let mut result = match executor.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    let matching_rows = plan
+        .writes
+        .iter()
+        .filter(|row| materialized_write_matches_request(row, request))
+        .collect::<Vec<_>>();
 
-    if result.rows.len() > 1 {
+    if matching_rows.len() > 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
@@ -213,51 +199,93 @@ pub(crate) async fn load_exact_committed_state_row(
             ),
         });
     }
-    let Some(row) = result.rows.pop() else {
+    let Some(row) = matching_rows.into_iter().next() else {
         return Ok(None);
     };
-    if row.len() < 9 {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "tracked write state source query returned too few columns".to_string(),
-        });
+    exact_committed_state_row_from_materialized_write(row)
+}
+
+fn materialized_write_matches_request(
+    row: &MaterializationWrite,
+    request: &ExactCommittedStateRowRequest,
+) -> bool {
+    if row.entity_id != request.entity_id
+        || row.schema_key != request.schema_key
+        || row.version_id != request.version_id
+    {
+        return false;
     }
 
-    let entity_id = required_text_value(&row[0], "entity_id")?;
-    let schema_key = required_text_value(&row[1], "schema_key")?;
-    let schema_version = required_text_value(&row[2], "schema_version")?;
-    let file_id = required_text_value(&row[3], "file_id")?;
-    let version_id = required_text_value(&row[4], "version_id")?;
-    let plugin_key = required_text_value(&row[5], "plugin_key")?;
-    let snapshot_content = required_text_value(&row[6], "snapshot_content")?;
-    let metadata = optional_value(&row[7]);
-    let change_id = optional_value(&row[8]);
+    if let Some(global) = request.global_filter {
+        if row.global != global {
+            return false;
+        }
+    }
+
+    for column in ["file_id", "plugin_key", "schema_version"] {
+        if let Some(expected) = request.exact_filters.get(column) {
+            let Some(expected) = text_from_value(expected) else {
+                return false;
+            };
+            let actual = match column {
+                "file_id" => row.file_id.as_str(),
+                "plugin_key" => row.plugin_key.as_str(),
+                "schema_version" => row.schema_version.as_str(),
+                _ => unreachable!(),
+            };
+            if actual != expected {
+                return false;
+            }
+        }
+    }
+
+    match row.op {
+        MaterializationWriteOp::Upsert => row.snapshot_content.is_some(),
+        MaterializationWriteOp::Tombstone => false,
+    }
+}
+
+fn exact_committed_state_row_from_materialized_write(
+    row: &MaterializationWrite,
+) -> Result<Option<ExactCommittedStateRow>, LixError> {
+    let Some(snapshot_content) = row.snapshot_content.clone() else {
+        return Ok(None);
+    };
 
     let mut values = BTreeMap::new();
-    values.insert("entity_id".to_string(), Value::Text(entity_id.clone()));
-    values.insert("schema_key".to_string(), Value::Text(schema_key.clone()));
+    values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(row.schema_key.clone()),
+    );
     values.insert(
         "schema_version".to_string(),
-        Value::Text(schema_version.clone()),
+        Value::Text(row.schema_version.clone()),
     );
-    values.insert("file_id".to_string(), Value::Text(file_id.clone()));
-    values.insert("version_id".to_string(), Value::Text(version_id.clone()));
-    values.insert("plugin_key".to_string(), Value::Text(plugin_key));
+    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(row.version_id.clone()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(row.plugin_key.clone()),
+    );
     values.insert(
         "snapshot_content".to_string(),
         Value::Text(snapshot_content),
     );
-    if let Some(metadata) = metadata {
-        values.insert("metadata".to_string(), metadata);
+    if let Some(metadata) = row.metadata.clone() {
+        values.insert("metadata".to_string(), Value::Text(metadata));
     }
 
     Ok(Some(ExactCommittedStateRow {
-        entity_id,
-        schema_key,
-        file_id,
-        version_id,
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        version_id: row.version_id.clone(),
         values,
-        source_change_id: change_id.and_then(|value| text_from_value(&value)),
+        source_change_id: Some(row.change_id.clone()),
     }))
 }
 
@@ -305,23 +333,6 @@ fn parse_version_pointer_snapshot(value: &Value) -> Result<Option<LixVersionPoin
     Ok(Some(snapshot))
 }
 
-fn required_text_value(value: &Value, label: &str) -> Result<String, LixError> {
-    match value {
-        Value::Text(value) => Ok(value.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("tracked write state source expected text for '{label}'"),
-        }),
-    }
-}
-
-fn optional_value(value: &Value) -> Option<Value> {
-    match value {
-        Value::Null => None,
-        other => Some(other.clone()),
-    }
-}
-
 fn text_from_value(value: &Value) -> Option<String> {
     match value {
         Value::Text(value) => Some(value.clone()),
@@ -334,9 +345,4 @@ fn text_from_value(value: &Value) -> Option<String> {
 
 fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
-}
-
-fn quote_ident(value: &str) -> String {
-    let escaped = value.replace('"', "\"\"");
-    format!("\"{escaped}\"")
 }

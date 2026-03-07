@@ -1100,7 +1100,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        state_rows: Vec<Vec<Value>>,
+        change_rows: Vec<Vec<Value>>,
     }
 
     #[async_trait(?Send)]
@@ -1110,56 +1110,23 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM \"lix_internal_state_materialized_v1_lix_key_value\"") {
-                let entity_filter = extract_sql_string_filter(sql, "entity_id");
-                let version_filter = extract_sql_string_filter(sql, "version_id");
-                let file_filter = extract_sql_string_filter(sql, "file_id");
-                let plugin_filter = extract_sql_string_filter(sql, "plugin_key");
+            if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
+                && sql.contains("FROM lix_internal_change c")
+            {
                 return Ok(QueryResult {
-                        rows: self
-                            .state_rows
-                        .iter()
-                        .filter(|row| {
-                            let entity_matches = match entity_filter.as_ref() {
-                                Some(entity_id) => {
-                                    matches!(row.first(), Some(Value::Text(value)) if value == entity_id)
-                                }
-                                None => true,
-                            };
-                            let version_matches = match version_filter.as_ref() {
-                                Some(version_id) => {
-                                    matches!(row.get(4), Some(Value::Text(value)) if value == version_id)
-                                }
-                                None => true,
-                            };
-                            let file_matches = match file_filter.as_ref() {
-                                Some(file_id) => {
-                                    matches!(row.get(3), Some(Value::Text(value)) if value == file_id)
-                                }
-                                None => true,
-                            };
-                            let plugin_matches = match plugin_filter.as_ref() {
-                                Some(plugin_key) => {
-                                    matches!(row.get(5), Some(Value::Text(value)) if value == plugin_key)
-                                }
-                                None => true,
-                            };
-                            entity_matches && version_matches && file_matches && plugin_matches
-                        })
-                        .cloned()
-                        .collect(),
-                        columns: vec![
-                            "entity_id".to_string(),
-                            "schema_key".to_string(),
-                            "schema_version".to_string(),
-                            "file_id".to_string(),
-                            "version_id".to_string(),
-                            "plugin_key".to_string(),
-                            "snapshot_content".to_string(),
-                            "metadata".to_string(),
-                            "change_id".to_string(),
-                        ],
-                    });
+                    rows: self.change_rows.clone(),
+                    columns: vec![
+                        "id".to_string(),
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "plugin_key".to_string(),
+                        "snapshot_content".to_string(),
+                        "metadata".to_string(),
+                        "created_at".to_string(),
+                    ],
+                });
             }
 
             Ok(QueryResult {
@@ -1182,6 +1149,69 @@ mod tests {
         let rest = &sql[start..];
         let end = rest.find('\'')?;
         Some(rest[..end].to_string())
+    }
+
+    fn build_committed_state_change_rows(
+        entity_id: &str,
+        version_id: &str,
+        file_id: &str,
+        plugin_key: &str,
+        snapshot_content: &str,
+        metadata: Option<&str>,
+        change_id: &str,
+        commit_id: &str,
+    ) -> Vec<Vec<Value>> {
+        let commit_snapshot = serde_json::json!({
+            "id": commit_id,
+            "change_set_id": format!("change-set-{commit_id}"),
+            "change_ids": [change_id],
+            "author_account_ids": [],
+            "parent_commit_ids": [],
+            "meta_change_ids": []
+        })
+        .to_string();
+        let pointer_snapshot = serde_json::json!({
+            "id": version_id,
+            "commit_id": commit_id
+        })
+        .to_string();
+        vec![
+            vec![
+                Value::Text(change_id.to_string()),
+                Value::Text(entity_id.to_string()),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text(file_id.to_string()),
+                Value::Text(plugin_key.to_string()),
+                Value::Text(snapshot_content.to_string()),
+                metadata
+                    .map(|value| Value::Text(value.to_string()))
+                    .unwrap_or(Value::Null),
+                Value::Text("2026-03-06T18:00:00Z".to_string()),
+            ],
+            vec![
+                Value::Text(format!("commit-change-{commit_id}")),
+                Value::Text(commit_id.to_string()),
+                Value::Text("lix_commit".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text(commit_snapshot),
+                Value::Null,
+                Value::Text("2026-03-06T18:00:01Z".to_string()),
+            ],
+            vec![
+                Value::Text(format!("pointer-change-{version_id}")),
+                Value::Text(version_id.to_string()),
+                Value::Text("lix_version_pointer".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text(crate::version::version_pointer_file_id().to_string()),
+                Value::Text(crate::version::version_pointer_plugin_key().to_string()),
+                Value::Text(pointer_snapshot),
+                Value::Null,
+                Value::Text("2026-03-06T18:00:02Z".to_string()),
+            ],
+        ]
     }
 
     fn planned_write(
@@ -1252,17 +1282,16 @@ mod tests {
     #[tokio::test]
     async fn resolves_update_from_authoritative_pre_state() {
         let backend = FakeBackend {
-            state_rows: vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Text("{\"m\":1}".to_string()),
-                Value::Text("change-1".to_string()),
-            ]],
+            change_rows: build_committed_state_change_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"before\"}",
+                Some("{\"m\":1}"),
+                "change-1",
+                "commit-1",
+            ),
         };
         let resolved = resolve_write_plan(
             &backend,
@@ -1300,17 +1329,16 @@ mod tests {
     #[tokio::test]
     async fn resolves_delete_from_authoritative_pre_state() {
         let backend = FakeBackend {
-            state_rows: vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Null,
-                Value::Text("change-1".to_string()),
-            ]],
+            change_rows: build_committed_state_change_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"before\"}",
+                None,
+                "change-1",
+                "commit-1",
+            ),
         };
         let resolved = resolve_write_plan(
             &backend,
@@ -1358,17 +1386,16 @@ mod tests {
     #[tokio::test]
     async fn rejects_update_that_changes_identity_columns() {
         let backend = FakeBackend {
-            state_rows: vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Null,
-                Value::Text("change-1".to_string()),
-            ]],
+            change_rows: build_committed_state_change_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"before\"}",
+                None,
+                "change-1",
+                "commit-1",
+            ),
         };
         let error = resolve_write_plan(
             &backend,
@@ -1392,17 +1419,16 @@ mod tests {
     #[tokio::test]
     async fn exact_file_filter_prevents_mismatched_updates() {
         let backend = FakeBackend {
-            state_rows: vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Null,
-                Value::Text("change-1".to_string()),
-            ]],
+            change_rows: build_committed_state_change_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"before\"}",
+                None,
+                "change-1",
+                "commit-1",
+            ),
         };
         let resolved = resolve_write_plan(
             &backend,
@@ -1425,17 +1451,16 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_exact_or_selectors() {
         let backend = FakeBackend {
-            state_rows: vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Null,
-                Value::Text("change-1".to_string()),
-            ]],
+            change_rows: build_committed_state_change_rows(
+                "entity-1",
+                "version-a",
+                "lix",
+                "lix",
+                "{\"value\":\"before\"}",
+                None,
+                "change-1",
+                "commit-1",
+            ),
         };
         let error = resolve_write_plan(
             &backend,

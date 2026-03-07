@@ -186,6 +186,17 @@ impl SurfaceRegistry {
         self.bind_relation_name(&relation_name)
     }
 
+    pub(crate) fn registered_schema_keys(&self) -> Vec<String> {
+        let mut schema_keys = self
+            .descriptors
+            .values()
+            .filter_map(|descriptor| descriptor.implicit_overrides.fixed_schema_key.clone())
+            .collect::<Vec<_>>();
+        schema_keys.sort();
+        schema_keys.dedup();
+        schema_keys
+    }
+
     pub(crate) fn register_dynamic_entity_surfaces(
         &mut self,
         spec: DynamicEntitySurfaceSpec,

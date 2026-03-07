@@ -7,6 +7,10 @@ use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
 };
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    version_descriptor_schema_key, GLOBAL_VERSION_ID,
+};
 use crate::LixError;
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
@@ -92,8 +96,14 @@ fn lower_state_read_for_execution(
 
     let (pushdown_predicates, residual_selection) =
         split_state_selection_for_pushdown(select.selection.as_ref(), effective_state_plan);
-    let derived_query =
-        build_state_source_query(&canonicalized.surface_binding, &pushdown_predicates)?;
+    let Some(derived_query) = build_state_source_query(
+        &canonicalized.surface_binding,
+        effective_state_request,
+        &pushdown_predicates,
+    )?
+    else {
+        return Ok(None);
+    };
     let derived_alias = alias.clone().or_else(|| {
         Some(TableAlias {
             explicit: false,
@@ -142,8 +152,11 @@ fn lower_entity_read_for_execution(
         return Ok(None);
     };
 
-    let derived_query =
-        build_entity_source_query(&canonicalized.surface_binding, effective_state_request)?;
+    let Some(derived_query) =
+        build_entity_source_query(&canonicalized.surface_binding, effective_state_request)?
+    else {
+        return Ok(None);
+    };
     let derived_alias = alias.clone().or_else(|| {
         Some(TableAlias {
             explicit: false,
@@ -190,24 +203,25 @@ fn lower_change_read_for_execution(
 
 fn build_state_source_query(
     surface_binding: &SurfaceBinding,
+    effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[String],
-) -> Result<Query, LixError> {
-    let source = render_identifier(&surface_binding.descriptor.public_name);
-    let sql = if pushdown_predicates.is_empty() {
-        format!("SELECT * FROM {source}")
-    } else {
-        format!(
-            "SELECT * FROM {source} WHERE {}",
-            pushdown_predicates.join(" AND ")
-        )
+) -> Result<Option<Query>, LixError> {
+    let sql = match surface_binding.descriptor.surface_variant {
+        SurfaceVariant::Default | SurfaceVariant::ByVersion => build_effective_state_source_sql(
+            effective_state_request,
+            surface_binding,
+            pushdown_predicates,
+        )?,
+        SurfaceVariant::History => build_state_history_source_sql(pushdown_predicates),
+        SurfaceVariant::Active | SurfaceVariant::WorkingChanges => return Ok(None),
     };
-    parse_single_query(&sql)
+    parse_single_query(&sql).map(Some)
 }
 
 fn build_entity_source_query(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
-) -> Result<Query, LixError> {
+) -> Result<Option<Query>, LixError> {
     let Some(schema_key) = surface_binding
         .implicit_overrides
         .fixed_schema_key
@@ -229,20 +243,561 @@ fn build_entity_source_query(
         projection.join(", ")
     };
 
-    let (source_table, mut predicates) = entity_source_predicates(surface_binding, schema_key);
+    let Some(state_source_query) =
+        build_state_source_query(surface_binding, effective_state_request, &[])?
+    else {
+        return Ok(None);
+    };
+    let mut predicates = Vec::new();
+    if !matches!(
+        surface_binding.descriptor.surface_variant,
+        SurfaceVariant::Default | SurfaceVariant::ByVersion | SurfaceVariant::History
+    ) {
+        predicates.push(format!(
+            "{} = '{}'",
+            render_identifier("schema_key"),
+            escape_sql_string(schema_key)
+        ));
+    }
     for predicate in &surface_binding.implicit_overrides.predicate_overrides {
         predicates.push(render_override_predicate(predicate));
     }
 
+    let source_sql = state_source_query.to_string();
     let sql = if predicates.is_empty() {
-        format!("SELECT {projection} FROM {source_table}")
+        format!("SELECT {projection} FROM ({source_sql}) AS state_source")
     } else {
         format!(
-            "SELECT {projection} FROM {source_table} WHERE {}",
+            "SELECT {projection} FROM ({source_sql}) AS state_source WHERE {}",
             predicates.join(" AND ")
         )
     };
-    parse_single_query(&sql)
+    parse_single_query(&sql).map(Some)
+}
+
+fn build_effective_state_source_sql(
+    effective_state_request: &EffectiveStateRequest,
+    surface_binding: &SurfaceBinding,
+    pushdown_predicates: &[String],
+) -> Result<String, LixError> {
+    let schema_keys = effective_state_request
+        .schema_set
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if schema_keys.is_empty() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "sql2 state read lowerer requires a bounded schema set for '{}'",
+                surface_binding.descriptor.public_name
+            ),
+        });
+    }
+
+    let (target_version_predicates, source_predicates) =
+        split_effective_state_pushdown_predicates(pushdown_predicates);
+    let target_versions_cte = match surface_binding.descriptor.surface_variant {
+        SurfaceVariant::Default => active_target_versions_cte_sql(),
+        SurfaceVariant::ByVersion => {
+            explicit_target_versions_cte_sql(&schema_keys, &target_version_predicates)
+        }
+        _ => {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "state lowerer expected default or by-version surface".to_string(),
+            });
+        }
+    };
+    let candidate_rows_sql = effective_state_candidate_rows_sql(&schema_keys, &source_predicates);
+    Ok(format!(
+        "WITH \
+           {target_versions_cte}, \
+           commit_by_version AS ( \
+             SELECT \
+               entity_id AS commit_id, \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id \
+             FROM lix_internal_state_materialized_v1_lix_commit \
+             WHERE schema_key = 'lix_commit' \
+               AND version_id = '{global_version}' \
+               AND global = true \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_set_element_by_version AS ( \
+             SELECT \
+               lix_json_extract(snapshot_content, 'change_set_id') AS change_set_id, \
+               lix_json_extract(snapshot_content, 'change_id') AS change_id \
+             FROM lix_internal_state_materialized_v1_lix_change_set_element \
+             WHERE schema_key = 'lix_change_set_element' \
+               AND version_id = '{global_version}' \
+               AND global = true \
+               AND is_tombstone = 0 \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           change_commit_by_change_id AS ( \
+             SELECT \
+               cse.change_id AS change_id, \
+               MAX(cbv.commit_id) AS commit_id \
+             FROM change_set_element_by_version cse \
+             JOIN commit_by_version cbv \
+               ON cbv.change_set_id = cse.change_set_id \
+             WHERE cse.change_id IS NOT NULL \
+             GROUP BY cse.change_id \
+           ), \
+           candidates AS ( \
+             {candidate_rows_sql} \
+           ), \
+           ranked AS ( \
+             SELECT \
+               c.entity_id AS entity_id, \
+               c.schema_key AS schema_key, \
+               c.file_id AS file_id, \
+               c.version_id AS version_id, \
+               c.plugin_key AS plugin_key, \
+               c.snapshot_content AS snapshot_content, \
+               c.schema_version AS schema_version, \
+               c.created_at AS created_at, \
+               c.updated_at AS updated_at, \
+               c.global AS global, \
+               c.change_id AS change_id, \
+               c.commit_id AS commit_id, \
+               c.untracked AS untracked, \
+               c.writer_key AS writer_key, \
+               c.metadata AS metadata, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY c.version_id, c.entity_id, c.schema_key, c.file_id \
+                 ORDER BY \
+                   c.precedence ASC, \
+                   c.updated_at DESC, \
+                   c.created_at DESC, \
+                   COALESCE(c.change_id, '') DESC \
+               ) AS rn \
+             FROM candidates c \
+           ) \
+         SELECT \
+           ranked.entity_id AS entity_id, \
+           ranked.schema_key AS schema_key, \
+           ranked.file_id AS file_id, \
+           ranked.version_id AS version_id, \
+           ranked.plugin_key AS plugin_key, \
+           ranked.snapshot_content AS snapshot_content, \
+           ranked.schema_version AS schema_version, \
+           ranked.created_at AS created_at, \
+           ranked.updated_at AS updated_at, \
+           ranked.global AS global, \
+           ranked.change_id AS change_id, \
+           ranked.commit_id AS commit_id, \
+           ranked.untracked AS untracked, \
+           ranked.writer_key AS writer_key, \
+           ranked.metadata AS metadata \
+         FROM ranked \
+         WHERE ranked.rn = 1 \
+           AND ranked.snapshot_content IS NOT NULL",
+        target_versions_cte = target_versions_cte,
+        candidate_rows_sql = candidate_rows_sql,
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
+    ))
+}
+
+fn active_target_versions_cte_sql() -> String {
+    format!(
+        "target_versions AS ( \
+           SELECT DISTINCT \
+             lix_json_extract(snapshot_content, 'version_id') AS version_id \
+           FROM lix_internal_state_untracked \
+           WHERE schema_key = '{schema_key}' \
+             AND file_id = '{file_id}' \
+             AND version_id = '{storage_version_id}' \
+             AND snapshot_content IS NOT NULL \
+         )",
+        schema_key = escape_sql_string(active_version_schema_key()),
+        file_id = escape_sql_string(active_version_file_id()),
+        storage_version_id = escape_sql_string(active_version_storage_version_id()),
+    )
+}
+
+fn explicit_target_versions_cte_sql(
+    schema_keys: &[String],
+    target_version_predicates: &[String],
+) -> String {
+    let version_descriptor_predicates = vec![
+        format!(
+            "schema_key = '{}'",
+            escape_sql_string(version_descriptor_schema_key())
+        ),
+        format!("version_id = '{}'", escape_sql_string(GLOBAL_VERSION_ID)),
+        "global = true".to_string(),
+        "is_tombstone = 0".to_string(),
+        "snapshot_content IS NOT NULL".to_string(),
+    ];
+    let schema_local_rows = schema_keys
+        .iter()
+        .map(|schema_key| {
+            format!(
+                "SELECT DISTINCT version_id \
+                 FROM {table_name} \
+                 WHERE global = false \
+                   AND version_id <> '{global_version}'",
+                table_name =
+                    quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}")),
+                global_version = escape_sql_string(GLOBAL_VERSION_ID),
+            )
+        })
+        .chain(schema_keys.iter().map(|schema_key| {
+            format!(
+                "SELECT DISTINCT version_id \
+                 FROM lix_internal_state_untracked \
+                 WHERE schema_key = '{schema_key}' \
+                   AND global = false \
+                   AND version_id <> '{global_version}'",
+                schema_key = escape_sql_string(schema_key),
+                global_version = escape_sql_string(GLOBAL_VERSION_ID),
+            )
+        }))
+        .collect::<Vec<_>>();
+    let all_target_versions = if schema_local_rows.is_empty() {
+        String::new()
+    } else {
+        format!(" UNION {}", schema_local_rows.join(" UNION "))
+    };
+    let target_versions_where = render_where_clause_sql(target_version_predicates, " WHERE ");
+    format!(
+        "all_target_versions AS ( \
+           SELECT DISTINCT entity_id AS version_id \
+           FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+           WHERE {version_descriptor_predicates}\
+           {all_target_versions} \
+         ), \
+         target_versions AS ( \
+           SELECT version_id \
+           FROM all_target_versions \
+           {target_versions_where} \
+         )",
+        version_descriptor_predicates = version_descriptor_predicates.join(" AND "),
+        all_target_versions = all_target_versions,
+        target_versions_where = target_versions_where,
+    )
+}
+
+fn effective_state_candidate_rows_sql(
+    schema_keys: &[String],
+    source_predicates: &[String],
+) -> String {
+    let tracked_predicates = render_where_clause_sql(source_predicates, " AND ");
+    let untracked_predicates = render_where_clause_sql(source_predicates, " AND ");
+    schema_keys
+        .iter()
+        .flat_map(|schema_key| {
+            let table_name =
+                quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+            let schema_filter = format!("schema_key = '{}'", escape_sql_string(schema_key));
+            [
+                format!(
+                    "SELECT \
+                       t.entity_id AS entity_id, \
+                       t.schema_key AS schema_key, \
+                       t.file_id AS file_id, \
+                       tv.version_id AS version_id, \
+                       t.plugin_key AS plugin_key, \
+                       t.snapshot_content AS snapshot_content, \
+                       t.schema_version AS schema_version, \
+                       t.created_at AS created_at, \
+                       t.updated_at AS updated_at, \
+                       t.global AS global, \
+                       t.change_id AS change_id, \
+                       cc.commit_id AS commit_id, \
+                       false AS untracked, \
+                       NULL AS writer_key, \
+                       t.metadata AS metadata, \
+                       2 AS precedence \
+                     FROM {table_name} t \
+                     JOIN target_versions tv \
+                       ON tv.version_id = t.version_id \
+                     LEFT JOIN change_commit_by_change_id cc \
+                       ON cc.change_id = t.change_id \
+                     WHERE t.global = false{tracked_predicates}",
+                    table_name = table_name,
+                    tracked_predicates = tracked_predicates,
+                ),
+                format!(
+                    "SELECT \
+                       t.entity_id AS entity_id, \
+                       t.schema_key AS schema_key, \
+                       t.file_id AS file_id, \
+                       tv.version_id AS version_id, \
+                       t.plugin_key AS plugin_key, \
+                       t.snapshot_content AS snapshot_content, \
+                       t.schema_version AS schema_version, \
+                       t.created_at AS created_at, \
+                       t.updated_at AS updated_at, \
+                       t.global AS global, \
+                       t.change_id AS change_id, \
+                       cc.commit_id AS commit_id, \
+                       false AS untracked, \
+                       NULL AS writer_key, \
+                       t.metadata AS metadata, \
+                       4 AS precedence \
+                     FROM {table_name} t \
+                     JOIN target_versions tv \
+                       ON t.version_id = '{global_version}' \
+                     LEFT JOIN change_commit_by_change_id cc \
+                       ON cc.change_id = t.change_id \
+                     WHERE t.global = true{tracked_predicates}",
+                    table_name = table_name,
+                    global_version = escape_sql_string(GLOBAL_VERSION_ID),
+                    tracked_predicates = tracked_predicates,
+                ),
+                format!(
+                    "SELECT \
+                       u.entity_id AS entity_id, \
+                       u.schema_key AS schema_key, \
+                       u.file_id AS file_id, \
+                       tv.version_id AS version_id, \
+                       u.plugin_key AS plugin_key, \
+                       u.snapshot_content AS snapshot_content, \
+                       u.schema_version AS schema_version, \
+                       u.created_at AS created_at, \
+                       u.updated_at AS updated_at, \
+                       u.global AS global, \
+                       NULL AS change_id, \
+                       'untracked' AS commit_id, \
+                       true AS untracked, \
+                       u.writer_key AS writer_key, \
+                       u.metadata AS metadata, \
+                       1 AS precedence \
+                     FROM lix_internal_state_untracked u \
+                     JOIN target_versions tv \
+                       ON tv.version_id = u.version_id \
+                     WHERE {schema_filter} \
+                       AND u.global = false{untracked_predicates}",
+                    schema_filter = schema_filter,
+                    untracked_predicates = untracked_predicates,
+                ),
+                format!(
+                    "SELECT \
+                       u.entity_id AS entity_id, \
+                       u.schema_key AS schema_key, \
+                       u.file_id AS file_id, \
+                       tv.version_id AS version_id, \
+                       u.plugin_key AS plugin_key, \
+                       u.snapshot_content AS snapshot_content, \
+                       u.schema_version AS schema_version, \
+                       u.created_at AS created_at, \
+                       u.updated_at AS updated_at, \
+                       u.global AS global, \
+                       NULL AS change_id, \
+                       'untracked' AS commit_id, \
+                       true AS untracked, \
+                       u.writer_key AS writer_key, \
+                       u.metadata AS metadata, \
+                       3 AS precedence \
+                     FROM lix_internal_state_untracked u \
+                     JOIN target_versions tv \
+                       ON u.version_id = '{global_version}' \
+                     WHERE {schema_filter} \
+                       AND u.global = true{untracked_predicates}",
+                    schema_filter = schema_filter,
+                    global_version = escape_sql_string(GLOBAL_VERSION_ID),
+                    untracked_predicates = untracked_predicates,
+                ),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+fn build_state_history_source_sql(pushdown_predicates: &[String]) -> String {
+    let requested_root_predicates = history_requested_root_predicates(pushdown_predicates);
+    let requested_roots_where = render_where_clause_sql(&requested_root_predicates, " AND ");
+    let default_root_scope = if requested_root_predicates.is_empty() {
+        "AND ( \
+           d.root_commit_id IS NOT NULL \
+           OR c.entity_id IN (SELECT root_commit_id FROM default_root_commits) \
+         )"
+        .to_string()
+    } else {
+        String::new()
+    };
+    format!(
+        "WITH \
+           active_version_rows AS ( \
+             SELECT DISTINCT \
+               lix_json_extract(snapshot_content, 'version_id') AS version_id \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = '{active_schema_key}' \
+               AND file_id = '{active_file_id}' \
+               AND version_id = '{active_storage_version_id}' \
+               AND snapshot_content IS NOT NULL \
+           ), \
+           default_root_commits AS ( \
+             SELECT DISTINCT \
+               lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+               vp.entity_id AS root_version_id \
+             FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+             JOIN active_version_rows av \
+               ON av.version_id = vp.entity_id \
+             WHERE vp.schema_key = 'lix_version_pointer' \
+               AND vp.version_id = '{global_version}' \
+               AND vp.global = true \
+               AND vp.is_tombstone = 0 \
+               AND vp.snapshot_content IS NOT NULL \
+           ), \
+           requested_commits AS ( \
+             SELECT DISTINCT \
+               c.entity_id AS commit_id, \
+               COALESCE(d.root_version_id, c.version_id) AS root_version_id \
+             FROM lix_internal_state_materialized_v1_lix_commit c \
+             LEFT JOIN default_root_commits d \
+               ON d.root_commit_id = c.entity_id \
+             WHERE c.schema_key = 'lix_commit' \
+               AND c.version_id = '{global_version}' \
+               AND c.global = true \
+               AND c.is_tombstone = 0 \
+               AND c.snapshot_content IS NOT NULL{requested_roots_where} \
+               {default_root_scope} \
+           ), \
+           reachable_commits_from_requested AS ( \
+             SELECT \
+               ancestry.ancestor_id AS commit_id, \
+               requested.commit_id AS root_commit_id, \
+               requested.root_version_id AS root_version_id, \
+               ancestry.depth AS commit_depth \
+             FROM requested_commits requested \
+             JOIN lix_internal_commit_ancestry ancestry \
+               ON ancestry.commit_id = requested.commit_id \
+             WHERE ancestry.depth <= 512 \
+           ), \
+           commit_changesets AS ( \
+             SELECT \
+               c.entity_id AS commit_id, \
+               lix_json_extract(c.snapshot_content, 'change_set_id') AS change_set_id, \
+               c.created_at AS commit_created_at, \
+               rc.root_commit_id AS root_commit_id, \
+               rc.root_version_id AS root_version_id, \
+               rc.commit_depth AS commit_depth \
+             FROM lix_internal_state_materialized_v1_lix_commit c \
+             JOIN reachable_commits_from_requested rc \
+               ON rc.commit_id = c.entity_id \
+             WHERE c.schema_key = 'lix_commit' \
+               AND c.version_id = '{global_version}' \
+               AND c.global = true \
+               AND c.is_tombstone = 0 \
+               AND c.snapshot_content IS NOT NULL \
+           ), \
+           cse_in_reachable_commits AS ( \
+             SELECT \
+               lix_json_extract(cse.snapshot_content, 'entity_id') AS target_entity_id, \
+               lix_json_extract(cse.snapshot_content, 'file_id') AS target_file_id, \
+               lix_json_extract(cse.snapshot_content, 'schema_key') AS target_schema_key, \
+               lix_json_extract(cse.snapshot_content, 'change_id') AS target_change_id, \
+               cc.commit_id AS origin_commit_id, \
+               cc.commit_created_at AS commit_created_at, \
+               cc.root_commit_id AS root_commit_id, \
+               cc.root_version_id AS root_version_id, \
+               cc.commit_depth AS commit_depth \
+             FROM lix_internal_state_materialized_v1_lix_change_set_element cse \
+             JOIN commit_changesets cc \
+               ON lix_json_extract(cse.snapshot_content, 'change_set_id') = cc.change_set_id \
+             WHERE cse.schema_key = 'lix_change_set_element' \
+               AND cse.version_id = '{global_version}' \
+               AND cse.global = true \
+               AND cse.is_tombstone = 0 \
+               AND cse.snapshot_content IS NOT NULL \
+           ), \
+           ranked AS ( \
+             SELECT \
+               ch.entity_id AS entity_id, \
+               ch.schema_key AS schema_key, \
+               ch.file_id AS file_id, \
+               ch.plugin_key AS plugin_key, \
+               CASE \
+                 WHEN ch.snapshot_id = 'no-content' THEN NULL \
+                 ELSE s.content \
+               END AS snapshot_content, \
+               ch.metadata AS metadata, \
+               ch.schema_version AS schema_version, \
+               r.target_change_id AS change_id, \
+               r.origin_commit_id AS commit_id, \
+               r.commit_created_at AS commit_created_at, \
+               r.root_commit_id AS root_commit_id, \
+               r.root_version_id AS version_id, \
+               r.commit_depth AS depth, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY \
+                   r.target_entity_id, \
+                   r.target_file_id, \
+                   r.target_schema_key, \
+                   r.root_commit_id, \
+                   r.commit_depth \
+                 ORDER BY ch.created_at DESC, ch.id DESC \
+               ) AS rn \
+             FROM cse_in_reachable_commits r \
+             JOIN lix_internal_change ch \
+               ON ch.id = r.target_change_id \
+             LEFT JOIN lix_internal_snapshot s \
+               ON s.id = ch.snapshot_id \
+           ) \
+         SELECT \
+           ranked.entity_id AS entity_id, \
+           ranked.schema_key AS schema_key, \
+           ranked.file_id AS file_id, \
+           ranked.plugin_key AS plugin_key, \
+           ranked.snapshot_content AS snapshot_content, \
+           ranked.metadata AS metadata, \
+           ranked.schema_version AS schema_version, \
+           ranked.change_id AS change_id, \
+           ranked.commit_id AS commit_id, \
+           ranked.commit_created_at AS commit_created_at, \
+           ranked.root_commit_id AS root_commit_id, \
+           ranked.depth AS depth, \
+           ranked.version_id AS version_id \
+         FROM ranked \
+         WHERE ranked.rn = 1 \
+           AND ranked.snapshot_content IS NOT NULL",
+        active_schema_key = escape_sql_string(active_version_schema_key()),
+        active_file_id = escape_sql_string(active_version_file_id()),
+        active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
+        global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        requested_roots_where = requested_roots_where,
+        default_root_scope = default_root_scope,
+    )
+}
+
+fn history_requested_root_predicates(pushdown_predicates: &[String]) -> Vec<String> {
+    pushdown_predicates
+        .iter()
+        .filter(|predicate| predicate.contains("root_commit_id"))
+        .map(|predicate| predicate.replace("root_commit_id", "c.entity_id"))
+        .collect()
+}
+
+fn split_effective_state_pushdown_predicates(
+    pushdown_predicates: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut target_version_predicates = Vec::new();
+    let mut source_predicates = Vec::new();
+    for predicate in pushdown_predicates {
+        if predicate.contains("version_id") && !predicate.contains("root_commit_id") {
+            target_version_predicates.push(predicate.clone());
+        } else {
+            source_predicates.push(predicate.clone());
+        }
+    }
+    (target_version_predicates, source_predicates)
+}
+
+fn render_where_clause_sql(predicates: &[String], prefix: &str) -> String {
+    if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}{}", predicates.join(" AND "))
+    }
+}
+
+fn quote_ident(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{escaped}\"")
 }
 
 fn build_change_source_query() -> Result<Query, LixError> {
@@ -602,8 +1157,8 @@ mod tests {
         let lowered_sql = lowered.statements[0].to_string();
 
         assert!(lowered_sql.contains("FROM (SELECT"));
-        assert!(lowered_sql.contains("FROM lix_state"));
-        assert!(lowered_sql.contains("schema_key = 'lix_key_value'"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("plugin_key = 'lix'"));
         assert_eq!(
@@ -648,7 +1203,7 @@ mod tests {
         .expect("dynamic entity read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("schema_key = 'message'"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_message"));
         assert!(lowered_sql.contains("file_id = 'inlang'"));
         assert!(lowered_sql.contains("plugin_key = 'inlang_sdk'"));
         assert!(lowered_sql.contains("global = true"));
@@ -673,8 +1228,8 @@ mod tests {
         .expect("state read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql
-            .contains("FROM (SELECT * FROM lix_state WHERE schema_key = 'lix_key_value')"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(!lowered_sql.contains("FROM lix_state"));
         assert!(!lowered_sql.contains(") WHERE schema_key = 'lix_key_value'"));
         assert_eq!(
             lowered.pushdown_decision.accepted_predicates,

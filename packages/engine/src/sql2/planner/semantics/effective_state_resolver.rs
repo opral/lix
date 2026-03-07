@@ -2,7 +2,7 @@ use crate::commit::{
     load_exact_committed_state_row, CommitQueryExecutor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::sql2::catalog::SurfaceFamily;
+use crate::sql2::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::ir::{CanonicalStateScan, ReadPlan, VersionScope};
 use crate::sql_shared::dependency_spec::DependencySpec;
@@ -341,10 +341,7 @@ pub(crate) async fn resolve_exact_effective_state_row(
             continue;
         }
 
-        let version_id = if matches!(
-            lane,
-            OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked
-        ) {
+        let version_id = if matches!(lane, OverlayLane::GlobalUntracked) {
             GLOBAL_VERSION_ID.to_string()
         } else {
             request.version_id.clone()
@@ -352,7 +349,7 @@ pub(crate) async fn resolve_exact_effective_state_row(
 
         let row = match lane {
             OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
-                load_exact_tracked_effective_row(backend, request, &version_id, lane).await?
+                load_exact_tracked_effective_row(backend, request, lane).await?
             }
             OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
                 load_exact_untracked_effective_row(backend, request, &version_id, lane).await?
@@ -370,10 +367,8 @@ pub(crate) async fn resolve_exact_effective_state_row(
 async fn load_exact_tracked_effective_row(
     backend: &dyn LixBackend,
     request: &ExactEffectiveStateRowRequest,
-    version_id: &str,
     overlay_lane: OverlayLane,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
-    let mut executor = backend;
     let Some(entity_id) = request
         .exact_filters
         .get("entity_id")
@@ -387,13 +382,22 @@ async fn load_exact_tracked_effective_row(
     exact_filters.remove("entity_id");
     exact_filters.remove("global");
     exact_filters.remove("untracked");
+    let global_filter = if request.version_id == GLOBAL_VERSION_ID {
+        request
+            .exact_filters
+            .get("global")
+            .and_then(bool_from_value)
+    } else {
+        Some(matches!(overlay_lane, OverlayLane::GlobalTracked))
+    };
 
     let row = load_exact_committed_state_row(
-        &mut executor,
+        backend,
         &ExactCommittedStateRowRequest {
             entity_id,
             schema_key: request.schema_key.clone(),
-            version_id: version_id.to_string(),
+            version_id: request.version_id.clone(),
+            global_filter,
             exact_filters,
         },
     )
@@ -659,16 +663,11 @@ fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
     let Some(selection) = &select.selection else {
         return Vec::new();
     };
-    let exposed_columns = canonicalized
-        .surface_binding
-        .exposed_columns
-        .iter()
-        .map(|column| column.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
+    let variant = canonicalized.surface_binding.descriptor.surface_variant;
 
     split_conjunctive_predicates(selection)
         .into_iter()
-        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, &exposed_columns))
+        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
         .map(ToString::to_string)
         .collect()
 }
@@ -694,35 +693,42 @@ fn collect_conjunctive_predicates<'a>(expr: &'a Expr, predicates: &mut Vec<&'a E
     }
 }
 
-fn state_predicate_is_pushdown_safe(expr: &Expr, exposed_columns: &BTreeSet<String>) -> bool {
+fn state_predicate_is_pushdown_safe(expr: &Expr, variant: SurfaceVariant) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
-        } => state_pushdown_column(left, exposed_columns).is_some() && constant_like_expr(right),
+        } => state_pushdown_column(left, variant).is_some() && constant_like_expr(right),
         Expr::InList {
             expr,
             list,
             negated: false,
-        } => {
-            state_pushdown_column(expr, exposed_columns).is_some()
-                && list.iter().all(constant_like_expr)
-        }
-        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner, exposed_columns),
+        } => state_pushdown_column(expr, variant).is_some() && list.iter().all(constant_like_expr),
+        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner, variant),
         _ => false,
     }
 }
 
-fn state_pushdown_column<'a>(
-    expr: &'a Expr,
-    exposed_columns: &BTreeSet<String>,
-) -> Option<&'a str> {
+fn state_pushdown_column<'a>(expr: &'a Expr, variant: SurfaceVariant) -> Option<&'a str> {
     let column = identifier_column_name(expr)?;
-    if exposed_columns.contains(&column.to_ascii_lowercase()) {
-        Some(column)
-    } else {
-        None
+    match variant {
+        SurfaceVariant::Default => match column.to_ascii_lowercase().as_str() {
+            "schema_key" | "entity_id" | "file_id" | "plugin_key" | "schema_version" => {
+                Some(column)
+            }
+            _ => None,
+        },
+        SurfaceVariant::ByVersion => match column.to_ascii_lowercase().as_str() {
+            "schema_key" | "entity_id" | "file_id" | "plugin_key" | "schema_version"
+            | "version_id" | "lixcol_version_id" => Some(column),
+            _ => None,
+        },
+        SurfaceVariant::History => match column.to_ascii_lowercase().as_str() {
+            "root_commit_id" | "lixcol_root_commit_id" => Some(column),
+            _ => None,
+        },
+        SurfaceVariant::Active | SurfaceVariant::WorkingChanges => None,
     }
 }
 
