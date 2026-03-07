@@ -9,7 +9,8 @@ use crate::sql2::planner::semantics::effective_state_resolver::{
 };
 use crate::LixError;
 use sqlparser::ast::{
-    Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    BinaryOperator, Expr, Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+    TableFactor,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,16 +25,17 @@ pub(crate) fn lower_read_for_execution(
     effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     match canonicalized.surface_binding.descriptor.surface_family {
-        SurfaceFamily::State => {
-            lower_state_read_for_execution(canonicalized, effective_state_request).map(
-                |statement| {
-                    statement.map(|statement| LoweredReadProgram {
-                        statements: vec![statement],
-                        pushdown_decision: build_pushdown_decision(effective_state_plan),
-                    })
-                },
-            )
-        }
+        SurfaceFamily::State => lower_state_read_for_execution(
+            canonicalized,
+            effective_state_request,
+            effective_state_plan,
+        )
+        .map(|statement| {
+            statement.map(|statement| LoweredReadProgram {
+                statements: vec![statement],
+                pushdown_decision: build_pushdown_decision(effective_state_plan),
+            })
+        }),
         SurfaceFamily::Entity => {
             lower_entity_read_for_execution(canonicalized, effective_state_request).map(
                 |statement| {
@@ -51,6 +53,7 @@ pub(crate) fn lower_read_for_execution(
 fn lower_state_read_for_execution(
     canonicalized: &CanonicalizedRead,
     effective_state_request: &EffectiveStateRequest,
+    effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<Statement>, LixError> {
     if !state_read_references_exposed_columns(
         &canonicalized.surface_binding,
@@ -67,7 +70,10 @@ fn lower_state_read_for_execution(
         return Ok(None);
     };
 
-    let derived_query = build_state_source_query(&canonicalized.surface_binding)?;
+    let (pushdown_predicates, residual_selection) =
+        split_state_selection_for_pushdown(select.selection.as_ref(), effective_state_plan);
+    let derived_query =
+        build_state_source_query(&canonicalized.surface_binding, &pushdown_predicates)?;
     let derived_alias = alias.clone().or_else(|| {
         Some(TableAlias {
             explicit: false,
@@ -80,6 +86,7 @@ fn lower_state_read_for_execution(
         subquery: Box::new(derived_query),
         alias: derived_alias,
     };
+    select.selection = residual_selection;
 
     Ok(Some(Statement::Query(query)))
 }
@@ -133,11 +140,19 @@ fn lower_entity_read_for_execution(
     Ok(Some(Statement::Query(query)))
 }
 
-fn build_state_source_query(surface_binding: &SurfaceBinding) -> Result<Query, LixError> {
-    let sql = format!(
-        "SELECT * FROM {}",
-        render_identifier(&surface_binding.descriptor.public_name)
-    );
+fn build_state_source_query(
+    surface_binding: &SurfaceBinding,
+    pushdown_predicates: &[String],
+) -> Result<Query, LixError> {
+    let source = render_identifier(&surface_binding.descriptor.public_name);
+    let sql = if pushdown_predicates.is_empty() {
+        format!("SELECT * FROM {source}")
+    } else {
+        format!(
+            "SELECT * FROM {source} WHERE {}",
+            pushdown_predicates.join(" AND ")
+        )
+    };
     parse_single_query(&sql)
 }
 
@@ -323,6 +338,63 @@ fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> Pushdow
     }
 }
 
+fn split_state_selection_for_pushdown(
+    selection: Option<&Expr>,
+    effective_state_plan: &EffectiveStatePlan,
+) -> (Vec<String>, Option<Expr>) {
+    let accepted = effective_state_plan
+        .pushdown_safe_predicates
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let Some(selection) = selection else {
+        return (Vec::new(), None);
+    };
+
+    let mut pushdown = Vec::new();
+    let mut residual = Vec::new();
+    for predicate in split_conjunctive_predicates(selection) {
+        if accepted.contains(&predicate.to_string()) {
+            pushdown.push(predicate.to_string());
+        } else {
+            residual.push(predicate);
+        }
+    }
+
+    (pushdown, combine_conjunctive_predicates(residual))
+}
+
+fn split_conjunctive_predicates(expr: &Expr) -> Vec<Expr> {
+    let mut predicates = Vec::new();
+    collect_conjunctive_predicates(expr, &mut predicates);
+    predicates
+}
+
+fn collect_conjunctive_predicates(expr: &Expr, predicates: &mut Vec<Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_conjunctive_predicates(left, predicates);
+            collect_conjunctive_predicates(right, predicates);
+        }
+        Expr::Nested(inner) => collect_conjunctive_predicates(inner, predicates),
+        _ => predicates.push(expr.clone()),
+    }
+}
+
+fn combine_conjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
+    let mut predicates = predicates.into_iter();
+    let first = predicates.next()?;
+    Some(predicates.fold(first, |left, right| Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::And,
+        right: Box::new(right),
+    }))
+}
+
 fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     let mut statements = parse_sql_script(sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -491,10 +563,16 @@ mod tests {
         .expect("state read should lower");
         let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered_sql.contains("FROM (SELECT * FROM lix_state)"));
+        assert!(lowered_sql
+            .contains("FROM (SELECT * FROM lix_state WHERE schema_key = 'lix_key_value')"));
+        assert!(!lowered_sql.contains(") WHERE schema_key = 'lix_key_value'"));
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            vec!["schema_key = 'lix_key_value'".to_string()]
+        );
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
-            vec!["schema_key = 'lix_key_value'".to_string()]
+            Vec::<String>::new()
         );
     }
 }

@@ -600,15 +600,25 @@ mod tests {
                 .pushdown_decision
                 .as_ref()
                 .expect("pushdown decision should be recorded")
-                .residual_predicates,
+                .accepted_predicates,
             vec!["schema_key = 'lix_key_value'".to_string()]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            Vec::<String>::new()
         );
         let lowered_sql = prepared
             .debug_trace
             .lowered_sql
             .first()
             .expect("state read should lower");
-        assert!(lowered_sql.contains("FROM (SELECT * FROM lix_state)"));
+        assert!(lowered_sql
+            .contains("FROM (SELECT * FROM lix_state WHERE schema_key = 'lix_key_value')"));
     }
 
     #[tokio::test]
