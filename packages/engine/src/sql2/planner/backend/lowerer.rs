@@ -350,7 +350,7 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             "SELECT \
                 d.entity_id AS id, \
                 lix_json_extract(d.snapshot_content, 'name') AS name, \
-                COALESCE(lix_json_extract(d.snapshot_content, 'hidden'), false) AS hidden, \
+                COALESCE(lix_json_extract(d.snapshot_content, 'hidden'), 'false') AS hidden, \
                 lix_json_extract(t.snapshot_content, 'commit_id') AS commit_id \
              FROM lix_internal_state_materialized_v1_lix_version_descriptor d \
              LEFT JOIN lix_internal_state_materialized_v1_lix_version_pointer t \
