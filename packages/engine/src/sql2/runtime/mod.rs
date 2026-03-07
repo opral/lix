@@ -394,6 +394,8 @@ mod tests {
         stored_schema_rows: HashMap<String, String>,
         version_descriptor_rows: HashMap<String, String>,
         version_pointer_rows: HashMap<String, String>,
+        active_version_rows: Vec<(String, String)>,
+        active_account_rows: Vec<String>,
         change_rows: Vec<Vec<Value>>,
     }
 
@@ -441,6 +443,39 @@ mod tests {
                     } else {
                         vec!["snapshot_content".to_string()]
                     },
+                });
+            }
+            if sql.contains("FROM lix_internal_state_untracked")
+                && sql.contains("schema_key = 'lix_active_version'")
+            {
+                let rows = self
+                    .active_version_rows
+                    .iter()
+                    .map(|(entity_id, snapshot)| {
+                        vec![Value::Text(entity_id.clone()), Value::Text(snapshot.clone())]
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_state_untracked")
+                && sql.contains("schema_key = 'lix_active_account'")
+            {
+                let rows = self
+                    .active_account_rows
+                    .iter()
+                    .map(|account_id| {
+                        vec![
+                            Value::Text(account_id.clone()),
+                            Value::Text(crate::account::active_account_snapshot_content(account_id)),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["entity_id".to_string(), "snapshot_content".to_string()],
                 });
             }
             if sql.contains("FROM lix_internal_change c")
@@ -1211,6 +1246,81 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| row.schema_key == crate::version::version_pointer_schema_key()));
+    }
+
+    #[tokio::test]
+    async fn prepares_active_version_updates_as_untracked_admin_writes() {
+        let backend = FakeBackend {
+            active_version_rows: vec![(
+                "active-row".to_string(),
+                crate::version::active_version_snapshot_content("active-row", "main"),
+            )],
+            version_descriptor_rows: HashMap::from([(
+                "version-b".to_string(),
+                crate::version::version_descriptor_snapshot_content(
+                    "version-b",
+                    "Version B",
+                    false,
+                ),
+            )]),
+            ..FakeBackend::default()
+        };
+
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one("UPDATE lix_active_version SET version_id = 'version-b'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("active version update should prepare through sql2");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_active_version"]);
+        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert!(prepared.planned_write.commit_preconditions.is_none());
+        assert!(prepared.domain_change_batch.is_none());
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .intended_post_state[0]
+                .version_id
+                .as_deref(),
+            Some(crate::version::active_version_storage_version_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepares_active_account_deletes_as_untracked_admin_writes() {
+        let backend = FakeBackend {
+            active_account_rows: vec!["acct-1".to_string()],
+            ..FakeBackend::default()
+        };
+
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one("DELETE FROM lix_active_account WHERE account_id = 'acct-1'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("active account delete should prepare through sql2");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_active_account"]);
+        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert!(prepared.planned_write.commit_preconditions.is_none());
+        assert!(prepared.domain_change_batch.is_none());
+        assert!(prepared
+            .planned_write
+            .resolved_write_plan
+            .as_ref()
+            .expect("resolved write plan should exist")
+            .intended_post_state[0]
+            .tombstone);
     }
 
     #[tokio::test]

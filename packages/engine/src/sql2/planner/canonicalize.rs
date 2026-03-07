@@ -172,7 +172,7 @@ fn canonicalize_insert_write(
     }
 
     let payload = insert_payload(&surface_binding, insert, &bound_statement.bound_parameters)?;
-    let mode = write_mode_from_payload(&payload);
+    let mode = write_mode_for_surface(&surface_binding, &payload);
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -204,17 +204,28 @@ fn canonicalize_update_write(
     }
     let surface_binding = bind_update_surface(update, registry)?;
     validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
-    let selection = update.selection.as_ref().ok_or_else(|| {
-        CanonicalizeError::unsupported(
-            "sql2 day-1 update canonicalizer requires an explicit WHERE predicate",
-        )
-    })?;
+    let selector = match update.selection.as_ref() {
+        Some(selection) => write_selector(
+            &surface_binding,
+            selection,
+            &bound_statement.bound_parameters,
+        )?,
+        None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
+            exact_only: true,
+            ..WriteSelector::default()
+        },
+        None => {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 update canonicalizer requires an explicit WHERE predicate",
+            ))
+        }
+    };
     let payload = assignment_payload(
         &surface_binding,
         &update.assignments,
         &bound_statement.bound_parameters,
     )?;
-    let mode = write_mode_from_payload(&payload);
+    let mode = write_mode_for_surface(&surface_binding, &payload);
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -222,11 +233,7 @@ fn canonicalize_update_write(
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Update,
             target: surface_binding.clone(),
-            selector: write_selector(
-                &surface_binding,
-                selection,
-                &bound_statement.bound_parameters,
-            )?,
+            selector,
             payload: MutationPayload::Patch(payload),
             mode,
             execution_context: bound_statement.execution_context,
@@ -251,11 +258,22 @@ fn canonicalize_delete_write(
     }
     let surface_binding = bind_delete_surface(delete, registry)?;
     validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
-    let selection = delete.selection.as_ref().ok_or_else(|| {
-        CanonicalizeError::unsupported(
-            "sql2 day-1 delete canonicalizer requires an explicit WHERE predicate",
-        )
-    })?;
+    let selector = match delete.selection.as_ref() {
+        Some(selection) => write_selector(
+            &surface_binding,
+            selection,
+            &bound_statement.bound_parameters,
+        )?,
+        None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
+            exact_only: true,
+            ..WriteSelector::default()
+        },
+        None => {
+            return Err(CanonicalizeError::unsupported(
+                "sql2 day-1 delete canonicalizer requires an explicit WHERE predicate",
+            ))
+        }
+    };
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -263,13 +281,9 @@ fn canonicalize_delete_write(
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Delete,
             target: surface_binding.clone(),
-            selector: write_selector(
-                &surface_binding,
-                selection,
-                &bound_statement.bound_parameters,
-            )?,
+            selector,
             payload: MutationPayload::Tombstone,
-            mode: WriteMode::Tracked,
+            mode: write_mode_for_surface(&surface_binding, &BTreeMap::new()),
             execution_context: bound_statement.execution_context,
         },
     })
@@ -511,7 +525,7 @@ fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         SurfaceFamily::Entity
     ) || matches!(
         surface_binding.descriptor.public_name.as_str(),
-        "lix_state" | "lix_state_by_version" | "lix_version"
+        "lix_state" | "lix_state_by_version" | "lix_version" | "lix_active_account"
     )
 }
 
@@ -521,7 +535,11 @@ fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         SurfaceFamily::Entity
     ) || matches!(
         surface_binding.descriptor.public_name.as_str(),
-        "lix_state" | "lix_state_by_version" | "lix_version"
+        "lix_state"
+            | "lix_state_by_version"
+            | "lix_version"
+            | "lix_active_version"
+            | "lix_active_account"
     )
 }
 
@@ -727,6 +745,8 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
             }),
         SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
             "lix_version" => column == "id",
+            "lix_active_version" => matches!(column, "id" | "version_id"),
+            "lix_active_account" => matches!(column, "id" | "account_id"),
             _ => false,
         },
         SurfaceFamily::Filesystem | SurfaceFamily::Change => false,
@@ -773,6 +793,20 @@ fn canonical_write_column_key(
         SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
             "lix_version" => match column.as_str() {
                 "id" | "name" | "hidden" | "commit_id" => Ok(column),
+                _ => Err(CanonicalizeError::unsupported(format!(
+                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                ))),
+            },
+            "lix_active_version" => match column.as_str() {
+                "id" | "version_id" => Ok(column),
+                _ => Err(CanonicalizeError::unsupported(format!(
+                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                ))),
+            },
+            "lix_active_account" => match column.as_str() {
+                "id" | "account_id" => Ok(column),
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
@@ -856,6 +890,27 @@ fn sql_value_to_engine_value(
             "sql2 day-1 write canonicalizer only supports string, numeric, boolean, null, blob, and placeholder VALUES",
         )),
     }
+}
+
+fn supports_implicit_admin_selector(surface_binding: &SurfaceBinding) -> bool {
+    matches!(
+        surface_binding.descriptor.public_name.as_str(),
+        "lix_active_version" | "lix_active_account"
+    )
+}
+
+fn write_mode_for_surface(
+    surface_binding: &SurfaceBinding,
+    payload: &BTreeMap<String, Value>,
+) -> WriteMode {
+    if matches!(
+        surface_binding.descriptor.public_name.as_str(),
+        "lix_active_version" | "lix_active_account"
+    ) {
+        return WriteMode::Untracked;
+    }
+
+    write_mode_from_payload(payload)
 }
 
 fn write_mode_from_payload(payload: &BTreeMap<String, Value>) -> WriteMode {
