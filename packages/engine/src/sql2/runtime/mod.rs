@@ -93,12 +93,11 @@ pub(crate) async fn prepare_sql2_read(
     );
     let canonicalized = canonicalize_read(bound_statement.clone(), &registry).ok()?;
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
-    let (effective_state_request, effective_state_plan) =
-        build_effective_state(&canonicalized, dependency_spec.as_ref())?;
+    let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
     let lowered_read = lower_read_for_execution(
         &canonicalized,
-        &effective_state_request,
-        &effective_state_plan,
+        effective_state.as_ref().map(|(request, _)| request),
+        effective_state.as_ref().map(|(_, plan)| plan),
     )
     .ok()
     .flatten();
@@ -118,8 +117,8 @@ pub(crate) async fn prepare_sql2_read(
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
             dependency_spec: dependency_spec.clone(),
-            effective_state_request: Some(effective_state_request.clone()),
-            effective_state_plan: Some(effective_state_plan.clone()),
+            effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
+            effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
             pushdown_decision: lowered_read
                 .as_ref()
                 .map(|program| program.pushdown_decision.clone()),
@@ -135,8 +134,8 @@ pub(crate) async fn prepare_sql2_read(
             lowered_sql,
         },
         dependency_spec,
-        effective_state_request: Some(effective_state_request),
-        effective_state_plan: Some(effective_state_plan),
+        effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
+        effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
         lowered_read,
         canonicalized,
     })
@@ -645,6 +644,45 @@ mod tests {
         assert!(lowered_sql.contains("FROM lix_state_history"));
         assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
         assert!(lowered_sql.contains("depth AS lixcol_depth"));
+    }
+
+    #[tokio::test]
+    async fn prepares_lix_change_reads_without_effective_state_artifacts() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT id, schema_key, snapshot_content \
+                 FROM lix_change \
+                 WHERE entity_id = 'entity-1'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("change read should canonicalize");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_change"]);
+        assert!(prepared.effective_state_request.is_none());
+        assert!(prepared.effective_state_plan.is_none());
+        assert_eq!(prepared.dependency_spec, None);
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec!["entity_id = 'entity-1'".to_string()]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("change read should lower");
+        assert!(lowered_sql.contains("FROM lix_internal_change ch"));
+        assert!(lowered_sql.contains("LEFT JOIN lix_internal_snapshot s"));
     }
 
     #[tokio::test]

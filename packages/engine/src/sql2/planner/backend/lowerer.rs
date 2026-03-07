@@ -21,22 +21,36 @@ pub(crate) struct LoweredReadProgram {
 
 pub(crate) fn lower_read_for_execution(
     canonicalized: &CanonicalizedRead,
-    effective_state_request: &EffectiveStateRequest,
-    effective_state_plan: &EffectiveStatePlan,
+    effective_state_request: Option<&EffectiveStateRequest>,
+    effective_state_plan: Option<&EffectiveStatePlan>,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     match canonicalized.surface_binding.descriptor.surface_family {
-        SurfaceFamily::State => lower_state_read_for_execution(
-            canonicalized,
-            effective_state_request,
-            effective_state_plan,
-        )
-        .map(|statement| {
-            statement.map(|statement| LoweredReadProgram {
-                statements: vec![statement],
-                pushdown_decision: build_pushdown_decision(effective_state_plan),
+        SurfaceFamily::State => {
+            let Some(effective_state_request) = effective_state_request else {
+                return Ok(None);
+            };
+            let Some(effective_state_plan) = effective_state_plan else {
+                return Ok(None);
+            };
+            lower_state_read_for_execution(
+                canonicalized,
+                effective_state_request,
+                effective_state_plan,
+            )
+            .map(|statement| {
+                statement.map(|statement| LoweredReadProgram {
+                    statements: vec![statement],
+                    pushdown_decision: build_pushdown_decision(effective_state_plan),
+                })
             })
-        }),
+        }
         SurfaceFamily::Entity => {
+            let Some(effective_state_request) = effective_state_request else {
+                return Ok(None);
+            };
+            let Some(effective_state_plan) = effective_state_plan else {
+                return Ok(None);
+            };
             lower_entity_read_for_execution(canonicalized, effective_state_request).map(
                 |statement| {
                     statement.map(|statement| LoweredReadProgram {
@@ -46,7 +60,13 @@ pub(crate) fn lower_read_for_execution(
                 },
             )
         }
-        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => Ok(None),
+        SurfaceFamily::Change => lower_change_read_for_execution(canonicalized).map(|statement| {
+            statement.map(|statement| LoweredReadProgram {
+                statements: vec![statement],
+                pushdown_decision: change_pushdown_decision(canonicalized),
+            })
+        }),
+        SurfaceFamily::Filesystem | SurfaceFamily::Admin => Ok(None),
     }
 }
 
@@ -140,6 +160,34 @@ fn lower_entity_read_for_execution(
     Ok(Some(Statement::Query(query)))
 }
 
+fn lower_change_read_for_execution(
+    canonicalized: &CanonicalizedRead,
+) -> Result<Option<Statement>, LixError> {
+    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
+        return Ok(None);
+    };
+    let select = select_mut(query.as_mut())?;
+    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
+        return Ok(None);
+    };
+
+    let derived_query = build_change_source_query()?;
+    let derived_alias = alias.clone().or_else(|| {
+        Some(TableAlias {
+            explicit: false,
+            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
+            columns: Vec::new(),
+        })
+    });
+    select.from[0].relation = TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(derived_query),
+        alias: derived_alias,
+    };
+
+    Ok(Some(Statement::Query(query)))
+}
+
 fn build_state_source_query(
     surface_binding: &SurfaceBinding,
     pushdown_predicates: &[String],
@@ -195,6 +243,27 @@ fn build_entity_source_query(
         )
     };
     parse_single_query(&sql)
+}
+
+fn build_change_source_query() -> Result<Query, LixError> {
+    parse_single_query(
+        "SELECT \
+            ch.id AS id, \
+            ch.entity_id AS entity_id, \
+            ch.schema_key AS schema_key, \
+            ch.schema_version AS schema_version, \
+            ch.file_id AS file_id, \
+            ch.plugin_key AS plugin_key, \
+            ch.metadata AS metadata, \
+            ch.created_at AS created_at, \
+            CASE \
+                WHEN ch.snapshot_id = 'no-content' THEN NULL \
+                ELSE s.content \
+            END AS snapshot_content \
+         FROM lix_internal_change ch \
+         LEFT JOIN lix_internal_snapshot s \
+            ON s.id = ch.snapshot_id",
+    )
 }
 
 fn entity_projection_sql(
@@ -338,6 +407,22 @@ fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> Pushdow
     }
 }
 
+fn change_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+    let residual_predicates = read_predicates_from_query(canonicalized);
+    PushdownDecision {
+        accepted_predicates: Vec::new(),
+        rejected_predicates: residual_predicates
+            .iter()
+            .map(|predicate| RejectedPredicate {
+                predicate: predicate.clone(),
+                reason: "sql2 change-scan lowering keeps change predicates above the derived change source".to_string(),
+                support: PushdownSupport::Unsupported,
+            })
+            .collect(),
+        residual_predicates,
+    }
+}
+
 fn split_state_selection_for_pushdown(
     selection: Option<&Expr>,
     effective_state_plan: &EffectiveStatePlan,
@@ -395,6 +480,23 @@ fn combine_conjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
     }))
 }
 
+fn read_predicates_from_query(canonicalized: &CanonicalizedRead) -> Vec<String> {
+    let Statement::Query(query) = &canonicalized.bound_statement.statement else {
+        return Vec::new();
+    };
+    let Some(select) = select_ref(query.as_ref()) else {
+        return Vec::new();
+    };
+    let Some(selection) = &select.selection else {
+        return Vec::new();
+    };
+
+    split_conjunctive_predicates(selection)
+        .into_iter()
+        .map(|predicate| predicate.to_string())
+        .collect()
+}
+
 fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     let mut statements = parse_sql_script(sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -437,6 +539,10 @@ fn select_query(query: &Query) -> Option<&Select> {
     Some(select.as_ref())
 }
 
+fn select_ref(query: &Query) -> Option<&Select> {
+    select_query(query)
+}
+
 fn select_mut(query: &mut Query) -> Result<&mut Select, LixError> {
     let SetExpr::Select(select) = query.body.as_mut() else {
         return Err(LixError {
@@ -476,9 +582,13 @@ mod tests {
         );
         let canonicalized = canonicalize_read(bound, registry).expect("query should canonicalize");
         let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
-        let (request, plan) =
-            build_effective_state(&canonicalized, dependency_spec.as_ref()).expect("state plan");
-        lower_read_for_execution(&canonicalized, &request, &plan).expect("lowering should succeed")
+        let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
+        lower_read_for_execution(
+            &canonicalized,
+            effective_state.as_ref().map(|(request, _)| request),
+            effective_state.as_ref().map(|(_, plan)| plan),
+        )
+        .expect("lowering should succeed")
     }
 
     #[test]
@@ -573,6 +683,25 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn lowers_change_reads_through_internal_change_sources() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT id, schema_key, snapshot_content FROM lix_change WHERE entity_id = 'entity-1'",
+        )
+        .expect("change read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("FROM (SELECT ch.id AS id"));
+        assert!(lowered_sql.contains("FROM lix_internal_change ch"));
+        assert!(lowered_sql.contains("LEFT JOIN lix_internal_snapshot s"));
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["entity_id = 'entity-1'".to_string()]
         );
     }
 }

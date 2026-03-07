@@ -69,6 +69,7 @@ pub(crate) struct SurfaceTraits {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SurfaceResolutionCapabilities {
     pub(crate) canonical_state_scan: bool,
+    pub(crate) canonical_change_scan: bool,
     pub(crate) entity_projection: bool,
     pub(crate) semantic_write: bool,
 }
@@ -264,7 +265,10 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
                 exposes_history_columns: true,
                 ..SurfaceTraits::default()
             },
-            resolution_capabilities: SurfaceResolutionCapabilities::default(),
+            resolution_capabilities: SurfaceResolutionCapabilities {
+                canonical_change_scan: true,
+                ..SurfaceResolutionCapabilities::default()
+            },
             implicit_overrides: SurfaceImplicitOverrides::default(),
             catalog_source: CatalogSource::Builtin,
         },
@@ -467,6 +471,7 @@ fn entity_descriptors_from_spec(
                 canonical_state_scan: true,
                 entity_projection: true,
                 semantic_write: true,
+                ..SurfaceResolutionCapabilities::default()
             },
             implicit_overrides: SurfaceImplicitOverrides {
                 fixed_schema_key: Some(spec.schema_key.clone()),
@@ -497,6 +502,7 @@ fn entity_descriptors_from_spec(
                 canonical_state_scan: true,
                 entity_projection: true,
                 semantic_write: true,
+                ..SurfaceResolutionCapabilities::default()
             },
             implicit_overrides: SurfaceImplicitOverrides {
                 fixed_schema_key: Some(spec.schema_key.clone()),
@@ -527,6 +533,7 @@ fn entity_descriptors_from_spec(
                 canonical_state_scan: true,
                 entity_projection: true,
                 semantic_write: false,
+                ..SurfaceResolutionCapabilities::default()
             },
             implicit_overrides: SurfaceImplicitOverrides {
                 fixed_schema_key: Some(spec.schema_key.clone()),
