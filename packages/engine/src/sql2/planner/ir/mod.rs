@@ -80,6 +80,53 @@ impl CanonicalChangeScan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilesystemKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalFilesystemScan {
+    pub(crate) binding: SurfaceBinding,
+    pub(crate) kind: FilesystemKind,
+    pub(crate) version_scope: VersionScope,
+}
+
+impl CanonicalFilesystemScan {
+    pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
+        if binding.descriptor.surface_family != SurfaceFamily::Filesystem {
+            return None;
+        }
+
+        let version_scope = match binding.descriptor.public_name.as_str() {
+            "lix_file" | "lix_directory" => VersionScope::ActiveVersion,
+            "lix_file_by_version" | "lix_directory_by_version" => VersionScope::ExplicitVersion,
+            "lix_file_history" | "lix_file_history_by_version" | "lix_directory_history" => {
+                VersionScope::History
+            }
+            _ => return None,
+        };
+
+        let kind = match binding.descriptor.public_name.as_str() {
+            "lix_file"
+            | "lix_file_by_version"
+            | "lix_file_history"
+            | "lix_file_history_by_version" => FilesystemKind::File,
+            "lix_directory" | "lix_directory_by_version" | "lix_directory_history" => {
+                FilesystemKind::Directory
+            }
+            _ => return None,
+        };
+
+        Some(Self {
+            binding,
+            kind,
+            version_scope,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalWorkingChangesScan {
     pub(crate) binding: SurfaceBinding,
@@ -146,6 +193,7 @@ pub(crate) struct SortKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadPlan {
     Scan(CanonicalStateScan),
+    FilesystemScan(CanonicalFilesystemScan),
     AdminScan(CanonicalAdminScan),
     ChangeScan(CanonicalChangeScan),
     WorkingChangesScan(CanonicalWorkingChangesScan),
@@ -175,6 +223,10 @@ impl ReadPlan {
 
     pub(crate) fn admin_scan(scan: CanonicalAdminScan) -> Self {
         Self::AdminScan(scan)
+    }
+
+    pub(crate) fn filesystem_scan(scan: CanonicalFilesystemScan) -> Self {
+        Self::FilesystemScan(scan)
     }
 
     pub(crate) fn change_scan(scan: CanonicalChangeScan) -> Self {

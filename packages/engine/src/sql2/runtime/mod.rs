@@ -915,6 +915,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_filesystem_reads_through_internal_projection_sources() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one("SELECT id, path, data FROM lix_file WHERE id = 'file-1'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("filesystem read should canonicalize");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_file"]);
+        assert!(prepared.effective_state_request.is_none());
+        assert!(prepared.effective_state_plan.is_none());
+        assert_eq!(
+            prepared
+                .dependency_spec
+                .as_ref()
+                .expect("filesystem dependency spec should be recorded")
+                .schema_keys
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "lix_active_version".to_string(),
+                "lix_binary_blob_ref".to_string(),
+                "lix_directory_descriptor".to_string(),
+                "lix_file_descriptor".to_string(),
+            ]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec!["id = 'file-1'".to_string()]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("filesystem read should lower");
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_binary_blob_store"));
+        assert!(!lowered_sql.contains("FROM lix_file_by_version"));
+    }
+
+    #[tokio::test]
+    async fn prepares_filesystem_by_version_reads_with_residual_version_filter() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT id, path FROM lix_directory_by_version \
+                 WHERE id = 'dir-1' AND lixcol_version_id = 'version-a'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("filesystem by-version read should canonicalize");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_directory_by_version"]);
+        assert!(prepared.effective_state_request.is_none());
+        assert!(prepared.effective_state_plan.is_none());
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec![
+                "id = 'dir-1'".to_string(),
+                "lixcol_version_id = 'version-a'".to_string()
+            ]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("filesystem by-version read should lower");
+        assert!(lowered_sql.contains("WITH RECURSIVE all_target_versions AS"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_directory_descriptor"));
+        assert!(!lowered_sql.contains("FROM lix_directory_by_version"));
+    }
+
+    #[tokio::test]
     async fn prepares_explain_over_state_reads_with_sql2_lowered_query() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(

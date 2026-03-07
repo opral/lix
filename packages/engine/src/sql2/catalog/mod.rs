@@ -69,6 +69,7 @@ pub(crate) struct SurfaceTraits {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SurfaceResolutionCapabilities {
     pub(crate) canonical_state_scan: bool,
+    pub(crate) canonical_filesystem_scan: bool,
     pub(crate) canonical_admin_scan: bool,
     pub(crate) canonical_change_scan: bool,
     pub(crate) canonical_working_changes_scan: bool,
@@ -307,6 +308,10 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
         filesystem_surface_descriptor("lix_file", SurfaceVariant::Default),
         filesystem_surface_descriptor("lix_file_by_version", SurfaceVariant::ByVersion),
         filesystem_surface_descriptor("lix_file_history", SurfaceVariant::History),
+        filesystem_surface_descriptor("lix_file_history_by_version", SurfaceVariant::History),
+        filesystem_surface_descriptor("lix_directory", SurfaceVariant::Default),
+        filesystem_surface_descriptor("lix_directory_by_version", SurfaceVariant::ByVersion),
+        filesystem_surface_descriptor("lix_directory_history", SurfaceVariant::History),
         admin_surface_descriptor("lix_version", SurfaceVariant::Default),
         admin_surface_descriptor("lix_active_version", SurfaceVariant::Active),
         admin_surface_descriptor("lix_stored_schema", SurfaceVariant::Default),
@@ -410,11 +415,21 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
         ),
     };
 
+    let visible_columns = match name {
+        "lix_file" => filesystem_file_columns(),
+        "lix_file_by_version" => filesystem_file_by_version_columns(),
+        "lix_file_history" | "lix_file_history_by_version" => filesystem_file_history_columns(),
+        "lix_directory" => filesystem_directory_columns(),
+        "lix_directory_by_version" => filesystem_directory_by_version_columns(),
+        "lix_directory_history" => filesystem_directory_history_columns(),
+        _ => filesystem_file_columns(),
+    };
+
     SurfaceDescriptor {
         public_name: name.to_string(),
         surface_family: SurfaceFamily::Filesystem,
         surface_variant: variant,
-        visible_columns: filesystem_columns(),
+        visible_columns,
         hidden_columns: Vec::new(),
         capability,
         default_scope,
@@ -424,6 +439,7 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
             ..SurfaceTraits::default()
         },
         resolution_capabilities: SurfaceResolutionCapabilities {
+            canonical_filesystem_scan: true,
             semantic_write: capability == SurfaceCapability::ReadWrite,
             ..SurfaceResolutionCapabilities::default()
         },
@@ -804,7 +820,42 @@ fn working_changes_columns() -> Vec<String> {
     .collect()
 }
 
-fn filesystem_columns() -> Vec<String> {
+fn filesystem_file_columns() -> Vec<String> {
+    [
+        "id",
+        "directory_id",
+        "name",
+        "extension",
+        "path",
+        "data",
+        "metadata",
+        "hidden",
+        "lixcol_entity_id",
+        "lixcol_schema_key",
+        "lixcol_file_id",
+        "lixcol_plugin_key",
+        "lixcol_schema_version",
+        "lixcol_global",
+        "lixcol_change_id",
+        "lixcol_created_at",
+        "lixcol_updated_at",
+        "lixcol_commit_id",
+        "lixcol_writer_key",
+        "lixcol_untracked",
+        "lixcol_metadata",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn filesystem_file_by_version_columns() -> Vec<String> {
+    let mut columns = filesystem_file_columns();
+    columns.insert(11, "lixcol_version_id".to_string());
+    columns
+}
+
+fn filesystem_file_history_columns() -> Vec<String> {
     [
         "id",
         "path",
@@ -818,7 +869,63 @@ fn filesystem_columns() -> Vec<String> {
         "lixcol_plugin_key",
         "lixcol_schema_version",
         "lixcol_change_id",
+        "lixcol_metadata",
         "lixcol_commit_id",
+        "lixcol_root_commit_id",
+        "lixcol_depth",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn filesystem_directory_columns() -> Vec<String> {
+    [
+        "id",
+        "parent_id",
+        "name",
+        "path",
+        "hidden",
+        "lixcol_entity_id",
+        "lixcol_schema_key",
+        "lixcol_schema_version",
+        "lixcol_global",
+        "lixcol_change_id",
+        "lixcol_created_at",
+        "lixcol_updated_at",
+        "lixcol_commit_id",
+        "lixcol_untracked",
+        "lixcol_metadata",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn filesystem_directory_by_version_columns() -> Vec<String> {
+    let mut columns = filesystem_directory_columns();
+    columns.insert(8, "lixcol_version_id".to_string());
+    columns
+}
+
+fn filesystem_directory_history_columns() -> Vec<String> {
+    [
+        "id",
+        "parent_id",
+        "name",
+        "path",
+        "hidden",
+        "lixcol_entity_id",
+        "lixcol_schema_key",
+        "lixcol_file_id",
+        "lixcol_version_id",
+        "lixcol_plugin_key",
+        "lixcol_schema_version",
+        "lixcol_change_id",
+        "lixcol_metadata",
+        "lixcol_commit_id",
+        "lixcol_root_commit_id",
+        "lixcol_depth",
     ]
     .into_iter()
     .map(str::to_string)

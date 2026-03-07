@@ -1047,7 +1047,9 @@ mod tests {
         assert!(rewritten.contains("binary_blob_ref_rows"));
         assert!(rewritten.contains("schema_key = 'lix_binary_blob_ref'"));
         assert!(rewritten.contains("LEFT JOIN lix_internal_binary_blob_store bbs"));
-        assert!(rewritten.contains("FROM lix_state_by_version"));
+        assert!(rewritten.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
+        assert!(rewritten.contains("FROM lix_internal_state_untracked"));
+        assert!(!rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
     }
 
@@ -1068,7 +1070,9 @@ mod tests {
         assert!(rewritten.contains("binary_blob_ref_rows"));
         assert!(rewritten.contains("schema_key = 'lix_binary_blob_ref'"));
         assert!(rewritten.contains("LEFT JOIN lix_internal_binary_blob_store bbs"));
-        assert!(rewritten.contains("FROM lix_state_by_version"));
+        assert!(rewritten.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
+        assert!(rewritten.contains("FROM lix_internal_state_untracked"));
+        assert!(!rewritten.contains("FROM lix_state_by_version"));
         assert!(rewritten.contains("schema_key = 'lix_file_descriptor'"));
         assert!(rewritten.contains("commit_id AS lixcol_commit_id"));
         assert!(!rewritten.contains("LEFT JOIN lix_version v"));
