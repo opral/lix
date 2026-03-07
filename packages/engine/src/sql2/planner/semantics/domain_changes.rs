@@ -1,4 +1,7 @@
-use crate::commit::{load_committed_version_tip_commit_id, ProposedDomainChange};
+use crate::commit::{
+    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id,
+    ProposedDomainChange,
+};
 use crate::sql2::planner::ir::{
     CommitPreconditions, ExpectedTip, IdempotencyKey, PlannedWrite, WriteLane, WriteMode,
 };
@@ -114,17 +117,9 @@ pub(crate) async fn derive_commit_preconditions(
             message: "sql2 commit precondition derivation requires exactly one tracked write lane"
                 .to_string(),
         })?;
-    let version_id = version_id_for_write_lane(&write_lane, planned_write)?;
     let mut executor = backend;
-    let current_tip = load_committed_version_tip_commit_id(&mut executor, &version_id)
-        .await
-        .map_err(domain_change_backend_error)?
-        .ok_or_else(|| DomainChangeError {
-            message: format!(
-                "sql2 commit precondition derivation could not find a version tip for '{}'",
-                version_id
-            ),
-        })?;
+    let current_tip = current_tip_for_write_lane(&mut executor, &write_lane, planned_write)
+        .await?;
     let idempotency_key = build_idempotency_key(planned_write, &write_lane, &current_tip)?;
 
     Ok(Some(CommitPreconditions {
@@ -134,24 +129,47 @@ pub(crate) async fn derive_commit_preconditions(
     }))
 }
 
-fn version_id_for_write_lane(
+async fn current_tip_for_write_lane(
+    executor: &mut dyn crate::commit::CommitQueryExecutor,
     write_lane: &WriteLane,
     planned_write: &PlannedWrite,
 ) -> Result<String, DomainChangeError> {
     match write_lane {
-        WriteLane::ActiveVersion => planned_write
+        WriteLane::ActiveVersion => {
+            let version_id = planned_write
             .command
             .execution_context
             .requested_version_id
             .clone()
             .ok_or_else(|| DomainChangeError {
                 message: "sql2 commit precondition derivation requires requested_version_id for ActiveVersion writes".to_string(),
+            })?;
+            load_committed_version_tip_commit_id(executor, &version_id)
+                .await
+                .map_err(domain_change_backend_error)?
+                .ok_or_else(|| DomainChangeError {
+                    message: format!(
+                        "sql2 commit precondition derivation could not find a version tip for '{}'",
+                        version_id
+                    ),
+                })
+        }
+        WriteLane::SingleVersion(version_id) => load_committed_version_tip_commit_id(executor, version_id)
+            .await
+            .map_err(domain_change_backend_error)?
+            .ok_or_else(|| DomainChangeError {
+                message: format!(
+                    "sql2 commit precondition derivation could not find a version tip for '{}'",
+                    version_id
+                ),
             }),
-        WriteLane::SingleVersion(version_id) => Ok(version_id.clone()),
-        WriteLane::GlobalAdmin => Err(DomainChangeError {
-            message: "sql2 day-1 commit preconditions do not yet support GlobalAdmin writes"
-                .to_string(),
-        }),
+        WriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
+            .await
+            .map_err(domain_change_backend_error)?
+            .ok_or_else(|| DomainChangeError {
+                message: "sql2 commit precondition derivation could not find the global admin tip"
+                    .to_string(),
+            }),
     }
 }
 

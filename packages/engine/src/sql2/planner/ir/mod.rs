@@ -80,6 +80,38 @@ impl CanonicalChangeScan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalAdminKind {
+    ActiveVersion,
+    ActiveAccount,
+    StoredSchema,
+    Version,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalAdminScan {
+    pub(crate) binding: SurfaceBinding,
+    pub(crate) kind: CanonicalAdminKind,
+}
+
+impl CanonicalAdminScan {
+    pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
+        if binding.descriptor.surface_family != SurfaceFamily::Admin {
+            return None;
+        }
+
+        let kind = match binding.descriptor.public_name.as_str() {
+            "lix_active_version" => CanonicalAdminKind::ActiveVersion,
+            "lix_active_account" => CanonicalAdminKind::ActiveAccount,
+            "lix_stored_schema" => CanonicalAdminKind::StoredSchema,
+            "lix_version" => CanonicalAdminKind::Version,
+            _ => return None,
+        };
+
+        Some(Self { binding, kind })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PredicateSpec {
     pub(crate) sql: String,
@@ -100,6 +132,7 @@ pub(crate) struct SortKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadPlan {
     Scan(CanonicalStateScan),
+    AdminScan(CanonicalAdminScan),
     ChangeScan(CanonicalChangeScan),
     Filter {
         input: Box<ReadPlan>,
@@ -123,6 +156,10 @@ pub(crate) enum ReadPlan {
 impl ReadPlan {
     pub(crate) fn scan(scan: CanonicalStateScan) -> Self {
         Self::Scan(scan)
+    }
+
+    pub(crate) fn admin_scan(scan: CanonicalAdminScan) -> Self {
+        Self::AdminScan(scan)
     }
 
     pub(crate) fn change_scan(scan: CanonicalChangeScan) -> Self {
@@ -189,6 +226,7 @@ pub(crate) enum StateSourceKind {
 pub(crate) enum ScopeProof {
     ActiveVersion,
     SingleVersion(String),
+    GlobalAdmin,
     FiniteVersionSet(BTreeSet<String>),
     Unbounded,
     Unknown,

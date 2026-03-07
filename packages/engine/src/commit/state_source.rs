@@ -8,9 +8,7 @@ use crate::materialization::{
     materialization_plan, MaterializationDebugMode, MaterializationRequest, MaterializationScope,
     MaterializationWrite, MaterializationWriteOp,
 };
-use crate::version::{
-    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
-};
+use crate::version::{version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
@@ -90,6 +88,42 @@ pub(crate) async fn load_committed_version_tip_commit_id(
     Ok(Some(pointer.commit_id))
 }
 
+pub(crate) async fn load_committed_global_tip_commit_id(
+    executor: &mut dyn CommitQueryExecutor,
+) -> Result<Option<String>, LixError> {
+    let sql = format!(
+        "SELECT s.content AS snapshot_content \
+         FROM {change_table} c \
+         LEFT JOIN {snapshot_table} s ON s.id = c.snapshot_id \
+         WHERE c.schema_key = '{schema_key}' \
+           AND c.entity_id = 'global' \
+           AND c.file_id = '{file_id}' \
+           AND c.plugin_key = '{plugin_key}' \
+         AND s.content IS NOT NULL \
+         ORDER BY c.created_at DESC, c.id DESC \
+         LIMIT 1",
+        change_table = CHANGE_TABLE,
+        snapshot_table = SNAPSHOT_TABLE,
+        schema_key = escape_sql_string(version_pointer_schema_key()),
+        file_id = escape_sql_string(version_pointer_file_id()),
+        plugin_key = escape_sql_string(version_pointer_plugin_key()),
+    );
+    let result = executor.execute(&sql, &[]).await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let Some(snapshot_content) = row.first() else {
+        return Ok(None);
+    };
+    let Some(pointer) = parse_version_pointer_snapshot(snapshot_content)? else {
+        return Ok(None);
+    };
+    if pointer.commit_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(pointer.commit_id))
+}
+
 pub(crate) async fn load_version_info_for_versions(
     executor: &mut dyn CommitQueryExecutor,
     version_ids: &BTreeSet<String>,
@@ -111,11 +145,29 @@ pub(crate) async fn load_version_info_for_versions(
         );
     }
 
+    if version_ids.contains("global") {
+        if let Some(commit_id) = load_committed_global_tip_commit_id(executor).await? {
+            versions.insert(
+                "global".to_string(),
+                VersionInfo {
+                    parent_commit_ids: vec![commit_id],
+                    snapshot: VersionSnapshot {
+                        id: "global".to_string(),
+                    },
+                },
+            );
+        }
+    }
+
     let in_list = version_ids
         .iter()
+        .filter(|version_id| version_id.as_str() != "global")
         .map(|version_id| format!("'{}'", escape_sql_string(version_id)))
         .collect::<Vec<_>>()
         .join(", ");
+    if in_list.is_empty() {
+        return Ok(versions);
+    }
     let sql = format!(
         "SELECT c.entity_id, s.content AS snapshot_content \
          FROM {change_table} c \

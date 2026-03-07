@@ -5,6 +5,12 @@ use crate::sql2::planner::ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedRowRef, ResolvedWritePlan, RowLineage,
     SchemaProof, ScopeProof, TargetSetProof, WriteLane, WriteMode, WriteOperationKind,
 };
+use crate::version::{
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content,
+    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
+    version_pointer_schema_version, version_pointer_snapshot_content, GLOBAL_VERSION_ID,
+};
 use crate::sql2::planner::semantics::effective_state_resolver::{
     resolve_exact_effective_state_row, ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
     OverlayLane,
@@ -58,7 +64,8 @@ pub(crate) async fn resolve_write_plan(
                 }
             }
         }
-        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => {
+        SurfaceFamily::Admin => resolve_admin_write(backend, planned_write, target_write_lane).await,
+        SurfaceFamily::Filesystem | SurfaceFamily::Change => {
             Err(WriteResolveError {
                 message: format!(
                     "sql2 write resolver does not support '{}' writes",
@@ -290,6 +297,386 @@ fn resolve_entity_insert_write_plan(
         }],
         target_write_lane,
     })
+}
+
+#[derive(Debug, Clone)]
+struct VersionAdminRow {
+    id: String,
+    name: String,
+    hidden: bool,
+    commit_id: String,
+    descriptor_change_id: Option<String>,
+    pointer_change_id: Option<String>,
+}
+
+async fn resolve_admin_write(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_version" => match planned_write.command.operation_kind {
+            WriteOperationKind::Insert => resolve_version_insert_write_plan(
+                backend,
+                planned_write,
+                target_write_lane,
+            )
+            .await,
+            WriteOperationKind::Update | WriteOperationKind::Delete => {
+                resolve_existing_version_write(backend, planned_write, target_write_lane).await
+            }
+        },
+        other => Err(WriteResolveError {
+            message: format!("sql2 write resolver does not yet support '{}' writes", other),
+        }),
+    }
+}
+
+async fn resolve_version_insert_write_plan(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let version_id = version_admin_id_from_payload(planned_write)?;
+    let name = version_admin_required_text(planned_write, "name")?;
+    let commit_id = version_admin_required_text(planned_write, "commit_id")?;
+    let hidden = version_admin_hidden_from_payload(planned_write)?;
+    let existing = load_version_admin_row(backend, &version_id)
+        .await
+        .map_err(write_resolve_backend_error)?;
+
+    let authoritative_pre_state = existing
+        .as_ref()
+        .map(version_admin_pre_state_refs)
+        .unwrap_or_default();
+
+    Ok(ResolvedWritePlan {
+        authoritative_pre_state,
+        intended_post_state: vec![
+            version_descriptor_row(&version_id, &name, hidden),
+            version_pointer_row(&version_id, &commit_id),
+        ],
+        tombstones: Vec::new(),
+        lineage: vec![RowLineage {
+            entity_id: version_id,
+            source_change_id: None,
+            source_commit_id: None,
+        }],
+        target_write_lane,
+    })
+}
+
+async fn resolve_existing_version_write(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    ensure_exact_selector(planned_write)?;
+    let version_id = version_admin_target_id(planned_write)?;
+    let Some(current_row) = load_version_admin_row(backend, &version_id)
+        .await
+        .map_err(write_resolve_backend_error)?
+    else {
+        return Ok(ResolvedWritePlan {
+            authoritative_pre_state: Vec::new(),
+            intended_post_state: Vec::new(),
+            tombstones: Vec::new(),
+            lineage: Vec::new(),
+            target_write_lane,
+        });
+    };
+
+    let authoritative_pre_state = version_admin_pre_state_refs(&current_row);
+    let lineage = vec![RowLineage {
+        entity_id: current_row.id.clone(),
+        source_change_id: current_row
+            .descriptor_change_id
+            .clone()
+            .or_else(|| current_row.pointer_change_id.clone()),
+        source_commit_id: None,
+    }];
+
+    match planned_write.command.operation_kind {
+        WriteOperationKind::Update => {
+            let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+                return Err(WriteResolveError {
+                    message: "sql2 version update resolver requires a patch payload".to_string(),
+                });
+            };
+            if payload.contains_key("id") {
+                return Err(WriteResolveError {
+                    message: "sql2 version update cannot modify id".to_string(),
+                });
+            }
+
+            let next_name = payload
+                .get("name")
+                .and_then(text_from_value)
+                .unwrap_or_else(|| current_row.name.clone());
+            if next_name.is_empty() {
+                return Err(WriteResolveError {
+                    message: "sql2 version update cannot set empty name".to_string(),
+                });
+            }
+            let next_hidden = payload
+                .get("hidden")
+                .and_then(value_as_bool)
+                .unwrap_or(current_row.hidden);
+            let next_commit_id = payload
+                .get("commit_id")
+                .and_then(text_from_value)
+                .unwrap_or_else(|| current_row.commit_id.clone());
+            if next_commit_id.is_empty() {
+                return Err(WriteResolveError {
+                    message: "sql2 version update cannot set empty commit_id".to_string(),
+                });
+            }
+
+            let mut intended_post_state = Vec::new();
+            if payload.contains_key("name") || payload.contains_key("hidden") {
+                intended_post_state.push(version_descriptor_row(
+                    &current_row.id,
+                    &next_name,
+                    next_hidden,
+                ));
+            }
+            if payload.contains_key("commit_id") {
+                intended_post_state.push(version_pointer_row(&current_row.id, &next_commit_id));
+            }
+
+            Ok(ResolvedWritePlan {
+                authoritative_pre_state,
+                intended_post_state,
+                tombstones: Vec::new(),
+                lineage,
+                target_write_lane,
+            })
+        }
+        WriteOperationKind::Delete => {
+            let tombstones = version_admin_tombstone_refs(&current_row);
+            Ok(ResolvedWritePlan {
+                authoritative_pre_state,
+                intended_post_state: vec![
+                    version_descriptor_tombstone_row(&current_row.id),
+                    version_pointer_tombstone_row(&current_row.id),
+                ],
+                tombstones,
+                lineage,
+                target_write_lane,
+            })
+        }
+        WriteOperationKind::Insert => Err(WriteResolveError {
+            message: "sql2 version existing-row resolver does not handle inserts".to_string(),
+        }),
+    }
+}
+
+async fn load_version_admin_row(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<Option<VersionAdminRow>, crate::LixError> {
+    let descriptor_sql = format!(
+        "SELECT s.content AS snapshot_content, c.id AS change_id \
+         FROM lix_internal_change c \
+         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+         WHERE c.schema_key = '{schema_key}' \
+           AND c.entity_id = '{entity_id}' \
+           AND c.file_id = '{file_id}' \
+           AND c.plugin_key = '{plugin_key}' \
+           AND s.content IS NOT NULL \
+         ORDER BY c.created_at DESC, c.id DESC \
+         LIMIT 1",
+        schema_key = version_descriptor_schema_key(),
+        entity_id = version_id.replace('\'', "''"),
+        file_id = version_descriptor_file_id(),
+        plugin_key = version_descriptor_plugin_key(),
+    );
+    let descriptor_result = backend.execute(&descriptor_sql, &[]).await?;
+    let Some(descriptor_row) = descriptor_result.rows.first() else {
+        return Ok(None);
+    };
+    let pointer_sql = format!(
+        "SELECT s.content AS snapshot_content, c.id AS change_id \
+         FROM lix_internal_change c \
+         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+         WHERE c.schema_key = '{schema_key}' \
+           AND c.entity_id = '{entity_id}' \
+           AND c.file_id = '{file_id}' \
+           AND c.plugin_key = '{plugin_key}' \
+           AND s.content IS NOT NULL \
+         ORDER BY c.created_at DESC, c.id DESC \
+         LIMIT 1",
+        schema_key = version_pointer_schema_key(),
+        entity_id = version_id.replace('\'', "''"),
+        file_id = version_pointer_file_id(),
+        plugin_key = version_pointer_plugin_key(),
+    );
+    let pointer_result = backend.execute(&pointer_sql, &[]).await?;
+    let pointer_row = pointer_result.rows.first();
+    Ok(Some(VersionAdminRow {
+        id: version_id.to_string(),
+        name: row_snapshot_name(descriptor_row).unwrap_or_default(),
+        hidden: row_snapshot_hidden(descriptor_row).unwrap_or(false),
+        commit_id: pointer_row
+            .and_then(|row| row_snapshot_commit_id(row))
+            .unwrap_or_default(),
+        descriptor_change_id: descriptor_row.get(1).and_then(text_from_value),
+        pointer_change_id: pointer_row.and_then(|row| row.get(1)).and_then(text_from_value),
+    }))
+}
+
+fn version_admin_pre_state_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    vec![
+        ResolvedRowRef {
+            entity_id: row.id.clone(),
+            schema_key: version_descriptor_schema_key().to_string(),
+            version_id: Some(GLOBAL_VERSION_ID.to_string()),
+            source_change_id: row.descriptor_change_id.clone(),
+            source_commit_id: None,
+        },
+        ResolvedRowRef {
+            entity_id: row.id.clone(),
+            schema_key: version_pointer_schema_key().to_string(),
+            version_id: Some(GLOBAL_VERSION_ID.to_string()),
+            source_change_id: row.pointer_change_id.clone(),
+            source_commit_id: None,
+        },
+    ]
+}
+
+fn version_admin_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
+    version_admin_pre_state_refs(row)
+}
+
+fn version_admin_id_from_payload(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+    payload_text_value(planned_write, "id").ok_or_else(|| WriteResolveError {
+        message: "sql2 version insert requires column 'id'".to_string(),
+    })
+}
+
+fn version_admin_target_id(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+    if let Some(value) = planned_write
+        .command
+        .selector
+        .exact_filters
+        .get("id")
+        .and_then(text_from_value)
+    {
+        return Ok(value);
+    }
+    payload_text_value(planned_write, "id").ok_or_else(|| WriteResolveError {
+        message: "sql2 version write resolver requires an exact 'id' target".to_string(),
+    })
+}
+
+fn version_admin_required_text(
+    planned_write: &PlannedWrite,
+    key: &str,
+) -> Result<String, WriteResolveError> {
+    let value = payload_text_value(planned_write, key).ok_or_else(|| WriteResolveError {
+        message: format!("sql2 version insert requires column '{key}'"),
+    })?;
+    if value.is_empty() {
+        return Err(WriteResolveError {
+            message: format!("sql2 version insert cannot set empty {key}"),
+        });
+    }
+    Ok(value)
+}
+
+fn version_admin_hidden_from_payload(planned_write: &PlannedWrite) -> Result<bool, WriteResolveError> {
+    let (MutationPayload::FullSnapshot(payload) | MutationPayload::Patch(payload)) =
+        &planned_write.command.payload
+    else {
+        return Ok(false);
+    };
+    Ok(payload.get("hidden").and_then(value_as_bool).unwrap_or(false))
+}
+
+fn version_descriptor_row(id: &str, name: &str, hidden: bool) -> PlannedStateRow {
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(version_descriptor_schema_key().to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(version_descriptor_file_id().to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(version_descriptor_plugin_key().to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(version_descriptor_schema_version().to_string()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(version_descriptor_snapshot_content(id, name, hidden)),
+    );
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(GLOBAL_VERSION_ID.to_string()),
+    );
+    PlannedStateRow {
+        entity_id: id.to_string(),
+        schema_key: version_descriptor_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+fn version_pointer_row(id: &str, commit_id: &str) -> PlannedStateRow {
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(version_pointer_schema_key().to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(version_pointer_file_id().to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(version_pointer_plugin_key().to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(version_pointer_schema_version().to_string()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(version_pointer_snapshot_content(id, commit_id)),
+    );
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(GLOBAL_VERSION_ID.to_string()),
+    );
+    PlannedStateRow {
+        entity_id: id.to_string(),
+        schema_key: version_pointer_schema_key().to_string(),
+        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+fn version_descriptor_tombstone_row(id: &str) -> PlannedStateRow {
+    let mut row = version_descriptor_row(id, id, false);
+    row.values.remove("snapshot_content");
+    row.tombstone = true;
+    row
+}
+
+fn version_pointer_tombstone_row(id: &str) -> PlannedStateRow {
+    let mut row = version_pointer_row(id, "deleted");
+    row.values.remove("snapshot_content");
+    row.tombstone = true;
+    row
 }
 
 fn merged_update_values(
@@ -753,6 +1140,7 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
         ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
             message: "sql2 day-1 write resolver cannot resolve multi-version writes".to_string(),
         }),
+        ScopeProof::GlobalAdmin => Ok(Some(GLOBAL_VERSION_ID.to_string())),
         ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
             message: "sql2 day-1 write resolver requires a bounded scope proof".to_string(),
         }),
@@ -775,10 +1163,32 @@ fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, WriteRes
         ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
             message: "sql2 day-1 tracked writes require exactly one write lane".to_string(),
         }),
+        ScopeProof::GlobalAdmin => Ok(WriteLane::GlobalAdmin),
         ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
             message: "sql2 day-1 tracked writes require a bounded write lane".to_string(),
         }),
     }
+}
+
+fn row_snapshot_name(row: &[Value]) -> Option<String> {
+    row.first()
+        .and_then(text_from_value)
+        .and_then(|snapshot| serde_json::from_str::<JsonValue>(&snapshot).ok())
+        .and_then(|snapshot| snapshot.get("name").and_then(JsonValue::as_str).map(ToString::to_string))
+}
+
+fn row_snapshot_hidden(row: &[Value]) -> Option<bool> {
+    row.first()
+        .and_then(text_from_value)
+        .and_then(|snapshot| serde_json::from_str::<JsonValue>(&snapshot).ok())
+        .and_then(|snapshot| snapshot.get("hidden").and_then(JsonValue::as_bool))
+}
+
+fn row_snapshot_commit_id(row: &[Value]) -> Option<String> {
+    row.first()
+        .and_then(text_from_value)
+        .and_then(|snapshot| serde_json::from_str::<JsonValue>(&snapshot).ok())
+        .and_then(|snapshot| snapshot.get("commit_id").and_then(JsonValue::as_str).map(ToString::to_string))
 }
 
 fn snapshot_from_entity_payload(
@@ -1101,6 +1511,8 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         change_rows: Vec<Vec<Value>>,
+        version_descriptor_rows: Vec<Vec<Value>>,
+        version_pointer_rows: Vec<Vec<Value>>,
     }
 
     #[async_trait(?Send)]
@@ -1110,6 +1522,23 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_descriptor'")
+            {
+                return Ok(QueryResult {
+                    rows: self.version_descriptor_rows.clone(),
+                    columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_pointer'")
+                && !sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version")
+            {
+                return Ok(QueryResult {
+                    rows: self.version_pointer_rows.clone(),
+                    columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
+                });
+            }
             if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
                 && sql.contains("FROM lix_internal_change c")
             {
@@ -1280,6 +1709,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolves_lix_version_insert_with_global_admin_lane() {
+        let backend = FakeBackend::default();
+        let resolved = resolve_write_plan(
+            &backend,
+            &planned_write(
+                "INSERT INTO lix_version (id, name, hidden, commit_id) \
+                 VALUES ('version-a', 'Version A', false, 'commit-a')",
+                "main",
+            ),
+        )
+        .await
+        .expect("version write should resolve");
+
+        assert_eq!(resolved.target_write_lane, Some(WriteLane::GlobalAdmin));
+        assert_eq!(resolved.intended_post_state.len(), 2);
+        assert!(resolved
+            .intended_post_state
+            .iter()
+            .any(|row| row.schema_key == crate::version::version_descriptor_schema_key()));
+        assert!(resolved
+            .intended_post_state
+            .iter()
+            .any(|row| row.schema_key == crate::version::version_pointer_schema_key()));
+    }
+
+    #[tokio::test]
     async fn resolves_update_from_authoritative_pre_state() {
         let backend = FakeBackend {
             change_rows: build_committed_state_change_rows(
@@ -1292,6 +1747,7 @@ mod tests {
                 "change-1",
                 "commit-1",
             ),
+            ..FakeBackend::default()
         };
         let resolved = resolve_write_plan(
             &backend,
@@ -1339,6 +1795,7 @@ mod tests {
                 "change-1",
                 "commit-1",
             ),
+            ..FakeBackend::default()
         };
         let resolved = resolve_write_plan(
             &backend,
@@ -1396,6 +1853,7 @@ mod tests {
                 "change-1",
                 "commit-1",
             ),
+            ..FakeBackend::default()
         };
         let error = resolve_write_plan(
             &backend,
@@ -1429,6 +1887,7 @@ mod tests {
                 "change-1",
                 "commit-1",
             ),
+            ..FakeBackend::default()
         };
         let resolved = resolve_write_plan(
             &backend,
@@ -1461,6 +1920,7 @@ mod tests {
                 "change-1",
                 "commit-1",
             ),
+            ..FakeBackend::default()
         };
         let error = resolve_write_plan(
             &backend,

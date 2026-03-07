@@ -4,8 +4,12 @@ use crate::sql2::catalog::{
 };
 use crate::sql2::core::parser::parse_sql_script;
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
+use crate::sql2::planner::ir::{CanonicalAdminKind, ReadPlan};
 use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
+};
+use crate::account::{
+    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -73,7 +77,13 @@ pub(crate) fn lower_read_for_execution(
                 pushdown_decision: change_pushdown_decision(canonicalized),
             })
         }),
-        SurfaceFamily::Filesystem | SurfaceFamily::Admin => Ok(None),
+        SurfaceFamily::Admin => lower_admin_read_for_execution(canonicalized).map(|statement| {
+            statement.map(|statement| LoweredReadProgram {
+                statements: vec![statement],
+                pushdown_decision: admin_pushdown_decision(canonicalized),
+            })
+        }),
+        SurfaceFamily::Filesystem => Ok(None),
     }
 }
 
@@ -211,6 +221,38 @@ fn lower_change_read_for_execution(
     Ok(Some(Statement::Query(query)))
 }
 
+fn lower_admin_read_for_execution(
+    canonicalized: &CanonicalizedRead,
+) -> Result<Option<Statement>, LixError> {
+    let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) else {
+        return Ok(None);
+    };
+
+    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
+        return Ok(None);
+    };
+    let select = select_mut(query.as_mut())?;
+    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
+        return Ok(None);
+    };
+
+    let derived_query = build_admin_source_query(admin_scan.kind)?;
+    let derived_alias = alias.clone().or_else(|| {
+        Some(TableAlias {
+            explicit: false,
+            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
+            columns: Vec::new(),
+        })
+    });
+    select.from[0].relation = TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(derived_query),
+        alias: derived_alias,
+    };
+
+    Ok(Some(Statement::Query(query)))
+}
+
 fn build_state_source_query(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
@@ -226,6 +268,71 @@ fn build_state_source_query(
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => return Ok(None),
     };
     parse_single_query(&sql).map(Some)
+}
+
+fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError> {
+    let sql = match kind {
+        CanonicalAdminKind::ActiveVersion => format!(
+            "SELECT \
+                entity_id AS id, \
+                lix_json_extract(snapshot_content, 'version_id') AS version_id \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = '{schema_key}' \
+               AND file_id = '{file_id}' \
+               AND version_id = '{storage_version_id}' \
+               AND snapshot_content IS NOT NULL",
+            schema_key = escape_sql_string(active_version_schema_key()),
+            file_id = escape_sql_string(active_version_file_id()),
+            storage_version_id = escape_sql_string(active_version_storage_version_id()),
+        ),
+        CanonicalAdminKind::ActiveAccount => format!(
+            "SELECT \
+                lix_json_extract(snapshot_content, 'account_id') AS id, \
+                lix_json_extract(snapshot_content, 'account_id') AS account_id \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = '{schema_key}' \
+               AND file_id = '{file_id}' \
+               AND version_id = '{storage_version_id}' \
+               AND snapshot_content IS NOT NULL",
+            schema_key = escape_sql_string(active_account_schema_key()),
+            file_id = escape_sql_string(active_account_file_id()),
+            storage_version_id = escape_sql_string(active_account_storage_version_id()),
+        ),
+        CanonicalAdminKind::StoredSchema => {
+            "SELECT \
+                lix_json_extract(snapshot_content, 'value') AS value, \
+                lix_json_extract(snapshot_content, 'value.x-lix-key') AS lixcol_schema_key, \
+                lix_json_extract(snapshot_content, 'value.x-lix-version') AS lixcol_schema_version \
+             FROM lix_internal_stored_schema_bootstrap \
+             WHERE snapshot_content IS NOT NULL"
+                .to_string()
+        }
+        CanonicalAdminKind::Version => format!(
+            "SELECT \
+                d.entity_id AS id, \
+                lix_json_extract(d.snapshot_content, 'name') AS name, \
+                COALESCE(lix_json_extract(d.snapshot_content, 'hidden'), false) AS hidden, \
+                lix_json_extract(t.snapshot_content, 'commit_id') AS commit_id \
+             FROM lix_internal_state_materialized_v1_lix_version_descriptor d \
+             LEFT JOIN lix_internal_state_materialized_v1_lix_version_pointer t \
+               ON t.entity_id = d.entity_id \
+              AND t.schema_key = 'lix_version_pointer' \
+              AND t.version_id = '{global_version}' \
+              AND t.global = true \
+              AND t.is_tombstone = 0 \
+              AND t.snapshot_content IS NOT NULL \
+             WHERE d.schema_key = '{descriptor_schema_key}' \
+               AND d.version_id = '{global_version}' \
+               AND d.global = true \
+               AND d.is_tombstone = 0 \
+               AND d.snapshot_content IS NOT NULL \
+               AND d.entity_id <> '{global_version}'",
+            descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        ),
+    };
+
+    parse_single_query(&sql)
 }
 
 fn build_entity_source_query(
@@ -842,6 +949,19 @@ fn build_change_source_query() -> Result<Query, LixError> {
     )
 }
 
+fn canonical_admin_scan(
+    read_plan: &ReadPlan,
+) -> Option<&crate::sql2::planner::ir::CanonicalAdminScan> {
+    match read_plan {
+        ReadPlan::AdminScan(scan) => Some(scan),
+        ReadPlan::Scan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::Filter { input, .. }
+        | ReadPlan::Project { input, .. }
+        | ReadPlan::Sort { input, .. }
+        | ReadPlan::Limit { input, .. } => canonical_admin_scan(input),
+    }
+}
+
 fn entity_projection_sql(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
@@ -992,6 +1112,24 @@ fn change_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecisi
             .map(|predicate| RejectedPredicate {
                 predicate: predicate.clone(),
                 reason: "sql2 change-scan lowering keeps change predicates above the derived change source".to_string(),
+                support: PushdownSupport::Unsupported,
+            })
+            .collect(),
+        residual_predicates,
+    }
+}
+
+fn admin_pushdown_decision(canonicalized: &CanonicalizedRead) -> PushdownDecision {
+    let residual_predicates = read_predicates_from_query(canonicalized);
+    PushdownDecision {
+        accepted_predicates: Vec::new(),
+        rejected_predicates: residual_predicates
+            .iter()
+            .map(|predicate| RejectedPredicate {
+                predicate: predicate.clone(),
+                reason:
+                    "sql2 admin-scan lowering keeps admin predicates above the derived admin source"
+                        .to_string(),
                 support: PushdownSupport::Unsupported,
             })
             .collect(),
@@ -1278,6 +1416,86 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["entity_id = 'entity-1'".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_active_version_reads_through_internal_untracked_sources() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT id, version_id FROM lix_active_version WHERE version_id = 'main'",
+        )
+        .expect("active version read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("schema_key = 'lix_active_version'"));
+        assert!(lowered_sql.contains("file_id = 'lix'"));
+        assert!(lowered_sql.contains("version_id = 'global'"));
+        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["version_id = 'main'".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_active_account_reads_through_internal_untracked_sources() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT account_id FROM lix_active_account WHERE account_id = 'acct-1'",
+        )
+        .expect("active account read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
+        assert!(lowered_sql.contains("schema_key = 'lix_active_account'"));
+        assert!(!lowered_sql.contains("FROM lix_active_account"));
+        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["account_id = 'acct-1'".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_version_reads_through_internal_descriptor_and_pointer_sources() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT id, name, hidden, commit_id FROM lix_version WHERE id = 'main'",
+        )
+        .expect("version read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_pointer"));
+        assert!(!lowered_sql.contains("FROM lix_version"));
+        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["id = 'main'".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_stored_schema_reads_through_bootstrap_table() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT value, lixcol_schema_key FROM lix_stored_schema WHERE lixcol_schema_key = 'x'",
+        )
+        .expect("stored schema read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("FROM lix_internal_stored_schema_bootstrap"));
+        assert!(!lowered_sql.contains("FROM lix_stored_schema"));
+        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["lixcol_schema_key = 'x'".to_string()]
         );
     }
 

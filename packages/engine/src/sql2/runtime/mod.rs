@@ -392,6 +392,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         stored_schema_rows: HashMap<String, String>,
+        version_descriptor_rows: HashMap<String, String>,
         version_pointer_rows: HashMap<String, String>,
         change_rows: Vec<Vec<Value>>,
     }
@@ -440,6 +441,28 @@ mod tests {
                     } else {
                         vec!["snapshot_content".to_string()]
                     },
+                });
+            }
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_version_descriptor'")
+            {
+                let rows = self
+                    .version_descriptor_rows
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("c.entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
+                    })
+                    .map(|(_, snapshot)| {
+                        vec![
+                            Value::Text(snapshot.clone()),
+                            Value::Text("descriptor-change".to_string()),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
                 });
             }
             if sql.contains("FROM lix_internal_change c")
@@ -1128,6 +1151,66 @@ mod tests {
                 .expected_tip,
             ExpectedTip::CommitId("commit-main".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn prepares_lix_version_inserts_with_global_admin_lane() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "global".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "global".to_string(),
+                commit_id: "commit-global".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
+
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one(
+                "INSERT INTO lix_version (id, name, hidden, commit_id) \
+                 VALUES ('version-a', 'Version A', false, 'commit-a')",
+            ),
+            &[],
+            "main",
+            Some("writer-a"),
+        )
+        .await
+        .expect("lix_version insert should prepare through sql2");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_version"]);
+        assert_eq!(prepared.planned_write.scope_proof, ScopeProof::GlobalAdmin);
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .target_write_lane,
+            Some(WriteLane::GlobalAdmin)
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .commit_preconditions
+                .as_ref()
+                .expect("tracked write should include commit preconditions")
+                .expected_tip,
+            ExpectedTip::CommitId("commit-global".to_string())
+        );
+        let rows = &prepared
+            .planned_write
+            .resolved_write_plan
+            .as_ref()
+            .expect("resolved write plan should exist")
+            .intended_post_state;
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.schema_key == crate::version::version_descriptor_schema_key()));
+        assert!(rows
+            .iter()
+            .any(|row| row.schema_key == crate::version::version_pointer_schema_key()));
     }
 
     #[tokio::test]
