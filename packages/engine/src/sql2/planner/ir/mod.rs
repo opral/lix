@@ -80,6 +80,20 @@ impl CanonicalChangeScan {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalWorkingChangesScan {
+    pub(crate) binding: SurfaceBinding,
+}
+
+impl CanonicalWorkingChangesScan {
+    pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
+        if binding.descriptor.public_name != "lix_working_changes" {
+            return None;
+        }
+        Some(Self { binding })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CanonicalAdminKind {
     ActiveVersion,
@@ -134,6 +148,7 @@ pub(crate) enum ReadPlan {
     Scan(CanonicalStateScan),
     AdminScan(CanonicalAdminScan),
     ChangeScan(CanonicalChangeScan),
+    WorkingChangesScan(CanonicalWorkingChangesScan),
     Filter {
         input: Box<ReadPlan>,
         predicate: PredicateSpec,
@@ -164,6 +179,10 @@ impl ReadPlan {
 
     pub(crate) fn change_scan(scan: CanonicalChangeScan) -> Self {
         Self::ChangeScan(scan)
+    }
+
+    pub(crate) fn working_changes_scan(scan: CanonicalWorkingChangesScan) -> Self {
+        Self::WorkingChangesScan(scan)
     }
 }
 

@@ -869,6 +869,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_lix_working_changes_reads_without_effective_state_artifacts() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT entity_id, status \
+                 FROM lix_working_changes \
+                 WHERE schema_key = 'lix_key_value'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("working-changes read should canonicalize");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_working_changes"]);
+        assert!(prepared.effective_state_request.is_none());
+        assert!(prepared.effective_state_plan.is_none());
+        assert_eq!(
+            prepared
+                .dependency_spec
+                .as_ref()
+                .expect("working-changes dependency spec should be recorded")
+                .precision,
+            crate::sql_shared::dependency_spec::DependencyPrecision::Conservative
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec!["schema_key = 'lix_key_value'".to_string()]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("working-changes read should lower");
+        assert!(lowered_sql.contains("FROM lix_internal_last_checkpoint"));
+        assert!(lowered_sql.contains("lix_internal_commit_ancestry"));
+    }
+
+    #[tokio::test]
     async fn prepares_explain_over_state_reads_with_sql2_lowered_query() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(

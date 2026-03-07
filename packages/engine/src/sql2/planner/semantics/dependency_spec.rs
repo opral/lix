@@ -16,6 +16,9 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     let Statement::Query(query) = &canonicalized.bound_statement.statement else {
         return None;
     };
+    if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
+        return Some(dependency_spec_for_working_changes_scan());
+    }
     if let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) {
         return Some(dependency_spec_for_admin_scan(admin_scan.kind));
     }
@@ -97,12 +100,22 @@ fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
     spec
 }
 
+fn dependency_spec_for_working_changes_scan() -> DependencySpec {
+    DependencySpec {
+        relations: ["lix_working_changes".to_string()].into_iter().collect(),
+        precision: DependencyPrecision::Conservative,
+        ..DependencySpec::default()
+    }
+}
+
 fn canonical_state_scan(
     read_plan: &ReadPlan,
 ) -> Option<&crate::sql2::planner::ir::CanonicalStateScan> {
     match read_plan {
         ReadPlan::Scan(scan) => Some(scan),
-        ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) | ReadPlan::WorkingChangesScan(_) => {
+            None
+        }
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
@@ -115,11 +128,24 @@ fn canonical_admin_scan(
 ) -> Option<&crate::sql2::planner::ir::CanonicalAdminScan> {
     match read_plan {
         ReadPlan::AdminScan(scan) => Some(scan),
-        ReadPlan::Scan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::Scan(_) | ReadPlan::ChangeScan(_) | ReadPlan::WorkingChangesScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
         | ReadPlan::Limit { input, .. } => canonical_admin_scan(input),
+    }
+}
+
+fn canonical_working_changes_scan(
+    read_plan: &ReadPlan,
+) -> Option<&crate::sql2::planner::ir::CanonicalWorkingChangesScan> {
+    match read_plan {
+        ReadPlan::WorkingChangesScan(scan) => Some(scan),
+        ReadPlan::Scan(_) | ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::Filter { input, .. }
+        | ReadPlan::Project { input, .. }
+        | ReadPlan::Sort { input, .. }
+        | ReadPlan::Limit { input, .. } => canonical_working_changes_scan(input),
     }
 }
 
