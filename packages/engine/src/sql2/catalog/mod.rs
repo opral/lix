@@ -71,6 +71,7 @@ pub(crate) struct SurfaceResolutionCapabilities {
     pub(crate) canonical_state_scan: bool,
     pub(crate) canonical_admin_scan: bool,
     pub(crate) canonical_change_scan: bool,
+    pub(crate) canonical_working_changes_scan: bool,
     pub(crate) entity_projection: bool,
     pub(crate) semantic_write: bool,
 }
@@ -296,7 +297,10 @@ fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
                 exposes_history_columns: true,
                 ..SurfaceTraits::default()
             },
-            resolution_capabilities: SurfaceResolutionCapabilities::default(),
+            resolution_capabilities: SurfaceResolutionCapabilities {
+                canonical_working_changes_scan: true,
+                ..SurfaceResolutionCapabilities::default()
+            },
             implicit_overrides: SurfaceImplicitOverrides::default(),
             catalog_source: CatalogSource::Builtin,
         },
