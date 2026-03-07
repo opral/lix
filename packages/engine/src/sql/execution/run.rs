@@ -11,6 +11,7 @@ use crate::state_commit_stream::{
 use crate::{Engine, LixError, LixTransaction, QueryResult};
 
 use super::super::contracts::effects::DetectedFileDomainChange;
+use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
 use super::super::contracts::planned_statement::MutationOperation;
@@ -24,6 +25,7 @@ pub(crate) struct SqlExecutionOutcome {
     pub(crate) public_result: QueryResult,
     pub(crate) postprocess_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) plugin_changes_committed: bool,
+    pub(crate) plan_effects_override: Option<PlanEffects>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
 }
 
@@ -216,6 +218,7 @@ pub(crate) async fn execute_plan_sql(
         public_result,
         postprocess_file_cache_targets,
         plugin_changes_committed,
+        plan_effects_override: None,
         state_commit_stream_changes,
     })
 }
@@ -362,6 +365,7 @@ pub(crate) async fn execute_plan_sql_with_transaction(
         public_result,
         postprocess_file_cache_targets,
         plugin_changes_committed,
+        plan_effects_override: None,
         state_commit_stream_changes,
     })
 }

@@ -35,7 +35,16 @@ pub(crate) struct Sql2DebugTrace {
     pub(crate) resolved_write_plan: Option<ResolvedWritePlan>,
     pub(crate) domain_change_batch: Option<DomainChangeBatch>,
     pub(crate) commit_preconditions: Option<CommitPreconditions>,
+    pub(crate) invariant_trace: Option<Sql2InvariantTrace>,
+    pub(crate) write_phase_trace: Vec<String>,
     pub(crate) lowered_sql: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Sql2InvariantTrace {
+    pub(crate) batch_local_checks: Vec<String>,
+    pub(crate) append_time_checks: Vec<String>,
+    pub(crate) physical_checks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +121,8 @@ pub(crate) async fn prepare_sql2_read(
             resolved_write_plan: None,
             domain_change_batch: None,
             commit_preconditions: None,
+            invariant_trace: None,
+            write_phase_trace: Vec::new(),
             lowered_sql,
         },
         dependency_spec,
@@ -155,6 +166,7 @@ pub(crate) async fn prepare_sql2_write(
         .await
         .ok()?;
     planned_write.commit_preconditions = commit_preconditions.clone();
+    let invariant_trace = Some(build_sql2_invariant_trace(&planned_write));
 
     Some(Sql2PreparedWrite {
         debug_trace: Sql2DebugTrace {
@@ -170,12 +182,87 @@ pub(crate) async fn prepare_sql2_write(
             resolved_write_plan: Some(resolved_write_plan),
             domain_change_batch: domain_change_batch.clone(),
             commit_preconditions: commit_preconditions.clone(),
+            invariant_trace,
+            write_phase_trace: sql2_write_phase_trace(),
             lowered_sql: Vec::new(),
         },
         planned_write,
         domain_change_batch,
         canonicalized,
     })
+}
+
+fn sql2_write_phase_trace() -> Vec<String> {
+    vec![
+        "canonicalize_write".to_string(),
+        "prove_write".to_string(),
+        "resolve_authoritative_pre_state".to_string(),
+        "build_domain_change_batch".to_string(),
+        "derive_commit_preconditions".to_string(),
+        "validate_batch_local_write".to_string(),
+        "append_time_invariant_recheck".to_string(),
+        "append_commit_if_preconditions_hold".to_string(),
+    ]
+}
+
+fn build_sql2_invariant_trace(planned_write: &PlannedWrite) -> Sql2InvariantTrace {
+    let mut batch_local_checks = Vec::new();
+    let mut append_time_checks = vec![
+        "write_lane.tip_precondition".to_string(),
+        "idempotency_key.recheck".to_string(),
+    ];
+    let mut physical_checks = Vec::new();
+
+    if planned_write.command.operation_kind == crate::sql2::planner::ir::WriteOperationKind::Update
+    {
+        append_time_checks.push("schema_mutability.recheck".to_string());
+    }
+
+    if let Some(resolved) = planned_write.resolved_write_plan.as_ref() {
+        let mut saw_snapshot_validation = false;
+        let mut saw_primary_key_consistency = false;
+        let mut saw_stored_schema_definition = false;
+        let mut saw_stored_schema_bootstrap_identity = false;
+
+        for row in &resolved.intended_post_state {
+            if row.tombstone {
+                continue;
+            }
+
+            if !saw_snapshot_validation {
+                batch_local_checks.push("snapshot_content.schema_validation".to_string());
+                saw_snapshot_validation = true;
+            }
+            if !saw_primary_key_consistency {
+                batch_local_checks.push("entity_id.primary_key_consistency".to_string());
+                saw_primary_key_consistency = true;
+            }
+            if row.schema_key == "lix_stored_schema" {
+                if !saw_stored_schema_definition {
+                    batch_local_checks.push("stored_schema.definition_validation".to_string());
+                    saw_stored_schema_definition = true;
+                }
+                if !saw_stored_schema_bootstrap_identity {
+                    batch_local_checks.push("stored_schema.bootstrap_identity".to_string());
+                    saw_stored_schema_bootstrap_identity = true;
+                }
+            }
+        }
+    }
+
+    if !planned_write
+        .command
+        .mode
+        .eq(&crate::sql2::planner::ir::WriteMode::Untracked)
+    {
+        physical_checks.push("backend_constraints.defense_in_depth".to_string());
+    }
+
+    Sql2InvariantTrace {
+        batch_local_checks,
+        append_time_checks,
+        physical_checks,
+    }
 }
 
 #[cfg(test)]
@@ -554,6 +641,31 @@ mod tests {
                 .write_lane,
             WriteLane::SingleVersion("version-a".to_string())
         );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .invariant_trace
+                .as_ref()
+                .expect("write debug trace should include invariant checks")
+                .batch_local_checks,
+            vec![
+                "snapshot_content.schema_validation".to_string(),
+                "entity_id.primary_key_consistency".to_string()
+            ]
+        );
+        assert_eq!(
+            prepared.debug_trace.write_phase_trace,
+            vec![
+                "canonicalize_write".to_string(),
+                "prove_write".to_string(),
+                "resolve_authoritative_pre_state".to_string(),
+                "build_domain_change_batch".to_string(),
+                "derive_commit_preconditions".to_string(),
+                "validate_batch_local_write".to_string(),
+                "append_time_invariant_recheck".to_string(),
+                "append_commit_if_preconditions_hold".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -604,6 +716,54 @@ mod tests {
                 .expect("tracked write should include commit preconditions")
                 .expected_tip,
             ExpectedTip::CommitId("commit-main".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn prepares_stored_schema_invariant_trace_for_sql2_writes() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "global".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "global".to_string(),
+                commit_id: "commit-global".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
+
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'schema-a~1', 'lix_stored_schema', 'lix', 'global', 'lix', '{\"value\":{\"x-lix-key\":\"schema-a\",\"x-lix-version\":\"1\",\"type\":\"object\"}}', '1'\
+                 )",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("stored schema write should prepare through sql2");
+
+        let invariant_trace = prepared
+            .debug_trace
+            .invariant_trace
+            .as_ref()
+            .expect("stored schema write should expose invariant trace");
+        assert!(invariant_trace
+            .batch_local_checks
+            .contains(&"stored_schema.definition_validation".to_string()));
+        assert!(invariant_trace
+            .batch_local_checks
+            .contains(&"stored_schema.bootstrap_identity".to_string()));
+        assert!(invariant_trace
+            .append_time_checks
+            .contains(&"write_lane.tip_precondition".to_string()));
+        assert_eq!(
+            invariant_trace.physical_checks,
+            vec!["backend_constraints.defense_in_depth".to_string()]
         );
     }
 

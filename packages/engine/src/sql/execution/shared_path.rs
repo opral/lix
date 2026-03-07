@@ -20,8 +20,13 @@ use crate::validation::{
     validate_inserts, validate_sql2_append_time_write, validate_sql2_batch_local_write,
     validate_updates,
 };
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
+use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
@@ -54,6 +59,9 @@ pub(crate) struct PreparedExecutionContext {
 pub(crate) struct CacheTargets {
     pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
 }
+
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 struct Sql2AppendInvariantChecker<'a> {
     planned_write: &'a crate::sql2::planner::ir::PlannedWrite,
@@ -185,15 +193,18 @@ pub(crate) async fn prepare_execution_with_backend(
 
 pub(crate) fn derive_cache_targets(
     plan: &ExecutionPlan,
+    active_effects: &PlanEffects,
+    effects_are_authoritative: bool,
     postprocess_file_cache_targets: BTreeSet<(String, String)>,
 ) -> CacheTargets {
-    let file_cache_refresh_targets = if plan.requirements.should_refresh_file_cache {
-        let mut targets = plan.effects.file_cache_refresh_targets.clone();
-        targets.extend(postprocess_file_cache_targets.clone());
-        targets
-    } else {
-        BTreeSet::new()
-    };
+    let file_cache_refresh_targets =
+        if effects_are_authoritative || plan.requirements.should_refresh_file_cache {
+            let mut targets = active_effects.file_cache_refresh_targets.clone();
+            targets.extend(postprocess_file_cache_targets.clone());
+            targets
+        } else {
+            BTreeSet::new()
+        };
 
     CacheTargets {
         file_cache_refresh_targets,
@@ -257,6 +268,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
             },
             postprocess_file_cache_targets: BTreeSet::new(),
             plugin_changes_committed: false,
+            plan_effects_override: Some(PlanEffects::default()),
             state_commit_stream_changes: Vec::new(),
         }));
     }
@@ -287,13 +299,10 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
 
     let plugin_changes_committed =
         matches!(append_result.disposition, AppendCommitDisposition::Applied);
-    let state_commit_stream_changes = if plugin_changes_committed {
-        state_commit_stream_changes_from_domain_changes(
-            &domain_change_batch.changes,
-            stream_operation,
-        )?
+    let plan_effects_override = if plugin_changes_committed {
+        semantic_plan_effects_from_domain_changes(&domain_change_batch.changes, stream_operation)?
     } else {
-        Vec::new()
+        PlanEffects::default()
     };
 
     let _ = writer_key;
@@ -304,7 +313,8 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
         },
         postprocess_file_cache_targets: BTreeSet::new(),
         plugin_changes_committed,
-        state_commit_stream_changes,
+        plan_effects_override: Some(plan_effects_override),
+        state_commit_stream_changes: Vec::new(),
     }))
 }
 
@@ -407,6 +417,57 @@ fn append_commit_error_to_lix_error(error: crate::commit::AppendCommitError) -> 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
     }
+}
+
+fn semantic_plan_effects_from_domain_changes(
+    changes: &[crate::commit::ProposedDomainChange],
+    stream_operation: StateCommitStreamOperation,
+) -> Result<PlanEffects, LixError> {
+    Ok(PlanEffects {
+        state_commit_stream_changes: state_commit_stream_changes_from_domain_changes(
+            changes,
+            stream_operation,
+        )?,
+        next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
+        file_cache_refresh_targets: file_cache_refresh_targets_from_domain_changes(changes),
+    })
+}
+
+fn next_active_version_id_from_domain_changes(
+    changes: &[crate::commit::ProposedDomainChange],
+) -> Result<Option<String>, LixError> {
+    for change in changes.iter().rev() {
+        if change.schema_key != active_version_schema_key()
+            || change.file_id.as_deref() != Some(active_version_file_id())
+            || change.version_id != active_version_storage_version_id()
+        {
+            continue;
+        }
+
+        let Some(snapshot_content) = change.snapshot_content.as_deref() else {
+            continue;
+        };
+        return parse_active_version_snapshot(snapshot_content).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn file_cache_refresh_targets_from_domain_changes(
+    changes: &[crate::commit::ProposedDomainChange],
+) -> BTreeSet<(String, String)> {
+    changes
+        .iter()
+        .filter(|change| change.file_id.as_deref() != Some("lix"))
+        .filter(|change| change.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY)
+        .filter(|change| change.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+        .filter_map(|change| {
+            change
+                .file_id
+                .as_ref()
+                .map(|file_id| (file_id.clone(), change.version_id.clone()))
+        })
+        .collect()
 }
 
 async fn mirror_sql2_stored_schema_bootstrap_rows(

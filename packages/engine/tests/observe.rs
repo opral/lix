@@ -27,6 +27,10 @@ fn update_key_value_sql(key: &str, value_json: &str) -> String {
     )
 }
 
+fn insert_key_value_entity_sql(key: &str, value: &str) -> String {
+    format!("INSERT INTO lix_key_value (key, value) VALUES ('{key}', '{value}')")
+}
+
 simulation_test!(
     observe_emits_initial_and_followup_rows,
     simulations = [sqlite, postgres],
@@ -135,6 +139,49 @@ simulation_test!(
         assert_eq!(
             update_b.rows.rows[0][0],
             Value::Text("observe-multi".to_string())
+        );
+    }
+);
+
+simulation_test!(
+    observe_sql2_entity_view_emits_after_live_write,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let mut observed = engine
+            .observe(ObserveQuery::new(
+                "SELECT key, value \
+                 FROM lix_key_value \
+                 WHERE key = ?1",
+                vec![Value::Text("observe-sql2-entity".to_string())],
+            ))
+            .expect("observe should succeed");
+
+        let initial = observed.next().await.unwrap().unwrap();
+        assert!(initial.rows.rows.is_empty());
+
+        engine
+            .execute(
+                &insert_key_value_entity_sql("observe-sql2-entity", "v0"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let update = observed.next().await.unwrap().unwrap();
+        assert!(update.state_commit_sequence.is_some());
+        assert_eq!(update.rows.rows.len(), 1);
+        assert_eq!(
+            update.rows.rows[0],
+            vec![
+                Value::Text("observe-sql2-entity".to_string()),
+                Value::Text("v0".to_string())
+            ]
         );
     }
 );
