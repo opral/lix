@@ -622,6 +622,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_state_by_version_reads_with_version_pushdown_trace() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT entity_id FROM lix_state_by_version \
+                 WHERE version_id = 'v1' AND schema_key = 'lix_key_value'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("state-by-version read should canonicalize");
+
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .accepted_predicates,
+            vec![
+                "version_id = 'v1'".to_string(),
+                "schema_key = 'lix_key_value'".to_string()
+            ]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("state-by-version read should lower");
+        assert!(lowered_sql.contains(
+            "FROM (SELECT * FROM lix_state_by_version WHERE version_id = 'v1' AND schema_key = 'lix_key_value')"
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepares_state_history_reads_with_root_commit_pushdown_trace() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT snapshot_content, root_commit_id, depth \
+                 FROM lix_state_history \
+                 WHERE entity_id = 'entity1' AND root_commit_id = 'commit-1' \
+                 ORDER BY depth ASC",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("state-history read should canonicalize");
+
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .accepted_predicates,
+            vec![
+                "entity_id = 'entity1'".to_string(),
+                "root_commit_id = 'commit-1'".to_string()
+            ]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("state-history read should lower");
+        assert!(lowered_sql.contains(
+            "FROM (SELECT * FROM lix_state_history WHERE entity_id = 'entity1' AND root_commit_id = 'commit-1')"
+        ));
+    }
+
+    #[tokio::test]
     async fn returns_none_for_nested_subqueries_that_stay_on_legacy_path() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(
