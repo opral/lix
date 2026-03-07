@@ -658,10 +658,16 @@ fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
     let Some(selection) = &select.selection else {
         return Vec::new();
     };
+    let exposed_columns = canonicalized
+        .surface_binding
+        .exposed_columns
+        .iter()
+        .map(|column| column.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
 
     split_conjunctive_predicates(selection)
         .into_iter()
-        .filter(|predicate| state_predicate_is_pushdown_safe(predicate))
+        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, &exposed_columns))
         .map(ToString::to_string)
         .collect()
 }
@@ -687,28 +693,45 @@ fn collect_conjunctive_predicates<'a>(expr: &'a Expr, predicates: &mut Vec<&'a E
     }
 }
 
-fn state_predicate_is_pushdown_safe(expr: &Expr) -> bool {
+fn state_predicate_is_pushdown_safe(expr: &Expr, exposed_columns: &BTreeSet<String>) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
-        } => state_pushdown_column(left).is_some() && constant_like_expr(right),
+        } => state_pushdown_column(left, exposed_columns).is_some() && constant_like_expr(right),
         Expr::InList {
             expr,
             list,
             negated: false,
-        } => state_pushdown_column(expr).is_some() && list.iter().all(constant_like_expr),
-        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner),
+        } => {
+            state_pushdown_column(expr, exposed_columns).is_some()
+                && list.iter().all(constant_like_expr)
+        }
+        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner, exposed_columns),
         _ => false,
     }
 }
 
-fn state_pushdown_column(expr: &Expr) -> Option<&'static str> {
-    match filter_column_name(expr) {
-        Some("schema_key") => Some("schema_key"),
-        Some("entity_id") => Some("entity_id"),
-        Some("file_id") => Some("file_id"),
+fn state_pushdown_column<'a>(
+    expr: &'a Expr,
+    exposed_columns: &BTreeSet<String>,
+) -> Option<&'a str> {
+    let column = identifier_column_name(expr)?;
+    if exposed_columns.contains(&column.to_ascii_lowercase()) {
+        Some(column)
+    } else {
+        None
+    }
+}
+
+fn identifier_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(identifier) => Some(identifier.value.as_str()),
+        Expr::CompoundIdentifier(identifiers) => identifiers
+            .last()
+            .map(|identifier| identifier.value.as_str()),
+        Expr::Nested(inner) => identifier_column_name(inner),
         _ => None,
     }
 }
