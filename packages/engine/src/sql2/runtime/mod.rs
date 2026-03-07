@@ -1,5 +1,5 @@
 use crate::sql2::backend::PushdownDecision;
-use crate::sql2::catalog::SurfaceRegistry;
+use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry};
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::backend::lowerer::{lower_read_for_execution, LoweredReadProgram};
 use crate::sql2::planner::canonicalize::{
@@ -104,6 +104,11 @@ pub(crate) async fn prepare_sql2_read(
     );
     let canonicalized = canonicalize_read(bound_statement.clone(), &registry).ok()?;
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
+    if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
+        && dependency_spec_has_unknown_schema_keys(&registry, dependency_spec.as_ref())
+    {
+        return None;
+    }
     let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
     let lowered_read = lower_read_for_execution(
         &canonicalized,
@@ -151,6 +156,26 @@ pub(crate) async fn prepare_sql2_read(
         lowered_read,
         canonicalized,
     })
+}
+
+fn dependency_spec_has_unknown_schema_keys(
+    registry: &SurfaceRegistry,
+    dependency_spec: Option<&DependencySpec>,
+) -> bool {
+    let Some(dependency_spec) = dependency_spec else {
+        return false;
+    };
+    if dependency_spec.schema_keys.is_empty() {
+        return false;
+    }
+    let registered = registry
+        .registered_schema_keys()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    dependency_spec
+        .schema_keys
+        .iter()
+        .any(|schema_key| !registered.contains(schema_key))
 }
 
 fn explain_query_statement(statement: &Statement) -> Option<(Statement, Option<ExplainEnvelope>)> {
@@ -368,7 +393,7 @@ mod tests {
     struct FakeBackend {
         stored_schema_rows: HashMap<String, String>,
         version_pointer_rows: HashMap<String, String>,
-        state_rows: HashMap<String, Vec<Vec<Value>>>,
+        change_rows: Vec<Vec<Value>>,
     }
 
     #[async_trait(?Send)]
@@ -447,48 +472,23 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM \"lix_internal_state_materialized_v1_") {
-                if let Some((_table_name, rows)) = self
-                    .state_rows
-                    .iter()
-                    .find(|(table_name, _)| sql.contains(table_name.as_str()))
-                {
-                    let entity_filter = extract_sql_string_filter(sql, "entity_id");
-                    let version_filter = extract_sql_string_filter(sql, "version_id");
-                    let filtered_rows = rows
-                        .iter()
-                        .filter(|row| {
-                            let entity_matches = match entity_filter.as_ref() {
-                                Some(entity_id) => {
-                                    matches!(row.first(), Some(Value::Text(value)) if value == entity_id)
-                                }
-                                None => true,
-                            };
-                            let version_matches = match version_filter.as_ref() {
-                                Some(version_id) => {
-                                    matches!(row.get(4), Some(Value::Text(value)) if value == version_id)
-                                }
-                                None => true,
-                            };
-                            entity_matches && version_matches
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    return Ok(QueryResult {
-                        rows: filtered_rows,
-                        columns: vec![
-                            "entity_id".to_string(),
-                            "schema_key".to_string(),
-                            "schema_version".to_string(),
-                            "file_id".to_string(),
-                            "version_id".to_string(),
-                            "plugin_key".to_string(),
-                            "snapshot_content".to_string(),
-                            "metadata".to_string(),
-                            "change_id".to_string(),
-                        ],
-                    });
-                }
+            if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
+                && sql.contains("FROM lix_internal_change c")
+            {
+                return Ok(QueryResult {
+                    rows: self.change_rows.clone(),
+                    columns: vec![
+                        "id".to_string(),
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "plugin_key".to_string(),
+                        "snapshot_content".to_string(),
+                        "metadata".to_string(),
+                        "created_at".to_string(),
+                    ],
+                });
             }
             Ok(QueryResult {
                 rows: Vec::new(),
@@ -514,6 +514,67 @@ mod tests {
         let rest = &sql[start..];
         let end = rest.find('\'')?;
         Some(rest[..end].to_string())
+    }
+
+    fn build_committed_state_change_rows(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+        metadata: Option<&str>,
+        change_id: &str,
+        commit_id: &str,
+    ) -> Vec<Vec<Value>> {
+        let commit_snapshot = json!({
+            "id": commit_id,
+            "change_set_id": format!("change-set-{commit_id}"),
+            "change_ids": [change_id],
+            "author_account_ids": [],
+            "parent_commit_ids": [],
+            "meta_change_ids": []
+        })
+        .to_string();
+        let pointer_snapshot = json!({
+            "id": version_id,
+            "commit_id": commit_id
+        })
+        .to_string();
+        vec![
+            vec![
+                Value::Text(change_id.to_string()),
+                Value::Text(entity_id.to_string()),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text(snapshot_content.to_string()),
+                metadata
+                    .map(|value| Value::Text(value.to_string()))
+                    .unwrap_or(Value::Null),
+                Value::Text("2026-03-06T18:00:00Z".to_string()),
+            ],
+            vec![
+                Value::Text(format!("commit-change-{commit_id}")),
+                Value::Text(commit_id.to_string()),
+                Value::Text("lix_commit".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text("lix".to_string()),
+                Value::Text(commit_snapshot),
+                Value::Null,
+                Value::Text("2026-03-06T18:00:01Z".to_string()),
+            ],
+            vec![
+                Value::Text(format!("pointer-change-{version_id}")),
+                Value::Text(version_id.to_string()),
+                Value::Text("lix_version_pointer".to_string()),
+                Value::Text("1".to_string()),
+                Value::Text(crate::version::version_pointer_file_id().to_string()),
+                Value::Text(crate::version::version_pointer_plugin_key().to_string()),
+                Value::Text(pointer_snapshot),
+                Value::Null,
+                Value::Text("2026-03-06T18:00:02Z".to_string()),
+            ],
+        ]
     }
 
     #[tokio::test]
@@ -566,10 +627,7 @@ mod tests {
             .first()
             .expect("live sql2 entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
-        assert_eq!(
-            extract_sql_string_filter(lowered_sql, "schema_key").as_deref(),
-            Some("lix_key_value")
-        );
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
         assert_eq!(
             extract_sql_string_filter(lowered_sql, "file_id").as_deref(),
             Some("lix")
@@ -627,10 +685,7 @@ mod tests {
             .first()
             .expect("stored-schema entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
-        assert_eq!(
-            extract_sql_string_filter(lowered_sql, "schema_key").as_deref(),
-            Some("message")
-        );
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_message"));
     }
 
     #[tokio::test]
@@ -671,7 +726,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("entity by-version read should lower");
-        assert!(lowered_sql.contains("FROM lix_state_by_version"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
         assert!(lowered_sql.contains("version_id AS lixcol_version_id"));
     }
 
@@ -711,7 +766,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("entity history read should lower");
-        assert!(lowered_sql.contains("FROM lix_state_history"));
+        assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
         assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
         assert!(lowered_sql.contains("depth AS lixcol_depth"));
     }
@@ -786,8 +841,7 @@ mod tests {
             .first()
             .expect("explain state read should lower");
         assert!(lowered_sql.starts_with("EXPLAIN SELECT"));
-        assert!(lowered_sql
-            .contains("FROM (SELECT * FROM lix_state WHERE schema_key = 'lix_key_value')"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
     }
 
     #[tokio::test]
@@ -843,8 +897,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("state read should lower");
-        assert!(lowered_sql
-            .contains("FROM (SELECT * FROM lix_state WHERE schema_key = 'lix_key_value')"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
     }
 
     #[tokio::test]
@@ -880,9 +933,8 @@ mod tests {
             .lowered_sql
             .first()
             .expect("state-by-version read should lower");
-        assert!(lowered_sql.contains(
-            "FROM (SELECT * FROM lix_state_by_version WHERE version_id = 'v1' AND schema_key = 'lix_key_value')"
-        ));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_key_value"));
+        assert!(lowered_sql.contains("WITH all_target_versions AS"));
     }
 
     #[tokio::test]
@@ -910,19 +962,15 @@ mod tests {
                 .as_ref()
                 .expect("pushdown decision should be recorded")
                 .accepted_predicates,
-            vec![
-                "entity_id = 'entity1'".to_string(),
-                "root_commit_id = 'commit-1'".to_string()
-            ]
+            vec!["root_commit_id = 'commit-1'".to_string()]
         );
         let lowered_sql = prepared
             .debug_trace
             .lowered_sql
             .first()
             .expect("state-history read should lower");
-        assert!(lowered_sql.contains(
-            "FROM (SELECT * FROM lix_state_history WHERE entity_id = 'entity1' AND root_commit_id = 'commit-1')"
-        ));
+        assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
+        assert!(lowered_sql.contains("c.entity_id = 'commit-1'"));
     }
 
     #[tokio::test]
@@ -1254,19 +1302,13 @@ mod tests {
             })
             .expect("version pointer JSON"),
         );
-        backend.state_rows.insert(
-            "lix_internal_state_materialized_v1_lix_key_value".to_string(),
-            vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Text("{\"m\":1}".to_string()),
-                Value::Text("change-1".to_string()),
-            ]],
+        backend.change_rows = build_committed_state_change_rows(
+            "entity-1",
+            "version-a",
+            "{\"value\":\"before\"}",
+            Some("{\"m\":1}"),
+            "change-1",
+            "commit-456",
         );
         let prepared = prepare_sql2_write(
             &backend,
@@ -1330,19 +1372,13 @@ mod tests {
             })
             .expect("version pointer JSON"),
         );
-        backend.state_rows.insert(
-            "lix_internal_state_materialized_v1_lix_key_value".to_string(),
-            vec![vec![
-                Value::Text("entity-1".to_string()),
-                Value::Text("lix_key_value".to_string()),
-                Value::Text("1".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("version-a".to_string()),
-                Value::Text("lix".to_string()),
-                Value::Text("{\"value\":\"before\"}".to_string()),
-                Value::Null,
-                Value::Text("change-1".to_string()),
-            ]],
+        backend.change_rows = build_committed_state_change_rows(
+            "entity-1",
+            "version-a",
+            "{\"value\":\"before\"}",
+            None,
+            "change-1",
+            "commit-789",
         );
         let prepared = prepare_sql2_write(
             &backend,
