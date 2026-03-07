@@ -1,3 +1,4 @@
+use crate::sql2::backend::PushdownDecision;
 use crate::sql2::catalog::SurfaceRegistry;
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::backend::lowerer::{lower_read_for_execution, LoweredReadProgram};
@@ -28,6 +29,7 @@ pub(crate) struct Sql2DebugTrace {
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
+    pub(crate) pushdown_decision: Option<PushdownDecision>,
     pub(crate) write_command: Option<WriteCommand>,
     pub(crate) scope_proof: Option<ScopeProof>,
     pub(crate) schema_proof: Option<SchemaProof>,
@@ -93,9 +95,13 @@ pub(crate) async fn prepare_sql2_read(
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
     let (effective_state_request, effective_state_plan) =
         build_effective_state(&canonicalized, dependency_spec.as_ref())?;
-    let lowered_read = lower_read_for_execution(&canonicalized, &effective_state_request)
-        .ok()
-        .flatten();
+    let lowered_read = lower_read_for_execution(
+        &canonicalized,
+        &effective_state_request,
+        &effective_state_plan,
+    )
+    .ok()
+    .flatten();
     let lowered_sql = lowered_read
         .as_ref()
         .map(|program| {
@@ -114,6 +120,9 @@ pub(crate) async fn prepare_sql2_read(
             dependency_spec: dependency_spec.clone(),
             effective_state_request: Some(effective_state_request.clone()),
             effective_state_plan: Some(effective_state_plan.clone()),
+            pushdown_decision: lowered_read
+                .as_ref()
+                .map(|program| program.pushdown_decision.clone()),
             write_command: None,
             scope_proof: None,
             schema_proof: None,
@@ -175,6 +184,7 @@ pub(crate) async fn prepare_sql2_write(
             dependency_spec: None,
             effective_state_request: None,
             effective_state_plan: None,
+            pushdown_decision: None,
             write_command: Some(canonicalized.write_command.clone()),
             scope_proof: Some(planned_write.scope_proof.clone()),
             schema_proof: Some(planned_write.schema_proof.clone()),
@@ -472,6 +482,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["lix_key_value".to_string()]
         );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec!["key = 'hello'".to_string()]
+        );
         let lowered_sql = prepared
             .debug_trace
             .lowered_sql
@@ -560,6 +579,36 @@ mod tests {
         .await;
 
         assert!(prepared.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepares_state_reads_with_explicit_residual_pushdown_trace() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one("SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("state read should canonicalize");
+
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec!["schema_key = 'lix_key_value'".to_string()]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("state read should lower");
+        assert!(lowered_sql.contains("FROM (SELECT * FROM lix_state)"));
     }
 
     #[tokio::test]
