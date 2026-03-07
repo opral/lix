@@ -78,6 +78,10 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
 }
 
 fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
+    if let Some(schema_key) = filesystem_write_schema_key(canonicalized) {
+        return SchemaProof::Exact(BTreeSet::from([schema_key.to_string()]));
+    }
+
     if let Some(schema_key) = canonicalized
         .surface_binding
         .implicit_overrides
@@ -95,12 +99,24 @@ fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
 
 fn prove_target_set(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
     let target_key = match canonicalized.surface_binding.descriptor.public_name.as_str() {
-        "lix_version" => "id",
+        "lix_version"
+        | "lix_file"
+        | "lix_file_by_version"
+        | "lix_directory"
+        | "lix_directory_by_version" => "id",
         _ => "entity_id",
     };
     write_text_value(canonicalized, target_key)
         .map(|entity_id| TargetSetProof::Exact(BTreeSet::from([entity_id])))
         .or(Some(TargetSetProof::Unknown))
+}
+
+fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<&'static str> {
+    match canonicalized.surface_binding.descriptor.public_name.as_str() {
+        "lix_file" | "lix_file_by_version" => Some("lix_file_descriptor"),
+        "lix_directory" | "lix_directory_by_version" => Some("lix_directory_descriptor"),
+        _ => None,
+    }
 }
 
 fn write_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {

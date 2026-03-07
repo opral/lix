@@ -1,4 +1,13 @@
 use crate::builtin_schema::builtin_schema_definition;
+use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::filesystem::live_projection::{
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+    FilesystemProjectionScope,
+};
+use crate::filesystem::path::{
+    compose_directory_path, directory_ancestor_paths, directory_name_from_path,
+    normalize_directory_path, normalize_path_segment, parent_directory_path,
+};
 use crate::account::{
     active_account_file_id, active_account_plugin_key, active_account_schema_key,
     active_account_schema_version, active_account_snapshot_content,
@@ -24,8 +33,15 @@ use crate::sql2::planner::semantics::effective_state_resolver::{
     OverlayLane,
 };
 use crate::{LixBackend, Value};
-use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::collections::BTreeMap;
+
+const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
+const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
+const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILESYSTEM_DIRECTORY_SCHEMA_VERSION: &str = "1";
+const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
+const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteResolveError {
@@ -72,8 +88,13 @@ pub(crate) async fn resolve_write_plan(
                 }
             }
         }
-        SurfaceFamily::Admin => resolve_admin_write(backend, planned_write, target_write_lane).await,
-        SurfaceFamily::Filesystem | SurfaceFamily::Change => {
+        SurfaceFamily::Admin => {
+            resolve_admin_write(backend, planned_write, target_write_lane).await
+        }
+        SurfaceFamily::Filesystem => {
+            resolve_filesystem_write(backend, planned_write, target_write_lane).await
+        }
+        SurfaceFamily::Change => {
             Err(WriteResolveError {
                 message: format!(
                     "sql2 write resolver does not support '{}' writes",
@@ -307,6 +328,629 @@ fn resolve_entity_insert_write_plan(
     })
 }
 
+async fn resolve_filesystem_write(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_directory" | "lix_directory_by_version" => match planned_write.command.operation_kind {
+            WriteOperationKind::Insert => {
+                resolve_directory_insert_write_plan(backend, planned_write, target_write_lane).await
+            }
+            WriteOperationKind::Update => {
+                resolve_existing_directory_write(backend, planned_write, target_write_lane).await
+            }
+            WriteOperationKind::Delete => Err(WriteResolveError {
+                message:
+                    "sql2 filesystem live slice does not yet support directory deletes"
+                        .to_string(),
+            }),
+        },
+        other => Err(WriteResolveError {
+            message: format!(
+                "sql2 filesystem live slice does not yet support '{}' writes",
+                other
+            ),
+        }),
+    }
+}
+
+async fn resolve_directory_insert_write_plan(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
+        return Err(WriteResolveError {
+            message: "sql2 filesystem directory insert requires a full snapshot payload"
+                .to_string(),
+        });
+    };
+    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
+        message: "sql2 filesystem directory insert requires a concrete version_id".to_string(),
+    })?;
+
+    let computed = resolve_directory_insert_target(backend, planned_write, payload, &version_id)
+        .await?;
+    let mut intended_post_state = Vec::new();
+    let mut lineage = Vec::new();
+
+    for ancestor in &computed.ancestor_rows {
+        intended_post_state.push(directory_descriptor_row(
+            &ancestor.id,
+            ancestor.parent_id.as_deref(),
+            &ancestor.name,
+            ancestor.hidden,
+            &ancestor.version_id,
+            ancestor.metadata.as_deref(),
+        ));
+        lineage.push(RowLineage {
+            entity_id: ancestor.id.clone(),
+            source_change_id: None,
+            source_commit_id: None,
+        });
+    }
+
+    intended_post_state.push(directory_descriptor_row(
+        &computed.id,
+        computed.parent_id.as_deref(),
+        &computed.name,
+        computed.hidden,
+        &version_id,
+        computed.metadata.as_deref(),
+    ));
+    lineage.push(RowLineage {
+        entity_id: computed.id.clone(),
+        source_change_id: None,
+        source_commit_id: None,
+    });
+
+    Ok(ResolvedWritePlan {
+        authoritative_pre_state: Vec::new(),
+        intended_post_state,
+        tombstones: Vec::new(),
+        lineage,
+        target_write_lane,
+    })
+}
+
+async fn resolve_existing_directory_write(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    ensure_exact_selector(planned_write)?;
+    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
+        message: "sql2 filesystem directory update requires a concrete version_id".to_string(),
+    })?;
+    let Some(current_row) =
+        load_target_directory_row(backend, planned_write, &version_id).await?
+    else {
+        return Ok(ResolvedWritePlan {
+            authoritative_pre_state: Vec::new(),
+            intended_post_state: Vec::new(),
+            tombstones: Vec::new(),
+            lineage: Vec::new(),
+            target_write_lane,
+        });
+    };
+
+    match planned_write.command.mode {
+        WriteMode::Tracked if current_row.untracked => {
+            return Err(WriteResolveError {
+                message:
+                    "sql2 live tracked filesystem writes do not yet support untracked winners"
+                        .to_string(),
+            })
+        }
+        WriteMode::Untracked if !current_row.untracked => {
+            return Err(WriteResolveError {
+                message: "sql2 untracked filesystem update requires an untracked visible row"
+                    .to_string(),
+            })
+        }
+        _ => {}
+    }
+
+    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+        return Err(WriteResolveError {
+            message: "sql2 filesystem directory update requires a patch payload".to_string(),
+        });
+    };
+    if payload.contains_key("id") {
+        return Err(WriteResolveError {
+            message:
+                "lix_directory id is immutable; create a new row and delete the old row instead"
+                    .to_string(),
+        });
+    }
+
+    let next_row =
+        resolve_directory_update_target(backend, &current_row, payload, &version_id).await?;
+    let row_ref = ResolvedRowRef {
+        entity_id: current_row.id.clone(),
+        schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
+        version_id: Some(version_id.clone()),
+        source_change_id: current_row.change_id.clone(),
+        source_commit_id: None,
+    };
+
+    Ok(ResolvedWritePlan {
+        authoritative_pre_state: vec![row_ref.clone()],
+        intended_post_state: vec![directory_descriptor_row(
+            &current_row.id,
+            next_row.parent_id.as_deref(),
+            &next_row.name,
+            next_row.hidden,
+            &version_id,
+            next_row.metadata.as_deref(),
+        )],
+        tombstones: Vec::new(),
+        lineage: vec![RowLineage {
+            entity_id: current_row.id,
+            source_change_id: row_ref.source_change_id,
+            source_commit_id: None,
+        }],
+        target_write_lane,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDirectoryInsertTarget {
+    id: String,
+    parent_id: Option<String>,
+    name: String,
+    hidden: bool,
+    metadata: Option<String>,
+    ancestor_rows: Vec<DirectoryFilesystemRow>,
+}
+
+async fn resolve_directory_insert_target(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    payload: &BTreeMap<String, Value>,
+    version_id: &str,
+) -> Result<ResolvedDirectoryInsertTarget, WriteResolveError> {
+    let explicit_id = payload.get("id").and_then(text_from_value);
+    let explicit_parent_id = payload.get("parent_id").and_then(text_from_value);
+    let explicit_name = payload.get("name").and_then(text_from_value);
+    let explicit_path = payload.get("path").and_then(text_from_value);
+    let hidden = payload.get("hidden").and_then(value_as_bool).unwrap_or(false);
+    let metadata = payload.get("metadata").and_then(text_from_value);
+
+    let (parent_id, name, normalized_path) = if let Some(raw_path) = explicit_path {
+        let normalized_path =
+            normalize_directory_path(&raw_path).map_err(write_resolve_backend_error)?;
+        let derived_name =
+            directory_name_from_path(&normalized_path).ok_or_else(|| WriteResolveError {
+                message: "Directory name must be provided".to_string(),
+            })?;
+        let derived_parent_id = match parent_directory_path(&normalized_path) {
+            Some(parent_path) => lookup_directory_id_by_path(backend, version_id, &parent_path)
+                .await?
+                .or_else(|| Some(auto_directory_id(version_id, &parent_path))),
+            None => None,
+        };
+
+        if explicit_parent_id.as_deref() != derived_parent_id.as_deref()
+            && explicit_parent_id.is_some()
+        {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Provided parent_id does not match parent derived from path {}",
+                    normalized_path
+                ),
+            });
+        }
+        if let Some(name) = explicit_name {
+            if normalize_path_segment(&name).map_err(write_resolve_backend_error)? != derived_name {
+                return Err(WriteResolveError {
+                    message: format!(
+                        "Provided directory name '{}' does not match path '{}'",
+                        name, normalized_path
+                    ),
+                });
+            }
+        }
+        (derived_parent_id, derived_name, normalized_path)
+    } else {
+        let raw_name = explicit_name.ok_or_else(|| WriteResolveError {
+            message: "Directory name must be provided".to_string(),
+        })?;
+        let name = normalize_path_segment(&raw_name).map_err(write_resolve_backend_error)?;
+        let parent_path = match explicit_parent_id.as_deref() {
+            Some(parent_id) => lookup_directory_path_by_id(backend, version_id, parent_id)
+                .await?
+                .ok_or_else(|| WriteResolveError {
+                    message: format!("Parent directory does not exist for id {parent_id}"),
+                })?,
+            None => "/".to_string(),
+        };
+        let computed_path =
+            compose_directory_path(parent_path.as_str(), &name).map_err(write_resolve_backend_error)?;
+        (explicit_parent_id, name, computed_path)
+    };
+
+    if let Some(existing_id) = lookup_directory_id_by_path(backend, version_id, &normalized_path).await?
+    {
+        let same_id = explicit_id
+            .as_deref()
+            .map(|value| value == existing_id.as_str())
+            .unwrap_or(false);
+        if !same_id {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Unique constraint violation: directory path '{}' already exists in version '{}'",
+                    normalized_path, version_id
+                ),
+            });
+        }
+    }
+    ensure_no_file_at_directory_path(backend, version_id, &normalized_path).await?;
+
+    let mut ancestor_rows = Vec::new();
+    for ancestor_path in directory_ancestor_paths(&normalized_path) {
+        if lookup_directory_id_by_path(backend, version_id, &ancestor_path)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        let ancestor_parent_id = match parent_directory_path(&ancestor_path) {
+            Some(path) => Some(lookup_or_auto_directory_id(backend, version_id, &path).await?),
+            None => None,
+        };
+        ancestor_rows.push(DirectoryFilesystemRow {
+            id: auto_directory_id(version_id, &ancestor_path),
+            parent_id: ancestor_parent_id,
+            name: directory_name_from_path(&ancestor_path).unwrap_or_default(),
+            path: ancestor_path,
+            hidden: false,
+            version_id: version_id.to_string(),
+            untracked: planned_write.command.mode == WriteMode::Untracked,
+            metadata: None,
+            change_id: None,
+        });
+    }
+
+    let id = explicit_id.unwrap_or_else(|| auto_directory_id(version_id, &normalized_path));
+    Ok(ResolvedDirectoryInsertTarget {
+        id,
+        parent_id,
+        name,
+        hidden,
+        metadata,
+        ancestor_rows,
+    })
+}
+
+async fn resolve_directory_update_target(
+    backend: &dyn LixBackend,
+    current_row: &DirectoryFilesystemRow,
+    payload: &BTreeMap<String, Value>,
+    version_id: &str,
+) -> Result<DirectoryFilesystemRow, WriteResolveError> {
+    let next_path = payload.get("path").and_then(text_from_value);
+    let next_parent_id = payload.get("parent_id").and_then(text_from_value);
+    let next_name = payload.get("name").and_then(text_from_value);
+    let next_hidden = payload
+        .get("hidden")
+        .and_then(value_as_bool)
+        .unwrap_or(current_row.hidden);
+    let next_metadata = payload
+        .get("metadata")
+        .and_then(text_from_value)
+        .or_else(|| current_row.metadata.clone());
+
+    let (resolved_parent_id, resolved_name, resolved_path) = if let Some(raw_path) = next_path {
+        let normalized_path =
+            normalize_directory_path(&raw_path).map_err(write_resolve_backend_error)?;
+        let name = directory_name_from_path(&normalized_path).ok_or_else(|| WriteResolveError {
+            message: "Directory name must be provided".to_string(),
+        })?;
+        let parent_id = match parent_directory_path(&normalized_path) {
+            Some(parent_path) => lookup_directory_id_by_path(backend, version_id, &parent_path)
+                .await?
+                .ok_or_else(|| WriteResolveError {
+                    message: format!("Parent directory does not exist for path {}", parent_path),
+                })?,
+            None => String::new(),
+        };
+        let parent_id_opt = if parent_id.is_empty() {
+            None
+        } else {
+            Some(parent_id)
+        };
+        (parent_id_opt, name, normalized_path)
+    } else {
+        let parent_id = next_parent_id.or_else(|| current_row.parent_id.clone());
+        let name_raw = next_name.unwrap_or_else(|| current_row.name.clone());
+        let name = normalize_path_segment(&name_raw).map_err(write_resolve_backend_error)?;
+        let parent_path = match parent_id.as_deref() {
+            Some(parent_id) => lookup_directory_path_by_id(backend, version_id, parent_id)
+                .await?
+                .ok_or_else(|| WriteResolveError {
+                    message: format!("Parent directory does not exist for id {}", parent_id),
+                })?,
+            None => "/".to_string(),
+        };
+        let path =
+            compose_directory_path(parent_path.as_str(), &name).map_err(write_resolve_backend_error)?;
+        (parent_id, name, path)
+    };
+
+    if resolved_parent_id.as_deref() == Some(current_row.id.as_str()) {
+        return Err(WriteResolveError {
+            message: "Directory cannot be its own parent".to_string(),
+        });
+    }
+    if let Some(parent_id) = resolved_parent_id.as_deref() {
+        assert_no_directory_cycle(backend, version_id, current_row.id.as_str(), parent_id).await?;
+    }
+    if let Some(existing_id) = lookup_directory_id_by_path(backend, version_id, &resolved_path).await?
+    {
+        if existing_id != current_row.id {
+            return Err(WriteResolveError {
+                message: format!(
+                    "Unique constraint violation: directory path '{}' already exists in version '{}'",
+                    resolved_path, version_id
+                ),
+            });
+        }
+    }
+    ensure_no_file_at_directory_path(backend, version_id, &resolved_path).await?;
+
+    Ok(DirectoryFilesystemRow {
+        id: current_row.id.clone(),
+        parent_id: resolved_parent_id,
+        name: resolved_name,
+        path: resolved_path,
+        hidden: next_hidden,
+        version_id: version_id.to_string(),
+        untracked: current_row.untracked,
+        metadata: next_metadata,
+        change_id: current_row.change_id.clone(),
+    })
+}
+
+async fn load_target_directory_row(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    version_id: &str,
+) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
+    if let Some(id) = planned_write.command.selector.exact_filters.get("id").and_then(text_from_value)
+    {
+        return load_directory_row_by_id(backend, version_id, &id).await;
+    }
+    if let Some(path) = planned_write
+        .command
+        .selector
+        .exact_filters
+        .get("path")
+        .and_then(text_from_value)
+    {
+        let normalized = normalize_directory_path(&path).map_err(write_resolve_backend_error)?;
+        return load_directory_row_by_path(backend, version_id, &normalized).await;
+    }
+    Err(WriteResolveError {
+        message: "sql2 filesystem directory update requires an exact id or path selector"
+            .to_string(),
+    })
+}
+
+async fn lookup_or_auto_directory_id(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<String, WriteResolveError> {
+    Ok(lookup_directory_id_by_path(backend, version_id, path)
+        .await?
+        .unwrap_or_else(|| auto_directory_id(version_id, path)))
+}
+
+async fn lookup_directory_id_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<String>, WriteResolveError> {
+    Ok(load_directory_row_by_path(backend, version_id, path)
+        .await?
+        .map(|row| row.id))
+}
+
+async fn lookup_directory_path_by_id(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: &str,
+) -> Result<Option<String>, WriteResolveError> {
+    Ok(load_directory_row_by_id(backend, version_id, directory_id)
+        .await?
+        .map(|row| row.path))
+}
+
+async fn ensure_no_file_at_directory_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_path: &str,
+) -> Result<(), WriteResolveError> {
+    let file_path = directory_path.trim_end_matches('/').to_string();
+    if load_file_row_by_path(backend, version_id, &file_path)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
+    Err(WriteResolveError {
+        message: format!("Directory path collides with existing file path: {file_path}"),
+    })
+}
+
+async fn assert_no_directory_cycle(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: &str,
+    parent_id: &str,
+) -> Result<(), WriteResolveError> {
+    let mut safety = 0usize;
+    let mut current_parent: Option<String> = Some(parent_id.to_string());
+    while let Some(parent_id) = current_parent {
+        if parent_id == directory_id {
+            return Err(WriteResolveError {
+                message: "Directory parent would create a cycle".to_string(),
+            });
+        }
+        if safety > 1024 {
+            return Err(WriteResolveError {
+                message: "Directory hierarchy appears to be cyclic".to_string(),
+            });
+        }
+        safety += 1;
+        let Some(parent_row) = load_directory_row_by_id(backend, version_id, &parent_id).await? else {
+            return Err(WriteResolveError {
+                message: format!("Parent directory does not exist for id {}", parent_id),
+            });
+        };
+        current_parent = parent_row.parent_id;
+    }
+    Ok(())
+}
+
+async fn load_directory_row_by_id(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    directory_id: &str,
+) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
+    let sql = format!(
+        "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
+         FROM ({projection_sql}) directories \
+         WHERE lixcol_version_id = '{version_id}' \
+           AND id = '{directory_id}' \
+         LIMIT 1",
+        projection_sql =
+            build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        version_id = escape_sql_string(version_id),
+        directory_id = escape_sql_string(directory_id),
+    );
+    load_directory_row_from_sql(backend, &sql).await
+}
+
+async fn load_directory_row_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
+    let sql = format!(
+        "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
+         FROM ({projection_sql}) directories \
+         WHERE lixcol_version_id = '{version_id}' \
+           AND path = '{path}' \
+         LIMIT 1",
+        projection_sql =
+            build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        version_id = escape_sql_string(version_id),
+        path = escape_sql_string(path),
+    );
+    load_directory_row_from_sql(backend, &sql).await
+}
+
+async fn load_directory_row_from_sql(
+    backend: &dyn LixBackend,
+    sql: &str,
+) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
+    let result = backend.execute(sql, &[]).await.map_err(write_resolve_backend_error)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(DirectoryFilesystemRow {
+        id: required_text_value(row, "id")?,
+        parent_id: optional_text_value(row.get(1)),
+        name: required_text_value_index(row, 2, "name")?,
+        path: required_text_value_index(row, 3, "path")?,
+        hidden: row.get(4).and_then(value_as_bool).unwrap_or(false),
+        version_id: required_text_value_index(row, 5, "lixcol_version_id")?,
+        untracked: row.get(6).and_then(value_as_bool).unwrap_or(false),
+        metadata: row.get(7).and_then(text_from_value),
+        change_id: row.get(8).and_then(text_from_value),
+    }))
+}
+
+async fn load_file_row_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<FileFilesystemRow>, WriteResolveError> {
+    let sql = format!(
+        "SELECT id \
+         FROM ({projection_sql}) files \
+         WHERE lixcol_version_id = '{version_id}' \
+           AND path = '{path}' \
+         LIMIT 1",
+        projection_sql =
+            build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false),
+        version_id = escape_sql_string(version_id),
+        path = escape_sql_string(path),
+    );
+    let result = backend.execute(&sql, &[]).await.map_err(write_resolve_backend_error)?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(FileFilesystemRow {
+        id: required_text_value(row, "id")?,
+    }))
+}
+
+fn directory_descriptor_row(
+    entity_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+    hidden: bool,
+    version_id: &str,
+    metadata: Option<&str>,
+) -> PlannedStateRow {
+    let snapshot_content = json!({
+        "id": entity_id,
+        "parent_id": parent_id,
+        "name": name,
+        "hidden": hidden,
+    })
+    .to_string();
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(entity_id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(FILESYSTEM_DIRECTORY_SCHEMA_VERSION.to_string()),
+    );
+    values.insert("snapshot_content".to_string(), Value::Text(snapshot_content));
+    values.insert("version_id".to_string(), Value::Text(version_id.to_string()));
+    if let Some(metadata) = metadata {
+        values.insert("metadata".to_string(), Value::Text(metadata.to_string()));
+    }
+    PlannedStateRow {
+        entity_id: entity_id.to_string(),
+        schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
+        version_id: Some(version_id.to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+fn auto_directory_id(version_id: &str, path: &str) -> String {
+    format!("lix-auto-dir:{}:{}", version_id, path)
+}
+
 #[derive(Debug, Clone)]
 struct VersionAdminRow {
     id: String,
@@ -326,6 +970,24 @@ struct ActiveVersionAdminRow {
 #[derive(Debug, Clone)]
 struct ActiveAccountAdminRow {
     account_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct DirectoryFilesystemRow {
+    id: String,
+    parent_id: Option<String>,
+    name: String,
+    path: String,
+    hidden: bool,
+    version_id: String,
+    untracked: bool,
+    metadata: Option<String>,
+    change_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FileFilesystemRow {
+    id: String,
 }
 
 async fn resolve_admin_write(
@@ -1854,6 +2516,26 @@ fn json_pointer_get<'a>(value: &'a JsonValue, pointer: &[String]) -> Option<&'a 
         }
     }
     Some(current)
+}
+
+fn required_text_value(row: &[Value], label: &str) -> Result<String, WriteResolveError> {
+    required_text_value_index(row, 0, label)
+}
+
+fn required_text_value_index(
+    row: &[Value],
+    index: usize,
+    label: &str,
+) -> Result<String, WriteResolveError> {
+    row.get(index)
+        .and_then(text_from_value)
+        .ok_or_else(|| WriteResolveError {
+            message: format!("sql2 filesystem resolver expected text {}", label),
+        })
+}
+
+fn optional_text_value(value: Option<&Value>) -> Option<String> {
+    value.and_then(text_from_value)
 }
 
 fn value_as_bool(value: &Value) -> Option<bool> {

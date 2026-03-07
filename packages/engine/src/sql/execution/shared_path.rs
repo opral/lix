@@ -359,6 +359,21 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
+    let target_name = sql2_write
+        .planned_write
+        .command
+        .target
+        .descriptor
+        .public_name
+        .as_str();
+    let filesystem_directory_side_effects_only = matches!(
+        target_name,
+        "lix_directory" | "lix_directory_by_version"
+    ) && prepared
+        .intent
+        .detected_file_domain_changes
+        .iter()
+        .all(|change| change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY);
 
     matches!(
         prepared.plan.result_contract,
@@ -369,7 +384,8 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     ) && sql2_write.domain_change_batch.is_some()
         && sql2_write.planned_write.commit_preconditions.is_some()
         && live_sql2_operation_supported(sql2_write)
-        && prepared.intent.detected_file_domain_changes.is_empty()
+        && (prepared.intent.detected_file_domain_changes.is_empty()
+            || filesystem_directory_side_effects_only)
         && prepared.intent.pending_file_writes.is_empty()
         && prepared.intent.pending_file_delete_targets.is_empty()
         && prepared

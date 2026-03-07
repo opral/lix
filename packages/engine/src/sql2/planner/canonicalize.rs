@@ -196,7 +196,7 @@ fn canonicalize_insert_write(
     }
 
     let payload = insert_payload(&surface_binding, insert, &bound_statement.bound_parameters)?;
-    let mode = write_mode_for_surface(&surface_binding, &payload);
+    let mode = write_mode_for_surface_and_selector(&surface_binding, &payload, None);
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -252,7 +252,7 @@ fn canonicalize_update_write(
             ))
         }
     };
-    let mode = write_mode_for_surface(&surface_binding, &payload);
+    let mode = write_mode_for_surface_and_selector(&surface_binding, &payload, Some(&selector));
 
     Ok(CanonicalizedWrite {
         bound_statement: bound_statement.clone(),
@@ -310,9 +310,13 @@ fn canonicalize_delete_write(
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Delete,
             target: surface_binding.clone(),
-            selector,
+            selector: selector.clone(),
             payload: MutationPayload::Tombstone,
-            mode: write_mode_for_surface(&surface_binding, &BTreeMap::new()),
+            mode: write_mode_for_surface_and_selector(
+                &surface_binding,
+                &BTreeMap::new(),
+                Some(&selector),
+            ),
             execution_context: bound_statement.execution_context,
         },
     })
@@ -533,10 +537,13 @@ fn validate_semantic_write_surface(
     }
     if !matches!(
         surface_binding.descriptor.surface_family,
-        SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Admin
+        SurfaceFamily::State
+            | SurfaceFamily::Entity
+            | SurfaceFamily::Admin
+            | SurfaceFamily::Filesystem
     ) {
         return Err(CanonicalizeError::unsupported(
-            "sql2 write canonicalizer only supports migrated state, entity, and admin surfaces",
+            "sql2 write canonicalizer only supports migrated state, entity, admin, and filesystem surfaces",
         ));
     }
     if !surface_rule(surface_binding) {
@@ -554,7 +561,12 @@ fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         SurfaceFamily::Entity
     ) || matches!(
         surface_binding.descriptor.public_name.as_str(),
-        "lix_state" | "lix_state_by_version" | "lix_version" | "lix_active_account"
+        "lix_state"
+            | "lix_state_by_version"
+            | "lix_version"
+            | "lix_active_account"
+            | "lix_directory"
+            | "lix_directory_by_version"
     )
 }
 
@@ -569,6 +581,8 @@ fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
             | "lix_version"
             | "lix_active_version"
             | "lix_active_account"
+            | "lix_directory"
+            | "lix_directory_by_version"
     )
 }
 
@@ -778,7 +792,14 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
             "lix_active_account" => matches!(column, "id" | "account_id"),
             _ => false,
         },
-        SurfaceFamily::Filesystem | SurfaceFamily::Change => false,
+        SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
+            "lix_directory" | "lix_directory_by_version" => matches!(
+                column,
+                "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
+            ),
+            _ => false,
+        },
+        SurfaceFamily::Change => false,
     }
 }
 
@@ -846,7 +867,21 @@ fn canonical_write_column_key(
                 surface_binding.descriptor.public_name
             ))),
         },
-        SurfaceFamily::Filesystem | SurfaceFamily::Change => {
+        SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
+            "lix_directory" | "lix_directory_by_version" => match column.as_str() {
+                "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
+                | "metadata" => Ok(column),
+                _ => Err(CanonicalizeError::unsupported(format!(
+                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                ))),
+            },
+            _ => Err(CanonicalizeError::unsupported(format!(
+                "sql2 write canonicalizer does not yet support '{}' writes",
+                surface_binding.descriptor.public_name
+            ))),
+        },
+        SurfaceFamily::Change => {
             Err(CanonicalizeError::unsupported(format!(
                 "sql2 day-1 write canonicalizer does not support '{}' writes",
                 surface_binding.descriptor.public_name
@@ -940,6 +975,40 @@ fn write_mode_for_surface(
     }
 
     write_mode_from_payload(payload)
+}
+
+fn write_mode_for_surface_and_selector(
+    surface_binding: &SurfaceBinding,
+    payload: &BTreeMap<String, Value>,
+    selector: Option<&WriteSelector>,
+) -> WriteMode {
+    let payload_mode = write_mode_for_surface(surface_binding, payload);
+    if payload_mode == WriteMode::Untracked {
+        return payload_mode;
+    }
+
+    if selector
+        .and_then(|selector| selector.exact_filters.get("untracked"))
+        .and_then(value_as_bool)
+        == Some(true)
+    {
+        return WriteMode::Untracked;
+    }
+
+    payload_mode
+}
+
+fn value_as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Boolean(value) => Some(*value),
+        Value::Integer(value) => Some(*value != 0),
+        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn write_mode_from_payload(payload: &BTreeMap<String, Value>) -> WriteMode {
