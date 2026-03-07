@@ -18,6 +18,9 @@ use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
+const STORED_SCHEMA_FILE_ID: &str = "lix";
+const STORED_SCHEMA_PLUGIN_KEY: &str = "lix";
+const STORED_SCHEMA_VERSION_ID: &str = "global";
 
 #[derive(Debug, Default)]
 pub struct SchemaCache {
@@ -269,6 +272,57 @@ async fn validate_sql2_planned_row(
     if row.schema_key == STORED_SCHEMA_KEY {
         validate_stored_schema_snapshot(provider, &snapshot).await?;
         let (key, schema) = schema_from_stored_snapshot(&snapshot)?;
+        let expected_entity_id = key.entity_id();
+        let actual_version_id = planned_row_required_text(row, "version_id")?;
+        let actual_file_id = planned_row_required_text(row, "file_id")?;
+        let actual_plugin_key = planned_row_required_text(row, "plugin_key")?;
+        let actual_schema_version = planned_row_required_text(row, "schema_version")?;
+
+        if row.entity_id != expected_entity_id {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "stored schema entity_id '{}' must match '{}'",
+                    row.entity_id, expected_entity_id
+                ),
+            });
+        }
+        if actual_version_id != STORED_SCHEMA_VERSION_ID {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "stored schema version_id '{}' must be '{}'",
+                    actual_version_id, STORED_SCHEMA_VERSION_ID
+                ),
+            });
+        }
+        if actual_file_id != STORED_SCHEMA_FILE_ID {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "stored schema file_id '{}' must be '{}'",
+                    actual_file_id, STORED_SCHEMA_FILE_ID
+                ),
+            });
+        }
+        if actual_plugin_key != STORED_SCHEMA_PLUGIN_KEY {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "stored schema plugin_key '{}' must be '{}'",
+                    actual_plugin_key, STORED_SCHEMA_PLUGIN_KEY
+                ),
+            });
+        }
+        if actual_schema_version != key.schema_version {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "stored schema row schema_version '{}' must match '{}'",
+                    actual_schema_version, key.schema_version
+                ),
+            });
+        }
         provider.remember_pending_schema(key, schema);
         return Ok(());
     }
