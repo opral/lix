@@ -448,7 +448,10 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         default_scope: DefaultScopeSemantics::GlobalAdmin,
         surface_traits: SurfaceTraits::default(),
         resolution_capabilities: SurfaceResolutionCapabilities::default(),
-        implicit_overrides: SurfaceImplicitOverrides::default(),
+        implicit_overrides: SurfaceImplicitOverrides {
+            fixed_schema_key: Some(name.to_string()),
+            ..SurfaceImplicitOverrides::default()
+        },
         catalog_source: CatalogSource::Builtin,
     }
 }

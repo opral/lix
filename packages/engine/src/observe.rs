@@ -541,7 +541,7 @@ async fn execute_observe_query(
     engine: &Engine,
     query: &ObserveQuery,
 ) -> Result<QueryResult, LixError> {
-    let result = engine.execute(&query.sql, &query.params).await?;
+    let result = Box::pin(engine.execute(&query.sql, &query.params)).await?;
     let [statement] = result.statements.as_slice() else {
         return Err(errors::unexpected_statement_count_error(
             "observe query",
@@ -737,15 +737,14 @@ async fn observe_poll_sleep(duration: Duration) {
 }
 
 async fn latest_observe_tick_seq(engine: &Engine) -> Result<Option<i64>, LixError> {
-    let result = engine
-        .execute_backend_sql(
-            "SELECT tick_seq \
-             FROM lix_internal_observe_tick \
-             ORDER BY tick_seq DESC \
-             LIMIT 1",
-            &[],
-        )
-        .await?;
+    let result = Box::pin(engine.execute_backend_sql(
+        "SELECT tick_seq \
+         FROM lix_internal_observe_tick \
+         ORDER BY tick_seq DESC \
+         LIMIT 1",
+        &[],
+    ))
+    .await?;
     let Some(first_row) = result.rows.first() else {
         return Ok(None);
     };
@@ -760,24 +759,22 @@ async fn observe_ticks_since(
     last_seen_tick_seq: Option<i64>,
 ) -> Result<Vec<ObserveTickRow>, LixError> {
     let result = if let Some(last_seen) = last_seen_tick_seq {
-        engine
-            .execute_backend_sql(
-                "SELECT tick_seq, writer_key \
-                 FROM lix_internal_observe_tick \
-                 WHERE tick_seq > $1 \
-                 ORDER BY tick_seq ASC",
-                &[Value::Integer(last_seen)],
-            )
-            .await?
+        Box::pin(engine.execute_backend_sql(
+            "SELECT tick_seq, writer_key \
+             FROM lix_internal_observe_tick \
+             WHERE tick_seq > $1 \
+             ORDER BY tick_seq ASC",
+            &[Value::Integer(last_seen)],
+        ))
+        .await?
     } else {
-        engine
-            .execute_backend_sql(
-                "SELECT tick_seq, writer_key \
-                 FROM lix_internal_observe_tick \
-                 ORDER BY tick_seq ASC",
-                &[],
-            )
-            .await?
+        Box::pin(engine.execute_backend_sql(
+            "SELECT tick_seq, writer_key \
+             FROM lix_internal_observe_tick \
+             ORDER BY tick_seq ASC",
+            &[],
+        ))
+        .await?
     };
 
     let mut ticks = Vec::with_capacity(result.rows.len());
