@@ -6,6 +6,7 @@ use crate::commit::{
     AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
 };
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
+use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema_registry::register_schema_sql_statements;
@@ -31,6 +32,10 @@ use super::intent::{
 };
 use super::run::SqlExecutionOutcome;
 use sqlparser::ast::Statement;
+
+const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
+const STORED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
+const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
     pub(crate) skip_side_effect_collection: bool,
@@ -113,6 +118,11 @@ pub(crate) async fn prepare_execution_with_backend(
         prepare_sql2_read(backend, &statements, params, active_version_id, writer_key).await;
     let sql2_write =
         prepare_sql2_write(backend, &statements, params, active_version_id, writer_key).await;
+    let plan_statements = sql2_read
+        .as_ref()
+        .and_then(|prepared| prepared.lowered_read.as_ref())
+        .map(|program| program.statements.clone())
+        .unwrap_or_else(|| statements.clone());
 
     let intent = collect_execution_intent_with_backend(
         engine,
@@ -131,7 +141,7 @@ pub(crate) async fn prepare_execution_with_backend(
     let plan = build_execution_plan(
         backend,
         &engine.cel_evaluator,
-        statements,
+        plan_statements,
         params,
         sql2_read
             .as_ref()
@@ -271,6 +281,10 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     .await
     .map_err(append_commit_error_to_lix_error)?;
 
+    if let Some(commit_result) = append_result.commit_result.as_ref() {
+        mirror_sql2_stored_schema_bootstrap_rows(transaction, commit_result).await?;
+    }
+
     let plugin_changes_committed =
         matches!(append_result.disposition, AppendCommitDisposition::Applied);
     let state_commit_stream_changes = if plugin_changes_committed {
@@ -328,6 +342,7 @@ fn live_sql2_operation_supported(sql2_write: &Sql2PreparedWrite) -> bool {
                 .as_ref()
                 .map(|preconditions| &preconditions.write_lane),
             Some(crate::sql2::planner::ir::WriteLane::SingleVersion(_))
+                | Some(crate::sql2::planner::ir::WriteLane::ActiveVersion)
         ),
     }
 }
@@ -392,4 +407,68 @@ fn append_commit_error_to_lix_error(error: crate::commit::AppendCommitError) -> 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
     }
+}
+
+async fn mirror_sql2_stored_schema_bootstrap_rows(
+    transaction: &mut dyn LixTransaction,
+    commit_result: &crate::commit::GenerateCommitResult,
+) -> Result<(), LixError> {
+    for row in &commit_result.materialized_state {
+        if row.schema_key != STORED_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
+            continue;
+        }
+
+        let snapshot_sql = row
+            .snapshot_content
+            .as_ref()
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let metadata_sql = row
+            .metadata
+            .as_ref()
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let writer_key_sql = row
+            .writer_key
+            .as_ref()
+            .map(|value| format!("'{}'", escape_sql_string(value)))
+            .unwrap_or_else(|| "NULL".to_string());
+        let is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 };
+
+        let sql = format!(
+            "INSERT INTO {table} (\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+             ) VALUES (\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'\
+             ) ON CONFLICT (entity_id, file_id, version_id) DO UPDATE SET \
+             schema_key = excluded.schema_key, \
+             schema_version = excluded.schema_version, \
+             global = excluded.global, \
+             plugin_key = excluded.plugin_key, \
+             snapshot_content = excluded.snapshot_content, \
+             change_id = excluded.change_id, \
+             metadata = excluded.metadata, \
+             writer_key = excluded.writer_key, \
+             is_tombstone = excluded.is_tombstone, \
+             updated_at = excluded.updated_at",
+            table = STORED_SCHEMA_BOOTSTRAP_TABLE,
+            entity_id = escape_sql_string(&row.entity_id),
+            schema_key = escape_sql_string(&row.schema_key),
+            schema_version = escape_sql_string(&row.schema_version),
+            file_id = escape_sql_string(&row.file_id),
+            version_id = escape_sql_string(&row.lixcol_version_id),
+            plugin_key = escape_sql_string(&row.plugin_key),
+            snapshot_content = snapshot_sql,
+            change_id = escape_sql_string(&row.id),
+            metadata = metadata_sql,
+            writer_key = writer_key_sql,
+            is_tombstone = is_tombstone,
+            created_at = escape_sql_string(&row.created_at),
+            updated_at = escape_sql_string(&row.created_at),
+        );
+
+        transaction.execute(&sql, &[]).await?;
+    }
+
+    Ok(())
 }

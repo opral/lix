@@ -293,6 +293,8 @@ mod tests {
         registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
+            fixed_version_id: None,
+            predicate_overrides: Vec::new(),
         });
 
         let binding = registry
