@@ -84,6 +84,21 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine
         .expect("sequence value must be integer")
 }
 
+async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let rows = engine
+        .execute(
+            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected active version id text, got {other:?}"),
+    }
+}
+
 simulation_test!(
     transaction_path_applies_insert_validation,
     simulations = [sqlite, postgres],
@@ -193,6 +208,106 @@ simulation_test!(
             .unwrap();
 
         assert_eq!(read_sequence_value(&engine).await, 5);
+    }
+);
+
+simulation_test!(
+    transaction_path_sql2_stored_schema_write_updates_bootstrap_for_followup_dynamic_surface_use,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let active_version_id = active_version_id(&engine).await;
+        let stored_schema_snapshot = serde_json::json!({
+            "value": {
+                "x-lix-key": "lix_tx_dynamic_schema",
+                "x-lix-version": "1",
+                "x-lix-primary-key": ["/id"],
+                "x-lix-override-lixcols": {
+                    "lixcol_file_id": "\"lix\"",
+                    "lixcol_plugin_key": "\"lix\""
+                },
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        })
+        .to_string()
+        .replace('\'', "''");
+
+        let active_version_id_for_tx = active_version_id.clone();
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'lix_tx_dynamic_schema~1', 'lix_stored_schema', 'lix', 'global', 'lix', '{stored_schema_snapshot}', '1'\
+                             )"
+                        ),
+                        &[],
+                    )
+                    .await?;
+
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'row-1', 'lix_tx_dynamic_schema', 'lix', '{}', 'lix', '{{\"id\":\"row-1\",\"name\":\"hello\"}}', '1'\
+                             )",
+                            active_version_id_for_tx
+                        ),
+                        &[],
+                    )
+                    .await?;
+
+                    let in_transaction = tx
+                        .execute(
+                            "SELECT name \
+                             FROM lix_tx_dynamic_schema \
+                             WHERE id = 'row-1'",
+                            &[],
+                        )
+                        .await?;
+                    assert_eq!(in_transaction.statements[0].rows.len(), 1);
+                    assert_eq!(
+                        in_transaction.statements[0].rows[0][0],
+                        Value::Text("hello".to_string())
+                    );
+
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let post_commit = engine
+            .execute(
+                &format!(
+                    "SELECT name \
+                     FROM lix_tx_dynamic_schema \
+                     WHERE id = 'row-1'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_commit.statements[0].rows.len(), 1);
+        assert_eq!(
+            post_commit.statements[0].rows[0][0],
+            Value::Text("hello".to_string())
+        );
     }
 );
 

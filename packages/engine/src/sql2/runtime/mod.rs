@@ -1,5 +1,6 @@
 use crate::sql2::catalog::SurfaceRegistry;
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
+use crate::sql2::planner::backend::lowerer::{lower_read_for_execution, LoweredReadProgram};
 use crate::sql2::planner::canonicalize::{
     canonicalize_read, canonicalize_write, CanonicalizedRead, CanonicalizedWrite,
 };
@@ -43,6 +44,7 @@ pub(crate) struct Sql2PreparedRead {
     pub(crate) dependency_spec: Option<DependencySpec>,
     pub(crate) effective_state_request: Option<EffectiveStateRequest>,
     pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
+    pub(crate) lowered_read: Option<LoweredReadProgram>,
     pub(crate) debug_trace: Sql2DebugTrace,
 }
 
@@ -82,6 +84,19 @@ pub(crate) async fn prepare_sql2_read(
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
     let (effective_state_request, effective_state_plan) =
         build_effective_state(&canonicalized, dependency_spec.as_ref())?;
+    let lowered_read = lower_read_for_execution(&canonicalized, &effective_state_request)
+        .ok()
+        .flatten();
+    let lowered_sql = lowered_read
+        .as_ref()
+        .map(|program| {
+            program
+                .statements
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     Some(Sql2PreparedRead {
         debug_trace: Sql2DebugTrace {
@@ -97,11 +112,12 @@ pub(crate) async fn prepare_sql2_read(
             resolved_write_plan: None,
             domain_change_batch: None,
             commit_preconditions: None,
-            lowered_sql: Vec::new(),
+            lowered_sql,
         },
         dependency_spec,
         effective_state_request: Some(effective_state_request),
         effective_state_plan: Some(effective_state_plan),
+        lowered_read,
         canonicalized,
     })
 }
@@ -165,7 +181,15 @@ pub(crate) async fn prepare_sql2_write(
 #[cfg(test)]
 mod tests {
     use super::{prepare_sql2_read, prepare_sql2_write};
+    use crate::sql2::catalog::SurfaceRegistry;
+    use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
+    use crate::sql2::planner::canonicalize::canonicalize_write;
     use crate::sql2::planner::ir::{ExpectedTip, ScopeProof, WriteLane, WriteMode};
+    use crate::sql2::planner::semantics::domain_changes::{
+        build_domain_change_batch, derive_commit_preconditions,
+    };
+    use crate::sql2::planner::semantics::proof_engine::prove_write;
+    use crate::sql2::planner::semantics::write_resolver::resolve_write_plan;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::{json, to_string};
@@ -189,14 +213,42 @@ mod tests {
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             if sql.contains("FROM lix_internal_stored_schema_bootstrap") {
+                let rows = self
+                    .stored_schema_rows
+                    .iter()
+                    .map(|(schema_key, snapshot)| {
+                        if sql.contains("SELECT schema_version, snapshot_content") {
+                            let schema_version =
+                                serde_json::from_str::<serde_json::Value>(snapshot)
+                                    .ok()
+                                    .and_then(|value| {
+                                        value
+                                            .get("value")
+                                            .and_then(|value| value.get("x-lix-version"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(ToString::to_string)
+                                    })
+                                    .unwrap_or_else(|| "1".to_string());
+                            vec![Value::Text(schema_version), Value::Text(snapshot.clone())]
+                        } else if sql.contains("substr(entity_id, 1,") {
+                            if sql.contains(schema_key) {
+                                vec![Value::Text(snapshot.clone())]
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            vec![Value::Text(snapshot.clone())]
+                        }
+                    })
+                    .filter(|row| !row.is_empty())
+                    .collect::<Vec<_>>();
                 return Ok(QueryResult {
-                    rows: self
-                        .stored_schema_rows
-                        .values()
-                        .cloned()
-                        .map(|snapshot| vec![Value::Text(snapshot)])
-                        .collect(),
-                    columns: vec!["snapshot_content".to_string()],
+                    rows,
+                    columns: if sql.contains("SELECT schema_version, snapshot_content") {
+                        vec!["schema_version".to_string(), "snapshot_content".to_string()]
+                    } else {
+                        vec!["snapshot_content".to_string()]
+                    },
                 });
             }
             if sql.contains("FROM lix_internal_change c")
@@ -333,6 +385,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["lix_key_value".to_string()]
         );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("live sql2 entity read should lower");
+        assert!(lowered_sql.contains("FROM (SELECT"));
+        assert_eq!(
+            extract_sql_string_filter(lowered_sql, "schema_key").as_deref(),
+            Some("lix_key_value")
+        );
+        assert_eq!(
+            extract_sql_string_filter(lowered_sql, "file_id").as_deref(),
+            Some("lix")
+        );
+        assert_eq!(
+            extract_sql_string_filter(lowered_sql, "plugin_key").as_deref(),
+            Some("lix")
+        );
     }
 
     #[tokio::test]
@@ -376,6 +446,16 @@ mod tests {
         );
         assert!(prepared.dependency_spec.is_some());
         assert!(prepared.effective_state_plan.is_some());
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("stored-schema entity read should lower");
+        assert!(lowered_sql.contains("FROM (SELECT"));
+        assert_eq!(
+            extract_sql_string_filter(lowered_sql, "schema_key").as_deref(),
+            Some("message")
+        );
     }
 
     #[tokio::test]
@@ -528,11 +608,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_none_for_entity_writes_that_stay_on_legacy_path() {
-        let backend = FakeBackend::default();
+    async fn prepares_builtin_entity_inserts_into_tracked_write_artifacts() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "main".to_string(),
+                commit_id: "commit-main".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
+        let registry = SurfaceRegistry::bootstrap_with_backend(&backend)
+            .await
+            .expect("registry should bootstrap");
+        let bound = BoundStatement::from_statement(
+            parse_one("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')")
+                .into_iter()
+                .next()
+                .expect("single statement"),
+            Vec::new(),
+            ExecutionContext {
+                dialect: Some(SqlDialect::Sqlite),
+                requested_version_id: Some("main".to_string()),
+                ..ExecutionContext::default()
+            },
+        );
+        let canonicalized =
+            canonicalize_write(bound, &registry).expect("entity insert should canonicalize");
+        let mut planned_write = prove_write(&canonicalized).expect("entity insert should prove");
+        let resolved_write_plan = resolve_write_plan(&backend, &planned_write)
+            .await
+            .expect("entity insert should resolve");
+        planned_write.resolved_write_plan = Some(resolved_write_plan);
+        let _ = build_domain_change_batch(&planned_write)
+            .expect("domain-change batch should build")
+            .expect("tracked entity insert should produce a batch");
+        let _ = derive_commit_preconditions(&backend, &planned_write)
+            .await
+            .expect("commit preconditions should derive")
+            .expect("tracked entity insert should produce commit preconditions");
+
         let prepared = prepare_sql2_write(
             &backend,
             &parse_one("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')"),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("builtin entity insert should prepare through sql2");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_key_value".to_string()]
+        );
+        assert_eq!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .intended_post_state[0]
+                .values
+                .get("snapshot_content"),
+            Some(&Value::Text("{\"key\":\"k\",\"value\":\"v\"}".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_none_for_entity_writes_that_need_legacy_global_override_handling() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            to_string(&crate::builtin_schema::types::LixVersionPointer {
+                id: "main".to_string(),
+                commit_id: "commit-main".to_string(),
+            })
+            .expect("version pointer JSON"),
+        );
+        backend.stored_schema_rows.insert(
+            "message".to_string(),
+            json!({
+                "value": {
+                    "x-lix-key": "message",
+                    "x-lix-version": "1",
+                    "x-lix-primary-key": ["/id"],
+                    "x-lix-override-lixcols": {
+                        "lixcol_file_id": "\"lix\"",
+                        "lixcol_plugin_key": "\"lix\"",
+                        "lixcol_global": "true"
+                    },
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "body": { "type": "string" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        let prepared = prepare_sql2_write(
+            &backend,
+            &parse_one("INSERT INTO message (id, body) VALUES ('m1', 'hello')"),
             &[],
             "main",
             None,

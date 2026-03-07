@@ -139,14 +139,14 @@ fn canonicalize_insert_write(
     registry: &SurfaceRegistry,
 ) -> Result<CanonicalizedWrite, CanonicalizeError> {
     let surface_binding = bind_insert_surface(insert, registry)?;
-    validate_state_write_surface(&surface_binding, insert_write_surface_supported)?;
+    validate_semantic_write_surface(&surface_binding, insert_write_surface_supported)?;
     if !insert.assignments.is_empty() || insert.on.is_some() || insert.returning.is_some() {
         return Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer only supports plain VALUES inserts without ON CONFLICT or RETURNING",
         ));
     }
 
-    let payload = insert_payload(insert, &bound_statement.bound_parameters)?;
+    let payload = insert_payload(&surface_binding, insert, &bound_statement.bound_parameters)?;
     let mode = write_mode_from_payload(&payload);
 
     Ok(CanonicalizedWrite {
@@ -178,13 +178,17 @@ fn canonicalize_update_write(
         ));
     }
     let surface_binding = bind_update_surface(update, registry)?;
-    validate_state_write_surface(&surface_binding, update_delete_surface_supported)?;
+    validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
     let selection = update.selection.as_ref().ok_or_else(|| {
         CanonicalizeError::unsupported(
             "sql2 day-1 update canonicalizer requires an explicit WHERE predicate",
         )
     })?;
-    let payload = assignment_payload(&update.assignments, &bound_statement.bound_parameters)?;
+    let payload = assignment_payload(
+        &surface_binding,
+        &update.assignments,
+        &bound_statement.bound_parameters,
+    )?;
     let mode = write_mode_from_payload(&payload);
 
     Ok(CanonicalizedWrite {
@@ -192,8 +196,12 @@ fn canonicalize_update_write(
         surface_binding: surface_binding.clone(),
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Update,
-            target: surface_binding,
-            selector: write_selector(selection, &bound_statement.bound_parameters)?,
+            target: surface_binding.clone(),
+            selector: write_selector(
+                &surface_binding,
+                selection,
+                &bound_statement.bound_parameters,
+            )?,
             payload: MutationPayload::Patch(payload),
             mode,
             execution_context: bound_statement.execution_context,
@@ -217,7 +225,7 @@ fn canonicalize_delete_write(
         ));
     }
     let surface_binding = bind_delete_surface(delete, registry)?;
-    validate_state_write_surface(&surface_binding, update_delete_surface_supported)?;
+    validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
     let selection = delete.selection.as_ref().ok_or_else(|| {
         CanonicalizeError::unsupported(
             "sql2 day-1 delete canonicalizer requires an explicit WHERE predicate",
@@ -229,8 +237,12 @@ fn canonicalize_delete_write(
         surface_binding: surface_binding.clone(),
         write_command: WriteCommand {
             operation_kind: WriteOperationKind::Delete,
-            target: surface_binding,
-            selector: write_selector(selection, &bound_statement.bound_parameters)?,
+            target: surface_binding.clone(),
+            selector: write_selector(
+                &surface_binding,
+                selection,
+                &bound_statement.bound_parameters,
+            )?,
             payload: MutationPayload::Tombstone,
             mode: WriteMode::Tracked,
             execution_context: bound_statement.execution_context,
@@ -441,7 +453,7 @@ fn bind_table_with_joins_surface(
     })
 }
 
-fn validate_state_write_surface(
+fn validate_semantic_write_surface(
     surface_binding: &SurfaceBinding,
     surface_rule: impl Fn(&SurfaceBinding) -> bool,
 ) -> Result<(), CanonicalizeError> {
@@ -451,9 +463,12 @@ fn validate_state_write_surface(
             surface_binding.descriptor.public_name
         )));
     }
-    if surface_binding.descriptor.surface_family != SurfaceFamily::State {
+    if !matches!(
+        surface_binding.descriptor.surface_family,
+        SurfaceFamily::State | SurfaceFamily::Entity
+    ) {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports lix_state* surfaces",
+            "sql2 day-1 write canonicalizer only supports state-backed surfaces",
         ));
     }
     if !surface_rule(surface_binding) {
@@ -467,16 +482,26 @@ fn validate_state_write_surface(
 
 fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
     matches!(
+        surface_binding.descriptor.surface_family,
+        SurfaceFamily::Entity
+    ) || matches!(
         surface_binding.descriptor.public_name.as_str(),
         "lix_state" | "lix_state_by_version"
     )
 }
 
 fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
-    surface_binding.descriptor.public_name == "lix_state_by_version"
+    matches!(
+        surface_binding.descriptor.surface_family,
+        SurfaceFamily::Entity
+    ) || matches!(
+        surface_binding.descriptor.public_name.as_str(),
+        "lix_state" | "lix_state_by_version"
+    )
 }
 
 fn insert_payload(
+    surface_binding: &SurfaceBinding,
     insert: &Insert,
     params: &[Value],
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
@@ -507,12 +532,14 @@ fn insert_payload(
     let mut payload = BTreeMap::new();
     for (column, expr) in insert.columns.iter().zip(row.iter()) {
         let value = expr_to_value(expr, params, &mut placeholder_state)?;
-        payload.insert(column.value.to_ascii_lowercase(), value);
+        let key = canonical_write_column_key(surface_binding, &column.value)?;
+        payload.insert(key, value);
     }
     Ok(payload)
 }
 
 fn assignment_payload(
+    surface_binding: &SurfaceBinding,
     assignments: &[sqlparser::ast::Assignment],
     params: &[Value],
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
@@ -530,27 +557,37 @@ fn assignment_payload(
                 "sql2 day-1 update canonicalizer only supports named column assignments",
             ));
         };
-        let key = column_name
+        let raw_key = column_name
             .0
             .last()
             .and_then(ObjectNamePart::as_ident)
-            .map(|ident| ident.value.to_ascii_lowercase())
+            .map(|ident| ident.value.clone())
             .ok_or_else(|| {
                 CanonicalizeError::unsupported(
                     "sql2 day-1 update canonicalizer requires named assignment columns",
                 )
             })?;
+        let key = canonical_write_column_key(surface_binding, &raw_key)?;
         let value = expr_to_value(&assignment.value, params, &mut placeholder_state)?;
         payload.insert(key, value);
     }
     Ok(payload)
 }
 
-fn write_selector(expr: &Expr, params: &[Value]) -> Result<WriteSelector, CanonicalizeError> {
+fn write_selector(
+    surface_binding: &SurfaceBinding,
+    expr: &Expr,
+    params: &[Value],
+) -> Result<WriteSelector, CanonicalizeError> {
     let mut placeholder_state = PlaceholderState::new();
     let mut exact_filters = BTreeMap::new();
-    let exact_only =
-        collect_exact_selector_filters(expr, params, &mut placeholder_state, &mut exact_filters);
+    let exact_only = collect_exact_selector_filters(
+        surface_binding,
+        expr,
+        params,
+        &mut placeholder_state,
+        &mut exact_filters,
+    );
 
     Ok(WriteSelector {
         residual_predicates: vec![expr.to_string()],
@@ -560,6 +597,7 @@ fn write_selector(expr: &Expr, params: &[Value]) -> Result<WriteSelector, Canoni
 }
 
 fn collect_exact_selector_filters(
+    surface_binding: &SurfaceBinding,
     expr: &Expr,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
@@ -571,19 +609,34 @@ fn collect_exact_selector_filters(
             op: BinaryOperator::And,
             right,
         } => {
-            collect_exact_selector_filters(left, params, placeholder_state, exact_filters)
-                && collect_exact_selector_filters(right, params, placeholder_state, exact_filters)
+            collect_exact_selector_filters(
+                surface_binding,
+                left,
+                params,
+                placeholder_state,
+                exact_filters,
+            ) && collect_exact_selector_filters(
+                surface_binding,
+                right,
+                params,
+                placeholder_state,
+                exact_filters,
+            )
         }
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
         } => {
-            let Some(column) = selector_column_name(left).or_else(|| selector_column_name(right))
+            let Some(raw_column) =
+                selector_column_name(left).or_else(|| selector_column_name(right))
             else {
                 return false;
             };
-            if !selector_column_is_supported(&column) {
+            let Ok(column) = canonical_write_column_key(surface_binding, &raw_column) else {
+                return false;
+            };
+            if !selector_column_is_supported(surface_binding, &column) {
                 return false;
             }
             let value_expr = if selector_column_name(left).is_some() {
@@ -603,9 +656,13 @@ fn collect_exact_selector_filters(
                 }
             }
         }
-        Expr::Nested(inner) => {
-            collect_exact_selector_filters(inner, params, placeholder_state, exact_filters)
-        }
+        Expr::Nested(inner) => collect_exact_selector_filters(
+            surface_binding,
+            inner,
+            params,
+            placeholder_state,
+            exact_filters,
+        ),
         _ => false,
     }
 }
@@ -621,11 +678,76 @@ fn selector_column_name(expr: &Expr) -> Option<String> {
     }
 }
 
-fn selector_column_is_supported(column: &str) -> bool {
-    matches!(
-        column,
-        "entity_id" | "schema_key" | "file_id" | "version_id" | "plugin_key" | "schema_version"
-    )
+fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) -> bool {
+    match surface_binding.descriptor.surface_family {
+        SurfaceFamily::State => matches!(
+            column,
+            "entity_id"
+                | "schema_key"
+                | "file_id"
+                | "version_id"
+                | "plugin_key"
+                | "schema_version"
+                | "global"
+                | "untracked"
+        ),
+        SurfaceFamily::Entity => surface_binding
+            .exposed_columns
+            .iter()
+            .chain(surface_binding.descriptor.hidden_columns.iter())
+            .any(|candidate| {
+                canonical_write_column_key(surface_binding, candidate)
+                    .map(|candidate| candidate == column)
+                    .unwrap_or(false)
+            }),
+        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => false,
+    }
+}
+
+fn canonical_write_column_key(
+    surface_binding: &SurfaceBinding,
+    raw_column: &str,
+) -> Result<String, CanonicalizeError> {
+    let column = raw_column.to_ascii_lowercase();
+    let canonical = match column.as_str() {
+        "lixcol_entity_id" => "entity_id",
+        "lixcol_schema_key" => "schema_key",
+        "lixcol_file_id" => "file_id",
+        "lixcol_version_id" => "version_id",
+        "lixcol_plugin_key" => "plugin_key",
+        "lixcol_schema_version" => "schema_version",
+        "lixcol_global" => "global",
+        "lixcol_writer_key" => "writer_key",
+        "lixcol_untracked" => "untracked",
+        "lixcol_metadata" => "metadata",
+        other => other,
+    }
+    .to_string();
+
+    match surface_binding.descriptor.surface_family {
+        SurfaceFamily::State => Ok(canonical),
+        SurfaceFamily::Entity => {
+            let supported = surface_binding
+                .exposed_columns
+                .iter()
+                .chain(surface_binding.descriptor.hidden_columns.iter())
+                .any(|candidate| candidate.eq_ignore_ascii_case(raw_column));
+            if supported {
+                Ok(canonical)
+            } else {
+                Err(CanonicalizeError::unsupported(format!(
+                    "sql2 day-1 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                )))
+            }
+        }
+        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => {
+            Err(CanonicalizeError::unsupported(format!(
+                "sql2 day-1 write canonicalizer does not support '{}' writes",
+                surface_binding.descriptor.public_name
+            )))
+        }
+    }
 }
 
 fn expr_to_value(
@@ -913,6 +1035,8 @@ mod tests {
         registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
+            fixed_version_id: None,
+            predicate_overrides: Vec::new(),
         });
 
         let canonicalized = canonicalize_read(
@@ -1023,23 +1147,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_entity_writes_for_day_one_write_shell() {
+    fn canonicalizes_entity_writes_into_semantic_commands() {
         let mut registry = SurfaceRegistry::with_builtin_surfaces();
         registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
             schema_key: "lix_key_value".to_string(),
             visible_columns: vec!["key".to_string(), "value".to_string()],
+            fixed_version_id: None,
+            predicate_overrides: Vec::new(),
         });
 
-        let error = canonicalize_write(
+        let canonicalized = canonicalize_write(
             bound_statement("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')"),
             &registry,
         )
-        .expect_err("entity writes should stay on the legacy path for now");
+        .expect("entity writes should canonicalize through the sql2 shell");
 
+        assert_eq!(
+            canonicalized.surface_binding.descriptor.public_name,
+            "lix_key_value"
+        );
         assert!(
-            error.message.contains("only supports lix_state* surfaces"),
-            "unexpected error: {}",
-            error.message
+            matches!(
+                canonicalized.write_command.payload,
+                MutationPayload::FullSnapshot(_)
+            ),
+            "expected full snapshot payload, got: {:?}",
+            canonicalized.write_command.payload
         );
     }
 }
