@@ -565,6 +565,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_builtin_entity_by_version_reads() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT key, value, lixcol_version_id \
+                 FROM lix_key_value_by_version \
+                 WHERE key = 'hello' AND lixcol_version_id = 'version-a'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("builtin entity by-version read should canonicalize");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_key_value_by_version"]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec![
+                "key = 'hello'".to_string(),
+                "lixcol_version_id = 'version-a'".to_string()
+            ]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("entity by-version read should lower");
+        assert!(lowered_sql.contains("FROM lix_state_by_version"));
+        assert!(lowered_sql.contains("version_id AS lixcol_version_id"));
+    }
+
+    #[tokio::test]
+    async fn prepares_builtin_entity_history_reads() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT key, value, lixcol_commit_id, lixcol_depth \
+                 FROM lix_key_value_history \
+                 WHERE key = 'hello' \
+                 ORDER BY lixcol_depth ASC",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("builtin entity history read should canonicalize");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_key_value_history"]
+        );
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec!["key = 'hello'".to_string()]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("entity history read should lower");
+        assert!(lowered_sql.contains("FROM lix_state_history"));
+        assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
+        assert!(lowered_sql.contains("depth AS lixcol_depth"));
+    }
+
+    #[tokio::test]
     async fn returns_none_for_unsupported_day_one_query_shapes() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(
