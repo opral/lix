@@ -1,9 +1,12 @@
+use crate::sql2::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql2::catalog::{
     SurfaceBinding, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue, SurfaceVariant,
 };
 use crate::sql2::core::parser::parse_sql_script;
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
-use crate::sql2::planner::semantics::effective_state_resolver::EffectiveStateRequest;
+use crate::sql2::planner::semantics::effective_state_resolver::{
+    EffectiveStatePlan, EffectiveStateRequest,
+};
 use crate::LixError;
 use sqlparser::ast::{
     Ident, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
@@ -12,27 +15,88 @@ use sqlparser::ast::{
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoweredReadProgram {
     pub(crate) statements: Vec<Statement>,
+    pub(crate) pushdown_decision: PushdownDecision,
 }
 
 pub(crate) fn lower_read_for_execution(
     canonicalized: &CanonicalizedRead,
     effective_state_request: &EffectiveStateRequest,
+    effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<LoweredReadProgram>, LixError> {
     match canonicalized.surface_binding.descriptor.surface_family {
-        SurfaceFamily::State => Ok(Some(LoweredReadProgram {
-            statements: vec![canonicalized.bound_statement.statement.clone()],
-        })),
+        SurfaceFamily::State => {
+            lower_state_read_for_execution(canonicalized, effective_state_request).map(
+                |statement| {
+                    statement.map(|statement| LoweredReadProgram {
+                        statements: vec![statement],
+                        pushdown_decision: build_pushdown_decision(effective_state_plan),
+                    })
+                },
+            )
+        }
         SurfaceFamily::Entity => {
             lower_entity_read_for_execution(canonicalized, effective_state_request).map(
                 |statement| {
                     statement.map(|statement| LoweredReadProgram {
                         statements: vec![statement],
+                        pushdown_decision: build_pushdown_decision(effective_state_plan),
                     })
                 },
             )
         }
         SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => Ok(None),
     }
+}
+
+fn lower_state_read_for_execution(
+    canonicalized: &CanonicalizedRead,
+    effective_state_request: &EffectiveStateRequest,
+) -> Result<Option<Statement>, LixError> {
+    if !state_read_references_exposed_columns(
+        &canonicalized.surface_binding,
+        effective_state_request,
+    ) {
+        return Ok(None);
+    }
+
+    let Statement::Query(mut query) = canonicalized.bound_statement.statement.clone() else {
+        return Ok(None);
+    };
+    let select = select_mut(query.as_mut())?;
+    let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
+        return Ok(None);
+    };
+
+    let derived_query = build_state_source_query(&canonicalized.surface_binding)?;
+    let derived_alias = alias.clone().or_else(|| {
+        Some(TableAlias {
+            explicit: false,
+            name: Ident::new(&canonicalized.surface_binding.descriptor.public_name),
+            columns: Vec::new(),
+        })
+    });
+    select.from[0].relation = TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(derived_query),
+        alias: derived_alias,
+    };
+
+    Ok(Some(Statement::Query(query)))
+}
+
+fn state_read_references_exposed_columns(
+    surface_binding: &SurfaceBinding,
+    effective_state_request: &EffectiveStateRequest,
+) -> bool {
+    let exposed = surface_binding
+        .exposed_columns
+        .iter()
+        .map(|column| column.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    effective_state_request
+        .required_columns
+        .iter()
+        .all(|column| exposed.contains(&column.to_ascii_lowercase()))
 }
 
 fn lower_entity_read_for_execution(
@@ -67,6 +131,14 @@ fn lower_entity_read_for_execution(
     };
 
     Ok(Some(Statement::Query(query)))
+}
+
+fn build_state_source_query(surface_binding: &SurfaceBinding) -> Result<Query, LixError> {
+    let sql = format!(
+        "SELECT * FROM {}",
+        render_identifier(&surface_binding.descriptor.public_name)
+    );
+    parse_single_query(&sql)
 }
 
 fn build_entity_source_query(
@@ -233,6 +305,24 @@ fn render_override_value(value: &SurfaceOverrideValue) -> String {
     }
 }
 
+fn build_pushdown_decision(effective_state_plan: &EffectiveStatePlan) -> PushdownDecision {
+    PushdownDecision {
+        accepted_predicates: effective_state_plan.pushdown_safe_predicates.clone(),
+        rejected_predicates: effective_state_plan
+            .residual_predicates
+            .iter()
+            .map(|predicate| RejectedPredicate {
+                predicate: predicate.clone(),
+                reason:
+                    "day-1 sql2 read lowering keeps this predicate above effective-state resolution"
+                        .to_string(),
+                support: PushdownSupport::Unsupported,
+            })
+            .collect(),
+        residual_predicates: effective_state_plan.residual_predicates.clone(),
+    }
+}
+
 fn parse_single_query(sql: &str) -> Result<Query, LixError> {
     let mut statements = parse_sql_script(sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -295,7 +385,7 @@ fn escape_sql_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::lower_read_for_execution;
+    use super::{lower_read_for_execution, LoweredReadProgram};
     use crate::sql2::catalog::SurfaceRegistry;
     use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
     use crate::sql2::planner::canonicalize::canonicalize_read;
@@ -303,7 +393,7 @@ mod tests {
     use crate::sql2::planner::semantics::effective_state_resolver::build_effective_state;
     use crate::{SqlDialect, Value};
 
-    fn lowered_sql(registry: &SurfaceRegistry, sql: &str) -> Option<String> {
+    fn lowered_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
         let mut statements =
             crate::sql2::core::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
@@ -314,27 +404,34 @@ mod tests {
         );
         let canonicalized = canonicalize_read(bound, registry).expect("query should canonicalize");
         let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
-        let (request, _plan) =
+        let (request, plan) =
             build_effective_state(&canonicalized, dependency_spec.as_ref()).expect("state plan");
-        lower_read_for_execution(&canonicalized, &request)
-            .expect("lowering should succeed")
-            .map(|program| program.statements[0].to_string())
+        lower_read_for_execution(&canonicalized, &request, &plan).expect("lowering should succeed")
     }
 
     #[test]
     fn lowers_builtin_entity_reads_through_state_surfaces() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let lowered = lowered_sql(
+        let lowered = lowered_program(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
         )
         .expect("builtin entity read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered.contains("FROM (SELECT"));
-        assert!(lowered.contains("FROM lix_state"));
-        assert!(lowered.contains("schema_key = 'lix_key_value'"));
-        assert!(lowered.contains("file_id = 'lix'"));
-        assert!(lowered.contains("plugin_key = 'lix'"));
+        assert!(lowered_sql.contains("FROM (SELECT"));
+        assert!(lowered_sql.contains("FROM lix_state"));
+        assert!(lowered_sql.contains("schema_key = 'lix_key_value'"));
+        assert!(lowered_sql.contains("file_id = 'lix'"));
+        assert!(lowered_sql.contains("plugin_key = 'lix'"));
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["key = 'hello'".to_string()]
+        );
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -362,21 +459,42 @@ mod tests {
             ],
         });
 
-        let lowered = lowered_sql(
+        let lowered = lowered_program(
             &registry,
             "SELECT body, lixcol_global FROM message WHERE id = 'm1'",
         )
         .expect("dynamic entity read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
 
-        assert!(lowered.contains("schema_key = 'message'"));
-        assert!(lowered.contains("file_id = 'inlang'"));
-        assert!(lowered.contains("plugin_key = 'inlang_sdk'"));
-        assert!(lowered.contains("global = true"));
+        assert!(lowered_sql.contains("schema_key = 'message'"));
+        assert!(lowered_sql.contains("file_id = 'inlang'"));
+        assert!(lowered_sql.contains("plugin_key = 'inlang_sdk'"));
+        assert!(lowered_sql.contains("global = true"));
     }
 
     #[test]
     fn rejects_entity_wildcard_reads_for_live_lowering() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        assert_eq!(lowered_sql(&registry, "SELECT * FROM lix_key_value"), None);
+        assert_eq!(
+            lowered_program(&registry, "SELECT * FROM lix_key_value"),
+            None
+        );
+    }
+
+    #[test]
+    fn lowers_state_reads_through_explicit_source_boundary() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
+        )
+        .expect("state read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("FROM (SELECT * FROM lix_state)"));
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["schema_key = 'lix_key_value'".to_string()]
+        );
     }
 }
