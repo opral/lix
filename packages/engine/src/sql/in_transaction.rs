@@ -74,12 +74,16 @@ impl Engine {
             Err(error) => return Err(error),
         };
 
-        if let Some(version_id) = &prepared.plan.effects.next_active_version_id {
+        let active_effects = execution
+            .plan_effects_override
+            .as_ref()
+            .unwrap_or(&prepared.plan.effects);
+
+        if let Some(version_id) = &active_effects.next_active_version_id {
             *active_version_id = version_id.clone();
         }
 
-        let mut state_commit_stream_changes =
-            prepared.plan.effects.state_commit_stream_changes.clone();
+        let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
         state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
 
         if skip_side_effect_collection && deferred_side_effects.is_none() {

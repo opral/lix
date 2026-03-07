@@ -241,12 +241,20 @@ impl Engine {
         )
         .await?;
 
-        if let Some(version_id) = &prepared.plan.effects.next_active_version_id {
+        let active_effects = execution
+            .plan_effects_override
+            .as_ref()
+            .unwrap_or(&prepared.plan.effects);
+        let effects_are_authoritative = execution.plan_effects_override.is_some();
+
+        if let Some(version_id) = &active_effects.next_active_version_id {
             self.set_active_version_id(version_id.clone());
         }
 
         let cache_targets = shared_path::derive_cache_targets(
             &prepared.plan,
+            active_effects,
+            effects_are_authoritative,
             execution.postprocess_file_cache_targets.clone(),
         );
 
@@ -262,17 +270,21 @@ impl Engine {
         )
         .await?;
 
-        let mut state_commit_stream_changes = prepared.plan.effects.state_commit_stream_changes;
+        let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
         state_commit_stream_changes.extend(execution.state_commit_stream_changes);
         let should_emit_observe_tick = !state_commit_stream_changes.is_empty();
 
         apply_effects_post_commit::apply_runtime_post_commit_effects(
             self,
             cache_targets.file_cache_refresh_targets,
-            prepared
-                .plan
-                .requirements
-                .should_invalidate_installed_plugins_cache,
+            if effects_are_authoritative {
+                false
+            } else {
+                prepared
+                    .plan
+                    .requirements
+                    .should_invalidate_installed_plugins_cache
+            },
             should_emit_observe_tick,
             options.writer_key.as_deref(),
             state_commit_stream_changes,

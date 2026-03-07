@@ -27,6 +27,10 @@ fn delete_key_value_sql(key: &str) -> String {
     )
 }
 
+fn insert_key_value_entity_sql(key: &str, value: &str) -> String {
+    format!("INSERT INTO lix_key_value (key, value) VALUES ('{key}', '{value}')")
+}
+
 simulation_test!(
     state_commit_stream_emits_matching_batches,
     simulations = [sqlite, postgres],
@@ -258,6 +262,49 @@ simulation_test!(
         assert!(
             events.try_next().is_none(),
             "rollback must drop queued state commit batches"
+        );
+    }
+);
+
+simulation_test!(
+    state_commit_stream_sql2_entity_insert_emits_one_semantic_change,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            entity_ids: vec!["state-commit-sql2-entity".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        engine
+            .execute(
+                &insert_key_value_entity_sql("state-commit-sql2-entity", "v0"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let batch = events
+            .try_next()
+            .expect("expected a state commit batch from the sql2 entity write");
+        assert_eq!(
+            batch.changes.len(),
+            1,
+            "sql2 live writes should emit one semantic change batch entry"
+        );
+        let change = &batch.changes[0];
+        assert_eq!(change.operation, StateCommitStreamOperation::Insert);
+        assert_eq!(change.entity_id, "state-commit-sql2-entity");
+        assert_eq!(change.schema_key, "lix_key_value");
+        assert!(
+            events.try_next().is_none(),
+            "sql2 entity insert should emit exactly one batch"
         );
     }
 );
