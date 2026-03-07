@@ -1,4 +1,9 @@
 use crate::builtin_schema::builtin_schema_definition;
+use crate::account::{
+    active_account_file_id, active_account_plugin_key, active_account_schema_key,
+    active_account_schema_version, active_account_snapshot_content,
+    active_account_storage_version_id, parse_active_account_snapshot,
+};
 use crate::schema::{SchemaProvider, SqlStoredSchemaProvider};
 use crate::sql2::catalog::SurfaceFamily;
 use crate::sql2::planner::ir::{
@@ -6,6 +11,9 @@ use crate::sql2::planner::ir::{
     SchemaProof, ScopeProof, TargetSetProof, WriteLane, WriteMode, WriteOperationKind,
 };
 use crate::version::{
+    active_version_file_id, active_version_plugin_key, active_version_schema_key,
+    active_version_schema_version, active_version_snapshot_content,
+    active_version_storage_version_id, parse_active_version_snapshot,
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
     version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
@@ -309,12 +317,46 @@ struct VersionAdminRow {
     pointer_change_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveVersionAdminRow {
+    id: String,
+    version_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAccountAdminRow {
+    account_id: String,
+}
+
 async fn resolve_admin_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_active_version" => match planned_write.command.operation_kind {
+            WriteOperationKind::Update => {
+                resolve_active_version_update_write_plan(backend, planned_write, target_write_lane)
+                    .await
+            }
+            _ => Err(WriteResolveError {
+                message: "sql2 write resolver only supports UPDATE for 'lix_active_version'"
+                    .to_string(),
+            }),
+        },
+        "lix_active_account" => match planned_write.command.operation_kind {
+            WriteOperationKind::Insert => {
+                resolve_active_account_insert_write_plan(planned_write, target_write_lane)
+            }
+            WriteOperationKind::Delete => {
+                resolve_active_account_delete_write_plan(backend, planned_write, target_write_lane)
+                    .await
+            }
+            WriteOperationKind::Update => Err(WriteResolveError {
+                message: "sql2 write resolver does not support UPDATE for 'lix_active_account'"
+                    .to_string(),
+            }),
+        },
         "lix_version" => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => resolve_version_insert_write_plan(
                 backend,
@@ -330,6 +372,366 @@ async fn resolve_admin_write(
             message: format!("sql2 write resolver does not yet support '{}' writes", other),
         }),
     }
+}
+
+async fn resolve_active_version_update_write_plan(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    ensure_exact_or_unfiltered_selector(planned_write)?;
+    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+        return Err(WriteResolveError {
+            message: "sql2 active-version update resolver requires a patch payload".to_string(),
+        });
+    };
+    if payload.contains_key("id") {
+        return Err(WriteResolveError {
+            message: "sql2 active-version update cannot modify id".to_string(),
+        });
+    }
+    if payload.keys().any(|key| key != "version_id") {
+        return Err(WriteResolveError {
+            message: "sql2 active-version update only supports version_id assignments"
+                .to_string(),
+        });
+    }
+    let next_version_id = payload_text_value(planned_write, "version_id").ok_or_else(|| {
+        WriteResolveError {
+            message: "sql2 active-version update must set version_id".to_string(),
+        }
+    })?;
+    if next_version_id.is_empty() {
+        return Err(WriteResolveError {
+            message: "sql2 active-version update cannot set empty version_id".to_string(),
+        });
+    }
+    let version_exists = load_version_admin_row(backend, &next_version_id)
+        .await
+        .map_err(write_resolve_backend_error)?
+        .is_some();
+    if !version_exists {
+        return Err(WriteResolveError {
+            message: format!(
+                "Foreign key constraint violation: lix_active_version.version_id '{}' references missing lix_version_descriptor.id",
+                next_version_id
+            ),
+        });
+    }
+
+    let current_rows = load_active_version_admin_rows(backend)
+        .await
+        .map_err(write_resolve_backend_error)?;
+    let matching_rows = current_rows
+        .into_iter()
+        .filter(|row| active_version_row_matches_exact_filters(row, &planned_write.command.selector.exact_filters))
+        .collect::<Vec<_>>();
+    if matching_rows.is_empty() {
+        return Ok(ResolvedWritePlan {
+            authoritative_pre_state: Vec::new(),
+            intended_post_state: Vec::new(),
+            tombstones: Vec::new(),
+            lineage: Vec::new(),
+            target_write_lane,
+        });
+    }
+
+    let authoritative_pre_state = matching_rows
+        .iter()
+        .map(active_version_admin_pre_state_ref)
+        .collect::<Vec<_>>();
+    let intended_post_state = matching_rows
+        .iter()
+        .map(|row| active_version_admin_row(&row.id, &next_version_id))
+        .collect::<Vec<_>>();
+    let lineage = matching_rows
+        .into_iter()
+        .map(|row| RowLineage {
+            entity_id: row.id,
+            source_change_id: None,
+            source_commit_id: None,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ResolvedWritePlan {
+        authoritative_pre_state,
+        intended_post_state,
+        tombstones: Vec::new(),
+        lineage,
+        target_write_lane,
+    })
+}
+
+fn resolve_active_account_insert_write_plan(
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let MutationPayload::FullSnapshot(payload) = &planned_write.command.payload else {
+        return Err(WriteResolveError {
+            message: "sql2 active-account insert resolver requires a full payload".to_string(),
+        });
+    };
+    if payload.keys().any(|key| key != "account_id") {
+        return Err(WriteResolveError {
+            message: "sql2 active-account insert only supports the account_id column".to_string(),
+        });
+    }
+    let account_id = payload_text_value(planned_write, "account_id").ok_or_else(|| {
+        WriteResolveError {
+            message: "sql2 active-account insert requires column 'account_id'".to_string(),
+        }
+    })?;
+    if account_id.is_empty() {
+        return Err(WriteResolveError {
+            message: "sql2 active-account insert requires non-empty account_id".to_string(),
+        });
+    }
+
+    Ok(ResolvedWritePlan {
+        authoritative_pre_state: Vec::new(),
+        intended_post_state: vec![active_account_admin_row(&account_id)],
+        tombstones: Vec::new(),
+        lineage: vec![RowLineage {
+            entity_id: account_id,
+            source_change_id: None,
+            source_commit_id: None,
+        }],
+        target_write_lane,
+    })
+}
+
+async fn resolve_active_account_delete_write_plan(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+    target_write_lane: Option<WriteLane>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    ensure_exact_or_unfiltered_selector(planned_write)?;
+    let current_rows = load_active_account_admin_rows(backend)
+        .await
+        .map_err(write_resolve_backend_error)?;
+    let matching_rows = current_rows
+        .into_iter()
+        .filter(|row| active_account_row_matches_exact_filters(row, &planned_write.command.selector.exact_filters))
+        .collect::<Vec<_>>();
+    if matching_rows.is_empty() {
+        return Ok(ResolvedWritePlan {
+            authoritative_pre_state: Vec::new(),
+            intended_post_state: Vec::new(),
+            tombstones: Vec::new(),
+            lineage: Vec::new(),
+            target_write_lane,
+        });
+    }
+
+    let authoritative_pre_state = matching_rows
+        .iter()
+        .map(active_account_admin_pre_state_ref)
+        .collect::<Vec<_>>();
+    let intended_post_state = matching_rows
+        .iter()
+        .map(|row| active_account_admin_tombstone_row(&row.account_id))
+        .collect::<Vec<_>>();
+    let tombstones = matching_rows
+        .iter()
+        .map(active_account_admin_pre_state_ref)
+        .collect::<Vec<_>>();
+    let lineage = matching_rows
+        .into_iter()
+        .map(|row| RowLineage {
+            entity_id: row.account_id,
+            source_change_id: None,
+            source_commit_id: None,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ResolvedWritePlan {
+        authoritative_pre_state,
+        intended_post_state,
+        tombstones,
+        lineage,
+        target_write_lane,
+    })
+}
+
+async fn load_active_version_admin_rows(
+    backend: &dyn LixBackend,
+) -> Result<Vec<ActiveVersionAdminRow>, crate::LixError> {
+    let sql = format!(
+        "SELECT entity_id, snapshot_content \
+         FROM lix_internal_state_untracked \
+         WHERE schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{storage_version_id}' \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC, entity_id ASC",
+        schema_key = active_version_schema_key(),
+        file_id = active_version_file_id(),
+        storage_version_id = active_version_storage_version_id(),
+    );
+    let result = backend.execute(&sql, &[]).await?;
+    let mut rows = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        let Some(id) = row.first().and_then(text_from_value) else {
+            continue;
+        };
+        let Some(snapshot_content) = row.get(1).and_then(text_from_value) else {
+            continue;
+        };
+        let version_id = parse_active_version_snapshot(&snapshot_content)?;
+        rows.push(ActiveVersionAdminRow { id, version_id });
+    }
+    Ok(rows)
+}
+
+fn active_version_row_matches_exact_filters(
+    row: &ActiveVersionAdminRow,
+    exact_filters: &BTreeMap<String, Value>,
+) -> bool {
+    exact_filters.iter().all(|(key, value)| match key.as_str() {
+        "id" => text_from_value(value).is_some_and(|expected| expected == row.id),
+        "version_id" => text_from_value(value).is_some_and(|expected| expected == row.version_id),
+        _ => false,
+    })
+}
+
+fn active_version_admin_pre_state_ref(row: &ActiveVersionAdminRow) -> ResolvedRowRef {
+    ResolvedRowRef {
+        entity_id: row.id.clone(),
+        schema_key: active_version_schema_key().to_string(),
+        version_id: Some(active_version_storage_version_id().to_string()),
+        source_change_id: None,
+        source_commit_id: None,
+    }
+}
+
+fn active_version_admin_row(id: &str, version_id: &str) -> PlannedStateRow {
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(active_version_schema_key().to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(active_version_file_id().to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(active_version_plugin_key().to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(active_version_schema_version().to_string()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(active_version_snapshot_content(id, version_id)),
+    );
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(active_version_storage_version_id().to_string()),
+    );
+    values.insert("global".to_string(), Value::Boolean(true));
+    PlannedStateRow {
+        entity_id: id.to_string(),
+        schema_key: active_version_schema_key().to_string(),
+        version_id: Some(active_version_storage_version_id().to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+async fn load_active_account_admin_rows(
+    backend: &dyn LixBackend,
+) -> Result<Vec<ActiveAccountAdminRow>, crate::LixError> {
+    let sql = format!(
+        "SELECT entity_id, snapshot_content \
+         FROM lix_internal_state_untracked \
+         WHERE schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{storage_version_id}' \
+           AND snapshot_content IS NOT NULL \
+         ORDER BY updated_at DESC, entity_id ASC",
+        schema_key = active_account_schema_key(),
+        file_id = active_account_file_id(),
+        storage_version_id = active_account_storage_version_id(),
+    );
+    let result = backend.execute(&sql, &[]).await?;
+    let mut rows = Vec::with_capacity(result.rows.len());
+    for row in &result.rows {
+        let Some(snapshot_content) = row.get(1).and_then(text_from_value) else {
+            continue;
+        };
+        let account_id = parse_active_account_snapshot(&snapshot_content)?;
+        rows.push(ActiveAccountAdminRow { account_id });
+    }
+    Ok(rows)
+}
+
+fn active_account_row_matches_exact_filters(
+    row: &ActiveAccountAdminRow,
+    exact_filters: &BTreeMap<String, Value>,
+) -> bool {
+    exact_filters.iter().all(|(key, value)| match key.as_str() {
+        "id" | "account_id" => {
+            text_from_value(value).is_some_and(|expected| expected == row.account_id)
+        }
+        _ => false,
+    })
+}
+
+fn active_account_admin_pre_state_ref(row: &ActiveAccountAdminRow) -> ResolvedRowRef {
+    ResolvedRowRef {
+        entity_id: row.account_id.clone(),
+        schema_key: active_account_schema_key().to_string(),
+        version_id: Some(active_account_storage_version_id().to_string()),
+        source_change_id: None,
+        source_commit_id: None,
+    }
+}
+
+fn active_account_admin_row(account_id: &str) -> PlannedStateRow {
+    let mut values = BTreeMap::new();
+    values.insert("entity_id".to_string(), Value::Text(account_id.to_string()));
+    values.insert(
+        "schema_key".to_string(),
+        Value::Text(active_account_schema_key().to_string()),
+    );
+    values.insert(
+        "file_id".to_string(),
+        Value::Text(active_account_file_id().to_string()),
+    );
+    values.insert(
+        "plugin_key".to_string(),
+        Value::Text(active_account_plugin_key().to_string()),
+    );
+    values.insert(
+        "schema_version".to_string(),
+        Value::Text(active_account_schema_version().to_string()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        Value::Text(active_account_snapshot_content(account_id)),
+    );
+    values.insert(
+        "version_id".to_string(),
+        Value::Text(active_account_storage_version_id().to_string()),
+    );
+    values.insert("global".to_string(), Value::Boolean(true));
+    PlannedStateRow {
+        entity_id: account_id.to_string(),
+        schema_key: active_account_schema_key().to_string(),
+        version_id: Some(active_account_storage_version_id().to_string()),
+        values,
+        tombstone: false,
+    }
+}
+
+fn active_account_admin_tombstone_row(account_id: &str) -> PlannedStateRow {
+    let mut row = active_account_admin_row(account_id);
+    row.values.remove("snapshot_content");
+    row.tombstone = true;
+    row
 }
 
 async fn resolve_version_insert_write_plan(
@@ -732,6 +1134,22 @@ fn ensure_exact_selector(planned_write: &PlannedWrite) -> Result<(), WriteResolv
         });
     }
     Ok(())
+}
+
+fn ensure_exact_or_unfiltered_selector(
+    planned_write: &PlannedWrite,
+) -> Result<(), WriteResolveError> {
+    if planned_write.command.selector.residual_predicates.is_empty()
+        || planned_write.command.selector.exact_only
+    {
+        return Ok(());
+    }
+
+    Err(WriteResolveError {
+        message:
+            "sql2 admin write resolver only supports exact conjunctive selectors or implicit singleton/all-row selection"
+                .to_string(),
+    })
 }
 
 fn ensure_local_tracked_overlay(

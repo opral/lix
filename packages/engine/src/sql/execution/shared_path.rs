@@ -40,6 +40,7 @@ use sqlparser::ast::Statement;
 
 const STORED_SCHEMA_KEY: &str = "lix_stored_schema";
 const STORED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_stored_schema_bootstrap";
+const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
 const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
@@ -216,7 +217,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_backend(
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    if !sql2_tracked_write_is_live(prepared) {
+    if !sql2_tracked_write_is_live(prepared) && !sql2_untracked_write_is_live(prepared) {
         return Ok(None);
     }
 
@@ -237,6 +238,10 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     prepared: &PreparedExecutionContext,
     writer_key: Option<&str>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
+    if sql2_untracked_write_is_live(prepared) {
+        return execute_sql2_untracked_write_with_transaction(transaction, prepared).await;
+    }
+
     if !sql2_tracked_write_is_live(prepared) {
         return Ok(None);
     }
@@ -321,6 +326,34 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     }))
 }
 
+async fn execute_sql2_untracked_write_with_transaction(
+    transaction: &mut dyn LixTransaction,
+    prepared: &PreparedExecutionContext,
+) -> Result<Option<SqlExecutionOutcome>, LixError> {
+    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+        return Ok(None);
+    };
+    let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut runtime_functions = prepared.functions.clone();
+    let timestamp = runtime_functions.timestamp();
+    apply_sql2_untracked_rows(transaction, &resolved.intended_post_state, &timestamp).await?;
+    let plan_effects_override = semantic_plan_effects_from_untracked_sql2_write(sql2_write)?;
+
+    Ok(Some(SqlExecutionOutcome {
+        public_result: QueryResult {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        },
+        postprocess_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed: false,
+        plan_effects_override: Some(plan_effects_override),
+        state_commit_stream_changes: Vec::new(),
+    }))
+}
+
 fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
@@ -336,6 +369,29 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         && sql2_write.planned_write.commit_preconditions.is_some()
         && live_sql2_operation_supported(sql2_write)
         && prepared.intent.detected_file_domain_changes.is_empty()
+        && prepared.intent.pending_file_writes.is_empty()
+        && prepared.intent.pending_file_delete_targets.is_empty()
+        && prepared
+            .intent
+            .untracked_filesystem_update_domain_changes
+            .is_empty()
+}
+
+fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
+    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+        return false;
+    };
+
+    matches!(
+        prepared.plan.result_contract,
+        ResultContract::DmlNoReturning
+    ) && matches!(
+        sql2_write.planned_write.command.mode,
+        crate::sql2::planner::ir::WriteMode::Untracked
+    ) && matches!(
+        sql2_write.planned_write.command.target.descriptor.public_name.as_str(),
+        "lix_active_version" | "lix_active_account"
+    ) && prepared.intent.detected_file_domain_changes.is_empty()
         && prepared.intent.pending_file_writes.is_empty()
         && prepared.intent.pending_file_delete_targets.is_empty()
         && prepared
@@ -414,6 +470,153 @@ fn append_preconditions(
         expected_tip,
         idempotency_key: commit_preconditions.idempotency_key.0.clone(),
     })
+}
+
+async fn apply_sql2_untracked_rows(
+    transaction: &mut dyn LixTransaction,
+    rows: &[crate::sql2::planner::ir::PlannedStateRow],
+    timestamp: &str,
+) -> Result<(), LixError> {
+    for row in rows {
+        if row.tombstone {
+            apply_sql2_untracked_delete(transaction, row).await?;
+        } else {
+            apply_sql2_untracked_upsert(transaction, row, timestamp).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_sql2_untracked_upsert(
+    transaction: &mut dyn LixTransaction,
+    row: &crate::sql2::planner::ir::PlannedStateRow,
+    timestamp: &str,
+) -> Result<(), LixError> {
+    let file_id = planned_row_text_value(row, "file_id")?;
+    let plugin_key = planned_row_text_value(row, "plugin_key")?;
+    let schema_version = planned_row_text_value(row, "schema_version")?;
+    let snapshot_content = planned_row_text_value(row, "snapshot_content")?;
+    let metadata_sql = planned_row_optional_text_value(row, "metadata")
+        .map(|value| format!("'{}'", escape_sql_string(value)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let writer_key_sql = planned_row_optional_text_value(row, "writer_key")
+        .map(|value| format!("'{}'", escape_sql_string(value)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let global = row
+        .values
+        .get("global")
+        .and_then(value_as_bool)
+        .unwrap_or_else(|| row.version_id.as_deref() == Some(GLOBAL_VERSION_ID));
+
+    let sql = format!(
+        "INSERT INTO {table} (\
+         entity_id, schema_key, file_id, version_id, global, plugin_key, snapshot_content, metadata, writer_key, schema_version, created_at, updated_at\
+         ) VALUES (\
+         '{entity_id}', '{schema_key}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{snapshot_content}', {metadata}, {writer_key}, '{schema_version}', '{timestamp}', '{timestamp}'\
+         ) ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE SET \
+         global = excluded.global, \
+         plugin_key = excluded.plugin_key, \
+         snapshot_content = excluded.snapshot_content, \
+         metadata = excluded.metadata, \
+         writer_key = excluded.writer_key, \
+         schema_version = excluded.schema_version, \
+         updated_at = excluded.updated_at",
+        table = UNTRACKED_TABLE,
+        entity_id = escape_sql_string(&row.entity_id),
+        schema_key = escape_sql_string(&row.schema_key),
+        file_id = escape_sql_string(file_id),
+        version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
+        global = if global { "true" } else { "false" },
+        plugin_key = escape_sql_string(plugin_key),
+        snapshot_content = escape_sql_string(snapshot_content),
+        metadata = metadata_sql,
+        writer_key = writer_key_sql,
+        schema_version = escape_sql_string(schema_version),
+        timestamp = escape_sql_string(timestamp),
+    );
+    transaction.execute(&sql, &[]).await?;
+    Ok(())
+}
+
+async fn apply_sql2_untracked_delete(
+    transaction: &mut dyn LixTransaction,
+    row: &crate::sql2::planner::ir::PlannedStateRow,
+) -> Result<(), LixError> {
+    let file_id = planned_row_text_value(row, "file_id")?;
+    let sql = format!(
+        "DELETE FROM {table} \
+         WHERE entity_id = '{entity_id}' \
+           AND schema_key = '{schema_key}' \
+           AND file_id = '{file_id}' \
+           AND version_id = '{version_id}'",
+        table = UNTRACKED_TABLE,
+        entity_id = escape_sql_string(&row.entity_id),
+        schema_key = escape_sql_string(&row.schema_key),
+        file_id = escape_sql_string(file_id),
+        version_id = escape_sql_string(row.version_id.as_deref().unwrap_or(GLOBAL_VERSION_ID)),
+    );
+    transaction.execute(&sql, &[]).await?;
+    Ok(())
+}
+
+fn planned_row_text_value<'a>(
+    row: &'a crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Result<&'a str, LixError> {
+    planned_row_optional_text_value(row, key).ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("sql2 untracked execution requires '{key}' in the resolved row"),
+    })
+}
+
+fn planned_row_optional_text_value<'a>(
+    row: &'a crate::sql2::planner::ir::PlannedStateRow,
+    key: &str,
+) -> Option<&'a str> {
+    match row.values.get(key) {
+        Some(Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn value_as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Boolean(value) => Some(*value),
+        Value::Integer(value) => Some(*value != 0),
+        Value::Text(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn semantic_plan_effects_from_untracked_sql2_write(
+    sql2_write: &Sql2PreparedWrite,
+) -> Result<PlanEffects, LixError> {
+    let mut effects = PlanEffects::default();
+    if sql2_write.planned_write.command.target.descriptor.public_name != "lix_active_version" {
+        return Ok(effects);
+    }
+    let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() else {
+        return Ok(effects);
+    };
+    for row in resolved.intended_post_state.iter().rev() {
+        if row.schema_key != active_version_schema_key()
+            || planned_row_optional_text_value(row, "file_id") != Some(active_version_file_id())
+            || row.version_id.as_deref() != Some(active_version_storage_version_id())
+            || row.tombstone
+        {
+            continue;
+        }
+        let Some(snapshot_content) = planned_row_optional_text_value(row, "snapshot_content") else {
+            continue;
+        };
+        effects.next_active_version_id = Some(parse_active_version_snapshot(snapshot_content)?);
+        break;
+    }
+    Ok(effects)
 }
 
 fn append_commit_error_to_lix_error(error: crate::commit::AppendCommitError) -> LixError {
