@@ -1008,6 +1008,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_filesystem_history_reads_through_internal_history_sources() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT id, path, lixcol_root_commit_id \
+                 FROM lix_file_history \
+                 WHERE id = 'file-1' AND lixcol_root_commit_id = 'commit-1'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("filesystem history read should canonicalize");
+
+        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_file_history"]);
+        assert!(prepared.effective_state_request.is_none());
+        assert!(prepared.effective_state_plan.is_none());
+        assert_eq!(
+            prepared
+                .debug_trace
+                .pushdown_decision
+                .as_ref()
+                .expect("pushdown decision should be recorded")
+                .residual_predicates,
+            vec![
+                "id = 'file-1'".to_string(),
+                "lixcol_root_commit_id = 'commit-1'".to_string()
+            ]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("filesystem history read should lower");
+        assert!(lowered_sql.contains("lix_internal_commit_ancestry"));
+        assert!(lowered_sql.contains("lix_internal_change ch"));
+        assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
+        assert!(!lowered_sql.contains("FROM lix_file_history"));
+    }
+
+    #[tokio::test]
     async fn prepares_explain_over_state_reads_with_sql2_lowered_query() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(

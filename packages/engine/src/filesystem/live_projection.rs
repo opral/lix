@@ -407,7 +407,7 @@ pub(crate) fn build_filesystem_directory_projection_sql(scope: FilesystemProject
     )
 }
 
-pub(crate) fn build_filesystem_file_history_projection_sql(active_root_only: bool) -> String {
+pub(crate) fn build_filesystem_file_history_projection_sql(state_history_source_sql: &str) -> String {
     format!(
         "WITH RECURSIVE \
            state_history_source AS ( \
@@ -680,11 +680,13 @@ pub(crate) fn build_filesystem_file_history_projection_sql(active_root_only: boo
              ) \
             LEFT JOIN lix_internal_binary_blob_store bbs \
               ON bbs.blob_hash = bhr.blob_hash",
-        state_history_source_sql = build_state_history_source_sql(active_root_only),
+        state_history_source_sql = state_history_source_sql,
     )
 }
 
-pub(crate) fn build_filesystem_directory_history_projection_sql(active_root_only: bool) -> String {
+pub(crate) fn build_filesystem_directory_history_projection_sql(
+    state_history_source_sql: &str,
+) -> String {
     format!(
         "WITH RECURSIVE \
            state_history_source AS ( \
@@ -786,7 +788,7 @@ pub(crate) fn build_filesystem_directory_history_projection_sql(active_root_only
               ON dp.target_id = d.id \
              AND dp.root_commit_id = d.lixcol_root_commit_id \
              AND dp.target_depth = d.lixcol_depth",
-        state_history_source_sql = build_state_history_source_sql(active_root_only),
+        state_history_source_sql = state_history_source_sql,
     )
 }
 
@@ -993,41 +995,62 @@ fn active_version_commit_id_sql() -> String {
     )
 }
 
-fn build_state_history_source_sql(active_root_only: bool) -> String {
-    let default_root_scope = if active_root_only {
-        "AND ( \
-           d.root_commit_id IS NOT NULL \
-           OR c.entity_id IN (SELECT root_commit_id FROM default_root_commits) \
-         )"
-        .to_string()
+pub(crate) fn build_filesystem_state_history_source_sql(
+    requested_roots_where: &str,
+    default_root_scope: &str,
+    force_active_scope: bool,
+) -> String {
+    let active_version_rows_sql = if force_active_scope {
+        format!(
+            "active_version_rows AS ( \
+               SELECT DISTINCT \
+                 lix_json_extract(snapshot_content, 'version_id') AS version_id \
+               FROM lix_internal_state_untracked \
+               WHERE schema_key = '{active_schema_key}' \
+                 AND file_id = '{active_file_id}' \
+                 AND version_id = '{active_storage_version_id}' \
+                 AND snapshot_content IS NOT NULL \
+             ), ",
+            active_schema_key = escape_sql_string(active_version_schema_key()),
+            active_file_id = escape_sql_string(active_version_file_id()),
+            active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
+        )
     } else {
         String::new()
     };
-
+    let default_root_commits_sql = if force_active_scope {
+        "default_root_commits AS ( \
+           SELECT DISTINCT \
+             lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+             vp.entity_id AS root_version_id \
+           FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+           JOIN active_version_rows av \
+             ON av.version_id = vp.entity_id \
+           WHERE vp.schema_key = 'lix_version_pointer' \
+             AND vp.version_id = '{global_version}' \
+             AND vp.global = true \
+             AND vp.is_tombstone = 0 \
+             AND vp.snapshot_content IS NOT NULL \
+         ), "
+            .to_string()
+    } else {
+        "default_root_commits AS ( \
+           SELECT DISTINCT \
+             lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
+             vp.entity_id AS root_version_id \
+           FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
+           WHERE vp.schema_key = 'lix_version_pointer' \
+             AND vp.version_id = '{global_version}' \
+             AND vp.global = true \
+             AND vp.is_tombstone = 0 \
+             AND vp.snapshot_content IS NOT NULL \
+         ), "
+            .to_string()
+    };
     format!(
         "WITH \
-           active_version_rows AS ( \
-             SELECT DISTINCT \
-               lix_json_extract(snapshot_content, 'version_id') AS version_id \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = '{active_schema_key}' \
-               AND file_id = '{active_file_id}' \
-               AND version_id = '{active_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           default_root_commits AS ( \
-             SELECT DISTINCT \
-               lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
-               vp.entity_id AS root_version_id \
-             FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
-             JOIN active_version_rows av \
-               ON av.version_id = vp.entity_id \
-             WHERE vp.schema_key = 'lix_version_pointer' \
-               AND vp.version_id = '{global_version}' \
-               AND vp.global = true \
-               AND vp.is_tombstone = 0 \
-               AND vp.snapshot_content IS NOT NULL \
-           ), \
+           {active_version_rows_sql}\
+           {default_root_commits_sql}\
            requested_commits AS ( \
              SELECT DISTINCT \
                c.entity_id AS commit_id, \
@@ -1039,7 +1062,7 @@ fn build_state_history_source_sql(active_root_only: bool) -> String {
                AND c.version_id = '{global_version}' \
                AND c.global = true \
                AND c.is_tombstone = 0 \
-               AND c.snapshot_content IS NOT NULL \
+               AND c.snapshot_content IS NOT NULL{requested_roots_where} \
                {default_root_scope} \
            ), \
            reachable_commits_from_requested AS ( \
@@ -1140,10 +1163,10 @@ fn build_state_history_source_sql(active_root_only: bool) -> String {
          FROM ranked \
          WHERE ranked.rn = 1 \
            AND ranked.snapshot_content IS NOT NULL",
-        active_schema_key = escape_sql_string(active_version_schema_key()),
-        active_file_id = escape_sql_string(active_version_file_id()),
-        active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
+        active_version_rows_sql = active_version_rows_sql,
+        default_root_commits_sql = default_root_commits_sql,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        requested_roots_where = requested_roots_where,
         default_root_scope = default_root_scope,
     )
 }

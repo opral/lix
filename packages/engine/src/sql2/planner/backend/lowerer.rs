@@ -9,7 +9,9 @@ use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
 };
 use crate::filesystem::live_projection::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+    build_filesystem_state_history_source_sql,
+    build_filesystem_directory_history_projection_sql, build_filesystem_directory_projection_sql,
+    build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
 use crate::account::{
@@ -314,9 +316,19 @@ fn lower_filesystem_read_for_execution(
         return Ok(None);
     };
     let select = select_mut(query.as_mut())?;
+    let allow_unqualified = select.from.len() == 1 && select.from[0].joins.is_empty();
     let TableFactor::Table { alias, .. } = &mut select.from[0].relation else {
         return Ok(None);
     };
+    let relation_name = alias
+        .as_ref()
+        .map(|value| value.name.value.clone())
+        .unwrap_or_else(|| canonicalized.surface_binding.descriptor.public_name.clone());
+    let history_pushdown_predicates = collect_filesystem_history_pushdown_predicates(
+        select.selection.as_ref(),
+        &relation_name,
+        allow_unqualified,
+    );
 
     let derived_query = match (filesystem_scan.kind, filesystem_scan.version_scope) {
         (FilesystemKind::File, VersionScope::ActiveVersion) => parse_single_query(
@@ -343,6 +355,30 @@ fn lower_filesystem_read_for_execution(
                     FilesystemProjectionScope::ExplicitVersion,
                 ),
             )?
+        }
+        (FilesystemKind::File, VersionScope::History)
+            if canonicalized.surface_binding.descriptor.public_name == "lix_file_history" =>
+        {
+            let state_history_source_sql =
+                build_state_history_source_sql(&history_pushdown_predicates, true);
+            parse_single_query(&build_filesystem_file_history_projection_sql(
+                &state_history_source_sql,
+            ))?
+        }
+        (FilesystemKind::File, VersionScope::History)
+            if canonicalized.surface_binding.descriptor.public_name
+                == "lix_file_history_by_version" =>
+        {
+            return Ok(None);
+        }
+        (FilesystemKind::Directory, VersionScope::History)
+            if canonicalized.surface_binding.descriptor.public_name == "lix_directory_history" =>
+        {
+            let state_history_source_sql =
+                build_state_history_source_sql(&history_pushdown_predicates, true);
+            parse_single_query(&build_filesystem_directory_history_projection_sql(
+                &state_history_source_sql,
+            ))?
         }
         _ => return Ok(None),
     };
@@ -374,7 +410,7 @@ fn build_state_source_query(
             surface_binding,
             pushdown_predicates,
         )?,
-        SurfaceVariant::History => build_state_history_source_sql(pushdown_predicates),
+        SurfaceVariant::History => build_state_history_source_sql(pushdown_predicates, true),
         SurfaceVariant::Active | SurfaceVariant::WorkingChanges => return Ok(None),
     };
     parse_single_query(&sql).map(Some)
@@ -838,10 +874,10 @@ fn effective_state_candidate_rows_sql(
         .join(" UNION ALL ")
 }
 
-fn build_state_history_source_sql(pushdown_predicates: &[String]) -> String {
+fn build_state_history_source_sql(pushdown_predicates: &[String], force_active_scope: bool) -> String {
     let requested_root_predicates = history_requested_root_predicates(pushdown_predicates);
     let requested_roots_where = render_where_clause_sql(&requested_root_predicates, " AND ");
-    let default_root_scope = if requested_root_predicates.is_empty() {
+    let default_root_scope = if force_active_scope && requested_root_predicates.is_empty() {
         "AND ( \
            d.root_commit_id IS NOT NULL \
            OR c.entity_id IN (SELECT root_commit_id FROM default_root_commits) \
@@ -850,149 +886,203 @@ fn build_state_history_source_sql(pushdown_predicates: &[String]) -> String {
     } else {
         String::new()
     };
-    format!(
-        "WITH \
-           active_version_rows AS ( \
-             SELECT DISTINCT \
-               lix_json_extract(snapshot_content, 'version_id') AS version_id \
-             FROM lix_internal_state_untracked \
-             WHERE schema_key = '{active_schema_key}' \
-               AND file_id = '{active_file_id}' \
-               AND version_id = '{active_storage_version_id}' \
-               AND snapshot_content IS NOT NULL \
-           ), \
-           default_root_commits AS ( \
-             SELECT DISTINCT \
-               lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
-               vp.entity_id AS root_version_id \
-             FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
-             JOIN active_version_rows av \
-               ON av.version_id = vp.entity_id \
-             WHERE vp.schema_key = 'lix_version_pointer' \
-               AND vp.version_id = '{global_version}' \
-               AND vp.global = true \
-               AND vp.is_tombstone = 0 \
-               AND vp.snapshot_content IS NOT NULL \
-           ), \
-           requested_commits AS ( \
-             SELECT DISTINCT \
-               c.entity_id AS commit_id, \
-               COALESCE(d.root_version_id, c.version_id) AS root_version_id \
-             FROM lix_internal_state_materialized_v1_lix_commit c \
-             LEFT JOIN default_root_commits d \
-               ON d.root_commit_id = c.entity_id \
-             WHERE c.schema_key = 'lix_commit' \
-               AND c.version_id = '{global_version}' \
-               AND c.global = true \
-               AND c.is_tombstone = 0 \
-               AND c.snapshot_content IS NOT NULL{requested_roots_where} \
-               {default_root_scope} \
-           ), \
-           reachable_commits_from_requested AS ( \
-             SELECT \
-               ancestry.ancestor_id AS commit_id, \
-               requested.commit_id AS root_commit_id, \
-               requested.root_version_id AS root_version_id, \
-               ancestry.depth AS commit_depth \
-             FROM requested_commits requested \
-             JOIN lix_internal_commit_ancestry ancestry \
-               ON ancestry.commit_id = requested.commit_id \
-             WHERE ancestry.depth <= 512 \
-           ), \
-           commit_changesets AS ( \
-             SELECT \
-               c.entity_id AS commit_id, \
-               lix_json_extract(c.snapshot_content, 'change_set_id') AS change_set_id, \
-               c.created_at AS commit_created_at, \
-               rc.root_commit_id AS root_commit_id, \
-               rc.root_version_id AS root_version_id, \
-               rc.commit_depth AS commit_depth \
-             FROM lix_internal_state_materialized_v1_lix_commit c \
-             JOIN reachable_commits_from_requested rc \
-               ON rc.commit_id = c.entity_id \
-             WHERE c.schema_key = 'lix_commit' \
-               AND c.version_id = '{global_version}' \
-               AND c.global = true \
-               AND c.is_tombstone = 0 \
-               AND c.snapshot_content IS NOT NULL \
-           ), \
-           cse_in_reachable_commits AS ( \
-             SELECT \
-               lix_json_extract(cse.snapshot_content, 'entity_id') AS target_entity_id, \
-               lix_json_extract(cse.snapshot_content, 'file_id') AS target_file_id, \
-               lix_json_extract(cse.snapshot_content, 'schema_key') AS target_schema_key, \
-               lix_json_extract(cse.snapshot_content, 'change_id') AS target_change_id, \
-               cc.commit_id AS origin_commit_id, \
-               cc.commit_created_at AS commit_created_at, \
-               cc.root_commit_id AS root_commit_id, \
-               cc.root_version_id AS root_version_id, \
-               cc.commit_depth AS commit_depth \
-             FROM lix_internal_state_materialized_v1_lix_change_set_element cse \
-             JOIN commit_changesets cc \
-               ON lix_json_extract(cse.snapshot_content, 'change_set_id') = cc.change_set_id \
-             WHERE cse.schema_key = 'lix_change_set_element' \
-               AND cse.version_id = '{global_version}' \
-               AND cse.global = true \
-               AND cse.is_tombstone = 0 \
-               AND cse.snapshot_content IS NOT NULL \
-           ), \
-           ranked AS ( \
-             SELECT \
-               ch.entity_id AS entity_id, \
-               ch.schema_key AS schema_key, \
-               ch.file_id AS file_id, \
-               ch.plugin_key AS plugin_key, \
-               CASE \
-                 WHEN ch.snapshot_id = 'no-content' THEN NULL \
-                 ELSE s.content \
-               END AS snapshot_content, \
-               ch.metadata AS metadata, \
-               ch.schema_version AS schema_version, \
-               r.target_change_id AS change_id, \
-               r.origin_commit_id AS commit_id, \
-               r.commit_created_at AS commit_created_at, \
-               r.root_commit_id AS root_commit_id, \
-               r.root_version_id AS version_id, \
-               r.commit_depth AS depth, \
-               ROW_NUMBER() OVER ( \
-                 PARTITION BY \
-                   r.target_entity_id, \
-                   r.target_file_id, \
-                   r.target_schema_key, \
-                   r.root_commit_id, \
-                   r.commit_depth \
-                 ORDER BY ch.created_at DESC, ch.id DESC \
-               ) AS rn \
-             FROM cse_in_reachable_commits r \
-             JOIN lix_internal_change ch \
-               ON ch.id = r.target_change_id \
-             LEFT JOIN lix_internal_snapshot s \
-               ON s.id = ch.snapshot_id \
-           ) \
-         SELECT \
-           ranked.entity_id AS entity_id, \
-           ranked.schema_key AS schema_key, \
-           ranked.file_id AS file_id, \
-           ranked.plugin_key AS plugin_key, \
-           ranked.snapshot_content AS snapshot_content, \
-           ranked.metadata AS metadata, \
-           ranked.schema_version AS schema_version, \
-           ranked.change_id AS change_id, \
-           ranked.commit_id AS commit_id, \
-           ranked.commit_created_at AS commit_created_at, \
-           ranked.root_commit_id AS root_commit_id, \
-           ranked.depth AS depth, \
-           ranked.version_id AS version_id \
-         FROM ranked \
-         WHERE ranked.rn = 1 \
-           AND ranked.snapshot_content IS NOT NULL",
-        active_schema_key = escape_sql_string(active_version_schema_key()),
-        active_file_id = escape_sql_string(active_version_file_id()),
-        active_storage_version_id = escape_sql_string(active_version_storage_version_id()),
-        global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        requested_roots_where = requested_roots_where,
-        default_root_scope = default_root_scope,
+    build_filesystem_state_history_source_sql(
+        &requested_roots_where,
+        &default_root_scope,
+        force_active_scope,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesystemHistoryFilterColumn {
+    RootCommitId,
+    VersionId,
+}
+
+fn collect_filesystem_history_pushdown_predicates(
+    selection: Option<&Expr>,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> Vec<String> {
+    let Some(selection) = selection else {
+        return Vec::new();
+    };
+    let mut predicates = Vec::new();
+    collect_filesystem_history_pushdown_predicates_from_expr(
+        selection,
+        relation_name,
+        allow_unqualified,
+        &mut predicates,
+    );
+    predicates
+}
+
+fn collect_filesystem_history_pushdown_predicates_from_expr(
+    expr: &Expr,
+    relation_name: &str,
+    allow_unqualified: bool,
+    predicates: &mut Vec<String>,
+) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_filesystem_history_pushdown_predicates_from_expr(
+                left,
+                relation_name,
+                allow_unqualified,
+                predicates,
+            );
+            collect_filesystem_history_pushdown_predicates_from_expr(
+                right,
+                relation_name,
+                allow_unqualified,
+                predicates,
+            );
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if let Some(column) =
+                extract_filesystem_history_filter_column(left, relation_name, allow_unqualified)
+            {
+                predicates.push(format!(
+                    "{} {} {}",
+                    filesystem_history_filter_column_name(column),
+                    op,
+                    right
+                ));
+            } else if let Some(column) =
+                extract_filesystem_history_filter_column(right, relation_name, allow_unqualified)
+            {
+                if let Some(inverted) = invert_filesystem_history_binary_operator(op.clone()) {
+                    predicates.push(format!(
+                        "{} {} {}",
+                        filesystem_history_filter_column_name(column),
+                        inverted,
+                        left
+                    ));
+                }
+            }
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            if let Some(column) =
+                extract_filesystem_history_filter_column(expr, relation_name, allow_unqualified)
+            {
+                let not_sql = if *negated { " NOT" } else { "" };
+                predicates.push(format!(
+                    "{}{} IN ({})",
+                    filesystem_history_filter_column_name(column),
+                    not_sql,
+                    subquery
+                ));
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if let Some(column) =
+                extract_filesystem_history_filter_column(expr, relation_name, allow_unqualified)
+            {
+                let not_sql = if *negated { " NOT" } else { "" };
+                predicates.push(format!(
+                    "{}{} IN ({})",
+                    filesystem_history_filter_column_name(column),
+                    not_sql,
+                    list.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        Expr::IsNull(inner) => {
+            if let Some(column) =
+                extract_filesystem_history_filter_column(inner, relation_name, allow_unqualified)
+            {
+                predicates.push(format!(
+                    "{} IS NULL",
+                    filesystem_history_filter_column_name(column)
+                ));
+            }
+        }
+        Expr::IsNotNull(inner) => {
+            if let Some(column) =
+                extract_filesystem_history_filter_column(inner, relation_name, allow_unqualified)
+            {
+                predicates.push(format!(
+                    "{} IS NOT NULL",
+                    filesystem_history_filter_column_name(column)
+                ));
+            }
+        }
+        Expr::Nested(inner) => collect_filesystem_history_pushdown_predicates_from_expr(
+            inner,
+            relation_name,
+            allow_unqualified,
+            predicates,
+        ),
+        _ => {}
+    }
+}
+
+fn extract_filesystem_history_filter_column(
+    expr: &Expr,
+    relation_name: &str,
+    allow_unqualified: bool,
+) -> Option<FilesystemHistoryFilterColumn> {
+    let column = match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            if !parts[0].value.eq_ignore_ascii_case(relation_name) {
+                return None;
+            }
+            parts[1].value.as_str()
+        }
+        Expr::Identifier(identifier) if allow_unqualified => identifier.value.as_str(),
+        Expr::Nested(inner) => {
+            return extract_filesystem_history_filter_column(
+                inner,
+                relation_name,
+                allow_unqualified,
+            )
+        }
+        _ => return None,
+    };
+
+    match column.to_ascii_lowercase().as_str() {
+        "lixcol_root_commit_id" | "root_commit_id" => {
+            Some(FilesystemHistoryFilterColumn::RootCommitId)
+        }
+        "lixcol_version_id" | "version_id" => Some(FilesystemHistoryFilterColumn::VersionId),
+        _ => None,
+    }
+}
+
+fn filesystem_history_filter_column_name(column: FilesystemHistoryFilterColumn) -> &'static str {
+    match column {
+        FilesystemHistoryFilterColumn::RootCommitId => "root_commit_id",
+        FilesystemHistoryFilterColumn::VersionId => "version_id",
+    }
+}
+
+fn invert_filesystem_history_binary_operator(
+    op: BinaryOperator,
+) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Eq => Some(BinaryOperator::Eq),
+        BinaryOperator::NotEq => Some(BinaryOperator::NotEq),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        _ => None,
+    }
 }
 
 fn history_requested_root_predicates(pushdown_predicates: &[String]) -> Vec<String> {
