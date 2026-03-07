@@ -55,14 +55,17 @@ pub(crate) fn lower_read_for_execution(
             let Some(effective_state_plan) = effective_state_plan else {
                 return Ok(None);
             };
-            lower_entity_read_for_execution(canonicalized, effective_state_request).map(
-                |statement| {
-                    statement.map(|statement| LoweredReadProgram {
-                        statements: vec![statement],
-                        pushdown_decision: build_pushdown_decision(effective_state_plan),
-                    })
-                },
+            lower_entity_read_for_execution(
+                canonicalized,
+                effective_state_request,
+                effective_state_plan,
             )
+            .map(|statement| {
+                statement.map(|statement| LoweredReadProgram {
+                    statements: vec![statement],
+                    pushdown_decision: build_pushdown_decision(effective_state_plan),
+                })
+            })
         }
         SurfaceFamily::Change => lower_change_read_for_execution(canonicalized).map(|statement| {
             statement.map(|statement| LoweredReadProgram {
@@ -139,6 +142,7 @@ fn state_read_references_exposed_columns(
 fn lower_entity_read_for_execution(
     canonicalized: &CanonicalizedRead,
     effective_state_request: &EffectiveStateRequest,
+    effective_state_plan: &EffectiveStatePlan,
 ) -> Result<Option<Statement>, LixError> {
     if query_uses_wildcard_projection(&canonicalized.bound_statement.statement) {
         return Ok(None);
@@ -152,8 +156,13 @@ fn lower_entity_read_for_execution(
         return Ok(None);
     };
 
-    let Some(derived_query) =
-        build_entity_source_query(&canonicalized.surface_binding, effective_state_request)?
+    let (pushdown_predicates, residual_selection) =
+        split_state_selection_for_pushdown(select.selection.as_ref(), effective_state_plan);
+    let Some(derived_query) = build_entity_source_query(
+        &canonicalized.surface_binding,
+        effective_state_request,
+        &pushdown_predicates,
+    )?
     else {
         return Ok(None);
     };
@@ -169,6 +178,7 @@ fn lower_entity_read_for_execution(
         subquery: Box::new(derived_query),
         alias: derived_alias,
     };
+    select.selection = residual_selection;
 
     Ok(Some(Statement::Query(query)))
 }
@@ -221,6 +231,7 @@ fn build_state_source_query(
 fn build_entity_source_query(
     surface_binding: &SurfaceBinding,
     effective_state_request: &EffectiveStateRequest,
+    pushdown_predicates: &[String],
 ) -> Result<Option<Query>, LixError> {
     let Some(schema_key) = surface_binding
         .implicit_overrides
@@ -243,8 +254,11 @@ fn build_entity_source_query(
         projection.join(", ")
     };
 
-    let Some(state_source_query) =
-        build_state_source_query(surface_binding, effective_state_request, &[])?
+    let Some(state_source_query) = build_state_source_query(
+        surface_binding,
+        effective_state_request,
+        pushdown_predicates,
+    )?
     else {
         return Ok(None);
     };
@@ -767,8 +781,15 @@ fn build_state_history_source_sql(pushdown_predicates: &[String]) -> String {
 fn history_requested_root_predicates(pushdown_predicates: &[String]) -> Vec<String> {
     pushdown_predicates
         .iter()
-        .filter(|predicate| predicate.contains("root_commit_id"))
-        .map(|predicate| predicate.replace("root_commit_id", "c.entity_id"))
+        .filter_map(|predicate| {
+            if predicate.contains("lixcol_root_commit_id") {
+                Some(predicate.replace("lixcol_root_commit_id", "c.entity_id"))
+            } else if predicate.contains("root_commit_id") {
+                Some(predicate.replace("root_commit_id", "c.entity_id"))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -1257,6 +1278,30 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["entity_id = 'entity-1'".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowers_entity_history_root_commit_alias_through_history_source() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT key, lixcol_root_commit_id, lixcol_depth \
+             FROM lix_key_value_history \
+             WHERE lixcol_root_commit_id = 'commit-1' AND lixcol_depth = 0",
+        )
+        .expect("entity history read should lower");
+        let lowered_sql = lowered.statements[0].to_string();
+
+        assert!(lowered_sql.contains("c.entity_id = 'commit-1'"));
+        assert!(!lowered_sql.contains("lixcol_c.entity_id"));
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            vec!["lixcol_root_commit_id = 'commit-1'".to_string()]
+        );
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicates,
+            vec!["lixcol_depth = 0".to_string()]
         );
     }
 }

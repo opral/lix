@@ -650,7 +650,11 @@ fn read_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
 }
 
 fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
-    if canonicalized.surface_binding.descriptor.surface_family != SurfaceFamily::State {
+    let family = canonicalized.surface_binding.descriptor.surface_family;
+    let variant = canonicalized.surface_binding.descriptor.surface_variant;
+    let state_backed_history_entity =
+        family == SurfaceFamily::Entity && variant == SurfaceVariant::History;
+    if family != SurfaceFamily::State && !state_backed_history_entity {
         return Vec::new();
     }
 
@@ -663,8 +667,6 @@ fn pushdown_safe_predicates(canonicalized: &CanonicalizedRead) -> Vec<String> {
     let Some(selection) = &select.selection else {
         return Vec::new();
     };
-    let variant = canonicalized.surface_binding.descriptor.surface_variant;
-
     split_conjunctive_predicates(selection)
         .into_iter()
         .filter(|predicate| state_predicate_is_pushdown_safe(predicate, variant))
