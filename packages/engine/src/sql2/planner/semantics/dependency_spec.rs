@@ -74,6 +74,7 @@ fn canonical_state_scan(
 ) -> Option<&crate::sql2::planner::ir::CanonicalStateScan> {
     match read_plan {
         ReadPlan::Scan(scan) => Some(scan),
+        ReadPlan::ChangeScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }

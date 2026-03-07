@@ -67,6 +67,20 @@ impl CanonicalStateScan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalChangeScan {
+    pub(crate) binding: SurfaceBinding,
+}
+
+impl CanonicalChangeScan {
+    pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
+        if binding.descriptor.surface_family != SurfaceFamily::Change {
+            return None;
+        }
+        Some(Self { binding })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PredicateSpec {
     pub(crate) sql: String,
 }
@@ -86,6 +100,7 @@ pub(crate) struct SortKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadPlan {
     Scan(CanonicalStateScan),
+    ChangeScan(CanonicalChangeScan),
     Filter {
         input: Box<ReadPlan>,
         predicate: PredicateSpec,
@@ -108,6 +123,10 @@ pub(crate) enum ReadPlan {
 impl ReadPlan {
     pub(crate) fn scan(scan: CanonicalStateScan) -> Self {
         Self::Scan(scan)
+    }
+
+    pub(crate) fn change_scan(scan: CanonicalChangeScan) -> Self {
+        Self::ChangeScan(scan)
     }
 }
 

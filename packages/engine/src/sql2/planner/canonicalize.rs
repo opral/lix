@@ -1,8 +1,9 @@
 use crate::sql2::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql2::core::contracts::{BoundStatement, StatementKind};
 use crate::sql2::planner::ir::{
-    CanonicalStateScan, MutationPayload, PredicateSpec, ProjectionExpr, ReadCommand, ReadContract,
-    ReadPlan, SortKey, WriteCommand, WriteMode, WriteOperationKind, WriteSelector,
+    CanonicalChangeScan, CanonicalStateScan, MutationPayload, PredicateSpec, ProjectionExpr,
+    ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode, WriteOperationKind,
+    WriteSelector,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -59,22 +60,34 @@ pub(crate) fn canonicalize_read(
 
     let select = extract_supported_select(query)?;
     let surface_binding = bind_single_surface(select, registry)?;
-    if !surface_binding.resolution_capabilities.canonical_state_scan {
+    let mut root = if surface_binding.resolution_capabilities.canonical_state_scan {
+        let scan =
+            CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
+                CanonicalizeError::unsupported(format!(
+                    "surface '{}' did not produce a canonical state scan",
+                    surface_binding.descriptor.public_name
+                ))
+            })?;
+        ReadPlan::scan(scan)
+    } else if surface_binding
+        .resolution_capabilities
+        .canonical_change_scan
+    {
+        let scan = CanonicalChangeScan::from_surface_binding(surface_binding.clone()).ok_or_else(
+            || {
+                CanonicalizeError::unsupported(format!(
+                    "surface '{}' did not produce a canonical change scan",
+                    surface_binding.descriptor.public_name
+                ))
+            },
+        )?;
+        ReadPlan::change_scan(scan)
+    } else {
         return Err(CanonicalizeError::unsupported(format!(
-            "surface '{}' does not yet canonicalize through CanonicalStateScan",
+            "surface '{}' does not yet canonicalize through sql2 read planning",
             surface_binding.descriptor.public_name
         )));
-    }
-
-    let scan =
-        CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
-            CanonicalizeError::unsupported(format!(
-                "surface '{}' did not produce a canonical state scan",
-                surface_binding.descriptor.public_name
-            ))
-        })?;
-
-    let mut root = ReadPlan::scan(scan);
+    };
 
     if let Some(predicate) = select.selection.as_ref() {
         root = ReadPlan::Filter {
