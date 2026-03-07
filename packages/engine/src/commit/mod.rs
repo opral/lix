@@ -17,9 +17,9 @@ pub(crate) use runtime::{
     load_commit_active_accounts, StatementBatch,
 };
 pub(crate) use state_source::{
-    load_committed_version_tip_commit_id, load_exact_committed_state_row,
-    load_version_info_for_versions, CommitQueryExecutor, ExactCommittedStateRow,
-    ExactCommittedStateRowRequest,
+    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id,
+    load_exact_committed_state_row, load_version_info_for_versions, CommitQueryExecutor,
+    ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
 pub(crate) use types::ProposedDomainChange;
 pub use types::{

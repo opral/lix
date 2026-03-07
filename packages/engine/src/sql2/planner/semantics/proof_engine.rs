@@ -72,8 +72,8 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
             Ok(ScopeProof::SingleVersion(version_id))
         }
         crate::sql2::catalog::DefaultScopeSemantics::History => Ok(ScopeProof::Unbounded),
-        crate::sql2::catalog::DefaultScopeSemantics::GlobalAdmin
-        | crate::sql2::catalog::DefaultScopeSemantics::WorkingChanges => Ok(ScopeProof::Unknown),
+        crate::sql2::catalog::DefaultScopeSemantics::GlobalAdmin => Ok(ScopeProof::GlobalAdmin),
+        crate::sql2::catalog::DefaultScopeSemantics::WorkingChanges => Ok(ScopeProof::Unknown),
     }
 }
 
@@ -94,7 +94,11 @@ fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
 }
 
 fn prove_target_set(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
-    write_text_value(canonicalized, "entity_id")
+    let target_key = match canonicalized.surface_binding.descriptor.public_name.as_str() {
+        "lix_version" => "id",
+        _ => "entity_id",
+    };
+    write_text_value(canonicalized, target_key)
         .map(|entity_id| TargetSetProof::Exact(BTreeSet::from([entity_id])))
         .or(Some(TargetSetProof::Unknown))
 }

@@ -69,6 +69,7 @@ pub(crate) struct SurfaceTraits {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct SurfaceResolutionCapabilities {
     pub(crate) canonical_state_scan: bool,
+    pub(crate) canonical_admin_scan: bool,
     pub(crate) canonical_change_scan: bool,
     pub(crate) entity_projection: bool,
     pub(crate) semantic_write: bool,
@@ -432,9 +433,8 @@ fn filesystem_surface_descriptor(name: &str, variant: SurfaceVariant) -> Surface
 
 fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescriptor {
     let capability = match name {
-        "lix_version" | "lix_active_version" | "lix_stored_schema" | "lix_active_account" => {
-            SurfaceCapability::ReadWrite
-        }
+        "lix_version" | "lix_active_version" | "lix_active_account" => SurfaceCapability::ReadWrite,
+        "lix_stored_schema" => SurfaceCapability::ReadOnly,
         _ => SurfaceCapability::ReadOnly,
     };
 
@@ -447,7 +447,11 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         capability,
         default_scope: DefaultScopeSemantics::GlobalAdmin,
         surface_traits: SurfaceTraits::default(),
-        resolution_capabilities: SurfaceResolutionCapabilities::default(),
+        resolution_capabilities: SurfaceResolutionCapabilities {
+            canonical_admin_scan: true,
+            semantic_write: capability == SurfaceCapability::ReadWrite,
+            ..SurfaceResolutionCapabilities::default()
+        },
         implicit_overrides: SurfaceImplicitOverrides {
             fixed_schema_key: Some(name.to_string()),
             ..SurfaceImplicitOverrides::default()
@@ -821,7 +825,17 @@ fn admin_columns(name: &str) -> Vec<String> {
     match name {
         "lix_active_version" => vec!["id".to_string(), "version_id".to_string()],
         "lix_active_account" => vec!["id".to_string(), "account_id".to_string()],
-        "lix_stored_schema" => vec!["value".to_string(), "lixcol_schema_key".to_string()],
+        "lix_stored_schema" => vec![
+            "value".to_string(),
+            "lixcol_schema_key".to_string(),
+            "lixcol_schema_version".to_string(),
+        ],
+        "lix_version" => vec![
+            "id".to_string(),
+            "name".to_string(),
+            "hidden".to_string(),
+            "commit_id".to_string(),
+        ],
         _ => vec!["id".to_string()],
     }
 }

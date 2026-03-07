@@ -1,9 +1,9 @@
 use crate::sql2::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql2::core::contracts::{BoundStatement, StatementKind};
 use crate::sql2::planner::ir::{
-    CanonicalChangeScan, CanonicalStateScan, MutationPayload, PredicateSpec, ProjectionExpr,
-    ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode, WriteOperationKind,
-    WriteSelector,
+    CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan, MutationPayload, PredicateSpec,
+    ProjectionExpr, ReadCommand, ReadContract, ReadPlan, SortKey, WriteCommand, WriteMode,
+    WriteOperationKind, WriteSelector,
 };
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -82,6 +82,18 @@ pub(crate) fn canonicalize_read(
             },
         )?;
         ReadPlan::change_scan(scan)
+    } else if surface_binding
+        .resolution_capabilities
+        .canonical_admin_scan
+    {
+        let scan =
+            CanonicalAdminScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
+                CanonicalizeError::unsupported(format!(
+                    "surface '{}' did not produce a canonical admin scan",
+                    surface_binding.descriptor.public_name
+                ))
+            })?;
+        ReadPlan::admin_scan(scan)
     } else {
         return Err(CanonicalizeError::unsupported(format!(
             "surface '{}' does not yet canonicalize through sql2 read planning",
@@ -478,10 +490,10 @@ fn validate_semantic_write_surface(
     }
     if !matches!(
         surface_binding.descriptor.surface_family,
-        SurfaceFamily::State | SurfaceFamily::Entity
+        SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Admin
     ) {
         return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 write canonicalizer only supports state-backed surfaces",
+            "sql2 write canonicalizer only supports migrated state, entity, and admin surfaces",
         ));
     }
     if !surface_rule(surface_binding) {
@@ -499,7 +511,7 @@ fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         SurfaceFamily::Entity
     ) || matches!(
         surface_binding.descriptor.public_name.as_str(),
-        "lix_state" | "lix_state_by_version"
+        "lix_state" | "lix_state_by_version" | "lix_version"
     )
 }
 
@@ -509,7 +521,7 @@ fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
         SurfaceFamily::Entity
     ) || matches!(
         surface_binding.descriptor.public_name.as_str(),
-        "lix_state" | "lix_state_by_version"
+        "lix_state" | "lix_state_by_version" | "lix_version"
     )
 }
 
@@ -713,7 +725,11 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
                     .map(|candidate| candidate == column)
                     .unwrap_or(false)
             }),
-        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => false,
+        SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
+            "lix_version" => column == "id",
+            _ => false,
+        },
+        SurfaceFamily::Filesystem | SurfaceFamily::Change => false,
     }
 }
 
@@ -754,7 +770,20 @@ fn canonical_write_column_key(
                 )))
             }
         }
-        SurfaceFamily::Filesystem | SurfaceFamily::Admin | SurfaceFamily::Change => {
+        SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
+            "lix_version" => match column.as_str() {
+                "id" | "name" | "hidden" | "commit_id" => Ok(column),
+                _ => Err(CanonicalizeError::unsupported(format!(
+                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                ))),
+            },
+            _ => Err(CanonicalizeError::unsupported(format!(
+                "sql2 write canonicalizer does not yet support '{}' writes",
+                surface_binding.descriptor.public_name
+            ))),
+        },
+        SurfaceFamily::Filesystem | SurfaceFamily::Change => {
             Err(CanonicalizeError::unsupported(format!(
                 "sql2 day-1 write canonicalizer does not support '{}' writes",
                 surface_binding.descriptor.public_name

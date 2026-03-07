@@ -1,5 +1,5 @@
 use crate::sql2::planner::canonicalize::CanonicalizedRead;
-use crate::sql2::planner::ir::{ReadPlan, VersionScope};
+use crate::sql2::planner::ir::{CanonicalAdminKind, ReadPlan, VersionScope};
 use crate::sql_shared::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
@@ -16,6 +16,9 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     let Statement::Query(query) = &canonicalized.bound_statement.statement else {
         return None;
     };
+    if let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) {
+        return Some(dependency_spec_for_admin_scan(admin_scan.kind));
+    }
     let Some(scan) = canonical_state_scan(&canonicalized.read_command.root) else {
         return None;
     };
@@ -69,16 +72,54 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
     Some(spec)
 }
 
+fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
+    let mut spec = DependencySpec::default();
+    match kind {
+        CanonicalAdminKind::ActiveVersion => {
+            spec.relations.insert("lix_active_version".to_string());
+            spec.schema_keys.insert("lix_active_version".to_string());
+        }
+        CanonicalAdminKind::ActiveAccount => {
+            spec.relations.insert("lix_active_account".to_string());
+            spec.schema_keys.insert("lix_active_account".to_string());
+        }
+        CanonicalAdminKind::StoredSchema => {
+            spec.relations.insert("lix_stored_schema".to_string());
+            spec.schema_keys.insert("lix_stored_schema".to_string());
+        }
+        CanonicalAdminKind::Version => {
+            spec.relations.insert("lix_version".to_string());
+            spec.schema_keys
+                .insert("lix_version_descriptor".to_string());
+            spec.schema_keys.insert("lix_version_pointer".to_string());
+        }
+    }
+    spec
+}
+
 fn canonical_state_scan(
     read_plan: &ReadPlan,
 ) -> Option<&crate::sql2::planner::ir::CanonicalStateScan> {
     match read_plan {
         ReadPlan::Scan(scan) => Some(scan),
-        ReadPlan::ChangeScan(_) => None,
+        ReadPlan::AdminScan(_) | ReadPlan::ChangeScan(_) => None,
         ReadPlan::Filter { input, .. }
         | ReadPlan::Project { input, .. }
         | ReadPlan::Sort { input, .. }
         | ReadPlan::Limit { input, .. } => canonical_state_scan(input),
+    }
+}
+
+fn canonical_admin_scan(
+    read_plan: &ReadPlan,
+) -> Option<&crate::sql2::planner::ir::CanonicalAdminScan> {
+    match read_plan {
+        ReadPlan::AdminScan(scan) => Some(scan),
+        ReadPlan::Scan(_) | ReadPlan::ChangeScan(_) => None,
+        ReadPlan::Filter { input, .. }
+        | ReadPlan::Project { input, .. }
+        | ReadPlan::Sort { input, .. }
+        | ReadPlan::Limit { input, .. } => canonical_admin_scan(input),
     }
 }
 

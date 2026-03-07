@@ -296,6 +296,9 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     if let Some(commit_result) = append_result.commit_result.as_ref() {
         mirror_sql2_stored_schema_bootstrap_rows(transaction, commit_result).await?;
     }
+    if matches!(append_result.disposition, AppendCommitDisposition::Applied) {
+        apply_sql2_version_last_checkpoint_side_effects(transaction, sql2_write).await?;
+    }
 
     let plugin_changes_committed =
         matches!(append_result.disposition, AppendCommitDisposition::Applied);
@@ -353,6 +356,7 @@ fn live_sql2_operation_supported(sql2_write: &Sql2PreparedWrite) -> bool {
                 .map(|preconditions| &preconditions.write_lane),
             Some(crate::sql2::planner::ir::WriteLane::SingleVersion(_))
                 | Some(crate::sql2::planner::ir::WriteLane::ActiveVersion)
+                | Some(crate::sql2::planner::ir::WriteLane::GlobalAdmin)
         ),
     }
 }
@@ -531,5 +535,124 @@ async fn mirror_sql2_stored_schema_bootstrap_rows(
         transaction.execute(&sql, &[]).await?;
     }
 
+    Ok(())
+}
+
+async fn apply_sql2_version_last_checkpoint_side_effects(
+    transaction: &mut dyn LixTransaction,
+    sql2_write: &Sql2PreparedWrite,
+) -> Result<(), LixError> {
+    if sql2_write.planned_write.command.target.descriptor.public_name != "lix_version" {
+        return Ok(());
+    }
+
+    let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() else {
+        return Ok(());
+    };
+
+    match sql2_write.planned_write.command.operation_kind {
+        crate::sql2::planner::ir::WriteOperationKind::Insert => {
+            upsert_last_checkpoint_rows(
+                transaction,
+                &version_checkpoint_rows(&resolved.intended_post_state),
+                true,
+            )
+            .await
+        }
+        crate::sql2::planner::ir::WriteOperationKind::Update => {
+            upsert_last_checkpoint_rows(
+                transaction,
+                &version_checkpoint_rows(&resolved.intended_post_state),
+                false,
+            )
+            .await
+        }
+        crate::sql2::planner::ir::WriteOperationKind::Delete => {
+            let version_ids = resolved
+                .authoritative_pre_state
+                .iter()
+                .map(|row| row.entity_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            delete_last_checkpoint_rows(transaction, &version_ids).await
+        }
+    }
+}
+
+fn version_checkpoint_rows(
+    rows: &[crate::sql2::planner::ir::PlannedStateRow],
+) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|row| row.schema_key == crate::version::version_pointer_schema_key())
+        .filter_map(|row| {
+            row.values
+                .get("snapshot_content")
+                .and_then(|value| match value {
+                    Value::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("commit_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|commit_id| (row.entity_id.clone(), commit_id.to_string()))
+                })
+        })
+        .collect()
+}
+
+async fn upsert_last_checkpoint_rows(
+    transaction: &mut dyn LixTransaction,
+    rows: &[(String, String)],
+    update_existing: bool,
+) -> Result<(), LixError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let values_sql = rows
+        .iter()
+        .map(|(version_id, checkpoint_commit_id)| {
+            format!(
+                "('{}', '{}')",
+                escape_sql_string(version_id),
+                escape_sql_string(checkpoint_commit_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let on_conflict = if update_existing {
+        "DO UPDATE SET checkpoint_commit_id = excluded.checkpoint_commit_id"
+    } else {
+        "DO NOTHING"
+    };
+    let sql = format!(
+        "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
+         VALUES {values_sql} \
+         ON CONFLICT (version_id) {on_conflict}"
+    );
+    transaction.execute(&sql, &[]).await?;
+    Ok(())
+}
+
+async fn delete_last_checkpoint_rows(
+    transaction: &mut dyn LixTransaction,
+    version_ids: &[String],
+) -> Result<(), LixError> {
+    if version_ids.is_empty() {
+        return Ok(());
+    }
+
+    let in_list = version_ids
+        .iter()
+        .map(|id| format!("'{}'", escape_sql_string(id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "DELETE FROM lix_internal_last_checkpoint WHERE version_id IN ({in_list})"
+    );
+    transaction.execute(&sql, &[]).await?;
     Ok(())
 }

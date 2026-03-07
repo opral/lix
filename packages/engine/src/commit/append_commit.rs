@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::builtin_schema::types::LixVersionPointer;
 use crate::functions::LixFunctionProvider;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, LixTransaction, QueryResult, Value};
 use async_trait::async_trait;
 
@@ -11,7 +12,8 @@ use super::runtime::{
     load_commit_active_accounts,
 };
 use super::state_source::{
-    load_committed_version_tip_commit_id, load_version_info_for_versions, CommitQueryExecutor,
+    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id,
+    load_version_info_for_versions, CommitQueryExecutor,
 };
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
@@ -126,7 +128,9 @@ pub(crate) async fn append_commit_if_preconditions_hold(
                 kind: AppendCommitErrorKind::TipDrift,
                 message: format!(
                     "append precondition failed for '{}': expected tip '{}', found '{}'",
-                    concrete_lane.version_id, expected, current
+                    lane_storage_key(&concrete_lane),
+                    expected,
+                    current
                 ),
             });
         }
@@ -135,7 +139,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
                 kind: AppendCommitErrorKind::MissingWriteLane,
                 message: format!(
                     "append precondition failed for '{}': version pointer is missing",
-                    concrete_lane.version_id
+                    lane_storage_key(&concrete_lane)
                 ),
             });
         }
@@ -151,7 +155,8 @@ pub(crate) async fn append_commit_if_preconditions_hold(
                 kind: AppendCommitErrorKind::TipDrift,
                 message: format!(
                     "append precondition failed for '{}': lane already exists at '{}'",
-                    concrete_lane.version_id, current
+                    lane_storage_key(&concrete_lane),
+                    current
                 ),
             });
         }
@@ -197,7 +202,7 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         || functions.uuid_v7(),
     )
     .map_err(backend_error)?;
-    let committed_tip = extract_committed_tip_id(&commit_result, &concrete_lane.version_id)?;
+    let committed_tip = extract_committed_tip_id(&commit_result, &concrete_lane)?;
 
     let prepared_statements = bind_statement_batch_for_dialect(
         build_statement_batch_from_generate_commit_result(
@@ -234,8 +239,9 @@ pub(crate) async fn append_commit_if_preconditions_hold(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ConcreteWriteLane {
-    version_id: String,
+enum ConcreteWriteLane {
+    Version { version_id: String },
+    GlobalAdmin,
 }
 
 struct TransactionCommitExecutor<'a> {
@@ -253,14 +259,10 @@ fn concrete_lane(
     preconditions: &AppendCommitPreconditions,
 ) -> Result<ConcreteWriteLane, AppendCommitError> {
     match &preconditions.write_lane {
-        AppendWriteLane::Version(version_id) => Ok(ConcreteWriteLane {
+        AppendWriteLane::Version(version_id) => Ok(ConcreteWriteLane::Version {
             version_id: version_id.clone(),
         }),
-        AppendWriteLane::GlobalAdmin => Err(AppendCommitError {
-            kind: AppendCommitErrorKind::UnsupportedWriteLane,
-            message: "append_commit_if_preconditions_hold does not yet support GlobalAdmin lanes"
-                .to_string(),
-        }),
+        AppendWriteLane::GlobalAdmin => Ok(ConcreteWriteLane::GlobalAdmin),
     }
 }
 
@@ -272,14 +274,26 @@ fn validate_change_versions(
         .iter()
         .map(|change| change.version_id.as_str())
         .collect::<BTreeSet<_>>();
-    if version_ids.len() != 1 || !version_ids.contains(concrete_lane.version_id.as_str()) {
-        return Err(AppendCommitError {
-            kind: AppendCommitErrorKind::Internal,
-            message: format!(
-                "append batch must target exactly one version lane '{}'",
-                concrete_lane.version_id
-            ),
-        });
+    match concrete_lane {
+        ConcreteWriteLane::Version { version_id } => {
+            if version_ids.len() != 1 || !version_ids.contains(version_id.as_str()) {
+                return Err(AppendCommitError {
+                    kind: AppendCommitErrorKind::Internal,
+                    message: format!(
+                        "append batch must target exactly one version lane '{}'",
+                        version_id
+                    ),
+                });
+            }
+        }
+        ConcreteWriteLane::GlobalAdmin => {
+            if version_ids.len() != 1 || !version_ids.contains(GLOBAL_VERSION_ID) {
+                return Err(AppendCommitError {
+                    kind: AppendCommitErrorKind::Internal,
+                    message: "append batch must target exactly the global admin lane".to_string(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -339,9 +353,16 @@ async fn load_current_tip_commit_id(
     executor: &mut dyn CommitQueryExecutor,
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<Option<String>, AppendCommitError> {
-    load_committed_version_tip_commit_id(executor, &concrete_lane.version_id)
-        .await
-        .map_err(backend_error)
+    match concrete_lane {
+        ConcreteWriteLane::Version { version_id } => {
+            load_committed_version_tip_commit_id(executor, version_id)
+                .await
+                .map_err(backend_error)
+        }
+        ConcreteWriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
+            .await
+            .map_err(backend_error),
+    }
 }
 
 async fn load_existing_idempotency_commit_id(
@@ -375,8 +396,12 @@ async fn load_existing_idempotency_commit_id(
 
 fn extract_committed_tip_id(
     commit_result: &GenerateCommitResult,
-    version_id: &str,
+    concrete_lane: &ConcreteWriteLane,
 ) -> Result<String, AppendCommitError> {
+    let version_id = match concrete_lane {
+        ConcreteWriteLane::Version { version_id } => version_id.as_str(),
+        ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
+    };
     let pointer_change = commit_result
         .changes
         .iter()
@@ -445,7 +470,10 @@ async fn insert_idempotency_row(
 }
 
 fn lane_storage_key(concrete_lane: &ConcreteWriteLane) -> String {
-    format!("version:{}", concrete_lane.version_id)
+    match concrete_lane {
+        ConcreteWriteLane::Version { version_id } => format!("version:{version_id}"),
+        ConcreteWriteLane::GlobalAdmin => "global-admin".to_string(),
+    }
 }
 
 fn backend_error(error: LixError) -> AppendCommitError {
@@ -467,6 +495,7 @@ mod tests {
         AppendCommitPreconditions, AppendExpectedTip, AppendWriteLane,
     };
     use crate::functions::LixFunctionProvider;
+    use crate::version::GLOBAL_VERSION_ID;
     use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -594,6 +623,26 @@ mod tests {
             snapshot_content: Some("{\"key\":\"hello\"}".to_string()),
             metadata: None,
             version_id: "version-a".to_string(),
+            writer_key: Some("writer-a".to_string()),
+        }
+    }
+
+    fn sample_global_change() -> crate::commit::ProposedDomainChange {
+        crate::commit::ProposedDomainChange {
+            entity_id: "version-a".to_string(),
+            schema_key: "lix_version_descriptor".to_string(),
+            schema_version: Some("1".to_string()),
+            file_id: Some(crate::version::version_descriptor_file_id().to_string()),
+            plugin_key: Some(crate::version::version_descriptor_plugin_key().to_string()),
+            snapshot_content: Some(
+                crate::version::version_descriptor_snapshot_content(
+                    "version-a",
+                    "Version A",
+                    false,
+                ),
+            ),
+            metadata: None,
+            version_id: GLOBAL_VERSION_ID.to_string(),
             writer_key: Some("writer-a".to_string()),
         }
     }
@@ -773,18 +822,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_global_admin_until_lane_support_is_added() {
+    async fn applies_global_admin_lane_when_tip_matches_expected() {
         let mut transaction = FakeTransaction::default();
+        transaction
+            .version_tips
+            .insert(GLOBAL_VERSION_ID.to_string(), "commit-global-123".to_string());
         let mut functions = CountingFunctionProvider::default();
 
-        let error = append_commit_if_preconditions_hold(
+        let result = append_commit_if_preconditions_hold(
             &mut transaction,
             AppendCommitArgs {
                 timestamp: "2026-03-06T14:22:00.000Z".to_string(),
-                changes: vec![sample_change()],
+                changes: vec![sample_global_change()],
                 preconditions: AppendCommitPreconditions {
                     write_lane: AppendWriteLane::GlobalAdmin,
-                    expected_tip: AppendExpectedTip::CommitId("commit-123".to_string()),
+                    expected_tip: AppendExpectedTip::CommitId("commit-global-123".to_string()),
                     idempotency_key: "idem-global".to_string(),
                 },
             },
@@ -792,9 +844,10 @@ mod tests {
             None,
         )
         .await
-        .expect_err("global admin should stay unsupported in v1");
+        .expect("global admin append should succeed");
 
-        assert_eq!(error.kind, AppendCommitErrorKind::UnsupportedWriteLane);
+        assert_eq!(result.disposition, AppendCommitDisposition::Applied);
+        assert!(result.commit_result.is_some());
     }
 
     #[tokio::test]
