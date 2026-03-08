@@ -1416,7 +1416,10 @@ simulation_test!(
             .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
             .await
             .unwrap();
-        assert_integer(&before_delete.statements[0].rows[0][0], 1);
+        let before_delete_count = match &before_delete.statements[0].rows[0][0] {
+            Value::Integer(value) => *value,
+            other => panic!("expected integer count, got {other:?}"),
+        };
 
         engine
             .execute(
@@ -1440,12 +1443,84 @@ simulation_test!(
             .unwrap();
 
         sim.assert_deterministic(rows.statements[0].rows.clone());
-        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_eq!(
+            rows.statements[0].rows.len(),
+            usize::try_from(before_delete_count + 1).unwrap()
+        );
         assert_text(
-            &rows.statements[0].rows[1][0],
+            &rows.statements[0].rows.last().unwrap()[0],
             &format!("version:{version_id}"),
         );
-        match &rows.statements[0].rows[1][1] {
+        match &rows.statements[0].rows.last().unwrap()[1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
+    }
+);
+
+simulation_test!(
+    directory_by_version_delete_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_sql = version_id.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
+                     VALUES ('dir-idem-delete', '/idem-delete/', NULL, 'idem-delete', '{version_sql}')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before_delete = engine
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
+            .await
+            .unwrap();
+        let before_delete_count = match &before_delete.statements[0].rows[0][0] {
+            Value::Integer(value) => *value,
+            other => panic!("expected integer count, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_directory_by_version \
+                     WHERE id = 'dir-idem-delete' AND lixcol_version_id = '{version_sql}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(
+            rows.statements[0].rows.len(),
+            usize::try_from(before_delete_count + 1).unwrap()
+        );
+        assert_text(
+            &rows.statements[0].rows.last().unwrap()[0],
+            &format!("version:{version_id}"),
+        );
+        match &rows.statements[0].rows.last().unwrap()[1] {
             Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
             other => panic!("expected text commit_id, got {other:?}"),
         }

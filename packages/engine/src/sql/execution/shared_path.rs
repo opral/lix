@@ -477,27 +477,25 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         .descriptor
         .public_name
         .as_str();
+    let filesystem_schema_set_supported =
+        prepared
+            .intent
+            .detected_file_domain_changes
+            .iter()
+            .all(|change| {
+                matches!(
+                    change.schema_key.as_str(),
+                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                        | FILE_DESCRIPTOR_SCHEMA_KEY
+                        | BINARY_BLOB_REF_SCHEMA_KEY
+                )
+            });
     let filesystem_directory_side_effects_only =
         matches!(target_name, "lix_directory" | "lix_directory_by_version")
-            && prepared
-                .intent
-                .detected_file_domain_changes
-                .iter()
-                .all(|change| change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY);
+            && filesystem_schema_set_supported;
     let filesystem_file_side_effects_only =
         matches!(target_name, "lix_file" | "lix_file_by_version")
-            && prepared
-                .intent
-                .detected_file_domain_changes
-                .iter()
-                .all(|change| {
-                    matches!(
-                        change.schema_key.as_str(),
-                        DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                            | FILE_DESCRIPTOR_SCHEMA_KEY
-                            | BINARY_BLOB_REF_SCHEMA_KEY
-                    )
-                });
+            && filesystem_schema_set_supported;
 
     matches!(
         prepared.plan.result_contract,

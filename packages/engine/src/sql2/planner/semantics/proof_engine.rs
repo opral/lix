@@ -147,6 +147,10 @@ fn payload_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<S
 }
 
 fn selection_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
+    if let Some(Value::Text(value)) = canonicalized.write_command.selector.exact_filters.get(key) {
+        return Some(value.clone());
+    }
+
     let selection = match &canonicalized.bound_statement.statement {
         Statement::Update(update) => update.selection.as_ref(),
         Statement::Delete(delete) => delete.selection.as_ref(),

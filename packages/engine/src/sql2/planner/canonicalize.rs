@@ -847,22 +847,22 @@ fn canonical_write_column_key(
             }
         }
         SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
-            "lix_version" => match column.as_str() {
-                "id" | "name" | "hidden" | "commit_id" => Ok(column),
+            "lix_version" => match canonical.as_str() {
+                "id" | "name" | "hidden" | "commit_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
                 ))),
             },
-            "lix_active_version" => match column.as_str() {
-                "id" | "version_id" => Ok(column),
+            "lix_active_version" => match canonical.as_str() {
+                "id" | "version_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
                 ))),
             },
-            "lix_active_account" => match column.as_str() {
-                "id" | "account_id" => Ok(column),
+            "lix_active_account" => match canonical.as_str() {
+                "id" | "account_id" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
@@ -874,18 +874,18 @@ fn canonical_write_column_key(
             ))),
         },
         SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
-            "lix_file" | "lix_file_by_version" => match column.as_str() {
+            "lix_file" | "lix_file_by_version" => match canonical.as_str() {
                 "id" | "path" | "hidden" | "version_id" | "untracked" | "metadata" | "data" => {
-                    Ok(column)
+                    Ok(canonical.clone())
                 }
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
                 ))),
             },
-            "lix_directory" | "lix_directory_by_version" => match column.as_str() {
+            "lix_directory" | "lix_directory_by_version" => match canonical.as_str() {
                 "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
-                | "metadata" => Ok(column),
+                | "metadata" => Ok(canonical.clone()),
                 _ => Err(CanonicalizeError::unsupported(format!(
                     "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
                     surface_binding.descriptor.public_name
