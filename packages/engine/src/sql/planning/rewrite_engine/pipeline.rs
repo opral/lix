@@ -91,7 +91,7 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     let mut statements = statements;
     normalize_statement_placeholders_in_batch(&mut statements)?;
 
-    let statement_pipeline = StatementPipeline::new(params, writer_key);
+    let statement_pipeline = StatementPipeline::new(params, writer_key, None);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());

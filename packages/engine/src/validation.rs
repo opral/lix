@@ -146,7 +146,7 @@ pub(crate) async fn validate_sql2_batch_local_write(
     cache: &SchemaCache,
     planned_write: &PlannedWrite,
 ) -> Result<(), LixError> {
-    validate_sql2_write(backend, cache, planned_write).await
+    validate_sql2_write(backend, cache, planned_write, false).await
 }
 
 pub(crate) async fn validate_sql2_append_time_write(
@@ -154,13 +154,14 @@ pub(crate) async fn validate_sql2_append_time_write(
     cache: &SchemaCache,
     planned_write: &PlannedWrite,
 ) -> Result<(), LixError> {
-    validate_sql2_write(backend, cache, planned_write).await
+    validate_sql2_write(backend, cache, planned_write, true).await
 }
 
 async fn validate_sql2_write(
     backend: &dyn LixBackend,
     cache: &SchemaCache,
     planned_write: &PlannedWrite,
+    require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
     let resolved = planned_write
         .resolved_write_plan
@@ -187,6 +188,7 @@ async fn validate_sql2_write(
             cache,
             planned_write.command.operation_kind,
             row,
+            require_binary_blob_ref_cas,
         )
         .await?;
     }
@@ -260,6 +262,7 @@ async fn validate_sql2_planned_row(
     cache: &SchemaCache,
     operation_kind: WriteOperationKind,
     row: &PlannedStateRow,
+    require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
     if row.tombstone {
         return Ok(());
@@ -334,9 +337,14 @@ async fn validate_sql2_planned_row(
     validate_snapshot_content(provider, cache, &key, &snapshot).await?;
     validate_entity_id_matches_primary_key(provider, &key, &row.entity_id, &snapshot).await?;
 
-    if operation_kind == WriteOperationKind::Insert {
-        validate_filesystem_snapshot_integrity(backend, &row.schema_key, &snapshot).await?;
-    }
+    let _ = operation_kind;
+    validate_filesystem_snapshot_integrity(
+        backend,
+        &row.schema_key,
+        &snapshot,
+        require_binary_blob_ref_cas,
+    )
+    .await?;
 
     Ok(())
 }
@@ -346,7 +354,7 @@ async fn validate_filesystem_insert_integrity(
     row: &MutationRow,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
-    validate_filesystem_snapshot_integrity(backend, &row.schema_key, snapshot).await
+    validate_filesystem_snapshot_integrity(backend, &row.schema_key, snapshot, true).await
 }
 
 async fn binary_cas_blob_exists(
@@ -387,6 +395,7 @@ async fn validate_filesystem_snapshot_integrity(
     backend: &dyn LixBackend,
     schema_key: &str,
     snapshot: &JsonValue,
+    require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
     if schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
         return Ok(());
@@ -403,7 +412,7 @@ async fn validate_filesystem_snapshot_integrity(
                     .to_string(),
         })?;
 
-    if !binary_cas_blob_exists(backend, blob_hash).await? {
+    if require_binary_blob_ref_cas && !binary_cas_blob_exists(backend, blob_hash).await? {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(

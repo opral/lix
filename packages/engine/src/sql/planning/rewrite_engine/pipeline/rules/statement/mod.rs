@@ -20,14 +20,19 @@ pub(crate) fn apply_sync_rule<P: LixFunctionProvider>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
+    active_version_id_hint: Option<&str>,
     provider: &mut P,
 ) -> Result<Option<RewriteOutput>, LixError> {
     match rule {
         StatementRule::QueryRead => query_read::apply_sync(statement),
         StatementRule::ExplainRead => explain_read::apply_sync(statement),
-        StatementRule::VtableWriteCanonical => {
-            canonical::rewrite_sync_statement(statement, params, writer_key, provider)
-        }
+        StatementRule::VtableWriteCanonical => canonical::rewrite_sync_statement(
+            statement,
+            params,
+            writer_key,
+            active_version_id_hint,
+            provider,
+        ),
         StatementRule::Passthrough => Ok(Some(passthrough::apply(statement))),
     }
 }
@@ -38,6 +43,7 @@ pub(crate) async fn apply_backend_rule<P>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
+    active_version_id_hint: Option<&str>,
     provider: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<Option<RewriteOutput>, LixError>
@@ -53,6 +59,7 @@ where
                 statement,
                 params,
                 writer_key,
+                active_version_id_hint,
                 provider,
                 detected_file_domain_changes,
             )

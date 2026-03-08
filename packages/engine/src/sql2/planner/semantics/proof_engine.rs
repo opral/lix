@@ -98,7 +98,12 @@ fn prove_schema(canonicalized: &CanonicalizedWrite) -> SchemaProof {
 }
 
 fn prove_target_set(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
-    let target_key = match canonicalized.surface_binding.descriptor.public_name.as_str() {
+    let target_key = match canonicalized
+        .surface_binding
+        .descriptor
+        .public_name
+        .as_str()
+    {
         "lix_version"
         | "lix_file"
         | "lix_file_by_version"
@@ -112,7 +117,12 @@ fn prove_target_set(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof
 }
 
 fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<&'static str> {
-    match canonicalized.surface_binding.descriptor.public_name.as_str() {
+    match canonicalized
+        .surface_binding
+        .descriptor
+        .public_name
+        .as_str()
+    {
         "lix_file" | "lix_file_by_version" => Some("lix_file_descriptor"),
         "lix_directory" | "lix_directory_by_version" => Some("lix_directory_descriptor"),
         _ => None,

@@ -9,6 +9,7 @@ use crate::{LixBackend, Value};
 pub(crate) struct StatementContext<'a> {
     pub(crate) params: &'a [Value],
     pub(crate) writer_key: Option<&'a str>,
+    pub(crate) active_version_id_hint: Option<&'a str>,
     pub(crate) backend: Option<&'a dyn LixBackend>,
     pub(crate) detected_file_domain_changes: &'a [DetectedFileDomainChange],
     pub(crate) side_effects: Vec<Statement>,
@@ -24,6 +25,7 @@ impl<'a> StatementContext<'a> {
         Self {
             params,
             writer_key,
+            active_version_id_hint: None,
             backend: None,
             detected_file_domain_changes: &[],
             side_effects: Vec::new(),
@@ -39,11 +41,13 @@ impl<'a> StatementContext<'a> {
         backend: &'a dyn LixBackend,
         params: &'a [Value],
         writer_key: Option<&'a str>,
+        active_version_id_hint: Option<&'a str>,
         detected_file_domain_changes: &'a [DetectedFileDomainChange],
     ) -> Self {
         Self {
             params,
             writer_key,
+            active_version_id_hint,
             backend: Some(backend),
             detected_file_domain_changes,
             side_effects: Vec::new(),

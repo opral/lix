@@ -1,5 +1,6 @@
+use crate::commit::load_committed_version_tip_commit_id;
 use crate::sql2::backend::PushdownDecision;
-use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry};
+use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
 use crate::sql2::planner::backend::lowerer::{lower_read_for_execution, LoweredReadProgram};
 use crate::sql2::planner::canonicalize::{
@@ -20,7 +21,7 @@ use crate::sql2::planner::semantics::proof_engine::prove_write;
 use crate::sql2::planner::semantics::write_resolver::resolve_write_plan;
 use crate::sql_shared::dependency_spec::DependencySpec;
 use crate::{LixBackend, Value};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value as SqlValue};
 
 #[derive(Debug, Clone, PartialEq)]
 struct ExplainEnvelope {
@@ -103,6 +104,9 @@ pub(crate) async fn prepare_sql2_read(
         },
     );
     let canonicalized = canonicalize_read(bound_statement.clone(), &registry).ok()?;
+    let canonicalized =
+        maybe_bind_active_history_root(backend, canonicalized, active_version_id, &registry)
+            .await?;
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
     if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
         && dependency_spec_has_unknown_schema_keys(&registry, dependency_spec.as_ref())
@@ -156,6 +160,106 @@ pub(crate) async fn prepare_sql2_read(
         lowered_read,
         canonicalized,
     })
+}
+
+async fn maybe_bind_active_history_root(
+    backend: &dyn LixBackend,
+    canonicalized: CanonicalizedRead,
+    active_version_id: &str,
+    registry: &SurfaceRegistry,
+) -> Option<CanonicalizedRead> {
+    let descriptor = &canonicalized.surface_binding.descriptor;
+    let public_name = descriptor.public_name.as_str();
+    let uses_active_history_root = descriptor.surface_variant == SurfaceVariant::History
+        && matches!(
+            descriptor.surface_family,
+            SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
+        )
+        && !public_name.ends_with("_history_by_version");
+    if !uses_active_history_root {
+        return Some(canonicalized);
+    }
+    if statement_has_root_commit_predicate(&canonicalized.bound_statement.statement) {
+        return Some(canonicalized);
+    }
+
+    let mut executor = backend;
+    let root_commit_id = load_committed_version_tip_commit_id(&mut executor, active_version_id)
+        .await
+        .ok()??;
+    let mut rebound = canonicalized.bound_statement.clone();
+    let Statement::Query(query) = &mut rebound.statement else {
+        return Some(canonicalized);
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Some(canonicalized);
+    };
+    let root_predicate = Expr::BinaryOp {
+        left: Box::new(Expr::Identifier(Ident::new("lixcol_root_commit_id"))),
+        op: BinaryOperator::Eq,
+        right: Box::new(Expr::Value(
+            SqlValue::SingleQuotedString(root_commit_id).into(),
+        )),
+    };
+    select.selection = Some(match select.selection.take() {
+        Some(existing) => Expr::BinaryOp {
+            left: Box::new(existing),
+            op: BinaryOperator::And,
+            right: Box::new(root_predicate),
+        },
+        None => root_predicate,
+    });
+    canonicalize_read(rebound, registry).ok()
+}
+
+fn statement_has_root_commit_predicate(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select
+        .selection
+        .as_ref()
+        .map(expr_has_root_commit_predicate)
+        .unwrap_or(false)
+}
+
+fn expr_has_root_commit_predicate(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_root_commit(left)
+                || expr_references_root_commit(right)
+                || expr_has_root_commit_predicate(left)
+                || expr_has_root_commit_predicate(right)
+        }
+        Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::UnaryOp { expr: inner, .. } => expr_has_root_commit_predicate(inner),
+        Expr::InList { expr, .. } | Expr::InSubquery { expr, .. } => {
+            expr_references_root_commit(expr) || expr_has_root_commit_predicate(expr)
+        }
+        _ => false,
+    }
+}
+
+fn expr_references_root_commit(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(identifier) => {
+            matches!(
+                identifier.value.to_ascii_lowercase().as_str(),
+                "lixcol_root_commit_id" | "root_commit_id"
+            )
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => matches!(
+            parts[1].value.to_ascii_lowercase().as_str(),
+            "lixcol_root_commit_id" | "root_commit_id"
+        ),
+        Expr::Nested(inner) => expr_references_root_commit(inner),
+        _ => false,
+    }
 }
 
 fn dependency_spec_has_unknown_schema_keys(
@@ -452,7 +556,10 @@ mod tests {
                     .active_version_rows
                     .iter()
                     .map(|(entity_id, snapshot)| {
-                        vec![Value::Text(entity_id.clone()), Value::Text(snapshot.clone())]
+                        vec![
+                            Value::Text(entity_id.clone()),
+                            Value::Text(snapshot.clone()),
+                        ]
                     })
                     .collect::<Vec<_>>();
                 return Ok(QueryResult {
@@ -469,7 +576,9 @@ mod tests {
                     .map(|account_id| {
                         vec![
                             Value::Text(account_id.clone()),
-                            Value::Text(crate::account::active_account_snapshot_content(account_id)),
+                            Value::Text(crate::account::active_account_snapshot_content(
+                                account_id,
+                            )),
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -790,7 +899,11 @@ mod tests {
 
     #[tokio::test]
     async fn prepares_builtin_entity_history_reads() {
-        let backend = FakeBackend::default();
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+        );
         let prepared = prepare_sql2_read(
             &backend,
             &parse_one(
@@ -825,6 +938,7 @@ mod tests {
             .first()
             .expect("entity history read should lower");
         assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
+        assert!(lowered_sql.contains("c.entity_id = 'commit-active-root'"));
         assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
         assert!(lowered_sql.contains("depth AS lixcol_depth"));
     }
@@ -885,7 +999,10 @@ mod tests {
         .await
         .expect("working-changes read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_working_changes"]);
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_working_changes"]
+        );
         assert!(prepared.effective_state_request.is_none());
         assert!(prepared.effective_state_plan.is_none());
         assert_eq!(
@@ -982,7 +1099,10 @@ mod tests {
         .await
         .expect("filesystem by-version read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_directory_by_version"]);
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_directory_by_version"]
+        );
         assert!(prepared.effective_state_request.is_none());
         assert!(prepared.effective_state_plan.is_none());
         assert_eq!(
@@ -1024,7 +1144,10 @@ mod tests {
         .await
         .expect("filesystem history read should canonicalize");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_file_history"]);
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_file_history"]
+        );
         assert!(prepared.effective_state_request.is_none());
         assert!(prepared.effective_state_plan.is_none());
         assert_eq!(
@@ -1048,6 +1171,68 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_change ch"));
         assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
         assert!(!lowered_sql.contains("FROM lix_file_history"));
+    }
+
+    #[tokio::test]
+    async fn binds_active_root_commit_for_filesystem_history_reads_without_explicit_root() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+        );
+
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT id, path, lixcol_commit_id, lixcol_depth \
+                 FROM lix_file_history \
+                 WHERE id = 'file-1' \
+                 ORDER BY lixcol_depth ASC",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("filesystem history read should canonicalize");
+
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("filesystem history read should lower");
+        assert!(lowered_sql.contains("c.entity_id = 'commit-active-root'"));
+    }
+
+    #[tokio::test]
+    async fn binds_active_root_commit_for_entity_history_reads_without_explicit_root() {
+        let mut backend = FakeBackend::default();
+        backend.version_pointer_rows.insert(
+            "main".to_string(),
+            crate::version::version_pointer_snapshot_content("main", "commit-active-root"),
+        );
+
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT key, value, lixcol_commit_id, lixcol_depth \
+                 FROM lix_key_value_history \
+                 WHERE key = 'hello' \
+                 ORDER BY lixcol_depth ASC",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("entity history read should canonicalize");
+
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("entity history read should lower");
+        assert!(lowered_sql.contains("c.entity_id = 'commit-active-root'"));
     }
 
     #[tokio::test]
@@ -1458,7 +1643,10 @@ mod tests {
         .await
         .expect("active version update should prepare through sql2");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_active_version"]);
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_active_version"]
+        );
         assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
@@ -1492,17 +1680,22 @@ mod tests {
         .await
         .expect("active account delete should prepare through sql2");
 
-        assert_eq!(prepared.debug_trace.surface_bindings, vec!["lix_active_account"]);
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_active_account"]
+        );
         assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
         assert!(prepared.planned_write.commit_preconditions.is_none());
         assert!(prepared.domain_change_batch.is_none());
-        assert!(prepared
-            .planned_write
-            .resolved_write_plan
-            .as_ref()
-            .expect("resolved write plan should exist")
-            .intended_post_state[0]
-            .tombstone);
+        assert!(
+            prepared
+                .planned_write
+                .resolved_write_plan
+                .as_ref()
+                .expect("resolved write plan should exist")
+                .intended_post_state[0]
+                .tombstone
+        );
     }
 
     #[tokio::test]

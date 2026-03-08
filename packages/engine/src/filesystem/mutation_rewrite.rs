@@ -138,6 +138,7 @@ pub async fn insert_side_effect_statements_with_backend(
     backend: &dyn LixBackend,
     insert: &Insert,
     params: &[EngineValue],
+    active_version_id_hint: Option<&str>,
 ) -> Result<FilesystemInsertSideEffects, LixError> {
     let Some(target) = target_from_table_object(&insert.table) else {
         return Ok(FilesystemInsertSideEffects::default());
@@ -171,7 +172,19 @@ pub async fn insert_side_effect_statements_with_backend(
             || column.value.eq_ignore_ascii_case("version_id")
     });
     let active_version_id = if target.uses_active_version_scope() {
-        Some(load_active_version_id(backend).await?)
+        Some(
+            active_version_id_hint.map(ToString::to_string).unwrap_or(
+                load_active_version_id(backend)
+                    .await
+                    .map_err(|error| LixError {
+                        code: error.code,
+                        description: format!(
+                        "filesystem insert side-effect discovery active-version lookup failed: {}",
+                        error.description
+                    ),
+                    })?,
+            ),
+        )
     } else {
         None
     };
@@ -282,7 +295,14 @@ pub async fn insert_side_effect_statements_with_backend(
 
         if let Some(existing_id) =
             find_directory_id_by_path(backend, &version_id, &path, &mut read_rewrite_session)
-                .await?
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                "filesystem insert side-effect discovery directory lookup failed for '{}': {}",
+                path, error.description
+            ),
+                })?
         {
             known_ids.insert(key, existing_id);
             continue;
@@ -299,7 +319,14 @@ pub async fn insert_side_effect_statements_with_backend(
                     &parent_path,
                     &mut read_rewrite_session,
                 )
-                .await?
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "filesystem insert side-effect discovery parent directory lookup failed for '{}': {}",
+                        parent_path, error.description
+                    ),
+                })?
                 {
                     known_ids.insert(parent_key, existing_parent_id.clone());
                     Some(existing_parent_id)
@@ -431,6 +458,7 @@ pub async fn update_side_effects_with_backend(
         params,
         target,
         &mut version_predicate_state,
+        None,
     )
     .await?;
     let matching_file_ids = file_ids_matching_update(
@@ -440,6 +468,7 @@ pub async fn update_side_effects_with_backend(
         params,
         selection_placeholder_state,
         &mut read_rewrite_session,
+        None,
     )
     .await?;
     if matching_file_ids.is_empty() {
@@ -509,6 +538,7 @@ pub async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     mut update: Update,
     params: &[EngineValue],
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
     let Some(target) = target_from_update_table(&update.table) else {
         return Ok(None);
@@ -539,6 +569,7 @@ pub async fn rewrite_update_with_backend(
             &original_assignments,
             params,
             target,
+            active_version_id_hint,
         )
         .await?;
         if update.selection.is_some() {
@@ -560,6 +591,7 @@ pub async fn rewrite_update_with_backend(
                 params,
                 &mut read_rewrite_session,
                 "update",
+                active_version_id_hint,
             )
             .await?;
             let predicate =
@@ -567,8 +599,14 @@ pub async fn rewrite_update_with_backend(
             update.selection = Some(parse_expression(&predicate)?);
         }
     } else {
-        rewrite_directory_update_assignments_with_backend(backend, &mut update, params, target)
-            .await?;
+        rewrite_directory_update_assignments_with_backend(
+            backend,
+            &mut update,
+            params,
+            target,
+            active_version_id_hint,
+        )
+        .await?;
     }
 
     replace_update_target_table(&mut update.table, target.rewrite_view_name)?;
@@ -597,6 +635,7 @@ pub async fn rewrite_delete_with_backend(
     backend: &dyn LixBackend,
     mut delete: Delete,
     params: &[EngineValue],
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<Delete>, LixError> {
     let Some(target) = target_from_delete(&delete) else {
         return Ok(None);
@@ -634,6 +673,7 @@ pub async fn rewrite_delete_with_backend(
             target,
             params,
             &mut read_rewrite_session,
+            active_version_id_hint,
         )
         .await?;
         let expanded =
@@ -660,6 +700,7 @@ pub async fn rewrite_delete_with_backend(
             params,
             &mut read_rewrite_session,
             "delete",
+            active_version_id_hint,
         )
         .await?;
         let predicate =
@@ -1166,6 +1207,7 @@ async fn rewrite_file_update_assignments_with_backend(
     original_assignments: &[Assignment],
     params: &[EngineValue],
     target: FilesystemTarget,
+    active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
     let mut read_rewrite_session = ReadRewriteSession::default();
     let mut placeholder_state = PlaceholderState::new();
@@ -1192,6 +1234,7 @@ async fn rewrite_file_update_assignments_with_backend(
         params,
         target,
         &mut version_predicate_state,
+        active_version_id_hint,
     )
     .await?;
     let parsed = parse_file_path(&raw_path)?;
@@ -1209,6 +1252,7 @@ async fn rewrite_file_update_assignments_with_backend(
         params,
         selection_placeholder_state,
         &mut read_rewrite_session,
+        active_version_id_hint,
     )
     .await?;
     let matching_file_ids = matching_file_ids
@@ -1345,6 +1389,7 @@ async fn rewrite_directory_update_assignments_with_backend(
     update: &mut Update,
     params: &[EngineValue],
     target: FilesystemTarget,
+    active_version_id_hint: Option<&str>,
 ) -> Result<(), LixError> {
     let mut placeholder_state = PlaceholderState::new();
     let mut read_rewrite_session = ReadRewriteSession::default();
@@ -1377,8 +1422,15 @@ async fn rewrite_directory_update_assignments_with_backend(
         return Ok(());
     }
 
-    let version_id =
-        resolve_update_version_id(backend, update, params, target, &mut placeholder_state).await?;
+    let version_id = resolve_update_version_id(
+        backend,
+        update,
+        params,
+        target,
+        &mut placeholder_state,
+        active_version_id_hint,
+    )
+    .await?;
     let current_directory_id =
         extract_predicate_string(update.selection.as_ref(), &["id", "lixcol_entity_id"]);
     let Some(current_directory_id) = current_directory_id else {
@@ -1544,9 +1596,12 @@ async fn resolve_update_version_id(
     params: &[EngineValue],
     target: FilesystemTarget,
     placeholder_state: &mut PlaceholderState,
+    active_version_id_hint: Option<&str>,
 ) -> Result<String, LixError> {
     if target.uses_active_version_scope() {
-        return load_active_version_id(backend).await;
+        return Ok(active_version_id_hint
+            .map(ToString::to_string)
+            .unwrap_or(load_active_version_id(backend).await?));
     }
     if target.requires_explicit_version_scope() {
         return extract_predicate_string_with_params_and_state(
@@ -2797,6 +2852,7 @@ async fn directory_rows_matching_delete(
     target: FilesystemTarget,
     params: &[EngineValue],
     read_rewrite_session: &mut ReadRewriteSession,
+    active_version_id_hint: Option<&str>,
 ) -> Result<Vec<ScopedDirectoryId>, LixError> {
     let where_clause = delete
         .selection
@@ -2804,7 +2860,11 @@ async fn directory_rows_matching_delete(
         .map(|selection| format!(" WHERE {selection}"))
         .unwrap_or_default();
     let active_version_id = if target.uses_active_version_scope() {
-        Some(load_active_version_id(backend).await?)
+        Some(
+            active_version_id_hint
+                .map(ToString::to_string)
+                .unwrap_or(load_active_version_id(backend).await?),
+        )
     } else {
         None
     };
@@ -2908,9 +2968,14 @@ async fn file_rows_matching_selection(
     params: &[EngineValue],
     read_rewrite_session: &mut ReadRewriteSession,
     operation: &str,
+    active_version_id_hint: Option<&str>,
 ) -> Result<Vec<ScopedFileSelectionRow>, LixError> {
     let active_version_id = if target.uses_active_version_scope() {
-        Some(load_active_version_id(backend).await?)
+        Some(
+            active_version_id_hint
+                .map(ToString::to_string)
+                .unwrap_or(load_active_version_id(backend).await?),
+        )
     } else {
         None
     };
@@ -3040,6 +3105,7 @@ async fn file_ids_matching_update(
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
     read_rewrite_session: &mut ReadRewriteSession,
+    active_version_id_hint: Option<&str>,
 ) -> Result<Vec<ScopedFileUpdateRow>, LixError> {
     let trace = file_prefetch_trace_enabled();
     if let Some(rows) = try_file_ids_matching_update_fast(
@@ -3049,6 +3115,7 @@ async fn file_ids_matching_update(
         params,
         placeholder_state,
         read_rewrite_session,
+        active_version_id_hint,
     )
     .await?
     {
@@ -3062,7 +3129,11 @@ async fn file_ids_matching_update(
     }
 
     let active_version_id = if target.uses_active_version_scope() {
-        Some(load_active_version_id(backend).await?)
+        Some(
+            active_version_id_hint
+                .map(ToString::to_string)
+                .unwrap_or(load_active_version_id(backend).await?),
+        )
     } else {
         None
     };
@@ -3141,6 +3212,7 @@ async fn try_file_ids_matching_update_fast(
     params: &[EngineValue],
     placeholder_state: PlaceholderState,
     read_rewrite_session: &mut ReadRewriteSession,
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<Vec<ScopedFileUpdateRow>>, LixError> {
     let mut selection_state = placeholder_state;
     let Some(selection) = extract_exact_file_update_selection_with_state(
@@ -3159,7 +3231,9 @@ async fn try_file_ids_matching_update_fast(
         return Ok(None);
     };
     let version_id = if target.uses_active_version_scope() {
-        load_active_version_id(backend).await?
+        active_version_id_hint
+            .map(ToString::to_string)
+            .unwrap_or(load_active_version_id(backend).await?)
     } else if target.requires_explicit_version_scope() {
         let Some(version_id) = selection.explicit_version_id else {
             return Ok(None);

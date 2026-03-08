@@ -38,10 +38,18 @@ impl Engine {
                     skip_side_effect_collection,
                 },
             )
-            .await?
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "transaction prepare_execution_with_backend failed: {}",
+                    error.description
+                ),
+            })?
         };
 
         let execution = match shared_path::maybe_execute_sql2_write_with_transaction(
+            self,
             transaction,
             &prepared,
             writer_key,
@@ -63,15 +71,30 @@ impl Engine {
                 Ok(execution) => execution,
                 Err(error) => {
                     let backend = TransactionBackendAdapter::new(transaction);
-                    return Err(normalize_sql_execution_error_with_backend(
+                    let normalized = normalize_sql_execution_error_with_backend(
                         &backend,
                         error,
                         &parsed_statements,
                     )
-                    .await);
+                    .await;
+                    return Err(LixError {
+                        code: normalized.code,
+                        description: format!(
+                            "transaction legacy plan execution failed: {}",
+                            normalized.description
+                        ),
+                    });
                 }
             },
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(LixError {
+                    code: error.code,
+                    description: format!(
+                        "transaction sql2 write execution failed: {}",
+                        error.description
+                    ),
+                })
+            }
         };
 
         let active_effects = execution
@@ -105,6 +128,8 @@ impl Engine {
                     .clone(),
             );
         } else {
+            let filesystem_payload_changes_already_committed =
+                shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared);
             if !prepared
                 .intent
                 .untracked_filesystem_update_domain_changes
@@ -114,25 +139,59 @@ impl Engine {
                     transaction,
                     &prepared.intent.untracked_filesystem_update_domain_changes,
                 )
-                .await?;
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "transaction untracked filesystem side effects failed: {}",
+                        error.description
+                    ),
+                })?;
             }
-            self.persist_pending_file_data_updates_in_transaction(
-                transaction,
-                &prepared.intent.pending_file_writes,
-            )
-            .await?;
-            let filesystem_payload_domain_changes = self
-                .collect_live_filesystem_payload_domain_changes_in_transaction(
+            if !filesystem_payload_changes_already_committed {
+                self.persist_pending_file_data_updates_in_transaction(
+                    transaction,
+                    &prepared.intent.pending_file_writes,
+                )
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "transaction pending filesystem payload persistence failed: {}",
+                        error.description
+                    ),
+                })?;
+            }
+            // Live sql2 filesystem writes already commit descriptor and payload domain changes
+            // through the append boundary. Re-deriving payload effects from pre-commit state
+            // inside the same transaction can observe incomplete runtime state and abort the
+            // transaction on Postgres.
+            let filesystem_payload_domain_changes = if filesystem_payload_changes_already_committed
+            {
+                Vec::new()
+            } else {
+                self.collect_live_filesystem_payload_domain_changes_in_transaction(
                     transaction,
                     &prepared.intent.pending_file_writes,
                     &prepared.intent.pending_file_delete_targets,
                     writer_key,
                 )
-                .await?;
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "transaction filesystem payload-domain-change collection failed: {}",
+                        error.description
+                    ),
+                })?
+            };
             let mut tracked_domain_changes = prepared.intent.detected_file_domain_changes.clone();
             tracked_domain_changes.extend(filesystem_payload_domain_changes.clone());
             tracked_domain_changes = dedupe_detected_file_domain_changes(&tracked_domain_changes);
-            let tracked_domain_changes_to_persist = if execution.plugin_changes_committed {
+            let tracked_domain_changes_to_persist = if filesystem_payload_changes_already_committed
+            {
+                Vec::new()
+            } else if execution.plugin_changes_committed {
                 dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes)
             } else {
                 tracked_domain_changes.clone()
@@ -142,14 +201,30 @@ impl Engine {
                     transaction,
                     &tracked_domain_changes_to_persist,
                 )
-                .await?;
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "transaction tracked filesystem side-effect persistence failed: {}",
+                        error.description
+                    ),
+                })?;
             }
-            if should_run_binary_cas_gc(
-                &prepared.plan.preprocess.mutations,
-                &tracked_domain_changes,
-            ) {
+            if !filesystem_payload_changes_already_committed
+                && should_run_binary_cas_gc(
+                    &prepared.plan.preprocess.mutations,
+                    &tracked_domain_changes,
+                )
+            {
                 self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-                    .await?;
+                    .await
+                    .map_err(|error| LixError {
+                        code: error.code,
+                        description: format!(
+                            "transaction binary CAS garbage collection failed: {}",
+                            error.description
+                        ),
+                    })?;
             }
         }
         self.persist_runtime_sequence_with_backend(
@@ -158,7 +233,14 @@ impl Engine {
             prepared.sequence_start,
             &prepared.functions,
         )
-        .await?;
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "transaction runtime-sequence persistence failed: {}",
+                error.description
+            ),
+        })?;
 
         pending_state_commit_stream_changes.extend(state_commit_stream_changes);
         Ok(execution.public_result)

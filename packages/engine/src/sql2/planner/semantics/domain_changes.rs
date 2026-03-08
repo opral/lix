@@ -1,6 +1,5 @@
 use crate::commit::{
-    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id,
-    ProposedDomainChange,
+    load_committed_global_tip_commit_id, load_committed_version_tip_commit_id, ProposedDomainChange,
 };
 use crate::sql2::planner::ir::{
     CommitPreconditions, ExpectedTip, IdempotencyKey, PlannedWrite, WriteLane, WriteMode,
@@ -118,8 +117,7 @@ pub(crate) async fn derive_commit_preconditions(
                 .to_string(),
         })?;
     let mut executor = backend;
-    let current_tip = current_tip_for_write_lane(&mut executor, &write_lane, planned_write)
-        .await?;
+    let current_tip = current_tip_for_write_lane(&mut executor, &write_lane, planned_write).await?;
     let idempotency_key = build_idempotency_key(planned_write, &write_lane, &current_tip)?;
 
     Ok(Some(CommitPreconditions {
@@ -154,15 +152,17 @@ async fn current_tip_for_write_lane(
                     ),
                 })
         }
-        WriteLane::SingleVersion(version_id) => load_committed_version_tip_commit_id(executor, version_id)
-            .await
-            .map_err(domain_change_backend_error)?
-            .ok_or_else(|| DomainChangeError {
-                message: format!(
-                    "sql2 commit precondition derivation could not find a version tip for '{}'",
-                    version_id
-                ),
-            }),
+        WriteLane::SingleVersion(version_id) => {
+            load_committed_version_tip_commit_id(executor, version_id)
+                .await
+                .map_err(domain_change_backend_error)?
+                .ok_or_else(|| DomainChangeError {
+                    message: format!(
+                        "sql2 commit precondition derivation could not find a version tip for '{}'",
+                        version_id
+                    ),
+                })
+        }
         WriteLane::GlobalAdmin => load_committed_global_tip_commit_id(executor)
             .await
             .map_err(domain_change_backend_error)?

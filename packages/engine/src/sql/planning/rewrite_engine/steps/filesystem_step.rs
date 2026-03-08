@@ -41,8 +41,15 @@ pub async fn insert_side_effect_statements_with_backend(
     backend: &dyn LixBackend,
     insert: &Insert,
     params: &[EngineValue],
+    active_version_id_hint: Option<&str>,
 ) -> Result<FilesystemInsertSideEffects, LixError> {
-    mutation_rewrite::insert_side_effect_statements_with_backend(backend, insert, params).await
+    mutation_rewrite::insert_side_effect_statements_with_backend(
+        backend,
+        insert,
+        params,
+        active_version_id_hint,
+    )
+    .await
 }
 
 pub fn rewrite_update(update: Update) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
@@ -53,8 +60,10 @@ pub async fn rewrite_update_with_backend(
     backend: &dyn LixBackend,
     update: Update,
     params: &[EngineValue],
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<FilesystemUpdateRewrite>, LixError> {
-    mutation_rewrite::rewrite_update_with_backend(backend, update, params).await
+    mutation_rewrite::rewrite_update_with_backend(backend, update, params, active_version_id_hint)
+        .await
 }
 
 pub fn rewrite_delete(delete: Delete) -> Result<Option<Delete>, LixError> {
@@ -65,6 +74,8 @@ pub async fn rewrite_delete_with_backend(
     backend: &dyn LixBackend,
     delete: Delete,
     params: &[EngineValue],
+    active_version_id_hint: Option<&str>,
 ) -> Result<Option<Delete>, LixError> {
-    mutation_rewrite::rewrite_delete_with_backend(backend, delete, params).await
+    mutation_rewrite::rewrite_delete_with_backend(backend, delete, params, active_version_id_hint)
+        .await
 }
