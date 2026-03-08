@@ -64,6 +64,7 @@ pub(crate) struct CacheTargets {
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
 struct Sql2AppendInvariantChecker<'a> {
     planned_write: &'a crate::sql2::planner::ir::PlannedWrite,
@@ -489,7 +490,14 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
                 .intent
                 .detected_file_domain_changes
                 .iter()
-                .all(|change| change.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY);
+                .all(|change| {
+                    matches!(
+                        change.schema_key.as_str(),
+                        DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                            | FILE_DESCRIPTOR_SCHEMA_KEY
+                            | BINARY_BLOB_REF_SCHEMA_KEY
+                    )
+                });
 
     matches!(
         prepared.plan.result_contract,
@@ -503,9 +511,6 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         && (prepared.intent.detected_file_domain_changes.is_empty()
             || filesystem_directory_side_effects_only
             || filesystem_file_side_effects_only)
-        && (filesystem_file_side_effects_only
-            || (prepared.intent.pending_file_writes.is_empty()
-                && prepared.intent.pending_file_delete_targets.is_empty()))
         && prepared
             .intent
             .untracked_filesystem_update_domain_changes

@@ -145,7 +145,7 @@ fn dependency_spec_for_filesystem_scan(
 
     if matches!(
         binding.descriptor.public_name.as_str(),
-        "lix_file" | "lix_directory" | "lix_file_history"
+        "lix_file" | "lix_directory" | "lix_file_history" | "lix_directory_history"
     ) {
         spec.depends_on_active_version = true;
         spec.schema_keys.insert("lix_active_version".to_string());
