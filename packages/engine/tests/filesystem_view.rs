@@ -1279,6 +1279,179 @@ simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
     assert!(after_delete_b.statements[0].rows.is_empty());
 });
 
+simulation_test!(
+    file_by_version_insert_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_sql = version_id.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                     VALUES ('file-idem-insert', '/idem-insert.json', X'6869', '{version_sql}')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(
+            &rows.statements[0].rows[0][0],
+            &format!("version:{version_id}"),
+        );
+        match &rows.statements[0].rows[0][1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
+    }
+);
+
+simulation_test!(
+    file_by_version_update_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_sql = version_id.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                     VALUES ('file-idem-update', '/idem-update.json', X'6869', '{version_sql}')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before_update = engine
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
+            .await
+            .unwrap();
+        assert_integer(&before_update.statements[0].rows[0][0], 1);
+
+        engine
+            .execute(
+                &format!(
+                    "UPDATE lix_file_by_version \
+                     SET data = X'68692d75706461746564' \
+                     WHERE id = 'file-idem-update' AND lixcol_version_id = '{version_sql}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(
+            &rows.statements[0].rows[1][0],
+            &format!("version:{version_id}"),
+        );
+        match &rows.statements[0].rows[1][1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
+    }
+);
+
+simulation_test!(
+    file_by_version_delete_records_append_idempotency,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_sql = version_id.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                     VALUES ('file-idem-delete', '/idem-delete.json', X'6869', '{version_sql}')"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before_delete = engine
+            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
+            .await
+            .unwrap();
+        assert_integer(&before_delete.statements[0].rows[0][0], 1);
+
+        engine
+            .execute(
+                &format!(
+                    "DELETE FROM lix_file_by_version \
+                     WHERE id = 'file-idem-delete' AND lixcol_version_id = '{version_sql}'"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let rows = engine
+            .execute(
+                "SELECT write_lane, commit_id \
+                 FROM lix_internal_commit_idempotency \
+                 ORDER BY write_lane, idempotency_key",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sim.assert_deterministic(rows.statements[0].rows.clone());
+        assert_eq!(rows.statements[0].rows.len(), 2);
+        assert_text(
+            &rows.statements[0].rows[1][0],
+            &format!("version:{version_id}"),
+        );
+        match &rows.statements[0].rows[1][1] {
+            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+            other => panic!("expected text commit_id, got {other:?}"),
+        }
+    }
+);
+
 simulation_test!(file_by_version_requires_version_id, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
