@@ -349,14 +349,10 @@ async fn resolve_filesystem_write(
                     resolve_directory_insert_write_plan(backend, planned_write, target_write_lane)
                         .await
                 }
-                WriteOperationKind::Update => {
+                WriteOperationKind::Update | WriteOperationKind::Delete => {
                     resolve_existing_directory_write(backend, planned_write, target_write_lane)
                         .await
                 }
-                WriteOperationKind::Delete => Err(WriteResolveError {
-                    message: "sql2 filesystem live slice does not yet support directory deletes"
-                        .to_string(),
-                }),
             }
         }
         other => Err(WriteResolveError {
@@ -446,6 +442,18 @@ async fn resolve_existing_directory_write(
             target_write_lane,
         });
     };
+    if !directory_row_matches_exact_filters(
+        &current_row,
+        &planned_write.command.selector.exact_filters,
+    ) {
+        return Ok(ResolvedWritePlan {
+            authoritative_pre_state: Vec::new(),
+            intended_post_state: Vec::new(),
+            tombstones: Vec::new(),
+            lineage: Vec::new(),
+            target_write_lane,
+        });
+    }
 
     match planned_write.command.mode {
         WriteMode::Tracked if current_row.untracked => {
@@ -463,47 +471,157 @@ async fn resolve_existing_directory_write(
         _ => {}
     }
 
-    let MutationPayload::Patch(payload) = &planned_write.command.payload else {
-        return Err(WriteResolveError {
-            message: "sql2 filesystem directory update requires a patch payload".to_string(),
-        });
-    };
-    if payload.contains_key("id") {
-        return Err(WriteResolveError {
-            message:
-                "lix_directory id is immutable; create a new row and delete the old row instead"
-                    .to_string(),
-        });
+    match planned_write.command.operation_kind {
+        WriteOperationKind::Update => {
+            let MutationPayload::Patch(payload) = &planned_write.command.payload else {
+                return Err(WriteResolveError {
+                    message: "sql2 filesystem directory update requires a patch payload"
+                        .to_string(),
+                });
+            };
+            if payload.contains_key("id") {
+                return Err(WriteResolveError {
+                    message:
+                        "lix_directory id is immutable; create a new row and delete the old row instead"
+                            .to_string(),
+                });
+            }
+
+            let next_row =
+                resolve_directory_update_target(backend, &current_row, payload, &version_id)
+                    .await?;
+            let row_ref = ResolvedRowRef {
+                entity_id: current_row.id.clone(),
+                schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
+                version_id: Some(version_id.clone()),
+                source_change_id: current_row.change_id.clone(),
+                source_commit_id: None,
+            };
+
+            Ok(ResolvedWritePlan {
+                authoritative_pre_state: vec![row_ref.clone()],
+                intended_post_state: vec![directory_descriptor_row(
+                    &current_row.id,
+                    next_row.parent_id.as_deref(),
+                    &next_row.name,
+                    next_row.hidden,
+                    &version_id,
+                    next_row.metadata.as_deref(),
+                )],
+                tombstones: Vec::new(),
+                lineage: vec![RowLineage {
+                    entity_id: current_row.id,
+                    source_change_id: row_ref.source_change_id,
+                    source_commit_id: None,
+                }],
+                target_write_lane,
+            })
+        }
+        WriteOperationKind::Delete => {
+            let descendant_directories =
+                load_directory_rows_under_path(backend, &version_id, &current_row.path).await?;
+            let descendant_files =
+                load_file_rows_under_path(backend, &version_id, &current_row.path).await?;
+
+            match planned_write.command.mode {
+                WriteMode::Tracked
+                    if descendant_directories.iter().any(|row| row.untracked)
+                        || descendant_files.iter().any(|row| row.untracked) =>
+                {
+                    return Err(WriteResolveError {
+                        message: "sql2 live tracked filesystem directory deletes do not yet support untracked winners in the cascade".to_string(),
+                    });
+                }
+                WriteMode::Untracked
+                    if descendant_directories.iter().any(|row| !row.untracked)
+                        || descendant_files.iter().any(|row| !row.untracked) =>
+                {
+                    return Err(WriteResolveError {
+                        message: "sql2 untracked filesystem directory delete requires untracked visible rows throughout the cascade".to_string(),
+                    });
+                }
+                _ => {}
+            }
+
+            let mut authoritative_pre_state = Vec::new();
+            let mut intended_post_state = Vec::new();
+            let mut tombstones = Vec::new();
+            let mut lineage = Vec::new();
+
+            for row in &descendant_directories {
+                let row_ref = ResolvedRowRef {
+                    entity_id: row.id.clone(),
+                    schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
+                    version_id: Some(version_id.clone()),
+                    source_change_id: row.change_id.clone(),
+                    source_commit_id: None,
+                };
+                authoritative_pre_state.push(row_ref.clone());
+                intended_post_state.push(directory_descriptor_tombstone_row(
+                    &row.id,
+                    row.parent_id.as_deref(),
+                    &row.name,
+                    row.hidden,
+                    &version_id,
+                    row.metadata.as_deref(),
+                ));
+                tombstones.push(row_ref);
+                lineage.push(RowLineage {
+                    entity_id: row.id.clone(),
+                    source_change_id: row.change_id.clone(),
+                    source_commit_id: None,
+                });
+            }
+
+            for row in &descendant_files {
+                let file_ref = ResolvedRowRef {
+                    entity_id: row.id.clone(),
+                    schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
+                    version_id: Some(version_id.clone()),
+                    source_change_id: row.change_id.clone(),
+                    source_commit_id: None,
+                };
+                let blob_ref = ResolvedRowRef {
+                    entity_id: row.id.clone(),
+                    schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+                    version_id: Some(version_id.clone()),
+                    source_change_id: None,
+                    source_commit_id: None,
+                };
+                authoritative_pre_state.push(file_ref.clone());
+                authoritative_pre_state.push(blob_ref.clone());
+                intended_post_state.push(file_descriptor_tombstone_row(
+                    &row.id,
+                    row.directory_id.as_deref(),
+                    &row.name,
+                    row.extension.as_deref(),
+                    row.hidden,
+                    &version_id,
+                    row.metadata.as_deref(),
+                ));
+                intended_post_state.push(binary_blob_ref_tombstone_row(&row.id, &version_id));
+                tombstones.push(file_ref);
+                tombstones.push(blob_ref);
+                lineage.push(RowLineage {
+                    entity_id: row.id.clone(),
+                    source_change_id: row.change_id.clone(),
+                    source_commit_id: None,
+                });
+            }
+
+            Ok(ResolvedWritePlan {
+                authoritative_pre_state,
+                intended_post_state,
+                tombstones,
+                lineage,
+                target_write_lane,
+            })
+        }
+        WriteOperationKind::Insert => Err(WriteResolveError {
+            message: "sql2 filesystem directory existing-row resolver does not handle inserts"
+                .to_string(),
+        }),
     }
-
-    let next_row =
-        resolve_directory_update_target(backend, &current_row, payload, &version_id).await?;
-    let row_ref = ResolvedRowRef {
-        entity_id: current_row.id.clone(),
-        schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
-        version_id: Some(version_id.clone()),
-        source_change_id: current_row.change_id.clone(),
-        source_commit_id: None,
-    };
-
-    Ok(ResolvedWritePlan {
-        authoritative_pre_state: vec![row_ref.clone()],
-        intended_post_state: vec![directory_descriptor_row(
-            &current_row.id,
-            next_row.parent_id.as_deref(),
-            &next_row.name,
-            next_row.hidden,
-            &version_id,
-            next_row.metadata.as_deref(),
-        )],
-        tombstones: Vec::new(),
-        lineage: vec![RowLineage {
-            entity_id: current_row.id,
-            source_change_id: row_ref.source_change_id,
-            source_commit_id: None,
-        }],
-        target_write_lane,
-    })
 }
 
 async fn resolve_file_insert_write_plan(
@@ -587,6 +705,16 @@ async fn resolve_existing_file_write(
             target_write_lane,
         });
     };
+    if !file_row_matches_exact_filters(&current_row, &planned_write.command.selector.exact_filters)
+    {
+        return Ok(ResolvedWritePlan {
+            authoritative_pre_state: Vec::new(),
+            intended_post_state: Vec::new(),
+            tombstones: Vec::new(),
+            lineage: Vec::new(),
+            target_write_lane,
+        });
+    }
 
     match planned_write.command.mode {
         WriteMode::Tracked if current_row.untracked => {
@@ -1394,25 +1522,38 @@ async fn load_directory_row_from_sql(
     backend: &dyn LixBackend,
     sql: &str,
 ) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
+    Ok(load_directory_rows_from_sql(backend, sql)
+        .await?
+        .into_iter()
+        .next())
+}
+
+async fn load_directory_rows_from_sql(
+    backend: &dyn LixBackend,
+    sql: &str,
+) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
     let lowered_sql = lower_internal_sql_for_backend(backend, sql)?;
     let result = backend
         .execute(&lowered_sql, &[])
         .await
         .map_err(write_resolve_backend_error)?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(DirectoryFilesystemRow {
-        id: required_text_value(row, "id")?,
-        parent_id: optional_text_value(row.get(1)),
-        name: required_text_value_index(row, 2, "name")?,
-        path: required_text_value_index(row, 3, "path")?,
-        hidden: row.get(4).and_then(value_as_bool).unwrap_or(false),
-        version_id: required_text_value_index(row, 5, "lixcol_version_id")?,
-        untracked: row.get(6).and_then(value_as_bool).unwrap_or(false),
-        metadata: row.get(7).and_then(text_from_value),
-        change_id: row.get(8).and_then(text_from_value),
-    }))
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(DirectoryFilesystemRow {
+                id: required_text_value(row, "id")?,
+                parent_id: optional_text_value(row.get(1)),
+                name: required_text_value_index(row, 2, "name")?,
+                path: required_text_value_index(row, 3, "path")?,
+                hidden: row.get(4).and_then(value_as_bool).unwrap_or(false),
+                version_id: required_text_value_index(row, 5, "lixcol_version_id")?,
+                untracked: row.get(6).and_then(value_as_bool).unwrap_or(false),
+                metadata: row.get(7).and_then(text_from_value),
+                change_id: row.get(8).and_then(text_from_value),
+            })
+        })
+        .collect()
 }
 
 async fn load_file_row_by_path(
@@ -1457,26 +1598,81 @@ async fn load_file_row_from_sql(
     backend: &dyn LixBackend,
     sql: &str,
 ) -> Result<Option<FileFilesystemRow>, WriteResolveError> {
+    Ok(load_file_rows_from_sql(backend, sql)
+        .await?
+        .into_iter()
+        .next())
+}
+
+async fn load_file_rows_from_sql(
+    backend: &dyn LixBackend,
+    sql: &str,
+) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
     let lowered_sql = lower_internal_sql_for_backend(backend, sql)?;
     let result = backend
         .execute(&lowered_sql, &[])
         .await
         .map_err(write_resolve_backend_error)?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(FileFilesystemRow {
-        id: required_text_value(row, "id")?,
-        directory_id: optional_text_value(row.get(1)),
-        name: required_text_value_index(row, 2, "name")?,
-        extension: optional_text_value(row.get(3)),
-        path: required_text_value_index(row, 4, "path")?,
-        hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
-        version_id: required_text_value_index(row, 6, "lixcol_version_id")?,
-        untracked: row.get(7).and_then(value_as_bool).unwrap_or(false),
-        metadata: row.get(8).and_then(text_from_value),
-        change_id: row.get(9).and_then(text_from_value),
-    }))
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(FileFilesystemRow {
+                id: required_text_value(row, "id")?,
+                directory_id: optional_text_value(row.get(1)),
+                name: required_text_value_index(row, 2, "name")?,
+                extension: optional_text_value(row.get(3)),
+                path: required_text_value_index(row, 4, "path")?,
+                hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
+                version_id: required_text_value_index(row, 6, "lixcol_version_id")?,
+                untracked: row.get(7).and_then(value_as_bool).unwrap_or(false),
+                metadata: row.get(8).and_then(text_from_value),
+                change_id: row.get(9).and_then(text_from_value),
+            })
+        })
+        .collect()
+}
+
+async fn load_directory_rows_under_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    root_path: &str,
+) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
+    let prefix_length = root_path.chars().count();
+    let sql = format!(
+        "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
+         FROM ({projection_sql}) directories \
+         WHERE lixcol_version_id = '{version_id}' \
+           AND substr(path, 1, {prefix_length}) = '{root_path}' \
+         ORDER BY path ASC, id ASC",
+        projection_sql =
+            build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        version_id = escape_sql_string(version_id),
+        prefix_length = prefix_length,
+        root_path = escape_sql_string(root_path),
+    );
+    load_directory_rows_from_sql(backend, &sql).await
+}
+
+async fn load_file_rows_under_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    root_path: &str,
+) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
+    let prefix_length = root_path.chars().count();
+    let sql = format!(
+        "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id \
+         FROM ({projection_sql}) files \
+         WHERE lixcol_version_id = '{version_id}' \
+           AND substr(path, 1, {prefix_length}) = '{root_path}' \
+         ORDER BY path ASC, id ASC",
+        projection_sql =
+            build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false),
+        version_id = escape_sql_string(version_id),
+        prefix_length = prefix_length,
+        root_path = escape_sql_string(root_path),
+    );
+    load_file_rows_from_sql(backend, &sql).await
 }
 
 fn directory_descriptor_row(
@@ -1606,6 +1802,21 @@ fn file_descriptor_tombstone_row(
         version_id,
         metadata,
     );
+    row.values.remove("snapshot_content");
+    row.tombstone = true;
+    row
+}
+
+fn directory_descriptor_tombstone_row(
+    entity_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+    hidden: bool,
+    version_id: &str,
+    metadata: Option<&str>,
+) -> PlannedStateRow {
+    let mut row =
+        directory_descriptor_row(entity_id, parent_id, name, hidden, version_id, metadata);
     row.values.remove("snapshot_content");
     row.tombstone = true;
     row
@@ -2601,6 +2812,60 @@ fn ensure_local_tracked_overlay(
         });
     }
     Ok(())
+}
+
+fn directory_row_matches_exact_filters(
+    row: &DirectoryFilesystemRow,
+    exact_filters: &BTreeMap<String, Value>,
+) -> bool {
+    exact_filters.iter().all(|(key, value)| match key.as_str() {
+        "id" => text_from_value(value).is_some_and(|expected| expected == row.id),
+        "path" => text_from_value(value)
+            .map(|expected| normalize_directory_path(&expected))
+            .transpose()
+            .ok()
+            .flatten()
+            .is_some_and(|expected| expected == row.path),
+        "parent_id" => optional_text_matches(value, row.parent_id.as_deref()),
+        "name" => text_from_value(value)
+            .map(|expected| normalize_path_segment(&expected))
+            .transpose()
+            .ok()
+            .flatten()
+            .is_some_and(|expected| expected == row.name),
+        "hidden" => value_as_bool(value).is_some_and(|expected| expected == row.hidden),
+        "version_id" => text_from_value(value).is_some_and(|expected| expected == row.version_id),
+        "untracked" => value_as_bool(value).is_some_and(|expected| expected == row.untracked),
+        "metadata" => optional_text_matches(value, row.metadata.as_deref()),
+        _ => false,
+    })
+}
+
+fn file_row_matches_exact_filters(
+    row: &FileFilesystemRow,
+    exact_filters: &BTreeMap<String, Value>,
+) -> bool {
+    exact_filters.iter().all(|(key, value)| match key.as_str() {
+        "id" => text_from_value(value).is_some_and(|expected| expected == row.id),
+        "path" => text_from_value(value)
+            .map(|expected| parse_file_path(&expected).map(|parsed| parsed.normalized_path))
+            .transpose()
+            .ok()
+            .flatten()
+            .is_some_and(|expected| expected == row.path),
+        "hidden" => value_as_bool(value).is_some_and(|expected| expected == row.hidden),
+        "version_id" => text_from_value(value).is_some_and(|expected| expected == row.version_id),
+        "untracked" => value_as_bool(value).is_some_and(|expected| expected == row.untracked),
+        "metadata" => optional_text_matches(value, row.metadata.as_deref()),
+        _ => false,
+    })
+}
+
+fn optional_text_matches(value: &Value, actual: Option<&str>) -> bool {
+    match value {
+        Value::Null => actual.is_none(),
+        _ => text_from_value(value).is_some_and(|expected| Some(expected.as_str()) == actual),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3838,5 +4103,163 @@ mod tests {
         .expect_err("unsupported selectors should stay off the live sql2 slice");
 
         assert!(error.message.contains("exact conjunctive selectors"));
+    }
+
+    #[tokio::test]
+    async fn resolves_directory_delete_cascade_from_authoritative_pre_state() {
+        #[derive(Default)]
+        struct FilesystemDeleteBackend;
+
+        #[async_trait(?Send)]
+        impl LixBackend for FilesystemDeleteBackend {
+            fn dialect(&self) -> SqlDialect {
+                SqlDialect::Sqlite
+            }
+
+            async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+                if sql.contains("SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id")
+                    && sql.contains("lix_directory_descriptor")
+                {
+                    let rows = if sql.contains("id = 'dir-root'") {
+                        vec![vec![
+                            Value::Text("dir-root".to_string()),
+                            Value::Null,
+                            Value::Text("root".to_string()),
+                            Value::Text("/root/".to_string()),
+                            Value::Boolean(false),
+                            Value::Text("version-a".to_string()),
+                            Value::Boolean(false),
+                            Value::Null,
+                            Value::Text("change-dir-root".to_string()),
+                        ]]
+                    } else if sql.contains("substr(path, 1, 6) = '/root/'") {
+                        vec![
+                            vec![
+                                Value::Text("dir-root".to_string()),
+                                Value::Null,
+                                Value::Text("root".to_string()),
+                                Value::Text("/root/".to_string()),
+                                Value::Boolean(false),
+                                Value::Text("version-a".to_string()),
+                                Value::Boolean(false),
+                                Value::Null,
+                                Value::Text("change-dir-root".to_string()),
+                            ],
+                            vec![
+                                Value::Text("dir-child".to_string()),
+                                Value::Text("dir-root".to_string()),
+                                Value::Text("child".to_string()),
+                                Value::Text("/root/child/".to_string()),
+                                Value::Boolean(false),
+                                Value::Text("version-a".to_string()),
+                                Value::Boolean(false),
+                                Value::Null,
+                                Value::Text("change-dir-child".to_string()),
+                            ],
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(QueryResult {
+                        rows,
+                        columns: vec![
+                            "id".to_string(),
+                            "parent_id".to_string(),
+                            "name".to_string(),
+                            "path".to_string(),
+                            "hidden".to_string(),
+                            "lixcol_version_id".to_string(),
+                            "lixcol_untracked".to_string(),
+                            "lixcol_metadata".to_string(),
+                            "lixcol_change_id".to_string(),
+                        ],
+                    });
+                }
+
+                if sql.contains("SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id")
+                    && sql.contains("lix_file_descriptor")
+                {
+                    let rows = if sql.contains("substr(path, 1, 6) = '/root/'") {
+                        vec![vec![
+                            Value::Text("file-1".to_string()),
+                            Value::Text("dir-child".to_string()),
+                            Value::Text("note".to_string()),
+                            Value::Text("txt".to_string()),
+                            Value::Text("/root/child/note.txt".to_string()),
+                            Value::Boolean(false),
+                            Value::Text("version-a".to_string()),
+                            Value::Boolean(false),
+                            Value::Null,
+                            Value::Text("change-file-1".to_string()),
+                        ]]
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(QueryResult {
+                        rows,
+                        columns: vec![
+                            "id".to_string(),
+                            "directory_id".to_string(),
+                            "name".to_string(),
+                            "extension".to_string(),
+                            "path".to_string(),
+                            "hidden".to_string(),
+                            "lixcol_version_id".to_string(),
+                            "lixcol_untracked".to_string(),
+                            "metadata".to_string(),
+                            "lixcol_change_id".to_string(),
+                        ],
+                    });
+                }
+
+                Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                })
+            }
+
+            async fn begin_transaction(
+                &self,
+            ) -> Result<Box<dyn crate::LixTransaction + '_>, LixError> {
+                Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "transactions are not needed in this test backend".to_string(),
+                })
+            }
+        }
+
+        let backend = FilesystemDeleteBackend;
+        let resolved = resolve_write_plan(
+            &backend,
+            &planned_write(
+                "DELETE FROM lix_directory_by_version \
+                 WHERE id = 'dir-root' \
+                   AND lixcol_version_id = 'version-a'",
+                "main",
+            ),
+        )
+        .await
+        .expect("directory delete should resolve through sql2");
+
+        assert_eq!(
+            resolved.target_write_lane,
+            Some(WriteLane::SingleVersion("version-a".into()))
+        );
+        assert_eq!(resolved.authoritative_pre_state.len(), 4);
+        assert_eq!(resolved.intended_post_state.len(), 4);
+        assert_eq!(resolved.tombstones.len(), 4);
+        assert!(resolved.intended_post_state.iter().all(|row| row.tombstone));
+        assert!(resolved
+            .intended_post_state
+            .iter()
+            .any(|row| row.schema_key == "lix_directory_descriptor"));
+        assert!(resolved
+            .intended_post_state
+            .iter()
+            .any(|row| row.schema_key == "lix_file_descriptor"));
+        assert!(resolved
+            .intended_post_state
+            .iter()
+            .any(|row| row.schema_key == "lix_binary_blob_ref"));
     }
 }
