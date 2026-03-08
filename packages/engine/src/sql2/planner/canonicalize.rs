@@ -8,9 +8,10 @@ use crate::sql2::planner::ir::{
 use crate::sql_shared::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, GroupByExpr, Insert, LimitClause,
-    ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins, Update, Value as SqlValue, Visit, Visitor,
+    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Insert, LimitClause, ObjectNamePart, OrderBy, OrderByKind,
+    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Update,
+    Value as SqlValue, Visit, Visitor,
 };
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -106,10 +107,7 @@ pub(crate) fn canonicalize_read(
                 ))
             })?;
         ReadPlan::filesystem_scan(scan)
-    } else if surface_binding
-        .resolution_capabilities
-        .canonical_admin_scan
-    {
+    } else if surface_binding.resolution_capabilities.canonical_admin_scan {
         let scan =
             CanonicalAdminScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
                 CanonicalizeError::unsupported(format!(
@@ -565,6 +563,8 @@ fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
             | "lix_state_by_version"
             | "lix_version"
             | "lix_active_account"
+            | "lix_file"
+            | "lix_file_by_version"
             | "lix_directory"
             | "lix_directory_by_version"
     )
@@ -581,6 +581,8 @@ fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
             | "lix_version"
             | "lix_active_version"
             | "lix_active_account"
+            | "lix_file"
+            | "lix_file_by_version"
             | "lix_directory"
             | "lix_directory_by_version"
     )
@@ -793,6 +795,10 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
             _ => false,
         },
         SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
+            "lix_file" | "lix_file_by_version" => matches!(
+                column,
+                "id" | "path" | "hidden" | "metadata" | "data" | "version_id" | "untracked"
+            ),
             "lix_directory" | "lix_directory_by_version" => matches!(
                 column,
                 "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
@@ -868,6 +874,15 @@ fn canonical_write_column_key(
             ))),
         },
         SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
+            "lix_file" | "lix_file_by_version" => match column.as_str() {
+                "id" | "path" | "hidden" | "version_id" | "untracked" | "metadata" | "data" => {
+                    Ok(column)
+                }
+                _ => Err(CanonicalizeError::unsupported(format!(
+                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                ))),
+            },
             "lix_directory" | "lix_directory_by_version" => match column.as_str() {
                 "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
                 | "metadata" => Ok(column),
@@ -881,12 +896,10 @@ fn canonical_write_column_key(
                 surface_binding.descriptor.public_name
             ))),
         },
-        SurfaceFamily::Change => {
-            Err(CanonicalizeError::unsupported(format!(
-                "sql2 day-1 write canonicalizer does not support '{}' writes",
-                surface_binding.descriptor.public_name
-            )))
-        }
+        SurfaceFamily::Change => Err(CanonicalizeError::unsupported(format!(
+            "sql2 day-1 write canonicalizer does not support '{}' writes",
+            surface_binding.descriptor.public_name
+        ))),
     }
 }
 
@@ -897,6 +910,20 @@ fn expr_to_value(
 ) -> Result<Value, CanonicalizeError> {
     match expr {
         Expr::Value(value) => sql_value_to_engine_value(&value.value, params, placeholder_state),
+        Expr::Function(function)
+            if function_name(function)
+                .is_some_and(|name| name.eq_ignore_ascii_case("lix_text_encode")) =>
+        {
+            let encoded = single_function_arg_expr(function, "lix_text_encode")?;
+            match expr_to_value(encoded, params, placeholder_state)? {
+                Value::Text(text) => Ok(Value::Blob(text.into_bytes())),
+                Value::Blob(bytes) => Ok(Value::Blob(bytes)),
+                Value::Null => Ok(Value::Null),
+                _ => Err(CanonicalizeError::unsupported(
+                    "sql2 day-1 write canonicalizer only supports string/blob/null lix_text_encode arguments",
+                )),
+            }
+        }
         Expr::Nested(inner) => expr_to_value(inner, params, placeholder_state),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
             match expr_to_value(expr, params, placeholder_state)? {
@@ -910,6 +937,53 @@ fn expr_to_value(
         _ => Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer only supports literal and placeholder VALUES",
         )),
+    }
+}
+
+fn function_name(function: &sqlparser::ast::Function) -> Option<&str> {
+    function
+        .name
+        .0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.as_str())
+}
+
+fn single_function_arg_expr<'a>(
+    function: &'a sqlparser::ast::Function,
+    function_name: &str,
+) -> Result<&'a Expr, CanonicalizeError> {
+    let args = match &function.args {
+        FunctionArguments::List(list) if list.clauses.is_empty() => list.args.as_slice(),
+        FunctionArguments::None => {
+            return Err(CanonicalizeError::unsupported(format!(
+                "sql2 day-1 write canonicalizer requires one argument for {function_name}",
+            )))
+        }
+        _ => {
+            return Err(CanonicalizeError::unsupported(format!(
+            "sql2 day-1 write canonicalizer does not support complex arguments for {function_name}",
+        )))
+        }
+    };
+    if args.len() != 1 {
+        return Err(CanonicalizeError::unsupported(format!(
+            "sql2 day-1 write canonicalizer requires one argument for {function_name}",
+        )));
+    }
+    match &args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        }
+        | FunctionArg::ExprNamed {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        } => Ok(expr),
+        _ => Err(CanonicalizeError::unsupported(format!(
+            "sql2 day-1 write canonicalizer only supports expression arguments for {function_name}",
+        ))),
     }
 }
 

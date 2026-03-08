@@ -634,13 +634,11 @@ mod tests {
             schema_version: Some("1".to_string()),
             file_id: Some(crate::version::version_descriptor_file_id().to_string()),
             plugin_key: Some(crate::version::version_descriptor_plugin_key().to_string()),
-            snapshot_content: Some(
-                crate::version::version_descriptor_snapshot_content(
-                    "version-a",
-                    "Version A",
-                    false,
-                ),
-            ),
+            snapshot_content: Some(crate::version::version_descriptor_snapshot_content(
+                "version-a",
+                "Version A",
+                false,
+            )),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.to_string(),
             writer_key: Some("writer-a".to_string()),
@@ -824,9 +822,10 @@ mod tests {
     #[tokio::test]
     async fn applies_global_admin_lane_when_tip_matches_expected() {
         let mut transaction = FakeTransaction::default();
-        transaction
-            .version_tips
-            .insert(GLOBAL_VERSION_ID.to_string(), "commit-global-123".to_string());
+        transaction.version_tips.insert(
+            GLOBAL_VERSION_ID.to_string(),
+            "commit-global-123".to_string(),
+        );
         let mut functions = CountingFunctionProvider::default();
 
         let result = append_commit_if_preconditions_hold(

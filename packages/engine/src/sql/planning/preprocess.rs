@@ -53,8 +53,8 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for statement in statements {
-        let output =
-            StatementPipeline::new(params, writer_key).rewrite_statement(statement, provider)?;
+        let output = StatementPipeline::new(params, writer_key, None)
+            .rewrite_statement(statement, provider)?;
         accumulate_rewrite_output(
             from_rewrite_output(output),
             provider,
@@ -91,6 +91,7 @@ async fn preprocess_statements_with_provider_and_backend<P>(
     backend: &dyn LixBackend,
     statements: Vec<Statement>,
     params: &[Value],
+    active_version_id_hint: Option<&str>,
     provider: &mut P,
     detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
     writer_key: Option<&str>,
@@ -113,14 +114,22 @@ where
         // Keep this async rewrite future boxed to avoid infinitely sized
         // futures in recursive rewrite call paths.
         let output = Box::pin(
-            StatementPipeline::new(params, writer_key).rewrite_statement_with_backend(
-                backend,
-                statement,
-                provider,
-                statement_detected_file_domain_changes,
-            ),
+            StatementPipeline::new(params, writer_key, active_version_id_hint)
+                .rewrite_statement_with_backend(
+                    backend,
+                    statement,
+                    provider,
+                    statement_detected_file_domain_changes,
+                ),
         )
-        .await?;
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "preprocess_with_surfaces_to_plan backend rewrite failed for statement {}: {}",
+                statement_index, error.description
+            ),
+        })?;
 
         accumulate_rewrite_output(
             from_rewrite_output(output),
@@ -203,6 +212,7 @@ where
         evaluator,
         parse_sql_statements(sql_text)?,
         params,
+        None,
         functions,
         detected_file_domain_changes_by_statement,
         writer_key,
@@ -215,6 +225,7 @@ pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
     evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
+    active_version_id_hint: Option<&str>,
     functions: SharedFunctionProvider<P>,
     detected_file_domain_changes_by_statement: &[Vec<DetectedFileDomainChange>],
     writer_key: Option<&str>,
@@ -226,7 +237,15 @@ where
     let mut statements = coalesce_vtable_inserts_in_transactions(statements)?;
     normalize_statement_placeholders_in_batch(&mut statements)?;
 
-    materialize_vtable_insert_select_sources(backend, &mut statements, &params).await?;
+    materialize_vtable_insert_select_sources(backend, &mut statements, &params)
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "preprocess_with_surfaces_to_plan insert-select materialization failed: {}",
+                error.description
+            ),
+        })?;
 
     apply_vtable_insert_defaults(
         backend,
@@ -235,13 +254,21 @@ where
         &params,
         functions.clone(),
     )
-    .await?;
+    .await
+    .map_err(|error| LixError {
+        code: error.code,
+        description: format!(
+            "preprocess_with_surfaces_to_plan insert default application failed: {}",
+            error.description
+        ),
+    })?;
 
     let mut provider = functions.clone();
     preprocess_statements_with_provider_and_backend(
         backend,
         statements,
         &params,
+        active_version_id_hint,
         &mut provider,
         detected_file_domain_changes_by_statement,
         writer_key,

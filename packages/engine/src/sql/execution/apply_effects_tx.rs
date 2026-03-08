@@ -13,6 +13,7 @@ pub(crate) async fn apply_sql_backed_effects(
     detected_file_domain_changes: &[DetectedFileDomainChange],
     untracked_filesystem_update_domain_changes: &[DetectedFileDomainChange],
     plugin_changes_committed: bool,
+    filesystem_payload_changes_already_committed: bool,
     writer_key: Option<&str>,
 ) -> Result<(), LixError> {
     let filesystem_payload_domain_changes = engine
@@ -26,7 +27,9 @@ pub(crate) async fn apply_sql_backed_effects(
     tracked_domain_changes.extend(filesystem_payload_domain_changes.clone());
     tracked_domain_changes =
         crate::engine::dedupe_detected_file_domain_changes(&tracked_domain_changes);
-    let tracked_domain_changes_to_persist = if plugin_changes_committed {
+    let tracked_domain_changes_to_persist = if filesystem_payload_changes_already_committed {
+        Vec::new()
+    } else if plugin_changes_committed {
         crate::engine::dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes)
     } else {
         tracked_domain_changes.clone()
@@ -34,9 +37,11 @@ pub(crate) async fn apply_sql_backed_effects(
     let should_run_binary_gc =
         crate::engine::should_run_binary_cas_gc(mutations, &tracked_domain_changes);
 
-    engine
-        .persist_pending_file_data_updates(pending_file_writes)
-        .await?;
+    if !filesystem_payload_changes_already_committed {
+        engine
+            .persist_pending_file_data_updates(pending_file_writes)
+            .await?;
+    }
     if !tracked_domain_changes_to_persist.is_empty() {
         engine
             .persist_detected_file_domain_changes(&tracked_domain_changes_to_persist)

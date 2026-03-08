@@ -260,8 +260,14 @@ pub(crate) fn build_filesystem_file_projection_sql(
           AND bfr.lixcol_version_id = f.lixcol_version_id \
          LEFT JOIN lix_internal_binary_blob_store bbs \
            ON bbs.blob_hash = bfr.blob_hash",
-        target_versions_cte =
-            target_versions_cte_sql(scope, &[FILE_DESCRIPTOR_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, BINARY_BLOB_REF_SCHEMA_KEY]),
+        target_versions_cte = target_versions_cte_sql(
+            scope,
+            &[
+                FILE_DESCRIPTOR_SCHEMA_KEY,
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                BINARY_BLOB_REF_SCHEMA_KEY
+            ]
+        ),
         directory_candidates_sql = effective_state_candidates_sql(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
         file_candidates_sql = effective_state_candidates_sql(FILE_DESCRIPTOR_SCHEMA_KEY),
         blob_candidates_sql = effective_state_candidates_sql(BINARY_BLOB_REF_SCHEMA_KEY),
@@ -271,7 +277,9 @@ pub(crate) fn build_filesystem_file_projection_sql(
     )
 }
 
-pub(crate) fn build_filesystem_directory_projection_sql(scope: FilesystemProjectionScope) -> String {
+pub(crate) fn build_filesystem_directory_projection_sql(
+    scope: FilesystemProjectionScope,
+) -> String {
     let commit_id_projection = match scope {
         FilesystemProjectionScope::ActiveVersion => active_version_commit_id_sql(),
         FilesystemProjectionScope::ExplicitVersion => "d.lixcol_commit_id".to_string(),
@@ -407,7 +415,9 @@ pub(crate) fn build_filesystem_directory_projection_sql(scope: FilesystemProject
     )
 }
 
-pub(crate) fn build_filesystem_file_history_projection_sql(state_history_source_sql: &str) -> String {
+pub(crate) fn build_filesystem_file_history_projection_sql(
+    state_history_source_sql: &str,
+) -> String {
     format!(
         "WITH RECURSIVE \
            state_history_source AS ( \
@@ -812,7 +822,8 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
             let union_rows = schema_keys
                 .iter()
                 .flat_map(|schema_key| {
-                    let quoted = quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
+                    let quoted =
+                        quote_ident(&format!("lix_internal_state_materialized_v1_{schema_key}"));
                     [
                         format!(
                             "SELECT DISTINCT version_id \
@@ -1032,7 +1043,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
          ), "
-            .to_string()
+        .to_string()
     } else {
         "default_root_commits AS ( \
            SELECT DISTINCT \
@@ -1045,7 +1056,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
          ), "
-            .to_string()
+        .to_string()
     };
     format!(
         "WITH \

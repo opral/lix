@@ -34,6 +34,7 @@ pub(crate) fn rewrite_sync_statement<P: LixFunctionProvider>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
+    _active_version_id_hint: Option<&str>,
     functions: &mut P,
 ) -> Result<Option<RewriteOutput>, LixError> {
     let mut context = StatementContext::new_sync(params, writer_key);
@@ -54,6 +55,7 @@ pub(crate) async fn rewrite_backend_statement<P>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
+    active_version_id_hint: Option<&str>,
     functions: &mut P,
     detected_file_domain_changes: &[DetectedFileDomainChange],
 ) -> Result<Option<RewriteOutput>, LixError>
@@ -86,6 +88,7 @@ where
                     backend,
                     params,
                     writer_key,
+                    active_version_id_hint,
                     detected_file_domain_changes,
                 );
                 let outcome = rewrite_backend_loop(statement, &mut context, functions).await?;
@@ -381,8 +384,16 @@ where
                         backend,
                         &insert,
                         context.params,
+                        context.active_version_id_hint,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| LixError {
+                        code: error.code,
+                        description: format!(
+                            "filesystem backend insert side-effect discovery failed: {}",
+                            error.description
+                        ),
+                    })?;
                 context.side_effects = filesystem_insert_side_effects.statements.clone();
 
                 let mut insert_detected_file_domain_changes =
@@ -401,8 +412,14 @@ where
                     Some(&filesystem_insert_side_effects.resolved_directory_ids),
                     filesystem_insert_side_effects.active_version_id.as_deref(),
                 )
-                .await?
-                {
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "filesystem backend insert rewrite failed: {}",
+                        error.description
+                    ),
+                })? {
                     rewritten
                 } else {
                     insert
@@ -499,8 +516,14 @@ where
                     context.writer_key,
                     functions,
                 )
-                .await?
-                {
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "filesystem/backend insert vtable lowering failed: {}",
+                        error.description
+                    ),
+                })? {
                     context.registrations.extend(rewritten.registrations);
                     context.generated_params.extend(rewritten.params);
                     context.mutations.extend(rewritten.mutations);
@@ -531,6 +554,7 @@ where
                     backend,
                     update.clone(),
                     context.params,
+                    context.active_version_id_hint,
                 )
                 .await?
                 {
@@ -631,6 +655,7 @@ where
                     backend,
                     delete.clone(),
                     context.params,
+                    context.active_version_id_hint,
                 )
                 .await?
                 {
@@ -841,10 +866,11 @@ mod tests {
         let statement = parse_statement("UPDATE lix_file SET data = X'01' WHERE id = 'f1'");
         let mut functions = SystemFunctionProvider;
 
-        let output = rewrite_backend_statement(&backend, statement, &[], None, &mut functions, &[])
-            .await
-            .expect("rewrite should succeed")
-            .expect("filesystem update should match rewrite rule");
+        let output =
+            rewrite_backend_statement(&backend, statement, &[], None, None, &mut functions, &[])
+                .await
+                .expect("rewrite should succeed")
+                .expect("filesystem update should match rewrite rule");
 
         assert!(output.statements.is_empty());
         assert!(output.effect_only);

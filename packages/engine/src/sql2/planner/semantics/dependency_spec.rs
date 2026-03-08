@@ -20,7 +20,10 @@ pub(crate) fn derive_dependency_spec_from_canonicalized_read(
         return Some(dependency_spec_for_working_changes_scan());
     }
     if let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) {
-        return Some(dependency_spec_for_filesystem_scan(filesystem_scan.kind, &canonicalized.surface_binding));
+        return Some(dependency_spec_for_filesystem_scan(
+            filesystem_scan.kind,
+            &canonicalized.surface_binding,
+        ));
     }
     if let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) {
         return Some(dependency_spec_for_admin_scan(admin_scan.kind));
@@ -121,7 +124,9 @@ fn dependency_spec_for_filesystem_scan(
     binding: &crate::sql2::catalog::SurfaceBinding,
 ) -> DependencySpec {
     let mut spec = DependencySpec {
-        relations: [binding.descriptor.public_name.clone()].into_iter().collect(),
+        relations: [binding.descriptor.public_name.clone()]
+            .into_iter()
+            .collect(),
         ..DependencySpec::default()
     };
 
@@ -129,10 +134,12 @@ fn dependency_spec_for_filesystem_scan(
         FilesystemKind::File => {
             spec.schema_keys.insert("lix_file_descriptor".to_string());
             spec.schema_keys.insert("lix_binary_blob_ref".to_string());
-            spec.schema_keys.insert("lix_directory_descriptor".to_string());
+            spec.schema_keys
+                .insert("lix_directory_descriptor".to_string());
         }
         FilesystemKind::Directory => {
-            spec.schema_keys.insert("lix_directory_descriptor".to_string());
+            spec.schema_keys
+                .insert("lix_directory_descriptor".to_string());
         }
     }
 

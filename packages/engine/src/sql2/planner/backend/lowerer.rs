@@ -1,3 +1,11 @@
+use crate::account::{
+    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
+};
+use crate::filesystem::live_projection::{
+    build_filesystem_directory_history_projection_sql, build_filesystem_directory_projection_sql,
+    build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
+    build_filesystem_state_history_source_sql, FilesystemProjectionScope,
+};
 use crate::sql2::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql2::catalog::{
     SurfaceBinding, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue, SurfaceVariant,
@@ -7,15 +15,6 @@ use crate::sql2::planner::canonicalize::CanonicalizedRead;
 use crate::sql2::planner::ir::{CanonicalAdminKind, FilesystemKind, ReadPlan, VersionScope};
 use crate::sql2::planner::semantics::effective_state_resolver::{
     EffectiveStatePlan, EffectiveStateRequest,
-};
-use crate::filesystem::live_projection::{
-    build_filesystem_state_history_source_sql,
-    build_filesystem_directory_history_projection_sql, build_filesystem_directory_projection_sql,
-    build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
-    FilesystemProjectionScope,
-};
-use crate::account::{
-    active_account_file_id, active_account_schema_key, active_account_storage_version_id,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -78,13 +77,12 @@ pub(crate) fn lower_read_for_execution(
             })
         }
         SurfaceFamily::Change => lower_change_read_for_execution(canonicalized).map(|statement| {
-            let pushdown_decision = if canonical_working_changes_scan(&canonicalized.read_command.root)
-                .is_some()
-            {
-                working_changes_pushdown_decision(canonicalized)
-            } else {
-                change_pushdown_decision(canonicalized)
-            };
+            let pushdown_decision =
+                if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
+                    working_changes_pushdown_decision(canonicalized)
+                } else {
+                    change_pushdown_decision(canonicalized)
+                };
             statement.map(|statement| LoweredReadProgram {
                 statements: vec![statement],
                 pushdown_decision,
@@ -337,24 +335,21 @@ fn lower_filesystem_read_for_execution(
         (FilesystemKind::File, VersionScope::ExplicitVersion)
             if canonicalized.surface_binding.descriptor.public_name == "lix_file_by_version" =>
         {
-            parse_single_query(
-                &build_filesystem_file_projection_sql(
-                    FilesystemProjectionScope::ExplicitVersion,
-                    false,
-                ),
-            )?
+            parse_single_query(&build_filesystem_file_projection_sql(
+                FilesystemProjectionScope::ExplicitVersion,
+                false,
+            ))?
         }
         (FilesystemKind::Directory, VersionScope::ActiveVersion) => parse_single_query(
             &build_filesystem_directory_projection_sql(FilesystemProjectionScope::ActiveVersion),
         )?,
         (FilesystemKind::Directory, VersionScope::ExplicitVersion)
-            if canonicalized.surface_binding.descriptor.public_name == "lix_directory_by_version" =>
+            if canonicalized.surface_binding.descriptor.public_name
+                == "lix_directory_by_version" =>
         {
-            parse_single_query(
-                &build_filesystem_directory_projection_sql(
-                    FilesystemProjectionScope::ExplicitVersion,
-                ),
-            )?
+            parse_single_query(&build_filesystem_directory_projection_sql(
+                FilesystemProjectionScope::ExplicitVersion,
+            ))?
         }
         (FilesystemKind::File, VersionScope::History)
             if canonicalized.surface_binding.descriptor.public_name == "lix_file_history" =>
@@ -444,15 +439,13 @@ fn build_admin_source_query(kind: CanonicalAdminKind) -> Result<Query, LixError>
             file_id = escape_sql_string(active_account_file_id()),
             storage_version_id = escape_sql_string(active_account_storage_version_id()),
         ),
-        CanonicalAdminKind::StoredSchema => {
-            "SELECT \
+        CanonicalAdminKind::StoredSchema => "SELECT \
                 lix_json_extract(snapshot_content, 'value') AS value, \
                 lix_json_extract(snapshot_content, 'value.x-lix-key') AS lixcol_schema_key, \
                 lix_json_extract(snapshot_content, 'value.x-lix-version') AS lixcol_schema_version \
              FROM lix_internal_stored_schema_bootstrap \
              WHERE snapshot_content IS NOT NULL"
-                .to_string()
-        }
+            .to_string(),
         CanonicalAdminKind::Version => format!(
             "SELECT \
                 d.entity_id AS id, \
@@ -874,7 +867,10 @@ fn effective_state_candidate_rows_sql(
         .join(" UNION ALL ")
 }
 
-fn build_state_history_source_sql(pushdown_predicates: &[String], force_active_scope: bool) -> String {
+fn build_state_history_source_sql(
+    pushdown_predicates: &[String],
+    force_active_scope: bool,
+) -> String {
     let requested_root_predicates = history_requested_root_predicates(pushdown_predicates);
     let requested_roots_where = render_where_clause_sql(&requested_root_predicates, " AND ");
     let default_root_scope = if force_active_scope && requested_root_predicates.is_empty() {
@@ -1071,9 +1067,7 @@ fn filesystem_history_filter_column_name(column: FilesystemHistoryFilterColumn) 
     }
 }
 
-fn invert_filesystem_history_binary_operator(
-    op: BinaryOperator,
-) -> Option<BinaryOperator> {
+fn invert_filesystem_history_binary_operator(op: BinaryOperator) -> Option<BinaryOperator> {
     match op {
         BinaryOperator::Eq => Some(BinaryOperator::Eq),
         BinaryOperator::NotEq => Some(BinaryOperator::NotEq),
@@ -2096,7 +2090,10 @@ mod tests {
         assert!(lowered_sql.contains("schema_key = 'lix_active_version'"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("version_id = 'global'"));
-        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            Vec::<String>::new()
+        );
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["version_id = 'main'".to_string()]
@@ -2116,7 +2113,10 @@ mod tests {
         assert!(lowered_sql.contains("FROM lix_internal_state_untracked"));
         assert!(lowered_sql.contains("schema_key = 'lix_active_account'"));
         assert!(!lowered_sql.contains("FROM lix_active_account"));
-        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            Vec::<String>::new()
+        );
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["account_id = 'acct-1'".to_string()]
@@ -2136,7 +2136,10 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_descriptor"));
         assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_version_pointer"));
         assert!(!lowered_sql.contains("FROM lix_version"));
-        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            Vec::<String>::new()
+        );
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["id = 'main'".to_string()]
@@ -2155,7 +2158,10 @@ mod tests {
 
         assert!(lowered_sql.contains("FROM lix_internal_stored_schema_bootstrap"));
         assert!(!lowered_sql.contains("FROM lix_stored_schema"));
-        assert_eq!(lowered.pushdown_decision.accepted_predicates, Vec::<String>::new());
+        assert_eq!(
+            lowered.pushdown_decision.accepted_predicates,
+            Vec::<String>::new()
+        );
         assert_eq!(
             lowered.pushdown_decision.residual_predicates,
             vec!["lixcol_schema_key = 'x'".to_string()]

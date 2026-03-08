@@ -12,11 +12,20 @@ use super::validator::validate_statement_output;
 pub(crate) struct StatementPipeline<'a> {
     params: &'a [Value],
     writer_key: Option<&'a str>,
+    active_version_id_hint: Option<&'a str>,
 }
 
 impl<'a> StatementPipeline<'a> {
-    pub(crate) fn new(params: &'a [Value], writer_key: Option<&'a str>) -> Self {
-        Self { params, writer_key }
+    pub(crate) fn new(
+        params: &'a [Value],
+        writer_key: Option<&'a str>,
+        active_version_id_hint: Option<&'a str>,
+    ) -> Self {
+        Self {
+            params,
+            writer_key,
+            active_version_id_hint,
+        }
     }
 
     pub(crate) fn rewrite_statement<P: LixFunctionProvider>(
@@ -24,8 +33,9 @@ impl<'a> StatementPipeline<'a> {
         statement: Statement,
         provider: &mut P,
     ) -> Result<RewriteOutput, LixError> {
-        let output = StatementRuleEngine::new(self.params, self.writer_key)
-            .rewrite_statement(statement, provider)?;
+        let output =
+            StatementRuleEngine::new(self.params, self.writer_key, self.active_version_id_hint)
+                .rewrite_statement(statement, provider)?;
         validate_statement_output(&output)?;
         Ok(output)
     }
@@ -40,14 +50,15 @@ impl<'a> StatementPipeline<'a> {
     where
         P: LixFunctionProvider + Clone + Send + 'static,
     {
-        let output = StatementRuleEngine::new(self.params, self.writer_key)
-            .rewrite_statement_with_backend(
-                backend,
-                statement,
-                provider,
-                detected_file_domain_changes,
-            )
-            .await?;
+        let output =
+            StatementRuleEngine::new(self.params, self.writer_key, self.active_version_id_hint)
+                .rewrite_statement_with_backend(
+                    backend,
+                    statement,
+                    provider,
+                    detected_file_domain_changes,
+                )
+                .await?;
         validate_statement_output(&output)?;
         Ok(output)
     }
@@ -56,11 +67,20 @@ impl<'a> StatementPipeline<'a> {
 struct StatementRuleEngine<'a> {
     params: &'a [Value],
     writer_key: Option<&'a str>,
+    active_version_id_hint: Option<&'a str>,
 }
 
 impl<'a> StatementRuleEngine<'a> {
-    fn new(params: &'a [Value], writer_key: Option<&'a str>) -> Self {
-        Self { params, writer_key }
+    fn new(
+        params: &'a [Value],
+        writer_key: Option<&'a str>,
+        active_version_id_hint: Option<&'a str>,
+    ) -> Self {
+        Self {
+            params,
+            writer_key,
+            active_version_id_hint,
+        }
     }
 
     fn rewrite_statement<P: LixFunctionProvider>(
@@ -74,6 +94,7 @@ impl<'a> StatementRuleEngine<'a> {
                 statement.clone(),
                 self.params,
                 self.writer_key,
+                self.active_version_id_hint,
                 provider,
             )? {
                 return Ok(output);
@@ -102,6 +123,7 @@ impl<'a> StatementRuleEngine<'a> {
                 statement.clone(),
                 self.params,
                 self.writer_key,
+                self.active_version_id_hint,
                 provider,
                 detected_file_domain_changes,
             )

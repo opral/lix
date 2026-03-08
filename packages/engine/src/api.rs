@@ -266,6 +266,7 @@ impl Engine {
             &prepared.intent.detected_file_domain_changes,
             &prepared.intent.untracked_filesystem_update_domain_changes,
             execution.plugin_changes_committed,
+            shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared),
             writer_key,
         )
         .await?;

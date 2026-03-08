@@ -8,7 +8,9 @@ use crate::materialization::{
     materialization_plan, MaterializationDebugMode, MaterializationRequest, MaterializationScope,
     MaterializationWrite, MaterializationWriteOp,
 };
-use crate::version::{version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key};
+use crate::version::{
+    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
