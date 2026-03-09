@@ -35,6 +35,26 @@ fn assert_integer(value: &Value, expected: i64) {
     }
 }
 
+fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<String> {
+    let marker = "Available columns: ";
+    let start = description
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing available columns marker in error: {description}"));
+    let tail = &description[start + marker.len()..];
+    let end = tail
+        .find('.')
+        .unwrap_or_else(|| panic!("missing available columns terminator in error: {description}"));
+    let raw = tail[..end].trim();
+    if raw == "(unknown)" {
+        return Vec::new();
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let rows = engine
         .execute(
@@ -3766,7 +3786,7 @@ simulation_test!(
 
         let file_history = engine
             .execute(
-                "SELECT id, path, lixcol_commit_id, lixcol_depth \
+                "SELECT id, path, lixcol_commit_id, lixcol_commit_created_at, lixcol_depth \
              FROM lix_file_history \
              WHERE id = 'history-file' \
              ORDER BY lixcol_depth ASC",
@@ -3786,12 +3806,16 @@ simulation_test!(
         ));
         assert!(matches!(
             file_history.statements[0].rows[0][3],
+            Value::Text(_)
+        ));
+        assert!(matches!(
+            file_history.statements[0].rows[0][4],
             Value::Integer(_)
         ));
 
         let directory_history = engine
             .execute(
-                "SELECT id, path, lixcol_commit_id, lixcol_depth \
+                "SELECT id, path, lixcol_commit_id, lixcol_commit_created_at, lixcol_depth \
              FROM lix_directory_history \
              WHERE id = 'history-dir' \
              ORDER BY lixcol_depth ASC",
@@ -3811,8 +3835,88 @@ simulation_test!(
         ));
         assert!(matches!(
             directory_history.statements[0].rows[0][3],
+            Value::Text(_)
+        ));
+        assert!(matches!(
+            directory_history.statements[0].rows[0][4],
             Value::Integer(_)
         ));
+    }
+);
+
+simulation_test!(
+    directory_history_unknown_column_diagnostic_matches_select_star_columns,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, parent_id, name) \
+                 VALUES ('history-dir-columns', '/history-dir-columns/', NULL, 'history-dir-columns')",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_directory SET name = 'history-dir-columns-renamed' WHERE id = 'history-dir-columns'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let root_commit_id = active_version_commit_id(&engine).await;
+        let select_star = engine
+            .execute(
+                &format!(
+                    "SELECT * \
+                     FROM lix_directory_history \
+                     WHERE id = 'history-dir-columns' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("SELECT * on lix_directory_history should succeed");
+        assert_eq!(select_star.statements[0].rows.len(), 1);
+        assert!(
+            select_star
+                .statements[0]
+                .columns
+                .contains(&"lixcol_commit_created_at".to_string()),
+            "directory history select-star columns should expose lixcol_commit_created_at"
+        );
+
+        let error = engine
+            .execute(
+                &format!(
+                    "SELECT bogus \
+                     FROM lix_directory_history \
+                     WHERE id = 'history-dir-columns' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect_err("unknown directory history column read should fail");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+
+        let available_columns =
+            parse_available_columns_from_unknown_column_error(&error.description);
+        assert_eq!(
+            available_columns, select_star.statements[0].columns,
+            "unknown-column diagnostics should list the same columns as `SELECT *` on lix_directory_history. error: {}",
+            error.description
+        );
     }
 );
 

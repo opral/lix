@@ -19,6 +19,26 @@ fn assert_non_empty_text(value: &Value) {
     }
 }
 
+fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<String> {
+    let marker = "Available columns: ";
+    let start = description
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing available columns marker in error: {description}"));
+    let tail = &description[start + marker.len()..];
+    let end = tail
+        .find('.')
+        .unwrap_or_else(|| panic!("missing available columns terminator in error: {description}"));
+    let raw = tail[..end].trim();
+    if raw == "(unknown)" {
+        return Vec::new();
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
     engine
         .execute(
@@ -150,7 +170,6 @@ simulation_test!(
             )
             .await
             .unwrap();
-
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 3);
         assert_eq!(rows.statements[0].rows[0][0], Value::Integer(0));
@@ -217,6 +236,76 @@ simulation_test!(
         assert_eq!(rows.statements[0].rows[1][0], Value::Integer(1));
         assert_non_empty_text(&rows.statements[0].rows[1][1]);
         assert_non_empty_text(&rows.statements[0].rows[1][2]);
+    }
+);
+
+simulation_test!(
+    lix_state_history_unknown_column_diagnostic_matches_select_star_columns,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.init().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'history-diagnostic-state', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
+                 )", &[])
+            .await
+            .unwrap();
+
+        let root_commit_id = active_commit_id(&engine).await;
+        let select_star = engine
+            .execute(
+                &format!(
+                    "SELECT * \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'history-diagnostic-state' \
+                       AND schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{root_commit_id}' \
+                       AND depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .expect("SELECT * on lix_state_history should succeed");
+        assert_eq!(select_star.statements[0].rows.len(), 1);
+        assert!(
+            select_star.statements[0]
+                .columns
+                .contains(&"commit_created_at".to_string()),
+            "state history select-star columns should expose commit_created_at"
+        );
+
+        let error = engine
+            .execute(
+                &format!(
+                    "SELECT bogus \
+                     FROM lix_state_history \
+                     WHERE entity_id = 'history-diagnostic-state' \
+                       AND schema_key = 'test_state_history_schema' \
+                       AND root_commit_id = '{root_commit_id}' \
+                       AND depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("unknown state-history column read should fail");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+
+        let available_columns =
+            parse_available_columns_from_unknown_column_error(&error.description);
+        assert_eq!(
+            available_columns, select_star.statements[0].columns,
+            "unknown-column diagnostics should list the same columns as `SELECT *` on lix_state_history. error: {}",
+            error.description
+        );
     }
 );
 
