@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -26,8 +26,6 @@ use super::super::storage::sql_text::escape_sql_string;
 
 const MATERIALIZED_PREFIX: &str = "lix_internal_state_materialized_v1_";
 const UNTRACKED_TABLE: &str = "lix_internal_state_untracked";
-const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const UPDATE_RETURNING_COLUMNS: &[&str] = &[
     "entity_id",
     "file_id",
@@ -239,7 +237,6 @@ async fn build_delete_followup_statement_batch(
     let timestamp = functions.timestamp();
     let mut domain_changes = Vec::new();
     let mut affected_versions = BTreeSet::new();
-    let mut deleted_directory_scopes: Vec<(String, String)> = Vec::new();
     let mut tombstoned_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
 
     for row in rows {
@@ -259,9 +256,6 @@ async fn build_delete_followup_statement_batch(
         let metadata = value_to_optional_text(&row[6], "metadata")?;
         let row_writer_key = writer_key.map(ToString::to_string);
         tombstoned_keys.insert((entity_id.clone(), file_id.clone(), version_id.clone()));
-        if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-            deleted_directory_scopes.push((version_id.clone(), entity_id.clone()));
-        }
         affected_versions.insert(version_id.clone());
         domain_changes.push(DomainChangeInput {
             id: functions.uuid_v7(),
@@ -293,12 +287,6 @@ async fn build_delete_followup_statement_batch(
                 continue;
             }
             let row_writer_key = writer_key.map(ToString::to_string);
-            if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-                deleted_directory_scopes.push((
-                    fallback_row.version_id.clone(),
-                    fallback_row.entity_id.clone(),
-                ));
-            }
             affected_versions.insert(fallback_row.version_id.clone());
             domain_changes.push(DomainChangeInput {
                 id: functions.uuid_v7(),
@@ -313,21 +301,6 @@ async fn build_delete_followup_statement_batch(
                 created_at: timestamp.clone(),
                 writer_key: row_writer_key,
             });
-        }
-    }
-
-    if plan.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-        let cascaded_file_deletes = load_cascaded_file_delete_changes(
-            executor,
-            &deleted_directory_scopes,
-            &timestamp,
-            writer_key,
-            functions,
-        )
-        .await?;
-        for change in cascaded_file_deletes {
-            affected_versions.insert(change.version_id.clone());
-            domain_changes.push(change);
         }
     }
 
@@ -505,93 +478,6 @@ async fn load_effective_scope_delete_rows(
         });
     }
     Ok(resolved)
-}
-
-async fn load_cascaded_file_delete_changes(
-    executor: &mut dyn SqlExecutor,
-    directory_scopes: &[(String, String)],
-    timestamp: &str,
-    writer_key: Option<&str>,
-    functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<DomainChangeInput>, LixError> {
-    if directory_scopes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut grouped_directory_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (version_id, directory_id) in directory_scopes {
-        grouped_directory_ids
-            .entry(version_id.clone())
-            .or_default()
-            .insert(directory_id.clone());
-    }
-
-    let mut changes = Vec::new();
-    let mut seen_file_versions: BTreeSet<(String, String)> = BTreeSet::new();
-    for (version_id, directory_ids) in grouped_directory_ids {
-        if directory_ids.is_empty() {
-            continue;
-        }
-        let materialized_table = format!("{MATERIALIZED_PREFIX}{FILE_DESCRIPTOR_SCHEMA_KEY}");
-        let in_list = directory_ids
-            .iter()
-            .map(|directory_id| format!("'{}'", escape_sql_string(directory_id)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT \
-                m.entity_id, \
-                m.file_id, \
-                m.version_id, \
-                m.plugin_key, \
-                m.schema_version, \
-                m.metadata \
-             FROM {materialized_table} m \
-             WHERE m.version_id = '{version_id}' \
-               AND m.is_tombstone = 0 \
-               AND lix_json_extract(m.snapshot_content, 'directory_id') IN ({in_list})",
-            materialized_table = materialized_table,
-            version_id = escape_sql_string(&version_id),
-            in_list = in_list,
-        );
-        let lowered_sql = lower_single_statement_for_dialect(&sql, executor.dialect())?;
-        let result = executor.execute(&lowered_sql, &[]).await?;
-        for row in result.rows {
-            if row.len() < 6 {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "filesystem directory delete cascade expected six file columns"
-                        .to_string(),
-                });
-            }
-            let entity_id = value_to_string(&row[0], "entity_id")?;
-            let file_id = value_to_string(&row[1], "file_id")?;
-            let cascaded_version_id = value_to_string(&row[2], "version_id")?;
-            let plugin_key = value_to_string(&row[3], "plugin_key")?;
-            let schema_version = value_to_string(&row[4], "schema_version")?;
-            let metadata = value_to_optional_text(&row[5], "metadata")?;
-
-            if !seen_file_versions.insert((entity_id.clone(), cascaded_version_id.clone())) {
-                continue;
-            }
-
-            changes.push(DomainChangeInput {
-                id: functions.uuid_v7(),
-                entity_id,
-                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                schema_version,
-                file_id,
-                version_id: cascaded_version_id,
-                plugin_key,
-                snapshot_content: None,
-                metadata,
-                created_at: timestamp.to_string(),
-                writer_key: writer_key.map(ToString::to_string),
-            });
-        }
-    }
-
-    Ok(changes)
 }
 
 fn lower_single_statement_for_dialect(sql: &str, dialect: SqlDialect) -> Result<String, LixError> {
