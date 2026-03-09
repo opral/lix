@@ -11,7 +11,7 @@ use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
-    prepare_sql2_read, prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
+    prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
 };
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
@@ -135,7 +135,15 @@ pub(crate) async fn prepare_execution_with_backend(
     let sql2_read =
         prepare_sql2_read(backend, &statements, params, active_version_id, writer_key).await;
     let sql2_write =
-        prepare_sql2_write(backend, &statements, params, active_version_id, writer_key).await;
+        try_prepare_sql2_write(backend, &statements, params, active_version_id, writer_key)
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "prepare_execution_with_backend sql2 write preparation failed: {}",
+                    error.description
+                ),
+            })?;
     let plan_statements = sql2_read
         .as_ref()
         .and_then(|prepared| prepared.lowered_read.as_ref())
@@ -290,7 +298,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
     writer_key: Option<&str>,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
     if sql2_untracked_write_is_live(prepared) {
-        return execute_sql2_untracked_write_with_transaction(transaction, prepared).await;
+        return execute_sql2_untracked_write_with_transaction(engine, transaction, prepared).await;
     }
 
     if !sql2_tracked_write_is_live(prepared) {
@@ -418,6 +426,7 @@ pub(crate) async fn maybe_execute_sql2_write_with_transaction(
 }
 
 async fn execute_sql2_untracked_write_with_transaction(
+    engine: &Engine,
     transaction: &mut dyn LixTransaction,
     prepared: &PreparedExecutionContext,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
@@ -430,8 +439,24 @@ async fn execute_sql2_untracked_write_with_transaction(
 
     let mut runtime_functions = prepared.functions.clone();
     let timestamp = runtime_functions.timestamp();
+    if sql2_persists_filesystem_payload_writes(prepared) {
+        engine
+            .persist_pending_file_data_updates_in_transaction(
+                transaction,
+                &prepared.intent.pending_file_writes,
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "sql2 untracked filesystem payload persistence failed before state apply: {}",
+                    error.description
+                ),
+            })?;
+    }
     apply_sql2_untracked_rows(transaction, &resolved.intended_post_state, &timestamp).await?;
-    let plan_effects_override = semantic_plan_effects_from_untracked_sql2_write(sql2_write)?;
+    let plan_effects_override =
+        semantic_plan_effects_from_untracked_sql2_write(prepared, sql2_write)?;
 
     Ok(Some(SqlExecutionOutcome {
         public_result: QueryResult {
@@ -466,6 +491,54 @@ pub(crate) fn sql2_commits_filesystem_payload_domain_changes(
     ) && sql2_tracked_write_is_live(prepared)
 }
 
+fn sql2_persists_filesystem_payload_writes(prepared: &PreparedExecutionContext) -> bool {
+    let Some(sql2_write) = prepared.sql2_write.as_ref() else {
+        return false;
+    };
+    matches!(
+        sql2_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+            .as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) && matches!(
+        sql2_write.planned_write.command.mode,
+        crate::sql2::planner::ir::WriteMode::Tracked
+            | crate::sql2::planner::ir::WriteMode::Untracked
+    ) && !prepared.intent.pending_file_writes.is_empty()
+}
+
+fn sql2_filesystem_write_targets_global_version(sql2_write: &Sql2PreparedWrite) -> bool {
+    let target_name = sql2_write
+        .planned_write
+        .command
+        .target
+        .descriptor
+        .public_name
+        .as_str();
+    if !matches!(
+        target_name,
+        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
+    ) {
+        return false;
+    }
+
+    sql2_write
+        .planned_write
+        .resolved_write_plan
+        .as_ref()
+        .is_some_and(|resolved| {
+            resolved
+                .intended_post_state
+                .iter()
+                .filter_map(|row| row.version_id.as_deref())
+                .any(|version_id| version_id == GLOBAL_VERSION_ID)
+        })
+}
+
 fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
@@ -496,6 +569,18 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let filesystem_file_side_effects_only =
         matches!(target_name, "lix_file" | "lix_file_by_version")
             && filesystem_schema_set_supported;
+    let filesystem_surface = matches!(
+        target_name,
+        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
+    );
+    let no_legacy_detected_filesystem_duplicates =
+        filesystem_surface || prepared.intent.detected_file_domain_changes.is_empty();
+    let no_legacy_untracked_filesystem_duplicates = filesystem_surface
+        || prepared
+            .intent
+            .untracked_filesystem_update_domain_changes
+            .is_empty();
+    let non_global_filesystem_write = !sql2_filesystem_write_targets_global_version(sql2_write);
 
     matches!(
         prepared.plan.result_contract,
@@ -506,19 +591,31 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     ) && sql2_write.domain_change_batch.is_some()
         && sql2_write.planned_write.commit_preconditions.is_some()
         && live_sql2_operation_supported(sql2_write)
-        && (prepared.intent.detected_file_domain_changes.is_empty()
+        && (no_legacy_detected_filesystem_duplicates
             || filesystem_directory_side_effects_only
             || filesystem_file_side_effects_only)
-        && prepared
-            .intent
-            .untracked_filesystem_update_domain_changes
-            .is_empty()
+        && no_legacy_untracked_filesystem_duplicates
+        && non_global_filesystem_write
 }
 
 fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
     };
+    let target_name = sql2_write
+        .planned_write
+        .command
+        .target
+        .descriptor
+        .public_name
+        .as_str();
+    let filesystem_surface = matches!(
+        target_name,
+        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
+    );
+    let no_legacy_filesystem_duplicates =
+        filesystem_surface || prepared.intent.detected_file_domain_changes.is_empty();
+    let non_global_filesystem_write = !sql2_filesystem_write_targets_global_version(sql2_write);
 
     matches!(
         prepared.plan.result_contract,
@@ -527,21 +624,15 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
         sql2_write.planned_write.command.mode,
         crate::sql2::planner::ir::WriteMode::Untracked
     ) && matches!(
-        sql2_write
-            .planned_write
-            .command
-            .target
-            .descriptor
-            .public_name
-            .as_str(),
-        "lix_active_version" | "lix_active_account"
-    ) && prepared.intent.detected_file_domain_changes.is_empty()
-        && prepared.intent.pending_file_writes.is_empty()
-        && prepared.intent.pending_file_delete_targets.is_empty()
-        && prepared
-            .intent
-            .untracked_filesystem_update_domain_changes
-            .is_empty()
+        target_name,
+        "lix_active_version"
+            | "lix_active_account"
+            | "lix_file"
+            | "lix_file_by_version"
+            | "lix_directory"
+            | "lix_directory_by_version"
+    ) && no_legacy_filesystem_duplicates
+        && non_global_filesystem_write
 }
 
 fn live_sql2_operation_supported(sql2_write: &Sql2PreparedWrite) -> bool {
@@ -737,6 +828,7 @@ fn value_as_bool(value: &Value) -> Option<bool> {
 }
 
 fn semantic_plan_effects_from_untracked_sql2_write(
+    prepared: &PreparedExecutionContext,
     sql2_write: &Sql2PreparedWrite,
 ) -> Result<PlanEffects, LixError> {
     let mut effects = PlanEffects::default();
@@ -754,6 +846,22 @@ fn semantic_plan_effects_from_untracked_sql2_write(
             .writer_key
             .as_deref(),
     )?;
+    if matches!(
+        sql2_write
+            .planned_write
+            .command
+            .target
+            .descriptor
+            .public_name
+            .as_str(),
+        "lix_file" | "lix_file_by_version"
+    ) {
+        effects.file_cache_refresh_targets =
+            authoritative_pending_file_write_targets(&prepared.intent.pending_file_writes);
+        effects
+            .file_cache_refresh_targets
+            .extend(prepared.intent.pending_file_delete_targets.iter().cloned());
+    }
     if sql2_write
         .planned_write
         .command
