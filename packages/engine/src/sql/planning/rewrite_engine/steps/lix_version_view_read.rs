@@ -71,18 +71,28 @@ fn build_lix_version_view_query() -> Result<Query, LixError> {
                    AND snapshot_content IS NOT NULL \
                ) AS d \
                LEFT JOIN ( \
-                 SELECT \
-                   entity_id, \
-                   change_id, \
-                   created_at, \
-                   updated_at, \
-                   lix_json_extract(snapshot_content, 'id') AS id, \
-                   lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
-                 FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_version_pointer' \
-                   AND version_id = 'global' \
-                   AND global = true \
-                   AND snapshot_content IS NOT NULL \
+                 SELECT entity_id, change_id, created_at, updated_at, id, commit_id \
+                 FROM ( \
+                   SELECT \
+                     entity_id, \
+                     change_id, \
+                     created_at, \
+                     updated_at, \
+                     lix_json_extract(snapshot_content, 'id') AS id, \
+                     lix_json_extract(snapshot_content, 'commit_id') AS commit_id, \
+                     ROW_NUMBER() OVER ( \
+                       PARTITION BY entity_id \
+                       ORDER BY CASE WHEN version_id <> 'global' THEN 0 ELSE 1 END, \
+                                updated_at DESC, \
+                                created_at DESC, \
+                                change_id DESC \
+                     ) AS rn \
+                   FROM lix_internal_state_vtable \
+                   WHERE schema_key = 'lix_version_pointer' \
+                     AND global = true \
+                     AND snapshot_content IS NOT NULL \
+                 ) AS ranked_version_pointers \
+                 WHERE rn = 1 \
                ) AS t \
                  ON t.id = d.id";
     parse_single_query(sql)

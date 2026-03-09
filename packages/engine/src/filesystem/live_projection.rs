@@ -592,7 +592,8 @@ pub(crate) fn build_filesystem_file_history_projection_sql(
                    ranked.lixcol_root_commit_id, \
                    ranked.lixcol_depth AS lixcol_raw_depth, \
                    ranked.lixcol_change_id, \
-                   ranked.lixcol_commit_id \
+                   ranked.lixcol_commit_id, \
+                   ranked.lixcol_commit_created_at \
                FROM (\
                    SELECT \
                        candidate.id, \
@@ -600,6 +601,7 @@ pub(crate) fn build_filesystem_file_history_projection_sql(
                        candidate.lixcol_depth, \
                        candidate.lixcol_change_id, \
                        candidate.lixcol_commit_id, \
+                       candidate.lixcol_commit_created_at, \
                        ROW_NUMBER() OVER (\
                            PARTITION BY candidate.id, candidate.lixcol_root_commit_id, candidate.lixcol_depth \
                            ORDER BY candidate.lixcol_commit_created_at DESC, candidate.lixcol_commit_id DESC, candidate.lixcol_change_id DESC\
@@ -615,6 +617,7 @@ pub(crate) fn build_filesystem_file_history_projection_sql(
                    checkpoint.lixcol_raw_depth, \
                    checkpoint.lixcol_change_id, \
                    checkpoint.lixcol_commit_id, \
+                   checkpoint.lixcol_commit_created_at, \
                    ROW_NUMBER() OVER (\
                        PARTITION BY checkpoint.id, checkpoint.lixcol_root_commit_id \
                        ORDER BY checkpoint.lixcol_raw_depth ASC, checkpoint.lixcol_commit_id DESC, checkpoint.lixcol_change_id DESC\
@@ -651,6 +654,7 @@ pub(crate) fn build_filesystem_file_history_projection_sql(
                checkpoint.lixcol_change_id, \
                descriptor.lixcol_metadata, \
                checkpoint.lixcol_commit_id, \
+               checkpoint.lixcol_commit_created_at, \
                checkpoint.lixcol_root_commit_id, \
                checkpoint.lixcol_depth \
             FROM file_history_ranked_checkpoints checkpoint \
@@ -717,6 +721,7 @@ pub(crate) fn build_filesystem_directory_history_projection_sql(
                    change_id AS lixcol_change_id, \
                    metadata AS lixcol_metadata, \
                    commit_id AS lixcol_commit_id, \
+                   commit_created_at AS lixcol_commit_created_at, \
                    root_commit_id AS lixcol_root_commit_id, \
                    depth AS lixcol_depth \
                 FROM state_history_source \
@@ -791,6 +796,7 @@ pub(crate) fn build_filesystem_directory_history_projection_sql(
                d.lixcol_change_id, \
                d.lixcol_metadata, \
                d.lixcol_commit_id, \
+               d.lixcol_commit_created_at, \
                d.lixcol_root_commit_id, \
                d.lixcol_depth \
             FROM directory_history_base d \
@@ -852,6 +858,8 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
             };
             format!(
                 "all_target_versions AS ( \
+                   SELECT '{global_version}' AS version_id \
+                   UNION \
                    SELECT DISTINCT entity_id AS version_id \
                    FROM lix_internal_state_materialized_v1_lix_version_descriptor \
                    WHERE schema_key = '{version_descriptor_schema_key}' \
@@ -1008,6 +1016,7 @@ fn active_version_commit_id_sql() -> String {
 
 pub(crate) fn build_filesystem_state_history_source_sql(
     requested_roots_where: &str,
+    requested_versions_where: &str,
     default_root_scope: &str,
     force_active_scope: bool,
 ) -> String {
@@ -1030,7 +1039,8 @@ pub(crate) fn build_filesystem_state_history_source_sql(
         String::new()
     };
     let default_root_commits_sql = if force_active_scope {
-        "default_root_commits AS ( \
+        format!(
+            "default_root_commits AS ( \
            SELECT DISTINCT \
              lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
              vp.entity_id AS root_version_id \
@@ -1042,10 +1052,25 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              AND vp.global = true \
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
-         ), "
-        .to_string()
+           UNION \
+           SELECT DISTINCT \
+             lix_json_extract(vd.snapshot_content, 'commit_id') AS root_commit_id, \
+             vd.entity_id AS root_version_id \
+           FROM lix_internal_state_materialized_v1_lix_version_descriptor vd \
+           JOIN active_version_rows av \
+             ON av.version_id = vd.entity_id \
+           WHERE vd.schema_key = '{version_descriptor_schema_key}' \
+             AND vd.version_id = '{global_version}' \
+             AND vd.global = true \
+             AND vd.is_tombstone = 0 \
+             AND vd.snapshot_content IS NOT NULL \
+         ), ",
+            version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        )
     } else {
-        "default_root_commits AS ( \
+        format!(
+            "default_root_commits AS ( \
            SELECT DISTINCT \
              lix_json_extract(vp.snapshot_content, 'commit_id') AS root_commit_id, \
              vp.entity_id AS root_version_id \
@@ -1055,8 +1080,20 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              AND vp.global = true \
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
-         ), "
-        .to_string()
+           UNION \
+           SELECT DISTINCT \
+             lix_json_extract(vd.snapshot_content, 'commit_id') AS root_commit_id, \
+             vd.entity_id AS root_version_id \
+           FROM lix_internal_state_materialized_v1_lix_version_descriptor vd \
+           WHERE vd.schema_key = '{version_descriptor_schema_key}' \
+             AND vd.version_id = '{global_version}' \
+             AND vd.global = true \
+             AND vd.is_tombstone = 0 \
+             AND vd.snapshot_content IS NOT NULL \
+         ), ",
+            version_descriptor_schema_key = escape_sql_string(version_descriptor_schema_key()),
+            global_version = escape_sql_string(GLOBAL_VERSION_ID),
+        )
     };
     format!(
         "WITH \
@@ -1073,7 +1110,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                AND c.version_id = '{global_version}' \
                AND c.global = true \
                AND c.is_tombstone = 0 \
-               AND c.snapshot_content IS NOT NULL{requested_roots_where} \
+               AND c.snapshot_content IS NOT NULL{requested_roots_where}{requested_versions_where} \
                {default_root_scope} \
            ), \
            reachable_commits_from_requested AS ( \
@@ -1178,6 +1215,7 @@ pub(crate) fn build_filesystem_state_history_source_sql(
         default_root_commits_sql = default_root_commits_sql,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         requested_roots_where = requested_roots_where,
+        requested_versions_where = requested_versions_where,
         default_root_scope = default_root_scope,
     )
 }

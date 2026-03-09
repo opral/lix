@@ -1,5 +1,9 @@
 use crate::cel::CelEvaluator;
 use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::filesystem::live_projection::{
+    build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
+    build_filesystem_state_history_source_sql, FilesystemProjectionScope,
+};
 use crate::materialization::{MaterializationPlan, MaterializationWrite, MaterializationWriteOp};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
@@ -1239,9 +1243,15 @@ async fn load_missing_file_descriptors(
     backend: &dyn LixBackend,
     versions: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<(String, String), FileDescriptorRow>, LixError> {
+    let file_projection_sql =
+        build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false);
     let mut sql = String::from(
         "SELECT id, lixcol_version_id, path \
-         FROM lix_file_by_version \
+         FROM (",
+    );
+    sql.push_str(&file_projection_sql);
+    sql.push_str(
+        ") file_view \
          WHERE path IS NOT NULL \
            AND NOT EXISTS (\
                SELECT 1 \
@@ -1296,6 +1306,8 @@ async fn load_file_paths_for_descriptors(
         return Ok(BTreeMap::new());
     }
 
+    let file_projection_sql =
+        build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false);
     let mut sql = String::from("WITH requested(file_id, version_id) AS (VALUES ");
     let mut params = Vec::with_capacity(targets.len() * 2);
     for (index, (version_id, file_id)) in targets.iter().enumerate() {
@@ -1314,7 +1326,11 @@ async fn load_file_paths_for_descriptors(
     sql.push_str(
         ") \
          SELECT f.id, f.lixcol_version_id, f.path \
-         FROM lix_file_by_version f \
+         FROM (",
+    );
+    sql.push_str(&file_projection_sql);
+    sql.push_str(
+        ") f \
          JOIN requested r \
            ON r.file_id = f.id \
           AND r.version_id = f.lixcol_version_id \
@@ -1340,32 +1356,37 @@ async fn load_file_paths_for_descriptors(
 async fn load_missing_file_history_descriptors(
     backend: &dyn LixBackend,
 ) -> Result<BTreeMap<(String, String, i64), FileHistoryDescriptorRow>, LixError> {
-    let sql = "SELECT \
-                 id AS file_id, \
-                 lixcol_root_commit_id AS root_commit_id, \
-                 lixcol_depth AS depth, \
-                 lixcol_commit_id AS commit_id, \
-                 path \
-               FROM lix_file_history_by_version \
-               WHERE path IS NOT NULL \
-                 AND lixcol_root_commit_id IN (\
-                   SELECT entity_id \
-                   FROM lix_internal_state_materialized_v1_lix_commit \
-                   WHERE schema_key = 'lix_commit' \
-                     AND version_id = 'global' \
-                     AND is_tombstone = 0 \
-                     AND snapshot_content IS NOT NULL\
-                 ) \
-                 AND NOT EXISTS (\
-                   SELECT 1 \
-                   FROM lix_internal_file_history_data_cache cache \
-                   WHERE cache.file_id = id \
-                     AND cache.root_commit_id = lixcol_root_commit_id \
-                     AND cache.depth = lixcol_depth\
-                 ) \
-               ORDER BY lixcol_root_commit_id, lixcol_depth, id";
+    let history_source_sql = build_filesystem_state_history_source_sql("", "", "", false);
+    let history_projection_sql =
+        build_filesystem_file_history_projection_sql(&history_source_sql);
+    let sql = format!(
+        "SELECT \
+             history.id AS file_id, \
+             history.lixcol_root_commit_id AS root_commit_id, \
+             history.lixcol_depth AS depth, \
+             history.lixcol_commit_id AS commit_id, \
+             history.path \
+           FROM ({history_projection_sql}) history \
+           WHERE history.path IS NOT NULL \
+             AND history.lixcol_root_commit_id IN (\
+               SELECT entity_id \
+               FROM lix_internal_state_materialized_v1_lix_commit \
+               WHERE schema_key = 'lix_commit' \
+                 AND version_id = 'global' \
+                 AND is_tombstone = 0 \
+                 AND snapshot_content IS NOT NULL\
+             ) \
+             AND NOT EXISTS (\
+               SELECT 1 \
+               FROM lix_internal_file_history_data_cache cache \
+               WHERE cache.file_id = history.id \
+                 AND cache.root_commit_id = history.lixcol_root_commit_id \
+                 AND cache.depth = history.lixcol_depth\
+             ) \
+           ORDER BY history.lixcol_root_commit_id, history.lixcol_depth, history.id"
+    );
 
-    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), sql, &[]).await?;
+    let preprocessed = preprocess_sql(backend, &CelEvaluator::new(), &sql, &[]).await?;
     let rows = backend
         .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;

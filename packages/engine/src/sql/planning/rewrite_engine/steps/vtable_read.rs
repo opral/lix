@@ -811,6 +811,9 @@ fn build_untracked_union_query(
 ) -> Result<Query, LixError> {
     let dialect = GenericDialect {};
     let stripped_predicate = pushdown_predicate.and_then(|expr| strip_qualifiers(expr.clone()));
+    let has_version_predicate = stripped_predicate
+        .as_ref()
+        .is_some_and(|expr| expr_references_column(expr, "version_id"));
     let predicate_sql = stripped_predicate.as_ref().map(ToString::to_string);
     let predicate_schema_keys = stripped_predicate
         .as_ref()
@@ -862,6 +865,24 @@ fn build_untracked_union_query(
     }
 
     let union_sql = union_parts.join(" UNION ALL ");
+    let partition_version_expr = if has_version_predicate {
+        "version_id".to_string()
+    } else {
+        format!(
+            "CASE WHEN global = true THEN '{}' ELSE version_id END",
+            escape_string_literal(GLOBAL_VERSION_ID)
+        )
+    };
+    let presentation_rank_expr = if has_version_predicate {
+        "0".to_string()
+    } else {
+        format!(
+            "CASE WHEN global = true AND version_id <> '{}' THEN 0 \
+                  WHEN global = true THEN 1 \
+                  ELSE 0 END",
+            escape_string_literal(GLOBAL_VERSION_ID)
+        )
+    };
 
     let sql = format!(
         "SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
@@ -869,10 +890,15 @@ fn build_untracked_union_query(
          FROM (\
              SELECT entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, \
                     created_at, updated_at, global, change_id, writer_key, untracked, \
-                    ROW_NUMBER() OVER (PARTITION BY entity_id, schema_key, file_id, version_id ORDER BY priority) AS rn \
+                    ROW_NUMBER() OVER (\
+                        PARTITION BY entity_id, schema_key, file_id, {partition_version_expr} \
+                        ORDER BY {presentation_rank_expr}, priority\
+                    ) AS rn \
              FROM ({union_sql}) AS lix_state_union\
          ) AS lix_state_ranked \
          WHERE rn = 1",
+        partition_version_expr = partition_version_expr,
+        presentation_rank_expr = presentation_rank_expr,
     );
 
     let mut statements = Parser::parse_sql(&dialect, &sql).map_err(|err| LixError {
@@ -1032,6 +1058,63 @@ fn expr_is_schema_key_column(expr: &Expr) -> bool {
 
 fn expr_is_plugin_key_column(expr: &Expr) -> bool {
     expr_last_identifier_eq(expr, "plugin_key")
+}
+
+fn expr_references_column(expr: &Expr, column_name: &str) -> bool {
+    if expr_last_identifier_eq(expr, column_name) {
+        return true;
+    }
+
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_column(left, column_name)
+                || expr_references_column(right, column_name)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr) => expr_references_column(expr, column_name),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_column(expr, column_name)
+                || expr_references_column(low, column_name)
+                || expr_references_column(high, column_name)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            expr_references_column(expr, column_name)
+                || expr_references_column(pattern, column_name)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_references_column(expr, column_name)
+                || list
+                    .iter()
+                    .any(|item| expr_references_column(item, column_name))
+        }
+        Expr::InSubquery { expr, .. } => expr_references_column(expr, column_name),
+        Expr::Tuple(items) => items
+            .iter()
+            .any(|item| expr_references_column(item, column_name)),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|value| expr_references_column(value, column_name))
+                || conditions.iter().any(|condition| {
+                    expr_references_column(&condition.condition, column_name)
+                        || expr_references_column(&condition.result, column_name)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|value| expr_references_column(value, column_name))
+        }
+        _ => false,
+    }
 }
 
 fn strip_qualifiers(expr: Expr) -> Option<Expr> {

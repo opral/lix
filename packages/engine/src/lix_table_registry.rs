@@ -108,6 +108,7 @@ const LIX_FILE_HISTORY_COLUMNS: &[&str] = &[
     "lixcol_change_id",
     "lixcol_metadata",
     "lixcol_commit_id",
+    "lixcol_commit_created_at",
     "lixcol_root_commit_id",
     "lixcol_depth",
 ];
@@ -164,6 +165,7 @@ const LIX_DIRECTORY_HISTORY_COLUMNS: &[&str] = &[
     "lixcol_change_id",
     "lixcol_metadata",
     "lixcol_commit_id",
+    "lixcol_commit_created_at",
     "lixcol_root_commit_id",
     "lixcol_depth",
 ];

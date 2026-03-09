@@ -526,7 +526,7 @@ simulation_test!(
             .expect_err("expected schema validation failure");
         assert!(
             err.description
-                .contains("expects one of [string], got integer"),
+                .contains("is not of type \"string\""),
             "unexpected error: {}",
             err.description
         );
@@ -650,12 +650,12 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT version_id, snapshot_content \
+                "SELECT version_id, global, snapshot_content \
                  FROM lix_internal_state_vtable \
                  WHERE schema_key = 'lix_version_override_schema' \
                    AND entity_id = 'ovr-2' \
                    AND snapshot_content IS NOT NULL \
-                 ORDER BY version_id",
+                 ORDER BY version_id, global DESC",
                 &[],
             )
             .await
@@ -668,23 +668,28 @@ simulation_test!(
                     Value::Text(value) => value.clone(),
                     other => panic!("expected version_id text, got {other:?}"),
                 };
-                (version_id, snapshot_field(&row[1], "name"))
+                let global = match &row[1] {
+                    Value::Boolean(value) => *value,
+                    Value::Integer(value) => *value != 0,
+                    other => panic!("expected global bool-like value, got {other:?}"),
+                };
+                (version_id, global, snapshot_field(&row[2], "name"))
             })
             .collect::<Vec<_>>();
         let global_name = versioned_names
             .iter()
-            .find_map(|(version_id, name)| {
-                if version_id == "global" {
+            .find_map(|(_, global, name)| {
+                if *global {
                     Some(name.clone())
                 } else {
                     None
                 }
             })
-            .expect("expected global row");
+            .expect("expected global-backed row");
         let main_name = versioned_names
             .iter()
-            .find_map(|(version_id, name)| {
-                if version_id == "main" {
+            .find_map(|(_, global, name)| {
+                if !*global {
                     Some(name.clone())
                 } else {
                     None

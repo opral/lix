@@ -708,6 +708,64 @@ simulation_test!(
             );
         }
 
+        let main_authoritative_tip = engine
+            .execute(
+                "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_version_pointer' \
+                   AND c.entity_id = $1 \
+                 ORDER BY c.created_at DESC, c.id DESC \
+                 LIMIT 1",
+                &[lix_engine::Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(main_authoritative_tip.statements[0].rows.len(), 1);
+        assert_eq!(
+            text_value(&main_authoritative_tip.statements[0].rows[0][0], "commit_id"),
+            baselines.statements[0]
+                .rows
+                .iter()
+                .find_map(|row| {
+                    if text_value(&row[0], "version_id") == main_version_id {
+                        Some(text_value(&row[1], "checkpoint_commit_id"))
+                    } else {
+                        None
+                    }
+                })
+                .expect("main version checkpoint must exist"),
+        );
+
+        let global_authoritative_tip = engine
+            .execute(
+                "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_global_pointer' \
+                   AND c.entity_id = 'global' \
+                 ORDER BY c.created_at DESC, c.id DESC \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(global_authoritative_tip.statements[0].rows.len(), 1);
+        assert_eq!(
+            text_value(&global_authoritative_tip.statements[0].rows[0][0], "commit_id"),
+            baselines.statements[0]
+                .rows
+                .iter()
+                .find_map(|row| {
+                    if text_value(&row[0], "version_id") == "global" {
+                        Some(text_value(&row[1], "checkpoint_commit_id"))
+                    } else {
+                        None
+                    }
+                })
+                .expect("global checkpoint must exist"),
+        );
+
         let second_init_err = engine
             .init()
             .await

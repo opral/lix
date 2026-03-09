@@ -1869,6 +1869,15 @@ pub(crate) async fn resolve_file_id_by_path_in_version(
     find_file_id_by_path(backend, version_id, path, &mut read_rewrite_session).await
 }
 
+pub(crate) async fn resolve_directory_id_by_path_in_version(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<String>, LixError> {
+    let mut read_rewrite_session = ReadRewriteSession::default();
+    find_directory_id_by_path(backend, version_id, path, &mut read_rewrite_session).await
+}
+
 async fn find_file_id_by_components(
     backend: &dyn LixBackend,
     version_id: &str,

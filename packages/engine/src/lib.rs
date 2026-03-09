@@ -13,6 +13,7 @@ mod error_classification;
 mod errors;
 mod filesystem;
 mod functions;
+mod history_timeline;
 mod init;
 mod json_truthiness;
 mod key_value;

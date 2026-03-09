@@ -224,6 +224,36 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
 }
 
 #[test]
+fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_surface_classifier() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let registry_source = fs::read_to_string(root.join("src/sql/surfaces/registry.rs"))
+        .expect("registry.rs should be readable");
+
+    assert!(
+        !registry_source.contains("filesystem::planner::matches(statement)"),
+        "filesystem public surfaces must not re-enter the legacy surface classifier"
+    );
+    assert!(
+        !registry_source.contains("filesystem::lower::lowering_kind(statement)"),
+        "filesystem public surfaces must not re-enter legacy filesystem lowering coverage"
+    );
+}
+
+#[test]
+fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let logical_views_source = fs::read_to_string(
+        root.join("src/sql/planning/rewrite_engine/pipeline/rules/query/canonical/logical_views.rs"),
+    )
+    .expect("logical_views.rs should be readable");
+
+    assert!(
+        !logical_views_source.contains("filesystem_views::rewrite_query"),
+        "filesystem public surfaces must not re-enter legacy canonical query rewrite"
+    );
+}
+
+#[test]
 fn guardrail_runtime_source_forbids_crate_sql_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

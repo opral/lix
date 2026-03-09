@@ -608,6 +608,8 @@ impl Engine {
         entity_id: &str,
         commit_id: &str,
     ) -> Result<(), LixError> {
+        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id);
+        let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
         let table = format!(
             "lix_internal_state_materialized_v1_{}",
             version_pointer_schema_key()
@@ -630,37 +632,44 @@ impl Engine {
             version_id = escape_sql_string(version_pointer_storage_version_id()),
         );
         let existing = self.backend.execute(&check_sql, &[]).await?;
-        if !existing.rows.is_empty() {
-            return Ok(());
+        if existing.rows.is_empty() {
+            let insert_sql = format!(
+                "INSERT INTO {table} (\
+                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+                 ) VALUES (\
+                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+                 )",
+                table = table,
+                entity_id = escape_sql_string(entity_id),
+                schema_key = escape_sql_string(version_pointer_schema_key()),
+                schema_version = escape_sql_string(version_pointer_schema_version()),
+                file_id = escape_sql_string(version_pointer_file_id()),
+                version_id = escape_sql_string(version_pointer_storage_version_id()),
+                plugin_key = escape_sql_string(version_pointer_plugin_key()),
+                snapshot_content = escape_sql_string(&snapshot_content),
+                change_id = escape_sql_string(&change_id),
+            );
+            self.backend.execute(&insert_sql, &[]).await?;
         }
 
-        let snapshot_content = version_pointer_snapshot_content(entity_id, commit_id);
-        let change_id = format!("seed~{}~{}", version_pointer_schema_key(), entity_id);
-        let insert_sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
-             )",
-            table = table,
-            entity_id = escape_sql_string(entity_id),
-            schema_key = escape_sql_string(version_pointer_schema_key()),
-            schema_version = escape_sql_string(version_pointer_schema_version()),
-            file_id = escape_sql_string(version_pointer_file_id()),
-            version_id = escape_sql_string(version_pointer_storage_version_id()),
-            plugin_key = escape_sql_string(version_pointer_plugin_key()),
-            snapshot_content = escape_sql_string(&snapshot_content),
-            change_id = escape_sql_string(&change_id),
-        );
-        self.backend.execute(&insert_sql, &[]).await?;
-
-        Ok(())
+        self.seed_committed_pointer_change(
+            entity_id,
+            version_pointer_schema_key(),
+            version_pointer_schema_version(),
+            version_pointer_file_id(),
+            version_pointer_plugin_key(),
+            &snapshot_content,
+            &change_id,
+        )
+        .await
     }
 
     pub(crate) async fn seed_materialized_global_pointer(
         &self,
         commit_id: &str,
     ) -> Result<(), LixError> {
+        let snapshot_content = global_pointer_snapshot_content(commit_id);
+        let change_id = format!("seed~{}~{}", global_pointer_schema_key(), GLOBAL_VERSION_ID);
         let table = format!(
             "lix_internal_state_materialized_v1_{}",
             global_pointer_schema_key()
@@ -682,30 +691,78 @@ impl Engine {
             version_id = escape_sql_string(global_pointer_storage_version_id()),
         );
         let existing = self.backend.execute(&check_sql, &[]).await?;
-        if !existing.rows.is_empty() {
-            return Ok(());
+        if existing.rows.is_empty() {
+            let insert_sql = format!(
+                "INSERT INTO {table} (\
+                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+                 ) VALUES (\
+                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
+                 )",
+                table = table,
+                entity_id = escape_sql_string(GLOBAL_VERSION_ID),
+                schema_key = escape_sql_string(global_pointer_schema_key()),
+                schema_version = escape_sql_string(global_pointer_schema_version()),
+                file_id = escape_sql_string(global_pointer_file_id()),
+                version_id = escape_sql_string(global_pointer_storage_version_id()),
+                plugin_key = escape_sql_string(global_pointer_plugin_key()),
+                snapshot_content = escape_sql_string(&snapshot_content),
+                change_id = escape_sql_string(&change_id),
+            );
+            self.backend.execute(&insert_sql, &[]).await?;
         }
 
-        let snapshot_content = global_pointer_snapshot_content(commit_id);
-        let change_id = format!("seed~{}~{}", global_pointer_schema_key(), GLOBAL_VERSION_ID);
-        let insert_sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
-             )",
-            table = table,
-            entity_id = escape_sql_string(GLOBAL_VERSION_ID),
-            schema_key = escape_sql_string(global_pointer_schema_key()),
-            schema_version = escape_sql_string(global_pointer_schema_version()),
-            file_id = escape_sql_string(global_pointer_file_id()),
-            version_id = escape_sql_string(global_pointer_storage_version_id()),
-            plugin_key = escape_sql_string(global_pointer_plugin_key()),
-            snapshot_content = escape_sql_string(&snapshot_content),
-            change_id = escape_sql_string(&change_id),
-        );
-        self.backend.execute(&insert_sql, &[]).await?;
+        self.seed_committed_pointer_change(
+            GLOBAL_VERSION_ID,
+            global_pointer_schema_key(),
+            global_pointer_schema_version(),
+            global_pointer_file_id(),
+            global_pointer_plugin_key(),
+            &snapshot_content,
+            &change_id,
+        )
+        .await
+    }
 
+    async fn seed_committed_pointer_change(
+        &self,
+        entity_id: &str,
+        schema_key: &str,
+        schema_version: &str,
+        file_id: &str,
+        plugin_key: &str,
+        snapshot_content: &str,
+        change_id: &str,
+    ) -> Result<(), LixError> {
+        let snapshot_id = format!("{change_id}~snapshot");
+        self.backend
+            .execute(
+                "INSERT INTO lix_internal_snapshot (id, content) \
+                 SELECT $1, $2 \
+                 WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
+                &[
+                    Value::Text(snapshot_id.clone()),
+                    Value::Text(snapshot_content.to_string()),
+                ],
+            )
+            .await?;
+        self.backend
+            .execute(
+                "INSERT INTO lix_internal_change (\
+                 id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+                 ) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, NULL, '1970-01-01T00:00:00Z' \
+                 WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
+                &[
+                    Value::Text(change_id.to_string()),
+                    Value::Text(entity_id.to_string()),
+                    Value::Text(schema_key.to_string()),
+                    Value::Text(schema_version.to_string()),
+                    Value::Text(file_id.to_string()),
+                    Value::Text(plugin_key.to_string()),
+                    Value::Text(snapshot_id),
+                ],
+            )
+            .await?;
         Ok(())
     }
 
