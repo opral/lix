@@ -195,6 +195,21 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
     }
 }
 
+async fn active_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+    let rows = engine
+        .execute(
+            "SELECT version_id FROM lix_active_version ORDER BY id LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("active version query should succeed");
+    assert_eq!(rows.statements[0].rows.len(), 1);
+    match &rows.statements[0].rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected active version id text, got {other:?}"),
+    }
+}
+
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
 ) -> support::simulation_test::SimulationEngine {
@@ -1336,6 +1351,13 @@ simulation_test!(
             !select_star.statements[0].columns.is_empty(),
             "SELECT * should expose columns for comparison"
         );
+        assert!(
+            select_star
+                .statements[0]
+                .columns
+                .contains(&"lixcol_commit_created_at".to_string()),
+            "filesystem history select-star columns should expose lixcol_commit_created_at"
+        );
 
         let error = engine
             .execute(
@@ -1357,6 +1379,136 @@ simulation_test!(
         assert_eq!(
             available_columns, select_star.statements[0].columns,
             "unknown-column diagnostics should list the same columns as `SELECT *` on lix_file_history. error: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    file_history_by_version_matches_active_history_when_scoped_equivalently,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-by-version-file', '/history-by-version.json', lix_text_encode('{\"value\":\"v0\"}'))",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        let version_id = active_version_id(&engine).await;
+        let root_commit_id = active_version_commit_id(&engine).await;
+
+        let active_rows = engine
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_version_id, lixcol_commit_id, lixcol_commit_created_at, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history \
+                     WHERE id = 'history-by-version-file' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("active filesystem history read should succeed");
+
+        let by_version_rows = engine
+            .execute(
+                &format!(
+                    "SELECT id, path, lixcol_version_id, lixcol_commit_id, lixcol_commit_created_at, lixcol_root_commit_id, lixcol_depth \
+                     FROM lix_file_history_by_version \
+                     WHERE id = 'history-by-version-file' \
+                       AND lixcol_version_id = '{}' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    version_id, root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("by-version filesystem history read should succeed");
+
+        assert_eq!(active_rows.statements[0].rows.len(), 1);
+        assert_eq!(by_version_rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            active_rows.statements[0].rows[0],
+            by_version_rows.statements[0].rows[0],
+            "filesystem history and filesystem history by version should agree when scoped to the same version/root/depth"
+        );
+        assert_not_null(
+            &by_version_rows.statements[0].rows[0][4],
+            "lix_file_history_by_version.lixcol_commit_created_at",
+        );
+    }
+);
+
+simulation_test!(
+    file_history_by_version_unknown_column_diagnostic_matches_select_star_columns,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = boot_engine_with_json_plugin(&sim).await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-by-version-diagnostic', '/history-by-version-diagnostic.json', lix_text_encode('{\"value\":\"v0\"}'))",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        let version_id = active_version_id(&engine).await;
+        let root_commit_id = active_version_commit_id(&engine).await;
+
+        let select_star = engine
+            .execute(
+                &format!(
+                    "SELECT * \
+                     FROM lix_file_history_by_version \
+                     WHERE id = 'history-by-version-diagnostic' \
+                       AND lixcol_version_id = '{}' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    version_id, root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect("SELECT * on lix_file_history_by_version should succeed");
+        assert_eq!(select_star.statements[0].rows.len(), 1);
+        assert!(
+            select_star
+                .statements[0]
+                .columns
+                .contains(&"lixcol_commit_created_at".to_string()),
+            "filesystem by-version history select-star columns should expose lixcol_commit_created_at"
+        );
+
+        let error = engine
+            .execute(
+                &format!(
+                    "SELECT bogus \
+                     FROM lix_file_history_by_version \
+                     WHERE id = 'history-by-version-diagnostic' \
+                       AND lixcol_version_id = '{}' \
+                       AND lixcol_root_commit_id = '{}' \
+                       AND lixcol_depth = 0",
+                    version_id, root_commit_id
+                ),
+                &[],
+            )
+            .await
+            .expect_err("unknown by-version filesystem history column read should fail");
+        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+
+        let available_columns =
+            parse_available_columns_from_unknown_column_error(&error.description);
+        assert_eq!(
+            available_columns, select_star.statements[0].columns,
+            "unknown-column diagnostics should list the same columns as `SELECT *` on lix_file_history_by_version. error: {}",
             error.description
         );
     }
