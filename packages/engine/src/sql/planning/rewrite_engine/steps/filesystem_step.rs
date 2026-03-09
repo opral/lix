@@ -1,20 +1,9 @@
-use sqlparser::ast::{Delete, Insert, Query, Update};
+use sqlparser::ast::{Delete, Insert, Update};
 
 pub(crate) use crate::filesystem::mutation_rewrite::FilesystemUpdateRewrite;
 use crate::filesystem::mutation_rewrite::{FilesystemInsertSideEffects, ResolvedDirectoryIdMap};
-use crate::filesystem::{mutation_rewrite, select_rewrite};
+use crate::filesystem::mutation_rewrite;
 use crate::{LixBackend, LixError, Value as EngineValue};
-
-pub fn rewrite_query(query: Query) -> Result<Option<Query>, LixError> {
-    select_rewrite::rewrite_query(query)
-}
-
-pub fn rewrite_query_with_params(
-    query: Query,
-    params: &[EngineValue],
-) -> Result<Option<Query>, LixError> {
-    select_rewrite::rewrite_query_with_params(query, params)
-}
 
 pub fn rewrite_insert(insert: Insert) -> Result<Option<Insert>, LixError> {
     mutation_rewrite::rewrite_insert(insert)

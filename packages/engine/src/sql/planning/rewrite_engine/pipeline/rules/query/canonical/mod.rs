@@ -1,5 +1,4 @@
 pub(crate) mod entity_views;
-pub(crate) mod filesystem_views;
 pub(crate) mod lix_active_account;
 pub(crate) mod lix_active_version;
 pub(crate) mod lix_change;
