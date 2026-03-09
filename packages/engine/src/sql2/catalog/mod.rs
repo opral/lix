@@ -754,6 +754,13 @@ fn state_columns() -> Vec<String> {
         "snapshot_content",
         "metadata",
         "schema_version",
+        "created_at",
+        "updated_at",
+        "global",
+        "change_id",
+        "commit_id",
+        "untracked",
+        "writer_key",
     ]
     .into_iter()
     .map(str::to_string)
@@ -777,6 +784,7 @@ fn state_history_columns() -> Vec<String> {
         "schema_version",
         "change_id",
         "commit_id",
+        "commit_created_at",
         "root_commit_id",
         "depth",
         "version_id",
@@ -871,6 +879,7 @@ fn filesystem_file_history_columns() -> Vec<String> {
         "lixcol_change_id",
         "lixcol_metadata",
         "lixcol_commit_id",
+        "lixcol_commit_created_at",
         "lixcol_root_commit_id",
         "lixcol_depth",
     ]
@@ -924,6 +933,7 @@ fn filesystem_directory_history_columns() -> Vec<String> {
         "lixcol_change_id",
         "lixcol_metadata",
         "lixcol_commit_id",
+        "lixcol_commit_created_at",
         "lixcol_root_commit_id",
         "lixcol_depth",
     ]

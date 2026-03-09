@@ -7,8 +7,7 @@ use super::super::contracts::planned_statement::PlannedStatementSet;
 use super::super::planning::preprocess::preprocess_with_surfaces_to_plan;
 use super::super::vtable;
 use super::{
-    entity, filesystem, lix_change, lix_state, lix_state_by_version, lix_state_history,
-    lix_working_changes,
+    entity, lix_change, lix_state, lix_state_by_version, lix_state_history, lix_working_changes,
 };
 use sqlparser::ast::Statement;
 
@@ -59,9 +58,6 @@ pub(crate) fn classify_statement(statement: &Statement) -> SurfaceKind {
     if lix_state::planner::matches(statement) {
         return SurfaceKind::LixState;
     }
-    if filesystem::planner::matches(statement) {
-        return SurfaceKind::Filesystem;
-    }
     if entity::planner::matches(statement) {
         return SurfaceKind::Entity;
     }
@@ -102,7 +98,6 @@ pub(crate) fn collect_surface_coverage(statements: &[Statement]) -> SurfaceCover
                 coverage.lix_working_changes += 1;
             }
             SurfaceKind::Filesystem => {
-                let _ = filesystem::lower::lowering_kind(statement);
                 coverage.filesystem += 1;
             }
             SurfaceKind::Entity => {
@@ -175,11 +170,11 @@ mod tests {
     }
 
     #[test]
-    fn classifies_filesystem_surface() {
+    fn filesystem_surfaces_no_longer_enter_legacy_surface_classifier() {
         let statements =
             Parser::parse_sql(&GenericDialect {}, "SELECT * FROM lix_file WHERE id = 'f'")
                 .expect("parse SQL");
-        assert_eq!(classify_statement(&statements[0]), SurfaceKind::Filesystem);
+        assert_eq!(classify_statement(&statements[0]), SurfaceKind::Generic);
     }
 
     #[test]

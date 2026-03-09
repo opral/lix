@@ -499,6 +499,7 @@ simulation_test!(
             .execute(
                 "SELECT write_lane, commit_id \
                  FROM lix_internal_commit_idempotency \
+                 WHERE write_lane = 'version:version-a' \
                  ORDER BY write_lane, idempotency_key",
                 &[],
             )

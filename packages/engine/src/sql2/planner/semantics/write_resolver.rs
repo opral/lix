@@ -30,8 +30,10 @@ use crate::version::{
     active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
     version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
+    version_descriptor_storage_version_id,
     version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
-    version_pointer_schema_version, version_pointer_snapshot_content, GLOBAL_VERSION_ID,
+    version_pointer_schema_version, version_pointer_snapshot_content,
+    version_pointer_storage_version_id, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, Value};
 use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
@@ -364,6 +366,63 @@ async fn resolve_filesystem_write(
     }
 }
 
+fn filesystem_write_lookup_scope(planned_write: &PlannedWrite) -> FilesystemProjectionScope {
+    match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_file" | "lix_directory" => FilesystemProjectionScope::ActiveVersion,
+        "lix_file_by_version" | "lix_directory_by_version" => {
+            FilesystemProjectionScope::ExplicitVersion
+        }
+        _ => FilesystemProjectionScope::ExplicitVersion,
+    }
+}
+
+async fn resolved_filesystem_version_id(
+    backend: &dyn LixBackend,
+    planned_write: &PlannedWrite,
+) -> Result<String, WriteResolveError> {
+    match planned_write.command.target.descriptor.public_name.as_str() {
+        "lix_file" | "lix_directory" => load_active_filesystem_version_id(backend).await,
+        _ => resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
+            message: "sql2 filesystem write requires a concrete version_id".to_string(),
+        }),
+    }
+}
+
+async fn load_active_filesystem_version_id(
+    backend: &dyn LixBackend,
+) -> Result<String, WriteResolveError> {
+    let result = backend
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_internal_state_untracked \
+             WHERE schema_key = $1 \
+               AND file_id = $2 \
+               AND version_id = $3 \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+            &[
+                Value::Text(active_version_schema_key().to_string()),
+                Value::Text(active_version_file_id().to_string()),
+                Value::Text(active_version_storage_version_id().to_string()),
+            ],
+        )
+        .await
+        .map_err(write_resolve_backend_error)?;
+    let Some(row) = result.rows.first() else {
+        return Err(WriteResolveError {
+            message: "sql2 filesystem write requires an active version".to_string(),
+        });
+    };
+    let Some(snapshot_content) = row.first().and_then(text_from_value) else {
+        return Err(WriteResolveError {
+            message:
+                "sql2 filesystem active-version lookup expected snapshot_content text".to_string(),
+        });
+    };
+    parse_active_version_snapshot(&snapshot_content).map_err(write_resolve_backend_error)
+}
+
 async fn resolve_directory_insert_write_plan(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
@@ -375,12 +434,17 @@ async fn resolve_directory_insert_write_plan(
                 .to_string(),
         });
     };
-    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "sql2 filesystem directory insert requires a concrete version_id".to_string(),
-    })?;
+    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let lookup_scope = filesystem_write_lookup_scope(planned_write);
 
-    let computed =
-        resolve_directory_insert_target(backend, planned_write, payload, &version_id).await?;
+    let computed = resolve_directory_insert_target(
+        backend,
+        planned_write,
+        payload,
+        &version_id,
+        lookup_scope,
+    )
+    .await?;
     let mut intended_post_state = Vec::new();
     let mut lineage = Vec::new();
 
@@ -429,10 +493,10 @@ async fn resolve_existing_directory_write(
     target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
-    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "sql2 filesystem directory update requires a concrete version_id".to_string(),
-    })?;
-    let Some(current_row) = load_target_directory_row(backend, planned_write, &version_id).await?
+    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let Some(current_row) =
+        load_target_directory_row(backend, planned_write, &version_id, lookup_scope).await?
     else {
         return Ok(ResolvedWritePlan {
             authoritative_pre_state: Vec::new(),
@@ -487,9 +551,14 @@ async fn resolve_existing_directory_write(
                 });
             }
 
-            let next_row =
-                resolve_directory_update_target(backend, &current_row, payload, &version_id)
-                    .await?;
+            let next_row = resolve_directory_update_target(
+                backend,
+                &current_row,
+                payload,
+                &version_id,
+                lookup_scope,
+            )
+            .await?;
             let row_ref = ResolvedRowRef {
                 entity_id: current_row.id.clone(),
                 schema_key: FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string(),
@@ -634,10 +703,16 @@ async fn resolve_file_insert_write_plan(
             message: "sql2 filesystem file insert requires a full snapshot payload".to_string(),
         });
     };
-    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "sql2 filesystem file insert requires a concrete version_id".to_string(),
-    })?;
-    let computed = resolve_file_insert_target(backend, planned_write, payload, &version_id).await?;
+    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let computed = resolve_file_insert_target(
+        backend,
+        planned_write,
+        payload,
+        &version_id,
+        lookup_scope,
+    )
+    .await?;
     let payload_bytes = payload_binary_value(payload, "data")?;
 
     let mut intended_post_state = Vec::new();
@@ -693,10 +768,11 @@ async fn resolve_existing_file_write(
     target_write_lane: Option<WriteLane>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     ensure_exact_selector(planned_write)?;
-    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "sql2 filesystem file write requires a concrete version_id".to_string(),
-    })?;
-    let Some(current_row) = load_target_file_row(backend, planned_write, &version_id).await? else {
+    let version_id = resolved_filesystem_version_id(backend, planned_write).await?;
+    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let Some(current_row) =
+        load_target_file_row(backend, planned_write, &version_id, lookup_scope).await?
+    else {
         return Ok(ResolvedWritePlan {
             authoritative_pre_state: Vec::new(),
             intended_post_state: Vec::new(),
@@ -756,8 +832,14 @@ async fn resolve_existing_file_write(
             }
 
             let payload_bytes = payload_binary_value(payload, "data")?;
-            let (next_row, ancestor_rows) =
-                resolve_file_update_target(backend, &current_row, payload, &version_id).await?;
+            let (next_row, ancestor_rows) = resolve_file_update_target(
+                backend,
+                &current_row,
+                payload,
+                &version_id,
+                lookup_scope,
+            )
+            .await?;
             let descriptor_changed =
                 file_descriptor_changed(&current_row, &next_row) || !ancestor_rows.is_empty();
             let mut intended_post_state = Vec::new();
@@ -864,6 +946,7 @@ async fn resolve_file_insert_target(
     planned_write: &PlannedWrite,
     payload: &BTreeMap<String, Value>,
     version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<ResolvedFileInsertTarget, WriteResolveError> {
     let explicit_path = payload_text_required(payload, "path", "sql2 filesystem file insert")?;
     let parsed = parse_file_path(&explicit_path).map_err(write_resolve_backend_error)?;
@@ -873,22 +956,25 @@ async fn resolve_file_insert_target(
         .and_then(value_as_bool)
         .unwrap_or(false);
     let metadata = payload_optional_text(payload, "metadata")?;
-    ensure_no_directory_at_file_path(backend, version_id, &parsed.normalized_path).await?;
+    ensure_no_directory_at_file_path(backend, version_id, &parsed.normalized_path, lookup_scope)
+        .await?;
 
     let (directory_id, ancestor_rows) = resolve_parent_directory_target(
         backend,
         version_id,
         parsed.directory_path.as_deref(),
         planned_write.command.mode == WriteMode::Untracked,
+        lookup_scope,
     )
     .await?;
 
-    if let Some(existing_row) =
-        load_file_row_by_path(backend, version_id, &parsed.normalized_path).await?
+    if let Some(existing_id) =
+        lookup_file_id_by_path(backend, version_id, &parsed.normalized_path, lookup_scope)
+            .await?
     {
         let same_id = explicit_id
             .as_deref()
-            .map(|value| value == existing_row.id.as_str())
+            .map(|value| value == existing_id.as_str())
             .unwrap_or(false);
         if !same_id {
             return Err(WriteResolveError {
@@ -916,6 +1002,7 @@ async fn resolve_file_update_target(
     current_row: &FileFilesystemRow,
     payload: &BTreeMap<String, Value>,
     version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<(FileFilesystemRow, Vec<DirectoryFilesystemRow>), WriteResolveError> {
     let next_hidden = payload
         .get("hidden")
@@ -931,12 +1018,19 @@ async fn resolve_file_update_target(
     let (next_directory_id, next_name, next_extension, next_path) =
         if let Some(raw_path) = payload.get("path").and_then(text_from_value) {
             let parsed = parse_file_path(&raw_path).map_err(write_resolve_backend_error)?;
-            ensure_no_directory_at_file_path(backend, version_id, &parsed.normalized_path).await?;
+            ensure_no_directory_at_file_path(
+                backend,
+                version_id,
+                &parsed.normalized_path,
+                lookup_scope,
+            )
+            .await?;
             let (directory_id, missing_ancestors) = resolve_parent_directory_target(
                 backend,
                 version_id,
                 parsed.directory_path.as_deref(),
                 current_row.untracked,
+                lookup_scope,
             )
             .await?;
             ancestor_rows = missing_ancestors;
@@ -955,8 +1049,10 @@ async fn resolve_file_update_target(
             )
         };
 
-    if let Some(existing_row) = load_file_row_by_path(backend, version_id, &next_path).await? {
-        if existing_row.id != current_row.id {
+    if let Some(existing_id) =
+        lookup_file_id_by_path(backend, version_id, &next_path, lookup_scope).await?
+    {
+        if existing_id != current_row.id {
             return Err(WriteResolveError {
                 message: format!(
                     "Unique constraint violation: file path '{}' already exists in version '{}'",
@@ -988,16 +1084,23 @@ async fn resolve_parent_directory_target(
     version_id: &str,
     directory_path: Option<&str>,
     untracked: bool,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<(Option<String>, Vec<DirectoryFilesystemRow>), WriteResolveError> {
     let Some(directory_path) = directory_path else {
         return Ok((None, Vec::new()));
     };
-    let missing_rows =
-        resolve_missing_directory_rows(backend, version_id, directory_path, untracked).await?;
+    let missing_rows = resolve_missing_directory_rows(
+        backend,
+        version_id,
+        directory_path,
+        untracked,
+        lookup_scope,
+    )
+    .await?;
     let directory_id = if let Some(last_row) = missing_rows.last() {
         Some(last_row.id.clone())
     } else {
-        lookup_directory_id_by_path(backend, version_id, directory_path).await?
+        lookup_directory_id_by_path(backend, version_id, directory_path, lookup_scope).await?
     };
     Ok((directory_id, missing_rows))
 }
@@ -1007,6 +1110,7 @@ async fn resolve_missing_directory_rows(
     version_id: &str,
     directory_path: &str,
     untracked: bool,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
     let mut missing = Vec::new();
     let mut known_ids = BTreeMap::<String, String>::new();
@@ -1015,18 +1119,21 @@ async fn resolve_missing_directory_rows(
 
     for candidate_path in paths {
         if let Some(existing_id) =
-            lookup_directory_id_by_path(backend, version_id, &candidate_path).await?
+            lookup_directory_id_by_path(backend, version_id, &candidate_path, lookup_scope)
+                .await?
         {
             known_ids.insert(candidate_path, existing_id);
             continue;
         }
-        ensure_no_file_at_directory_path(backend, version_id, &candidate_path).await?;
+        ensure_no_file_at_directory_path(backend, version_id, &candidate_path, lookup_scope)
+            .await?;
         let parent_id = match parent_directory_path(&candidate_path) {
             Some(parent_path) => {
                 if let Some(parent_id) = known_ids.get(&parent_path).cloned() {
                     Some(parent_id)
                 } else if let Some(existing_parent_id) =
-                    lookup_directory_id_by_path(backend, version_id, &parent_path).await?
+                    lookup_directory_id_by_path(backend, version_id, &parent_path, lookup_scope)
+                        .await?
                 {
                     Some(existing_parent_id)
                 } else {
@@ -1057,9 +1164,10 @@ async fn ensure_no_directory_at_file_path(
     backend: &dyn LixBackend,
     version_id: &str,
     file_path: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<(), WriteResolveError> {
     let directory_path = format!("{}/", file_path.trim_end_matches('/'));
-    if lookup_directory_id_by_path(backend, version_id, &directory_path)
+    if lookup_directory_id_by_path(backend, version_id, &directory_path, lookup_scope)
         .await?
         .is_none()
     {
@@ -1133,6 +1241,7 @@ async fn resolve_directory_insert_target(
     planned_write: &PlannedWrite,
     payload: &BTreeMap<String, Value>,
     version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<ResolvedDirectoryInsertTarget, WriteResolveError> {
     let explicit_id = payload.get("id").and_then(text_from_value);
     let explicit_parent_id = payload.get("parent_id").and_then(text_from_value);
@@ -1152,9 +1261,14 @@ async fn resolve_directory_insert_target(
                 message: "Directory name must be provided".to_string(),
             })?;
         let derived_parent_id = match parent_directory_path(&normalized_path) {
-            Some(parent_path) => lookup_directory_id_by_path(backend, version_id, &parent_path)
-                .await?
-                .or_else(|| Some(auto_directory_id(version_id, &parent_path))),
+            Some(parent_path) => lookup_directory_id_by_path(
+                backend,
+                version_id,
+                &parent_path,
+                lookup_scope,
+            )
+            .await?
+            .or_else(|| Some(auto_directory_id(version_id, &parent_path))),
             None => None,
         };
 
@@ -1185,11 +1299,16 @@ async fn resolve_directory_insert_target(
         })?;
         let name = normalize_path_segment(&raw_name).map_err(write_resolve_backend_error)?;
         let parent_path = match explicit_parent_id.as_deref() {
-            Some(parent_id) => lookup_directory_path_by_id(backend, version_id, parent_id)
-                .await?
-                .ok_or_else(|| WriteResolveError {
-                    message: format!("Parent directory does not exist for id {parent_id}"),
-                })?,
+            Some(parent_id) => lookup_directory_path_by_id(
+                backend,
+                version_id,
+                parent_id,
+                lookup_scope,
+            )
+            .await?
+            .ok_or_else(|| WriteResolveError {
+                message: format!("Parent directory does not exist for id {parent_id}"),
+            })?,
             None => "/".to_string(),
         };
         let computed_path = compose_directory_path(parent_path.as_str(), &name)
@@ -1198,7 +1317,7 @@ async fn resolve_directory_insert_target(
     };
 
     if let Some(existing_id) =
-        lookup_directory_id_by_path(backend, version_id, &normalized_path).await?
+        lookup_directory_id_by_path(backend, version_id, &normalized_path, lookup_scope).await?
     {
         let same_id = explicit_id
             .as_deref()
@@ -1213,18 +1332,21 @@ async fn resolve_directory_insert_target(
             });
         }
     }
-    ensure_no_file_at_directory_path(backend, version_id, &normalized_path).await?;
+    ensure_no_file_at_directory_path(backend, version_id, &normalized_path, lookup_scope)
+        .await?;
 
     let mut ancestor_rows = Vec::new();
     for ancestor_path in directory_ancestor_paths(&normalized_path) {
-        if lookup_directory_id_by_path(backend, version_id, &ancestor_path)
+        if lookup_directory_id_by_path(backend, version_id, &ancestor_path, lookup_scope)
             .await?
             .is_some()
         {
             continue;
         }
         let ancestor_parent_id = match parent_directory_path(&ancestor_path) {
-            Some(path) => Some(lookup_or_auto_directory_id(backend, version_id, &path).await?),
+            Some(path) => Some(
+                lookup_or_auto_directory_id(backend, version_id, &path, lookup_scope).await?,
+            ),
             None => None,
         };
         ancestor_rows.push(DirectoryFilesystemRow {
@@ -1256,6 +1378,7 @@ async fn resolve_directory_update_target(
     current_row: &DirectoryFilesystemRow,
     payload: &BTreeMap<String, Value>,
     version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<DirectoryFilesystemRow, WriteResolveError> {
     let next_path = payload.get("path").and_then(text_from_value);
     let next_parent_id = payload.get("parent_id").and_then(text_from_value);
@@ -1276,11 +1399,16 @@ async fn resolve_directory_update_target(
             message: "Directory name must be provided".to_string(),
         })?;
         let parent_id = match parent_directory_path(&normalized_path) {
-            Some(parent_path) => lookup_directory_id_by_path(backend, version_id, &parent_path)
-                .await?
-                .ok_or_else(|| WriteResolveError {
-                    message: format!("Parent directory does not exist for path {}", parent_path),
-                })?,
+            Some(parent_path) => lookup_directory_id_by_path(
+                backend,
+                version_id,
+                &parent_path,
+                lookup_scope,
+            )
+            .await?
+            .ok_or_else(|| WriteResolveError {
+                message: format!("Parent directory does not exist for path {}", parent_path),
+            })?,
             None => String::new(),
         };
         let parent_id_opt = if parent_id.is_empty() {
@@ -1294,7 +1422,12 @@ async fn resolve_directory_update_target(
         let name_raw = next_name.unwrap_or_else(|| current_row.name.clone());
         let name = normalize_path_segment(&name_raw).map_err(write_resolve_backend_error)?;
         let parent_path = match parent_id.as_deref() {
-            Some(parent_id) => lookup_directory_path_by_id(backend, version_id, parent_id)
+            Some(parent_id) => lookup_directory_path_by_id(
+                backend,
+                version_id,
+                parent_id,
+                lookup_scope,
+            )
                 .await?
                 .ok_or_else(|| WriteResolveError {
                     message: format!("Parent directory does not exist for id {}", parent_id),
@@ -1312,10 +1445,17 @@ async fn resolve_directory_update_target(
         });
     }
     if let Some(parent_id) = resolved_parent_id.as_deref() {
-        assert_no_directory_cycle(backend, version_id, current_row.id.as_str(), parent_id).await?;
+        assert_no_directory_cycle(
+            backend,
+            version_id,
+            current_row.id.as_str(),
+            parent_id,
+            lookup_scope,
+        )
+        .await?;
     }
     if let Some(existing_id) =
-        lookup_directory_id_by_path(backend, version_id, &resolved_path).await?
+        lookup_directory_id_by_path(backend, version_id, &resolved_path, lookup_scope).await?
     {
         if existing_id != current_row.id {
             return Err(WriteResolveError {
@@ -1326,7 +1466,7 @@ async fn resolve_directory_update_target(
             });
         }
     }
-    ensure_no_file_at_directory_path(backend, version_id, &resolved_path).await?;
+    ensure_no_file_at_directory_path(backend, version_id, &resolved_path, lookup_scope).await?;
 
     Ok(DirectoryFilesystemRow {
         id: current_row.id.clone(),
@@ -1345,6 +1485,7 @@ async fn load_target_directory_row(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
     if let Some(id) = planned_write
         .command
@@ -1353,7 +1494,7 @@ async fn load_target_directory_row(
         .get("id")
         .and_then(text_from_value)
     {
-        return load_directory_row_by_id(backend, version_id, &id).await;
+        return load_directory_row_by_id(backend, version_id, &id, lookup_scope).await;
     }
     if let Some(path) = planned_write
         .command
@@ -1363,7 +1504,12 @@ async fn load_target_directory_row(
         .and_then(text_from_value)
     {
         let normalized = normalize_directory_path(&path).map_err(write_resolve_backend_error)?;
-        return load_directory_row_by_path(backend, version_id, &normalized).await;
+        let Some(directory_id) =
+            lookup_directory_id_by_path(backend, version_id, &normalized, lookup_scope).await?
+        else {
+            return Ok(None);
+        };
+        return load_directory_row_by_id(backend, version_id, &directory_id, lookup_scope).await;
     }
     Err(WriteResolveError {
         message: "sql2 filesystem directory update requires an exact id or path selector"
@@ -1375,6 +1521,7 @@ async fn load_target_file_row(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
     version_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, WriteResolveError> {
     if let Some(id) = planned_write
         .command
@@ -1383,7 +1530,7 @@ async fn load_target_file_row(
         .get("id")
         .and_then(text_from_value)
     {
-        return load_file_row_by_id(backend, version_id, &id).await;
+        return load_file_row_by_id(backend, version_id, &id, lookup_scope).await;
     }
     if let Some(path) = planned_write
         .command
@@ -1395,7 +1542,12 @@ async fn load_target_file_row(
         let normalized = parse_file_path(&path)
             .map_err(write_resolve_backend_error)?
             .normalized_path;
-        return load_file_row_by_path(backend, version_id, &normalized).await;
+        let Some(file_id) =
+            lookup_file_id_by_path(backend, version_id, &normalized, lookup_scope).await?
+        else {
+            return Ok(None);
+        };
+        return load_file_row_by_id(backend, version_id, &file_id, lookup_scope).await;
     }
     Err(WriteResolveError {
         message: "sql2 filesystem file write requires an exact id or path selector".to_string(),
@@ -1406,8 +1558,9 @@ async fn lookup_or_auto_directory_id(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<String, WriteResolveError> {
-    Ok(lookup_directory_id_by_path(backend, version_id, path)
+    Ok(lookup_directory_id_by_path(backend, version_id, path, lookup_scope)
         .await?
         .unwrap_or_else(|| auto_directory_id(version_id, path)))
 }
@@ -1416,8 +1569,20 @@ async fn lookup_directory_id_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, WriteResolveError> {
-    Ok(load_directory_row_by_path(backend, version_id, path)
+    Ok(load_directory_row_by_path(backend, version_id, path, lookup_scope)
+        .await?
+        .map(|row| row.id))
+}
+
+async fn lookup_file_id_by_path(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+    lookup_scope: FilesystemProjectionScope,
+) -> Result<Option<String>, WriteResolveError> {
+    Ok(load_file_row_by_path(backend, version_id, path, lookup_scope)
         .await?
         .map(|row| row.id))
 }
@@ -1426,8 +1591,9 @@ async fn lookup_directory_path_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, WriteResolveError> {
-    Ok(load_directory_row_by_id(backend, version_id, directory_id)
+    Ok(load_directory_row_by_id(backend, version_id, directory_id, lookup_scope)
         .await?
         .map(|row| row.path))
 }
@@ -1436,9 +1602,10 @@ async fn ensure_no_file_at_directory_path(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_path: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<(), WriteResolveError> {
     let file_path = directory_path.trim_end_matches('/').to_string();
-    if load_file_row_by_path(backend, version_id, &file_path)
+    if lookup_file_id_by_path(backend, version_id, &file_path, lookup_scope)
         .await?
         .is_none()
     {
@@ -1454,6 +1621,7 @@ async fn assert_no_directory_cycle(
     version_id: &str,
     directory_id: &str,
     parent_id: &str,
+    lookup_scope: FilesystemProjectionScope,
 ) -> Result<(), WriteResolveError> {
     let mut safety = 0usize;
     let mut current_parent: Option<String> = Some(parent_id.to_string());
@@ -1469,7 +1637,8 @@ async fn assert_no_directory_cycle(
             });
         }
         safety += 1;
-        let Some(parent_row) = load_directory_row_by_id(backend, version_id, &parent_id).await?
+        let Some(parent_row) =
+            load_directory_row_by_id(backend, version_id, &parent_id, lookup_scope).await?
         else {
             return Err(WriteResolveError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
@@ -1484,6 +1653,7 @@ async fn load_directory_row_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     directory_id: &str,
+    scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
     let sql = format!(
         "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
@@ -1491,8 +1661,7 @@ async fn load_directory_row_by_id(
          WHERE lixcol_version_id = '{version_id}' \
            AND id = '{directory_id}' \
          LIMIT 1",
-        projection_sql =
-            build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        projection_sql = build_filesystem_directory_projection_sql(scope),
         version_id = escape_sql_string(version_id),
         directory_id = escape_sql_string(directory_id),
     );
@@ -1503,6 +1672,7 @@ async fn load_directory_row_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, WriteResolveError> {
     let sql = format!(
         "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
@@ -1510,8 +1680,7 @@ async fn load_directory_row_by_path(
          WHERE lixcol_version_id = '{version_id}' \
            AND path = '{path}' \
          LIMIT 1",
-        projection_sql =
-            build_filesystem_directory_projection_sql(FilesystemProjectionScope::ExplicitVersion),
+        projection_sql = build_filesystem_directory_projection_sql(scope),
         version_id = escape_sql_string(version_id),
         path = escape_sql_string(path),
     );
@@ -1560,6 +1729,7 @@ async fn load_file_row_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     path: &str,
+    scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, WriteResolveError> {
     let sql = format!(
         "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id \
@@ -1567,8 +1737,7 @@ async fn load_file_row_by_path(
          WHERE lixcol_version_id = '{version_id}' \
            AND path = '{path}' \
          LIMIT 1",
-        projection_sql =
-            build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false),
+        projection_sql = build_filesystem_file_projection_sql(scope, false),
         version_id = escape_sql_string(version_id),
         path = escape_sql_string(path),
     );
@@ -1579,6 +1748,7 @@ async fn load_file_row_by_id(
     backend: &dyn LixBackend,
     version_id: &str,
     file_id: &str,
+    scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, WriteResolveError> {
     let sql = format!(
         "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id \
@@ -1586,8 +1756,7 @@ async fn load_file_row_by_id(
          WHERE lixcol_version_id = '{version_id}' \
            AND id = '{file_id}' \
          LIMIT 1",
-        projection_sql =
-            build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false),
+        projection_sql = build_filesystem_file_projection_sql(scope, false),
         version_id = escape_sql_string(version_id),
         file_id = escape_sql_string(file_id),
     );
@@ -2513,40 +2682,44 @@ async fn load_version_admin_row(
     version_id: &str,
 ) -> Result<Option<VersionAdminRow>, crate::LixError> {
     let descriptor_sql = format!(
-        "SELECT s.content AS snapshot_content, c.id AS change_id \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND s.content IS NOT NULL \
-         ORDER BY c.created_at DESC, c.id DESC \
+        "SELECT snapshot_content, change_id \
+         FROM lix_internal_state_materialized_v1_lix_version_descriptor \
+         WHERE schema_key = '{schema_key}' \
+           AND entity_id = '{entity_id}' \
+           AND file_id = '{file_id}' \
+           AND plugin_key = '{plugin_key}' \
+           AND version_id = '{storage_version_id}' \
+           AND global = true \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL \
          LIMIT 1",
         schema_key = version_descriptor_schema_key(),
         entity_id = version_id.replace('\'', "''"),
         file_id = version_descriptor_file_id(),
         plugin_key = version_descriptor_plugin_key(),
+        storage_version_id = version_descriptor_storage_version_id(),
     );
     let descriptor_result = backend.execute(&descriptor_sql, &[]).await?;
     let Some(descriptor_row) = descriptor_result.rows.first() else {
         return Ok(None);
     };
     let pointer_sql = format!(
-        "SELECT s.content AS snapshot_content, c.id AS change_id \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = '{schema_key}' \
-           AND c.entity_id = '{entity_id}' \
-           AND c.file_id = '{file_id}' \
-           AND c.plugin_key = '{plugin_key}' \
-           AND s.content IS NOT NULL \
-         ORDER BY c.created_at DESC, c.id DESC \
+        "SELECT snapshot_content, change_id \
+         FROM lix_internal_state_materialized_v1_lix_version_pointer \
+         WHERE schema_key = '{schema_key}' \
+           AND entity_id = '{entity_id}' \
+           AND file_id = '{file_id}' \
+           AND plugin_key = '{plugin_key}' \
+           AND version_id = '{storage_version_id}' \
+           AND global = true \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL \
          LIMIT 1",
         schema_key = version_pointer_schema_key(),
         entity_id = version_id.replace('\'', "''"),
         file_id = version_pointer_file_id(),
         plugin_key = version_pointer_plugin_key(),
+        storage_version_id = version_pointer_storage_version_id(),
     );
     let pointer_result = backend.execute(&pointer_sql, &[]).await?;
     let pointer_row = pointer_result.rows.first();

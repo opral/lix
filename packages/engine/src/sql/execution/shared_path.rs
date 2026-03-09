@@ -29,6 +29,8 @@ use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
 use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
+use super::super::contracts::planned_statement::PlannedStatementSet;
+use super::super::contracts::requirements::PlanRequirements;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
 use super::super::planning::plan::build_execution_plan;
@@ -171,32 +173,37 @@ pub(crate) async fn prepare_execution_with_backend(
         ),
     })?;
 
-    let plan = build_execution_plan(
-        backend,
-        &engine.cel_evaluator,
-        plan_statements,
-        params,
-        Some(active_version_id),
-        sql2_read
-            .as_ref()
-            .and_then(|prepared| prepared.dependency_spec.clone()),
-        functions.clone(),
-        &intent.detected_file_domain_changes_by_statement,
-        &intent.pending_file_delete_targets,
-        &authoritative_pending_file_write_targets(&intent.pending_file_writes),
-        writer_key,
-    )
-    .await
-    .map_err(LixError::from)
-    .map_err(|error| LixError {
-        code: error.code,
-        description: format!(
-            "prepare_execution_with_backend plan building failed: {}",
-            error.description
-        ),
-    })?;
+    let sql2_write_owned_execution = sql2_write.is_some();
+    let plan = if sql2_write_owned_execution {
+        passthrough_execution_plan_for_sql2_write(&statements)
+    } else {
+        build_execution_plan(
+            backend,
+            &engine.cel_evaluator,
+            plan_statements,
+            params,
+            Some(active_version_id),
+            sql2_read
+                .as_ref()
+                .and_then(|prepared| prepared.dependency_spec.clone()),
+            functions.clone(),
+            &intent.detected_file_domain_changes_by_statement,
+            &intent.pending_file_delete_targets,
+            &authoritative_pending_file_write_targets(&intent.pending_file_writes),
+            writer_key,
+        )
+        .await
+        .map_err(LixError::from)
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "prepare_execution_with_backend plan building failed: {}",
+                error.description
+            ),
+        })?
+    };
 
-    if !plan.preprocess.mutations.is_empty() {
+    if !sql2_write_owned_execution && !plan.preprocess.mutations.is_empty() {
         validate_inserts(backend, &engine.schema_cache, &plan.preprocess.mutations)
             .await
             .map_err(|error| LixError {
@@ -207,7 +214,7 @@ pub(crate) async fn prepare_execution_with_backend(
                 ),
             })?;
     }
-    if !plan.preprocess.update_validations.is_empty() {
+    if !sql2_write_owned_execution && !plan.preprocess.update_validations.is_empty() {
         validate_updates(
             backend,
             &engine.schema_cache,
@@ -244,6 +251,51 @@ pub(crate) async fn prepare_execution_with_backend(
         sql2_read,
         sql2_write,
     })
+}
+
+fn passthrough_execution_plan_for_sql2_write(statements: &[Statement]) -> ExecutionPlan {
+    ExecutionPlan {
+        preprocess: PlannedStatementSet {
+            sql: String::new(),
+            prepared_statements: Vec::new(),
+            registrations: Vec::new(),
+            postprocess: None,
+            mutations: Vec::new(),
+            update_validations: Vec::new(),
+        },
+        result_contract: derive_result_contract_for_statements(statements),
+        requirements: PlanRequirements::default(),
+        dependency_spec: crate::sql_shared::dependency_spec::DependencySpec::default(),
+        effects: PlanEffects::default(),
+    }
+}
+
+fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultContract {
+    match statements.last() {
+        Some(Statement::Query(_) | Statement::Explain { .. }) => ResultContract::Select,
+        Some(Statement::Insert(insert)) => {
+            if insert.returning.is_some() {
+                ResultContract::DmlReturning
+            } else {
+                ResultContract::DmlNoReturning
+            }
+        }
+        Some(Statement::Update(update)) => {
+            if update.returning.is_some() {
+                ResultContract::DmlReturning
+            } else {
+                ResultContract::DmlNoReturning
+            }
+        }
+        Some(Statement::Delete(delete)) => {
+            if delete.returning.is_some() {
+                ResultContract::DmlReturning
+            } else {
+                ResultContract::DmlNoReturning
+            }
+        }
+        Some(_) | None => ResultContract::Other,
+    }
 }
 
 pub(crate) fn derive_cache_targets(
@@ -511,34 +563,6 @@ fn sql2_persists_filesystem_payload_writes(prepared: &PreparedExecutionContext) 
     ) && !prepared.intent.pending_file_writes.is_empty()
 }
 
-fn sql2_filesystem_write_targets_global_version(sql2_write: &Sql2PreparedWrite) -> bool {
-    let target_name = sql2_write
-        .planned_write
-        .command
-        .target
-        .descriptor
-        .public_name
-        .as_str();
-    if !matches!(
-        target_name,
-        "lix_file" | "lix_file_by_version" | "lix_directory" | "lix_directory_by_version"
-    ) {
-        return false;
-    }
-
-    sql2_write
-        .planned_write
-        .resolved_write_plan
-        .as_ref()
-        .is_some_and(|resolved| {
-            resolved
-                .intended_post_state
-                .iter()
-                .filter_map(|row| row.version_id.as_deref())
-                .any(|version_id| version_id == GLOBAL_VERSION_ID)
-        })
-}
-
 fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     let Some(sql2_write) = prepared.sql2_write.as_ref() else {
         return false;
@@ -580,8 +604,6 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
             .intent
             .untracked_filesystem_update_domain_changes
             .is_empty();
-    let non_global_filesystem_write = !sql2_filesystem_write_targets_global_version(sql2_write);
-
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
@@ -595,7 +617,6 @@ fn sql2_tracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
             || filesystem_directory_side_effects_only
             || filesystem_file_side_effects_only)
         && no_legacy_untracked_filesystem_duplicates
-        && non_global_filesystem_write
 }
 
 fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
@@ -615,8 +636,6 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
     );
     let no_legacy_filesystem_duplicates =
         filesystem_surface || prepared.intent.detected_file_domain_changes.is_empty();
-    let non_global_filesystem_write = !sql2_filesystem_write_targets_global_version(sql2_write);
-
     matches!(
         prepared.plan.result_contract,
         ResultContract::DmlNoReturning
@@ -632,7 +651,6 @@ fn sql2_untracked_write_is_live(prepared: &PreparedExecutionContext) -> bool {
             | "lix_directory"
             | "lix_directory_by_version"
     ) && no_legacy_filesystem_duplicates
-        && non_global_filesystem_write
 }
 
 fn live_sql2_operation_supported(sql2_write: &Sql2PreparedWrite) -> bool {

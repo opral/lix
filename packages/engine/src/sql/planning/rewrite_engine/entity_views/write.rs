@@ -2723,9 +2723,19 @@ mod tests {
             }
             if sql.contains("FROM lix_internal_state_untracked")
                 || sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer")
+                || sql.contains("FROM lix_internal_state_materialized_v1_lix_global_pointer")
                 || (sql.contains("FROM lix_internal_change c")
-                    && sql.contains("c.schema_key = 'lix_version_pointer'"))
+                    && (sql.contains("c.schema_key = 'lix_version_pointer'")
+                        || sql.contains("c.schema_key = 'lix_global_pointer'")))
             {
+                if sql.contains("lix_global_pointer") {
+                    return Ok(QueryResult {
+                        rows: vec![vec![EngineValue::Text(
+                            crate::version::global_pointer_snapshot_content("commit-global-seed"),
+                        )]],
+                        columns: vec!["snapshot_content".to_string()],
+                    });
+                }
                 return Ok(QueryResult {
                     rows: Vec::new(),
                     columns: Vec::new(),

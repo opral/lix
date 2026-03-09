@@ -2,10 +2,11 @@ use crate::commit::{
     load_committed_global_tip_commit_id, load_committed_version_tip_commit_id, ProposedDomainChange,
 };
 use crate::sql2::planner::ir::{
-    CommitPreconditions, ExpectedTip, IdempotencyKey, PlannedWrite, WriteLane, WriteMode,
+    CommitPreconditions, ExpectedTip, IdempotencyKey, MutationPayload, PlannedStateRow,
+    PlannedWrite, WriteLane, WriteMode,
 };
 use crate::{LixBackend, LixError};
-use serde_json::json;
+use serde_json::{json, Map, Value as JsonValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticEffect {
@@ -184,18 +185,102 @@ fn build_idempotency_key(
         .ok_or_else(|| DomainChangeError {
             message: "sql2 idempotency-key derivation requires a resolved write plan".to_string(),
         })?;
+    let summarized = json!({
+        "surface": planned_write.command.target.descriptor.public_name,
+        "operation": format!("{:?}", planned_write.command.operation_kind),
+        "lane": format!("{:?}", write_lane),
+        "tip": current_tip,
+        "writer_key": planned_write.command.execution_context.writer_key,
+        "payload": summarize_mutation_payload(&planned_write.command.payload),
+        "resolved_rows": summarize_planned_rows(&resolved.intended_post_state),
+    });
+    let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| DomainChangeError {
+        message: format!("sql2 idempotency-key serialization failed: {error}"),
+    })?;
+    let fingerprint = crate::plugin::runtime::binary_blob_hash_hex(&summarized_bytes);
+
     Ok(IdempotencyKey(
         json!({
             "surface": planned_write.command.target.descriptor.public_name,
             "operation": format!("{:?}", planned_write.command.operation_kind),
             "lane": format!("{:?}", write_lane),
             "tip": current_tip,
-            "writer_key": planned_write.command.execution_context.writer_key,
-            "payload": format!("{:?}", planned_write.command.payload),
-            "resolved_rows": format!("{:?}", resolved.intended_post_state),
+            "fingerprint": fingerprint,
         })
         .to_string(),
     ))
+}
+
+fn summarize_mutation_payload(payload: &MutationPayload) -> JsonValue {
+    match payload {
+        MutationPayload::FullSnapshot(values) => json!({
+            "kind": "full_snapshot",
+            "values": summarize_value_map(values),
+        }),
+        MutationPayload::Patch(values) => json!({
+            "kind": "patch",
+            "values": summarize_value_map(values),
+        }),
+        MutationPayload::Tombstone => json!({
+            "kind": "tombstone",
+        }),
+    }
+}
+
+fn summarize_planned_rows(rows: &[PlannedStateRow]) -> JsonValue {
+    JsonValue::Array(
+        rows.iter()
+            .map(|row| {
+                json!({
+                    "entity_id": row.entity_id,
+                    "schema_key": row.schema_key,
+                    "version_id": row.version_id,
+                    "tombstone": row.tombstone,
+                    "values": summarize_value_map(&row.values),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn summarize_value_map(
+    values: &std::collections::BTreeMap<String, crate::Value>,
+) -> JsonValue {
+    let mut map = Map::new();
+    for (key, value) in values {
+        map.insert(key.clone(), summarize_engine_value(value));
+    }
+    JsonValue::Object(map)
+}
+
+fn summarize_engine_value(value: &crate::Value) -> JsonValue {
+    match value {
+        crate::Value::Null => json!({
+            "kind": "null",
+        }),
+        crate::Value::Text(text) => json!({
+            "kind": "text",
+            "sha256": crate::plugin::runtime::binary_blob_hash_hex(text.as_bytes()),
+            "len": text.len(),
+        }),
+        crate::Value::Blob(bytes) => json!({
+            "kind": "blob",
+            "sha256": crate::plugin::runtime::binary_blob_hash_hex(bytes),
+            "len": bytes.len(),
+        }),
+        crate::Value::Integer(value) => json!({
+            "kind": "integer",
+            "value": value,
+        }),
+        crate::Value::Real(value) => json!({
+            "kind": "real",
+            "value": value,
+        }),
+        crate::Value::Boolean(value) => json!({
+            "kind": "boolean",
+            "value": value,
+        }),
+    }
 }
 
 fn domain_change_backend_error(error: LixError) -> DomainChangeError {
@@ -308,8 +393,9 @@ mod tests {
         }
     }
 
-    async fn planned_write(
+    async fn planned_write_with_params(
         sql: &str,
+        params: Vec<Value>,
         requested_version_id: &str,
     ) -> crate::sql2::planner::ir::PlannedWrite {
         let registry = SurfaceRegistry::with_builtin_surfaces();
@@ -317,7 +403,7 @@ mod tests {
         let statement = statements.pop().expect("single statement");
         let bound = BoundStatement::from_statement(
             statement,
-            Vec::new(),
+            params,
             ExecutionContext {
                 requested_version_id: Some(requested_version_id.to_string()),
                 writer_key: Some("writer-a".to_string()),
@@ -332,6 +418,13 @@ mod tests {
             .expect("write should resolve");
         planned_write.resolved_write_plan = Some(resolved_write_plan);
         planned_write
+    }
+
+    async fn planned_write(
+        sql: &str,
+        requested_version_id: &str,
+    ) -> crate::sql2::planner::ir::PlannedWrite {
+        planned_write_with_params(sql, Vec::new(), requested_version_id).await
     }
 
     #[tokio::test]
@@ -388,6 +481,39 @@ mod tests {
         assert!(
             preconditions.idempotency_key.0.contains("commit-123"),
             "idempotency key should reflect the expected tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn derives_compact_commit_preconditions_for_large_blob_payloads() {
+        let planned_write = planned_write_with_params(
+            "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+             VALUES ($1, $2, $3, 'version-a')",
+            vec![
+                Value::Text("plugin-archive".to_string()),
+                Value::Text("/plugins/json.zip".to_string()),
+                Value::Blob(vec![7; 1024 * 1024]),
+            ],
+            "main",
+        )
+        .await;
+        let backend = FakeBackend {
+            version_tip_commit_id: Some("commit-123".to_string()),
+            expected_version_id: Some("version-a".to_string()),
+        };
+
+        let preconditions = derive_commit_preconditions(&backend, &planned_write)
+            .await
+            .expect("preconditions should derive")
+            .expect("tracked writes should require commit preconditions");
+
+        assert!(
+            preconditions.idempotency_key.0.len() < 512,
+            "idempotency key should stay compact for large blob payloads"
+        );
+        assert!(
+            preconditions.idempotency_key.0.contains("commit-123"),
+            "idempotency key should still reflect the expected tip"
         );
     }
 }

@@ -4,16 +4,17 @@ use crate::engine::sql::planning::rewrite_engine::pipeline::registry::QueryRuleO
 use crate::{LixBackend, LixError, Value};
 
 use super::{
-    entity_views, filesystem_views, lix_active_account, lix_active_version, lix_change, lix_state,
+    entity_views, lix_active_account, lix_active_version, lix_change, lix_state,
     lix_state_by_version, lix_state_history, lix_version, lix_working_changes,
 };
 
-pub(crate) fn rewrite_query(query: Query, params: &[Value]) -> Result<QueryRuleOutcome, LixError> {
+pub(crate) fn rewrite_query(
+    query: Query,
+    _params: &[Value],
+) -> Result<QueryRuleOutcome, LixError> {
     let mut current = query;
     let mut changed = false;
 
-    let rewritten = filesystem_views::rewrite_query(current.clone(), params)?;
-    changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_change::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_working_changes::rewrite_query(current.clone())?;
@@ -51,8 +52,6 @@ pub(crate) async fn rewrite_query_with_backend(
     let mut current = query;
     let mut changed = false;
 
-    let rewritten = filesystem_views::rewrite_query(current.clone(), params)?;
-    changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_change::rewrite_query(current.clone())?;
     changed |= apply_step(&mut current, rewritten);
     let rewritten = lix_working_changes::rewrite_query(current.clone())?;

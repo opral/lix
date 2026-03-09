@@ -338,7 +338,8 @@ fn build_filesystem_projection_query(
                         ranked.lixcol_root_commit_id, \
                         ranked.lixcol_depth AS lixcol_raw_depth, \
                         ranked.lixcol_change_id, \
-                        ranked.lixcol_commit_id \
+                        ranked.lixcol_commit_id, \
+                        ranked.lixcol_commit_created_at \
                     FROM (\
                         SELECT \
                             candidate.id, \
@@ -346,6 +347,7 @@ fn build_filesystem_projection_query(
                             candidate.lixcol_depth, \
                             candidate.lixcol_change_id, \
                             candidate.lixcol_commit_id, \
+                            candidate.lixcol_commit_created_at, \
                             ROW_NUMBER() OVER (\
                                 PARTITION BY candidate.id, candidate.lixcol_root_commit_id, candidate.lixcol_depth \
                                 ORDER BY candidate.lixcol_commit_created_at DESC, candidate.lixcol_commit_id DESC, candidate.lixcol_change_id DESC\
@@ -361,6 +363,7 @@ fn build_filesystem_projection_query(
                         checkpoint.lixcol_raw_depth, \
                         checkpoint.lixcol_change_id, \
                         checkpoint.lixcol_commit_id, \
+                        checkpoint.lixcol_commit_created_at, \
                         ROW_NUMBER() OVER (\
                             PARTITION BY checkpoint.id, checkpoint.lixcol_root_commit_id \
                             ORDER BY checkpoint.lixcol_raw_depth ASC, checkpoint.lixcol_commit_id DESC, checkpoint.lixcol_change_id DESC\
@@ -397,6 +400,7 @@ fn build_filesystem_projection_query(
                     checkpoint.lixcol_change_id, \
                     descriptor.lixcol_metadata, \
                     checkpoint.lixcol_commit_id, \
+                    checkpoint.lixcol_commit_created_at, \
                     checkpoint.lixcol_root_commit_id, \
                     checkpoint.lixcol_depth \
                  FROM file_history_ranked_checkpoints checkpoint \
@@ -586,6 +590,7 @@ fn build_filesystem_projection_query(
                         change_id AS lixcol_change_id, \
                         metadata AS lixcol_metadata, \
                         commit_id AS lixcol_commit_id, \
+                        commit_created_at AS lixcol_commit_created_at, \
                         root_commit_id AS lixcol_root_commit_id, \
                         depth AS lixcol_depth \
                      FROM {state_history_view} \
@@ -661,6 +666,7 @@ fn build_filesystem_projection_query(
                     d.lixcol_change_id, \
                     d.lixcol_metadata, \
                     d.lixcol_commit_id, \
+                    d.lixcol_commit_created_at, \
                     d.lixcol_root_commit_id, \
                     d.lixcol_depth \
                  FROM directory_history_base d \

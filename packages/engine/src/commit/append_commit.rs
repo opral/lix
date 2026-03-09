@@ -17,6 +17,7 @@ use super::state_source::{
 };
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
+    VersionInfo, VersionSnapshot,
 };
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
@@ -180,12 +181,23 @@ pub(crate) async fn append_commit_if_preconditions_hold(
         .iter()
         .map(|change| change.version_id.clone())
         .collect::<BTreeSet<_>>();
-    let versions = {
+    let mut versions = {
         let mut executor = TransactionCommitExecutor { transaction };
         load_version_info_for_versions(&mut executor, &affected_versions)
             .await
             .map_err(backend_error)?
     };
+    if matches!(concrete_lane, ConcreteWriteLane::GlobalAdmin) {
+        let global_version = versions
+            .entry(GLOBAL_VERSION_ID.to_string())
+            .or_insert_with(|| VersionInfo {
+                parent_commit_ids: Vec::new(),
+                snapshot: VersionSnapshot {
+                    id: GLOBAL_VERSION_ID.to_string(),
+                },
+            });
+        global_version.parent_commit_ids = current_tip.clone().into_iter().collect();
+    }
     let active_accounts = {
         let mut executor = TransactionCommitExecutor { transaction };
         load_commit_active_accounts(&mut executor, &domain_changes)
@@ -538,6 +550,22 @@ mod tests {
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
 
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_global_pointer") {
+                let rows = self
+                    .version_tips
+                    .get(GLOBAL_VERSION_ID)
+                    .map(|commit_id| {
+                        vec![Value::Text(crate::version::global_pointer_snapshot_content(
+                            commit_id,
+                        ))]
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["snapshot_content".to_string()],
+                });
+            }
             if sql.contains("FROM lix_internal_change c")
                 && sql.contains("c.schema_key = 'lix_version_pointer'")
             {
