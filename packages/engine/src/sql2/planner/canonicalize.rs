@@ -11,10 +11,9 @@ use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, Insert, LimitClause, ObjectNamePart, OrderBy, OrderByKind,
     Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Update,
-    Value as SqlValue, Visit, Visitor,
+    Value as SqlValue,
 };
 use std::collections::BTreeMap;
-use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalizeError {
@@ -373,58 +372,7 @@ fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError>
             "sql2 day-1 canonicalizer requires a single surface scan without joins",
         ));
     }
-    if query_contains_nested_query_shape(query) {
-        return Err(CanonicalizeError::unsupported(
-            "sql2 day-1 canonicalizer does not support subqueries or derived tables",
-        ));
-    }
-
     Ok(select)
-}
-
-fn query_contains_nested_query_shape(query: &Query) -> bool {
-    struct Collector {
-        query_count: usize,
-        has_derived_tables: bool,
-        has_expression_subqueries: bool,
-    }
-
-    impl Visitor for Collector {
-        type Break = ();
-
-        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-            self.query_count += 1;
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_table_factor(
-            &mut self,
-            table_factor: &TableFactor,
-        ) -> ControlFlow<Self::Break> {
-            if matches!(table_factor, TableFactor::Derived { .. }) {
-                self.has_derived_tables = true;
-            }
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            if matches!(
-                expr,
-                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
-            ) {
-                self.has_expression_subqueries = true;
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut collector = Collector {
-        query_count: 0,
-        has_derived_tables: false,
-        has_expression_subqueries: false,
-    };
-    let _ = query.visit(&mut collector);
-    collector.query_count > 1 || collector.has_derived_tables || collector.has_expression_subqueries
 }
 
 fn bind_single_surface(
@@ -619,6 +567,7 @@ fn insert_payload(
     let mut placeholder_state = PlaceholderState::new();
     let mut payload = BTreeMap::new();
     for (column, expr) in insert.columns.iter().zip(row.iter()) {
+        reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
         let value = expr_to_value(expr, params, &mut placeholder_state)?;
         let key = canonical_write_column_key(surface_binding, &column.value)?;
         payload.insert(key, value);
@@ -655,6 +604,7 @@ fn assignment_payload(
                     "sql2 day-1 update canonicalizer requires named assignment columns",
                 )
             })?;
+        reject_forbidden_default_state_write_column(surface_binding, &raw_key, "update")?;
         let key = canonical_write_column_key(surface_binding, &raw_key)?;
         let value = expr_to_value(&assignment.value, params, placeholder_state)?;
         payload.insert(key, value);
@@ -668,6 +618,7 @@ fn write_selector(
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
 ) -> Result<WriteSelector, CanonicalizeError> {
+    reject_forbidden_default_state_selector(surface_binding, expr)?;
     let mut exact_filters = BTreeMap::new();
     let exact_only = collect_exact_selector_filters(
         surface_binding,
@@ -766,6 +717,82 @@ fn selector_column_name(expr: &Expr) -> Option<String> {
     }
 }
 
+fn reject_forbidden_default_state_write_column(
+    surface_binding: &SurfaceBinding,
+    raw_column: &str,
+    operation: &str,
+) -> Result<(), CanonicalizeError> {
+    if !default_state_surface_rejects_version_id(surface_binding) {
+        return Ok(());
+    }
+
+    if matches!(raw_column.to_ascii_lowercase().as_str(), "version_id" | "lixcol_version_id") {
+        return Err(CanonicalizeError::unsupported(format!(
+            "lix_state {operation} cannot set version_id; active version is resolved automatically"
+        )));
+    }
+
+    Ok(())
+}
+
+fn reject_forbidden_default_state_selector(
+    surface_binding: &SurfaceBinding,
+    expr: &Expr,
+) -> Result<(), CanonicalizeError> {
+    if default_state_surface_rejects_version_id(surface_binding)
+        && contains_version_id_reference(expr)
+    {
+        return Err(CanonicalizeError::unsupported(
+            "lix_state does not expose version_id; use lix_state_by_version for explicit version filters",
+        ));
+    }
+
+    Ok(())
+}
+
+fn default_state_surface_rejects_version_id(surface_binding: &SurfaceBinding) -> bool {
+    surface_binding.descriptor.public_name.eq_ignore_ascii_case("lix_state")
+}
+
+fn contains_version_id_reference(expr: &Expr) -> bool {
+    contains_column_reference(expr, "version_id") || contains_column_reference(expr, "lixcol_version_id")
+}
+
+fn contains_column_reference(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column),
+        Expr::CompoundIdentifier(idents) => idents
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case(column))
+            .unwrap_or(false),
+        Expr::BinaryOp { left, right, .. } => {
+            contains_column_reference(left, column) || contains_column_reference(right, column)
+        }
+        Expr::UnaryOp { expr, .. } => contains_column_reference(expr, column),
+        Expr::Nested(inner) => contains_column_reference(inner, column),
+        Expr::InList { expr, list, .. } => {
+            contains_column_reference(expr, column)
+                || list
+                    .iter()
+                    .any(|item| contains_column_reference(item, column))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            contains_column_reference(expr, column)
+                || contains_column_reference(low, column)
+                || contains_column_reference(high, column)
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            contains_column_reference(expr, column) || contains_column_reference(pattern, column)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => contains_column_reference(inner, column),
+        Expr::Cast { expr, .. } => contains_column_reference(expr, column),
+        Expr::Function(_) => false,
+        _ => false,
+    }
+}
+
 fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) -> bool {
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::State => matches!(
@@ -830,7 +857,21 @@ fn canonical_write_column_key(
     .to_string();
 
     match surface_binding.descriptor.surface_family {
-        SurfaceFamily::State => Ok(canonical),
+        SurfaceFamily::State => {
+            let supported = surface_binding
+                .exposed_columns
+                .iter()
+                .chain(surface_binding.descriptor.hidden_columns.iter())
+                .any(|candidate| candidate.eq_ignore_ascii_case(raw_column));
+            if supported {
+                Ok(canonical)
+            } else {
+                Err(CanonicalizeError::unsupported(format!(
+                    "sql2 day-1 write canonicalizer does not support column '{raw_column}' on '{}'",
+                    surface_binding.descriptor.public_name
+                )))
+            }
+        }
         SurfaceFamily::Entity => {
             let supported = surface_binding
                 .exposed_columns
@@ -1009,7 +1050,17 @@ fn sql_value_to_engine_value(
         }
         SqlValue::Boolean(value) => Ok(Value::Boolean(*value)),
         SqlValue::Null => Ok(Value::Null),
-        SqlValue::SingleQuotedByteStringLiteral(value) => Ok(Value::Blob(value.clone().into_bytes())),
+        SqlValue::SingleQuotedByteStringLiteral(value)
+        | SqlValue::DoubleQuotedByteStringLiteral(value)
+        | SqlValue::TripleSingleQuotedByteStringLiteral(value)
+        | SqlValue::TripleDoubleQuotedByteStringLiteral(value) => {
+            Ok(Value::Blob(value.clone().into_bytes()))
+        }
+        SqlValue::HexStringLiteral(value) => {
+            Ok(Value::Blob(parse_hex_literal(value).map_err(
+                CanonicalizeError::unsupported,
+            )?))
+        }
         SqlValue::Placeholder(token) => {
             let index = resolve_placeholder_index(token, params.len(), placeholder_state).map_err(
                 |err| CanonicalizeError::unsupported(format!(
@@ -1027,6 +1078,35 @@ fn sql_value_to_engine_value(
         _ => Err(CanonicalizeError::unsupported(
             "sql2 day-1 write canonicalizer only supports string, numeric, boolean, null, blob, and placeholder VALUES",
         )),
+    }
+}
+
+fn parse_hex_literal(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err(format!(
+            "hex literal must contain an even number of digits, got {}",
+            text.len()
+        ));
+    }
+
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let hi = hex_nibble(bytes[index])?;
+        let lo = hex_nibble(bytes[index + 1])?;
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex digit '{}'", char::from(byte))),
     }
 }
 
@@ -1359,22 +1439,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nested_subqueries_for_day_one_shell() {
+    fn allows_nested_subqueries_for_day_one_shell() {
         let registry = SurfaceRegistry::with_builtin_surfaces();
-        let error = canonicalize_read(
+        let canonicalized = canonicalize_read(
             bound_statement(
                 "SELECT entity_id FROM lix_state WHERE entity_id IN (SELECT entity_id FROM lix_state_by_version)",
             ),
             &registry,
         )
-        .expect_err("subqueries should be rejected");
+        .expect("subqueries should canonicalize");
 
-        assert!(
-            error
-                .message
-                .contains("does not support subqueries or derived tables"),
-            "unexpected error: {}",
-            error.message
+        assert_eq!(
+            canonicalized.surface_binding.descriptor.public_name,
+            "lix_state"
         );
     }
 

@@ -1,4 +1,5 @@
 use crate::commit::load_committed_version_tip_commit_id;
+use crate::history_timeline::ensure_history_timeline_materialized_for_root;
 use crate::sql2::backend::PushdownDecision;
 use crate::sql2::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
@@ -107,6 +108,9 @@ pub(crate) async fn prepare_sql2_read(
     let canonicalized =
         maybe_bind_active_history_root(backend, canonicalized, active_version_id, &registry)
             .await?;
+    ensure_sql2_history_timeline_roots(backend, &canonicalized.bound_statement.statement)
+        .await
+        .ok()?;
     let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
     if canonicalized.surface_binding.descriptor.surface_family == SurfaceFamily::State
         && dependency_spec_has_unknown_schema_keys(&registry, dependency_spec.as_ref())
@@ -242,6 +246,91 @@ fn expr_has_root_commit_predicate(expr: &Expr) -> bool {
             expr_references_root_commit(expr) || expr_has_root_commit_predicate(expr)
         }
         _ => false,
+    }
+}
+
+async fn ensure_sql2_history_timeline_roots(
+    backend: &dyn LixBackend,
+    statement: &Statement,
+) -> Result<(), LixError> {
+    for root_commit_id in requested_history_root_commit_ids(statement) {
+        ensure_history_timeline_materialized_for_root(backend, &root_commit_id, 512).await?;
+    }
+    Ok(())
+}
+
+fn requested_history_root_commit_ids(statement: &Statement) -> Vec<String> {
+    let Statement::Query(query) = statement else {
+        return Vec::new();
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Vec::new();
+    };
+    let mut roots = std::collections::BTreeSet::new();
+    if let Some(selection) = select.selection.as_ref() {
+        collect_history_root_commit_ids(selection, &mut roots);
+    }
+    roots.into_iter().collect()
+}
+
+fn collect_history_root_commit_ids(
+    expr: &Expr,
+    roots: &mut std::collections::BTreeSet<String>,
+) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if *op == BinaryOperator::And {
+                collect_history_root_commit_ids(left, roots);
+                collect_history_root_commit_ids(right, roots);
+                return;
+            }
+            if *op == BinaryOperator::Eq {
+                if history_root_identifier(left).is_some() {
+                    if let Some(value) = expr_string_literal(right) {
+                        roots.insert(value.to_string());
+                    }
+                } else if history_root_identifier(right).is_some() {
+                    if let Some(value) = expr_string_literal(left) {
+                        roots.insert(value.to_string());
+                    }
+                }
+            }
+        }
+        Expr::Nested(inner) => collect_history_root_commit_ids(inner, roots),
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } if history_root_identifier(expr).is_some() => {
+            for item in list {
+                if let Some(value) = expr_string_literal(item) {
+                    roots.insert(value.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn history_root_identifier(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.as_str()),
+        Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.as_str()),
+        _ => None,
+    }
+    .filter(|name| {
+        name.eq_ignore_ascii_case("root_commit_id")
+            || name.eq_ignore_ascii_case("lixcol_root_commit_id")
+    })
+}
+
+fn expr_string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Value(value) => match value.value {
+            SqlValue::SingleQuotedString(ref inner) => Some(inner.as_str()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -661,6 +750,34 @@ mod tests {
                     columns: vec!["snapshot_content".to_string(), "change_id".to_string()],
                 });
             }
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_descriptor") {
+                let rows = self
+                    .version_descriptor_rows
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
+                    })
+                    .map(|(_, snapshot)| {
+                        if sql.contains("change_id") {
+                            vec![
+                                Value::Text(snapshot.clone()),
+                                Value::Text("descriptor-change".to_string()),
+                            ]
+                        } else {
+                            vec![Value::Text(snapshot.clone())]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: if sql.contains("change_id") {
+                        vec!["snapshot_content".to_string(), "change_id".to_string()]
+                    } else {
+                        vec!["snapshot_content".to_string()]
+                    },
+                });
+            }
             if sql.contains("FROM lix_internal_change c")
                 && sql.contains("c.schema_key = 'lix_version_pointer'")
             {
@@ -689,6 +806,66 @@ mod tests {
                     } else {
                         vec!["snapshot_content".to_string()]
                     },
+                });
+            }
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer") {
+                let rows = self
+                    .version_pointer_rows
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
+                    })
+                    .map(|(_, snapshot)| {
+                        if sql.contains("change_id") {
+                            vec![
+                                Value::Text(snapshot.clone()),
+                                Value::Text("pointer-change".to_string()),
+                            ]
+                        } else {
+                            vec![Value::Text(snapshot.clone())]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: if sql.contains("change_id") {
+                        vec!["snapshot_content".to_string(), "change_id".to_string()]
+                    } else {
+                        vec!["snapshot_content".to_string()]
+                    },
+                });
+            }
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_global_pointer") {
+                let rows = self
+                    .version_pointer_rows
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
+                    })
+                    .map(|(_, snapshot)| vec![Value::Text(snapshot.clone())])
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["snapshot_content".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_change c")
+                && sql.contains("c.schema_key = 'lix_global_pointer'")
+            {
+                let rows = self
+                    .version_pointer_rows
+                    .iter()
+                    .filter(|(version_id, _)| {
+                        sql.contains(&format!("c.entity_id = '{}'", version_id))
+                            || sql.contains(&format!("'{}'", version_id))
+                    })
+                    .map(|(_, snapshot)| vec![Value::Text(snapshot.clone())])
+                    .collect::<Vec<_>>();
+                return Ok(QueryResult {
+                    rows,
+                    columns: vec!["snapshot_content".to_string()],
                 });
             }
             if sql.contains("SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at")
@@ -990,7 +1167,7 @@ mod tests {
             .first()
             .expect("entity history read should lower");
         assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
-        assert!(lowered_sql.contains("c.entity_id = 'commit-active-root'"));
+        assert!(lowered_sql.contains("c.id = 'commit-active-root'"));
         assert!(lowered_sql.contains("commit_id AS lixcol_commit_id"));
         assert!(lowered_sql.contains("depth AS lixcol_depth"));
     }
@@ -1226,6 +1403,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_filesystem_history_by_version_reads_through_internal_history_sources() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_sql2_read(
+            &backend,
+            &parse_one(
+                "SELECT id, path, lixcol_version_id, lixcol_root_commit_id \
+                 FROM lix_file_history_by_version \
+                 WHERE id = 'file-1' \
+                   AND lixcol_version_id = 'version-a' \
+                   AND lixcol_root_commit_id = 'commit-1'",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("filesystem by-version history read should canonicalize");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_file_history_by_version"]
+        );
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("filesystem by-version history read should lower");
+        assert!(lowered_sql.contains("lix_internal_commit_ancestry"));
+        assert!(lowered_sql.contains("lix_internal_change ch"));
+        assert!(lowered_sql.contains("lix_internal_file_history_data_cache"));
+        assert!(!lowered_sql.contains("FROM lix_file_history_by_version"));
+    }
+
+    #[tokio::test]
     async fn binds_active_root_commit_for_filesystem_history_reads_without_explicit_root() {
         let mut backend = FakeBackend::default();
         backend.version_pointer_rows.insert(
@@ -1284,7 +1495,7 @@ mod tests {
             .lowered_sql
             .first()
             .expect("entity history read should lower");
-        assert!(lowered_sql.contains("c.entity_id = 'commit-active-root'"));
+        assert!(lowered_sql.contains("c.id = 'commit-active-root'"));
     }
 
     #[tokio::test]
@@ -1447,24 +1658,33 @@ mod tests {
             .first()
             .expect("state-history read should lower");
         assert!(lowered_sql.contains("FROM lix_internal_state_materialized_v1_lix_commit"));
-        assert!(lowered_sql.contains("c.entity_id = 'commit-1'"));
+        assert!(lowered_sql.contains("c.id = 'commit-1'"));
     }
 
     #[tokio::test]
-    async fn returns_none_for_nested_subqueries_that_stay_on_legacy_path() {
+    async fn prepares_nested_filesystem_subqueries_through_sql2_lowering() {
         let backend = FakeBackend::default();
         let prepared = prepare_sql2_read(
             &backend,
             &parse_one(
-                "SELECT entity_id FROM lix_state WHERE entity_id IN (SELECT entity_id FROM lix_state_by_version)",
+                "SELECT COUNT(*) \
+                 FROM lix_working_changes wc \
+                 WHERE wc.file_id IN (SELECT f.id FROM lix_file f WHERE f.path = '/hello.txt')",
             ),
             &[],
             "main",
             None,
         )
-        .await;
+        .await
+        .expect("nested filesystem subquery should prepare through sql2");
 
-        assert!(prepared.is_none());
+        let lowered_sql = prepared
+            .debug_trace
+            .lowered_sql
+            .first()
+            .expect("nested filesystem subquery should lower");
+        assert!(!lowered_sql.contains("FROM lix_file"));
+        assert!(lowered_sql.contains("lix_internal_state_materialized_v1_lix_file_descriptor"));
     }
 
     #[tokio::test]
