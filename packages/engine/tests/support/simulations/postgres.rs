@@ -12,6 +12,7 @@ use crate::support::simulation_test::{Simulation, SimulationBehavior};
 
 static POSTGRES: OnceCell<Arc<PostgresInstance>> = OnceCell::const_new();
 static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+const CREATE_DATABASE_RETRY_LIMIT: usize = 8;
 
 struct PostgresInstance {
     _lock: FileLock,
@@ -78,6 +79,45 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
         .map(Arc::clone)
 }
 
+fn is_retryable_database_creation_error(error: &LixError) -> bool {
+    error.description.contains("deadline has elapsed")
+}
+
+async fn create_database_url(prefix: &str) -> Result<String, LixError> {
+    let process_id = std::process::id();
+
+    for attempt in 0..CREATE_DATABASE_RETRY_LIMIT {
+        let instance = ensure_postgres().await?;
+        let db_index = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let db_name = format!("{prefix}_{process_id}_{now_nanos}_{db_index}");
+
+        let create_result = {
+            let pg = instance.postgresql.lock().await;
+            pg.create_database(&db_name).await.map_err(|err| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: err.to_string(),
+            })
+        };
+
+        match create_result {
+            Ok(()) => return Ok(instance.settings.url(&db_name)),
+            Err(error)
+                if attempt + 1 < CREATE_DATABASE_RETRY_LIMIT
+                    && is_retryable_database_creation_error(&error) =>
+            {
+                tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("database creation retry loop should always return")
+}
+
 pub fn postgres_simulation() -> Simulation {
     let connection_string = Arc::new(Mutex::new(None::<String>));
     let setup_handle = connection_string.clone();
@@ -87,24 +127,7 @@ pub fn postgres_simulation() -> Simulation {
         setup: Some(Arc::new(move || {
             let connection_string = setup_handle.clone();
             Box::pin(async move {
-                let instance = ensure_postgres().await?;
-                let db_index = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let process_id = std::process::id();
-                let now_nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|duration| duration.as_nanos())
-                    .unwrap_or(0);
-                let db_name = format!("lix_test_{}_{}_{}", process_id, now_nanos, db_index);
-
-                {
-                    let pg = instance.postgresql.lock().await;
-                    pg.create_database(&db_name).await.map_err(|err| LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: err.to_string(),
-                    })?;
-                }
-
-                let url = instance.settings.url(&db_name);
+                let url = create_database_url("lix_test").await?;
 
                 *connection_string
                     .lock()
@@ -134,28 +157,11 @@ pub fn postgres_backend_with_connection_string(
 }
 
 pub async fn create_postgres_test_database_url(label: &str) -> Result<String, LixError> {
-    let instance = ensure_postgres().await?;
-    let db_index = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let process_id = std::process::id();
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
     let normalized_label = label
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
-    let db_name = format!("lix_obs_{normalized_label}_{process_id}_{now_nanos}_{db_index}");
-
-    {
-        let pg = instance.postgresql.lock().await;
-        pg.create_database(&db_name).await.map_err(|err| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: err.to_string(),
-        })?;
-    }
-
-    Ok(instance.settings.url(&db_name))
+    create_database_url(&format!("lix_obs_{normalized_label}")).await
 }
 
 struct PostgresBackend {

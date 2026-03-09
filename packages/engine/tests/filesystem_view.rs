@@ -2925,6 +2925,298 @@ simulation_test!(
 );
 
 simulation_test!(
+    untracked_file_write_roundtrip_persists_data,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
+                 VALUES ('file-untracked-live', '/untracked-live.md', lix_text_encode('before'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked file insert should succeed");
+
+        let inserted = engine
+            .execute(
+                "SELECT lix_text_decode(data), lixcol_untracked \
+                 FROM lix_file \
+                 WHERE id = 'file-untracked-live' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("inserted untracked file should be readable");
+        assert_eq!(inserted.statements[0].rows.len(), 1);
+        assert_text(&inserted.statements[0].rows[0][0], "before");
+        assert_boolean_like(&inserted.statements[0].rows[0][1], true);
+
+        engine
+            .execute(
+                "UPDATE lix_file \
+                 SET data = lix_text_encode('after') \
+                 WHERE id = 'file-untracked-live' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("untracked file data update should succeed");
+
+        let updated = engine
+            .execute(
+                "SELECT lix_text_decode(data) \
+                 FROM lix_file \
+                 WHERE id = 'file-untracked-live' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("updated untracked file should be readable");
+        assert_eq!(updated.statements[0].rows.len(), 1);
+        assert_text(&updated.statements[0].rows[0][0], "after");
+
+        engine
+            .execute(
+                "DELETE FROM lix_file \
+                 WHERE id = 'file-untracked-live' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("untracked file delete should succeed");
+
+        let deleted = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_file \
+                 WHERE id = 'file-untracked-live' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("deleted untracked file should be queryable");
+        assert!(deleted.statements[0].rows.is_empty());
+    }
+);
+
+simulation_test!(
+    file_by_version_insert_with_untracked_persists_data,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_id_sql = version_id.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id, lixcol_untracked) \
+                     VALUES ('file-untracked-by-version', '/untracked-by-version.md', lix_text_encode('versioned'), '{version_id_sql}', true)"
+                ),
+                &[],
+            )
+            .await
+            .expect("untracked file_by_version insert should succeed");
+
+        let rows = engine
+            .execute(
+                &format!(
+                    "SELECT lix_text_decode(data), lixcol_untracked \
+                     FROM lix_file_by_version \
+                     WHERE id = 'file-untracked-by-version' \
+                       AND lixcol_version_id = '{version_id_sql}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("untracked file_by_version row should be readable");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "versioned");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
+    }
+);
+
+simulation_test!(
+    untracked_directory_insert_autocreates_missing_parent_directories,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-untracked-live', '/untracked/docs/guides/', true)",
+                &[],
+            )
+            .await
+            .expect("untracked directory insert should succeed");
+
+        let rows = engine
+            .execute(
+                "SELECT path, lixcol_untracked \
+                 FROM lix_directory \
+                 WHERE path IN ('/untracked/', '/untracked/docs/', '/untracked/docs/guides/') \
+                 ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("untracked directory rows should be readable");
+        assert_eq!(rows.statements[0].rows.len(), 3);
+        assert_text(&rows.statements[0].rows[0][0], "/untracked/");
+        assert_text(&rows.statements[0].rows[1][0], "/untracked/docs/");
+        assert_text(&rows.statements[0].rows[2][0], "/untracked/docs/guides/");
+        for row in &rows.statements[0].rows {
+            assert_boolean_like(&row[1], true);
+        }
+    }
+);
+
+simulation_test!(
+    directory_by_version_insert_with_untracked_is_visible,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        let version_id = active_version_id(&engine).await;
+        let version_id_sql = version_id.replace('\'', "''");
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_version (id, path, lixcol_version_id, lixcol_untracked) \
+                     VALUES ('dir-untracked-by-version', '/untracked-by-version/', '{version_id_sql}', true)"
+                ),
+                &[],
+            )
+            .await
+            .expect("untracked directory_by_version insert should succeed");
+
+        let rows = engine
+            .execute(
+                &format!(
+                    "SELECT path, lixcol_untracked \
+                     FROM lix_directory_by_version \
+                     WHERE id = 'dir-untracked-by-version' \
+                       AND lixcol_version_id = '{version_id_sql}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("untracked directory_by_version row should be readable");
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_text(&rows.statements[0].rows[0][0], "/untracked-by-version/");
+        assert_boolean_like(&rows.statements[0].rows[0][1], true);
+    }
+);
+
+simulation_test!(
+    untracked_directory_delete_cascades_only_untracked_descendants,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path, lixcol_untracked) \
+                 VALUES ('dir-untracked-delete', '/delete-untracked/root/', true)",
+                &[],
+            )
+            .await
+            .expect("seed untracked directory should succeed");
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
+                 VALUES ('file-untracked-delete', '/delete-untracked/root/note.md', lix_text_encode('gone'), true)",
+                &[],
+            )
+            .await
+            .expect("seed untracked child file should succeed");
+
+        engine
+            .execute(
+                "DELETE FROM lix_directory \
+                 WHERE id = 'dir-untracked-delete' AND lixcol_untracked = true",
+                &[],
+            )
+            .await
+            .expect("untracked directory delete should succeed");
+
+        let directory_rows = engine
+            .execute(
+                "SELECT path FROM lix_directory WHERE path = '/delete-untracked/root/'",
+                &[],
+            )
+            .await
+            .expect("deleted directory cascade should be queryable");
+        assert!(directory_rows.statements[0].rows.is_empty());
+
+        let file_rows = engine
+            .execute(
+                "SELECT id FROM lix_file WHERE id = 'file-untracked-delete'",
+                &[],
+            )
+            .await
+            .expect("deleted untracked file should be queryable");
+        assert!(file_rows.statements[0].rows.is_empty());
+    }
+);
+
+simulation_test!(
+    tracked_directory_delete_rejects_untracked_descendant_winner,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine should succeed");
+        engine.init().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-tracked-mixed', '/tracked-mixed/')",
+                &[],
+            )
+            .await
+            .expect("tracked directory insert should succeed");
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
+                 VALUES ('file-untracked-mixed', '/tracked-mixed/note.md', lix_text_encode('mixed'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked child file insert should succeed");
+
+        let error = engine
+            .execute(
+                "DELETE FROM lix_directory WHERE id = 'dir-tracked-mixed'",
+                &[],
+            )
+            .await
+            .expect_err("tracked delete should reject mixed tracked/untracked cascade");
+        assert!(
+            error
+                .description
+                .contains("untracked winners in the cascade"),
+            "unexpected error: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
     file_path_update_noop_does_not_create_parent_directories,
     |sim| async move {
         let engine = sim

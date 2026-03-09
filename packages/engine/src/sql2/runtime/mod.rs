@@ -20,7 +20,7 @@ use crate::sql2::planner::semantics::effective_state_resolver::{
 use crate::sql2::planner::semantics::proof_engine::prove_write;
 use crate::sql2::planner::semantics::write_resolver::resolve_write_plan;
 use crate::sql_shared::dependency_spec::DependencySpec;
-use crate::{LixBackend, Value};
+use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, SetExpr, Statement, Value as SqlValue};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -340,20 +340,20 @@ fn wrap_lowered_read_for_explain(
     }
 }
 
-pub(crate) async fn prepare_sql2_write(
+pub(crate) async fn try_prepare_sql2_write(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Option<Sql2PreparedWrite> {
+) -> Result<Option<Sql2PreparedWrite>, LixError> {
     if parsed_statements.len() != 1 {
-        return None;
+        return Ok(None);
     }
 
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
-        .ok()?;
+        .map_err(|error| LixError::new(error.code, error.description))?;
     let statement = parsed_statements[0].clone();
     let bound_statement = BoundStatement::from_statement(
         statement,
@@ -364,18 +364,34 @@ pub(crate) async fn prepare_sql2_write(
             requested_version_id: Some(active_version_id.to_string()),
         },
     );
-    let canonicalized = canonicalize_write(bound_statement.clone(), &registry).ok()?;
-    let mut planned_write = prove_write(&canonicalized).ok()?;
-    let resolved_write_plan = resolve_write_plan(backend, &planned_write).await.ok()?;
+    let canonicalized = match canonicalize_write(bound_statement.clone(), &registry) {
+        Ok(canonicalized) => canonicalized,
+        Err(_) => return Ok(None),
+    };
+    let mut planned_write = match prove_write(&canonicalized) {
+        Ok(planned_write) => planned_write,
+        Err(_) => return Ok(None),
+    };
+    let resolved_write_plan = match resolve_write_plan(backend, &planned_write).await {
+        Ok(resolved_write_plan) => resolved_write_plan,
+        Err(error) => match sql2_authoritative_write_error(&canonicalized, error.message) {
+            Some(error) => return Err(error),
+            None => return Ok(None),
+        },
+    };
     planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
-    let domain_change_batch = build_domain_change_batch(&planned_write).ok()?;
-    let commit_preconditions = derive_commit_preconditions(backend, &planned_write)
-        .await
-        .ok()?;
+    let domain_change_batch = match build_domain_change_batch(&planned_write) {
+        Ok(domain_change_batch) => domain_change_batch,
+        Err(_) => return Ok(None),
+    };
+    let commit_preconditions = match derive_commit_preconditions(backend, &planned_write).await {
+        Ok(commit_preconditions) => commit_preconditions,
+        Err(_) => return Ok(None),
+    };
     planned_write.commit_preconditions = commit_preconditions.clone();
     let invariant_trace = Some(build_sql2_invariant_trace(&planned_write));
 
-    Some(Sql2PreparedWrite {
+    Ok(Some(Sql2PreparedWrite {
         debug_trace: Sql2DebugTrace {
             bound_statements: vec![bound_statement],
             surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
@@ -397,7 +413,43 @@ pub(crate) async fn prepare_sql2_write(
         planned_write,
         domain_change_batch,
         canonicalized,
-    })
+    }))
+}
+
+pub(crate) async fn prepare_sql2_write(
+    backend: &dyn LixBackend,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Option<Sql2PreparedWrite> {
+    try_prepare_sql2_write(
+        backend,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+fn sql2_authoritative_write_error(
+    canonicalized: &CanonicalizedWrite,
+    message: String,
+) -> Option<LixError> {
+    match canonicalized.surface_binding.descriptor.surface_family {
+        SurfaceFamily::Filesystem
+            if message.contains("untracked winner")
+                || message.contains("untracked visible row")
+                || message.contains("untracked visible rows")
+                || message.contains("untracked winners in the cascade") =>
+        {
+            Some(LixError::new("LIX_ERROR_INVALID_INPUT", message))
+        }
+        _ => None,
+    }
 }
 
 fn sql2_write_phase_trace() -> Vec<String> {
@@ -1695,6 +1747,79 @@ mod tests {
                 .expect("resolved write plan should exist")
                 .intended_post_state[0]
                 .tombstone
+        );
+    }
+
+    #[tokio::test]
+    async fn prepares_untracked_filesystem_file_by_version_inserts_with_payload_rows() {
+        let prepared = prepare_sql2_write(
+            &FakeBackend::default(),
+            &parse_one(
+                "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('file-u', '/docs/untracked.md', lix_text_encode('hello'), 'version-a', true)",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("untracked file insert should prepare through sql2");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_file_by_version"]
+        );
+        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert!(prepared.planned_write.commit_preconditions.is_none());
+        assert!(prepared.domain_change_batch.is_none());
+        let rows = &prepared
+            .planned_write
+            .resolved_write_plan
+            .as_ref()
+            .expect("resolved write plan should exist")
+            .intended_post_state;
+        assert!(rows
+            .iter()
+            .any(|row| row.schema_key == "lix_file_descriptor"));
+        assert!(rows
+            .iter()
+            .any(|row| row.schema_key == "lix_binary_blob_ref"));
+    }
+
+    #[tokio::test]
+    async fn prepares_untracked_directory_by_version_inserts_without_commit_artifacts() {
+        let prepared = prepare_sql2_write(
+            &FakeBackend::default(),
+            &parse_one(
+                "INSERT INTO lix_directory_by_version (id, path, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('dir-u', '/docs/guides/', 'version-a', true)",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("untracked directory insert should prepare through sql2");
+
+        assert_eq!(
+            prepared.debug_trace.surface_bindings,
+            vec!["lix_directory_by_version"]
+        );
+        assert_eq!(prepared.planned_write.command.mode, WriteMode::Untracked);
+        assert!(prepared.planned_write.commit_preconditions.is_none());
+        assert!(prepared.domain_change_batch.is_none());
+        let rows = &prepared
+            .planned_write
+            .resolved_write_plan
+            .as_ref()
+            .expect("resolved write plan should exist")
+            .intended_post_state;
+        assert!(rows
+            .iter()
+            .all(|row| row.schema_key == "lix_directory_descriptor"));
+        assert!(
+            rows.len() >= 2,
+            "missing ancestor directory rows should be planned"
         );
     }
 
