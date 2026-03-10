@@ -21,11 +21,11 @@ pub(crate) async fn apply_sql_backed_effects(
         )
         .await?;
     let filesystem_payload_domain_changes =
-        crate::engine::dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes);
+        crate::engine::dedupe_filesystem_payload_domain_changes(&filesystem_payload_domain_changes);
     let payload_domain_changes_to_persist = if filesystem_payload_changes_already_committed {
         Vec::new()
     } else if plugin_changes_committed {
-        crate::engine::dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes)
+        crate::engine::dedupe_filesystem_payload_domain_changes(&filesystem_payload_domain_changes)
     } else {
         filesystem_payload_domain_changes.clone()
     };
@@ -39,7 +39,7 @@ pub(crate) async fn apply_sql_backed_effects(
     }
     if !payload_domain_changes_to_persist.is_empty() {
         engine
-            .persist_detected_file_domain_changes(&payload_domain_changes_to_persist)
+            .persist_filesystem_payload_domain_changes(&payload_domain_changes_to_persist)
             .await?;
     }
     if should_run_binary_gc {

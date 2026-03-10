@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::state_commit_stream::StateCommitStreamChange;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DetectedFileDomainChange {
+pub(crate) struct FilesystemPayloadDomainChange {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,

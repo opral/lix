@@ -156,11 +156,11 @@ impl Engine {
                 })?
             };
             let filesystem_payload_domain_changes =
-                dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes);
+                dedupe_filesystem_payload_domain_changes(&filesystem_payload_domain_changes);
             if !filesystem_payload_domain_changes.is_empty()
                 && !filesystem_payload_changes_already_committed
             {
-                self.persist_detected_file_domain_changes_in_transaction(
+                self.persist_filesystem_payload_domain_changes_in_transaction(
                     transaction,
                     &filesystem_payload_domain_changes,
                 )

@@ -87,7 +87,7 @@ fn binary_blob_ref_change_for_bytes(
     version_id: &str,
     data: &[u8],
     writer_key: Option<&str>,
-) -> Result<DetectedFileDomainChange, LixError> {
+) -> Result<FilesystemPayloadDomainChange, LixError> {
     let size_bytes = u64::try_from(data.len()).map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
@@ -101,7 +101,7 @@ fn binary_blob_ref_change_for_bytes(
         "size_bytes": size_bytes,
     })
     .to_string();
-    Ok(DetectedFileDomainChange {
+    Ok(FilesystemPayloadDomainChange {
         entity_id: file_id.to_string(),
         schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
@@ -118,8 +118,8 @@ fn binary_blob_ref_tombstone_change_for_target(
     file_id: &str,
     version_id: &str,
     writer_key: Option<&str>,
-) -> DetectedFileDomainChange {
-    DetectedFileDomainChange {
+) -> FilesystemPayloadDomainChange {
+    FilesystemPayloadDomainChange {
         entity_id: file_id.to_string(),
         schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
@@ -212,7 +212,7 @@ impl Engine {
             collapse_pending_file_writes_for_transaction(&side_effects.pending_file_writes);
         side_effects.pending_file_writes = collapsed_writes;
 
-        let filesystem_payload_domain_changes = dedupe_detected_file_domain_changes(
+        let filesystem_payload_domain_changes = dedupe_filesystem_payload_domain_changes(
             &self
                 .collect_live_filesystem_payload_domain_changes_in_transaction(
                     transaction,
@@ -232,7 +232,7 @@ impl Engine {
         )
         .await?;
         if !filesystem_payload_domain_changes.is_empty() {
-            self.persist_detected_file_domain_changes_in_transaction(
+            self.persist_filesystem_payload_domain_changes_in_transaction(
                 transaction,
                 &filesystem_payload_domain_changes,
             )
@@ -246,20 +246,20 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn persist_detected_file_domain_changes(
+    pub(crate) async fn persist_filesystem_payload_domain_changes(
         &self,
-        changes: &[DetectedFileDomainChange],
+        changes: &[FilesystemPayloadDomainChange],
     ) -> Result<(), LixError> {
-        self.persist_detected_file_domain_changes_with_untracked(changes, false)
+        self.persist_filesystem_payload_domain_changes_with_untracked(changes, false)
             .await
     }
 
-    pub(crate) async fn persist_detected_file_domain_changes_in_transaction(
+    pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
-        changes: &[DetectedFileDomainChange],
+        changes: &[FilesystemPayloadDomainChange],
     ) -> Result<(), LixError> {
-        self.persist_detected_file_domain_changes_with_untracked_in_transaction(
+        self.persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
             transaction,
             changes,
             false,
@@ -267,17 +267,18 @@ impl Engine {
         .await
     }
 
-    pub(crate) async fn persist_detected_file_domain_changes_with_untracked(
+    pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked(
         &self,
-        changes: &[DetectedFileDomainChange],
+        changes: &[FilesystemPayloadDomainChange],
         untracked: bool,
     ) -> Result<(), LixError> {
-        let deduped_changes = dedupe_detected_file_domain_changes(changes);
+        let deduped_changes = dedupe_filesystem_payload_domain_changes(changes);
         if deduped_changes.is_empty() {
             return Ok(());
         }
 
-        let (sql, params) = build_detected_file_domain_changes_insert(&deduped_changes, untracked);
+        let (sql, params) =
+            build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
         let mut transaction = self.backend.begin_transaction().await?;
         let mut active_version_id = self.require_active_version_id()?;
         let previous_active_version_id = active_version_id.clone();
@@ -311,18 +312,19 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn persist_detected_file_domain_changes_with_untracked_in_transaction(
+    pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
         &self,
         transaction: &mut dyn LixTransaction,
-        changes: &[DetectedFileDomainChange],
+        changes: &[FilesystemPayloadDomainChange],
         untracked: bool,
     ) -> Result<(), LixError> {
-        let deduped_changes = dedupe_detected_file_domain_changes(changes);
+        let deduped_changes = dedupe_filesystem_payload_domain_changes(changes);
         if deduped_changes.is_empty() {
             return Ok(());
         }
 
-        let (sql, params) = build_detected_file_domain_changes_insert(&deduped_changes, untracked);
+        let (sql, params) =
+            build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
         let output = {
             let backend = TransactionBackendAdapter::new(transaction);
             preprocess_sql_to_plan(&backend, &self.cel_evaluator, &sql, &params).await?
@@ -337,7 +339,7 @@ impl Engine {
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
         delete_targets: &BTreeSet<(String, String)>,
         writer_key: Option<&str>,
-    ) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+    ) -> Result<Vec<FilesystemPayloadDomainChange>, LixError> {
         let mut latest_by_key = BTreeMap::new();
 
         for write in writes {
@@ -371,7 +373,7 @@ impl Engine {
         writes: &[crate::filesystem::pending_file_writes::PendingFileWrite],
         delete_targets: &BTreeSet<(String, String)>,
         writer_key: Option<&str>,
-    ) -> Result<Vec<DetectedFileDomainChange>, LixError> {
+    ) -> Result<Vec<FilesystemPayloadDomainChange>, LixError> {
         let mut latest_by_key = BTreeMap::new();
 
         for write in writes {
@@ -503,8 +505,8 @@ impl Engine {
     }
 }
 
-fn build_detected_file_domain_changes_insert(
-    changes: &[DetectedFileDomainChange],
+fn build_filesystem_payload_domain_changes_insert(
+    changes: &[FilesystemPayloadDomainChange],
     untracked: bool,
 ) -> (String, Vec<Value>) {
     let values_per_row = if untracked { 10 } else { 9 };
@@ -536,7 +538,8 @@ fn build_detected_file_domain_changes_insert(
         }
     }
 
-    let sql = state_queries::insert_detected_file_domain_changes_sql(&rows.join(", "), untracked);
+    let sql =
+        state_queries::insert_filesystem_payload_domain_changes_sql(&rows.join(", "), untracked);
     (sql, params)
 }
 
