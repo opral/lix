@@ -458,29 +458,6 @@ fn should_run_binary_cas_gc(
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
-fn collect_binary_blob_ref_targets(
-    mutations: &[MutationRow],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
-) -> BTreeSet<(String, String)> {
-    let mut targets = BTreeSet::new();
-
-    for mutation in mutations {
-        if mutation.untracked || mutation.schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
-            continue;
-        }
-        targets.insert((mutation.file_id.clone(), mutation.version_id.clone()));
-    }
-
-    for change in detected_file_domain_changes {
-        if change.schema_key != BINARY_BLOB_REF_SCHEMA_KEY {
-            continue;
-        }
-        targets.insert((change.file_id.clone(), change.version_id.clone()));
-    }
-
-    targets
-}
-
 fn collect_postprocess_file_cache_targets(
     rows: &[Vec<Value>],
     schema_key: &str,
@@ -533,17 +510,6 @@ trait DedupableDetectedFileChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str);
 }
 
-impl DedupableDetectedFileChange for crate::plugin::runtime::DetectedFileChange {
-    fn dedupe_key(&self) -> (&str, &str, &str, &str) {
-        (
-            &self.file_id,
-            &self.version_id,
-            &self.schema_key,
-            &self.entity_id,
-        )
-    }
-}
-
 impl DedupableDetectedFileChange for DetectedFileDomainChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str) {
         (
@@ -572,50 +538,10 @@ where
         .collect()
 }
 
-fn dedupe_detected_file_changes(
-    changes: &[crate::plugin::runtime::DetectedFileChange],
-) -> Vec<crate::plugin::runtime::DetectedFileChange> {
-    dedupe_detected_changes(changes)
-}
-
 fn dedupe_detected_file_domain_changes(
     changes: &[DetectedFileDomainChange],
 ) -> Vec<DetectedFileDomainChange> {
     dedupe_detected_changes(changes)
-}
-
-fn detected_file_domain_changes_from_detected_file_changes(
-    changes: &[crate::plugin::runtime::DetectedFileChange],
-    writer_key: Option<&str>,
-) -> Vec<DetectedFileDomainChange> {
-    changes
-        .iter()
-        .map(|change| DetectedFileDomainChange {
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            version_id: change.version_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: None,
-            writer_key: writer_key.map(ToString::to_string),
-        })
-        .collect()
-}
-
-fn detected_file_domain_changes_with_writer_key(
-    changes: &[DetectedFileDomainChange],
-    writer_key: Option<&str>,
-) -> Vec<DetectedFileDomainChange> {
-    changes
-        .iter()
-        .map(|change| {
-            let mut next = change.clone();
-            next.writer_key = writer_key.map(ToString::to_string);
-            next
-        })
-        .collect()
 }
 
 fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
@@ -640,15 +566,12 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot, detected_file_domain_changes_from_detected_file_changes,
-        detected_file_domain_changes_with_writer_key,
-        should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
+        boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs, ExecuteOptions,
     };
     use crate::backend::{LixBackend, LixTransaction, SqlDialect};
     use crate::engine::sql::ast::utils::parse_sql_statements;
     use crate::engine::sql::ast::utils::{bind_sql_with_state, PlaceholderState};
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
-    use crate::engine::sql::contracts::effects::DetectedFileDomainChange;
     use crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
     use crate::engine::sql::history::plugin_inputs::{
         file_history_read_materialization_required_for_statements,
@@ -1337,48 +1260,6 @@ mod tests {
              WHERE (data, id) IN (('x', 'file-a'))",
         );
         assert_eq!(scope, Some(FileReadMaterializationScope::ActiveVersionOnly));
-    }
-
-    #[test]
-    fn detected_file_domain_changes_apply_writer_key_fallback() {
-        let detected = vec![crate::plugin::runtime::DetectedFileChange {
-            entity_id: "entity-1".to_string(),
-            schema_key: "schema-1".to_string(),
-            schema_version: "1".to_string(),
-            file_id: "file-1".to_string(),
-            version_id: "version-1".to_string(),
-            plugin_key: "plugin-1".to_string(),
-            snapshot_content: Some("{\"a\":1}".to_string()),
-        }];
-
-        let with_writer_key =
-            detected_file_domain_changes_from_detected_file_changes(&detected, Some("writer-123"));
-        assert_eq!(with_writer_key[0].writer_key.as_deref(), Some("writer-123"));
-    }
-
-    #[test]
-    fn detected_file_domain_changes_writer_key_is_overwritten_by_execution_writer() {
-        let detected = vec![DetectedFileDomainChange {
-            entity_id: "entity-1".to_string(),
-            schema_key: "schema-1".to_string(),
-            schema_version: "1".to_string(),
-            file_id: "file-1".to_string(),
-            version_id: "version-1".to_string(),
-            plugin_key: "plugin-1".to_string(),
-            snapshot_content: Some("{\"a\":1}".to_string()),
-            metadata: None,
-            writer_key: Some("writer-stale".to_string()),
-        }];
-
-        let with_writer_key = detected_file_domain_changes_with_writer_key(&detected, None);
-        assert_eq!(with_writer_key[0].writer_key, None);
-
-        let with_writer_key =
-            detected_file_domain_changes_with_writer_key(&detected, Some("writer-current"));
-        assert_eq!(
-            with_writer_key[0].writer_key.as_deref(),
-            Some("writer-current")
-        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
+use crate::schema_registry::register_schema_sql_statements;
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
     StateCommitStreamOperation,
