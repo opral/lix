@@ -60,7 +60,7 @@ mod runtime_functions;
 #[path = "sql/mod.rs"]
 pub(crate) mod sql;
 
-use self::sql::contracts::effects::DetectedFileDomainChange;
+use self::sql::contracts::effects::FilesystemPayloadDomainChange;
 use self::sql::contracts::planned_statement::MutationRow;
 use self::sql::planning::parse::parse_sql;
 use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
@@ -448,12 +448,12 @@ fn direct_state_file_cache_refresh_targets(
 
 fn should_run_binary_cas_gc(
     mutations: &[MutationRow],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
+    filesystem_payload_domain_changes: &[FilesystemPayloadDomainChange],
 ) -> bool {
     mutations
         .iter()
         .any(|mutation| !mutation.untracked && mutation.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
-        || detected_file_domain_changes
+        || filesystem_payload_domain_changes
             .iter()
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
@@ -506,11 +506,11 @@ fn collect_postprocess_file_cache_targets(
     Ok(targets)
 }
 
-trait DedupableDetectedFileChange {
+trait DedupableFilesystemPayloadChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str);
 }
 
-impl DedupableDetectedFileChange for DetectedFileDomainChange {
+impl DedupableFilesystemPayloadChange for FilesystemPayloadDomainChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str) {
         (
             &self.file_id,
@@ -523,7 +523,7 @@ impl DedupableDetectedFileChange for DetectedFileDomainChange {
 
 fn dedupe_detected_changes<T>(changes: &[T]) -> Vec<T>
 where
-    T: DedupableDetectedFileChange + Clone,
+    T: DedupableFilesystemPayloadChange + Clone,
 {
     let mut latest_by_key: BTreeMap<(&str, &str, &str, &str), usize> = BTreeMap::new();
     for (index, change) in changes.iter().enumerate() {
@@ -538,9 +538,9 @@ where
         .collect()
 }
 
-fn dedupe_detected_file_domain_changes(
-    changes: &[DetectedFileDomainChange],
-) -> Vec<DetectedFileDomainChange> {
+fn dedupe_filesystem_payload_domain_changes(
+    changes: &[FilesystemPayloadDomainChange],
+) -> Vec<FilesystemPayloadDomainChange> {
     dedupe_detected_changes(changes)
 }
 

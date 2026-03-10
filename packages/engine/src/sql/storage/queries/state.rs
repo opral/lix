@@ -1,6 +1,9 @@
 use super::super::tables;
 
-pub(crate) fn insert_detected_file_domain_changes_sql(row_values: &str, untracked: bool) -> String {
+pub(crate) fn insert_filesystem_payload_domain_changes_sql(
+    row_values: &str,
+    untracked: bool,
+) -> String {
     if untracked {
         return format!(
             "INSERT INTO {} (\
