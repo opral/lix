@@ -139,7 +139,7 @@ impl Engine {
     }
 
     pub(crate) async fn seed_default_checkpoint_label(&self) -> Result<(), LixError> {
-        let bootstrap_commit_id = self.load_global_pointer_commit_id().await?;
+        let bootstrap_commit_id = self.load_global_version_commit_id().await?;
         let existing = self
             .execute_internal(
                 "SELECT entity_id, snapshot_content \
@@ -202,16 +202,15 @@ impl Engine {
         Ok(())
     }
 
-    async fn load_global_pointer_commit_id(&self) -> Result<String, LixError> {
+    async fn load_global_version_commit_id(&self) -> Result<String, LixError> {
         let rows = self
             .execute_internal(
                 "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
                  FROM lix_internal_state_vtable \
-                 WHERE schema_key = 'lix_global_pointer' \
+                 WHERE schema_key = 'lix_version_pointer' \
                    AND entity_id = 'global' \
                    AND file_id = 'lix' \
                    AND version_id = 'global' \
-                   AND global = true \
                    AND snapshot_content IS NOT NULL \
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
@@ -221,7 +220,7 @@ impl Engine {
             .await?;
         let [statement] = rows.statements.as_slice() else {
             return Err(errors::unexpected_statement_count_error(
-                "global pointer commit_id query",
+                "hidden global version commit_id query",
                 1,
                 rows.statements.len(),
             ));
@@ -229,10 +228,11 @@ impl Engine {
         let Some(first) = statement.rows.first() else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "init invariant violation: global pointer is missing".to_string(),
+                description: "init invariant violation: hidden global version pointer is missing"
+                    .to_string(),
             });
         };
-        text_value(first.first(), "lix_global_pointer.commit_id")
+        text_value(first.first(), "lix_version_pointer.commit_id")
     }
 
     async fn ensure_checkpoint_label_on_bootstrap_commit(
@@ -325,7 +325,9 @@ impl Engine {
         }
         self.assert_commit_change_set_integrity(&bootstrap_commit_id)
             .await?;
-        self.seed_materialized_global_pointer(&bootstrap_commit_id)
+        self.seed_materialized_version_descriptor(GLOBAL_VERSION_ID, GLOBAL_VERSION_ID)
+            .await?;
+        self.seed_materialized_version_pointer(GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
         self.seed_materialized_version_pointer(&main_version_id, &bootstrap_commit_id)
             .await?;
@@ -505,7 +507,6 @@ impl Engine {
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
@@ -520,7 +521,11 @@ impl Engine {
             return Ok(());
         }
 
-        let snapshot_content = version_descriptor_snapshot_content(entity_id, name, false);
+        let snapshot_content = version_descriptor_snapshot_content(
+            entity_id,
+            name,
+            entity_id == GLOBAL_VERSION_ID,
+        );
         let change_id = format!("seed~{}~{}", version_descriptor_schema_key(), entity_id);
         let insert_sql = format!(
             "INSERT INTO {table} (\
@@ -557,7 +562,6 @@ impl Engine {
              WHERE schema_key = '{schema_key}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL",
             table = table,
@@ -621,7 +625,6 @@ impl Engine {
                AND entity_id = '{entity_id}' \
                AND file_id = '{file_id}' \
                AND version_id = '{version_id}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
@@ -658,65 +661,6 @@ impl Engine {
             version_pointer_schema_version(),
             version_pointer_file_id(),
             version_pointer_plugin_key(),
-            &snapshot_content,
-            &change_id,
-        )
-        .await
-    }
-
-    pub(crate) async fn seed_materialized_global_pointer(
-        &self,
-        commit_id: &str,
-    ) -> Result<(), LixError> {
-        let snapshot_content = global_pointer_snapshot_content(commit_id);
-        let change_id = format!("seed~{}~{}", global_pointer_schema_key(), GLOBAL_VERSION_ID);
-        let table = format!(
-            "lix_internal_state_materialized_v1_{}",
-            global_pointer_schema_key()
-        );
-        let check_sql = format!(
-            "SELECT 1 \
-             FROM {table} \
-             WHERE schema_key = '{schema_key}' \
-               AND entity_id = '{entity_id}' \
-               AND file_id = '{file_id}' \
-               AND version_id = '{version_id}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL \
-             LIMIT 1",
-            table = table,
-            schema_key = escape_sql_string(global_pointer_schema_key()),
-            entity_id = escape_sql_string(GLOBAL_VERSION_ID),
-            file_id = escape_sql_string(global_pointer_file_id()),
-            version_id = escape_sql_string(global_pointer_storage_version_id()),
-        );
-        let existing = self.backend.execute(&check_sql, &[]).await?;
-        if existing.rows.is_empty() {
-            let insert_sql = format!(
-                "INSERT INTO {table} (\
-                 entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
-                 ) VALUES (\
-                 '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', '{snapshot_content}', '{change_id}', NULL, NULL, 0, '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'\
-                 )",
-                table = table,
-                entity_id = escape_sql_string(GLOBAL_VERSION_ID),
-                schema_key = escape_sql_string(global_pointer_schema_key()),
-                schema_version = escape_sql_string(global_pointer_schema_version()),
-                file_id = escape_sql_string(global_pointer_file_id()),
-                version_id = escape_sql_string(global_pointer_storage_version_id()),
-                plugin_key = escape_sql_string(global_pointer_plugin_key()),
-                snapshot_content = escape_sql_string(&snapshot_content),
-                change_id = escape_sql_string(&change_id),
-            );
-            self.backend.execute(&insert_sql, &[]).await?;
-        }
-
-        self.seed_committed_pointer_change(
-            GLOBAL_VERSION_ID,
-            global_pointer_schema_key(),
-            global_pointer_schema_version(),
-            global_pointer_file_id(),
-            global_pointer_plugin_key(),
             &snapshot_content,
             &change_id,
         )
@@ -806,7 +750,7 @@ impl Engine {
             .execute("DELETE FROM lix_internal_last_checkpoint", &[])
             .await?;
 
-        let global_commit_id = self.load_global_pointer_commit_id().await?;
+        let global_commit_id = self.load_global_version_commit_id().await?;
         let global_checkpoint_commit_id = self
             .resolve_last_checkpoint_commit_id_for_tip(&global_commit_id)
             .await?
@@ -816,6 +760,9 @@ impl Engine {
 
         for row in &statement.rows {
             let version_id = text_value(row.get(0), "lix_version.id")?;
+            if version_id == GLOBAL_VERSION_ID {
+                continue;
+            }
             let commit_id = text_value(row.get(1), "lix_version.commit_id")?;
             let checkpoint_commit_id = self
                 .resolve_last_checkpoint_commit_id_for_tip(&commit_id)

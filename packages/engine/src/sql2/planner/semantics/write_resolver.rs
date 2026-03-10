@@ -2689,7 +2689,6 @@ async fn load_version_admin_row(
            AND file_id = '{file_id}' \
            AND plugin_key = '{plugin_key}' \
            AND version_id = '{storage_version_id}' \
-           AND global = true \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL \
          LIMIT 1",
@@ -2711,7 +2710,6 @@ async fn load_version_admin_row(
            AND file_id = '{file_id}' \
            AND plugin_key = '{plugin_key}' \
            AND version_id = '{storage_version_id}' \
-           AND global = true \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL \
          LIMIT 1",

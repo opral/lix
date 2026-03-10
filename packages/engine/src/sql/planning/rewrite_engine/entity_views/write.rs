@@ -2731,7 +2731,10 @@ mod tests {
                 if sql.contains("lix_global_pointer") {
                     return Ok(QueryResult {
                         rows: vec![vec![EngineValue::Text(
-                            crate::version::global_pointer_snapshot_content("commit-global-seed"),
+                            crate::version::version_pointer_snapshot_content(
+                                crate::version::GLOBAL_VERSION_ID,
+                                "commit-global-seed",
+                            ),
                         )]],
                         columns: vec!["snapshot_content".to_string()],
                     });

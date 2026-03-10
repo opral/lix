@@ -41,12 +41,12 @@ async fn active_version_id(engine: &support::simulation_test::SimulationEngine) 
     )
 }
 
-async fn global_pointer_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn global_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
     let result = engine
         .execute(
             "SELECT lix_json_extract(snapshot_content, 'commit_id') AS commit_id \
              FROM lix_internal_state_vtable \
-             WHERE schema_key = 'lix_global_pointer' \
+             WHERE schema_key = 'lix_version_pointer' \
                AND entity_id = 'global' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
@@ -60,7 +60,7 @@ async fn global_pointer_commit_id(engine: &support::simulation_test::SimulationE
     assert_eq!(result.statements[0].rows.len(), 1);
     text_value(
         &result.statements[0].rows[0][0],
-        "lix_global_pointer.commit_id",
+        "lix_version_pointer.commit_id",
     )
 }
 
@@ -573,7 +573,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
 });
 
 simulation_test!(
-    init_seeds_bootstrap_change_set_for_bootstrap_global_pointer_commit,
+    init_seeds_bootstrap_change_set_for_hidden_global_version_commit,
     |sim| async move {
         let engine = sim
             .boot_simulated_engine(None)
@@ -582,7 +582,7 @@ simulation_test!(
 
         engine.init().await.unwrap();
 
-        let commit_id = global_pointer_commit_id(&engine).await;
+        let commit_id = global_version_commit_id(&engine).await;
 
         let change_set_result = engine
             .execute(
@@ -646,7 +646,7 @@ simulation_test!(
             "expected exactly one public main version row"
         );
         let main_commit_id = text_value(&main_version.statements[0].rows[0][1], "commit_id");
-        let global_commit_id = global_pointer_commit_id(&engine).await;
+        let global_commit_id = global_version_commit_id(&engine).await;
 
         let baselines = engine
             .execute(
@@ -742,7 +742,7 @@ simulation_test!(
                 "SELECT lix_json_extract(s.content, 'commit_id') AS commit_id \
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-                 WHERE c.schema_key = 'lix_global_pointer' \
+                 WHERE c.schema_key = 'lix_version_pointer' \
                    AND c.entity_id = 'global' \
                  ORDER BY c.created_at DESC, c.id DESC \
                  LIMIT 1",
@@ -842,7 +842,7 @@ simulation_test!(
         assert!(has_checkpoint, "expected checkpoint label in global lane");
         let checkpoint_label_id =
             checkpoint_label_id.expect("checkpoint label id should be present");
-        let global_commit_id = global_pointer_commit_id(&engine).await;
+        let global_commit_id = global_version_commit_id(&engine).await;
 
         let checkpoint_links = engine
             .execute(

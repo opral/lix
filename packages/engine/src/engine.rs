@@ -24,9 +24,7 @@ use crate::validation::SchemaCache;
 use crate::version::{
     active_version_file_id, active_version_plugin_key, active_version_schema_key,
     active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id, global_pointer_file_id, global_pointer_plugin_key,
-    global_pointer_schema_key, global_pointer_schema_version, global_pointer_snapshot_content,
-    global_pointer_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
+    active_version_storage_version_id, parse_active_version_snapshot, version_descriptor_file_id,
     version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content,
     version_descriptor_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,

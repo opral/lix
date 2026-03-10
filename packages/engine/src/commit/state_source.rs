@@ -9,16 +9,14 @@ use crate::materialization::{
     MaterializationWrite, MaterializationWriteOp,
 };
 use crate::version::{
-    global_pointer_file_id, global_pointer_plugin_key, global_pointer_schema_key,
-    global_pointer_storage_version_id, version_pointer_storage_version_id,
-    version_pointer_file_id, version_pointer_plugin_key, version_pointer_schema_key,
+    version_pointer_storage_version_id, version_pointer_file_id, version_pointer_plugin_key,
+    version_pointer_schema_key, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 use super::types::{VersionInfo, VersionSnapshot};
 
 const VERSION_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_version_pointer";
-const GLOBAL_POINTER_TABLE: &str = "lix_internal_state_materialized_v1_lix_global_pointer";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExactCommittedStateRow {
@@ -35,7 +33,6 @@ pub(crate) struct ExactCommittedStateRowRequest {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
-    pub(crate) global_filter: Option<bool>,
     pub(crate) exact_filters: BTreeMap<String, Value>,
 }
 
@@ -95,38 +92,7 @@ pub(crate) async fn load_committed_version_tip_commit_id(
 pub(crate) async fn load_committed_global_tip_commit_id(
     executor: &mut dyn CommitQueryExecutor,
 ) -> Result<Option<String>, LixError> {
-    let snapshot_content = match load_current_pointer_snapshot_content(
-        executor,
-        GLOBAL_POINTER_TABLE,
-        global_pointer_schema_key(),
-        "global",
-        global_pointer_file_id(),
-        global_pointer_plugin_key(),
-        global_pointer_storage_version_id(),
-    )
-    .await?
-    {
-        Some(snapshot_content) => Some(snapshot_content),
-        None => None,
-    };
-    if let Some(snapshot_content) = snapshot_content {
-        let Some(pointer) = parse_version_pointer_snapshot(&snapshot_content)? else {
-            return Ok(None);
-        };
-        if pointer.commit_id.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(pointer.commit_id));
-    }
-
-    load_pointer_tip_commit_id_from_change_log(
-        executor,
-        global_pointer_schema_key(),
-        "global",
-        global_pointer_file_id(),
-        global_pointer_plugin_key(),
-    )
-    .await
+    load_committed_version_tip_commit_id(executor, GLOBAL_VERSION_ID).await
 }
 
 pub(crate) async fn load_version_info_for_versions(
@@ -183,7 +149,6 @@ async fn load_current_pointer_snapshot_content(
            AND file_id = '{file_id}' \
            AND plugin_key = '{plugin_key}' \
            AND version_id = '{storage_version_id}' \
-           AND global = true \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL \
          LIMIT 1",
@@ -350,12 +315,6 @@ fn materialized_write_matches_request(
         || row.version_id != request.version_id
     {
         return false;
-    }
-
-    if let Some(global) = request.global_filter {
-        if row.global != global {
-            return false;
-        }
     }
 
     for column in ["file_id", "plugin_key", "schema_version"] {

@@ -17,6 +17,7 @@ use crate::functions::LixFunctionProvider;
 
 use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect, Value as EngineValue};
 
 use super::state_source::CommitQueryExecutor;
@@ -388,13 +389,13 @@ fn collect_commit_parent_map_for_ancestry(
 ) -> Result<BTreeMap<String, BTreeSet<String>>, LixError> {
     let mut out = BTreeMap::<String, BTreeSet<String>>::new();
     for row in materialized_state {
-        if row.schema_key == COMMIT_SCHEMA_KEY && row.lixcol_version_id == GLOBAL_VERSION {
+        if row.schema_key == COMMIT_SCHEMA_KEY && row.lixcol_version_id == GLOBAL_VERSION_ID {
             out.entry(row.entity_id.clone()).or_default();
         }
     }
 
     for row in materialized_state {
-        if row.schema_key != COMMIT_EDGE_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION {
+        if row.schema_key != COMMIT_EDGE_SCHEMA_KEY || row.lixcol_version_id != GLOBAL_VERSION_ID {
             continue;
         }
         let Some(raw) = row.snapshot_content.as_deref() else {

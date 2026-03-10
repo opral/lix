@@ -47,7 +47,6 @@ pub(crate) fn build_filesystem_file_projection_sql(
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
@@ -58,7 +57,6 @@ pub(crate) fn build_filesystem_file_projection_sql(
              FROM lix_internal_state_materialized_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
@@ -294,7 +292,6 @@ pub(crate) fn build_filesystem_directory_projection_sql(
              FROM lix_internal_state_materialized_v1_lix_commit \
              WHERE schema_key = 'lix_commit' \
                AND version_id = '{global_version}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
@@ -305,7 +302,6 @@ pub(crate) fn build_filesystem_directory_projection_sql(
              FROM lix_internal_state_materialized_v1_lix_change_set_element \
              WHERE schema_key = 'lix_change_set_element' \
                AND version_id = '{global_version}' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
            ), \
@@ -834,8 +830,7 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                         format!(
                             "SELECT DISTINCT version_id \
                              FROM {quoted} \
-                             WHERE global = false \
-                               AND version_id <> '{global_version}'",
+                             WHERE version_id <> '{global_version}'",
                             quoted = quoted,
                             global_version = escape_sql_string(GLOBAL_VERSION_ID),
                         ),
@@ -843,7 +838,6 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                             "SELECT DISTINCT version_id \
                              FROM lix_internal_state_untracked \
                              WHERE schema_key = '{schema_key}' \
-                               AND global = false \
                                AND version_id <> '{global_version}'",
                             schema_key = escape_sql_string(schema_key),
                             global_version = escape_sql_string(GLOBAL_VERSION_ID),
@@ -864,7 +858,6 @@ fn target_versions_cte_sql(scope: FilesystemProjectionScope, schema_keys: &[&str
                    FROM lix_internal_state_materialized_v1_lix_version_descriptor \
                    WHERE schema_key = '{version_descriptor_schema_key}' \
                      AND version_id = '{global_version}' \
-                     AND global = true \
                      AND is_tombstone = 0 \
                      AND snapshot_content IS NOT NULL{union_sql} \
                  ), \
@@ -894,7 +887,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            t.schema_version AS schema_version, \
            t.created_at AS created_at, \
            t.updated_at AS updated_at, \
-           t.global AS global, \
+           CASE WHEN tv.version_id = '{global_version}' THEN true ELSE false END AS global, \
            t.change_id AS change_id, \
            cc.commit_id AS commit_id, \
            false AS untracked, \
@@ -906,7 +899,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            ON tv.version_id = t.version_id \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
-         WHERE t.global = false \
+         WHERE 1 = 1 \
          UNION ALL \
          SELECT \
            t.entity_id AS entity_id, \
@@ -918,7 +911,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            t.schema_version AS schema_version, \
            t.created_at AS created_at, \
            t.updated_at AS updated_at, \
-           t.global AS global, \
+           true AS global, \
            t.change_id AS change_id, \
            cc.commit_id AS commit_id, \
            false AS untracked, \
@@ -927,10 +920,11 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            4 AS precedence \
          FROM {table_name} t \
          JOIN target_versions tv \
-           ON t.version_id = '{global_version}' \
+           ON tv.version_id <> '{global_version}' \
+          AND t.version_id = '{global_version}' \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
-         WHERE t.global = true \
+         WHERE t.version_id = '{global_version}' \
          UNION ALL \
          SELECT \
            u.entity_id AS entity_id, \
@@ -942,7 +936,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.schema_version AS schema_version, \
            u.created_at AS created_at, \
            u.updated_at AS updated_at, \
-           u.global AS global, \
+           CASE WHEN tv.version_id = '{global_version}' THEN true ELSE false END AS global, \
            NULL AS change_id, \
            'untracked' AS commit_id, \
            true AS untracked, \
@@ -953,7 +947,6 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
          JOIN target_versions tv \
            ON tv.version_id = u.version_id \
          WHERE {schema_filter} \
-           AND u.global = false \
          UNION ALL \
          SELECT \
            u.entity_id AS entity_id, \
@@ -965,7 +958,7 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            u.schema_version AS schema_version, \
            u.created_at AS created_at, \
            u.updated_at AS updated_at, \
-           u.global AS global, \
+           true AS global, \
            NULL AS change_id, \
            'untracked' AS commit_id, \
            true AS untracked, \
@@ -974,9 +967,10 @@ fn effective_state_candidates_sql(schema_key: &str) -> String {
            3 AS precedence \
          FROM lix_internal_state_untracked u \
          JOIN target_versions tv \
-           ON u.version_id = '{global_version}' \
+           ON tv.version_id <> '{global_version}' \
+          AND u.version_id = '{global_version}' \
          WHERE {schema_filter} \
-           AND u.global = true",
+           AND u.version_id = '{global_version}'",
         table_name = table_name,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
         schema_filter = schema_filter,
@@ -994,7 +988,6 @@ fn active_version_commit_id_sql() -> String {
          FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
          WHERE vp.schema_key = 'lix_version_pointer' \
            AND vp.version_id = '{global_version}' \
-           AND vp.global = true \
            AND vp.snapshot_content IS NOT NULL \
            AND vp.entity_id = (\
                SELECT lix_json_extract(snapshot_content, 'version_id') \
@@ -1049,7 +1042,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              ON av.version_id = vp.entity_id \
            WHERE vp.schema_key = 'lix_version_pointer' \
              AND vp.version_id = '{global_version}' \
-             AND vp.global = true \
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
            UNION \
@@ -1061,7 +1053,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
              ON av.version_id = vd.entity_id \
            WHERE vd.schema_key = '{version_descriptor_schema_key}' \
              AND vd.version_id = '{global_version}' \
-             AND vd.global = true \
              AND vd.is_tombstone = 0 \
              AND vd.snapshot_content IS NOT NULL \
          ), ",
@@ -1077,7 +1068,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            FROM lix_internal_state_materialized_v1_lix_version_pointer vp \
            WHERE vp.schema_key = 'lix_version_pointer' \
              AND vp.version_id = '{global_version}' \
-             AND vp.global = true \
              AND vp.is_tombstone = 0 \
              AND vp.snapshot_content IS NOT NULL \
            UNION \
@@ -1087,7 +1077,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
            FROM lix_internal_state_materialized_v1_lix_version_descriptor vd \
            WHERE vd.schema_key = '{version_descriptor_schema_key}' \
              AND vd.version_id = '{global_version}' \
-             AND vd.global = true \
              AND vd.is_tombstone = 0 \
              AND vd.snapshot_content IS NOT NULL \
          ), ",
@@ -1108,7 +1097,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                ON d.root_commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
                AND c.version_id = '{global_version}' \
-               AND c.global = true \
                AND c.is_tombstone = 0 \
                AND c.snapshot_content IS NOT NULL{requested_roots_where}{requested_versions_where} \
                {default_root_scope} \
@@ -1137,7 +1125,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                ON rc.commit_id = c.entity_id \
              WHERE c.schema_key = 'lix_commit' \
                AND c.version_id = '{global_version}' \
-               AND c.global = true \
                AND c.is_tombstone = 0 \
                AND c.snapshot_content IS NOT NULL \
            ), \
@@ -1157,7 +1144,6 @@ pub(crate) fn build_filesystem_state_history_source_sql(
                ON lix_json_extract(cse.snapshot_content, 'change_set_id') = cc.change_set_id \
              WHERE cse.schema_key = 'lix_change_set_element' \
                AND cse.version_id = '{global_version}' \
-               AND cse.global = true \
                AND cse.is_tombstone = 0 \
                AND cse.snapshot_content IS NOT NULL \
            ), \

@@ -836,7 +836,9 @@ mod tests {
                     },
                 });
             }
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_global_pointer") {
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer")
+                && sql.contains("entity_id = 'global'")
+            {
                 let rows = self
                     .version_pointer_rows
                     .iter()
@@ -852,7 +854,8 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_change c")
-                && sql.contains("c.schema_key = 'lix_global_pointer'")
+                && sql.contains("c.schema_key = 'lix_version_pointer'")
+                && sql.contains("c.entity_id = 'global'")
             {
                 let rows = self
                     .version_pointer_rows
