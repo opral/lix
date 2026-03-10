@@ -300,6 +300,31 @@ fn guardrail_vtable_read_stays_filesystem_blind() {
 }
 
 #[test]
+fn guardrail_legacy_filesystem_select_rewrite_is_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/filesystem/select_rewrite.rs").exists(),
+        "legacy filesystem select rewrite must stay removed once sql2 owns filesystem reads"
+    );
+
+    let filesystem_mod_source =
+        fs::read_to_string(root.join("src/filesystem/mod.rs")).expect("filesystem mod readable");
+    assert!(
+        !filesystem_mod_source.contains("select_rewrite"),
+        "filesystem module tree must not re-export the removed select rewrite"
+    );
+}
+
+#[test]
+fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/sql/planning/rewrite_engine/rewrite.rs").exists(),
+        "dead rewrite_engine filesystem coalescer must stay removed"
+    );
+}
+
+#[test]
 fn guardrail_runtime_source_forbids_crate_sql_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
