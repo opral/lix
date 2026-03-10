@@ -22,13 +22,6 @@ const LOGICAL_READ_VIEW_NAMES: &[&str] = &[
     "lix_state_history_by_version",
     "lix_working_changes",
     "lix_version",
-    "lix_file",
-    "lix_file_by_version",
-    "lix_file_history",
-    "lix_file_history_by_version",
-    "lix_directory",
-    "lix_directory_by_version",
-    "lix_directory_history",
 ];
 
 pub(crate) fn validate_final_read_query(query: &Query) -> Result<(), LixError> {

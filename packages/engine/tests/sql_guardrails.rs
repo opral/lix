@@ -325,6 +325,40 @@ fn guardrail_dead_rewrite_engine_filesystem_coalescer_stays_removed() {
 }
 
 #[test]
+fn guardrail_legacy_query_pipeline_context_and_validator_are_filesystem_blind() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let context_source = fs::read_to_string(
+        root.join("src/sql/planning/rewrite_engine/pipeline/context.rs"),
+    )
+    .expect("context.rs should be readable");
+    let validator_source = fs::read_to_string(
+        root.join("src/sql/planning/rewrite_engine/pipeline/validator.rs"),
+    )
+    .expect("validator.rs should be readable");
+
+    for forbidden in [
+        "lix_file",
+        "lix_file_by_version",
+        "lix_file_history",
+        "lix_file_history_by_version",
+        "lix_directory",
+        "lix_directory_by_version",
+        "lix_directory_history",
+        "FILESYSTEM_VIEW_NAMES",
+        "references_any_filesystem_view",
+    ] {
+        assert!(
+            !context_source.contains(forbidden),
+            "legacy query rewrite context must not carry filesystem surface awareness: {forbidden}"
+        );
+        assert!(
+            !validator_source.contains(forbidden),
+            "legacy query rewrite validator must not carry filesystem surface awareness: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn guardrail_runtime_source_forbids_crate_sql_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
