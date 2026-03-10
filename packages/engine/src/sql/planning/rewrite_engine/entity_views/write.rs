@@ -1356,7 +1356,7 @@ async fn rewrite_and_lower_read_subquery_with_backend(
     backend: &dyn LixBackend,
     subquery: Query,
 ) -> Result<Query, LixError> {
-    lower_public_read_query_with_sql2_backend(backend, subquery).await
+    lower_public_read_query_with_sql2_backend(backend, subquery, &[]).await
 }
 
 fn rewrite_column_reference_expr(

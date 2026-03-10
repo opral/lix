@@ -7,7 +7,7 @@ use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfac
 use crate::sql2::runtime::prepare_sql2_read;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
+    parse_active_version_snapshot, DEFAULT_ACTIVE_VERSION_NAME,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
@@ -38,10 +38,11 @@ pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
 pub(crate) async fn lower_public_read_query_with_sql2_backend(
     backend: &dyn LixBackend,
     query: sqlparser::ast::Query,
+    params: &[Value],
 ) -> Result<sqlparser::ast::Query, LixError> {
     let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
     let parsed = vec![Statement::Query(Box::new(query))];
-    let prepared = prepare_sql2_read(backend, &parsed, &[], &active_version_id, None)
+    let prepared = prepare_sql2_read(backend, &parsed, params, &active_version_id, None)
         .await
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -88,10 +89,9 @@ async fn load_active_version_id_for_sql2_read(backend: &dyn LixBackend) -> Resul
         )
         .await?;
 
-    let row = result.rows.first().ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "sql2 read subquery requires an active version".to_string(),
-    })?;
+    let Some(row) = result.rows.first() else {
+        return Ok(DEFAULT_ACTIVE_VERSION_NAME.to_string());
+    };
     let snapshot_content = row.first().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "active version query row is missing snapshot_content".to_string(),
