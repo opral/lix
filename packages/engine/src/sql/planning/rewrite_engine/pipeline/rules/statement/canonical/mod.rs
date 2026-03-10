@@ -2,25 +2,16 @@ use std::collections::VecDeque;
 
 use sqlparser::ast::{Delete, Statement, Update};
 
-use crate::cel::CelEvaluator;
-use crate::engine::sql::planning::rewrite_engine::entity_views::write as entity_view_write;
-use crate::engine::sql::planning::rewrite_engine::steps::lix_active_account_view_write;
-use crate::engine::sql::planning::rewrite_engine::steps::lix_active_version_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
-use crate::engine::sql::planning::rewrite_engine::steps::lix_state_by_version_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
-use crate::engine::sql::planning::rewrite_engine::steps::lix_state_view_write;
-use crate::engine::sql::planning::rewrite_engine::steps::lix_version_view_write;
 use crate::engine::sql::planning::rewrite_engine::steps::stored_schema;
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
 use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput};
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
 use super::context::StatementContext;
-use super::helpers::{
-    merge_rewrite_output, rewrite_vtable_inserts, rewrite_vtable_inserts_with_backend,
-};
+use super::helpers::merge_rewrite_output;
 use super::outcome::StatementRuleOutcome;
 
 const MAX_REWRITE_PASSES: usize = 32;
@@ -237,42 +228,8 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
 
-                if let Some(version_inserts) =
-                    lix_version_view_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    let output = rewrite_vtable_inserts(
-                        version_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )?;
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-                if let Some(active_account_inserts) =
-                    lix_active_account_view_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    let output = rewrite_vtable_inserts(
-                        active_account_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )?;
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-                if let Some(rewritten) =
-                    entity_view_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    current = Statement::Insert(rewritten);
-                    continue;
-                }
-
                 let mut current_insert = insert;
                 let mut supplemental_statements = Vec::new();
-                if let Some(rewritten) =
-                    lix_state_by_version_view_write::rewrite_insert(current_insert.clone())?
-                {
-                    current_insert = rewritten;
-                }
                 if let Some(rewritten) =
                     stored_schema::rewrite_insert(current_insert.clone(), context.params)?
                 {
@@ -320,21 +277,6 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
-                if let Some(rewritten) =
-                    entity_view_write::rewrite_update(update.clone(), context.params)?
-                {
-                    current = Statement::Update(rewritten);
-                    continue;
-                }
-
-                let update = if let Some(rewritten) =
-                    lix_state_by_version_view_write::rewrite_update(update.clone())?
-                {
-                    rewritten
-                } else {
-                    update
-                };
-
                 let output = rewrite_vtable_update_output(
                     update.clone(),
                     vtable_write::rewrite_update(update, context.params)?,
@@ -345,23 +287,8 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 lix_change_view_write::reject_delete(&delete)?;
                 lix_state_history_view_write::reject_delete(&delete)?;
 
-                if let Some(rewritten) = entity_view_write::rewrite_delete(delete.clone())? {
-                    current = Statement::Delete(rewritten);
-                    continue;
-                }
-
-                let mut effective_scope_fallback = false;
-                let delete = if let Some(rewritten) =
-                    lix_state_by_version_view_write::rewrite_delete(delete.clone())?
-                {
-                    effective_scope_fallback = true;
-                    rewritten
-                } else {
-                    delete
-                };
-
                 let output =
-                    rewrite_vtable_delete_output(delete, effective_scope_fallback, context.params)?;
+                    rewrite_vtable_delete_output(delete, false, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {
@@ -410,69 +337,7 @@ where
             Statement::Insert(insert) => {
                 lix_change_view_write::reject_insert(&insert)?;
                 lix_state_history_view_write::reject_insert(&insert)?;
-
-                if let Some(version_rewrite) = lix_version_view_write::rewrite_insert_with_backend(
-                    backend,
-                    insert.clone(),
-                    context.params,
-                )
-                .await?
-                {
-                    let mut output = rewrite_vtable_inserts_with_backend(
-                        backend,
-                        version_rewrite.vtable_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )
-                    .await?;
-                    output
-                        .statements
-                        .extend(version_rewrite.supplemental_statements);
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-
-                if let Some(active_account_inserts) =
-                    lix_active_account_view_write::rewrite_insert(insert.clone(), context.params)?
-                {
-                    let output = rewrite_vtable_inserts_with_backend(
-                        backend,
-                        active_account_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )
-                    .await?;
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-
-                let insert = if let Some(rewritten) = entity_view_write::rewrite_insert_with_backend(
-                    backend,
-                    insert.clone(),
-                    context.params,
-                    &CelEvaluator::new(),
-                    SharedFunctionProvider::new(functions.clone()),
-                )
-                .await?
-                {
-                    rewritten
-                } else {
-                    insert
-                };
-
                 let mut current_insert = insert;
-                if let Some(rewritten) =
-                    lix_state_view_write::rewrite_insert_with_backend(backend, current_insert.clone())
-                        .await?
-                {
-                    current_insert = rewritten;
-                }
-                if let Some(rewritten) =
-                    lix_state_by_version_view_write::rewrite_insert(current_insert.clone())?
-                {
-                    current_insert = rewritten;
-                }
-
                 let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
                     stored_schema::rewrite_insert(current_insert.clone(), context.params)?
@@ -533,76 +398,6 @@ where
                 lix_change_view_write::reject_update(&update)?;
                 lix_state_history_view_write::reject_update(&update)?;
 
-                let update = if let Some(rewritten) =
-                    entity_view_write::rewrite_update_with_backend(
-                        backend,
-                        update.clone(),
-                        context.params,
-                    )
-                    .await?
-                {
-                    rewritten
-                } else {
-                    update
-                };
-
-                if let Some(active_version_inserts) =
-                    lix_active_version_view_write::rewrite_update_with_backend(
-                        backend,
-                        update.clone(),
-                        context.params,
-                    )
-                    .await?
-                {
-                    let output = rewrite_vtable_inserts_with_backend(
-                        backend,
-                        active_version_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )
-                    .await?;
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-
-                if let Some(rewritten) = lix_state_view_write::rewrite_update_with_backend(
-                    backend,
-                    update.clone(),
-                    context.params,
-                )
-                .await?
-                {
-                    current = Statement::Update(rewritten);
-                    continue;
-                }
-
-                if let Some(rewritten) = lix_state_by_version_view_write::rewrite_update(update.clone())?
-                {
-                    current = Statement::Update(rewritten);
-                    continue;
-                }
-
-                if let Some(version_rewrite) = lix_version_view_write::rewrite_update_with_backend(
-                    backend,
-                    update.clone(),
-                    context.params,
-                )
-                .await?
-                {
-                    let mut output = rewrite_vtable_inserts_with_backend(
-                        backend,
-                        version_rewrite.vtable_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )
-                    .await?;
-                    output
-                        .statements
-                        .extend(version_rewrite.supplemental_statements);
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-
                 let output = rewrite_vtable_update_output(
                     update.clone(),
                     vtable_write::rewrite_update(update, context.params)?,
@@ -613,66 +408,8 @@ where
                 lix_change_view_write::reject_delete(&delete)?;
                 lix_state_history_view_write::reject_delete(&delete)?;
 
-                let mut effective_scope_fallback = false;
-                let delete = if let Some(rewritten) =
-                    entity_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
-                {
-                    rewritten
-                } else {
-                    delete
-                };
-
-                let delete = if let Some(rewritten) =
-                    lix_state_view_write::rewrite_delete_with_backend(backend, delete.clone()).await?
-                {
-                    rewritten
-                } else {
-                    delete
-                };
-
-                let delete = if let Some(rewritten) =
-                    lix_state_by_version_view_write::rewrite_delete(delete.clone())?
-                {
-                    effective_scope_fallback = true;
-                    rewritten
-                } else {
-                    delete
-                };
-
-                if let Some(rewritten) = lix_active_account_view_write::rewrite_delete_with_backend(
-                    backend,
-                    delete.clone(),
-                    context.params,
-                )
-                .await?
-                {
-                    current = rewritten;
-                    continue;
-                }
-
-                if let Some(version_rewrite) = lix_version_view_write::rewrite_delete_with_backend(
-                    backend,
-                    delete.clone(),
-                    context.params,
-                )
-                .await?
-                {
-                    let mut output = rewrite_vtable_inserts_with_backend(
-                        backend,
-                        version_rewrite.vtable_inserts,
-                        context.params,
-                        functions,
-                        context.writer_key,
-                    )
-                    .await?;
-                    output
-                        .statements
-                        .extend(version_rewrite.supplemental_statements);
-                    return Ok(StatementRuleOutcome::Emit(output));
-                }
-
                 let output =
-                    rewrite_vtable_delete_output(delete, effective_scope_fallback, context.params)?;
+                    rewrite_vtable_delete_output(delete, false, context.params)?;
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             other => {
