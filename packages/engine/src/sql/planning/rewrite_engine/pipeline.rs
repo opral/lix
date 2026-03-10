@@ -30,7 +30,7 @@ use crate::engine::sql::planning::rewrite_engine::types::{
 };
 #[cfg(test)]
 use crate::engine::sql::planning::rewrite_engine::{
-    bind_sql_with_state_and_appended_params, PlaceholderState,
+    bind_sql_with_state_and_appended_params, rewrite_statement, PlaceholderState,
 };
 #[cfg(test)]
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
@@ -40,11 +40,7 @@ use crate::LixError;
 use crate::Value;
 
 pub(crate) mod rules;
-pub(crate) mod statement_pipeline;
 pub(crate) mod validator;
-
-#[cfg(test)]
-use self::statement_pipeline::StatementPipeline;
 
 #[cfg(test)]
 struct RewrittenStatementBinding {
@@ -92,14 +88,13 @@ pub fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider
     let mut statements = statements;
     normalize_statement_placeholders_in_batch(&mut statements)?;
 
-    let statement_pipeline = StatementPipeline::new(params, writer_key);
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
     let mut postprocess: Option<PostprocessPlan> = None;
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut mutations = Vec::new();
     let mut update_validations = Vec::new();
     for statement in statements {
-        let output = statement_pipeline.rewrite_statement(statement, provider)?;
+        let output = rewrite_statement(statement, params, writer_key, provider)?;
         registrations.extend(output.registrations);
         if let Some(plan) = output.postprocess {
             if postprocess.is_some() {
