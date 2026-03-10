@@ -1,5 +1,5 @@
 use crate::cel::CelEvaluator;
-use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::query_runtime::preprocess::preprocess_sql_to_plan as preprocess_sql;
 use crate::filesystem::live_projection::{
     build_filesystem_file_history_projection_sql, build_filesystem_file_projection_sql,
     build_filesystem_state_history_source_sql, FilesystemProjectionScope,

@@ -3,10 +3,9 @@ use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFuncti
 use crate::internal_state::{
     prepare_statements_sync_to_plan, prepare_statements_with_backend_to_plan,
 };
+use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
 use crate::sql_shared::ast::parse_sql_statements;
 use crate::{LixBackend, LixError, SqlDialect, Value};
-
-use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
 use sqlparser::ast::Statement;
 
 pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(

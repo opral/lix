@@ -74,8 +74,7 @@ fn guardrail_sql_runtime_forbids_legacy_sql2_imports() {
 
     for file in files {
         let source = fs::read_to_string(&file).expect("source file should be readable");
-        let is_transition_shim = file.ends_with(Path::new("src/sql/execution/shared_path.rs"))
-            || file.ends_with(Path::new("src/sql/planning/preprocess.rs"));
+        let is_transition_shim = file.ends_with(Path::new("src/sql/execution/shared_path.rs"));
         assert!(
             !source.contains("crate::engine::sql2::"),
             "sql runtime must not depend on removed engine::sql2 bridge paths: {}",
@@ -378,7 +377,7 @@ fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
     let script_source = fs::read_to_string(root.join("src/internal_state/script.rs"))
         .expect("script.rs should be readable");
     let scripts_source =
-        fs::read_to_string(root.join("src/sql/scripts.rs")).expect("scripts.rs readable");
+        fs::read_to_string(root.join("src/statement_scripts.rs")).expect("statement_scripts.rs readable");
     let engine_source =
         fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
 
@@ -388,7 +387,7 @@ fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
     );
     assert!(
         !scripts_source.contains("coalesce_lix_file_transaction_statements"),
-        "sql/scripts.rs must not call the removed lix_file transaction coalescer"
+        "statement_scripts.rs must not call the removed lix_file transaction coalescer"
     );
     assert!(
         !engine_source.contains("coalesce_lix_file_transaction_statements"),
@@ -424,17 +423,17 @@ fn guardrail_runtime_source_forbids_crate_sql_imports() {
 }
 
 #[test]
-fn guardrail_preprocess_uses_bind_once_path_for_placeholder_binding() {
+fn guardrail_query_runtime_preprocess_uses_bind_once_path_for_placeholder_binding() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let preprocess_source = fs::read_to_string(root.join("src/sql/planning/preprocess.rs"))
-        .expect("sql/planning/preprocess.rs should be readable");
+    let preprocess_source = fs::read_to_string(root.join("src/query_runtime/preprocess.rs"))
+        .expect("query_runtime/preprocess.rs should be readable");
     let internal_state_source = fs::read_to_string(root.join("src/internal_state/mod.rs"))
         .expect("internal_state/mod.rs should be readable");
 
     assert!(
         preprocess_source.contains("prepare_statements_with_backend_to_plan")
             && preprocess_source.contains("prepare_statements_sync_to_plan"),
-        "preprocess should delegate statement preparation to the internal_state entrypoints"
+        "query_runtime preprocess should delegate statement preparation to the internal_state entrypoints"
     );
     assert!(
         internal_state_source.contains("bind_statements_with_appended_params_once"),
