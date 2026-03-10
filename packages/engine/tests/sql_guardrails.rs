@@ -264,6 +264,42 @@ fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_query_rewrite() {
 }
 
 #[test]
+fn guardrail_legacy_filesystem_step_wrapper_is_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root
+            .join("src/sql/planning/rewrite_engine/steps/filesystem_step.rs")
+            .exists(),
+        "legacy filesystem step wrapper must stay removed"
+    );
+
+    let canonical_source = fs::read_to_string(root.join(
+        "src/sql/planning/rewrite_engine/pipeline/rules/statement/canonical/filesystem_write.rs",
+    ))
+    .expect("filesystem_write.rs should be readable");
+
+    assert!(
+        !canonical_source.contains("filesystem_step::"),
+        "filesystem canonical write rule must call neutral filesystem runtime directly"
+    );
+}
+
+#[test]
+fn guardrail_vtable_read_stays_filesystem_blind() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vtable_read_source =
+        fs::read_to_string(root.join("src/sql/planning/rewrite_engine/steps/vtable_read.rs"))
+            .expect("vtable_read.rs should be readable");
+
+    for forbidden in ["lix_file", "lix_directory", "filesystem::"] {
+        assert!(
+            !vtable_read_source.contains(forbidden),
+            "vtable_read must not reintroduce public filesystem bridge logic: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn guardrail_runtime_source_forbids_crate_sql_imports() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
