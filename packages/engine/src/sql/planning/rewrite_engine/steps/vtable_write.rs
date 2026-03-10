@@ -1495,7 +1495,7 @@ fn advance_placeholder_state_for_expr(
             };
 
             if let Err(error) =
-                crate::engine::sql::planning::rewrite_engine::params::resolve_placeholder_index(
+                crate::engine::sql::ast::utils::resolve_placeholder_index(
                     token,
                     self.params_len,
                     self.state,

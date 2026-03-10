@@ -17,6 +17,10 @@ use sqlparser::parser::Parser;
 #[cfg(test)]
 use crate::backend::SqlDialect;
 #[cfg(test)]
+use crate::engine::sql::ast::utils::{
+    bind_sql_with_state_and_appended_params, PlaceholderState,
+};
+#[cfg(test)]
 use crate::engine::sql::ast::lowering::lower_statement;
 #[cfg(test)]
 use crate::engine::sql::planning::param_context::normalize_statement_placeholders_in_batch;
@@ -29,11 +33,9 @@ use crate::engine::sql::planning::rewrite_engine::types::{
     PostprocessPlan, PreparedStatement, PreprocessOutput, SchemaRegistration,
 };
 #[cfg(test)]
-use crate::engine::sql::planning::rewrite_engine::{
-    bind_sql_with_state_and_appended_params, rewrite_statement, PlaceholderState,
-};
-#[cfg(test)]
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+#[cfg(test)]
+use crate::engine::sql::planning::rewrite_engine::rewrite_statement;
 #[cfg(test)]
 use crate::LixError;
 #[cfg(test)]
