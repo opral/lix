@@ -1,8 +1,5 @@
-#[path = "steps/stored_schema.rs"]
 pub(crate) mod stored_schema;
-#[path = "steps/vtable_read.rs"]
 pub(crate) mod vtable_read;
-#[path = "steps/vtable_write.rs"]
 pub(crate) mod vtable_write;
 #[path = "canonical_write.rs"]
 mod canonical;

@@ -28,7 +28,9 @@ use super::bind_once::{bind_statements_with_appended_params_once, StatementWithA
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::materialize::materialize_vtable_insert_select_sources;
 use super::param_context::normalize_statement_placeholders_in_batch;
-use super::rewrite_engine::{rewrite_statement, rewrite_statement_with_backend, vtable_read, RewriteOutput};
+use super::internal_vtable::{
+    rewrite_statement, rewrite_statement_with_backend, vtable_read, RewriteOutput,
+};
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
@@ -575,7 +577,7 @@ fn render_statements_with_params(
     Ok((normalized_sql, prepared_statements))
 }
 
-fn from_rewrite_output(output: super::rewrite_engine::RewriteOutput) -> StatementRewriteOutput {
+fn from_rewrite_output(output: super::internal_vtable::RewriteOutput) -> StatementRewriteOutput {
     StatementRewriteOutput {
         statements: output.statements,
         params: output.params,

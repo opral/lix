@@ -4,7 +4,7 @@ use sqlparser::ast::{
     OnInsert, Statement, TableObject, Value, ValueWithSpan,
 };
 
-use crate::engine::sql::planning::rewrite_engine::{
+use crate::engine::sql::planning::internal_vtable::{
     object_name_matches, MutationOperation, MutationRow, ResolvedCell, RowSourceResolver,
     SchemaRegistration,
 };
