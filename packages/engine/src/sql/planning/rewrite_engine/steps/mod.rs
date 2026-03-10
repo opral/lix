@@ -8,7 +8,6 @@ pub mod lix_state_history_view_write;
 pub mod lix_state_view_write;
 pub mod lix_version_view_write;
 pub(crate) mod state_columns;
-pub(crate) mod state_pushdown;
 pub mod stored_schema;
 pub mod vtable_read;
 pub mod vtable_write;
