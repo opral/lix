@@ -1,9 +1,5 @@
 pub(crate) mod bind_once;
-pub(crate) mod dependency_spec;
-pub(crate) mod derive_effects;
-pub(crate) mod derive_requirements;
 pub(crate) mod inline_functions;
-pub(crate) mod invariants;
 pub(crate) mod lower_sql;
 pub(crate) mod param_context;
 pub(crate) mod parse;

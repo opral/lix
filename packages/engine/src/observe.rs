@@ -1,5 +1,5 @@
 use crate::engine::sql::ast::utils::parse_sql_statements;
-use crate::engine::sql::planning::dependency_spec::{
+use crate::query_runtime::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
 use crate::engine::Engine;
