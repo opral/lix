@@ -109,7 +109,6 @@ pub(crate) async fn preprocess_with_surfaces<P: LixFunctionProvider>(
     evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
-    active_version_id_hint: Option<&str>,
     functions: SharedFunctionProvider<P>,
     writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
@@ -122,7 +121,6 @@ where
         evaluator,
         statements,
         params,
-        active_version_id_hint,
         functions,
         writer_key,
     )

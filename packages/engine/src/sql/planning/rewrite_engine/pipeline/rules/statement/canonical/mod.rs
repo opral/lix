@@ -30,7 +30,6 @@ pub(crate) fn rewrite_sync_statement<P: LixFunctionProvider>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
-    _active_version_id_hint: Option<&str>,
     functions: &mut P,
 ) -> Result<Option<RewriteOutput>, LixError> {
     let mut context = StatementContext::new_sync(params, writer_key);
@@ -51,7 +50,6 @@ pub(crate) async fn rewrite_backend_statement<P>(
     statement: Statement,
     params: &[Value],
     writer_key: Option<&str>,
-    active_version_id_hint: Option<&str>,
     functions: &mut P,
 ) -> Result<Option<RewriteOutput>, LixError>
 where
@@ -83,7 +81,6 @@ where
                     backend,
                     params,
                     writer_key,
-                    active_version_id_hint,
                 );
                 let outcome = rewrite_backend_loop(statement, &mut context, functions).await?;
                 let side_effects = std::mem::take(&mut context.side_effects);
