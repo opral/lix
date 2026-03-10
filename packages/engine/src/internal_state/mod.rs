@@ -33,6 +33,11 @@ pub(crate) type PreparedStatement =
 pub(crate) use postprocess::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 
 #[derive(Debug, Clone)]
+pub(crate) struct InternalStatePlan {
+    pub(crate) postprocess: Option<PostprocessPlan>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct RewriteOutput {
     pub(crate) statements: Vec<Statement>,
     pub(crate) effect_only: bool,
@@ -48,7 +53,7 @@ pub(crate) struct PreprocessOutput {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) registrations: Vec<SchemaRegistration>,
-    pub(crate) postprocess: Option<PostprocessPlan>,
+    pub(crate) internal_state: Option<InternalStatePlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
 }
@@ -59,11 +64,19 @@ impl From<PreprocessOutput> for PlannedStatementSet {
             sql: output.sql,
             prepared_statements: output.prepared_statements,
             registrations: output.registrations,
-            postprocess: output.postprocess,
+            internal_state: output.internal_state,
             mutations: output.mutations,
             update_validations: output.update_validations,
         }
     }
+}
+
+pub(crate) fn internal_state_plan_from_postprocess(
+    postprocess: Option<PostprocessPlan>,
+) -> Option<InternalStatePlan> {
+    postprocess.map(|postprocess| InternalStatePlan {
+        postprocess: Some(postprocess),
+    })
 }
 
 pub(crate) fn parse_single_query(sql: &str) -> Result<sqlparser::ast::Query, LixError> {
@@ -118,6 +131,35 @@ pub(crate) fn statement_references_internal_state_vtable(statement: &Statement) 
 
 pub(crate) fn requires_single_statement_postprocess(plan: Option<&PostprocessPlan>) -> bool {
     matches!(plan, Some(PostprocessPlan::VtableDelete(_)))
+}
+
+pub(crate) fn requires_single_statement_internal_state_plan(
+    plan: Option<&InternalStatePlan>,
+) -> bool {
+    requires_single_statement_postprocess(plan.and_then(|plan| plan.postprocess.as_ref()))
+}
+
+pub(crate) fn validate_internal_state_plan(plan: Option<&InternalStatePlan>) -> Result<(), LixError> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    let Some(postprocess) = plan.postprocess.as_ref() else {
+        return Ok(());
+    };
+    let schema_key = match postprocess {
+        PostprocessPlan::VtableUpdate(update) => &update.schema_key,
+        PostprocessPlan::VtableDelete(delete) => &delete.schema_key,
+    };
+    if !schema_key.trim().is_empty()
+        && !schema_key.contains(char::is_whitespace)
+        && !schema_key.contains('\'')
+    {
+        return Ok(());
+    }
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "vtable postprocess plan requires a valid schema_key".to_string(),
+    })
 }
 
 fn collect_query_relation_names(query: &Query) -> BTreeSet<String> {

@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{LixError, Value};
 
-use crate::internal_state::PostprocessPlan;
+use crate::internal_state::InternalStatePlan;
 use super::prepared_statement::PreparedStatement;
 use sqlparser::ast::Expr;
 
@@ -44,7 +44,7 @@ pub(crate) struct PlannedStatementSet {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) registrations: Vec<SchemaRegistration>,
-    pub(crate) postprocess: Option<PostprocessPlan>,
+    pub(crate) internal_state: Option<InternalStatePlan>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
 }
