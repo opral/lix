@@ -21,6 +21,7 @@ pub fn sqlite_simulation() -> Simulation {
     }
 }
 
+#[allow(dead_code)]
 pub fn sqlite_backend_with_filename(filename: String) -> Box<dyn LixBackend + Send + Sync> {
     Box::new(SqliteBackend::new(SqliteConfig { filename }))
 }

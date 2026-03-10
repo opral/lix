@@ -150,12 +150,14 @@ pub fn postgres_simulation() -> Simulation {
     }
 }
 
+#[allow(dead_code)]
 pub fn postgres_backend_with_connection_string(
     connection_string: String,
 ) -> Box<dyn LixBackend + Send + Sync> {
     Box::new(PostgresBackend::new(PostgresConfig { connection_string }))
 }
 
+#[allow(dead_code)]
 pub async fn create_postgres_test_database_url(label: &str) -> Result<String, LixError> {
     let normalized_label = label
         .chars()
