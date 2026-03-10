@@ -1,7 +1,10 @@
+pub(crate) mod bind_once;
+pub(crate) mod inline_functions;
 pub(crate) mod stored_schema;
 pub(crate) mod vtable_read;
 pub(crate) mod vtable_write;
 pub(crate) mod materialize;
+pub(crate) mod param_context;
 pub(crate) mod script;
 #[path = "canonical_write.rs"]
 mod canonical;
@@ -34,11 +37,11 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::engine::sql::ast::lowering::lower_statement;
-use crate::engine::sql::planning::bind_once::{
+use crate::internal_state::bind_once::{
     bind_statements_with_appended_params_once, StatementWithAppendedParams,
 };
-use crate::engine::sql::planning::inline_functions::inline_lix_functions_with_provider;
-use crate::engine::sql::planning::param_context::normalize_statement_placeholders_in_batch;
+use crate::internal_state::inline_functions::inline_lix_functions_with_provider;
+use crate::internal_state::param_context::normalize_statement_placeholders_in_batch;
 
 pub(crate) use crate::engine::sql::ast::walk::object_name_matches;
 pub(crate) use crate::engine::sql::ast::utils::PlaceholderState;

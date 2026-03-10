@@ -4,5 +4,7 @@ pub(crate) mod derive_effects;
 pub(crate) mod derive_requirements;
 pub(crate) mod execute;
 pub(crate) mod invariants;
+pub(crate) mod lower_sql;
 pub(crate) mod plan;
+pub(crate) mod parse;
 pub(crate) mod preprocess;

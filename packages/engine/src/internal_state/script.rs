@@ -1,7 +1,7 @@
 use sqlparser::ast::{Expr, Insert, SetExpr, Statement, TableObject, Value as SqlAstValue};
 
 use crate::engine::sql::ast::walk::object_name_matches;
-use crate::engine::sql::planning::bind_once::bind_script_placeholders_once;
+use crate::internal_state::bind_once::bind_script_placeholders_once;
 use crate::{LixError, SqlDialect, Value};
 
 pub(crate) fn extract_explicit_transaction_script_from_statements(

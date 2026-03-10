@@ -7,7 +7,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
 
-use crate::engine::sql::planning::param_context::{
+use crate::internal_state::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, normalize_query_placeholders,
     PlaceholderOrdinalState,
 };

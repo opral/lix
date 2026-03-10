@@ -1,11 +1,9 @@
 use std::ops::ControlFlow;
 
+use crate::engine::sql::ast::walk::object_name_matches;
+use crate::functions::LixFunctionProvider;
 use sqlparser::ast::{Expr, Function, FunctionArguments, Statement, Value as SqlValue};
 use sqlparser::ast::{VisitMut, VisitorMut};
-
-use crate::functions::LixFunctionProvider;
-
-use super::super::ast::walk::object_name_matches;
 
 pub(crate) fn inline_lix_functions_with_provider<P: LixFunctionProvider>(
     mut statement: Statement,
