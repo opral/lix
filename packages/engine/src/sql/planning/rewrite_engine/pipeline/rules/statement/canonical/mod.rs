@@ -1,13 +1,15 @@
 use std::collections::VecDeque;
 
-use sqlparser::ast::{Delete, Statement, Update};
+use sqlparser::ast::{
+    Delete, FromTable, Insert, Statement, TableFactor, TableObject, TableWithJoins, Update,
+};
 
-use crate::engine::sql::planning::rewrite_engine::steps::lix_change_view_write;
-use crate::engine::sql::planning::rewrite_engine::steps::lix_state_history_view_write;
+use crate::engine::sql::planning::rewrite_engine::object_name_matches;
 use crate::engine::sql::planning::rewrite_engine::steps::stored_schema;
 use crate::engine::sql::planning::rewrite_engine::steps::vtable_write;
 use crate::engine::sql::planning::rewrite_engine::types::{PostprocessPlan, RewriteOutput};
 use crate::functions::LixFunctionProvider;
+use crate::errors;
 use crate::{LixBackend, LixError, Value};
 
 use super::context::StatementContext;
@@ -15,6 +17,101 @@ use super::helpers::merge_rewrite_output;
 use super::outcome::StatementRuleOutcome;
 
 const MAX_REWRITE_PASSES: usize = 32;
+const LIX_CHANGE_VIEW_NAME: &str = "lix_change";
+const LIX_STATE_HISTORY_VIEW_NAME: &str = "lix_state_history";
+const LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME: &str = "lix_state_history_by_version";
+
+fn reject_read_only_public_write(statement: &Statement) -> Result<(), LixError> {
+    match statement {
+        Statement::Insert(insert) => {
+            if table_object_is_read_only_public_surface(&insert.table) {
+                return Err(read_only_public_write_error(read_only_insert_target_name(insert), "INSERT"));
+            }
+        }
+        Statement::Update(update) => {
+            if table_with_joins_is_read_only_public_surface(&update.table) {
+                return Err(read_only_public_write_error(read_only_update_target_name(update), "UPDATE"));
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(surface_name) = read_only_delete_target_name(delete) {
+                return Err(read_only_public_write_error(surface_name, "DELETE"));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn read_only_public_write_error(surface_name: &str, operation: &str) -> LixError {
+    errors::read_only_view_write_error(surface_name, operation)
+}
+
+fn read_only_insert_target_name(insert: &Insert) -> &'static str {
+    match &insert.table {
+        TableObject::TableName(name) if object_name_matches(name, LIX_CHANGE_VIEW_NAME) => {
+            LIX_CHANGE_VIEW_NAME
+        }
+        TableObject::TableName(name)
+            if object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME)
+                || object_name_matches(name, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME) =>
+        {
+            LIX_STATE_HISTORY_VIEW_NAME
+        }
+        _ => LIX_CHANGE_VIEW_NAME,
+    }
+}
+
+fn read_only_update_target_name(update: &Update) -> &'static str {
+    if table_with_joins_matches(&update.table, LIX_CHANGE_VIEW_NAME) {
+        LIX_CHANGE_VIEW_NAME
+    } else {
+        LIX_STATE_HISTORY_VIEW_NAME
+    }
+}
+
+fn read_only_delete_target_name(delete: &Delete) -> Option<&'static str> {
+    match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+            for table in tables {
+                if table_with_joins_matches(table, LIX_CHANGE_VIEW_NAME) {
+                    return Some(LIX_CHANGE_VIEW_NAME);
+                }
+                if table_with_joins_matches(table, LIX_STATE_HISTORY_VIEW_NAME)
+                    || table_with_joins_matches(table, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME)
+                {
+                    return Some(LIX_STATE_HISTORY_VIEW_NAME);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn table_object_is_read_only_public_surface(table: &TableObject) -> bool {
+    match table {
+        TableObject::TableName(name) => {
+            object_name_matches(name, LIX_CHANGE_VIEW_NAME)
+                || object_name_matches(name, LIX_STATE_HISTORY_VIEW_NAME)
+                || object_name_matches(name, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME)
+        }
+        _ => false,
+    }
+}
+
+fn table_with_joins_is_read_only_public_surface(table: &TableWithJoins) -> bool {
+    table_with_joins_matches(table, LIX_CHANGE_VIEW_NAME)
+        || table_with_joins_matches(table, LIX_STATE_HISTORY_VIEW_NAME)
+        || table_with_joins_matches(table, LIX_STATE_HISTORY_BY_VERSION_VIEW_NAME)
+}
+
+fn table_with_joins_matches(table: &TableWithJoins, surface_name: &str) -> bool {
+    table.joins.is_empty()
+        && matches!(
+            &table.relation,
+            TableFactor::Table { name, .. } if object_name_matches(name, surface_name)
+        )
+}
 
 fn rewrite_vtable_update_output(
     update: Update,
@@ -225,8 +322,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
     for _ in 0..MAX_REWRITE_PASSES {
         match current {
             Statement::Insert(insert) => {
-                lix_change_view_write::reject_insert(&insert)?;
-                lix_state_history_view_write::reject_insert(&insert)?;
+                reject_read_only_public_write(&Statement::Insert(insert.clone()))?;
 
                 let mut current_insert = insert;
                 let mut supplemental_statements = Vec::new();
@@ -274,8 +370,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }
             Statement::Update(update) => {
-                lix_change_view_write::reject_update(&update)?;
-                lix_state_history_view_write::reject_update(&update)?;
+                reject_read_only_public_write(&Statement::Update(update.clone()))?;
 
                 let output = rewrite_vtable_update_output(
                     update.clone(),
@@ -284,8 +379,7 @@ fn rewrite_sync_loop<P: LixFunctionProvider>(
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
-                lix_change_view_write::reject_delete(&delete)?;
-                lix_state_history_view_write::reject_delete(&delete)?;
+                reject_read_only_public_write(&Statement::Delete(delete.clone()))?;
 
                 let output =
                     rewrite_vtable_delete_output(delete, false, context.params)?;
@@ -335,8 +429,7 @@ where
     for _ in 0..MAX_REWRITE_PASSES {
         match current {
             Statement::Insert(insert) => {
-                lix_change_view_write::reject_insert(&insert)?;
-                lix_state_history_view_write::reject_insert(&insert)?;
+                reject_read_only_public_write(&Statement::Insert(insert.clone()))?;
                 let mut current_insert = insert;
                 let mut supplemental_statements = Vec::new();
                 if let Some(rewritten) =
@@ -395,8 +488,7 @@ where
                 return Ok(StatementRuleOutcome::Emit(context.take_output(statements)));
             }
             Statement::Update(update) => {
-                lix_change_view_write::reject_update(&update)?;
-                lix_state_history_view_write::reject_update(&update)?;
+                reject_read_only_public_write(&Statement::Update(update.clone()))?;
 
                 let output = rewrite_vtable_update_output(
                     update.clone(),
@@ -405,8 +497,7 @@ where
                 return Ok(StatementRuleOutcome::Emit(output));
             }
             Statement::Delete(delete) => {
-                lix_change_view_write::reject_delete(&delete)?;
-                lix_state_history_view_write::reject_delete(&delete)?;
+                reject_read_only_public_write(&Statement::Delete(delete.clone()))?;
 
                 let output =
                     rewrite_vtable_delete_output(delete, false, context.params)?;
