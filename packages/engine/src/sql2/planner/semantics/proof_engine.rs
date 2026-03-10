@@ -64,7 +64,7 @@ fn prove_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, ProofEr
             let Some(version_id) = write_text_value(canonicalized, "version_id") else {
                 return Err(ProofError {
                     message: format!(
-                        "sql2 write proof requires explicit version_id for '{}'",
+                        "sql2 write proof requires version_id for '{}'",
                         canonicalized.surface_binding.descriptor.public_name
                     ),
                 });

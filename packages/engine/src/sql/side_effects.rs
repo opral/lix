@@ -13,48 +13,6 @@ const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 
-pub(crate) struct FilesystemUpdateDomainChangeCollection {
-    pub(crate) untracked_changes: Vec<DetectedFileDomainChange>,
-    pub(crate) tracked_changes_by_statement: Vec<Vec<DetectedFileDomainChange>>,
-}
-
-pub(crate) async fn collect_filesystem_update_detected_file_domain_changes_from_statements(
-    backend: &dyn LixBackend,
-    statements: &[Statement],
-    params: &[Value],
-) -> Result<FilesystemUpdateDomainChangeCollection, LixError> {
-    let mut placeholder_state = PlaceholderState::new();
-    let mut tracked_changes_by_statement = Vec::with_capacity(statements.len());
-    let mut untracked_changes = Vec::new();
-    for statement in statements {
-        match statement {
-            Statement::Update(update) => {
-                let side_effects =
-                    crate::filesystem::mutation_rewrite::update_side_effects_with_backend(
-                        backend,
-                        &update,
-                        params,
-                        &mut placeholder_state,
-                    )
-                    .await?;
-                let statement_tracked_changes =
-                    dedupe_detected_file_domain_changes(&side_effects.tracked_directory_changes);
-                tracked_changes_by_statement.push(statement_tracked_changes);
-                untracked_changes.extend(side_effects.untracked_directory_changes);
-            }
-            other => {
-                tracked_changes_by_statement.push(Vec::new());
-                advance_placeholder_state_for_statement(&other, params, &mut placeholder_state)?;
-            }
-        }
-    }
-
-    Ok(FilesystemUpdateDomainChangeCollection {
-        untracked_changes: dedupe_detected_file_domain_changes(&untracked_changes),
-        tracked_changes_by_statement,
-    })
-}
-
 pub(crate) fn advance_placeholder_state_for_statement(
     statement: &Statement,
     params: &[Value],
@@ -80,7 +38,7 @@ async fn resolve_pending_write_file_id_with_backend(
     else {
         return Ok(write.file_id.clone());
     };
-    let resolved = crate::filesystem::mutation_rewrite::resolve_file_id_by_path_in_version(
+    let resolved = crate::filesystem::live_projection::resolve_file_id_by_path_in_version(
         backend,
         &write.version_id,
         path,
@@ -107,7 +65,7 @@ async fn resolve_pending_write_file_id_in_transaction(
     };
     let resolved = {
         let backend = TransactionBackendAdapter::new(transaction);
-        crate::filesystem::mutation_rewrite::resolve_file_id_by_path_in_version(
+        crate::filesystem::live_projection::resolve_file_id_by_path_in_version(
             &backend,
             &write.version_id,
             path,
@@ -202,7 +160,6 @@ impl Engine {
         params: &[Value],
         active_version_id: &str,
         writer_key: Option<&str>,
-        skip_legacy_filesystem_update_side_effect_detection: bool,
     ) -> Result<CollectedExecutionSideEffects, LixError> {
         let pending_file_write_collection =
             crate::filesystem::pending_file_writes::collect_pending_file_writes_from_statements(
@@ -242,27 +199,7 @@ impl Engine {
         let mut detected_file_domain_changes_by_statement =
             vec![Vec::new(); pending_file_writes_by_statement.len()];
 
-        let filesystem_update_domain_changes =
-            if skip_legacy_filesystem_update_side_effect_detection {
-                FilesystemUpdateDomainChangeCollection {
-                    untracked_changes: Vec::new(),
-                    tracked_changes_by_statement: vec![Vec::new(); statements.len()],
-                }
-            } else {
-                collect_filesystem_update_detected_file_domain_changes_from_statements(
-                    backend, statements, params,
-                )
-                .await
-                .map_err(|error| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "filesystem update side-effect detection failed: {}",
-                        error.description
-                    ),
-                })?
-            };
-        let filesystem_update_tracked_changes_by_statement = filesystem_update_domain_changes
-            .tracked_changes_by_statement
+        let filesystem_update_tracked_changes_by_statement = vec![Vec::new(); statements.len()]
             .iter()
             .map(|changes| detected_file_domain_changes_with_writer_key(changes, writer_key))
             .collect::<Vec<_>>();
@@ -285,11 +222,9 @@ impl Engine {
             .collect::<Vec<_>>();
         detected_file_domain_changes =
             dedupe_detected_file_domain_changes(&detected_file_domain_changes);
-        let untracked_filesystem_update_domain_changes =
-            dedupe_detected_file_domain_changes(&detected_file_domain_changes_with_writer_key(
-                &filesystem_update_domain_changes.untracked_changes,
-                writer_key,
-            ));
+        let untracked_filesystem_update_domain_changes = dedupe_detected_file_domain_changes(
+            &detected_file_domain_changes_with_writer_key(&[], writer_key),
+        );
 
         Ok(CollectedExecutionSideEffects {
             pending_file_writes,

@@ -185,6 +185,7 @@ fn canonicalize_insert_write(
     registry: &SurfaceRegistry,
 ) -> Result<CanonicalizedWrite, CanonicalizeError> {
     let surface_binding = bind_insert_surface(insert, registry)?;
+    reject_filesystem_history_write(&surface_binding, "INSERT")?;
     validate_semantic_write_surface(&surface_binding, insert_write_surface_supported)?;
     if !insert.assignments.is_empty() || insert.on.is_some() || insert.returning.is_some() {
         return Err(CanonicalizeError::unsupported(
@@ -224,6 +225,7 @@ fn canonicalize_update_write(
         ));
     }
     let surface_binding = bind_update_surface(update, registry)?;
+    reject_filesystem_history_write(&surface_binding, "UPDATE")?;
     validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
     let mut placeholder_state = PlaceholderState::new();
     let payload = assignment_payload(
@@ -281,6 +283,7 @@ fn canonicalize_delete_write(
         ));
     }
     let surface_binding = bind_delete_surface(delete, registry)?;
+    reject_filesystem_history_write(&surface_binding, "DELETE")?;
     validate_semantic_write_surface(&surface_binding, update_delete_surface_supported)?;
     let mut placeholder_state = PlaceholderState::new();
     let selector = match delete.selection.as_ref() {
@@ -501,6 +504,23 @@ fn validate_semantic_write_surface(
     Ok(())
 }
 
+fn reject_filesystem_history_write(
+    surface_binding: &SurfaceBinding,
+    operation: &str,
+) -> Result<(), CanonicalizeError> {
+    if surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
+        && surface_binding.descriptor.surface_variant
+            == crate::sql2::catalog::SurfaceVariant::History
+    {
+        return Err(CanonicalizeError::unsupported(format!(
+            "{} does not support {operation}",
+            surface_binding.descriptor.public_name
+        )));
+    }
+
+    Ok(())
+}
+
 fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
     matches!(
         surface_binding.descriptor.surface_family,
@@ -568,8 +588,12 @@ fn insert_payload(
     let mut payload = BTreeMap::new();
     for (column, expr) in insert.columns.iter().zip(row.iter()) {
         reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
-        let value = expr_to_value(expr, params, &mut placeholder_state)?;
         let key = canonical_write_column_key(surface_binding, &column.value)?;
+        let value = match expr_to_value(expr, params, &mut placeholder_state) {
+            Ok(value) => value,
+            Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
+            Err(error) => return Err(error),
+        };
         payload.insert(key, value);
     }
     Ok(payload)
@@ -606,7 +630,11 @@ fn assignment_payload(
             })?;
         reject_forbidden_default_state_write_column(surface_binding, &raw_key, "update")?;
         let key = canonical_write_column_key(surface_binding, &raw_key)?;
-        let value = expr_to_value(&assignment.value, params, placeholder_state)?;
+        let value = match expr_to_value(&assignment.value, params, placeholder_state) {
+            Ok(value) => value,
+            Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
+            Err(error) => return Err(error),
+        };
         payload.insert(key, value);
     }
     Ok(payload)
@@ -619,6 +647,7 @@ fn write_selector(
     placeholder_state: &mut PlaceholderState,
 ) -> Result<WriteSelector, CanonicalizeError> {
     reject_forbidden_default_state_selector(surface_binding, expr)?;
+    reject_unknown_selector_columns(surface_binding, expr)?;
     let mut exact_filters = BTreeMap::new();
     let exact_only = collect_exact_selector_filters(
         surface_binding,
@@ -695,6 +724,35 @@ fn collect_exact_selector_filters(
                 }
             }
         }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if list.len() != 1 {
+                return false;
+            }
+            let Some(raw_column) = selector_column_name(expr) else {
+                return false;
+            };
+            let Ok(column) = canonical_write_column_key(surface_binding, &raw_column) else {
+                return false;
+            };
+            if !selector_column_is_supported(surface_binding, &column) {
+                return false;
+            }
+            let Ok(value) = expr_to_value(&list[0], params, placeholder_state) else {
+                return false;
+            };
+            match exact_filters.get(&column) {
+                Some(existing) if existing != &value => false,
+                Some(_) => true,
+                None => {
+                    exact_filters.insert(column, value);
+                    true
+                }
+            }
+        }
         Expr::Nested(inner) => collect_exact_selector_filters(
             surface_binding,
             inner,
@@ -715,6 +773,50 @@ fn selector_column_name(expr: &Expr) -> Option<String> {
         Expr::Nested(inner) => selector_column_name(inner),
         _ => None,
     }
+}
+
+fn reject_unknown_selector_columns(
+    surface_binding: &SurfaceBinding,
+    expr: &Expr,
+) -> Result<(), CanonicalizeError> {
+    if let Some(raw_column) = selector_column_name(expr) {
+        match canonical_write_column_key(surface_binding, &raw_column) {
+            Ok(column) if selector_column_is_supported(surface_binding, &column) => {}
+            Ok(_) | Err(_) => return Err(unknown_write_column_error(surface_binding, &raw_column)),
+        }
+    }
+
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            reject_unknown_selector_columns(surface_binding, left)?;
+            reject_unknown_selector_columns(surface_binding, right)?;
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => reject_unknown_selector_columns(surface_binding, expr)?,
+        Expr::InList { expr, list, .. } => {
+            reject_unknown_selector_columns(surface_binding, expr)?;
+            for item in list {
+                reject_unknown_selector_columns(surface_binding, item)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            reject_unknown_selector_columns(surface_binding, expr)?;
+            reject_unknown_selector_columns(surface_binding, low)?;
+            reject_unknown_selector_columns(surface_binding, high)?;
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            reject_unknown_selector_columns(surface_binding, expr)?;
+            reject_unknown_selector_columns(surface_binding, pattern)?;
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn reject_forbidden_default_state_write_column(
@@ -926,18 +1028,12 @@ fn canonical_write_column_key(
                 "id" | "path" | "hidden" | "version_id" | "untracked" | "metadata" | "data" => {
                     Ok(canonical.clone())
                 }
-                _ => Err(CanonicalizeError::unsupported(format!(
-                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                ))),
+                _ => Err(unknown_write_column_error(surface_binding, raw_column)),
             },
             "lix_directory" | "lix_directory_by_version" => match canonical.as_str() {
                 "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
                 | "metadata" => Ok(canonical.clone()),
-                _ => Err(CanonicalizeError::unsupported(format!(
-                    "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                ))),
+                _ => Err(unknown_write_column_error(surface_binding, raw_column)),
             },
             _ => Err(CanonicalizeError::unsupported(format!(
                 "sql2 write canonicalizer does not yet support '{}' writes",
@@ -949,6 +1045,28 @@ fn canonical_write_column_key(
             surface_binding.descriptor.public_name
         ))),
     }
+}
+
+fn unknown_write_column_error(
+    surface_binding: &SurfaceBinding,
+    raw_column: &str,
+) -> CanonicalizeError {
+    match surface_binding.descriptor.surface_family {
+        SurfaceFamily::Filesystem => CanonicalizeError::unsupported(format!(
+            "strict rewrite violation: unknown column '{raw_column}' on '{}'",
+            surface_binding.descriptor.public_name
+        )),
+        _ => CanonicalizeError::unsupported(format!(
+            "sql2 write canonicalizer does not support column '{raw_column}' on '{}'",
+            surface_binding.descriptor.public_name
+        )),
+    }
+}
+
+fn filesystem_file_data_error(_error: CanonicalizeError) -> CanonicalizeError {
+    CanonicalizeError::unsupported(
+        "data expects bytes; use lix_text_encode('...') for text, X'HEX', or a blob parameter",
+    )
 }
 
 fn expr_to_value(
@@ -1526,6 +1644,30 @@ mod tests {
             ),
             "expected full snapshot payload, got: {:?}",
             canonicalized.write_command.payload
+        );
+    }
+
+    #[test]
+    fn canonicalizes_singleton_in_selector_as_exact_filesystem_delete() {
+        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let canonicalized = canonicalize_write(
+            bound_statement("DELETE FROM lix_file WHERE id IN ('file-1')"),
+            &registry,
+        )
+        .expect("singleton IN delete should canonicalize");
+
+        assert_eq!(
+            canonicalized.write_command.operation_kind,
+            WriteOperationKind::Delete
+        );
+        assert!(canonicalized.write_command.selector.exact_only);
+        assert_eq!(
+            canonicalized
+                .write_command
+                .selector
+                .exact_filters
+                .get("id"),
+            Some(&Value::Text("file-1".to_string()))
         );
     }
 }

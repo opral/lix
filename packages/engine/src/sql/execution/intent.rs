@@ -9,7 +9,6 @@ use sqlparser::ast::Statement;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IntentCollectionPolicy {
     pub(crate) skip_side_effect_collection: bool,
-    pub(crate) skip_legacy_filesystem_update_side_effect_detection: bool,
 }
 
 pub(crate) struct ExecutionIntent {
@@ -52,7 +51,6 @@ pub(crate) async fn collect_execution_intent_with_backend(
                 params,
                 active_version_id,
                 writer_key,
-                policy.skip_legacy_filesystem_update_side_effect_detection,
             )
             .await?
     };
