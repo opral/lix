@@ -218,7 +218,7 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
             "crate::engine::sql::ast::utils",
             "crate::sql::ast::utils",
             "crate::engine::sql::execution::followup",
-            "crate::engine::sql::surfaces::registry",
+            "crate::engine::sql::surfaces",
             "rewrite_engine",
             "classify_statement(",
             "preprocess_with_surfaces_to_plan(",
@@ -233,18 +233,11 @@ fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_mod
 }
 
 #[test]
-fn guardrail_filesystem_public_surfaces_do_not_enter_legacy_surface_classifier() {
+fn guardrail_legacy_surface_registry_directory_is_removed() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let registry_source = fs::read_to_string(root.join("src/sql/surfaces/registry.rs"))
-        .expect("registry.rs should be readable");
-
     assert!(
-        !registry_source.contains("filesystem::planner::matches(statement)"),
-        "filesystem public surfaces must not re-enter the legacy surface classifier"
-    );
-    assert!(
-        !registry_source.contains("filesystem::lower::lowering_kind(statement)"),
-        "filesystem public surfaces must not re-enter legacy filesystem lowering coverage"
+        !root.join("src/sql/surfaces").exists(),
+        "legacy sql/surfaces directory must stay removed"
     );
 }
 

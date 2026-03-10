@@ -1,7 +1,8 @@
 use super::super::contracts::execution_plan::ExecutionPlan;
+use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::planner_error::PlannerError;
 use super::super::contracts::result_contract::ResultContract;
-use super::super::vtable::registry::validate_postprocess_plan;
+use crate::LixError;
 
 pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), PlannerError> {
     if plan.preprocess.prepared_statements.is_empty() && !allows_effect_only_execution(plan) {
@@ -50,6 +51,26 @@ pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), Planne
         ));
     }
     Ok(())
+}
+
+fn validate_postprocess_plan(plan: &PostprocessPlan) -> Result<(), LixError> {
+    let schema_key = match plan {
+        PostprocessPlan::VtableUpdate(update) => &update.schema_key,
+        PostprocessPlan::VtableDelete(delete) => &delete.schema_key,
+    };
+    if schema_key_is_valid(schema_key) {
+        return Ok(());
+    }
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "vtable postprocess plan requires a valid schema_key".to_string(),
+    })
+}
+
+fn schema_key_is_valid(schema_key: &str) -> bool {
+    !schema_key.trim().is_empty()
+        && !schema_key.contains(char::is_whitespace)
+        && !schema_key.contains('\'')
 }
 
 fn allows_effect_only_execution(plan: &ExecutionPlan) -> bool {
