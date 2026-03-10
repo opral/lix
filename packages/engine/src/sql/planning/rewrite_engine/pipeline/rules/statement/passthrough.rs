@@ -1,6 +1,6 @@
 use sqlparser::ast::Statement;
 
-use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
+use crate::engine::sql::planning::rewrite_engine::RewriteOutput;
 
 pub(crate) fn apply(statement: Statement) -> RewriteOutput {
     RewriteOutput {

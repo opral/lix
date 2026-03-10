@@ -1,4 +1,4 @@
-use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
+use crate::engine::sql::planning::rewrite_engine::RewriteOutput;
 use crate::LixError;
 
 pub(crate) fn merge_rewrite_output(
