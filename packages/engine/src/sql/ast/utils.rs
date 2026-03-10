@@ -24,6 +24,64 @@ pub(crate) struct ResolvedCell {
     pub(crate) placeholder_index: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedInsertRowSource {
+    pub(crate) rows: Vec<Vec<Expr>>,
+    pub(crate) resolved_rows: Vec<Vec<ResolvedCell>>,
+    pub(crate) values_layout: InsertValuesLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InsertValuesLayout {
+    pub(crate) explicit_row: bool,
+    pub(crate) value_keyword: bool,
+}
+
+pub(crate) struct RowSourceResolver<'a> {
+    params: &'a [Value],
+}
+
+impl<'a> RowSourceResolver<'a> {
+    pub(crate) fn new(params: &'a [Value]) -> Self {
+        Self { params }
+    }
+
+    pub(crate) fn resolve_insert(
+        &self,
+        insert: &Insert,
+    ) -> Result<Option<ResolvedInsertRowSource>, LixError> {
+        let Some(source) = &insert.source else {
+            return Ok(None);
+        };
+        let SetExpr::Values(values) = source.body.as_ref() else {
+            return Ok(None);
+        };
+
+        let rows = values.rows.clone();
+        let resolved_rows = resolve_values_rows(&rows, self.params)?;
+
+        Ok(Some(ResolvedInsertRowSource {
+            rows,
+            resolved_rows,
+            values_layout: InsertValuesLayout {
+                explicit_row: values.explicit_row,
+                value_keyword: values.value_keyword,
+            },
+        }))
+    }
+
+    pub(crate) fn resolve_insert_required(
+        &self,
+        insert: &Insert,
+        operation: &str,
+    ) -> Result<ResolvedInsertRowSource, LixError> {
+        self.resolve_insert(insert)?.ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("{operation} requires VALUES rows"),
+        })
+    }
+}
+
 pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),

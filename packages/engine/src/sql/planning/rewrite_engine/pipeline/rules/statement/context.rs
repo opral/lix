@@ -1,6 +1,6 @@
 use sqlparser::ast::Statement;
 
-use crate::engine::sql::planning::rewrite_engine::types::{
+use crate::engine::sql::planning::rewrite_engine::{
     MutationRow, PostprocessPlan, RewriteOutput, SchemaRegistration, UpdateValidationPlan,
 };
 use crate::{LixBackend, Value};

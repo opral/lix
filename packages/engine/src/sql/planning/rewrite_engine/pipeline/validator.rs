@@ -1,5 +1,4 @@
-use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
-use crate::engine::sql::planning::rewrite_engine::PostprocessPlan;
+use crate::engine::sql::planning::rewrite_engine::{PostprocessPlan, RewriteOutput};
 use crate::LixError;
 
 pub(crate) fn validate_statement_output(output: &RewriteOutput) -> Result<(), LixError> {
@@ -87,7 +86,7 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
-    use crate::engine::sql::planning::rewrite_engine::types::{
+    use crate::engine::sql::planning::rewrite_engine::{
         PostprocessPlan, RewriteOutput, VtableDeletePlan, VtableUpdatePlan,
     };
 
@@ -120,8 +119,8 @@ mod tests {
                 effective_scope_selection_sql: None,
                 effective_scope_untracked_selection_sql: None,
             })),
-            mutations: vec![crate::engine::sql::planning::rewrite_engine::types::MutationRow {
-                operation: crate::engine::sql::planning::rewrite_engine::types::MutationOperation::Insert,
+            mutations: vec![crate::engine::sql::planning::rewrite_engine::MutationRow {
+                operation: crate::engine::sql::planning::rewrite_engine::MutationOperation::Insert,
                 entity_id: "e".to_string(),
                 schema_key: "s".to_string(),
                 schema_version: "1".to_string(),
@@ -149,7 +148,7 @@ mod tests {
             postprocess: None,
             mutations: Vec::new(),
             update_validations: vec![
-                crate::engine::sql::planning::rewrite_engine::types::UpdateValidationPlan {
+                crate::engine::sql::planning::rewrite_engine::UpdateValidationPlan {
                     table: "t".to_string(),
                     where_clause: None,
                     snapshot_content: None,
@@ -175,7 +174,7 @@ mod tests {
             postprocess: None,
             mutations: Vec::new(),
             update_validations: vec![
-                crate::engine::sql::planning::rewrite_engine::types::UpdateValidationPlan {
+                crate::engine::sql::planning::rewrite_engine::UpdateValidationPlan {
                     table: "t".to_string(),
                     where_clause: None,
                     snapshot_content: None,

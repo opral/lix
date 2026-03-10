@@ -19,13 +19,10 @@ use crate::engine::sql::history::commit_runtime::{
 use crate::engine::sql::planning::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, match_bool_column_equality,
 };
-use crate::engine::sql::planning::rewrite_engine::types::{
-    MutationOperation, MutationRow, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
-};
-use crate::engine::sql::planning::rewrite_engine::SchemaRegistration;
 use crate::engine::sql::planning::rewrite_engine::{
     object_name_matches, parse_single_query, quote_ident, resolve_expr_cell_with_state,
-    PlaceholderState, ResolvedCell, RowSourceResolver,
+    MutationOperation, MutationRow, PlaceholderState, ResolvedCell, RowSourceResolver,
+    SchemaRegistration, UpdateValidationPlan, VtableDeletePlan, VtableUpdatePlan,
 };
 use crate::errors;
 use crate::functions::LixFunctionProvider;
