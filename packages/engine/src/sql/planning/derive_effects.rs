@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
-use super::super::contracts::effects::PlanEffects;
-use super::super::contracts::planned_statement::PlannedStatementSet;
-use super::super::contracts::planner_error::PlannerError;
+use crate::query_runtime::contracts::effects::PlanEffects;
+use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
+use crate::query_runtime::contracts::planner_error::PlannerError;
 use super::super::semantics::state_resolution::effects::derive_effects_from_state_resolution;
 
 pub(crate) fn derive_plan_effects(

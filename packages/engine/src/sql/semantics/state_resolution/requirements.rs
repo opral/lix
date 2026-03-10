@@ -1,4 +1,4 @@
-use super::super::super::contracts::requirements::PlanRequirements;
+use crate::query_runtime::contracts::requirements::PlanRequirements;
 use sqlparser::ast::Statement;
 
 use super::canonical::canonicalize_state_resolution;

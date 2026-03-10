@@ -15,7 +15,7 @@ use crate::account::{
 };
 use crate::functions::LixFunctionProvider;
 
-use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
+use crate::query_runtime::contracts::prepared_statement::PreparedStatement;
 use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect, Value as EngineValue};

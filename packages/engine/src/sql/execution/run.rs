@@ -7,13 +7,13 @@ use crate::schema_registry::register_schema_sql_statements;
 use crate::state_commit_stream::StateCommitStreamChange;
 use crate::{Engine, LixError, LixTransaction, QueryResult};
 
-use super::super::contracts::effects::PlanEffects;
-use super::super::contracts::execution_plan::ExecutionPlan;
-use super::super::contracts::executor_error::ExecutorError;
+use crate::query_runtime::contracts::effects::PlanEffects;
+use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
+use crate::query_runtime::contracts::executor_error::ExecutorError;
 use crate::internal_state::followup::{
     execute_internal_state_plan_with_backend, execute_internal_state_plan_with_transaction,
 };
-use super::super::contracts::result_contract::ResultContract;
+use crate::query_runtime::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
 
 pub(crate) struct SqlExecutionOutcome {

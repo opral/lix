@@ -1,12 +1,19 @@
-use super::super::*;
-use super::execution::execute_prepared::execute_prepared_with_transaction;
-use super::history::plugin_inputs as history_plugin_inputs;
-use super::planning::preprocess::preprocess_sql_to_plan;
-use super::storage::queries::{
+use super::{
+    collapse_pending_file_writes_for_transaction, dedupe_filesystem_payload_domain_changes,
+    should_run_binary_cas_gc, CollectedExecutionSideEffects, DeferredTransactionSideEffects,
+    Engine, TransactionBackendAdapter,
+};
+use crate::engine::sql::execution::execute_prepared::execute_prepared_with_transaction;
+use crate::engine::sql::history::plugin_inputs as history_plugin_inputs;
+use crate::engine::sql::planning::preprocess::preprocess_sql_to_plan;
+use crate::engine::sql::storage::queries::{
     filesystem as filesystem_queries, history as history_queries, state as state_queries,
 };
-use super::storage::tables;
-use crate::SqlDialect;
+use crate::engine::sql::storage::tables;
+use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
+use crate::{ExecuteOptions, LixBackend, LixError, LixTransaction, QueryResult, SqlDialect, Value};
+use sqlparser::ast::Statement;
+use std::collections::{BTreeMap, BTreeSet};
 
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";

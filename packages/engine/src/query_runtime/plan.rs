@@ -1,19 +1,19 @@
-use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql_shared::dependency_spec::DependencySpec;
-use crate::LixBackend;
-use crate::Value;
 use std::collections::BTreeSet;
 
-use super::super::contracts::execution_plan::ExecutionPlan;
-use super::super::contracts::planner_error::PlannerError;
-use super::super::contracts::result_contract::ResultContract;
-use super::preprocess::preprocess_with_surfaces_to_plan;
-use super::dependency_spec::derive_dependency_spec_from_statements;
-use super::derive_effects::derive_plan_effects;
-use super::derive_requirements::derive_plan_requirements;
-use super::invariants::validate_execution_plan;
+use crate::cel::CelEvaluator;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::query_runtime::contracts::dependency_spec::DependencySpec;
+use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
+use crate::query_runtime::contracts::planner_error::PlannerError;
+use crate::query_runtime::contracts::result_contract::ResultContract;
+use crate::{LixBackend, Value};
 use sqlparser::ast::Statement;
+
+use crate::engine::sql::planning::dependency_spec::derive_dependency_spec_from_statements;
+use crate::engine::sql::planning::derive_effects::derive_plan_effects;
+use crate::engine::sql::planning::derive_requirements::derive_plan_requirements;
+use crate::engine::sql::planning::invariants::validate_execution_plan;
+use crate::engine::sql::planning::preprocess::preprocess_with_surfaces_to_plan;
 
 pub(crate) async fn build_execution_plan<P>(
     backend: &dyn LixBackend,

@@ -8,7 +8,7 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use super::super::ast::utils::{bind_sql_with_state, parse_sql_statements, PlaceholderState};
-use super::super::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
+use crate::query_runtime::contracts::dependency_spec::{DependencyPrecision, DependencySpec};
 use crate::state_commit_stream::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};
 
@@ -445,7 +445,7 @@ mod tests {
         dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
         parse_sql_statements,
     };
-    use crate::engine::sql::contracts::dependency_spec::DependencyPrecision;
+    use crate::query_runtime::contracts::dependency_spec::DependencyPrecision;
     use crate::Value;
 
     #[test]

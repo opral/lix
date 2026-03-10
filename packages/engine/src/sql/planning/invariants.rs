@@ -1,9 +1,9 @@
-use super::super::contracts::execution_plan::ExecutionPlan;
+use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
 use crate::internal_state::{
     requires_single_statement_internal_state_plan, validate_internal_state_plan,
 };
-use super::super::contracts::planner_error::PlannerError;
-use super::super::contracts::result_contract::ResultContract;
+use crate::query_runtime::contracts::planner_error::PlannerError;
+use crate::query_runtime::contracts::result_contract::ResultContract;
 
 pub(crate) fn validate_execution_plan(plan: &ExecutionPlan) -> Result<(), PlannerError> {
     if plan.preprocess.prepared_statements.is_empty() && !allows_effect_only_execution(plan) {
