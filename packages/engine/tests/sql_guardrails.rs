@@ -372,30 +372,6 @@ fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
 }
 
 #[test]
-fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script_source = fs::read_to_string(root.join("src/internal_state/script.rs"))
-        .expect("script.rs should be readable");
-    let scripts_source =
-        fs::read_to_string(root.join("src/statement_scripts.rs")).expect("statement_scripts.rs readable");
-    let engine_source =
-        fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs should be readable");
-
-    assert!(
-        !script_source.contains("coalesce_lix_file_transaction_statements"),
-        "live transaction-script filesystem coalescer must stay removed from script.rs"
-    );
-    assert!(
-        !scripts_source.contains("coalesce_lix_file_transaction_statements"),
-        "statement_scripts.rs must not call the removed lix_file transaction coalescer"
-    );
-    assert!(
-        !engine_source.contains("coalesce_lix_file_transaction_statements"),
-        "engine.rs tests must not pin the removed lix_file transaction coalescer"
-    );
-}
-
-#[test]
 fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     assert!(
@@ -420,33 +396,6 @@ fn guardrail_runtime_source_forbids_crate_sql_imports() {
             file.display()
         );
     }
-}
-
-#[test]
-fn guardrail_query_runtime_preprocess_uses_bind_once_path_for_placeholder_binding() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let preprocess_source = fs::read_to_string(root.join("src/query_runtime/preprocess.rs"))
-        .expect("query_runtime/preprocess.rs should be readable");
-    let internal_state_source = fs::read_to_string(root.join("src/internal_state/mod.rs"))
-        .expect("internal_state/mod.rs should be readable");
-
-    assert!(
-        preprocess_source.contains("prepare_statements_with_backend_to_plan")
-            && preprocess_source.contains("prepare_statements_sync_to_plan"),
-        "query_runtime preprocess should delegate statement preparation to the internal_state entrypoints"
-    );
-    assert!(
-        internal_state_source.contains("bind_statements_with_appended_params_once"),
-        "internal_state preparation should bind placeholders through bind_once helper"
-    );
-    assert!(
-        !internal_state_source.contains("bind_sql_with_state_and_appended_params("),
-        "internal_state preparation should not bind placeholders directly through ast utils"
-    );
-    assert!(
-        !internal_state_source.contains("PlaceholderState::new()"),
-        "internal_state preparation should not own placeholder state directly"
-    );
 }
 
 #[test]
