@@ -76,7 +76,6 @@ impl Engine {
             let CollectedExecutionSideEffects {
                 pending_file_writes,
                 pending_file_delete_targets,
-                detected_file_domain_changes: filesystem_tracked_domain_changes,
                 ..
             } = {
                 let backend = TransactionBackendAdapter::new(transaction);
@@ -92,7 +91,6 @@ impl Engine {
             Some(DeferredTransactionSideEffects {
                 pending_file_writes,
                 pending_file_delete_targets: pending_file_delete_targets.clone(),
-                detected_file_domain_changes: filesystem_tracked_domain_changes,
             })
         } else {
             None

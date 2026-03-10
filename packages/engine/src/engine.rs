@@ -240,14 +240,12 @@ pub(crate) struct TransactionBackendAdapter<'a> {
 pub(crate) struct CollectedExecutionSideEffects {
     pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
     pending_file_delete_targets: BTreeSet<(String, String)>,
-    detected_file_domain_changes: Vec<DetectedFileDomainChange>,
 }
 
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
     pending_file_writes: Vec<crate::filesystem::pending_file_writes::PendingFileWrite>,
     pending_file_delete_targets: BTreeSet<(String, String)>,
-    detected_file_domain_changes: Vec<DetectedFileDomainChange>,
 }
 
 #[derive(Default)]

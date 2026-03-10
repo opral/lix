@@ -60,7 +60,6 @@ impl Engine {
             Ok(None) => match run::execute_plan_sql_with_transaction(
                 transaction,
                 &prepared.plan,
-                &prepared.intent.detected_file_domain_changes,
                 prepared.plan.requirements.should_refresh_file_cache,
                 &prepared.functions,
                 writer_key,
@@ -116,11 +115,6 @@ impl Engine {
             deferred
                 .pending_file_writes
                 .extend(prepared.intent.pending_file_writes.clone());
-            if !execution.plugin_changes_committed {
-                deferred
-                    .detected_file_domain_changes
-                    .extend(prepared.intent.detected_file_domain_changes.clone());
-            }
         } else {
             let filesystem_payload_changes_already_committed =
                 shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared);
@@ -161,21 +155,14 @@ impl Engine {
                     ),
                 })?
             };
-            let mut tracked_domain_changes = prepared.intent.detected_file_domain_changes.clone();
-            tracked_domain_changes.extend(filesystem_payload_domain_changes.clone());
-            tracked_domain_changes = dedupe_detected_file_domain_changes(&tracked_domain_changes);
-            let tracked_domain_changes_to_persist = if filesystem_payload_changes_already_committed
+            let filesystem_payload_domain_changes =
+                dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes);
+            if !filesystem_payload_domain_changes.is_empty()
+                && !filesystem_payload_changes_already_committed
             {
-                Vec::new()
-            } else if execution.plugin_changes_committed {
-                dedupe_detected_file_domain_changes(&filesystem_payload_domain_changes)
-            } else {
-                tracked_domain_changes.clone()
-            };
-            if !tracked_domain_changes_to_persist.is_empty() {
                 self.persist_detected_file_domain_changes_in_transaction(
                     transaction,
-                    &tracked_domain_changes_to_persist,
+                    &filesystem_payload_domain_changes,
                 )
                 .await
                 .map_err(|error| LixError {
@@ -189,7 +176,7 @@ impl Engine {
             if !filesystem_payload_changes_already_committed
                 && should_run_binary_cas_gc(
                     &prepared.plan.preprocess.mutations,
-                    &tracked_domain_changes,
+                    &filesystem_payload_domain_changes,
                 )
             {
                 self.garbage_collect_unreachable_binary_cas_in_transaction(transaction)

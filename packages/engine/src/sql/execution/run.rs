@@ -3,18 +3,15 @@ use std::collections::BTreeSet;
 use crate::deterministic_mode::DeterministicSettings;
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::schema_registry::register_schema_sql_statements;
 use crate::state_commit_stream::{
     state_commit_stream_changes_from_postprocess_rows, StateCommitStreamChange,
     StateCommitStreamOperation,
 };
 use crate::{Engine, LixError, LixTransaction, QueryResult};
 
-use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
 use super::super::contracts::executor_error::ExecutorError;
-use super::super::contracts::planned_statement::MutationOperation;
 use super::super::contracts::postprocess_actions::PostprocessPlan;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::lower_sql::lower_to_prepared_statements;
@@ -32,7 +29,6 @@ pub(crate) struct SqlExecutionOutcome {
 pub(crate) async fn execute_plan_sql(
     engine: &Engine,
     plan: &ExecutionPlan,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     should_refresh_file_cache: bool,
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
@@ -54,13 +50,6 @@ pub(crate) async fn execute_plan_sql(
                 execute_prepared_with_backend(engine.backend.as_ref(), &prepared_statements)
                     .await
                     .map_err(ExecutorError::execute)?;
-            let tracked_insert_mutation_present =
-                plan.preprocess.mutations.iter().any(|mutation| {
-                    mutation.operation == MutationOperation::Insert && !mutation.untracked
-                });
-            if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
-                plugin_changes_committed = true;
-            }
             result
         }
         Some(postprocess_plan) => {
@@ -143,20 +132,6 @@ pub(crate) async fn execute_plan_sql(
                 }
             }
 
-            let additional_schema_keys = detected_file_domain_changes
-                .iter()
-                .map(|change| change.schema_key.clone())
-                .collect::<BTreeSet<_>>();
-            for schema_key in additional_schema_keys {
-                for statement in register_schema_sql_statements(&schema_key, transaction.dialect())
-                {
-                    if let Err(error) = transaction.execute(&statement, &[]).await {
-                        let _ = transaction.rollback().await;
-                        return Err(ExecutorError::execute(error));
-                    }
-                }
-            }
-
             let mut followup_functions = functions.clone();
             let followup_params = prepared_statements
                 .first()
@@ -168,7 +143,6 @@ pub(crate) async fn execute_plan_sql(
                         transaction.as_mut(),
                         update_plan,
                         &result.rows,
-                        detected_file_domain_changes,
                         writer_key,
                         &mut followup_functions,
                     )
@@ -187,7 +161,6 @@ pub(crate) async fn execute_plan_sql(
                         delete_plan,
                         &result.rows,
                         followup_params,
-                        detected_file_domain_changes,
                         writer_key,
                         &mut followup_functions,
                     )
@@ -226,7 +199,6 @@ pub(crate) async fn execute_plan_sql(
 pub(crate) async fn execute_plan_sql_with_transaction(
     transaction: &mut dyn LixTransaction,
     plan: &ExecutionPlan,
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     should_refresh_file_cache: bool,
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
@@ -253,13 +225,6 @@ pub(crate) async fn execute_plan_sql_with_transaction(
             let result = execute_prepared_with_transaction(transaction, &prepared_statements)
                 .await
                 .map_err(ExecutorError::execute)?;
-            let tracked_insert_mutation_present =
-                plan.preprocess.mutations.iter().any(|mutation| {
-                    mutation.operation == MutationOperation::Insert && !mutation.untracked
-                });
-            if tracked_insert_mutation_present && !detected_file_domain_changes.is_empty() {
-                plugin_changes_committed = true;
-            }
             result
         }
         Some(postprocess_plan) => {
@@ -310,20 +275,6 @@ pub(crate) async fn execute_plan_sql_with_transaction(
                 }
             }
 
-            let additional_schema_keys = detected_file_domain_changes
-                .iter()
-                .map(|change| change.schema_key.clone())
-                .collect::<BTreeSet<_>>();
-            for schema_key in additional_schema_keys {
-                for statement in register_schema_sql_statements(&schema_key, transaction.dialect())
-                {
-                    transaction
-                        .execute(&statement, &[])
-                        .await
-                        .map_err(ExecutorError::execute)?;
-                }
-            }
-
             let mut followup_functions = functions.clone();
             let followup_params = prepared_statements
                 .first()
@@ -334,7 +285,6 @@ pub(crate) async fn execute_plan_sql_with_transaction(
                     transaction,
                     update_plan,
                     &result.rows,
-                    detected_file_domain_changes,
                     writer_key,
                     &mut followup_functions,
                 )
@@ -345,7 +295,6 @@ pub(crate) async fn execute_plan_sql_with_transaction(
                     delete_plan,
                     &result.rows,
                     followup_params,
-                    detected_file_domain_changes,
                     writer_key,
                     &mut followup_functions,
                 )

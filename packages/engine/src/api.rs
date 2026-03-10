@@ -212,7 +212,6 @@ impl Engine {
                 Ok(None) => match run::execute_plan_sql(
                     self,
                     &prepared.plan,
-                    &prepared.intent.detected_file_domain_changes,
                     prepared.plan.requirements.should_refresh_file_cache,
                     &prepared.functions,
                     writer_key,
@@ -263,7 +262,6 @@ impl Engine {
             &prepared.plan.preprocess.mutations,
             &prepared.intent.pending_file_writes,
             &prepared.intent.pending_file_delete_targets,
-            &prepared.intent.detected_file_domain_changes,
             execution.plugin_changes_committed,
             shared_path::sql2_commits_filesystem_payload_domain_changes(&prepared),
             writer_key,

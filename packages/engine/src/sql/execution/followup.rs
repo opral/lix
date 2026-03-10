@@ -14,7 +14,6 @@ use crate::{LixError, LixTransaction, QueryResult, SqlDialect, Value as EngineVa
 
 use super::super::ast::lowering::lower_statement;
 use super::super::ast::utils::{bind_sql_with_state, PlaceholderState};
-use super::super::contracts::effects::DetectedFileDomainChange;
 use super::super::contracts::postprocess_actions::{VtableDeletePlan, VtableUpdatePlan};
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::super::history::commit_runtime::{
@@ -84,20 +83,13 @@ pub(crate) async fn build_update_followup_statements(
     transaction: &mut dyn LixTransaction,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<Vec<PreparedStatement>, LixError> {
     let mut executor = TransactionExecutor { transaction };
-    let batch = build_update_followup_statement_batch(
-        &mut executor,
-        plan,
-        rows,
-        detected_file_domain_changes,
-        writer_key,
-        functions,
-    )
-    .await?;
+    let batch =
+        build_update_followup_statement_batch(&mut executor, plan, rows, writer_key, functions)
+            .await?;
     bind_statement_batch_for_dialect(batch, executor.dialect())
 }
 
@@ -106,7 +98,6 @@ pub(crate) async fn build_delete_followup_statements(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     params: &[EngineValue],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut SharedFunctionProvider<RuntimeFunctionProvider>,
 ) -> Result<Vec<PreparedStatement>, LixError> {
@@ -116,7 +107,6 @@ pub(crate) async fn build_delete_followup_statements(
         plan,
         rows,
         params,
-        detected_file_domain_changes,
         writer_key,
         functions,
     )
@@ -128,11 +118,10 @@ async fn build_update_followup_statement_batch(
     executor: &mut dyn SqlExecutor,
     plan: &VtableUpdatePlan,
     rows: &[Vec<EngineValue>],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<StatementBatch, LixError> {
-    if rows.is_empty() && detected_file_domain_changes.is_empty() {
+    if rows.is_empty() {
         return Ok(StatementBatch {
             statements: Vec::new(),
             params: Vec::new(),
@@ -183,27 +172,6 @@ async fn build_update_followup_statement_batch(
         });
     }
 
-    for change in detected_file_domain_changes {
-        affected_versions.insert(change.version_id.clone());
-        let domain_writer_key = change
-            .writer_key
-            .clone()
-            .or_else(|| writer_key.map(ToString::to_string));
-        domain_changes.push(DomainChangeInput {
-            id: functions.uuid_v7(),
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            version_id: change.version_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            created_at: timestamp.clone(),
-            writer_key: domain_writer_key,
-        });
-    }
-
     let mut commit_executor = CommitExecutorAdapter { executor };
     let versions = load_version_info_for_versions(&mut commit_executor, &affected_versions).await?;
     let active_accounts =
@@ -230,7 +198,6 @@ async fn build_delete_followup_statement_batch(
     plan: &VtableDeletePlan,
     rows: &[Vec<EngineValue>],
     params: &[EngineValue],
-    detected_file_domain_changes: &[DetectedFileDomainChange],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<StatementBatch, LixError> {
@@ -302,27 +269,6 @@ async fn build_delete_followup_statement_batch(
                 writer_key: row_writer_key,
             });
         }
-    }
-
-    for change in detected_file_domain_changes {
-        affected_versions.insert(change.version_id.clone());
-        let domain_writer_key = change
-            .writer_key
-            .clone()
-            .or_else(|| writer_key.map(ToString::to_string));
-        domain_changes.push(DomainChangeInput {
-            id: functions.uuid_v7(),
-            entity_id: change.entity_id.clone(),
-            schema_key: change.schema_key.clone(),
-            schema_version: change.schema_version.clone(),
-            file_id: change.file_id.clone(),
-            version_id: change.version_id.clone(),
-            plugin_key: change.plugin_key.clone(),
-            snapshot_content: change.snapshot_content.clone(),
-            metadata: change.metadata.clone(),
-            created_at: timestamp.clone(),
-            writer_key: domain_writer_key,
-        });
     }
 
     if domain_changes.is_empty() {

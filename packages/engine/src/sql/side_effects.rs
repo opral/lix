@@ -196,13 +196,9 @@ impl Engine {
                 ),
             })?;
 
-        let mut detected_file_domain_changes = Vec::new();
-        detected_file_domain_changes =
-            dedupe_detected_file_domain_changes(&detected_file_domain_changes);
         Ok(CollectedExecutionSideEffects {
             pending_file_writes,
             pending_file_delete_targets,
-            detected_file_domain_changes,
         })
     }
 
@@ -216,20 +212,18 @@ impl Engine {
             collapse_pending_file_writes_for_transaction(&side_effects.pending_file_writes);
         side_effects.pending_file_writes = collapsed_writes;
 
-        let mut detected_file_domain_changes =
-            std::mem::take(&mut side_effects.detected_file_domain_changes);
-        detected_file_domain_changes.extend(
-            self.collect_live_filesystem_payload_domain_changes_in_transaction(
-                transaction,
-                &side_effects.pending_file_writes,
-                &side_effects.pending_file_delete_targets,
-                writer_key,
-            )
-            .await?,
+        let filesystem_payload_domain_changes = dedupe_detected_file_domain_changes(
+            &self
+                .collect_live_filesystem_payload_domain_changes_in_transaction(
+                    transaction,
+                    &side_effects.pending_file_writes,
+                    &side_effects.pending_file_delete_targets,
+                    writer_key,
+                )
+                .await?,
         );
-        detected_file_domain_changes =
-            dedupe_detected_file_domain_changes(&detected_file_domain_changes);
-        let should_run_binary_gc = should_run_binary_cas_gc(&[], &detected_file_domain_changes);
+        let should_run_binary_gc =
+            should_run_binary_cas_gc(&[], &filesystem_payload_domain_changes);
         let _ = std::mem::take(&mut side_effects.pending_file_delete_targets);
 
         self.persist_pending_file_data_updates_in_transaction(
@@ -237,10 +231,10 @@ impl Engine {
             &side_effects.pending_file_writes,
         )
         .await?;
-        if !detected_file_domain_changes.is_empty() {
+        if !filesystem_payload_domain_changes.is_empty() {
             self.persist_detected_file_domain_changes_in_transaction(
                 transaction,
-                &detected_file_domain_changes,
+                &filesystem_payload_domain_changes,
             )
             .await?;
         }
