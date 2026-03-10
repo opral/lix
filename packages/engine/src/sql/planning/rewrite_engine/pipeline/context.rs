@@ -4,16 +4,6 @@ use sqlparser::ast::Query;
 
 use super::walker::{walk_query, QueryWalkSummary};
 
-const FILESYSTEM_VIEW_NAMES: &[&str] = &[
-    "lix_file",
-    "lix_file_by_version",
-    "lix_file_history",
-    "lix_file_history_by_version",
-    "lix_directory",
-    "lix_directory_by_version",
-    "lix_directory_history",
-];
-
 #[derive(Debug, Clone)]
 pub(crate) struct AnalysisContext {
     relation_names: BTreeSet<String>,
@@ -48,12 +38,6 @@ impl AnalysisContext {
         self.relation_names.contains(name)
     }
 
-    pub(crate) fn references_any_filesystem_view(&self) -> bool {
-        FILESYSTEM_VIEW_NAMES
-            .iter()
-            .any(|name| self.references_relation(name))
-    }
-
     pub(crate) fn references_state_views(&self) -> bool {
         self.references_relation("lix_state")
             || self.references_relation("lix_state_by_version")
@@ -71,8 +55,7 @@ impl AnalysisContext {
     }
 
     pub(crate) fn references_any_logical_read_view(&self) -> bool {
-        self.references_any_filesystem_view()
-            || self.references_entity_views()
+        self.references_entity_views()
             || self.references_relation("lix_change")
             || self.references_relation("lix_version")
             || self.references_relation("lix_active_version")
@@ -109,5 +92,4 @@ fn is_builtin_logical_relation(name: &str) -> bool {
         || name == "lix_state_history"
         || name == "lix_state_history_by_version"
         || name == "lix_working_changes"
-        || FILESYSTEM_VIEW_NAMES.contains(&name)
 }
