@@ -1,6 +1,5 @@
 mod ast_utils;
 mod entity_views;
-mod lowering;
 mod params;
 mod pipeline;
 mod row_resolution;

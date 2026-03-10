@@ -14,9 +14,9 @@ use sqlparser::parser::Parser;
 #[cfg(test)]
 use crate::backend::SqlDialect;
 #[cfg(test)]
-use crate::engine::sql::planning::param_context::normalize_statement_placeholders_in_batch;
+use crate::engine::sql::ast::lowering::lower_statement;
 #[cfg(test)]
-use crate::engine::sql::planning::rewrite_engine::lowering::lower_statement;
+use crate::engine::sql::planning::param_context::normalize_statement_placeholders_in_batch;
 #[cfg(test)]
 use crate::engine::sql::planning::rewrite_engine::object_name_matches;
 #[cfg(test)]
