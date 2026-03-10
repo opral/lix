@@ -41,7 +41,12 @@ pub(crate) async fn execute_plan_sql(
     let mut postprocess_file_cache_targets = BTreeSet::new();
     let mut plugin_changes_committed = false;
     let mut state_commit_stream_changes = Vec::new();
-    let internal_result = match &plan.preprocess.postprocess {
+    let internal_result = match plan
+        .preprocess
+        .internal_state
+        .as_ref()
+        .and_then(|plan| plan.postprocess.as_ref())
+    {
         None => {
             let result =
                 execute_prepared_with_backend(engine.backend.as_ref(), &prepared_statements)
@@ -113,7 +118,12 @@ pub(crate) async fn execute_plan_sql_with_transaction(
     let mut plugin_changes_committed = false;
     let mut state_commit_stream_changes = Vec::new();
 
-    let internal_result = match &plan.preprocess.postprocess {
+    let internal_result = match plan
+        .preprocess
+        .internal_state
+        .as_ref()
+        .and_then(|plan| plan.postprocess.as_ref())
+    {
         None => {
             let result = execute_prepared_with_transaction(transaction, &prepared_statements)
                 .await

@@ -22,16 +22,16 @@ use super::super::ast::utils::parse_sql_statements;
 use super::super::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, SchemaRegistration, UpdateValidationPlan,
 };
-use crate::internal_state::PostprocessPlan;
 use super::super::contracts::prepared_statement::PreparedStatement;
 use super::bind_once::{bind_statements_with_appended_params_once, StatementWithAppendedParams};
 use super::inline_functions::inline_lix_functions_with_provider;
 use super::param_context::normalize_statement_placeholders_in_batch;
 use crate::internal_state::{
+    internal_state_plan_from_postprocess,
     materialize::materialize_vtable_insert_select_sources, requires_single_statement_postprocess,
     rewrite_internal_state_query_read, rewrite_internal_state_query_read_with_backend,
     rewrite_statement, rewrite_statement_with_backend, statement_references_internal_state_vtable,
-    RewriteOutput,
+    InternalStatePlan, RewriteOutput,
 };
 use crate::internal_state::script::coalesce_vtable_inserts_in_transactions;
 use std::collections::BTreeSet;
@@ -44,7 +44,7 @@ struct StatementRewriteOutput {
     statements: Vec<Statement>,
     params: Vec<Value>,
     registrations: Vec<SchemaRegistration>,
-    postprocess: Option<PostprocessPlan>,
+    internal_state: Option<InternalStatePlan>,
     mutations: Vec<MutationRow>,
     update_validations: Vec<UpdateValidationPlan>,
 }
@@ -280,7 +280,7 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
 
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
-    let mut postprocess: Option<PostprocessPlan> = None;
+    let mut internal_state: Option<InternalStatePlan> = None;
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
@@ -298,13 +298,15 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
             dialect,
             &mut rewritten,
             &mut registrations,
-            &mut postprocess,
+            &mut internal_state,
             &mut mutations,
             &mut update_validations,
         )?;
     }
 
-    if requires_single_statement_postprocess(postprocess.as_ref()) && rewritten.len() != 1 {
+    if requires_single_statement_postprocess(
+        internal_state.as_ref().and_then(|plan| plan.postprocess.as_ref()),
+    ) && rewritten.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
@@ -318,7 +320,7 @@ fn preprocess_statements_with_provider_and_writer_key<P: LixFunctionProvider>(
         sql: normalized_sql,
         prepared_statements,
         registrations,
-        postprocess,
+        internal_state,
         mutations,
         update_validations,
     })
@@ -336,7 +338,7 @@ where
 {
     let mut rewritten = Vec::with_capacity(statements.len());
     let mut registrations: Vec<SchemaRegistration> = Vec::new();
-    let mut postprocess: Option<PostprocessPlan> = None;
+    let mut internal_state: Option<InternalStatePlan> = None;
     let mut mutations: Vec<MutationRow> = Vec::new();
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
@@ -371,13 +373,15 @@ where
             backend.dialect(),
             &mut rewritten,
             &mut registrations,
-            &mut postprocess,
+            &mut internal_state,
             &mut mutations,
             &mut update_validations,
         )?;
     }
 
-    if requires_single_statement_postprocess(postprocess.as_ref()) && rewritten.len() != 1 {
+    if requires_single_statement_postprocess(
+        internal_state.as_ref().and_then(|plan| plan.postprocess.as_ref()),
+    ) && rewritten.len() != 1 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "postprocess rewrites require a single statement".to_string(),
@@ -391,7 +395,7 @@ where
         sql: normalized_sql,
         prepared_statements,
         registrations,
-        postprocess,
+        internal_state,
         mutations,
         update_validations,
     })
@@ -516,19 +520,19 @@ fn accumulate_rewrite_output<P: LixFunctionProvider>(
     dialect: SqlDialect,
     rewritten: &mut Vec<RewrittenStatementBinding>,
     registrations: &mut Vec<SchemaRegistration>,
-    postprocess: &mut Option<PostprocessPlan>,
+    internal_state: &mut Option<InternalStatePlan>,
     mutations: &mut Vec<MutationRow>,
     update_validations: &mut Vec<UpdateValidationPlan>,
 ) -> Result<(), LixError> {
     registrations.extend(output.registrations);
-    if let Some(plan) = output.postprocess {
-        if postprocess.is_some() {
+    if let Some(plan) = output.internal_state {
+        if internal_state.is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "only one postprocess rewrite is supported per query".to_string(),
             });
         }
-        *postprocess = Some(plan);
+        *internal_state = Some(plan);
     }
     mutations.extend(output.mutations);
     update_validations.extend(output.update_validations);
@@ -582,7 +586,7 @@ fn from_rewrite_output(output: crate::internal_state::RewriteOutput) -> Statemen
         statements: output.statements,
         params: output.params,
         registrations: output.registrations,
-        postprocess: output.postprocess,
+        internal_state: internal_state_plan_from_postprocess(output.postprocess),
         mutations: output.mutations,
         update_validations: output.update_validations,
     }

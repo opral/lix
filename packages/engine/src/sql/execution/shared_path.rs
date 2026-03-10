@@ -277,7 +277,7 @@ fn passthrough_execution_plan_for_sql2_write(
             sql: String::new(),
             prepared_statements: Vec::new(),
             registrations,
-            postprocess: None,
+            internal_state: None,
             mutations: Vec::new(),
             update_validations: Vec::new(),
         },
