@@ -4,8 +4,7 @@ use crate::engine::sql::planning::rewrite_engine::types::RewriteOutput;
 use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixError, Value};
 
-use super::registry::statement_rules;
-use super::rules::statement::{apply_backend_rule, apply_sync_rule};
+use super::rules::statement::{canonical, passthrough};
 use super::validator::validate_statement_output;
 
 pub(crate) struct StatementPipeline<'a> {
@@ -26,8 +25,16 @@ impl<'a> StatementPipeline<'a> {
         statement: Statement,
         provider: &mut P,
     ) -> Result<RewriteOutput, LixError> {
-        let output = StatementRuleEngine::new(self.params, self.writer_key)
-            .rewrite_statement(statement, provider)?;
+        let output = if let Some(output) = canonical::rewrite_sync_statement(
+            statement.clone(),
+            self.params,
+            self.writer_key,
+            provider,
+        )? {
+            output
+        } else {
+            passthrough::apply(statement)
+        };
         validate_statement_output(&output)?;
         Ok(output)
     }
@@ -41,73 +48,20 @@ impl<'a> StatementPipeline<'a> {
     where
         P: LixFunctionProvider + Clone + Send + 'static,
     {
-        let output = StatementRuleEngine::new(self.params, self.writer_key)
-            .rewrite_statement_with_backend(backend, statement, provider)
-            .await?;
+        let output = if let Some(output) = canonical::rewrite_backend_statement(
+            backend,
+            statement.clone(),
+            self.params,
+            self.writer_key,
+            provider,
+        )
+        .await?
+        {
+            output
+        } else {
+            passthrough::apply(statement)
+        };
         validate_statement_output(&output)?;
         Ok(output)
-    }
-}
-
-struct StatementRuleEngine<'a> {
-    params: &'a [Value],
-    writer_key: Option<&'a str>,
-}
-
-impl<'a> StatementRuleEngine<'a> {
-    fn new(params: &'a [Value], writer_key: Option<&'a str>) -> Self {
-        Self { params, writer_key }
-    }
-
-    fn rewrite_statement<P: LixFunctionProvider>(
-        &self,
-        statement: Statement,
-        provider: &mut P,
-    ) -> Result<RewriteOutput, LixError> {
-        for rule in statement_rules() {
-            if let Some(output) = apply_sync_rule(
-                *rule,
-                statement.clone(),
-                self.params,
-                self.writer_key,
-                provider,
-            )? {
-                return Ok(output);
-            }
-        }
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "statement rewrite engine could not match statement rule".to_string(),
-        })
-    }
-
-    async fn rewrite_statement_with_backend<P>(
-        &self,
-        backend: &dyn LixBackend,
-        statement: Statement,
-        provider: &mut P,
-    ) -> Result<RewriteOutput, LixError>
-    where
-        P: LixFunctionProvider + Clone + Send + 'static,
-    {
-        for rule in statement_rules() {
-            if let Some(output) = apply_backend_rule(
-                *rule,
-                backend,
-                statement.clone(),
-                self.params,
-                self.writer_key,
-                provider,
-            )
-            .await?
-            {
-                return Ok(output);
-            }
-        }
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "statement backend rewrite engine could not match statement rule"
-                .to_string(),
-        })
     }
 }
