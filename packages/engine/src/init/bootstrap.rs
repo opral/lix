@@ -1,5 +1,9 @@
 use super::*;
 use crate::SqlDialect;
+use crate::version::{
+    version_pointer_file_id, version_pointer_schema_key, version_pointer_storage_version_id,
+    GLOBAL_VERSION_ID,
+};
 
 impl Engine {
     pub async fn init(&self) -> Result<(), LixError> {
@@ -80,7 +84,7 @@ impl Engine {
                         "SELECT 1 \
                          FROM sqlite_master \
                          WHERE type = 'table' \
-                           AND name = 'lix_internal_state_materialized_v1_lix_global_pointer' \
+                           AND name = 'lix_internal_state_materialized_v1_lix_version_pointer' \
                          LIMIT 1",
                         &[],
                     )
@@ -94,7 +98,7 @@ impl Engine {
                         "SELECT 1 \
                          FROM information_schema.tables \
                          WHERE table_schema = current_schema() \
-                           AND table_name = 'lix_internal_state_materialized_v1_lix_global_pointer' \
+                           AND table_name = 'lix_internal_state_materialized_v1_lix_version_pointer' \
                          LIMIT 1",
                         &[],
                     )
@@ -110,15 +114,19 @@ impl Engine {
             .backend
             .execute(
                 "SELECT 1 \
-                 FROM lix_internal_state_materialized_v1_lix_global_pointer \
-                 WHERE schema_key = 'lix_global_pointer' \
-                   AND entity_id = 'global' \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND global = true \
+                 FROM lix_internal_state_materialized_v1_lix_version_pointer \
+                 WHERE schema_key = $1 \
+                   AND entity_id = $2 \
+                   AND file_id = $3 \
+                   AND version_id = $4 \
                    AND snapshot_content IS NOT NULL \
                  LIMIT 1",
-                &[],
+                &[
+                    Value::Text(version_pointer_schema_key().to_string()),
+                    Value::Text(GLOBAL_VERSION_ID.to_string()),
+                    Value::Text(version_pointer_file_id().to_string()),
+                    Value::Text(version_pointer_storage_version_id().to_string()),
+                ],
             )
             .await?;
         Ok(!result.rows.is_empty())

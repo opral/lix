@@ -34,7 +34,6 @@ struct VisibleRow {
 #[derive(Debug, Clone)]
 struct FinalStateRow {
     version_id: String,
-    global: bool,
     source: VisibleRow,
 }
 
@@ -946,12 +945,7 @@ fn build_version_ancestry(
     let mut ancestry: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
 
     for version_id in target_versions {
-        let mut rows = vec![(version_id.clone(), 0usize)];
-        if version_id != GLOBAL_VERSION_ID {
-            rows.push((GLOBAL_VERSION_ID.to_string(), 1));
-        }
-
-        ancestry.insert(version_id.clone(), rows);
+        ancestry.insert(version_id.clone(), vec![(version_id.clone(), 0usize)]);
     }
 
     stats.push(StageStat {
@@ -984,7 +978,7 @@ fn build_final_state(
         };
 
         let mut chosen: BTreeMap<(String, String, String), FinalStateRow> = BTreeMap::new();
-        for (ancestor_id, depth) in ancestry {
+        for (ancestor_id, _depth) in ancestry {
             let Some(candidates) = visible_by_version.get(ancestor_id) else {
                 continue;
             };
@@ -1011,7 +1005,6 @@ fn build_final_state(
                     key,
                     FinalStateRow {
                         version_id: version_id.clone(),
-                        global: ancestor_id == GLOBAL_VERSION_ID || *depth > 0,
                         source: candidate.clone(),
                     },
                 );
@@ -1052,7 +1045,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Vec<MaterializationWrite> {
             entity_id: row.source.entity_id.clone(),
             file_id: row.source.file_id.clone(),
             version_id: row.version_id.clone(),
-            global: row.global,
+            global: row.version_id == GLOBAL_VERSION_ID,
             op,
             snapshot_content: row.source.snapshot_content.clone(),
             metadata: row.source.metadata.clone(),
@@ -1159,7 +1152,7 @@ fn build_debug_trace(
                 entity_id: row.source.entity_id.clone(),
                 schema_key: row.source.schema_key.clone(),
                 file_id: row.source.file_id.clone(),
-                global: row.global,
+                global: row.version_id == GLOBAL_VERSION_ID,
                 change_id: row.source.change_id.clone(),
             })
             .take(limit)

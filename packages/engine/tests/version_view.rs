@@ -84,7 +84,7 @@ simulation_test!(
     }
 );
 
-simulation_test!(lix_version_hides_internal_global_lane, |sim| async move {
+simulation_test!(lix_version_exposes_hidden_global_version, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
         .await
@@ -93,13 +93,18 @@ simulation_test!(lix_version_hides_internal_global_lane, |sim| async move {
 
     let result = engine
         .execute(
-            "SELECT id, name FROM lix_version WHERE id = 'global' OR name = 'global'",
+            "SELECT id, name, hidden \
+             FROM lix_version \
+             WHERE id = 'global'",
             &[],
         )
         .await
         .unwrap();
 
-    assert!(result.statements[0].rows.is_empty());
+    assert_eq!(result.statements[0].rows.len(), 1);
+    assert_text(&result.statements[0].rows[0][0], "global");
+    assert_text(&result.statements[0].rows[0][1], "global");
+    assert_bool(&result.statements[0].rows[0][2], true);
 });
 
 simulation_test!(

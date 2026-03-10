@@ -50,9 +50,3 @@ pub(crate) struct LixVersionPointer {
     pub id: String,
     pub commit_id: String,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LixGlobalPointer {
-    pub id: String,
-    pub commit_id: String,
-}

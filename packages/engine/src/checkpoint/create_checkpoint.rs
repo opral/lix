@@ -42,7 +42,7 @@ async fn create_checkpoint_in_transaction(
     };
     let version_id = text_at(row, 0, "version_id")?;
     let local_commit_id = text_at(row, 1, "commit_id")?;
-    let global_commit_id = load_global_pointer_commit_id(tx).await?;
+    let global_commit_id = load_global_version_commit_id(tx).await?;
 
     let commit = load_commit(tx, &local_commit_id)
         .await?
@@ -128,16 +128,15 @@ async fn load_commit(
     }))
 }
 
-async fn load_global_pointer_commit_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
+async fn load_global_version_commit_id(tx: &mut EngineTransaction<'_>) -> Result<String, LixError> {
     let result = tx
         .execute_internal(
             "SELECT lix_json_extract(snapshot_content, 'commit_id') \
-             FROM lix_internal_state_materialized_v1_lix_global_pointer \
-             WHERE schema_key = 'lix_global_pointer' \
+             FROM lix_internal_state_materialized_v1_lix_version_pointer \
+             WHERE schema_key = 'lix_version_pointer' \
                AND entity_id = 'global' \
                AND file_id = 'lix' \
                AND version_id = 'global' \
-               AND global = true \
                AND is_tombstone = 0 \
                AND snapshot_content IS NOT NULL \
              ORDER BY updated_at DESC, created_at DESC, change_id DESC \
@@ -147,7 +146,7 @@ async fn load_global_pointer_commit_id(tx: &mut EngineTransaction<'_>) -> Result
         .await?;
     let [statement] = result.statements.as_slice() else {
         return Err(errors::unexpected_statement_count_error(
-            "global pointer commit query",
+            "hidden global version commit query",
             1,
             result.statements.len(),
         ));
@@ -155,10 +154,10 @@ async fn load_global_pointer_commit_id(tx: &mut EngineTransaction<'_>) -> Result
     let Some(row) = statement.rows.first() else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "global pointer row is missing".to_string(),
+            description: "hidden global version pointer row is missing".to_string(),
         });
     };
-    text_at(row, 0, "lix_global_pointer.commit_id")
+    text_at(row, 0, "lix_version_pointer.commit_id")
 }
 
 async fn ensure_checkpoint_label_on_commit(

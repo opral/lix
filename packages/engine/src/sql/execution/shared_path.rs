@@ -9,6 +9,7 @@ use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::engine::sql::storage::sql_text::escape_sql_string;
 use crate::engine::{Engine, TransactionBackendAdapter};
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::schema::schema_from_stored_snapshot;
 use crate::schema_registry::register_schema_sql_statements;
 use crate::sql2::runtime::{
     prepare_sql2_read, try_prepare_sql2_write, Sql2PreparedRead, Sql2PreparedWrite,
@@ -29,7 +30,7 @@ use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
 use super::super::contracts::effects::PlanEffects;
 use super::super::contracts::execution_plan::ExecutionPlan;
-use super::super::contracts::planned_statement::PlannedStatementSet;
+use super::super::contracts::planned_statement::{PlannedStatementSet, SchemaRegistration};
 use super::super::contracts::requirements::PlanRequirements;
 use super::super::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
@@ -175,7 +176,13 @@ pub(crate) async fn prepare_execution_with_backend(
 
     let sql2_write_owned_execution = sql2_write.is_some();
     let plan = if sql2_write_owned_execution {
-        passthrough_execution_plan_for_sql2_write(&statements)
+        passthrough_execution_plan_for_sql2_write(
+            &statements,
+            sql2_write
+                .as_ref()
+                .map(sql2_schema_registrations)
+                .unwrap_or_default(),
+        )
     } else {
         build_execution_plan(
             backend,
@@ -253,12 +260,15 @@ pub(crate) async fn prepare_execution_with_backend(
     })
 }
 
-fn passthrough_execution_plan_for_sql2_write(statements: &[Statement]) -> ExecutionPlan {
+fn passthrough_execution_plan_for_sql2_write(
+    statements: &[Statement],
+    registrations: Vec<SchemaRegistration>,
+) -> ExecutionPlan {
     ExecutionPlan {
         preprocess: PlannedStatementSet {
             sql: String::new(),
             prepared_statements: Vec::new(),
-            registrations: Vec::new(),
+            registrations,
             postprocess: None,
             mutations: Vec::new(),
             update_validations: Vec::new(),
@@ -268,6 +278,37 @@ fn passthrough_execution_plan_for_sql2_write(statements: &[Statement]) -> Execut
         dependency_spec: crate::sql_shared::dependency_spec::DependencySpec::default(),
         effects: PlanEffects::default(),
     }
+}
+
+fn sql2_schema_registrations(sql2_write: &Sql2PreparedWrite) -> Vec<SchemaRegistration> {
+    let mut schema_keys = BTreeSet::new();
+    if let Some(resolved) = sql2_write.planned_write.resolved_write_plan.as_ref() {
+        for row in &resolved.intended_post_state {
+            if row.schema_key != STORED_SCHEMA_KEY {
+                schema_keys.insert(row.schema_key.clone());
+            }
+
+            if row.schema_key != STORED_SCHEMA_KEY || row.tombstone {
+                continue;
+            }
+
+            let Some(Value::Text(snapshot_content)) = row.values.get("snapshot_content") else {
+                continue;
+            };
+            let Ok(snapshot) = serde_json::from_str(snapshot_content) else {
+                continue;
+            };
+            let Ok((schema_key, _)) = schema_from_stored_snapshot(&snapshot) else {
+                continue;
+            };
+            schema_keys.insert(schema_key.schema_key);
+        }
+    }
+
+    schema_keys
+        .into_iter()
+        .map(|schema_key| SchemaRegistration { schema_key })
+        .collect()
 }
 
 fn derive_result_contract_for_statements(statements: &[Statement]) -> ResultContract {

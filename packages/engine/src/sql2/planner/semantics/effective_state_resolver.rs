@@ -321,10 +321,16 @@ pub(crate) async fn resolve_exact_effective_state_row(
         .exact_filters
         .get("untracked")
         .and_then(bool_from_value);
-    let requested_global = request
+    let mut requested_global = request
         .exact_filters
         .get("global")
         .and_then(bool_from_value);
+    if request.version_id == GLOBAL_VERSION_ID {
+        if requested_global == Some(false) {
+            return Ok(None);
+        }
+        requested_global = None;
+    }
 
     let mut lanes = vec![OverlayLane::LocalTracked];
     if request.include_untracked_overlay {
@@ -344,7 +350,10 @@ pub(crate) async fn resolve_exact_effective_state_row(
             continue;
         }
 
-        let version_id = if matches!(lane, OverlayLane::GlobalUntracked) {
+        let internal_version_id = if matches!(
+            lane,
+            OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked
+        ) {
             GLOBAL_VERSION_ID.to_string()
         } else {
             request.version_id.clone()
@@ -352,10 +361,12 @@ pub(crate) async fn resolve_exact_effective_state_row(
 
         let row = match lane {
             OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
-                load_exact_tracked_effective_row(backend, request, lane).await?
+                load_exact_tracked_effective_row(backend, request, &internal_version_id, lane)
+                    .await?
             }
             OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
-                load_exact_untracked_effective_row(backend, request, &version_id, lane).await?
+                load_exact_untracked_effective_row(backend, request, &internal_version_id, lane)
+                    .await?
             }
         };
 
@@ -370,6 +381,7 @@ pub(crate) async fn resolve_exact_effective_state_row(
 async fn load_exact_tracked_effective_row(
     backend: &dyn LixBackend,
     request: &ExactEffectiveStateRowRequest,
+    internal_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
     let Some(entity_id) = request
@@ -385,28 +397,21 @@ async fn load_exact_tracked_effective_row(
     exact_filters.remove("entity_id");
     exact_filters.remove("global");
     exact_filters.remove("untracked");
-    let global_filter = if request.version_id == GLOBAL_VERSION_ID {
-        request
-            .exact_filters
-            .get("global")
-            .and_then(bool_from_value)
-    } else {
-        Some(matches!(overlay_lane, OverlayLane::GlobalTracked))
-    };
 
     let row = load_exact_committed_state_row(
         backend,
         &ExactCommittedStateRowRequest {
             entity_id,
             schema_key: request.schema_key.clone(),
-            version_id: request.version_id.clone(),
-            global_filter,
+            version_id: internal_version_id.to_string(),
             exact_filters,
         },
     )
     .await?;
 
-    Ok(row.map(|row| exact_effective_state_row_from_tracked(row, overlay_lane)))
+    Ok(row.map(|row| {
+        exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane)
+    }))
 }
 
 async fn load_exact_untracked_effective_row(
@@ -426,19 +431,31 @@ async fn load_exact_untracked_effective_row(
     )
     .await?;
 
-    Ok(row.map(|row| exact_effective_state_row_from_untracked(row, overlay_lane)))
+    Ok(row.map(|row| {
+        exact_effective_state_row_from_untracked(row, &request.version_id, overlay_lane)
+    }))
 }
 
 fn exact_effective_state_row_from_tracked(
     row: ExactCommittedStateRow,
+    requested_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> ExactEffectiveStateRow {
+    let projected_version_id = if matches!(overlay_lane, OverlayLane::GlobalTracked)
+        && row.version_id == GLOBAL_VERSION_ID
+    {
+        requested_version_id.to_string()
+    } else {
+        row.version_id.clone()
+    };
+    let mut values = row.values;
+    values.insert("version_id".to_string(), Value::Text(projected_version_id.clone()));
     ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        version_id: row.version_id.clone(),
-        values: row.values,
+        version_id: projected_version_id,
+        values,
         source_change_id: row.source_change_id,
         overlay_lane,
     }
@@ -446,14 +463,24 @@ fn exact_effective_state_row_from_tracked(
 
 fn exact_effective_state_row_from_untracked(
     row: ExactUntrackedStateRow,
+    requested_version_id: &str,
     overlay_lane: OverlayLane,
 ) -> ExactEffectiveStateRow {
+    let projected_version_id = if matches!(overlay_lane, OverlayLane::GlobalUntracked)
+        && row.version_id == GLOBAL_VERSION_ID
+    {
+        requested_version_id.to_string()
+    } else {
+        row.version_id.clone()
+    };
+    let mut values = row.values;
+    values.insert("version_id".to_string(), Value::Text(projected_version_id.clone()));
     ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        version_id: row.version_id.clone(),
-        values: row.values,
+        version_id: projected_version_id,
+        values,
         source_change_id: Some("untracked".to_string()),
         overlay_lane,
     }

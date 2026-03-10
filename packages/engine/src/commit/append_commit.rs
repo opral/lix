@@ -550,12 +550,15 @@ mod tests {
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
             self.executed_sql.push(sql.to_string());
 
-            if sql.contains("FROM lix_internal_state_materialized_v1_lix_global_pointer") {
+            if sql.contains("FROM lix_internal_state_materialized_v1_lix_version_pointer")
+                && sql.contains("entity_id = 'global'")
+            {
                 let rows = self
                     .version_tips
                     .get(GLOBAL_VERSION_ID)
                     .map(|commit_id| {
-                        vec![Value::Text(crate::version::global_pointer_snapshot_content(
+                        vec![Value::Text(crate::version::version_pointer_snapshot_content(
+                            GLOBAL_VERSION_ID,
                             commit_id,
                         ))]
                     })
