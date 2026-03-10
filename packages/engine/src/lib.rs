@@ -17,7 +17,6 @@ mod history_timeline;
 mod init;
 mod json_truthiness;
 mod key_value;
-mod lix_table_registry;
 mod materialization;
 mod observe;
 mod plugin;

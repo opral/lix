@@ -1,4 +1,4 @@
-use crate::lix_table_registry::public_lix_table_names;
+use crate::sql2::catalog::builtin_public_surface_names;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,7 +80,7 @@ pub(crate) fn not_initialized_error() -> LixError {
 }
 
 pub(crate) fn table_not_found_read_error() -> LixError {
-    let available_tables = public_lix_table_names().join(", ");
+    let available_tables = builtin_public_surface_names().join(", ");
     build_error(
         ErrorCode::TableNotFound,
         &format!(
@@ -151,7 +151,7 @@ pub(crate) fn sql_unknown_column_error(
 }
 
 pub(crate) fn internal_table_access_denied_error() -> LixError {
-    let available_tables = public_lix_table_names().join(", ");
+    let available_tables = builtin_public_surface_names().join(", ");
     build_error(
         ErrorCode::InternalTableAccessDenied,
         &format!(
