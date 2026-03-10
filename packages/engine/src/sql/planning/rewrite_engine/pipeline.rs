@@ -35,13 +35,10 @@ use crate::LixError;
 #[cfg(test)]
 use crate::Value;
 
-pub(crate) mod context;
-pub(crate) mod query_engine;
 pub(crate) mod registry;
 pub(crate) mod rules;
 pub(crate) mod statement_pipeline;
 pub(crate) mod validator;
-pub(crate) mod walker;
 
 #[cfg(test)]
 use self::statement_pipeline::StatementPipeline;

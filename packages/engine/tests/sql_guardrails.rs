@@ -421,11 +421,14 @@ fn guardrail_live_transaction_script_filesystem_coalescer_stays_removed() {
 }
 
 #[test]
-fn guardrail_legacy_query_pipeline_context_and_validator_are_filesystem_blind() {
+fn guardrail_legacy_query_pipeline_context_is_removed_and_validator_is_filesystem_blind() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let context_source =
-        fs::read_to_string(root.join("src/sql/planning/rewrite_engine/pipeline/context.rs"))
-            .expect("context.rs should be readable");
+    assert!(
+        !root
+            .join("src/sql/planning/rewrite_engine/pipeline/context.rs")
+            .exists(),
+        "legacy query rewrite context.rs should be removed"
+    );
     let validator_source =
         fs::read_to_string(root.join("src/sql/planning/rewrite_engine/pipeline/validator.rs"))
             .expect("validator.rs should be readable");
@@ -441,10 +444,6 @@ fn guardrail_legacy_query_pipeline_context_and_validator_are_filesystem_blind() 
         "FILESYSTEM_VIEW_NAMES",
         "references_any_filesystem_view",
     ] {
-        assert!(
-            !context_source.contains(forbidden),
-            "legacy query rewrite context must not carry filesystem surface awareness: {forbidden}"
-        );
         assert!(
             !validator_source.contains(forbidden),
             "legacy query rewrite validator must not carry filesystem surface awareness: {forbidden}"

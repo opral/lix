@@ -4,6 +4,12 @@ use crate::cel::CelEvaluator;
 use crate::default_values::apply_vtable_insert_defaults;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::sql2::planner::backend::lowerer::rewrite_supported_public_read_surfaces_in_statement;
+use crate::sql2::planner::backend::lowerer::lower_read_for_execution;
+use crate::sql2::catalog::SurfaceRegistry;
+use crate::sql2::core::contracts::{BoundStatement, ExecutionContext};
+use crate::sql2::planner::canonicalize::canonicalize_read;
+use crate::sql2::planner::semantics::dependency_spec::derive_dependency_spec_from_canonicalized_read;
+use crate::sql2::planner::semantics::effective_state_resolver::build_effective_state;
 use crate::sql2::runtime::prepare_sql2_read;
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -25,7 +31,10 @@ use super::param_context::normalize_statement_placeholders_in_batch;
 use super::rewrite_engine::StatementPipeline;
 use super::rewrite_output::StatementRewriteOutput;
 use super::script::coalesce_vtable_inserts_in_transactions;
-use sqlparser::ast::Statement;
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{Expr, ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
 
 pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
     statement: &mut Statement,
@@ -35,23 +44,158 @@ pub(crate) fn rewrite_public_read_statement_to_lowered_sql(
     lower_statement(statement.clone(), dialect)
 }
 
+pub(crate) fn statement_references_public_sql2_surface(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => query_references_builtin_public_sql2_surface(query),
+        Statement::Explain { statement, .. } => statement_references_public_sql2_surface(statement),
+        _ => false,
+    }
+}
+
+pub(crate) fn statement_references_internal_state_vtable(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => collect_query_relation_names(query)
+            .contains("lix_internal_state_vtable"),
+        Statement::Explain { statement, .. } => {
+            statement_references_internal_state_vtable(statement)
+        }
+        _ => false,
+    }
+}
+
+pub(crate) async fn statement_references_public_sql2_surface_with_backend(
+    backend: &dyn LixBackend,
+    statement: &Statement,
+) -> bool {
+    let query = match statement {
+        Statement::Query(query) => query,
+        Statement::Explain { statement, .. } => match statement.as_ref() {
+            Statement::Query(query) => query,
+            _ => return false,
+        },
+        _ => return false,
+    };
+
+    let relation_names = collect_query_relation_names(query);
+    if relation_names.is_empty() {
+        return false;
+    }
+    if relation_names
+        .iter()
+        .all(|name| name.starts_with("lix_internal_"))
+    {
+        return false;
+    }
+
+    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
+        Ok(registry) => registry,
+        Err(_) => return query_references_builtin_public_sql2_surface(query),
+    };
+
+    relation_names
+        .iter()
+        .any(|name| registry.bind_relation_name(name).is_some())
+}
+
+fn query_references_builtin_public_sql2_surface(query: &Query) -> bool {
+    let registry = SurfaceRegistry::with_builtin_surfaces();
+    collect_query_relation_names(query)
+        .into_iter()
+        .any(|name| registry.bind_relation_name(&name).is_some())
+}
+
+fn collect_query_relation_names(query: &Query) -> BTreeSet<String> {
+    struct Collector {
+        relation_names: BTreeSet<String>,
+    }
+
+    impl Visitor for Collector {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            if let TableFactor::Table { name, .. } = table_factor {
+                if let Some(identifier) = name.0.last().and_then(ObjectNamePart::as_ident) {
+                    self.relation_names
+                        .insert(identifier.value.to_ascii_lowercase());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = Collector {
+        relation_names: BTreeSet::new(),
+    };
+    let _ = query.visit(&mut collector);
+    collector.relation_names
+}
+
+pub(crate) fn rewrite_public_read_query_to_lowered_sql(
+    query: sqlparser::ast::Query,
+    dialect: SqlDialect,
+) -> Result<sqlparser::ast::Query, LixError> {
+    let mut statement = Statement::Query(Box::new(query));
+    match rewrite_public_read_statement_to_lowered_sql(&mut statement, dialect)? {
+        Statement::Query(query) => Ok(*query),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "expected lowered read query to remain a SELECT query".to_string(),
+        }),
+    }
+}
+
 pub(crate) async fn lower_public_read_query_with_sql2_backend(
     backend: &dyn LixBackend,
     query: sqlparser::ast::Query,
     params: &[Value],
 ) -> Result<sqlparser::ast::Query, LixError> {
     let active_version_id = load_active_version_id_for_sql2_read(backend).await?;
-    let parsed = vec![Statement::Query(Box::new(query))];
+    let parsed = vec![Statement::Query(Box::new(query.clone()))];
     let prepared = prepare_sql2_read(backend, &parsed, params, &active_version_id, None)
-        .await
+        .await;
+    let lowered = if let Some(prepared) = prepared {
+        prepared.lowered_read.ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "sql2 read subquery did not lower to executable SQL".to_string(),
+        })?
+    } else {
+        let rewritten = rewrite_public_read_query_to_lowered_sql(query.clone(), backend.dialect())?;
+        if rewritten != query {
+            return Ok(rewritten);
+        }
+        let registry = SurfaceRegistry::bootstrap_with_backend(backend).await?;
+        let bound_statement = BoundStatement::from_statement(
+            Statement::Query(Box::new(query)),
+            params.to_vec(),
+            ExecutionContext {
+                dialect: Some(backend.dialect()),
+                writer_key: None,
+                requested_version_id: Some(active_version_id),
+            },
+        );
+        let canonicalized = canonicalize_read(bound_statement, &registry).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("sql2 read subquery canonicalization failed: {}", error.message),
+        })?;
+        let dependency_spec = derive_dependency_spec_from_canonicalized_read(&canonicalized);
+        let effective_state = build_effective_state(&canonicalized, dependency_spec.as_ref());
+        lower_read_for_execution(
+            &canonicalized,
+            effective_state.as_ref().map(|(request, _)| request),
+            effective_state.as_ref().map(|(_, plan)| plan),
+        )?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "sql2 could not prepare read subquery".to_string(),
-        })?;
-    let lowered = prepared.lowered_read.ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "sql2 read subquery did not lower to executable SQL".to_string(),
-    })?;
+        })?
+    };
     let statement = lowered
         .statements
         .into_iter()
@@ -327,6 +471,9 @@ where
     })?;
 
     for statement in &mut statements {
+        if matches!(statement, Statement::Query(_) | Statement::Explain { .. }) {
+            continue;
+        }
         rewrite_supported_public_read_surfaces_in_statement(statement).map_err(|error| LixError {
             code: error.code,
             description: format!(

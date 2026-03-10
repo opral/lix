@@ -234,10 +234,10 @@ fn visit_table_factor_in_place(
 
 #[cfg(test)]
 mod tests {
-    use sqlparser::ast::{Query, Select, Statement, TableFactor};
+    use sqlparser::ast::{Ident, Query, Select, Statement, TableFactor};
+    use sqlparser::ast::TableAlias;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-    use sqlparser::ast::TableAlias;
 
     use super::{
         object_name_matches, parse_single_query, rewrite_query_selects,
