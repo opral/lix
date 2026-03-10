@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::{Engine, LixError};
 
-use super::super::contracts::planned_statement::MutationRow;
+use crate::query_runtime::contracts::planned_statement::MutationRow;
 
 pub(crate) async fn apply_sql_backed_effects(
     engine: &Engine,

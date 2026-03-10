@@ -362,7 +362,7 @@ fn guardrail_legacy_filesystem_mutation_rewrite_is_removed() {
 fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let side_effects_source =
-        fs::read_to_string(root.join("src/sql/side_effects.rs")).expect("side_effects readable");
+        fs::read_to_string(root.join("src/runtime_effects.rs")).expect("runtime_effects readable");
     let intent_source =
         fs::read_to_string(root.join("src/sql/execution/intent.rs")).expect("intent readable");
     let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
@@ -375,7 +375,7 @@ fn guardrail_sql_side_effects_stays_off_legacy_filesystem_update_detector() {
     ] {
         assert!(
             !side_effects_source.contains(forbidden),
-            "sql side-effects must not keep legacy filesystem update detector plumbing: {forbidden}"
+            "runtime effects must not keep legacy filesystem update detector plumbing: {forbidden}"
         );
         assert!(
             !intent_source.contains(forbidden),
@@ -527,8 +527,8 @@ fn guardrail_filesystem_noop_sql_synthesis_stays_removed() {
 #[test]
 fn guardrail_live_filesystem_intent_path_has_no_plugin_detection_branch() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let side_effects_source = fs::read_to_string(root.join("src/sql/side_effects.rs"))
-        .expect("side_effects.rs should be readable");
+    let side_effects_source = fs::read_to_string(root.join("src/runtime_effects.rs"))
+        .expect("runtime_effects.rs should be readable");
     let shared_path_source = fs::read_to_string(root.join("src/sql/execution/shared_path.rs"))
         .expect("shared_path.rs should be readable");
     let intent_source = fs::read_to_string(root.join("src/sql/execution/intent.rs"))

@@ -57,11 +57,13 @@ mod init_seed;
 mod plugin_install;
 #[path = "runtime_functions.rs"]
 mod runtime_functions;
+#[path = "runtime_effects.rs"]
+mod runtime_effects;
 #[path = "sql/mod.rs"]
 pub(crate) mod sql;
 
-use self::sql::contracts::effects::FilesystemPayloadDomainChange;
-use self::sql::contracts::planned_statement::MutationRow;
+use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
+use crate::query_runtime::contracts::planned_statement::MutationRow;
 use self::sql::planning::parse::parse_sql;
 use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use self::sql::storage::sql_text::escape_sql_string;
@@ -551,7 +553,7 @@ mod tests {
         PlaceholderState,
     };
     use crate::engine::sql::ast::walk::contains_transaction_control_statement;
-    use crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
+    use crate::query_runtime::contracts::planned_statement::UpdateValidationPlan;
     use crate::engine::sql::history::plugin_inputs::file_history_read_materialization_required_for_statements;
     use crate::internal_state::script::extract_explicit_transaction_script_from_statements;
     use crate::engine::sql::semantics::state_resolution::canonical::is_query_only_statements;

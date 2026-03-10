@@ -23,7 +23,7 @@ use crate::engine::sql::execution::execute_prepared::{
     execute_prepared_with_backend, execute_prepared_with_transaction,
 };
 use crate::internal_state::{InternalStatePlan, PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
-use crate::engine::sql::contracts::prepared_statement::PreparedStatement;
+use crate::query_runtime::contracts::prepared_statement::PreparedStatement;
 use crate::engine::sql::history::commit_runtime::{
     bind_statement_batch_for_dialect, build_statement_batch_from_generate_commit_result,
     load_commit_active_accounts, load_version_info_for_versions, CommitQueryExecutor,

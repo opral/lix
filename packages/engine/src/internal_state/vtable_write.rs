@@ -1344,7 +1344,7 @@ fn build_untracked_insert(
 fn bind_statement_batch_for_dialect(
     batch: StatementBatch,
     dialect: SqlDialect,
-) -> Result<Vec<crate::engine::sql::contracts::prepared_statement::PreparedStatement>, LixError> {
+) -> Result<Vec<crate::query_runtime::contracts::prepared_statement::PreparedStatement>, LixError> {
     bind_shared_statement_batch_for_dialect(batch, dialect)
 }
 

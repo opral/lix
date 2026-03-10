@@ -1,5 +1,5 @@
 use crate::commit::ProposedDomainChange;
-use crate::engine::sql::contracts::planned_statement::{MutationOperation, MutationRow};
+use crate::query_runtime::contracts::planned_statement::{MutationOperation, MutationRow};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;

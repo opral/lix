@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::{LixError, Value};
-
 use crate::internal_state::InternalStatePlan;
-use super::prepared_statement::PreparedStatement;
+use crate::{LixError, Value};
 use sqlparser::ast::Expr;
+
+use super::prepared_statement::PreparedStatement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaRegistration {

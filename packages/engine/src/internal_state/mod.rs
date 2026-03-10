@@ -25,7 +25,7 @@ use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, DEFAULT_ACTIVE_VERSION_NAME,
 };
-use crate::engine::sql::contracts::planned_statement::PlannedStatementSet;
+use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
 use crate::sql_shared::ast::parse_sql_statements;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use sqlparser::ast::{ObjectNamePart, Query, Statement, TableFactor, Visit, Visitor};
@@ -46,14 +46,14 @@ pub(crate) use crate::engine::sql::ast::utils::{
     resolve_expr_cell_with_state, ResolvedCell, RowSourceResolver,
 };
 pub(crate) type SchemaRegistration =
-    crate::engine::sql::contracts::planned_statement::SchemaRegistration;
+    crate::query_runtime::contracts::planned_statement::SchemaRegistration;
 pub(crate) type MutationOperation =
-    crate::engine::sql::contracts::planned_statement::MutationOperation;
-pub(crate) type MutationRow = crate::engine::sql::contracts::planned_statement::MutationRow;
+    crate::query_runtime::contracts::planned_statement::MutationOperation;
+pub(crate) type MutationRow = crate::query_runtime::contracts::planned_statement::MutationRow;
 pub(crate) type UpdateValidationPlan =
-    crate::engine::sql::contracts::planned_statement::UpdateValidationPlan;
+    crate::query_runtime::contracts::planned_statement::UpdateValidationPlan;
 pub(crate) type PreparedStatement =
-    crate::engine::sql::contracts::prepared_statement::PreparedStatement;
+    crate::query_runtime::contracts::prepared_statement::PreparedStatement;
 pub(crate) use postprocess::{PostprocessPlan, VtableDeletePlan, VtableUpdatePlan};
 
 #[derive(Debug, Clone)]

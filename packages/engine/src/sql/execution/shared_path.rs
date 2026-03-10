@@ -29,13 +29,13 @@ use crate::version::{
 };
 use crate::{LixBackend, LixError, LixTransaction, QueryResult, Value};
 
-use super::super::contracts::effects::PlanEffects;
-use super::super::contracts::execution_plan::ExecutionPlan;
-use super::super::contracts::planned_statement::{PlannedStatementSet, SchemaRegistration};
-use super::super::contracts::requirements::PlanRequirements;
-use super::super::contracts::result_contract::ResultContract;
+use crate::query_runtime::contracts::effects::PlanEffects;
+use crate::query_runtime::contracts::execution_plan::ExecutionPlan;
+use crate::query_runtime::contracts::planned_statement::{PlannedStatementSet, SchemaRegistration};
+use crate::query_runtime::contracts::requirements::PlanRequirements;
+use crate::query_runtime::contracts::result_contract::ResultContract;
 use super::super::planning::derive_requirements::derive_plan_requirements;
-use super::super::planning::plan::build_execution_plan;
+use crate::query_runtime::plan::build_execution_plan;
 use super::intent::{
     authoritative_pending_file_write_targets, collect_execution_intent_with_backend,
     ExecutionIntent, IntentCollectionPolicy,

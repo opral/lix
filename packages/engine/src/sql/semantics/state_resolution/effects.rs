@@ -9,11 +9,11 @@ use crate::version::{
 use crate::LixError;
 use sqlparser::ast::{BinaryOperator, Expr};
 
-use super::super::super::contracts::effects::PlanEffects;
-use super::super::super::contracts::planned_statement::{
+use crate::query_runtime::contracts::effects::PlanEffects;
+use crate::query_runtime::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, UpdateValidationPlan,
 };
-use super::super::super::contracts::planner_error::PlannerError;
+use crate::query_runtime::contracts::planner_error::PlannerError;
 
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,

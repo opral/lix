@@ -6,7 +6,7 @@ use crate::internal_state::{
 use crate::sql_shared::ast::parse_sql_statements;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
-use super::super::contracts::planned_statement::PlannedStatementSet;
+use crate::query_runtime::contracts::planned_statement::PlannedStatementSet;
 use sqlparser::ast::Statement;
 
 pub(crate) fn preprocess_statements_with_provider_to_plan<P: LixFunctionProvider>(

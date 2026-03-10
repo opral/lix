@@ -21,6 +21,7 @@ mod key_value;
 mod materialization;
 mod observe;
 mod plugin;
+mod query_runtime;
 mod schema;
 mod schema_registry;
 mod snapshot;
