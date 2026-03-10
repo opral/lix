@@ -66,7 +66,7 @@ pub(crate) mod sql;
 
 use crate::query_runtime::contracts::effects::FilesystemPayloadDomainChange;
 use crate::query_runtime::contracts::planned_statement::MutationRow;
-use self::sql::planning::parse::parse_sql;
+use crate::query_runtime::parse::parse_sql;
 use self::sql::semantics::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
 use self::sql::storage::sql_text::escape_sql_string;
 

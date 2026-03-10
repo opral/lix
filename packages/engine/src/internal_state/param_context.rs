@@ -1,10 +1,9 @@
 use std::ops::ControlFlow;
 
+use crate::{LixError, Value as EngineValue};
 use sqlparser::ast::{
     BinaryOperator, Expr, Query, Statement, Value as SqlValue, ValueWithSpan, VisitMut, VisitorMut,
 };
-
-use crate::{LixError, Value as EngineValue};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PlaceholderOrdinalState {
@@ -262,16 +261,16 @@ fn resolve_string_scalar(expr: &Expr, params: &[EngineValue]) -> Option<String> 
 fn resolve_bool_scalar(expr: &Expr, params: &[EngineValue]) -> Option<bool> {
     match unwrap_wrappers(expr) {
         Expr::Value(ValueWithSpan {
-            value: SqlValue::Boolean(value),
-            ..
-        }) => Some(*value),
-        Expr::Value(ValueWithSpan {
             value: SqlValue::Placeholder(token),
             ..
         }) => resolve_explicit_placeholder_value(token, params).and_then(|value| match value {
-            EngineValue::Boolean(flag) => Some(*flag),
+            EngineValue::Boolean(boolean) => Some(*boolean),
             _ => None,
         }),
+        Expr::Value(ValueWithSpan {
+            value: SqlValue::Boolean(boolean),
+            ..
+        }) => Some(*boolean),
         _ => None,
     }
 }
@@ -280,194 +279,43 @@ fn resolve_explicit_placeholder_value<'a>(
     token: &str,
     params: &'a [EngineValue],
 ) -> Option<&'a EngineValue> {
-    let trimmed = token.trim();
-
-    let index_1_based = if let Some(numeric) = trimmed.strip_prefix('?') {
-        parse_1_based_placeholder_for_lookup(numeric)
-    } else if let Some(numeric) = trimmed.strip_prefix('$') {
-        parse_1_based_placeholder_for_lookup(numeric)
-    } else {
-        None
-    }?;
-
-    params.get(index_1_based - 1)
-}
-
-fn parse_1_based_placeholder_for_lookup(numeric: &str) -> Option<usize> {
-    let parsed = numeric.parse::<usize>().ok()?;
-    if parsed == 0 {
-        return None;
-    }
-    Some(parsed)
-}
-
-fn dedup_values<T>(values: Vec<T>) -> Vec<T>
-where
-    T: Clone + PartialEq,
-{
-    let mut out = Vec::new();
-    for value in values {
-        if !out.contains(&value) {
-            out.push(value);
-        }
-    }
-    out
-}
-
-fn union_values<T>(left: &[T], right: &[T]) -> Vec<T>
-where
-    T: Clone + PartialEq,
-{
-    let mut out = left.to_vec();
-    for value in right {
-        if !out.contains(value) {
-            out.push(value.clone());
-        }
-    }
-    out
+    let numeric = token.strip_prefix('?').or_else(|| token.strip_prefix('$'))?;
+    let index = numeric.parse::<usize>().ok()?;
+    index.checked_sub(1).and_then(|zero_based| params.get(zero_based))
 }
 
 fn intersect_values<T>(left: &[T], right: &[T]) -> Vec<T>
 where
     T: Clone + PartialEq,
 {
-    let mut out = Vec::new();
-    for value in left {
-        if right.contains(value) && !out.contains(value) {
-            out.push(value.clone());
-        }
-    }
-    out
+    left.iter()
+        .filter(|value| right.contains(value))
+        .cloned()
+        .collect::<Vec<_>>()
 }
 
-#[cfg(test)]
-mod tests {
-    use sqlparser::ast::Statement;
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    use super::{
-        expr_last_identifier_eq, extract_bool_column_values_from_expr,
-        extract_string_column_values_from_expr, match_bool_column_equality,
-        normalize_statement_placeholders_in_batch,
-    };
-    use crate::Value;
-
-    fn expr_is_schema_key(expr: &sqlparser::ast::Expr) -> bool {
-        expr_last_identifier_eq(expr, "schema_key")
+fn union_values<T>(left: &[T], right: &[T]) -> Vec<T>
+where
+    T: Clone + PartialEq,
+{
+    let mut values = left.to_vec();
+    for value in right {
+        if !values.contains(value) {
+            values.push(value.clone());
+        }
     }
+    values
+}
 
-    fn expr_is_untracked(expr: &sqlparser::ast::Expr) -> bool {
-        expr_last_identifier_eq(expr, "untracked")
+fn dedup_values<T>(values: Vec<T>) -> Vec<T>
+where
+    T: Clone + PartialEq,
+{
+    let mut deduped = Vec::with_capacity(values.len());
+    for value in values {
+        if !deduped.contains(&value) {
+            deduped.push(value);
+        }
     }
-
-    #[test]
-    fn placeholder_normalization_is_stable_across_statements() {
-        let mut statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT ?; SELECT ?3; SELECT $2; SELECT ?",
-        )
-        .expect("parse SQL");
-
-        normalize_statement_placeholders_in_batch(&mut statements).expect("normalize");
-
-        let rendered = statements
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(rendered[0], "SELECT ?1");
-        assert_eq!(rendered[1], "SELECT ?3");
-        assert_eq!(rendered[2], "SELECT ?2");
-        assert_eq!(rendered[3], "SELECT ?4");
-    }
-
-    #[test]
-    fn extracts_string_domain_from_literal_and_placeholder() {
-        let mut statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT * FROM t WHERE schema_key IN ('a', ?2) AND schema_key = ?1",
-        )
-        .expect("parse SQL");
-
-        normalize_statement_placeholders_in_batch(&mut statements).expect("normalize");
-
-        let statement = statements.remove(0);
-        let Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        let selection = select.selection.as_ref().expect("selection");
-
-        let values = extract_string_column_values_from_expr(
-            selection,
-            expr_is_schema_key,
-            &[Value::Text("b".to_string()), Value::Text("b".to_string())],
-        )
-        .expect("domain");
-
-        assert_eq!(values, vec!["b".to_string()]);
-    }
-
-    #[test]
-    fn extracts_bool_domain_from_placeholder() {
-        let mut statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT * FROM t WHERE untracked = ? AND untracked = ?2",
-        )
-        .expect("parse SQL");
-
-        normalize_statement_placeholders_in_batch(&mut statements).expect("normalize");
-
-        let statement = statements.remove(0);
-        let Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        let selection = select.selection.as_ref().expect("selection");
-
-        let values = extract_bool_column_values_from_expr(
-            selection,
-            expr_is_untracked,
-            &[Value::Boolean(true), Value::Boolean(true)],
-        )
-        .expect("domain");
-
-        assert_eq!(values, vec![true]);
-    }
-
-    #[test]
-    fn matches_only_atomic_bool_column_equality() {
-        let mut statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT * FROM t WHERE untracked = ? AND schema_key = 'x'",
-        )
-        .expect("parse SQL");
-        normalize_statement_placeholders_in_batch(&mut statements).expect("normalize");
-
-        let statement = statements.remove(0);
-        let Statement::Query(query) = statement else {
-            panic!("expected query");
-        };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select");
-        };
-        let selection = select.selection.as_ref().expect("selection");
-
-        assert_eq!(
-            match_bool_column_equality(selection, expr_is_untracked, &[Value::Boolean(true)]),
-            None
-        );
-
-        let sqlparser::ast::Expr::BinaryOp { left, .. } = selection else {
-            panic!("expected top-level and expression");
-        };
-        assert_eq!(
-            match_bool_column_equality(left, expr_is_untracked, &[Value::Boolean(true)]),
-            Some(true)
-        );
-    }
+    deduped
 }

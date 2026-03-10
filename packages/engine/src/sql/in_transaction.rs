@@ -1,7 +1,7 @@
 use super::super::*;
 use super::execution::shared_path;
-use super::planning::parse::parse_sql;
 use crate::query_runtime::execute;
+use crate::query_runtime::parse::parse_sql;
 
 impl Engine {
     pub(crate) async fn execute_with_options_in_transaction(

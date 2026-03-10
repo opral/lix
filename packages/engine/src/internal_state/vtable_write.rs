@@ -16,7 +16,7 @@ use crate::engine::sql::history::commit_runtime::{
     build_statement_batch_from_generate_commit_result, load_commit_active_accounts,
     load_version_info_for_versions, CommitQueryExecutor, StatementBatch,
 };
-use crate::engine::sql::planning::param_context::{
+use crate::internal_state::param_context::{
     expr_last_identifier_eq, extract_string_column_values_from_expr, match_bool_column_equality,
 };
 use crate::internal_state::{

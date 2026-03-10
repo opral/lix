@@ -1,9 +1,8 @@
-use crate::{SqlDialect, Value};
-
-use super::super::ast::utils::{
+use crate::engine::sql::ast::utils::{
     bind_sql_with_state, bind_sql_with_state_and_appended_params, PlaceholderState,
 };
 use crate::query_runtime::contracts::planner_error::PlannerError;
+use crate::{SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 pub(crate) fn bind_script_placeholders_once(
