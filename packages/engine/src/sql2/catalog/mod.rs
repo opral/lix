@@ -5,6 +5,7 @@ use crate::{LixBackend, LixError};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct CatalogEpoch(u64);
@@ -189,6 +190,21 @@ impl SurfaceRegistry {
         self.bind_relation_name(&relation_name)
     }
 
+    pub(crate) fn public_surface_names(&self) -> Vec<String> {
+        self.descriptors
+            .values()
+            .map(|descriptor| descriptor.public_name.clone())
+            .collect()
+    }
+
+    pub(crate) fn public_surface_columns(&self, relation_name: &str) -> Option<Vec<String>> {
+        self.bind_relation_name(relation_name).map(|binding| {
+            let mut columns = binding.descriptor.visible_columns.clone();
+            columns.extend(binding.descriptor.hidden_columns.clone());
+            columns
+        })
+    }
+
     pub(crate) fn registered_schema_keys(&self) -> Vec<String> {
         let mut schema_keys = self
             .descriptors
@@ -253,6 +269,19 @@ impl SurfaceRegistry {
 
 fn normalize_surface_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
+}
+
+fn builtin_surface_registry() -> &'static SurfaceRegistry {
+    static BUILTIN_SURFACE_REGISTRY: OnceLock<SurfaceRegistry> = OnceLock::new();
+    BUILTIN_SURFACE_REGISTRY.get_or_init(SurfaceRegistry::with_builtin_surfaces)
+}
+
+pub(crate) fn builtin_public_surface_names() -> Vec<String> {
+    builtin_surface_registry().public_surface_names()
+}
+
+pub(crate) fn builtin_public_surface_columns(relation_name: &str) -> Option<Vec<String>> {
+    builtin_surface_registry().public_surface_columns(relation_name)
 }
 
 fn object_name_to_relation_name(name: &ObjectName) -> Option<String> {
@@ -948,8 +977,17 @@ fn admin_columns(name: &str) -> Vec<String> {
         "lix_active_account" => vec!["id".to_string(), "account_id".to_string()],
         "lix_stored_schema" => vec![
             "value".to_string(),
+            "lixcol_entity_id".to_string(),
             "lixcol_schema_key".to_string(),
+            "lixcol_file_id".to_string(),
+            "lixcol_plugin_key".to_string(),
             "lixcol_schema_version".to_string(),
+            "lixcol_created_at".to_string(),
+            "lixcol_updated_at".to_string(),
+            "lixcol_global".to_string(),
+            "lixcol_change_id".to_string(),
+            "lixcol_untracked".to_string(),
+            "lixcol_metadata".to_string(),
         ],
         "lix_version" => vec![
             "id".to_string(),
@@ -1001,15 +1039,15 @@ fn entity_hidden_columns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        entity_surface_spec_from_schema, CatalogEpoch, DefaultScopeSemantics,
-        DynamicEntitySurfaceSpec, SurfaceFamily, SurfaceOverrideValue, SurfaceRegistry,
-        SurfaceVariant,
+        builtin_public_surface_columns, builtin_public_surface_names, entity_surface_spec_from_schema,
+        CatalogEpoch, DefaultScopeSemantics, DynamicEntitySurfaceSpec, SurfaceFamily,
+        SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
     };
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn binds_builtin_state_surfaces() {
@@ -1064,6 +1102,74 @@ mod tests {
         assert_eq!(
             binding.implicit_overrides.fixed_schema_key.as_deref(),
             Some("lix_key_value")
+        );
+    }
+
+    #[test]
+    fn builtin_public_surface_names_are_unique() {
+        let names = builtin_public_surface_names();
+        let mut seen = HashSet::new();
+        for name in names {
+            assert!(seen.insert(name.clone()), "duplicate public surface: {name}");
+        }
+    }
+
+    #[test]
+    fn filesystem_surface_columns_match_public_contracts() {
+        assert_eq!(
+            builtin_public_surface_columns("lix_file").expect("lix_file columns"),
+            vec![
+                "id",
+                "directory_id",
+                "name",
+                "extension",
+                "path",
+                "data",
+                "metadata",
+                "hidden",
+                "lixcol_entity_id",
+                "lixcol_schema_key",
+                "lixcol_file_id",
+                "lixcol_plugin_key",
+                "lixcol_schema_version",
+                "lixcol_global",
+                "lixcol_change_id",
+                "lixcol_created_at",
+                "lixcol_updated_at",
+                "lixcol_commit_id",
+                "lixcol_writer_key",
+                "lixcol_untracked",
+                "lixcol_metadata",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            builtin_public_surface_columns("lix_file_history_by_version")
+                .expect("lix_file_history_by_version columns"),
+            vec![
+                "id",
+                "path",
+                "data",
+                "metadata",
+                "hidden",
+                "lixcol_entity_id",
+                "lixcol_schema_key",
+                "lixcol_file_id",
+                "lixcol_version_id",
+                "lixcol_plugin_key",
+                "lixcol_schema_version",
+                "lixcol_change_id",
+                "lixcol_metadata",
+                "lixcol_commit_id",
+                "lixcol_commit_created_at",
+                "lixcol_root_commit_id",
+                "lixcol_depth",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
         );
     }
 

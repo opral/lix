@@ -197,6 +197,15 @@ fn guardrail_sql2_directory_exists_alongside_legacy_sql_runtime() {
 }
 
 #[test]
+fn guardrail_duplicate_public_surface_registry_is_removed() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !root.join("src/lix_table_registry.rs").exists(),
+        "duplicate public surface registry must stay removed once sql2/catalog owns diagnostics"
+    );
+}
+
+#[test]
 fn guardrail_sql2_stays_isolated_from_legacy_rewrite_followup_and_classifier_modules() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql2");
     let mut files = Vec::new();

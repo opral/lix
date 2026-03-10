@@ -1,8 +1,6 @@
-use crate::engine::sql::planning::rewrite_engine::{
-    projected_columns_for_entity_view_target,
-    resolve_entity_view_target_from_view_name_with_backend,
+use crate::sql2::catalog::{
+    builtin_public_surface_columns, builtin_public_surface_names, SurfaceRegistry,
 };
-use crate::lix_table_registry::{columns_for_public_lix_table, public_lix_table_names};
 use crate::LixBackend;
 use crate::{errors, LixError};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
@@ -15,12 +13,16 @@ pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> 
         let table_name = choose_table_for_unknown_column(&missing_column, &relation_names);
         let available_columns = table_name
             .as_deref()
-            .and_then(columns_for_public_lix_table)
-            .unwrap_or(&[]);
+            .and_then(|table_name| builtin_public_surface_columns(table_name))
+            .unwrap_or_default();
+        let available_column_refs = available_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         return errors::sql_unknown_column_error(
             &missing_column,
             table_name.as_deref(),
-            available_columns,
+            available_column_refs.as_slice(),
             parse_sql_offset(&error.description),
         );
     }
@@ -31,10 +33,14 @@ pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> 
                 .into_iter()
                 .next()
         }) {
-            let available_tables = public_lix_table_names();
+            let available_tables = builtin_public_surface_names();
+            let available_table_refs = available_tables
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             return errors::sql_unknown_table_error(
                 &table_name,
-                available_tables.as_slice(),
+                available_table_refs.as_slice(),
                 parse_sql_offset(&error.description),
             );
         }
@@ -75,10 +81,14 @@ pub(crate) async fn normalize_sql_error_with_backend(
                 .into_iter()
                 .next()
         }) {
-            let available_tables = public_lix_table_names();
+            let available_tables = resolve_available_tables(backend).await;
+            let available_table_refs = available_tables
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             return errors::sql_unknown_table_error(
                 &table_name,
-                available_tables.as_slice(),
+                available_table_refs.as_slice(),
                 parse_sql_offset(&error.description),
             );
         }
@@ -92,23 +102,28 @@ async fn resolve_available_columns(
     table_name: &str,
     backend: Option<&dyn LixBackend>,
 ) -> Vec<String> {
-    if let Some(columns) = columns_for_public_lix_table(table_name) {
-        return columns.iter().map(|column| (*column).to_string()).collect();
+    if let Some(columns) = builtin_public_surface_columns(table_name) {
+        return columns;
     }
 
     let Some(backend) = backend else {
         return Vec::new();
     };
 
-    let target =
-        match resolve_entity_view_target_from_view_name_with_backend(backend, table_name).await {
-            Ok(target) => target,
-            Err(_) => return Vec::new(),
-        };
-    let Some(target) = target else {
-        return Vec::new();
+    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
+        Ok(registry) => registry,
+        Err(_) => return Vec::new(),
     };
-    projected_columns_for_entity_view_target(&target)
+    registry
+        .public_surface_columns(table_name)
+        .unwrap_or_default()
+}
+
+async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
+    match SurfaceRegistry::bootstrap_with_backend(backend).await {
+        Ok(registry) => registry.public_surface_names(),
+        Err(_) => builtin_public_surface_names(),
+    }
 }
 
 pub(crate) fn is_missing_relation_error(err: &LixError) -> bool {
@@ -163,7 +178,7 @@ fn choose_table_for_unknown_column(
     }
 
     for relation in relation_names {
-        if columns_for_public_lix_table(relation).is_some() {
+        if builtin_public_surface_columns(relation).is_some() {
             return Some(relation.clone());
         }
     }
