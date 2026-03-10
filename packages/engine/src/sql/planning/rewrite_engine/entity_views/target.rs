@@ -129,16 +129,6 @@ pub(crate) async fn resolve_targets_with_backend(
     Ok(out)
 }
 
-pub(crate) fn projected_columns_for_target(target: &EntityViewTarget) -> Vec<String> {
-    let mut columns = target.properties.clone();
-    for (_, alias) in projected_lixcol_aliases_for_variant(target.variant) {
-        if !columns.iter().any(|existing| existing == alias) {
-            columns.push((*alias).to_string());
-        }
-    }
-    columns
-}
-
 pub(crate) fn projected_lixcol_aliases_for_variant(
     variant: EntityViewVariant,
 ) -> &'static [(&'static str, &'static str)] {

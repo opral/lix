@@ -502,20 +502,20 @@ fn guardrail_preprocess_uses_bind_once_path_for_placeholder_binding() {
 #[test]
 fn guardrail_side_effect_placeholder_advancement_is_ast_based() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let side_effects_source = fs::read_to_string(root.join("src/sql/side_effects.rs"))
-        .expect("sql/side_effects.rs should be readable");
+    let ast_utils_source = fs::read_to_string(root.join("src/sql/ast/utils.rs"))
+        .expect("sql/ast/utils.rs should be readable");
 
     assert!(
-        side_effects_source.contains("advance_placeholder_state_for_statement_ast"),
-        "side effects should advance placeholder state through AST visitor helper"
+        ast_utils_source.contains("advance_placeholder_state_for_statement_ast"),
+        "placeholder advancement should stay on the AST visitor helper"
     );
     assert!(
-        !side_effects_source.contains("bind_sql_with_state(&statement_sql"),
-        "side effects must not rebind rendered statement SQL to advance placeholders"
+        !ast_utils_source.contains("bind_sql_with_state(&statement_sql"),
+        "placeholder advancement must not rebind rendered statement SQL"
     );
     assert!(
-        !side_effects_source.contains("let statement_sql = statement.to_string();"),
-        "side effects must not render statements to SQL text for placeholder advancement"
+        !ast_utils_source.contains("let statement_sql = statement.to_string();"),
+        "placeholder advancement must not render statements to SQL text"
     );
 }
 

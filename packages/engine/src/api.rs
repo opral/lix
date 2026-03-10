@@ -88,36 +88,6 @@ impl Engine {
         self.state_commit_stream_bus.emit(changes);
     }
 
-    pub(crate) async fn load_installed_plugins_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-        allow_cache: bool,
-    ) -> Result<Vec<InstalledPlugin>, LixError> {
-        if allow_cache {
-            let cached = self
-                .installed_plugins_cache
-                .read()
-                .map_err(|_| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "installed plugin cache lock poisoned".to_string(),
-                })?
-                .clone();
-            if let Some(plugins) = cached {
-                return Ok(plugins);
-            }
-        }
-
-        let loaded = crate::plugin::runtime::load_installed_plugins(backend).await?;
-        if allow_cache {
-            let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "installed plugin cache lock poisoned".to_string(),
-            })?;
-            *guard = Some(loaded.clone());
-        }
-        Ok(loaded)
-    }
-
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
         let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

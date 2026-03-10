@@ -1,5 +1,4 @@
 use super::super::*;
-use super::ast::utils::{advance_placeholder_state_for_statement_ast, PlaceholderState};
 use super::execution::execute_prepared::execute_prepared_with_transaction;
 use super::history::plugin_inputs as history_plugin_inputs;
 use super::planning::preprocess::preprocess_sql_to_plan;
@@ -12,22 +11,6 @@ use crate::SqlDialect;
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
-
-pub(crate) fn advance_placeholder_state_for_statement(
-    statement: &Statement,
-    params: &[Value],
-    placeholder_state: &mut PlaceholderState,
-) -> Result<(), LixError> {
-    advance_placeholder_state_for_statement_ast(statement, params.len(), placeholder_state).map_err(
-        |error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "filesystem side-effect placeholder advancement failed: {}",
-                error.description
-            ),
-        },
-    )
-}
 
 async fn resolve_pending_write_file_id_with_backend(
     backend: &dyn LixBackend,

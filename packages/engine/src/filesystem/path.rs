@@ -10,13 +10,6 @@ pub(crate) struct ParsedFilePath {
     pub(crate) extension: Option<String>,
 }
 
-pub(crate) fn path_depth(path: &str) -> usize {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-}
-
 pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
     let normalized = raw.nfc().collect::<String>();
     if normalized.is_empty() {
@@ -171,10 +164,6 @@ pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
         name,
         extension,
     })
-}
-
-pub(crate) fn file_ancestor_directory_paths(path: &str) -> Vec<String> {
-    ancestor_directory_paths(path)
 }
 
 pub(crate) fn directory_ancestor_paths(path: &str) -> Vec<String> {

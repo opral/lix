@@ -16,10 +16,6 @@ pub(crate) enum FilesystemProjectionScope {
     ExplicitVersion,
 }
 
-pub(crate) fn build_live_file_projection_sql() -> String {
-    build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, false)
-}
-
 pub(crate) fn build_live_file_prefetch_projection_sql() -> String {
     build_filesystem_file_projection_sql(FilesystemProjectionScope::ExplicitVersion, true)
 }
